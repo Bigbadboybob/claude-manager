@@ -1,0 +1,23 @@
+[project]
+name = "claude-manager"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.30",
+    "click>=8.1",
+    "google-cloud-compute>=1.22",
+    "google-cloud-secret-manager>=2.22",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cli*", "dispatch*", "worker*"]
+
+[project.scripts]
+cm = "cli.main:cli"
