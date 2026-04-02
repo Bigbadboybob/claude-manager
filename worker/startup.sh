@@ -35,9 +35,13 @@ api_update() {
 }
 
 # ---------------------------------------------------------------------------
-# Credentials (base image has Claude Code pre-authed, just need git token)
+# Credentials
 # ---------------------------------------------------------------------------
 GCP_PROJECT="prediction-market-scalper"
+
+# Long-lived OAuth token (1 year, from `claude setup-token`)
+CLAUDE_OAUTH_TOKEN=$(gcloud secrets versions access latest \
+    --secret=claude-setup-token --project="$GCP_PROJECT")
 
 GITHUB_TOKEN=$(gcloud secrets versions access latest \
     --secret=github-pat --project="$GCP_PROJECT")
@@ -62,6 +66,27 @@ chown -R worker:worker /workspace
 echo "[cm-worker] Repo ready"
 
 # ---------------------------------------------------------------------------
+# Configure Claude Code auth for worker user
+# ---------------------------------------------------------------------------
+WORKER_HOME=$(eval echo ~worker)
+
+# Set onboarding complete flag (skips all first-run dialogs)
+if [ -f "$WORKER_HOME/.claude.json" ]; then
+    python3 -c "
+import json
+with open('$WORKER_HOME/.claude.json') as f: d = json.load(f)
+d['hasCompletedOnboarding'] = True
+with open('$WORKER_HOME/.claude.json', 'w') as f: json.dump(d, f)
+"
+else
+    echo '{"hasCompletedOnboarding":true}' > "$WORKER_HOME/.claude.json"
+fi
+chown worker:worker "$WORKER_HOME/.claude.json"
+
+# Write the OAuth token to worker's bashrc so it's available in tmux
+echo "export CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_OAUTH_TOKEN" >> "$WORKER_HOME/.bashrc"
+
+# ---------------------------------------------------------------------------
 # Start Claude Code in tmux
 # ---------------------------------------------------------------------------
 su - worker -c "tmux new-session -d -s claude -x 200 -y 50"
@@ -78,6 +103,7 @@ for attempt in $(seq 1 30); do
         break
     fi
 
+    # Dismiss any remaining dialog
     su - worker -c "tmux send-keys -t claude Enter"
     echo "[cm-worker] Sent Enter (attempt $attempt)"
 done
