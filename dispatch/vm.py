@@ -2,7 +2,7 @@
 import json
 from google.cloud import compute_v1
 from google.cloud import secretmanager_v1
-from dispatch.config import GCP_PROJECT, GCP_ZONE, VM_MACHINE_TYPE, VM_IMAGE_FAMILY, VM_IMAGE_PROJECT
+from dispatch.config import GCP_PROJECT, GCP_ZONE, VM_MACHINE_TYPE, VM_IMAGE_FAMILY, VM_IMAGE_PROJECT, API_TOKEN
 from pathlib import Path
 
 
@@ -59,6 +59,7 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
                 compute_v1.Items(key="repo-branch", value=repo_branch),
                 compute_v1.Items(key="task-prompt", value=prompt),
                 compute_v1.Items(key="manager-callback-url", value=manager_callback_url),
+                compute_v1.Items(key="api-token", value=API_TOKEN),
             ],
         ),
         service_accounts=[

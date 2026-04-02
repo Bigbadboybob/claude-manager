@@ -1,6 +1,12 @@
 import asyncio
+import uuid
 import asyncpg
 from dispatch.config import DB_DSN
+
+
+def _serialize(row: dict) -> dict:
+    """Convert UUID and other non-JSON types to strings."""
+    return {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()}
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -24,24 +30,20 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                RETURNING id, status, priority, prompt, repo_url, created_at""",
             repo_url, repo_branch, prompt, priority,
         )
-        return dict(row)
+        return _serialize(dict(row))
 
 
 async def list_tasks(pool: asyncpg.Pool, status: str | None = None) -> list[dict]:
     async with pool.acquire() as conn:
         if status:
             rows = await conn.fetch(
-                """SELECT id, status, priority, prompt, repo_url, repo_branch,
-                          worker_vm, ttyd_url, blocked_at, created_at
-                   FROM tasks WHERE status = $1
+                """SELECT * FROM tasks WHERE status = $1
                    ORDER BY priority, created_at""",
                 status,
             )
         else:
             rows = await conn.fetch(
-                """SELECT id, status, priority, prompt, repo_url, repo_branch,
-                          worker_vm, ttyd_url, blocked_at, created_at
-                   FROM tasks ORDER BY
+                """SELECT * FROM tasks ORDER BY
                        CASE status
                            WHEN 'blocked' THEN 0
                            WHEN 'running' THEN 1
@@ -50,7 +52,7 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None) -> list[dict
                        END,
                        priority, created_at""",
             )
-        return [dict(r) for r in rows]
+        return [_serialize(dict(r)) for r in rows]
 
 
 async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
@@ -58,7 +60,7 @@ async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
         row = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1", task_id,
         )
-        return dict(row) if row else None
+        return _serialize(dict(row)) if row else None
 
 
 async def update_task(pool: asyncpg.Pool, task_id: str, **fields) -> dict | None:
@@ -71,7 +73,7 @@ async def update_task(pool: asyncpg.Pool, task_id: str, **fields) -> dict | None
             f"UPDATE tasks SET {sets} WHERE id = $1 RETURNING *",
             task_id, *fields.values(),
         )
-        return dict(row) if row else None
+        return _serialize(dict(row)) if row else None
 
 
 async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
@@ -88,4 +90,4 @@ async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
                )
                RETURNING *""",
         )
-        return dict(row) if row else None
+        return _serialize(dict(row)) if row else None

@@ -17,9 +17,22 @@ TASK_ID=$(curl -sf "$META_URL/task-id" -H "$META_HEADER")
 REPO_URL=$(curl -sf "$META_URL/repo-url" -H "$META_HEADER")
 REPO_BRANCH=$(curl -sf "$META_URL/repo-branch" -H "$META_HEADER")
 TASK_PROMPT=$(curl -sf "$META_URL/task-prompt" -H "$META_HEADER")
+MANAGER_URL=$(curl -sf "$META_URL/manager-callback-url" -H "$META_HEADER" || echo "")
+API_TOKEN=$(curl -sf "$META_URL/api-token" -H "$META_HEADER" || echo "")
 
 echo "[cm-worker] Task: $TASK_ID"
 echo "[cm-worker] Repo: $REPO_URL (branch: $REPO_BRANCH)"
+echo "[cm-worker] Manager: $MANAGER_URL"
+
+# Helper: update task via API
+api_update() {
+    if [ -n "$MANAGER_URL" ] && [ -n "$API_TOKEN" ]; then
+        curl -sf -X PATCH "$MANAGER_URL/tasks/$TASK_ID" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -d "$1" || echo "[cm-worker] WARNING: API callback failed"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Credentials (base image has Claude Code pre-authed, just need git token)
@@ -55,7 +68,7 @@ su - worker -c "tmux new-session -d -s claude -x 200 -y 50"
 su - worker -c "tmux send-keys -t claude \
     'cd /workspace && claude --dangerously-skip-permissions --permission-mode bypassPermissions' Enter"
 
-# Wait for Claude to be ready (base image has first-run done, just trust dialog)
+# Wait for Claude to be ready
 for attempt in $(seq 1 30); do
     sleep 3
     PANE=$(su - worker -c "tmux capture-pane -t claude -p" 2>/dev/null || echo "")
@@ -65,7 +78,6 @@ for attempt in $(seq 1 30); do
         break
     fi
 
-    # Dismiss any dialog (trust dialog, etc.)
     su - worker -c "tmux send-keys -t claude Enter"
     echo "[cm-worker] Sent Enter (attempt $attempt)"
 done
@@ -86,9 +98,13 @@ ttyd -i 0.0.0.0 -p 8080 --writable su - worker -c "tmux attach -t claude" &
 
 EXTERNAL_IP=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" \
     -H "Metadata-Flavor: Google")
-echo "[cm-worker] ttyd at http://${EXTERNAL_IP}:8080"
+TTYD_URL="http://${EXTERNAL_IP}:8080"
+echo "[cm-worker] ttyd at $TTYD_URL"
 
-# Write state file (polled by cm CLI via SSH)
+# Report ttyd URL to manager
+api_update "{\"ttyd_url\": \"$TTYD_URL\"}"
+
+# Also write state file for debugging
 echo "running" > /var/log/cm-worker-state
 
 # ---------------------------------------------------------------------------
@@ -105,6 +121,7 @@ while true; do
     if ! su - worker -c "tmux has-session -t claude" 2>/dev/null; then
         echo "[cm-worker] Claude session ended"
         echo "done" > /var/log/cm-worker-state
+        api_update '{"status": "done"}'
         break
     fi
 
@@ -119,6 +136,13 @@ while true; do
     if [ "$CURRENT_STATE" != "$LAST_STATE" ]; then
         echo "[cm-worker] $LAST_STATE -> $CURRENT_STATE"
         echo "$CURRENT_STATE" > /var/log/cm-worker-state
+
+        if [ "$CURRENT_STATE" = "blocked" ]; then
+            api_update "{\"status\": \"blocked\", \"blocked_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+        else
+            api_update '{"status": "running"}'
+        fi
+
         LAST_STATE="$CURRENT_STATE"
     fi
 done

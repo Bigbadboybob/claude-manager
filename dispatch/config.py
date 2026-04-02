@@ -1,11 +1,18 @@
-GCP_PROJECT = "prediction-market-scalper"
-GCP_ZONE = "us-east4-a"
-VM_MACHINE_TYPE = "e2-medium"
-VM_IMAGE_FAMILY = "cm-worker-base"
-VM_IMAGE_PROJECT = "prediction-market-scalper"
+import os
 
-# Local postgres (Phase 1)
-DB_DSN = "postgresql://predictionuser:oracle123@localhost/claude_manager"
+GCP_PROJECT = os.getenv("CM_GCP_PROJECT", "prediction-market-scalper")
+GCP_ZONE = os.getenv("CM_GCP_ZONE", "us-east4-a")
+VM_MACHINE_TYPE = os.getenv("CM_VM_MACHINE_TYPE", "e2-medium")
+VM_IMAGE_FAMILY = "cm-worker-base"
+VM_IMAGE_PROJECT = GCP_PROJECT
+
+# Database
+DB_DSN = os.getenv("CM_DB_DSN", "postgresql://predictionuser:oracle123@localhost/claude_manager")
+
+# API
+MANAGER_URL = os.getenv("CM_API_URL", "http://localhost:8000")
+API_TOKEN = os.getenv("CM_API_TOKEN", "dev-token")
+MAX_WORKERS = int(os.getenv("CM_MAX_WORKERS", "3"))
 
 # Repo shortnames -> full clone URLs
 REPOS = {

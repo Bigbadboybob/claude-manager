@@ -7,6 +7,10 @@ dependencies = [
     "click>=8.1",
     "google-cloud-compute>=1.22",
     "google-cloud-secret-manager>=2.22",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.10",
 ]
 
 [tool.uv]
@@ -17,7 +21,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["cli*", "dispatch*", "worker*"]
+include = ["cli*", "dispatch*", "worker*", "api*"]
 
 [project.scripts]
 cm = "cli.main:cli"
