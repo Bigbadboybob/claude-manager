@@ -1,4 +1,14 @@
 import os
+from pathlib import Path
+
+# Load .env from ~/.config/claude-manager/.env
+_env_file = Path.home() / ".config" / "claude-manager" / ".env"
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
 
 GCP_PROJECT = os.getenv("CM_GCP_PROJECT", "prediction-market-scalper")
 GCP_ZONE = os.getenv("CM_GCP_ZONE", "us-east4-a")

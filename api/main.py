@@ -73,14 +73,16 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     if not fields:
         return task
 
-    # Side effect: when marking done, delete the worker VM
+    # Side effect: when marking done, delete the worker VM (fire-and-forget)
     if fields.get("status") == "done" and task["worker_vm"]:
-        try:
-            from dispatch.vm import delete_worker
-            await asyncio.to_thread(delete_worker, task["worker_vm"])
-            logger.info(f"Deleted VM {task['worker_vm']} for task {task_id}")
-        except Exception:
-            logger.exception(f"Failed to delete VM {task['worker_vm']}")
+        async def _delete_vm(vm_name):
+            try:
+                from dispatch.vm import delete_worker
+                await asyncio.to_thread(delete_worker, vm_name)
+                logger.info(f"Deleted VM {vm_name}")
+            except Exception:
+                logger.exception(f"Failed to delete VM {vm_name}")
+        asyncio.create_task(_delete_vm(task["worker_vm"]))
 
     # Auto-set blocked_at when transitioning to blocked
     if fields.get("status") == "blocked" and "blocked_at" not in fields:
@@ -99,11 +101,14 @@ async def delete_task(task_id: str, pool=Depends(get_pool)):
         raise HTTPException(status_code=404, detail="Task not found")
 
     if task["worker_vm"]:
-        try:
-            from dispatch.vm import delete_worker
-            await asyncio.to_thread(delete_worker, task["worker_vm"])
-        except Exception:
-            logger.exception(f"Failed to delete VM {task['worker_vm']}")
+        async def _delete_vm(vm_name):
+            try:
+                from dispatch.vm import delete_worker
+                await asyncio.to_thread(delete_worker, vm_name)
+                logger.info(f"Deleted VM {vm_name}")
+            except Exception:
+                logger.exception(f"Failed to delete VM {vm_name}")
+        asyncio.create_task(_delete_vm(task["worker_vm"]))
 
     await db.update_task(pool, task_id, status="done")
     return {"ok": True}
