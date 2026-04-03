@@ -444,5 +444,68 @@ def pull(task_id, cwd):
     click.echo(f"  claude --resume {session_id}")
 
 
+@cli.group()
+def warm():
+    """Manage warm pool VMs."""
+    pass
+
+
+@warm.command("add")
+@click.option("--repo", "-r", required=True, help="Repo name or URL")
+@click.option("--branch", "-b", default="main", help="Branch")
+@click.option("--size", "-s", default=1, help="Number of warm VMs to maintain")
+def warm_add(repo, branch, size):
+    """Add a warm pool for a repo."""
+    repo_url = resolve_repo(repo)
+    client = get_client()
+    wp = client.create_warm_pool(repo_url, branch, size)
+    click.echo(f"Warm pool created: {short_id(wp['id'])}")
+    click.echo(f"  Repo: {repo_url}")
+    click.echo(f"  Size: {size} VMs")
+    click.echo(f"  Dispatch daemon will launch VMs within 30s")
+
+
+@warm.command("list")
+def warm_list():
+    """List warm pools and their VMs."""
+    client = get_client()
+    pools = client.list_warm_pools()
+    if not pools:
+        click.echo("No warm pools configured.")
+        return
+    for wp in pools:
+        repo_short = wp["repo_url"].split("/")[-1].replace(".git", "")
+        click.echo(f"  Pool {short_id(wp['id'])} — {repo_short} (size={wp['pool_size']})")
+        vms = wp.get("vms", [])
+        if vms:
+            for vm in vms:
+                click.echo(f"    {vm['vm_name']:<25} {vm['status']:<8} {vm.get('external_ip', '')}")
+        else:
+            click.echo(f"    (no VMs yet — daemon will launch shortly)")
+
+
+@warm.command("remove")
+@click.argument("pool_id")
+def warm_remove(pool_id):
+    """Remove a warm pool and delete its VMs."""
+    client = get_client()
+    pools = client.list_warm_pools()
+    pool = next((p for p in pools if p["id"].startswith(pool_id)), None)
+    if not pool:
+        click.echo(f"No warm pool matching '{pool_id}'")
+        return
+    client.delete_warm_pool(pool["id"])
+    click.echo(f"Warm pool {short_id(pool['id'])} removed (VMs being deleted)")
+
+
+@cli.command()
+def config():
+    """Show current configuration."""
+    client = get_client()
+    cfg = client.get_config()
+    click.echo(f"  Max workers:     {cfg['max_workers']}")
+    click.echo(f"  Zombie timeout:  {cfg['zombie_timeout_minutes']}m")
+
+
 if __name__ == "__main__":
     cli()

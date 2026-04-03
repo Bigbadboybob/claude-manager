@@ -47,3 +47,28 @@ class CMClient:
         r = self.client.get("/health")
         r.raise_for_status()
         return r.json()
+
+    # Warm pools
+    def list_warm_pools(self) -> list[dict]:
+        r = self.client.get("/warm-pools")
+        r.raise_for_status()
+        return r.json()
+
+    def create_warm_pool(self, repo_url: str, repo_branch: str = "main",
+                         pool_size: int = 1) -> dict:
+        r = self.client.post("/warm-pools", json={
+            "repo_url": repo_url, "repo_branch": repo_branch,
+            "pool_size": pool_size,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    def delete_warm_pool(self, pool_id: str):
+        r = self.client.delete(f"/warm-pools/{pool_id}")
+        r.raise_for_status()
+        return r.json()
+
+    def get_config(self) -> dict:
+        r = self.client.get("/config")
+        r.raise_for_status()
+        return r.json()

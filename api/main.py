@@ -135,6 +135,61 @@ async def list_workers(pool=Depends(get_pool)):
 
 
 # ---------------------------------------------------------------------------
+# Warm Pools
+# ---------------------------------------------------------------------------
+
+@app.get("/warm-pools", dependencies=[Depends(verify_token)])
+async def list_warm_pools(pool=Depends(get_pool)):
+    pools = await db.list_warm_pools(pool)
+    for wp in pools:
+        wp["vms"] = await db.list_warm_vms(pool, pool_id=wp["id"])
+    return pools
+
+
+@app.post("/warm-pools", dependencies=[Depends(verify_token)])
+async def create_warm_pool(body: dict, pool=Depends(get_pool)):
+    wp = await db.add_warm_pool(
+        pool,
+        repo_url=body["repo_url"],
+        repo_branch=body.get("repo_branch", "main"),
+        pool_size=body.get("pool_size", 1),
+        vm_machine_type=body.get("vm_machine_type", "e2-medium"),
+    )
+    return wp
+
+
+@app.delete("/warm-pools/{pool_id}", dependencies=[Depends(verify_token)])
+async def delete_warm_pool(pool_id: str, pool=Depends(get_pool)):
+    # Delete all warm VMs first
+    vms = await db.list_warm_vms(pool, pool_id=pool_id)
+    for vm in vms:
+        if vm["status"] != "dead":
+            async def _delete(vm_name):
+                try:
+                    from dispatch.vm import delete_worker
+                    await asyncio.to_thread(delete_worker, vm_name)
+                except Exception:
+                    pass
+            asyncio.create_task(_delete(vm["vm_name"]))
+        await db.delete_warm_vm(pool, vm["id"])
+    await db.delete_warm_pool(pool, pool_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@app.get("/config", dependencies=[Depends(verify_token)])
+async def get_config():
+    from dispatch.config import MAX_WORKERS, ZOMBIE_TIMEOUT_MINUTES
+    return {
+        "max_workers": MAX_WORKERS,
+        "zombie_timeout_minutes": ZOMBIE_TIMEOUT_MINUTES,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 
