@@ -144,9 +144,20 @@ async def _maintain_warm_pools(pool):
             if not is_alive:
                 logger.warning(f"Warm VM {vm['vm_name']} is dead, removing")
                 await db.delete_warm_vm(pool, vm["id"])
-                # If it had a task, re-queue it
                 if vm.get("current_task_id"):
                     await db.update_task(pool, vm["current_task_id"], status="backlog")
+            elif vm["status"] == "booting":
+                # Check if the VM is actually ready (Claude at the prompt)
+                try:
+                    output = await asyncio.to_thread(
+                        _ssh_command, vm["vm_name"],
+                        "grep -c 'ready and waiting' /var/log/cm-worker.log 2>/dev/null || echo 0"
+                    )
+                    if output.strip() != "0":
+                        logger.info(f"Warm VM {vm['vm_name']} is now ready")
+                        await db.update_warm_vm(pool, vm["id"], status="ready")
+                except Exception:
+                    pass
 
 
 async def _detect_zombies(pool):
