@@ -160,6 +160,50 @@ api_update "{\"ttyd_url\": \"$TTYD_URL\"}"
 echo "running" > /var/log/cm-worker-state
 
 # ---------------------------------------------------------------------------
+# Preemption handler (GCP sends SIGTERM 30s before killing spot instances)
+# ---------------------------------------------------------------------------
+on_preempt() {
+    echo "[cm-worker] PREEMPTION DETECTED — saving state..."
+
+    # 1. Save Claude session file to GCS
+    SESSION_FILE=$(ls -t /home/worker/.claude/projects/-workspace/*.jsonl 2>/dev/null | head -1)
+    FOUND_SESSION_ID=""
+    if [ -n "$SESSION_FILE" ]; then
+        FOUND_SESSION_ID=$(basename "$SESSION_FILE" .jsonl)
+        echo "[cm-worker] Saving session $FOUND_SESSION_ID to GCS..."
+        gsutil cp "$SESSION_FILE" "$GCS_BUCKET/$FOUND_SESSION_ID/$FOUND_SESSION_ID.jsonl" 2>/dev/null || true
+        # Save subagent files if they exist
+        SESSION_DIR="${SESSION_FILE%.jsonl}"
+        [ -d "$SESSION_DIR" ] && gsutil -m cp -r "$SESSION_DIR" "$GCS_BUCKET/$FOUND_SESSION_ID/" 2>/dev/null || true
+        echo "[cm-worker] Session saved"
+    else
+        echo "[cm-worker] WARNING: No session file found"
+    fi
+
+    # 2. Git commit and push WIP
+    cd /workspace
+    WIP_BRANCH="cm/preempt-${TASK_ID:0:8}"
+    su - worker -c "cd /workspace && git checkout -b $WIP_BRANCH 2>/dev/null || git checkout $WIP_BRANCH"
+    su - worker -c "cd /workspace && git add -A && git commit -m 'WIP: preempted task ${TASK_ID:0:8}'" 2>/dev/null || true
+    su - worker -c "cd /workspace && git push -u origin $WIP_BRANCH" 2>/dev/null || true
+    echo "[cm-worker] WIP pushed to $WIP_BRANCH"
+
+    # 3. Re-queue the task with session info
+    REQUEUE_BODY="{\"status\": \"backlog\", \"wip_branch\": \"$WIP_BRANCH\""
+    if [ -n "$FOUND_SESSION_ID" ]; then
+        REQUEUE_BODY="$REQUEUE_BODY, \"session_id\": \"$FOUND_SESSION_ID\""
+    fi
+    REQUEUE_BODY="$REQUEUE_BODY}"
+    api_update "$REQUEUE_BODY"
+    echo "[cm-worker] Task re-queued to backlog"
+
+    echo "[cm-worker] Preemption handling complete"
+    exit 0
+}
+
+trap 'on_preempt' SIGTERM
+
+# ---------------------------------------------------------------------------
 # Watcher: detect idle (blocked) vs working (running)
 # ---------------------------------------------------------------------------
 sleep 30  # grace period

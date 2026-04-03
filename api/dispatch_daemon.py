@@ -45,10 +45,12 @@ async def dispatch_loop(pool):
 def _launch_worker(task):
     """Synchronous VM launch (called via asyncio.to_thread)."""
     from dispatch.vm import launch_worker
+    # Use wip_branch if task was preempted, otherwise use repo_branch
+    branch = task.get("wip_branch") or task["repo_branch"]
     return launch_worker(
         task_id=str(task["id"]),
         repo_url=task["repo_url"],
-        repo_branch=task["repo_branch"],
+        repo_branch=branch,
         prompt=task["prompt"],
         manager_callback_url=MANAGER_URL,
     )
