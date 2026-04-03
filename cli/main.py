@@ -152,7 +152,7 @@ def open_cmd(task_id, browser):
 @cli.command()
 @click.argument("task_id")
 def done(task_id):
-    """Mark a task as done and shut down its worker VM."""
+    """Mark a task as done and shut down its worker VM (warm VMs return to ready)."""
     client = get_client()
     task = find_task(client, task_id)
     if not task:
@@ -160,6 +160,39 @@ def done(task_id):
         return
     client.update_task(task["id"], status="done")
     click.echo(f"Task {short_id(task['id'])} marked done (VM will be deleted)")
+
+
+@cli.command()
+@click.argument("task_id")
+@click.option("--prompt", "-p", help="New prompt")
+@click.option("--priority", type=int, help="New priority")
+@click.option("--prompt-file", type=click.Path(exists=True), help="Read new prompt from file")
+def edit(task_id, prompt, priority, prompt_file):
+    """Edit a backlog task's prompt or priority."""
+    if prompt_file:
+        prompt = open(prompt_file).read()
+    client = get_client()
+    task = find_task(client, task_id)
+    if not task:
+        click.echo(f"No task found matching '{task_id}'")
+        return
+    if task["status"] != "backlog":
+        click.echo(f"Task {short_id(task['id'])} is '{task['status']}' — can only edit backlog tasks")
+        return
+    updates = {}
+    if prompt is not None:
+        updates["prompt"] = prompt
+    if priority is not None:
+        updates["priority"] = priority
+    if not updates:
+        click.echo("Nothing to update. Use --prompt or --priority.")
+        return
+    client.update_task(task["id"], **updates)
+    click.echo(f"Task {short_id(task['id'])} updated")
+    if prompt is not None:
+        click.echo(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+    if priority is not None:
+        click.echo(f"  Priority: {priority}")
 
 
 @cli.command()
