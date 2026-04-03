@@ -73,16 +73,24 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     if not fields:
         return task
 
-    # Side effect: when marking done, delete the worker VM (fire-and-forget)
+    # Side effect: when marking done, handle the worker VM
     if fields.get("status") == "done" and task["worker_vm"]:
-        async def _delete_vm(vm_name):
-            try:
-                from dispatch.vm import delete_worker
-                await asyncio.to_thread(delete_worker, vm_name)
-                logger.info(f"Deleted VM {vm_name}")
-            except Exception:
-                logger.exception(f"Failed to delete VM {vm_name}")
-        asyncio.create_task(_delete_vm(task["worker_vm"]))
+        # Check if this is a warm VM — if so, release it back to ready instead of deleting
+        warm_vms = await db.list_warm_vms(pool)
+        warm_vm = next((v for v in warm_vms if v["vm_name"] == task["worker_vm"]), None)
+        if warm_vm:
+            await db.update_warm_vm(pool, warm_vm["id"],
+                                    status="ready", current_task_id=None)
+            logger.info(f"Released warm VM {task['worker_vm']} back to ready")
+        else:
+            async def _delete_vm(vm_name):
+                try:
+                    from dispatch.vm import delete_worker
+                    await asyncio.to_thread(delete_worker, vm_name)
+                    logger.info(f"Deleted VM {vm_name}")
+                except Exception:
+                    logger.exception(f"Failed to delete VM {vm_name}")
+            asyncio.create_task(_delete_vm(task["worker_vm"]))
 
     # Auto-set blocked_at when transitioning to blocked
     if fields.get("status") == "blocked" and "blocked_at" not in fields:
