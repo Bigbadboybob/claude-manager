@@ -231,5 +231,218 @@ def logs(task_id, lines):
     click.echo(result.stdout.rstrip())
 
 
+def _get_project_path(cwd: str) -> str:
+    """Convert a directory path to Claude's project path format."""
+    return cwd.replace("/", "-").lstrip("-")
+
+
+def _find_latest_session(cwd: str) -> tuple[str, str] | None:
+    """Find the most recent Claude session for a directory. Returns (session_id, jsonl_path)."""
+    from pathlib import Path
+    project_path = _get_project_path(cwd)
+    project_dir = Path.home() / ".claude" / "projects" / project_path
+    if not project_dir.exists():
+        return None
+    jsonl_files = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not jsonl_files:
+        return None
+    session_id = jsonl_files[0].stem
+    return session_id, str(jsonl_files[0])
+
+
+GCS_BUCKET = "gs://cm-sessions-prediction-market-scalper"
+
+
+@cli.command()
+@click.option("--name", "-n", help="Task name/description")
+@click.option("--repo", "-r", help="Repo name (auto-detected from git remote if omitted)")
+@click.option("--session", "-s", help="Session ID (auto-detected from most recent if omitted)")
+@click.option("--cwd", help="Working directory (defaults to current)")
+def push(name, repo, session, cwd):
+    """Push a local Claude session to the cloud."""
+    cwd = cwd or os.getcwd()
+
+    # Auto-detect repo from git remote
+    if not repo:
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            click.echo("Could not detect git remote. Use --repo.")
+            return
+        repo_url = result.stdout.strip()
+        # Normalize SSH URLs to HTTPS
+        if repo_url.startswith("git@github.com:"):
+            repo_url = repo_url.replace("git@github.com:", "https://github.com/")
+    else:
+        repo_url = resolve_repo(repo)
+
+    # Auto-detect session
+    if not session:
+        found = _find_latest_session(cwd)
+        if not found:
+            click.echo(f"No Claude sessions found for {cwd}")
+            return
+        session_id, jsonl_path = found
+    else:
+        session_id = session
+        project_path = _get_project_path(cwd)
+        from pathlib import Path
+        jsonl_path = str(Path.home() / ".claude" / "projects" / project_path / f"{session_id}.jsonl")
+
+    # Auto-generate name from last user message if not provided
+    if not name:
+        name = f"Session {session_id[:8]} (pushed from local)"
+
+    click.echo(f"Session: {session_id[:8]}")
+    click.echo(f"Repo:    {repo_url}")
+
+    # 1. Commit and push WIP
+    click.echo("Committing WIP...")
+    branch = f"cm/push-{session_id[:8]}"
+    subprocess.run(["git", "-C", cwd, "checkout", "-b", branch], capture_output=True)
+    subprocess.run(["git", "-C", cwd, "add", "-A"], capture_output=True)
+    result = subprocess.run(
+        ["git", "-C", cwd, "commit", "-m", f"WIP: {name}"],
+        capture_output=True, text=True,
+    )
+    if "nothing to commit" in result.stdout:
+        click.echo("  No uncommitted changes")
+    else:
+        click.echo(f"  Committed to {branch}")
+    subprocess.run(
+        ["git", "-C", cwd, "push", "-u", "origin", branch],
+        capture_output=True, text=True,
+    )
+    click.echo(f"  Pushed branch {branch}")
+
+    # 2. Upload session file to GCS
+    click.echo("Uploading session...")
+    gcs_path = f"{GCS_BUCKET}/{session_id}/{session_id}.jsonl"
+    subprocess.run(
+        ["gcloud", "storage", "cp", jsonl_path, gcs_path],
+        capture_output=True,
+    )
+    # Upload subagent files if they exist
+    from pathlib import Path
+    subdir = Path(jsonl_path).parent / session_id
+    if subdir.exists():
+        subprocess.run(
+            ["gcloud", "storage", "cp", "-r", str(subdir), f"{GCS_BUCKET}/{session_id}/"],
+            capture_output=True,
+        )
+    click.echo(f"  Uploaded to {gcs_path}")
+
+    # 3. Create task via API
+    client = get_client()
+    task = client.add_task(repo_url, branch, name, priority=0)
+    # Update with session info
+    client.update_task(task["id"], session_id=session_id, wip_branch=branch)
+
+    click.echo(f"\nTask {short_id(task['id'])} created. Dispatch daemon will pick it up.")
+    click.echo(f"  cm queue    — check when it's blocked")
+    click.echo(f"  cm open {short_id(task['id'])}  — attach to the session")
+    click.echo(f"  cm pull {short_id(task['id'])}  — pull it back locally")
+
+
+@cli.command()
+@click.argument("task_id")
+@click.option("--cwd", help="Local repo directory (auto-detected from repo URL)")
+def pull(task_id, cwd):
+    """Pull a cloud Claude session back to local."""
+    client = get_client()
+    task = find_task(client, task_id)
+    if not task:
+        click.echo(f"No task found matching '{task_id}'")
+        return
+
+    session_id = task.get("session_id")
+    if not session_id:
+        click.echo(f"Task {short_id(task['id'])} has no session to pull")
+        return
+
+    # Auto-detect local repo dir from repo URL
+    if not cwd:
+        repo_name = task["repo_url"].split("/")[-1].replace(".git", "")
+        # Check common locations
+        for base in [os.path.expanduser("~/code/projects"), os.getcwd()]:
+            candidate = os.path.join(base, repo_name)
+            if os.path.isdir(candidate):
+                cwd = candidate
+                break
+        if not cwd:
+            click.echo(f"Could not find local repo for {repo_name}. Use --cwd.")
+            return
+
+    click.echo(f"Session: {session_id[:8]}")
+    click.echo(f"Local:   {cwd}")
+
+    # 1. Fetch and checkout the branch
+    branch = task.get("wip_branch")
+    if branch:
+        click.echo(f"Checking out {branch}...")
+        subprocess.run(["git", "-C", cwd, "fetch", "origin", branch], capture_output=True)
+        subprocess.run(["git", "-C", cwd, "checkout", branch], capture_output=True)
+        click.echo(f"  On branch {branch}")
+
+    # 2. Download session from GCS (or from VM if still running)
+    from pathlib import Path
+    project_path = _get_project_path(cwd)
+    local_project_dir = Path.home() / ".claude" / "projects" / project_path
+    local_project_dir.mkdir(parents=True, exist_ok=True)
+    local_jsonl = local_project_dir / f"{session_id}.jsonl"
+
+    # Try GCS first
+    click.echo("Downloading session...")
+    gcs_path = f"{GCS_BUCKET}/{session_id}/{session_id}.jsonl"
+    result = subprocess.run(
+        ["gcloud", "storage", "cp", gcs_path, str(local_jsonl)],
+        capture_output=True, text=True,
+    )
+
+    if result.returncode != 0:
+        # Try downloading from the running VM via SSH
+        if task.get("worker_vm"):
+            click.echo("  Not in GCS, pulling from worker VM...")
+            vm = task["worker_vm"]
+            zone = task.get("worker_zone") or GCP_ZONE
+            result = subprocess.run(
+                ["gcloud", "compute", "ssh", vm,
+                 f"--zone={zone}", f"--project={GCP_PROJECT}",
+                 "--command",
+                 f"sudo cat /home/worker/.claude/projects/-workspace/{session_id}.jsonl"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                # Filter out SSH noise
+                content = "\n".join(
+                    l for l in result.stdout.splitlines()
+                    if not l.startswith("Pseudo-terminal")
+                )
+                local_jsonl.write_text(content)
+            else:
+                click.echo(f"  Could not download session: {result.stderr}")
+                return
+    click.echo(f"  Saved to {local_jsonl}")
+
+    # Download subagent files
+    subprocess.run(
+        ["gcloud", "storage", "cp", "-r",
+         f"{GCS_BUCKET}/{session_id}/{session_id}/",
+         str(local_project_dir / session_id) + "/"],
+        capture_output=True,
+    )
+
+    # 3. Mark the cloud task as done if it's still running
+    if task["status"] in ("running", "blocked"):
+        click.echo("Marking cloud task as done...")
+        client.update_task(task["id"], status="done")
+
+    click.echo(f"\nSession pulled. Resume with:")
+    click.echo(f"  cd {cwd}")
+    click.echo(f"  claude --resume {session_id}")
+
+
 if __name__ == "__main__":
     cli()

@@ -34,12 +34,21 @@ api_update() {
     fi
 }
 
+# Fetch full task details from API (for session_id)
+SESSION_ID=""
+if [ -n "$MANAGER_URL" ] && [ -n "$API_TOKEN" ]; then
+    TASK_JSON=$(curl -sf "$MANAGER_URL/tasks/$TASK_ID" \
+        -H "Authorization: Bearer $API_TOKEN" || echo "{}")
+    SESSION_ID=$(echo "$TASK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_id') or '')" 2>/dev/null || echo "")
+fi
+echo "[cm-worker] Session ID: ${SESSION_ID:-none}"
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
 GCP_PROJECT="prediction-market-scalper"
+GCS_BUCKET="gs://cm-sessions-prediction-market-scalper"
 
-# Long-lived OAuth token (1 year, from `claude setup-token`)
 CLAUDE_OAUTH_TOKEN=$(gcloud secrets versions access latest \
     --secret=claude-setup-token --project="$GCP_PROJECT")
 
@@ -70,7 +79,7 @@ echo "[cm-worker] Repo ready"
 # ---------------------------------------------------------------------------
 WORKER_HOME=$(eval echo ~worker)
 
-# Set onboarding complete flag (skips all first-run dialogs)
+# Set onboarding complete flag
 if [ -f "$WORKER_HOME/.claude.json" ]; then
     python3 -c "
 import json
@@ -83,15 +92,33 @@ else
 fi
 chown worker:worker "$WORKER_HOME/.claude.json"
 
-# Write the OAuth token to worker's bashrc so it's available in tmux
+# Write the OAuth token to worker's bashrc
 echo "export CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_OAUTH_TOKEN" >> "$WORKER_HOME/.bashrc"
+
+# ---------------------------------------------------------------------------
+# Restore session if resuming (cm push -> cloud)
+# ---------------------------------------------------------------------------
+CLAUDE_ARGS="--dangerously-skip-permissions --permission-mode bypassPermissions"
+
+if [ -n "$SESSION_ID" ]; then
+    echo "[cm-worker] Restoring session $SESSION_ID from GCS..."
+    mkdir -p "$WORKER_HOME/.claude/projects/-workspace"
+    gsutil cp "$GCS_BUCKET/$SESSION_ID/$SESSION_ID.jsonl" \
+        "$WORKER_HOME/.claude/projects/-workspace/" 2>/dev/null || echo "[cm-worker] WARNING: No session file in GCS"
+    # Restore subagent files
+    gsutil -m cp -r "$GCS_BUCKET/$SESSION_ID/$SESSION_ID/" \
+        "$WORKER_HOME/.claude/projects/-workspace/" 2>/dev/null || true
+    chown -R worker:worker "$WORKER_HOME/.claude/projects"
+    CLAUDE_ARGS="$CLAUDE_ARGS --resume $SESSION_ID"
+    echo "[cm-worker] Will resume session $SESSION_ID"
+fi
 
 # ---------------------------------------------------------------------------
 # Start Claude Code in tmux
 # ---------------------------------------------------------------------------
 su - worker -c "tmux new-session -d -s claude -x 200 -y 50"
 su - worker -c "tmux send-keys -t claude \
-    'cd /workspace && claude --dangerously-skip-permissions --permission-mode bypassPermissions' Enter"
+    'cd /workspace && claude $CLAUDE_ARGS' Enter"
 
 # Wait for Claude to be ready
 for attempt in $(seq 1 30); do
@@ -103,19 +130,21 @@ for attempt in $(seq 1 30); do
         break
     fi
 
-    # Dismiss any remaining dialog
     su - worker -c "tmux send-keys -t claude Enter"
     echo "[cm-worker] Sent Enter (attempt $attempt)"
 done
 
-# Send the task prompt
-PROMPT_FILE=$(mktemp)
-echo "$TASK_PROMPT" > "$PROMPT_FILE"
-chmod 644 "$PROMPT_FILE"
-su - worker -c "tmux send-keys -t claude \"\$(cat $PROMPT_FILE)\" Enter"
-rm -f "$PROMPT_FILE"
-
-echo "[cm-worker] Prompt sent"
+# Only send prompt if this is a fresh task (not resuming a session)
+if [ -z "$SESSION_ID" ]; then
+    PROMPT_FILE=$(mktemp)
+    echo "$TASK_PROMPT" > "$PROMPT_FILE"
+    chmod 644 "$PROMPT_FILE"
+    su - worker -c "tmux send-keys -t claude \"\$(cat $PROMPT_FILE)\" Enter"
+    rm -f "$PROMPT_FILE"
+    echo "[cm-worker] Prompt sent"
+else
+    echo "[cm-worker] Resumed session (no prompt sent)"
+fi
 
 # ---------------------------------------------------------------------------
 # Start ttyd
@@ -127,10 +156,7 @@ EXTERNAL_IP=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/insta
 TTYD_URL="http://${EXTERNAL_IP}:8080"
 echo "[cm-worker] ttyd at $TTYD_URL"
 
-# Report ttyd URL to manager
 api_update "{\"ttyd_url\": \"$TTYD_URL\"}"
-
-# Also write state file for debugging
 echo "running" > /var/log/cm-worker-state
 
 # ---------------------------------------------------------------------------
