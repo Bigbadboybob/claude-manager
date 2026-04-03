@@ -1,0 +1,19 @@
+[package]
+name = "claude-manager-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Terminal UI framework
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = "0.29"
+
+# Terminal emulation
+alacritty_terminal = "0.25"
+
+# Key event -> ANSI byte encoding
+terminput = "0.5"
+terminput-crossterm = "0.4"
+
+# Error handling
+anyhow = "1"
