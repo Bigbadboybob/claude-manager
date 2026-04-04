@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -33,7 +35,14 @@ pub struct Session {
 
 impl Session {
     /// Spawn a new terminal session running the given shell command.
-    pub fn new(shell: &str, args: &[String], cols: u16, rows: u16) -> anyhow::Result<Self> {
+    pub fn new(
+        shell: &str,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+        working_dir: Option<PathBuf>,
+        env: HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
         let event_proxy = EventProxy { tx: event_tx };
 
@@ -48,9 +57,9 @@ impl Session {
 
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(shell.to_string(), args.to_vec())),
-            working_directory: None,
+            working_directory: working_dir,
             drain_on_exit: true,
-            env: Default::default(),
+            env,
         };
 
         let window_size = WindowSize {

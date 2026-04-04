@@ -1,6 +1,6 @@
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb};
 use alacritty_terminal::Term;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -64,8 +64,10 @@ impl Widget for TerminalWidget<'_> {
             }
         }
 
-        // Render cursor.
-        if self.focused && cursor.shape != CursorShape::Hidden {
+        // Render cursor. Always show when focused — inner apps (like Claude Code)
+        // may hide the hardware cursor but we have no real hardware cursor to show,
+        // so we always draw one at the reported position.
+        if self.focused {
             let cx = area.left() + cursor.point.column.0 as u16;
             let cy = area.top() + cursor.point.line.0 as u16;
             if cx < area.right() && cy < area.bottom() {

@@ -15,5 +15,12 @@ alacritty_terminal = "0.25"
 terminput = "0.5"
 terminput-crossterm = "0.4"
 
+# HTTP client (blocking, used in background thread)
+ureq = { version = "3", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Error handling
 anyhow = "1"

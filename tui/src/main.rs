@@ -1,7 +1,11 @@
+mod api;
 mod app;
+mod backend;
+mod config;
 mod input;
 mod session;
 mod terminal_widget;
+mod worktree;
 
 use std::io;
 use std::time::Duration;
@@ -15,8 +19,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::App;
+use config::Config;
 
 fn main() -> anyhow::Result<()> {
+    let config = Config::load();
+
     // Setup terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -24,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, config);
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -34,36 +41,15 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
-    let mut app = App::new();
-
-    // Demo sessions showing all statuses.
-    app.add_shell_session("Fix calibration test", "/bin/bash", &[]);
-    app.add_shell_session("Refactor parser", "/bin/bash", &[]);
-    app.entries.push(app::SessionEntry {
-        name: "Add retry logic".to_string(),
-        status: app::TaskStatus::Blocked,
-        session: None,
-    });
-    app.entries.push(app::SessionEntry {
-        name: "Update scraper".to_string(),
-        status: app::TaskStatus::Backlog,
-        session: None,
-    });
-    app.entries.push(app::SessionEntry {
-        name: "Clean up types".to_string(),
-        status: app::TaskStatus::Backlog,
-        session: None,
-    });
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> anyhow::Result<()> {
+    let mut app = App::new(config);
 
     loop {
         // Draw.
         terminal.draw(|frame| {
-            // Update terminal size for new sessions.
             let area = frame.area();
-            // Account for borders: the terminal inner area is smaller.
-            let term_cols = area.width.saturating_sub(32); // sidebar + borders
-            let term_rows = area.height.saturating_sub(2); // top + bottom border
+            let term_cols = area.width.saturating_sub(32);
+            let term_rows = area.height.saturating_sub(2);
             if (term_cols, term_rows) != app.last_term_size {
                 app.resize_terminals(term_cols, term_rows);
             }
@@ -75,15 +61,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<
             break;
         }
 
-        // Drain terminal events (new content, exits).
+        // Drain events from terminal sessions and backend.
         app.drain_terminal_events();
+        app.drain_backend_events();
 
-        // Poll for crossterm events with a short timeout for responsive rendering.
+        // Poll for crossterm events.
         if crossterm_poll(Duration::from_millis(16))? {
             let event = event::read()?;
 
             if let CrosstermEvent::Resize(_cols, _rows) = event {
-                // The terminal will handle the resize on next draw.
                 continue;
             }
 
