@@ -147,6 +147,25 @@ impl App {
                 BackendEvent::ApiError(msg) => {
                     self.set_status_msg(&format!("API: {}", msg));
                 }
+                BackendEvent::Progress(msg) => {
+                    self.set_status_msg(&msg);
+                }
+                BackendEvent::PullComplete {
+                    task_id: _,
+                    worktree_path,
+                    main_repo,
+                    session_id,
+                    repo_url,
+                    prompt,
+                } => {
+                    self.spawn_resumed_session(
+                        worktree_path,
+                        main_repo,
+                        session_id,
+                        repo_url,
+                        prompt,
+                    );
+                }
             }
         }
     }
@@ -278,6 +297,14 @@ impl App {
                     }
                     KeyCode::Char('n') => {
                         self.start_new_session();
+                        return true;
+                    }
+                    KeyCode::Char('p') => {
+                        self.push_active();
+                        return true;
+                    }
+                    KeyCode::Char('l') => {
+                        self.pull_active();
                         return true;
                     }
                     _ => {}
@@ -470,6 +497,112 @@ impl App {
                 self.backend.update_task(id.clone(), fields);
                 entry.status = TaskStatus::Done;
                 self.set_status_msg("Marked done");
+            }
+        }
+    }
+
+    /// Push the active local session to the cloud.
+    fn push_active(&mut self) {
+        if let Some(entry) = self.entries.get(self.active) {
+            // Only push local sessions (no task_id) that have a worktree.
+            if entry.task_id.is_some() {
+                self.set_status_msg("Can only push local sessions");
+                return;
+            }
+            let worktree_path = match &entry.worktree_path {
+                Some(p) => p.clone(),
+                None => {
+                    self.set_status_msg("No worktree to push");
+                    return;
+                }
+            };
+            let repo_url = match &entry.repo_url {
+                Some(u) => u.clone(),
+                None => {
+                    self.set_status_msg("No repo URL");
+                    return;
+                }
+            };
+            let name = entry.prompt.clone().unwrap_or_else(|| entry.name.clone());
+            self.backend.push(worktree_path, repo_url, name);
+            self.set_status_msg("Pushing to cloud...");
+        }
+    }
+
+    /// Pull the active cloud task to local.
+    fn pull_active(&mut self) {
+        if let Some(entry) = self.entries.get(self.active) {
+            let task_id = match &entry.task_id {
+                Some(id) => id.clone(),
+                None => {
+                    self.set_status_msg("Can only pull cloud tasks");
+                    return;
+                }
+            };
+            let repo_url = match &entry.repo_url {
+                Some(u) => u.clone(),
+                None => {
+                    self.set_status_msg("No repo URL on task");
+                    return;
+                }
+            };
+            let main_repo = match worktree::find_local_repo(&repo_url) {
+                Some(p) => p,
+                None => {
+                    self.set_status_msg("Repo not found locally");
+                    return;
+                }
+            };
+            self.backend.pull(task_id, main_repo);
+            self.set_status_msg("Pulling to local...");
+        }
+    }
+
+    /// Spawn a local claude --resume session after a pull completes.
+    fn spawn_resumed_session(
+        &mut self,
+        worktree_path: PathBuf,
+        main_repo: PathBuf,
+        session_id: String,
+        repo_url: String,
+        prompt: String,
+    ) {
+        let (cols, rows) = self.last_term_size;
+        let args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "--resume".to_string(),
+            session_id.clone(),
+        ];
+
+        match Session::new(
+            "claude",
+            &args,
+            cols,
+            rows,
+            Some(worktree_path.clone()),
+            Default::default(),
+        ) {
+            Ok(s) => {
+                self.entries.push(SessionEntry {
+                    task_id: None,
+                    name: prompt.chars().take(60).collect(),
+                    status: TaskStatus::Running,
+                    session: Some(s),
+                    worker_vm: None,
+                    worker_zone: None,
+                    repo_url: Some(repo_url),
+                    prompt: Some(prompt),
+                    wip_branch: None,
+                    session_id: Some(session_id),
+                    blocked_at: None,
+                    worktree_path: Some(worktree_path),
+                    main_repo_path: Some(main_repo),
+                });
+                self.active = self.entries.len() - 1;
+                self.set_status_msg("Resumed locally");
+            }
+            Err(e) => {
+                self.set_status_msg(&format!("Resume failed: {}", e));
             }
         }
     }
@@ -726,7 +859,8 @@ impl App {
         let help_lines: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-d  done"),
             ("A-Ent  attach", "A-r  refresh"),
-            ("A-n    new", "A-q  quit"),
+            ("A-n    new", "A-p  push"),
+            ("A-q    quit", "A-l  pull"),
         ];
 
         let mut lines = vec![sep];
