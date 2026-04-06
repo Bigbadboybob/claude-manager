@@ -10,7 +10,10 @@ mod worktree;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CrosstermEvent, poll as crossterm_poll};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyboardEnhancementFlags, poll as crossterm_poll,
+    PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -27,7 +30,13 @@ fn main() -> anyhow::Result<()> {
     // Setup terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -35,7 +44,11 @@ fn main() -> anyhow::Result<()> {
 
     // Restore terminal.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result

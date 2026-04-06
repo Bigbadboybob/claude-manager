@@ -373,7 +373,7 @@ impl App {
                         }
                         return true;
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Char('a') => {
                         self.attach_active();
                         return true;
                     }
@@ -924,9 +924,9 @@ impl App {
                 }
                 lines.push(Line::from(Span::styled(
                     if entry.worker_vm.is_some() {
-                        "Press Alt+Enter to SSH into this session"
+                        "Press Alt+A to SSH into this session"
                     } else {
-                        "Press Alt+Enter to attach"
+                        "Press Alt+A to attach"
                     },
                     Style::default().fg(Color::DarkGray),
                 )));
