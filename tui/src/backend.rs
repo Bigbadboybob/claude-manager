@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::api::{ApiClient, Task, TaskCreateBody};
 use crate::config::Config;
 
-const GCS_BUCKET: &str = "gs://cm-sessions-prediction-market-scalper";
+const GCS_BUCKET: &str = "gs://cm-sessions-claude-manager";
 
 /// Commands sent from the main thread to the background thread.
 pub enum BackendCommand {
@@ -31,6 +31,12 @@ pub enum BackendCommand {
         task_id: String,
         main_repo: PathBuf,
     },
+    /// Create a task in the DB for a local session.
+    CreateTask {
+        name: String,
+        repo_url: String,
+        wip_branch: String,
+    },
     Shutdown,
 }
 
@@ -42,6 +48,11 @@ pub enum BackendEvent {
     Disconnected,
     /// Progress message for multi-step operations.
     Progress(String),
+    /// Task created in DB — main thread should update the entry's task_id.
+    TaskCreated {
+        name: String,
+        task_id: String,
+    },
     /// Pull completed — main thread should spawn a local claude --resume session.
     PullComplete {
         task_id: String,
@@ -104,6 +115,14 @@ impl BackendHandle {
         let _ = self.cmd_tx.send(BackendCommand::Pull { task_id, main_repo });
     }
 
+    pub fn create_task(&self, name: String, repo_url: String, wip_branch: String) {
+        let _ = self.cmd_tx.send(BackendCommand::CreateTask {
+            name,
+            repo_url,
+            wip_branch,
+        });
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.cmd_tx.send(BackendCommand::Shutdown);
         if let Some(handle) = self.thread.take() {
@@ -159,6 +178,14 @@ fn backend_loop(
                 do_push(&client, &event_tx, &worktree_path, &repo_url, &name);
                 do_refresh(&client, &event_tx, &mut was_connected);
             }
+            Ok(BackendCommand::CreateTask {
+                name,
+                repo_url,
+                wip_branch,
+            }) => {
+                do_create_task(&client, &event_tx, &name, &repo_url, &wip_branch);
+                do_refresh(&client, &event_tx, &mut was_connected);
+            }
             Ok(BackendCommand::Pull { task_id, main_repo }) => {
                 do_pull(
                     &client,
@@ -197,6 +224,49 @@ fn do_refresh(
                 *was_connected = false;
             }
             let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+        }
+    }
+}
+
+/// Create a task in the DB for a local session.
+fn do_create_task(
+    client: &ApiClient,
+    event_tx: &mpsc::Sender<BackendEvent>,
+    name: &str,
+    repo_url: &str,
+    wip_branch: &str,
+) {
+    let body = TaskCreateBody {
+        repo_url: repo_url.to_string(),
+        repo_branch: wip_branch.to_string(),
+        name: Some(name.to_string()),
+        prompt: None,
+        priority: 0,
+    };
+
+    match client.create_task(&body) {
+        Ok(task) => {
+            // Set wip_branch and status to running (it's a local active session).
+            let mut fields = HashMap::new();
+            fields.insert(
+                "wip_branch".to_string(),
+                serde_json::Value::String(wip_branch.to_string()),
+            );
+            fields.insert(
+                "status".to_string(),
+                serde_json::Value::String("running".to_string()),
+            );
+            let _ = client.update_task(&task.id, &fields);
+            let _ = event_tx.send(BackendEvent::TaskCreated {
+                name: name.to_string(),
+                task_id: task.id,
+            });
+        }
+        Err(e) => {
+            let _ = event_tx.send(BackendEvent::ApiError(format!(
+                "Create task: {}",
+                e
+            )));
         }
     }
 }
@@ -324,7 +394,8 @@ fn do_push(
     let body = TaskCreateBody {
         repo_url: repo_url.to_string(),
         repo_branch: branch.clone(),
-        prompt: name.to_string(),
+        name: Some(name.to_string()),
+        prompt: None,
         priority: 0,
     };
 
@@ -379,7 +450,8 @@ fn do_pull(
         }
     };
 
-    let slug = crate::worktree::slugify(&task.prompt);
+    let task_label = task.name.as_deref().or(task.prompt.as_deref()).unwrap_or("task");
+    let slug = crate::worktree::slugify(task_label);
     let slug = if slug.is_empty() {
         session_id[..8.min(session_id.len())].to_string()
     } else {
@@ -397,7 +469,7 @@ fn do_pull(
         .args(["fetch", "origin", branch])
         .output();
 
-    let worktree_path = match crate::worktree::create_worktree(main_repo, &slug) {
+    let worktree_path = match crate::worktree::create_worktree(main_repo, &slug, Some(branch)) {
         Ok(p) => p,
         Err(e) => {
             progress(&format!("Pull failed: worktree: {}", e));
@@ -405,7 +477,7 @@ fn do_pull(
         }
     };
 
-    // Checkout the WIP branch in the worktree.
+    // Checkout the WIP branch in the worktree (may already be on it).
     let _ = Command::new("git")
         .arg("-C")
         .arg(&worktree_path)
@@ -494,6 +566,6 @@ fn do_pull(
         main_repo: main_repo.to_path_buf(),
         session_id,
         repo_url: task.repo_url,
-        prompt: task.prompt,
+        prompt: task.name.or(task.prompt).unwrap_or_default(),
     });
 }

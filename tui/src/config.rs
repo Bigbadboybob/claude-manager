@@ -44,7 +44,7 @@ impl Config {
             api_url: env::var("CM_API_URL").unwrap_or_else(|_| "http://localhost:8000".into()),
             api_token: env::var("CM_API_TOKEN").unwrap_or_else(|_| "dev-token".into()),
             gcp_project: env::var("CM_GCP_PROJECT")
-                .unwrap_or_else(|_| "prediction-market-scalper".into()),
+                .unwrap_or_else(|_| "claude-manager-prod".into()),
             gcp_zone: env::var("CM_GCP_ZONE").unwrap_or_else(|_| "us-east4-a".into()),
             repos,
         }

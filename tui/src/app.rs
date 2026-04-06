@@ -18,6 +18,13 @@ use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::worktree;
 
+mod dirs {
+    use std::path::PathBuf;
+    pub fn home_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
 
@@ -45,10 +52,13 @@ impl TaskStatus {
 enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
     Normal,
-    /// Typing a prompt for a new local session.
+    /// Typing a name/label for a new local session.
     NewSession {
-        prompt_text: String,
+        label_text: String,
+        branch_text: String,
         repo_url: String,
+        /// 0 = name field, 1 = branch field
+        active_field: u8,
     },
 }
 
@@ -126,8 +136,38 @@ impl App {
                         _ => {}
                     }
                 }
+
+                // Detect blocked/running for local sessions by checking terminal content.
+                if entry.task_id.is_none() && !session.exited {
+                    let is_busy = Self::check_terminal_busy(&session);
+                    if is_busy && entry.status != TaskStatus::Running {
+                        entry.status = TaskStatus::Running;
+                    } else if !is_busy && entry.status == TaskStatus::Running {
+                        entry.status = TaskStatus::Blocked;
+                    }
+                }
             }
         }
+    }
+
+    /// Check if a terminal session is busy (Claude is working).
+    /// Looks for "esc to interrupt" in the status line.
+    fn check_terminal_busy(session: &Session) -> bool {
+        use alacritty_terminal::grid::Dimensions;
+        let term = session.term.lock();
+        let grid = term.grid();
+        let last_line = grid.screen_lines().saturating_sub(1);
+
+        // Read the last few lines looking for the status indicator.
+        let mut text = String::new();
+        for line_idx in last_line.saturating_sub(2)..=last_line {
+            let line = alacritty_terminal::index::Line(line_idx as i32);
+            for col in 0..grid.columns() {
+                let cell = &grid[line][alacritty_terminal::index::Column(col)];
+                text.push(cell.c);
+            }
+        }
+        text.contains("esc to interrupt")
     }
 
     /// Process all pending backend events (non-blocking).
@@ -149,6 +189,16 @@ impl App {
                 }
                 BackendEvent::Progress(msg) => {
                     self.set_status_msg(&msg);
+                }
+                BackendEvent::TaskCreated { name, task_id } => {
+                    // Find the local entry by name and assign the DB task_id.
+                    if let Some(entry) = self
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.task_id.is_none() && e.name == name)
+                    {
+                        entry.task_id = Some(task_id);
+                    }
                 }
                 BackendEvent::PullComplete {
                     task_id: _,
@@ -185,35 +235,76 @@ impl App {
             }
             seen_ids.insert(task.id.clone());
 
+            // Display name: prefer name field, fall back to prompt, then id prefix.
+            let display_name = task
+                .name
+                .as_deref()
+                .or(task.prompt.as_deref())
+                .unwrap_or(&task.id[..8.min(task.id.len())])
+                .chars()
+                .take(60)
+                .collect::<String>();
+
+            // Detect local worktree path for tasks without a VM.
+            let is_local = task.worker_vm.is_none()
+                && task.wip_branch.as_ref().map_or(false, |b| b.starts_with("cm/"));
+
             if let Some(entry) = self
                 .entries
                 .iter_mut()
                 .find(|e| e.task_id.as_deref() == Some(&task.id))
             {
-                entry.name = task.prompt.chars().take(60).collect();
+                entry.name = display_name;
                 entry.status = TaskStatus::from_api(&task.status);
                 entry.worker_vm = task.worker_vm.clone();
                 entry.worker_zone = task.worker_zone.clone();
                 entry.repo_url = Some(task.repo_url.clone());
-                entry.prompt = Some(task.prompt.clone());
+                entry.prompt = task.prompt.clone();
                 entry.wip_branch = task.wip_branch.clone();
                 entry.session_id = task.session_id.clone();
                 entry.blocked_at = task.blocked_at.clone();
             } else {
+                // For local tasks, try to find the worktree on disk.
+                let worktree_path = if is_local {
+                    if let Some(ref branch) = task.wip_branch {
+                        let slug = branch.strip_prefix("cm/").unwrap_or(branch);
+                        let repo_name = task.repo_url
+                            .trim_end_matches('/')
+                            .trim_end_matches(".git")
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("repo");
+                        let path = dirs::home_dir()
+                            .unwrap_or_default()
+                            .join(format!(".cm/worktrees/{}-{}", repo_name, slug));
+                        if path.exists() { Some(path) } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let main_repo_path = if worktree_path.is_some() {
+                    worktree::find_local_repo(&task.repo_url)
+                } else {
+                    None
+                };
+
                 self.entries.push(SessionEntry {
                     task_id: Some(task.id.clone()),
-                    name: task.prompt.chars().take(60).collect(),
+                    name: display_name,
                     status: TaskStatus::from_api(&task.status),
                     session: None,
                     worker_vm: task.worker_vm.clone(),
                     worker_zone: task.worker_zone.clone(),
                     repo_url: Some(task.repo_url.clone()),
-                    prompt: Some(task.prompt.clone()),
+                    prompt: task.prompt.clone(),
                     wip_branch: task.wip_branch.clone(),
                     session_id: task.session_id.clone(),
                     blocked_at: task.blocked_at.clone(),
-                    worktree_path: None,
-                    main_repo_path: None,
+                    worktree_path,
+                    main_repo_path,
                 });
             }
         }
@@ -312,11 +403,39 @@ impl App {
             }
         }
 
+        // Handle scroll in terminal.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                match key.code {
+                    KeyCode::PageUp => {
+                        if let Some(entry) = self.entries.get(self.active) {
+                            if let Some(ref session) = entry.session {
+                                use alacritty_terminal::grid::Scroll;
+                                session.term.lock().scroll_display(Scroll::Delta(10));
+                            }
+                        }
+                        return true;
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(entry) = self.entries.get(self.active) {
+                            if let Some(ref session) = entry.session {
+                                use alacritty_terminal::grid::Scroll;
+                                session.term.lock().scroll_display(Scroll::Delta(-10));
+                            }
+                        }
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Forward to active terminal.
         if let Some(entry) = self.entries.get(self.active) {
             if let Some(ref session) = entry.session {
                 if !session.exited {
-                    if let Some(bytes) = input::event_to_bytes(event) {
+                    let term_mode = *session.term.lock().mode();
+                    if let Some(bytes) = input::event_to_bytes(event, &term_mode) {
                         session.write(bytes);
                     }
                     return true;
@@ -333,28 +452,47 @@ impl App {
             match &mut self.input_mode {
                 InputMode::Normal => return false,
                 InputMode::NewSession {
-                    prompt_text,
+                    label_text,
+                    branch_text,
                     repo_url,
+                    active_field,
                 } => match key.code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
                         return true;
                     }
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        *active_field = if *active_field == 0 { 1 } else { 0 };
+                        return true;
+                    }
                     KeyCode::Enter => {
-                        if !prompt_text.trim().is_empty() {
-                            let prompt = prompt_text.clone();
+                        if !label_text.trim().is_empty() {
+                            let label = label_text.clone();
                             let repo = repo_url.clone();
+                            let branch = if branch_text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(branch_text.clone())
+                            };
                             self.input_mode = InputMode::Normal;
-                            self.create_local_session(&repo, &prompt);
+                            self.create_local_session(&repo, &label, branch.as_deref());
                         }
                         return true;
                     }
                     KeyCode::Backspace => {
-                        prompt_text.pop();
+                        if *active_field == 0 {
+                            label_text.pop();
+                        } else {
+                            branch_text.pop();
+                        }
                         return true;
                     }
                     KeyCode::Char(c) => {
-                        prompt_text.push(c);
+                        if *active_field == 0 {
+                            label_text.push(c);
+                        } else {
+                            branch_text.push(c);
+                        }
                         return true;
                     }
                     _ => return true,
@@ -376,13 +514,15 @@ impl App {
         };
 
         self.input_mode = InputMode::NewSession {
-            prompt_text: String::new(),
+            label_text: String::new(),
+            branch_text: String::new(),
             repo_url,
+            active_field: 0,
         };
     }
 
     /// Create a local Claude session in a worktree.
-    fn create_local_session(&mut self, repo_url: &str, prompt: &str) {
+    fn create_local_session(&mut self, repo_url: &str, label: &str, start_branch: Option<&str>) {
         let main_repo = match worktree::find_local_repo(repo_url) {
             Some(p) => p,
             None => {
@@ -391,13 +531,13 @@ impl App {
             }
         };
 
-        let slug = worktree::slugify(prompt);
+        let slug = worktree::slugify(label);
         if slug.is_empty() {
-            self.set_status_msg("Invalid task name");
+            self.set_status_msg("Invalid name");
             return;
         }
 
-        let worktree_path = match worktree::create_worktree(&main_repo, &slug) {
+        let worktree_path = match worktree::create_worktree(&main_repo, &slug, start_branch) {
             Ok(p) => p,
             Err(e) => {
                 self.set_status_msg(&format!("Worktree: {}", e));
@@ -405,16 +545,11 @@ impl App {
             }
         };
 
-        // Run setup_worktree.sh if it exists.
         worktree::setup_worktree(&main_repo, &worktree_path);
 
-        // Spawn Claude Code in the worktree.
+        // Launch Claude Code directly — user types their first prompt in the terminal.
         let (cols, rows) = self.last_term_size;
-        let args = vec![
-            "--dangerously-skip-permissions".to_string(),
-            "-p".to_string(),
-            prompt.to_string(),
-        ];
+        let args = vec!["--dangerously-skip-permissions".to_string()];
 
         let session = Session::new(
             "claude",
@@ -425,18 +560,20 @@ impl App {
             Default::default(),
         );
 
+        let branch = format!("cm/{}", slug);
+
         match session {
             Ok(s) => {
                 let entry = SessionEntry {
-                    task_id: None,
-                    name: prompt.chars().take(60).collect(),
+                    task_id: None, // Will be set when TaskCreated event arrives.
+                    name: label.to_string(),
                     status: TaskStatus::Running,
                     session: Some(s),
                     worker_vm: None,
                     worker_zone: None,
                     repo_url: Some(repo_url.to_string()),
-                    prompt: Some(prompt.to_string()),
-                    wip_branch: None,
+                    prompt: None,
+                    wip_branch: Some(branch.clone()),
                     session_id: None,
                     blocked_at: None,
                     worktree_path: Some(worktree_path),
@@ -444,6 +581,13 @@ impl App {
                 };
                 self.entries.push(entry);
                 self.active = self.entries.len() - 1;
+
+                // Create task in DB (async, background).
+                self.backend.create_task(
+                    label.to_string(),
+                    repo_url.to_string(),
+                    branch,
+                );
                 self.set_status_msg("Local session started");
             }
             Err(e) => {
@@ -461,6 +605,7 @@ impl App {
             }
 
             if let Some(ref vm) = entry.worker_vm.clone() {
+                // Cloud: SSH into the worker VM.
                 let zone = entry
                     .worker_zone
                     .clone()
@@ -478,7 +623,15 @@ impl App {
                 ];
                 entry.session =
                     Session::new("gcloud", &args, cols, rows, None, Default::default()).ok();
+            } else if let Some(ref wt) = entry.worktree_path.clone() {
+                // Local worktree: launch Claude Code in it.
+                let args = vec!["--dangerously-skip-permissions".to_string()];
+                entry.session =
+                    Session::new("claude", &args, cols, rows, Some(wt.clone()), Default::default())
+                        .ok();
+                entry.status = TaskStatus::Running;
             } else {
+                // Fallback: bash shell.
                 entry.session =
                     Session::new("/bin/bash", &[], cols, rows, None, Default::default()).ok();
             }
@@ -636,11 +789,13 @@ impl App {
 
         // Draw input overlay if active.
         if let InputMode::NewSession {
-            prompt_text,
+            label_text,
+            branch_text,
             repo_url,
+            active_field,
         } = &self.input_mode
         {
-            self.draw_input_dialog(frame, area, prompt_text, repo_url);
+            self.draw_input_dialog(frame, area, label_text, branch_text, repo_url, *active_field);
         }
     }
 
@@ -648,11 +803,13 @@ impl App {
         &self,
         frame: &mut Frame,
         area: Rect,
-        prompt_text: &str,
+        label_text: &str,
+        branch_text: &str,
         repo_url: &str,
+        active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 7u16;
+        let height = 9u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -672,7 +829,6 @@ impl App {
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
-        // Extract repo name for display.
         let repo_name = repo_url
             .trim_end_matches('/')
             .trim_end_matches(".git")
@@ -680,20 +836,36 @@ impl App {
             .next()
             .unwrap_or(repo_url);
 
+        let cursor = "█";
+        let name_cursor = if active_field == 0 { cursor } else { "" };
+        let branch_cursor = if active_field == 1 { cursor } else { "" };
+
+        let branch_hint = if branch_text.is_empty() && active_field != 1 {
+            "main"
+        } else {
+            ""
+        };
+
         let lines = vec![
             Line::from(vec![
-                Span::styled("Repo: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Repo: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(repo_name, Style::default().fg(Color::White)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Prompt: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(prompt_text, Style::default().fg(Color::White)),
-                Span::styled("█", Style::default().fg(Color::White)),
+                Span::styled("  Name: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(label_text, Style::default().fg(Color::White)),
+                Span::styled(name_cursor, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Branch: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(branch_text, Style::default().fg(Color::White)),
+                Span::styled(branch_cursor, Style::default().fg(Color::White)),
+                Span::styled(branch_hint, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "Enter to start · Esc to cancel",
+                "Tab switch field · Enter start · Esc cancel",
                 Style::default().fg(Color::DarkGray),
             )),
         ];

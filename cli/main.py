@@ -283,7 +283,7 @@ def _find_latest_session(cwd: str) -> tuple[str, str] | None:
     return session_id, str(jsonl_files[0])
 
 
-GCS_BUCKET = "gs://cm-sessions-prediction-market-scalper"
+GCS_BUCKET = "gs://cm-sessions-claude-manager"
 
 
 @cli.command()

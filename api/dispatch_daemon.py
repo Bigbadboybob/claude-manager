@@ -69,8 +69,6 @@ async def _assign_to_warm_vm(pool, task, warm_vm):
     await db.update_warm_vm(pool, warm_vm["id"],
                             status="busy", current_task_id=task["id"])
 
-    # Send the prompt to the Claude tmux session on the warm VM
-    prompt = task["prompt"]
     branch = task.get("wip_branch") or task["repo_branch"]
 
     # If the task has a different branch, checkout first
@@ -80,11 +78,13 @@ async def _assign_to_warm_vm(pool, task, warm_vm):
             f"sudo su - worker -c 'cd /workspace && git fetch origin && git checkout {branch}'"
         )
 
-    # Send the prompt via tmux
-    await asyncio.to_thread(
-        _ssh_command, warm_vm["vm_name"],
-        f"sudo su - worker -c \"tmux send-keys -t claude '{prompt}' Enter\""
-    )
+    # Send the prompt via tmux (only if prompt exists — otherwise sync mode)
+    prompt = task.get("prompt") or ""
+    if prompt:
+        await asyncio.to_thread(
+            _ssh_command, warm_vm["vm_name"],
+            f"sudo su - worker -c \"tmux send-keys -t claude '{prompt}' Enter\""
+        )
 
     ttyd_url = f"http://{warm_vm['external_ip']}:8080"
     await db.update_task(pool, str(task["id"]),

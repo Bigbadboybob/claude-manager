@@ -25,7 +25,7 @@ echo "[cm-warm] Pool: $POOL_ID"
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
-GCP_PROJECT="prediction-market-scalper"
+GCP_PROJECT="claude-manager-prod"
 
 CLAUDE_OAUTH_TOKEN=$(gcloud secrets versions access latest \
     --secret=claude-setup-token --project="$GCP_PROJECT")

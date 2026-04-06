@@ -5,13 +5,15 @@ from pydantic import BaseModel
 class TaskCreate(BaseModel):
     repo_url: str
     repo_branch: str = "main"
-    prompt: str
+    name: str | None = None
+    prompt: str | None = None
     priority: int = 0
 
 
 class TaskUpdate(BaseModel):
     status: str | None = None
     priority: int | None = None
+    name: str | None = None
     prompt: str | None = None
     repo_branch: str | None = None
     worker_vm: str | None = None
@@ -28,7 +30,8 @@ class TaskResponse(BaseModel):
     updated_at: datetime
     repo_url: str
     repo_branch: str
-    prompt: str
+    name: str | None
+    prompt: str | None
     status: str
     priority: int
     worker_vm: str | None

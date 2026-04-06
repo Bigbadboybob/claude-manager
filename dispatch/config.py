@@ -10,7 +10,7 @@ if _env_file.exists():
             key, _, value = line.partition("=")
             os.environ.setdefault(key.strip(), value.strip())
 
-GCP_PROJECT = os.getenv("CM_GCP_PROJECT", "prediction-market-scalper")
+GCP_PROJECT = os.getenv("CM_GCP_PROJECT", "claude-manager-prod")
 GCP_ZONE = os.getenv("CM_GCP_ZONE", "us-east4-a")
 VM_MACHINE_TYPE = os.getenv("CM_VM_MACHINE_TYPE", "e2-medium")
 VM_IMAGE_FAMILY = "cm-worker-base"
@@ -28,4 +28,5 @@ ZOMBIE_TIMEOUT_MINUTES = int(os.getenv("CM_ZOMBIE_TIMEOUT_MINUTES", "15"))
 # Repo shortnames -> full clone URLs
 REPOS = {
     "predictionTrading": "https://github.com/Bigbadboybob/predictionTrading.git",
+    "claude-manager": "https://github.com/Bigbadboybob/claude-manager.git",
 }

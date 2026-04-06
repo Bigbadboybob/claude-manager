@@ -40,9 +40,16 @@ fn repo_name(repo_url: &str) -> String {
 /// Create a git worktree for a task.
 ///
 /// Returns the path to the new worktree directory.
+/// Create a git worktree for a task.
+///
+/// If `start_branch` is provided, the worktree starts from that branch
+/// (fetched from origin first). Otherwise creates a new `cm/<slug>` branch from HEAD.
+///
+/// Returns the path to the new worktree directory.
 pub fn create_worktree(
     main_repo: &Path,
     task_slug: &str,
+    start_branch: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     let base = worktree_base();
     std::fs::create_dir_all(&base)?;
@@ -58,32 +65,76 @@ pub fn create_worktree(
     let worktree_path = base.join(&dir_name);
     let branch_name = format!("cm/{}", task_slug);
 
-    // If the worktree already exists, return it.
     if worktree_path.exists() {
         return Ok(worktree_path);
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(main_repo)
-        .args(["worktree", "add"])
-        .arg(&worktree_path)
-        .args(["-b", &branch_name])
-        .output()?;
+    if let Some(start) = start_branch {
+        // Fetch the branch first.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(main_repo)
+            .args(["fetch", "origin", start])
+            .output();
 
-    if !output.status.success() {
-        // Branch might already exist — try without -b.
-        let output2 = Command::new("git")
+        // Create worktree on a new branch starting from the specified branch.
+        let output = Command::new("git")
             .arg("-C")
             .arg(main_repo)
             .args(["worktree", "add"])
             .arg(&worktree_path)
-            .arg(&branch_name)
+            .args(["-b", &branch_name, &format!("origin/{}", start)])
             .output()?;
 
-        if !output2.status.success() {
-            let stderr = String::from_utf8_lossy(&output2.stderr);
-            anyhow::bail!("git worktree add failed: {}", stderr.trim());
+        if !output.status.success() {
+            // Maybe the branch exists locally already, try that.
+            let output2 = Command::new("git")
+                .arg("-C")
+                .arg(main_repo)
+                .args(["worktree", "add"])
+                .arg(&worktree_path)
+                .args(["-b", &branch_name, start])
+                .output()?;
+
+            if !output2.status.success() {
+                // Try just checking out the start branch directly.
+                let output3 = Command::new("git")
+                    .arg("-C")
+                    .arg(main_repo)
+                    .args(["worktree", "add"])
+                    .arg(&worktree_path)
+                    .arg(start)
+                    .output()?;
+
+                if !output3.status.success() {
+                    let stderr = String::from_utf8_lossy(&output3.stderr);
+                    anyhow::bail!("git worktree add failed: {}", stderr.trim());
+                }
+            }
+        }
+    } else {
+        // Create new branch from HEAD.
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(main_repo)
+            .args(["worktree", "add"])
+            .arg(&worktree_path)
+            .args(["-b", &branch_name])
+            .output()?;
+
+        if !output.status.success() {
+            let output2 = Command::new("git")
+                .arg("-C")
+                .arg(main_repo)
+                .args(["worktree", "add"])
+                .arg(&worktree_path)
+                .arg(&branch_name)
+                .output()?;
+
+            if !output2.status.success() {
+                let stderr = String::from_utf8_lossy(&output2.stderr);
+                anyhow::bail!("git worktree add failed: {}", stderr.trim());
+            }
         }
     }
 

@@ -46,7 +46,11 @@ def get_pool():
 
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
-    task = await db.add_task(pool, body.repo_url, body.repo_branch, body.prompt, body.priority)
+    # prompt defaults to name if not provided
+    prompt = body.prompt or body.name or ""
+    task = await db.add_task(pool, body.repo_url, body.repo_branch, prompt, body.priority)
+    if body.name:
+        await db.update_task(pool, str(task["id"]), name=body.name)
     return await db.get_task(pool, str(task["id"]))
 
 

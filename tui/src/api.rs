@@ -12,7 +12,8 @@ pub struct Task {
     pub updated_at: String,
     pub repo_url: String,
     pub repo_branch: String,
-    pub prompt: String,
+    pub name: Option<String>,
+    pub prompt: Option<String>,
     pub status: String,
     pub priority: i32,
     pub worker_vm: Option<String>,
@@ -28,7 +29,9 @@ pub struct Task {
 pub struct TaskCreateBody {
     pub repo_url: String,
     pub repo_branch: String,
-    pub prompt: String,
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub priority: i32,
 }
 

@@ -3,13 +3,13 @@
 # After running this:
 #   1. SSH in and run `sudo su - worker -c "claude setup-token"` to auth
 #   2. Navigate the OAuth flow (visit URL, paste code)
-#   3. Run: gcloud compute instances stop cm-base-image --zone=us-east4-a --project=prediction-market-scalper
-#   4. Run: gcloud compute images create cm-worker-base-v1 --source-disk=cm-base-image --source-disk-zone=us-east4-a --project=prediction-market-scalper --family=cm-worker-base
-#   5. Delete the VM: gcloud compute instances delete cm-base-image --zone=us-east4-a --project=prediction-market-scalper --quiet
+#   3. Run: gcloud compute instances stop cm-base-image --zone=us-east4-a --project=claude-manager-prod
+#   4. Run: gcloud compute images create cm-worker-base-v1 --source-disk=cm-base-image --source-disk-zone=us-east4-a --project=claude-manager-prod --family=cm-worker-base
+#   5. Delete the VM: gcloud compute instances delete cm-base-image --zone=us-east4-a --project=claude-manager-prod --quiet
 
 set -euo pipefail
 
-PROJECT="prediction-market-scalper"
+PROJECT="claude-manager-prod"
 ZONE="us-east4-a"
 VM_NAME="cm-base-image"
 

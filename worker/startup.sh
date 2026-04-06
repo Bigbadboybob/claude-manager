@@ -46,8 +46,8 @@ echo "[cm-worker] Session ID: ${SESSION_ID:-none}"
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
-GCP_PROJECT="prediction-market-scalper"
-GCS_BUCKET="gs://cm-sessions-prediction-market-scalper"
+GCP_PROJECT="claude-manager-prod"
+GCS_BUCKET="gs://cm-sessions-claude-manager"
 
 CLAUDE_OAUTH_TOKEN=$(gcloud secrets versions access latest \
     --secret=claude-setup-token --project="$GCP_PROJECT")
@@ -134,14 +134,16 @@ for attempt in $(seq 1 30); do
     echo "[cm-worker] Sent Enter (attempt $attempt)"
 done
 
-# Only send prompt if this is a fresh task (not resuming a session)
-if [ -z "$SESSION_ID" ]; then
+# Send prompt if this is a fresh task (not resuming) and prompt is non-empty
+if [ -z "$SESSION_ID" ] && [ -n "$TASK_PROMPT" ]; then
     PROMPT_FILE=$(mktemp)
     echo "$TASK_PROMPT" > "$PROMPT_FILE"
     chmod 644 "$PROMPT_FILE"
     su - worker -c "tmux send-keys -t claude \"\$(cat $PROMPT_FILE)\" Enter"
     rm -f "$PROMPT_FILE"
-    echo "[cm-worker] Prompt sent"
+    echo "[cm-worker] Prompt sent (async)"
+elif [ -z "$SESSION_ID" ]; then
+    echo "[cm-worker] No prompt — waiting for user (sync)"
 else
     echo "[cm-worker] Resumed session (no prompt sent)"
 fi
