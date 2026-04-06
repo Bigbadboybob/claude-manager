@@ -74,11 +74,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             break;
         }
 
-        // Drain events from terminal sessions and backend.
-        app.drain_terminal_events();
-        app.drain_backend_events();
-
-        // Poll for crossterm events.
+        // Poll for crossterm events first so last_write_at is set
+        // before idle detection runs in drain_terminal_events.
         if crossterm_poll(Duration::from_millis(16))? {
             let event = event::read()?;
 
@@ -88,6 +85,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
 
             app.handle_event(&event);
         }
+
+        // Drain events from terminal sessions and backend.
+        app.drain_terminal_events();
+        app.drain_backend_events();
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event as TermEvent;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
@@ -27,6 +27,10 @@ mod dirs {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
+/// Duration of the rolling window for Wakeup burst detection.
+const WAKEUP_WINDOW: Duration = Duration::from_secs(2);
+/// Minimum Wakeups within the window to consider a session actively working.
+const WAKEUP_BURST_THRESHOLD: usize = 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskStatus {
@@ -79,6 +83,8 @@ pub struct SessionEntry {
     // Local session metadata.
     pub worktree_path: Option<PathBuf>,
     pub main_repo_path: Option<PathBuf>,
+    /// Last time user input was written to this session's PTY.
+    pub last_write_at: Option<Instant>,
 }
 
 pub struct App {
@@ -123,6 +129,8 @@ impl App {
 
     /// Process all pending terminal events (non-blocking).
     pub fn drain_terminal_events(&mut self) {
+        let now = Instant::now();
+
         for entry in &mut self.entries {
             if let Some(ref mut session) = entry.session {
                 while let Ok(event) = session.event_rx.try_recv() {
@@ -133,41 +141,34 @@ impl App {
                         TermEvent::Title(title) => {
                             session.title = title;
                         }
+                        TermEvent::Wakeup => {
+                            session.wakeup_times.push(now);
+                        }
                         _ => {}
                     }
                 }
 
-                // Detect blocked/running for local sessions by checking terminal content.
-                if entry.task_id.is_none() && !session.exited {
-                    let is_busy = Self::check_terminal_busy(&session);
-                    if is_busy && entry.status != TaskStatus::Running {
-                        entry.status = TaskStatus::Running;
-                    } else if !is_busy && entry.status == TaskStatus::Running {
-                        entry.status = TaskStatus::Blocked;
+                // Prune old wakeups outside the rolling window.
+                session.wakeup_times.retain(|t| now.duration_since(*t) < WAKEUP_WINDOW);
+
+                // Detect idle/active for sessions with a local terminal.
+                // Freeze while user is typing to avoid flicker from echo.
+                if !session.exited {
+                    let user_typing = entry
+                        .last_write_at
+                        .map_or(false, |t| now.duration_since(t) < WAKEUP_WINDOW);
+                    if !user_typing {
+                        let burst = session.wakeup_times.len() >= WAKEUP_BURST_THRESHOLD;
+                        let quiet = session.wakeup_times.is_empty();
+                        if quiet && entry.status == TaskStatus::Running {
+                            entry.status = TaskStatus::Blocked;
+                        } else if burst && entry.status != TaskStatus::Running {
+                            entry.status = TaskStatus::Running;
+                        }
                     }
                 }
             }
         }
-    }
-
-    /// Check if a terminal session is busy (Claude is working).
-    /// Looks for "esc to interrupt" in the status line.
-    fn check_terminal_busy(session: &Session) -> bool {
-        use alacritty_terminal::grid::Dimensions;
-        let term = session.term.lock();
-        let grid = term.grid();
-        let last_line = grid.screen_lines().saturating_sub(1);
-
-        // Read the last few lines looking for the status indicator.
-        let mut text = String::new();
-        for line_idx in last_line.saturating_sub(2)..=last_line {
-            let line = alacritty_terminal::index::Line(line_idx as i32);
-            for col in 0..grid.columns() {
-                let cell = &grid[line][alacritty_terminal::index::Column(col)];
-                text.push(cell.c);
-            }
-        }
-        text.contains("esc to interrupt")
     }
 
     /// Process all pending backend events (non-blocking).
@@ -255,7 +256,11 @@ impl App {
                 .find(|e| e.task_id.as_deref() == Some(&task.id))
             {
                 entry.name = display_name;
-                entry.status = TaskStatus::from_api(&task.status);
+                // Don't override status for sessions with a local terminal —
+                // idle detection is handled locally via PTY output tracking.
+                if entry.session.is_none() {
+                    entry.status = TaskStatus::from_api(&task.status);
+                }
                 entry.worker_vm = task.worker_vm.clone();
                 entry.worker_zone = task.worker_zone.clone();
                 entry.repo_url = Some(task.repo_url.clone());
@@ -305,6 +310,7 @@ impl App {
                     blocked_at: task.blocked_at.clone(),
                     worktree_path,
                     main_repo_path,
+                    last_write_at: None,
                 });
             }
         }
@@ -431,12 +437,13 @@ impl App {
         }
 
         // Forward to active terminal.
-        if let Some(entry) = self.entries.get(self.active) {
+        if let Some(entry) = self.entries.get_mut(self.active) {
             if let Some(ref session) = entry.session {
                 if !session.exited {
                     let term_mode = *session.term.lock().mode();
                     if let Some(bytes) = input::event_to_bytes(event, &term_mode) {
                         session.write(bytes);
+                        entry.last_write_at = Some(Instant::now());
                     }
                     return true;
                 }
@@ -578,6 +585,7 @@ impl App {
                     blocked_at: None,
                     worktree_path: Some(worktree_path),
                     main_repo_path: Some(main_repo),
+                    last_write_at: None,
                 };
                 self.entries.push(entry);
                 self.active = self.entries.len() - 1;
@@ -750,6 +758,7 @@ impl App {
                     blocked_at: None,
                     worktree_path: Some(worktree_path),
                     main_repo_path: Some(main_repo),
+                    last_write_at: None,
                 });
                 self.active = self.entries.len() - 1;
                 self.set_status_msg("Resumed locally");
@@ -962,46 +971,69 @@ impl App {
         }
 
         let spinner = self.spinner_frame();
-
         let list_height = inner.height.saturating_sub(7);
-        let items: Vec<ListItem> = self
+        let dim = Style::default().fg(Color::DarkGray);
+
+        // Build items grouped by section: active first, then waiting.
+        let make_item = |i: usize, entry: &SessionEntry| -> ListItem {
+            let is_active = i == self.active;
+            let (indicator, indicator_style) = match entry.status {
+                TaskStatus::Running => (spinner, Style::default().fg(Color::Green)),
+                TaskStatus::Blocked => ("●", Style::default().fg(Color::White)),
+                TaskStatus::Backlog => ("○", Style::default().fg(Color::DarkGray)),
+                TaskStatus::Done => ("✓", Style::default().fg(Color::DarkGray)),
+            };
+            let max_name = (inner.width as usize).saturating_sub(4);
+            let name = if entry.name.len() > max_name {
+                format!("{}...", &entry.name[..max_name.saturating_sub(3)])
+            } else {
+                entry.name.clone()
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", indicator), indicator_style),
+                Span::raw(name),
+            ]);
+            let base_style = if is_active {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ListItem::new(line).style(base_style)
+        };
+
+        let active_entries: Vec<(usize, &SessionEntry)> = self
             .entries
             .iter()
             .enumerate()
-            .take(list_height as usize)
-            .map(|(i, entry)| {
-                let is_active = i == self.active;
-
-                let (indicator, indicator_style) = match entry.status {
-                    TaskStatus::Running => (spinner, Style::default().fg(Color::Green)),
-                    TaskStatus::Blocked => ("●", Style::default().fg(Color::Yellow)),
-                    TaskStatus::Backlog => ("○", Style::default().fg(Color::DarkGray)),
-                    TaskStatus::Done => ("✓", Style::default().fg(Color::DarkGray)),
-                };
-
-                let max_name = (inner.width as usize).saturating_sub(4);
-                let name = if entry.name.len() > max_name {
-                    format!("{}...", &entry.name[..max_name.saturating_sub(3)])
-                } else {
-                    entry.name.clone()
-                };
-
-                let line = Line::from(vec![
-                    Span::styled(format!(" {} ", indicator), indicator_style),
-                    Span::raw(name),
-                ]);
-
-                let base_style = if is_active {
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-
-                ListItem::new(line).style(base_style)
-            })
+            .filter(|(_, e)| matches!(e.status, TaskStatus::Running))
             .collect();
+        let waiting_entries: Vec<(usize, &SessionEntry)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !matches!(e.status, TaskStatus::Running))
+            .collect();
+
+        let mut items: Vec<ListItem> = Vec::new();
+        let max = list_height as usize;
+
+        for &(i, entry) in &active_entries {
+            if items.len() >= max { break; }
+            items.push(make_item(i, entry));
+        }
+        if !active_entries.is_empty() && !waiting_entries.is_empty() && items.len() < max {
+            let sep_line = Line::from(Span::styled(
+                format!(" {}", "─".repeat(inner.width.saturating_sub(2) as usize)),
+                dim,
+            ));
+            items.push(ListItem::new(sep_line));
+        }
+        for &(i, entry) in &waiting_entries {
+            if items.len() >= max { break; }
+            items.push(make_item(i, entry));
+        }
 
         let list = List::new(items);
         frame.render_widget(
@@ -1030,7 +1062,7 @@ impl App {
 
         let help_lines: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-d  done"),
-            ("A-Ent  attach", "A-r  refresh"),
+            ("A-a    attach", "A-r  refresh"),
             ("A-n    new", "A-p  push"),
             ("A-q    quit", "A-l  pull"),
         ];

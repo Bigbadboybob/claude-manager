@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -31,6 +32,8 @@ pub struct Session {
     pub event_rx: mpsc::Receiver<TermEvent>,
     pub title: String,
     pub exited: bool,
+    /// Rolling window of recent Wakeup timestamps for burst detection.
+    pub wakeup_times: Vec<Instant>,
 }
 
 impl Session {
@@ -93,6 +96,7 @@ impl Session {
             event_rx,
             title: format!("{} {}", shell, args.join(" ")),
             exited: false,
+            wakeup_times: Vec::new(),
         })
     }
 
