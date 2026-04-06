@@ -127,6 +127,36 @@ impl App {
         !matches!(self.input_mode, InputMode::Normal)
     }
 
+    /// Find the most recent Claude session file for a worktree directory.
+    /// Returns the session UUID if found.
+    fn find_latest_session(worktree_path: &std::path::Path) -> Option<String> {
+        let home = dirs::home_dir()?;
+        // Claude encodes project paths: '/' and '.' both become '-'.
+        let path_str = worktree_path.to_str()?;
+        let encoded = path_str.replace('/', "-").replace('.', "-");
+        let session_dir = home.join(format!(".claude/projects/{}", encoded));
+        if !session_dir.is_dir() {
+            return None;
+        }
+        // Find the most recently modified .jsonl file.
+        let mut newest: Option<(std::time::SystemTime, String)> = None;
+        for entry in std::fs::read_dir(&session_dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        let stem = path.file_stem()?.to_str()?.to_string();
+                        if newest.as_ref().map_or(true, |(t, _)| modified > *t) {
+                            newest = Some((modified, stem));
+                        }
+                    }
+                }
+            }
+        }
+        newest.map(|(_, id)| id)
+    }
+
     /// Process all pending terminal events (non-blocking).
     pub fn drain_terminal_events(&mut self) {
         let now = Instant::now();
@@ -554,9 +584,13 @@ impl App {
 
         worktree::setup_worktree(&main_repo, &worktree_path);
 
-        // Launch Claude Code directly — user types their first prompt in the terminal.
+        // Launch Claude Code, resuming the latest session if one exists.
         let (cols, rows) = self.last_term_size;
-        let args = vec!["--dangerously-skip-permissions".to_string()];
+        let mut args = vec!["--dangerously-skip-permissions".to_string()];
+        if let Some(sid) = Self::find_latest_session(&worktree_path) {
+            args.push("--resume".to_string());
+            args.push(sid);
+        }
 
         let session = Session::new(
             "claude",
@@ -632,8 +666,12 @@ impl App {
                 entry.session =
                     Session::new("gcloud", &args, cols, rows, None, Default::default()).ok();
             } else if let Some(ref wt) = entry.worktree_path.clone() {
-                // Local worktree: launch Claude Code in it.
-                let args = vec!["--dangerously-skip-permissions".to_string()];
+                // Local worktree: launch Claude Code, resuming latest session if exists.
+                let mut args = vec!["--dangerously-skip-permissions".to_string()];
+                if let Some(sid) = Self::find_latest_session(wt) {
+                    args.push("--resume".to_string());
+                    args.push(sid);
+                }
                 entry.session =
                     Session::new("claude", &args, cols, rows, Some(wt.clone()), Default::default())
                         .ok();
