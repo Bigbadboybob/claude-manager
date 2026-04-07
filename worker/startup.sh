@@ -47,7 +47,7 @@ echo "[cm-worker] Session ID: ${SESSION_ID:-none}"
 # Credentials
 # ---------------------------------------------------------------------------
 GCP_PROJECT="claude-manager-prod"
-GCS_BUCKET="gs://cm-sessions-claude-manager"
+GCS_BUCKET="gs://cm-sessions"
 
 CLAUDE_OAUTH_TOKEN=$(gcloud secrets versions access latest \
     --secret=claude-setup-token --project="$GCP_PROJECT")

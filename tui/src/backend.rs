@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::api::{ApiClient, Task, TaskCreateBody};
 use crate::config::Config;
 
-const GCS_BUCKET: &str = "gs://cm-sessions-claude-manager";
+const GCS_BUCKET: &str = "gs://cm-sessions";
 
 /// Commands sent from the main thread to the background thread.
 pub enum BackendCommand {
@@ -271,12 +271,12 @@ fn do_create_task(
     }
 }
 
-/// Get the Claude project path for a directory (mirrors Python _get_project_path).
+/// Get the Claude project path for a directory.
+/// Claude encodes: '/' and '.' both become '-', leading dash kept.
 fn get_project_path(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .replace('/', "-")
-        .trim_start_matches('-')
-        .to_string()
+        .replace('.', "-")
 }
 
 /// Find the most recent Claude session JSONL for a working directory.

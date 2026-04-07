@@ -127,6 +127,27 @@ impl App {
         !matches!(self.input_mode, InputMode::Normal)
     }
 
+    /// Visual display order: Running entries first, then the rest.
+    /// Returns a vec of indices into self.entries.
+    fn visual_order(&self) -> Vec<usize> {
+        let mut active: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.status, TaskStatus::Running))
+            .map(|(i, _)| i)
+            .collect();
+        let mut rest: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !matches!(e.status, TaskStatus::Running))
+            .map(|(i, _)| i)
+            .collect();
+        active.append(&mut rest);
+        active
+    }
+
     /// Find the most recent Claude session file for a worktree directory.
     /// Returns the session UUID if found.
     fn find_latest_session(worktree_path: &std::path::Path) -> Option<String> {
@@ -232,7 +253,7 @@ impl App {
                     }
                 }
                 BackendEvent::PullComplete {
-                    task_id: _,
+                    task_id,
                     worktree_path,
                     main_repo,
                     session_id,
@@ -240,6 +261,7 @@ impl App {
                     prompt,
                 } => {
                     self.spawn_resumed_session(
+                        Some(task_id),
                         worktree_path,
                         main_repo,
                         session_id,
@@ -289,7 +311,12 @@ impl App {
                 // Don't override status for sessions with a local terminal —
                 // idle detection is handled locally via PTY output tracking.
                 if entry.session.is_none() {
-                    entry.status = TaskStatus::from_api(&task.status);
+                    // If no local session and no cloud worker, show as waiting.
+                    if task.worker_vm.is_none() {
+                        entry.status = TaskStatus::Blocked;
+                    } else {
+                        entry.status = TaskStatus::from_api(&task.status);
+                    }
                 }
                 entry.worker_vm = task.worker_vm.clone();
                 entry.worker_zone = task.worker_zone.clone();
@@ -345,9 +372,15 @@ impl App {
             }
         }
 
-        self.entries.retain(|e| match &e.task_id {
-            Some(id) => seen_ids.contains(id) || e.session.is_some(),
-            None => true,
+        self.entries.retain(|e| {
+            // Hide all done tasks from the TUI.
+            if e.status == TaskStatus::Done {
+                return false;
+            }
+            match &e.task_id {
+                Some(id) => seen_ids.contains(id) || e.session.is_some(),
+                None => true,
+            }
         });
 
         self.entries.sort_by(|a, b| {
@@ -396,16 +429,19 @@ impl App {
                         self.should_quit = true;
                         return true;
                     }
-                    KeyCode::Char('j') => {
-                        if !self.entries.is_empty() {
-                            self.active = (self.active + 1) % self.entries.len();
-                        }
-                        return true;
-                    }
-                    KeyCode::Char('k') => {
-                        if !self.entries.is_empty() {
-                            self.active =
-                                (self.active + self.entries.len() - 1) % self.entries.len();
+                    KeyCode::Char('j') | KeyCode::Char('k') => {
+                        let order = self.visual_order();
+                        if !order.is_empty() {
+                            let cur_vis = order
+                                .iter()
+                                .position(|&i| i == self.active)
+                                .unwrap_or(0);
+                            let next_vis = if key.code == KeyCode::Char('j') {
+                                (cur_vis + 1) % order.len()
+                            } else {
+                                (cur_vis + order.len() - 1) % order.len()
+                            };
+                            self.active = order[next_vis];
                         }
                         return true;
                     }
@@ -415,6 +451,10 @@ impl App {
                     }
                     KeyCode::Char('d') => {
                         self.mark_active_done();
+                        return true;
+                    }
+                    KeyCode::Char('x') => {
+                        self.delete_active();
                         return true;
                     }
                     KeyCode::Char('r') => {
@@ -700,11 +740,59 @@ impl App {
         }
     }
 
+    /// Delete the active task: close session, remove worktree + branch, delete from API.
+    fn delete_active(&mut self) {
+        if self.active >= self.entries.len() {
+            return;
+        }
+        let entry = &self.entries[self.active];
+        let task_id = entry.task_id.clone();
+        let worktree_path = entry.worktree_path.clone();
+        let main_repo = entry.main_repo_path.clone();
+        let wip_branch = entry.wip_branch.clone();
+
+        // Delete worktree.
+        if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo) {
+            worktree::remove_worktree(repo, wt);
+        }
+
+        // Delete branch locally. Only delete remote if it was pushed.
+        if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo) {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["branch", "-D", branch])
+                .output();
+            // Only delete remote branch if the task was pushed to cloud.
+            if task_id.is_some() {
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["push", "origin", "--delete", branch])
+                    .output();
+            }
+        }
+
+        // Delete from API.
+        if let Some(ref id) = task_id {
+            self.backend.delete_task(id.clone());
+        }
+
+        // Remove from local list.
+        self.entries.remove(self.active);
+        if !self.entries.is_empty() {
+            self.active = self.active.min(self.entries.len() - 1);
+        } else {
+            self.active = 0;
+        }
+        self.set_status_msg("Deleted");
+    }
+
     /// Push the active local session to the cloud.
     fn push_active(&mut self) {
         if let Some(entry) = self.entries.get(self.active) {
-            // Only push local sessions (no task_id) that have a worktree.
-            if entry.task_id.is_some() {
+            // Only push sessions with a local worktree (not cloud-only tasks).
+            if entry.worker_vm.is_some() {
                 self.set_status_msg("Can only push local sessions");
                 return;
             }
@@ -723,7 +811,22 @@ impl App {
                 }
             };
             let name = entry.prompt.clone().unwrap_or_else(|| entry.name.clone());
+            let task_id = entry.task_id.clone();
             self.backend.push(worktree_path, repo_url, name);
+
+            // Mark the local entry as done and drop the terminal session.
+            if let Some(entry) = self.entries.get_mut(self.active) {
+                entry.session = None;
+                entry.status = TaskStatus::Done;
+                if let Some(ref id) = task_id {
+                    let mut fields = HashMap::new();
+                    fields.insert(
+                        "status".to_string(),
+                        serde_json::Value::String("done".to_string()),
+                    );
+                    self.backend.update_task(id.clone(), fields);
+                }
+            }
             self.set_status_msg("Pushing to cloud...");
         }
     }
@@ -760,6 +863,7 @@ impl App {
     /// Spawn a local claude --resume session after a pull completes.
     fn spawn_resumed_session(
         &mut self,
+        task_id: Option<String>,
         worktree_path: PathBuf,
         main_repo: PathBuf,
         session_id: String,
@@ -783,7 +887,7 @@ impl App {
         ) {
             Ok(s) => {
                 self.entries.push(SessionEntry {
-                    task_id: None,
+                    task_id,
                     name: prompt.chars().take(60).collect(),
                     status: TaskStatus::Running,
                     session: Some(s),
@@ -1100,7 +1204,7 @@ impl App {
 
         let help_lines: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-d  done"),
-            ("A-a    attach", "A-r  refresh"),
+            ("A-a    attach", "A-x  delete"),
             ("A-n    new", "A-p  push"),
             ("A-q    quit", "A-l  pull"),
         ];
