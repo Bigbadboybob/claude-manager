@@ -27,13 +27,19 @@ impl Widget for TerminalWidget<'_> {
         let term = self.term.lock();
         let content = term.renderable_content();
         let cursor = content.cursor;
+        let display_offset = content.display_offset as i32;
 
         for indexed in content.display_iter {
             let point = indexed.point;
             let cell = &indexed.cell;
 
             let x = area.left() + point.column.0 as u16;
-            let y = area.top() + point.line.0 as u16;
+            // Convert absolute grid line to viewport-relative row.
+            let viewport_line = point.line.0 + display_offset;
+            if viewport_line < 0 {
+                continue;
+            }
+            let y = area.top() + viewport_line as u16;
 
             if x >= area.right() || y >= area.bottom() {
                 continue;
@@ -69,7 +75,13 @@ impl Widget for TerminalWidget<'_> {
         // so we always draw one at the reported position.
         if self.focused {
             let cx = area.left() + cursor.point.column.0 as u16;
-            let cy = area.top() + cursor.point.line.0 as u16;
+            let cursor_viewport_line = cursor.point.line.0 + display_offset;
+            let cy = if cursor_viewport_line >= 0 {
+                area.top() + cursor_viewport_line as u16
+            } else {
+                // Cursor is above the viewport when scrolled — skip rendering.
+                area.bottom()
+            };
             if cx < area.right() && cy < area.bottom() {
                 if let Some(cell) = buf.cell_mut((cx, cy)) {
                     // Resolve Reset to concrete colors so the cursor is always visible.

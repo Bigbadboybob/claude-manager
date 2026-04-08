@@ -1,5 +1,6 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,6 +30,8 @@ impl EventListener for EventProxy {
 pub struct Session {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub sender: EventLoopSender,
+    /// Direct fd to PTY master for low-latency input writes.
+    pty_writer: File,
     pub event_rx: mpsc::Receiver<TermEvent>,
     pub title: String,
     pub exited: bool,
@@ -77,6 +80,10 @@ impl Session {
 
         let pty = tty::new(&pty_config, window_size, 0)?;
 
+        // Dup the PTY master fd so we can write input directly,
+        // bypassing the event loop channel for lower latency.
+        let pty_writer = pty.file().try_clone()?;
+
         let event_loop = EventLoop::new(
             term.clone(),
             event_proxy,
@@ -93,6 +100,7 @@ impl Session {
         Ok(Session {
             term,
             sender,
+            pty_writer,
             event_rx,
             title: format!("{} {}", shell, args.join(" ")),
             exited: false,
@@ -101,8 +109,9 @@ impl Session {
     }
 
     /// Send raw bytes to the PTY (keyboard input).
-    pub fn write(&self, data: impl Into<Cow<'static, [u8]>>) {
-        let _ = self.sender.send(Msg::Input(data.into()));
+    /// Writes directly to the PTY fd for minimal latency.
+    pub fn write(&mut self, data: &[u8]) {
+        let _ = (&self.pty_writer).write_all(data);
     }
 
     /// Notify the PTY of a terminal resize.

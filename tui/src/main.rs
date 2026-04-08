@@ -13,6 +13,7 @@ use std::time::Duration;
 use crossterm::event::{
     self, Event as CrosstermEvent, KeyboardEnhancementFlags, poll as crossterm_poll,
     PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    EnableBracketedPaste, DisableBracketedPaste,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,6 +34,7 @@ fn main() -> anyhow::Result<()> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
@@ -47,6 +49,7 @@ fn main() -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -56,39 +59,52 @@ fn main() -> anyhow::Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> anyhow::Result<()> {
     let mut app = App::new(config);
+    let mut last_draw = std::time::Instant::now();
 
     loop {
-        // Draw.
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let term_cols = area.width.saturating_sub(32);
-            let term_rows = area.height.saturating_sub(2);
-            if (term_cols, term_rows) != app.last_term_size {
-                app.resize_terminals(term_cols, term_rows);
+        // Drain ALL queued crossterm events.
+        while crossterm_poll(Duration::ZERO)? {
+            let event = event::read()?;
+
+            if let CrosstermEvent::Resize(_cols, _rows) = event {
+                app.needs_redraw = true;
+                break;
             }
 
-            app.draw(frame);
-        })?;
+            app.handle_event(&event);
+
+            if app.should_quit {
+                break;
+            }
+        }
 
         if app.should_quit {
             break;
         }
 
-        // Poll for crossterm events first so last_write_at is set
-        // before idle detection runs in drain_terminal_events.
-        if crossterm_poll(Duration::from_millis(16))? {
-            let event = event::read()?;
-
-            if let CrosstermEvent::Resize(_cols, _rows) = event {
-                continue;
-            }
-
-            app.handle_event(&event);
-        }
-
         // Drain events from terminal sessions and backend.
         app.drain_terminal_events();
         app.drain_backend_events();
+
+        // Render at most ~120fps, but only when something changed.
+        let now = std::time::Instant::now();
+        if app.needs_redraw && now.duration_since(last_draw) >= Duration::from_millis(8) {
+            terminal.draw(|frame| {
+                let area = frame.area();
+                let term_cols = area.width.saturating_sub(32);
+                let term_rows = area.height.saturating_sub(3);
+                if (term_cols, term_rows) != app.last_term_size {
+                    app.resize_terminals(term_cols, term_rows);
+                }
+
+                app.draw(frame);
+            })?;
+            app.needs_redraw = false;
+            last_draw = now;
+        } else {
+            // Yield CPU briefly when idle.
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     Ok(())
