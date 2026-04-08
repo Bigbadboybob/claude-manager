@@ -67,6 +67,7 @@ pub struct TerminalSession {
     pub last_write_at: Option<Instant>,
     pub session_id: Option<String>,
     pub pending_jsonl_files: Option<Vec<String>>,
+    pub hidden: bool,
 }
 
 /// Interval between filesystem checks for session_id detection.
@@ -77,6 +78,8 @@ struct ManifestEntry {
     label: String,
     session_type: String,
     session_id: Option<String>,
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
@@ -305,6 +308,7 @@ impl App {
                         label: ts.label.clone(),
                         session_type: ts.session_type.clone(),
                         session_id: ts.session_id.clone(),
+                        hidden: ts.hidden,
                     }
                 })
                 .collect();
@@ -401,6 +405,7 @@ impl App {
                         last_write_at: None,
                         session_id: entry.session_id.clone(),
                         pending_jsonl_files: None,
+                        hidden: entry.hidden,
                     };
                     task.sessions.push(ts);
                 }
@@ -445,6 +450,24 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn toggle_session_hidden(&mut self) {
+        let (ti, si) = match self.cursor {
+            Cursor::Session(ti, si) => (ti, si),
+            Cursor::Task(ti) => {
+                if self.tasks.get(ti).map_or(false, |t| t.sessions.len() == 1) {
+                    (ti, 0)
+                } else {
+                    return;
+                }
+            }
+        };
+        if let Some(ts) = self.tasks.get_mut(ti).and_then(|t| t.sessions.get_mut(si)) {
+            ts.hidden = !ts.hidden;
+            self.save_session_manifest();
+            self.needs_redraw = true;
         }
     }
 
@@ -963,6 +986,7 @@ impl App {
                 return false;
             }
         }
+
         self.needs_redraw = true;
 
         // If in input mode, handle input events.
@@ -1021,6 +1045,10 @@ impl App {
                     }
                     KeyCode::Char('e') => {
                         self.start_rename_session();
+                        return true;
+                    }
+                    KeyCode::Char('h') => {
+                        self.toggle_session_hidden();
                         return true;
                     }
                     KeyCode::Char('n') => {
@@ -1369,6 +1397,7 @@ impl App {
                     last_write_at: None,
                     session_id: None,
                     pending_jsonl_files: Some(pending),
+                    hidden: false,
                 };
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
@@ -1446,6 +1475,7 @@ impl App {
                     last_write_at: None,
                     session_id: None,
                     pending_jsonl_files: None,
+                    hidden: false,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1471,6 +1501,7 @@ impl App {
                     last_write_at: None,
                     session_id: None,
                     pending_jsonl_files: Some(pending),
+                    hidden: false,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1489,6 +1520,7 @@ impl App {
                     last_write_at: None,
                     session_id: None,
                     pending_jsonl_files: None,
+                    hidden: false,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1532,6 +1564,7 @@ impl App {
                     last_write_at: None,
                     session_id: None,
                     pending_jsonl_files: pending,
+                    hidden: false,
                 };
                 let si = self.tasks[task_index].sessions.len();
                 self.tasks[task_index].sessions.push(ts);
@@ -1579,6 +1612,7 @@ impl App {
                     last_write_at: None,
                     session_id: Some(session_id.clone()),
                     pending_jsonl_files: None,
+                    hidden: false,
                 };
 
                 // Find existing task by task_id or create new.
@@ -2168,23 +2202,7 @@ impl App {
                         _ => false,
                     };
 
-                    let status = task.status();
-                    let (indicator, indicator_style) = match status {
-                        TaskStatus::Running => {
-                            (spinner, Style::default().fg(Color::Green))
-                        }
-                        TaskStatus::Blocked => {
-                            ("\u{25cf}", Style::default().fg(Color::White))
-                        }
-                        TaskStatus::Backlog => {
-                            ("\u{25cb}", Style::default().fg(Color::DarkGray))
-                        }
-                        TaskStatus::Done => {
-                            ("\u{2713}", Style::default().fg(Color::DarkGray))
-                        }
-                    };
-
-                    let max_name = (inner.width as usize).saturating_sub(4);
+                    let max_name = (inner.width as usize).saturating_sub(2);
                     let name = if task.name.len() > max_name {
                         format!(
                             "{}...",
@@ -2195,10 +2213,7 @@ impl App {
                     };
 
                     let line = Line::from(vec![
-                        Span::styled(
-                            format!(" {} ", indicator),
-                            indicator_style,
-                        ),
+                        Span::raw(" "),
                         Span::raw(name),
                     ]);
 
@@ -2219,12 +2234,16 @@ impl App {
                         _ => false,
                     };
 
-                    let (indicator, indicator_style) = match ts.status {
-                        SessionStatus::Running => {
-                            (spinner, Style::default().fg(Color::Green))
-                        }
-                        SessionStatus::Idle => {
-                            ("\u{25cf}", Style::default().fg(Color::White))
+                    let (indicator, indicator_style) = if ts.hidden {
+                        (" ", Style::default())
+                    } else {
+                        match ts.status {
+                            SessionStatus::Running => {
+                                (spinner, Style::default().fg(Color::Green))
+                            }
+                            SessionStatus::Idle => {
+                                ("\u{25cf}", Style::default().fg(Color::White))
+                            }
                         }
                     };
 
@@ -2295,7 +2314,19 @@ impl App {
         );
 
         // Help text — two columns.
-        let help_rows = 7u16;
+        let help_entries: Vec<(&str, &str)> = vec![
+            ("A-j/k  nav", "A-d  done"),
+            ("A-a    attach", "A-x  delete"),
+            ("A-n    new", "A-p  push"),
+            ("A-s    +session", "A-l  pull"),
+            ("A-w    close", "A-v  view"),
+            ("A-e    rename", "A-r  refresh"),
+            ("A-h    hide", "A-q  quit"),
+            ("PgUp   scroll up", ""),
+            ("PgDn   scroll dn", ""),
+            ("A-Ent  newline", ""),
+        ];
+        let help_rows = help_entries.len() as u16;
         let help_y = inner.y + inner.height.saturating_sub(help_rows + 1);
         let help_area = Rect {
             x: inner.x,
@@ -2311,17 +2342,8 @@ impl App {
         ));
         let col = inner.width / 2;
 
-        let help_lines: Vec<(&str, &str)> = vec![
-            ("A-j/k  nav", "A-d  done"),
-            ("A-a    attach", "A-x  delete"),
-            ("A-n    new", "A-p  push"),
-            ("A-s    +session", "A-l  pull"),
-            ("A-w    close", "A-v  view"),
-            ("A-e    rename", "A-r  refresh"),
-        ];
-
         let mut lines = vec![sep];
-        for (left, right) in &help_lines {
+        for (left, right) in &help_entries {
             let left_padded = format!("{:<w$}", left, w = col as usize);
             let line = Line::from(vec![
                 Span::styled(left_padded, dim),
@@ -2411,3 +2433,4 @@ impl App {
         }
     }
 }
+
