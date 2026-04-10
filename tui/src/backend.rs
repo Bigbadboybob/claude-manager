@@ -25,6 +25,7 @@ pub enum BackendCommand {
         worktree_path: PathBuf,
         repo_url: String,
         name: String,
+        task_id: Option<String>,
     },
     /// Pull a cloud session to local.
     Pull {
@@ -103,11 +104,18 @@ impl BackendHandle {
         let _ = self.cmd_tx.send(BackendCommand::DeleteTask { id });
     }
 
-    pub fn push(&self, worktree_path: PathBuf, repo_url: String, name: String) {
+    pub fn push(
+        &self,
+        worktree_path: PathBuf,
+        repo_url: String,
+        name: String,
+        task_id: Option<String>,
+    ) {
         let _ = self.cmd_tx.send(BackendCommand::Push {
             worktree_path,
             repo_url,
             name,
+            task_id,
         });
     }
 
@@ -174,8 +182,16 @@ fn backend_loop(
                 worktree_path,
                 repo_url,
                 name,
+                task_id,
             }) => {
-                do_push(&client, &event_tx, &worktree_path, &repo_url, &name);
+                do_push(
+                    &client,
+                    &event_tx,
+                    &worktree_path,
+                    &repo_url,
+                    &name,
+                    task_id.as_deref(),
+                );
                 do_refresh(&client, &event_tx, &mut was_connected);
             }
             Ok(BackendCommand::CreateTask {
@@ -316,6 +332,7 @@ fn do_push(
     worktree_path: &Path,
     repo_url: &str,
     name: &str,
+    task_id: Option<&str>,
 ) {
     let progress = |msg: &str| {
         let _ = event_tx.send(BackendEvent::Progress(msg.to_string()));
@@ -388,34 +405,48 @@ fn do_push(
             .output();
     }
 
-    progress("Creating cloud task...");
+    // 4. Create or update task via API.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session_id),
+    );
+    fields.insert(
+        "wip_branch".to_string(),
+        serde_json::Value::String(branch.clone()),
+    );
+    fields.insert(
+        "repo_branch".to_string(),
+        serde_json::Value::String(branch),
+    );
+    fields.insert(
+        "status".to_string(),
+        serde_json::Value::String("backlog".to_string()),
+    );
 
-    // 4. Create task via API.
-    let body = TaskCreateBody {
-        repo_url: repo_url.to_string(),
-        repo_branch: branch.clone(),
-        name: Some(name.to_string()),
-        prompt: None,
-        priority: 0,
-    };
-
-    match client.create_task(&body) {
-        Ok(task) => {
-            // Update with session metadata.
-            let mut fields = HashMap::new();
-            fields.insert(
-                "session_id".to_string(),
-                serde_json::Value::String(session_id),
-            );
-            fields.insert(
-                "wip_branch".to_string(),
-                serde_json::Value::String(branch),
-            );
-            let _ = client.update_task(&task.id, &fields);
-            progress(&format!("Pushed to cloud: {}", &task.id[..8]));
+    if let Some(id) = task_id {
+        progress("Updating cloud task...");
+        match client.update_task(id, &fields) {
+            Ok(_) => progress(&format!("Pushed to cloud: {}", &id[..8.min(id.len())])),
+            Err(e) => progress(&format!("Push failed: API update: {}", e)),
         }
-        Err(e) => {
-            progress(&format!("Push failed: API: {}", e));
+    } else {
+        progress("Creating cloud task...");
+        let body = TaskCreateBody {
+            repo_url: repo_url.to_string(),
+            repo_branch: "main".to_string(),
+            name: Some(name.to_string()),
+            prompt: None,
+            priority: 0,
+        };
+        match client.create_task(&body) {
+            Ok(task) => {
+                let _ = client.update_task(&task.id, &fields);
+                progress(&format!("Pushed to cloud: {}", &task.id[..8]));
+            }
+            Err(e) => {
+                progress(&format!("Push failed: API: {}", e));
+            }
         }
     }
 }

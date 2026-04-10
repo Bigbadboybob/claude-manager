@@ -15,6 +15,7 @@ use crate::api::Task;
 use crate::backend::{BackendEvent, BackendHandle};
 use crate::config::Config;
 use crate::input;
+use crate::planning::{PlanAction, PlanningView};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::worktree;
@@ -68,7 +69,11 @@ pub struct TerminalSession {
     pub session_id: Option<String>,
     pub pending_jsonl_files: Option<Vec<String>>,
     pub hidden: bool,
+    /// Seconds of quiet before marking idle. 0 = use global default.
+    pub idle_timeout_secs: u16,
 }
+
+const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
 
 /// Interval between filesystem checks for session_id detection.
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -80,6 +85,8 @@ struct ManifestEntry {
     session_id: Option<String>,
     #[serde(default)]
     hidden: bool,
+    #[serde(default)]
+    idle_timeout_secs: u16,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
@@ -104,6 +111,8 @@ pub struct TaskEntry {
     pub worktree_path: Option<PathBuf>,
     pub main_repo_path: Option<PathBuf>,
     pub sessions: Vec<TerminalSession>,
+    /// Whether this task has been pushed to cloud (as opposed to running locally).
+    pub is_cloud: bool,
 }
 
 impl TaskEntry {
@@ -112,7 +121,7 @@ impl TaskEntry {
             TaskStatus::Running
         } else if self.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
             TaskStatus::Blocked
-        } else if self.worker_vm.is_some() {
+        } else if self.worker_vm.as_deref().is_some_and(|s| !s.is_empty()) {
             self.api_status.clone()
         } else {
             // No local sessions and no cloud worker — show as waiting.
@@ -133,6 +142,12 @@ pub enum SidebarView {
     Task,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewMode {
+    Sessions,
+    Planning,
+}
+
 #[derive(Clone, Debug)]
 enum VisualItem {
     TaskHeader(usize),
@@ -148,8 +163,9 @@ enum InputMode {
     NewSession {
         label_text: String,
         branch_text: String,
+        idle_timeout_text: String,
         repo_url: String,
-        /// 0 = name field, 1 = branch field
+        /// 0 = name, 1 = branch, 2 = idle timeout
         active_field: u8,
     },
     /// Picking a session type to add to a task.
@@ -157,11 +173,15 @@ enum InputMode {
         task_index: usize,
         session_type: String,
     },
-    /// Renaming the focused session's label.
-    RenameSession {
+    /// Editing session settings.
+    SessionSettings {
         task_index: usize,
         session_index: usize,
-        text: String,
+        name: String,
+        idle_timeout: String,
+        hidden: bool,
+        /// 0 = name, 1 = idle timeout
+        active_field: u8,
     },
 }
 
@@ -169,6 +189,8 @@ pub struct App {
     pub tasks: Vec<TaskEntry>,
     pub cursor: Cursor,
     pub sidebar_view: SidebarView,
+    pub view_mode: ViewMode,
+    pub planning: PlanningView,
     pub should_quit: bool,
     pub last_term_size: (u16, u16),
     pub config: Config,
@@ -194,6 +216,8 @@ impl App {
             tasks: Vec::new(),
             cursor: Cursor::Task(0),
             sidebar_view,
+            view_mode: ViewMode::Sessions,
+            planning: PlanningView::new(),
             should_quit: false,
             last_term_size: (80, 24),
             config,
@@ -279,6 +303,61 @@ impl App {
         newest.map(|(_, id)| id)
     }
 
+    /// List codex session IDs (UUIDs) that were started in the given worktree.
+    fn list_codex_sessions(worktree_path: &Path) -> Vec<String> {
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let sessions_dir = home.join(".codex/sessions");
+        if !sessions_dir.is_dir() {
+            return Vec::new();
+        }
+        let wt_str = match worktree_path.to_str() {
+            Some(s) => s.to_string(),
+            None => return Vec::new(),
+        };
+        let mut ids = Vec::new();
+        // Walk YYYY/MM/DD subdirectories.
+        Self::walk_codex_sessions(&sessions_dir, &wt_str, &mut ids);
+        ids
+    }
+
+    fn walk_codex_sessions(dir: &Path, wt_str: &str, ids: &mut Vec<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk_codex_sessions(&path, wt_str, ids);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                // Read first line to check cwd.
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some(first_line) = content.lines().next() {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(first_line) {
+                            if let Some(cwd) = val.pointer("/payload/cwd").and_then(|v| v.as_str()) {
+                                if cwd == wt_str {
+                                    if let Some(id) = val.pointer("/payload/id").and_then(|v| v.as_str()) {
+                                        ids.push(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detect a new codex session_id by comparing against known IDs.
+    fn detect_codex_session_id(worktree_path: &Path, existing_ids: &[String]) -> Option<String> {
+        let current = Self::list_codex_sessions(worktree_path);
+        // Return the newest one not in existing_ids.
+        current.into_iter().find(|id| !existing_ids.contains(id))
+    }
+
     /// Path to the session manifest file.
     fn manifest_path() -> PathBuf {
         dirs::home_dir()
@@ -290,12 +369,16 @@ impl App {
     fn save_session_manifest(&self) {
         let mut sessions: HashMap<String, Vec<ManifestEntry>> = HashMap::new();
         for task in &self.tasks {
-            let key = match &task.worktree_path {
-                Some(p) => match p.to_str() {
+            // Key by worktree_path for local tasks, task_id for cloud tasks.
+            let key = if let Some(p) = &task.worktree_path {
+                match p.to_str() {
                     Some(s) => s.to_string(),
                     None => continue,
-                },
-                None => continue,
+                }
+            } else if let Some(id) = &task.task_id {
+                format!("task:{}", id)
+            } else {
+                continue;
             };
             if task.sessions.is_empty() {
                 continue;
@@ -309,6 +392,7 @@ impl App {
                         session_type: ts.session_type.clone(),
                         session_id: ts.session_id.clone(),
                         hidden: ts.hidden,
+                        idle_timeout_secs: ts.idle_timeout_secs,
                     }
                 })
                 .collect();
@@ -356,44 +440,76 @@ impl App {
             if !task.sessions.is_empty() {
                 continue;
             }
-            let wt = match &task.worktree_path {
-                Some(p) => p.clone(),
-                None => continue,
-            };
-            let key = match wt.to_str() {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let entries = match manifest.sessions.get(&key) {
-                Some(e) => e.clone(),
-                None => continue,
-            };
+
+            // Try worktree key first (local tasks), then task_id key (cloud tasks).
+            let entries = task
+                .worktree_path
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .and_then(|key| manifest.sessions.get(key))
+                .or_else(|| {
+                    task.task_id
+                        .as_ref()
+                        .and_then(|id| manifest.sessions.get(&format!("task:{}", id)))
+                })
+                .cloned()
+                .unwrap_or_default();
+
+            if entries.is_empty() {
+                continue;
+            }
+
+            let cloud_vm = task.worker_vm.as_deref().filter(|s| !s.is_empty());
 
             for entry in entries {
-                let result = match entry.session_type.as_str() {
-                    "claude" => {
-                        let mut args = vec!["--dangerously-skip-permissions".to_string()];
-                        if let Some(ref sid) = entry.session_id {
-                            args.push("--resume".to_string());
-                            args.push(sid.clone());
-                        }
-                        Session::new(
-                            "claude",
-                            &args,
-                            cols,
-                            rows,
-                            Some(wt.clone()),
-                            Default::default(),
-                        )
+                let result = if cloud_vm.is_some() && entry.session_type == "bash" {
+                    // Restore SSH bash session for cloud tasks.
+                    let vm = cloud_vm.unwrap().to_string();
+                    let zone = task
+                        .worker_zone
+                        .clone()
+                        .unwrap_or_else(|| self.config.gcp_zone.clone());
+                    let tmux_name = &entry.label;
+                    let args = vec![
+                        "compute".to_string(),
+                        "ssh".to_string(),
+                        vm.clone(),
+                        format!("--zone={}", zone),
+                        format!("--project={}", self.config.gcp_project),
+                        "--".to_string(),
+                        "-t".to_string(),
+                        format!(
+                            "TERM=xterm-256color sudo su - worker -c 'cd /workspace && tmux new-session -As {}'",
+                            tmux_name
+                        ),
+                    ];
+                    Session::new("gcloud", &args, cols, rows, None, Default::default())
+                } else if entry.session_type == "claude" {
+                    let wt = task.worktree_path.clone();
+                    let mut args = vec!["--dangerously-skip-permissions".to_string()];
+                    if let Some(ref sid) = entry.session_id {
+                        args.push("--resume".to_string());
+                        args.push(sid.clone());
                     }
-                    _ => Session::new(
+                    Session::new("claude", &args, cols, rows, wt, Default::default())
+                } else if entry.session_type == "codex" {
+                    let wt = task.worktree_path.clone();
+                    let mut args = vec!["--yolo".to_string()];
+                    if let Some(ref sid) = entry.session_id {
+                        args.push("resume".to_string());
+                        args.push(sid.clone());
+                    }
+                    Session::new("codex", &args, cols, rows, wt, Default::default())
+                } else {
+                    let wt = task.worktree_path.clone();
+                    Session::new(
                         "/bin/bash",
                         &[],
                         cols,
                         rows,
-                        Some(wt.clone()),
+                        wt,
                         Default::default(),
-                    ),
+                    )
                 };
 
                 if let Ok(s) = result {
@@ -406,6 +522,7 @@ impl App {
                         session_id: entry.session_id.clone(),
                         pending_jsonl_files: None,
                         hidden: entry.hidden,
+                        idle_timeout_secs: entry.idle_timeout_secs,
                     };
                     task.sessions.push(ts);
                 }
@@ -424,31 +541,33 @@ impl App {
         // It will be re-saved on quit or changes.
     }
 
-    /// Enter rename mode for the focused session.
-    fn start_rename_session(&mut self) {
-        match self.cursor {
-            Cursor::Session(ti, si) => {
-                if let Some(task) = self.tasks.get(ti) {
-                    if let Some(ts) = task.sessions.get(si) {
-                        self.input_mode = InputMode::RenameSession {
-                            task_index: ti,
-                            session_index: si,
-                            text: ts.label.clone(),
-                        };
-                    }
+    /// Open session settings for the focused session.
+    fn open_session_settings(&mut self) {
+        let (ti, si) = match self.cursor {
+            Cursor::Session(ti, si) => (ti, si),
+            Cursor::Task(ti) => {
+                if self.tasks.get(ti).map_or(false, |t| t.sessions.len() == 1) {
+                    (ti, 0)
+                } else {
+                    return;
                 }
             }
-            Cursor::Task(ti) => {
-                // If exactly one session, rename it.
-                if let Some(task) = self.tasks.get(ti) {
-                    if task.sessions.len() == 1 {
-                        self.input_mode = InputMode::RenameSession {
-                            task_index: ti,
-                            session_index: 0,
-                            text: task.sessions[0].label.clone(),
-                        };
-                    }
-                }
+        };
+        if let Some(task) = self.tasks.get(ti) {
+            if let Some(ts) = task.sessions.get(si) {
+                let timeout = ts.idle_timeout_secs;
+                self.input_mode = InputMode::SessionSettings {
+                    task_index: ti,
+                    session_index: si,
+                    name: ts.label.clone(),
+                    idle_timeout: if timeout == 0 {
+                        DEFAULT_IDLE_TIMEOUT_SECS.to_string()
+                    } else {
+                        timeout.to_string()
+                    },
+                    hidden: ts.hidden,
+                    active_field: 0,
+                };
             }
         }
     }
@@ -709,20 +828,34 @@ impl App {
                     }
                 }
 
-                // Prune old wakeups outside the rolling window.
+                // Two windows: a short one for detecting activity bursts (idle→running),
+                // and the per-session timeout for detecting quiet (running→idle).
+                let activity_window = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS as u64);
+                let idle_secs = if ts.idle_timeout_secs > 0 {
+                    ts.idle_timeout_secs as u64
+                } else {
+                    DEFAULT_IDLE_TIMEOUT_SECS as u64
+                };
+                let idle_window = Duration::from_secs(idle_secs);
+
+                // Prune old wakeups outside the longer window.
                 ts.session
                     .wakeup_times
-                    .retain(|t| now.duration_since(*t) < WAKEUP_WINDOW);
+                    .retain(|t| now.duration_since(*t) < idle_window);
 
                 // Detect idle/active for sessions with a local terminal.
                 // Freeze while user is typing to avoid flicker from echo.
                 if !ts.session.exited {
                     let user_typing = ts
                         .last_write_at
-                        .map_or(false, |t| now.duration_since(t) < WAKEUP_WINDOW);
+                        .map_or(false, |t| now.duration_since(t) < activity_window);
                     if !user_typing {
-                        let burst =
-                            ts.session.wakeup_times.len() >= WAKEUP_BURST_THRESHOLD;
+                        // Burst = recent wakeups in the short activity window → mark running.
+                        let recent_count = ts.session.wakeup_times.iter()
+                            .filter(|t| now.duration_since(**t) < activity_window)
+                            .count();
+                        let burst = recent_count >= WAKEUP_BURST_THRESHOLD;
+                        // Quiet = no wakeups at all in the full idle window → mark idle.
                         let quiet = ts.session.wakeup_times.is_empty();
                         if quiet && ts.status == SessionStatus::Running {
                             ts.status = SessionStatus::Idle;
@@ -732,14 +865,20 @@ impl App {
                     }
                 }
 
-                // Detect session_id for claude sessions that don't have one yet.
+                // Detect session_id for claude/codex sessions that don't have one yet.
                 if should_check_session_ids
+                    && (ts.session_type == "claude" || ts.session_type == "codex")
                     && ts.session_id.is_none()
                     && ts.pending_jsonl_files.is_some()
                 {
                     if let Some(ref wt) = worktree_path {
                         let existing = ts.pending_jsonl_files.as_ref().unwrap();
-                        if let Some(sid) = Self::detect_session_id(wt, existing) {
+                        let sid = if ts.session_type == "codex" {
+                            Self::detect_codex_session_id(wt, existing)
+                        } else {
+                            Self::detect_session_id(wt, existing)
+                        };
+                        if let Some(sid) = sid {
                             ts.session_id = Some(sid);
                             ts.pending_jsonl_files = None;
                         }
@@ -815,6 +954,17 @@ impl App {
         }
     }
 
+    /// Process planning editor events (non-blocking).
+    pub fn drain_planning_events(&mut self) {
+        if self.planning.drain_editor_events() {
+            self.needs_redraw = true;
+        }
+        if self.planning.needs_redraw {
+            self.needs_redraw = true;
+            self.planning.needs_redraw = false;
+        }
+    }
+
     /// Reconcile API tasks with local task entries.
     fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
         // Save cursor context for restoration.
@@ -850,8 +1000,11 @@ impl App {
                 .take(60)
                 .collect::<String>();
 
-            // Detect local worktree path for tasks without a VM.
-            let is_local = task.worker_vm.is_none()
+            let is_cloud = task.worker_vm.as_deref().is_some_and(|s| !s.is_empty())
+                    || task.session_id.as_deref().is_some_and(|s| !s.is_empty());
+
+            // Detect local worktree path for non-cloud tasks.
+            let is_local = !is_cloud
                 && task
                     .wip_branch
                     .as_ref()
@@ -872,6 +1025,7 @@ impl App {
                 entry.wip_branch = task.wip_branch.clone();
                 entry.session_id = task.session_id.clone();
                 entry.blocked_at = task.blocked_at.clone();
+                entry.is_cloud = is_cloud;
             } else {
                 // For local tasks, try to find the worktree on disk.
                 let worktree_path = if is_local {
@@ -905,6 +1059,8 @@ impl App {
                     None
                 };
 
+                let is_cloud = task.worker_vm.as_deref().is_some_and(|s| !s.is_empty())
+                    || task.session_id.as_deref().is_some_and(|s| !s.is_empty());
                 self.tasks.push(TaskEntry {
                     task_id: Some(task.id.clone()),
                     name: display_name,
@@ -919,6 +1075,7 @@ impl App {
                     worktree_path,
                     main_repo_path,
                     sessions: vec![],
+                    is_cloud,
                 });
             }
         }
@@ -989,6 +1146,45 @@ impl App {
 
         self.needs_redraw = true;
 
+        // Alt+t toggles between Sessions and Planning view.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t') {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Sessions => ViewMode::Planning,
+                    ViewMode::Planning => ViewMode::Sessions,
+                };
+                return true;
+            }
+        }
+
+        // Delegate to planning view when in Planning mode.
+        if self.view_mode == ViewMode::Planning {
+            let action = self.planning.handle_event(event);
+            match action {
+                PlanAction::Consumed => return true,
+                PlanAction::Ignored => return false,
+                PlanAction::LaunchTask {
+                    project,
+                    slug,
+                    prompt,
+                    branch,
+                    autostart,
+                } => {
+                    self.launch_from_plan(&project, &slug, &prompt, branch.as_deref(), autostart);
+                    return true;
+                }
+                PlanAction::SwitchToSessions => {
+                    self.view_mode = ViewMode::Sessions;
+                    return true;
+                }
+                PlanAction::Quit => {
+                    self.save_session_manifest();
+                    self.should_quit = true;
+                    return true;
+                }
+            }
+        }
+
         // If in input mode, handle input events.
         if self.is_input_mode() {
             return self.handle_input_event(event);
@@ -1044,7 +1240,7 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('e') => {
-                        self.start_rename_session();
+                        self.open_session_settings();
                         return true;
                     }
                     KeyCode::Char('h') => {
@@ -1158,6 +1354,7 @@ impl App {
                 InputMode::NewSession {
                     label_text,
                     branch_text,
+                    idle_timeout_text,
                     repo_url,
                     active_field,
                 } => match key.code {
@@ -1165,8 +1362,12 @@ impl App {
                         self.input_mode = InputMode::Normal;
                         return true;
                     }
-                    KeyCode::Tab | KeyCode::BackTab => {
-                        *active_field = if *active_field == 0 { 1 } else { 0 };
+                    KeyCode::Tab => {
+                        *active_field = (*active_field + 1) % 3;
+                        return true;
+                    }
+                    KeyCode::BackTab => {
+                        *active_field = if *active_field == 0 { 2 } else { *active_field - 1 };
                         return true;
                     }
                     KeyCode::Enter => {
@@ -1178,28 +1379,32 @@ impl App {
                             } else {
                                 Some(branch_text.clone())
                             };
+                            let timeout = idle_timeout_text.parse::<u16>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
                             self.input_mode = InputMode::Normal;
                             self.create_local_session(
                                 &repo,
                                 &label,
                                 branch.as_deref(),
+                                timeout,
                             );
                         }
                         return true;
                     }
                     KeyCode::Backspace => {
-                        if *active_field == 0 {
-                            label_text.pop();
-                        } else {
-                            branch_text.pop();
+                        match *active_field {
+                            0 => { label_text.pop(); }
+                            1 => { branch_text.pop(); }
+                            2 => { idle_timeout_text.pop(); }
+                            _ => {}
                         }
                         return true;
                     }
                     KeyCode::Char(c) => {
-                        if *active_field == 0 {
-                            label_text.push(c);
-                        } else {
-                            branch_text.push(c);
+                        match *active_field {
+                            0 => label_text.push(c),
+                            1 => branch_text.push(c),
+                            2 => { if c.is_ascii_digit() { idle_timeout_text.push(c); } }
+                            _ => {}
                         }
                         return true;
                     }
@@ -1213,11 +1418,19 @@ impl App {
                         self.input_mode = InputMode::Normal;
                         return true;
                     }
-                    KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Tab | KeyCode::BackTab => {
-                        *session_type = if session_type == "claude" {
-                            "bash".to_string()
-                        } else {
-                            "claude".to_string()
+                    KeyCode::Char('j') | KeyCode::Tab | KeyCode::Down => {
+                        *session_type = match session_type.as_str() {
+                            "claude" => "codex".to_string(),
+                            "codex" => "bash".to_string(),
+                            _ => "claude".to_string(),
+                        };
+                        return true;
+                    }
+                    KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Up => {
+                        *session_type = match session_type.as_str() {
+                            "claude" => "bash".to_string(),
+                            "bash" => "codex".to_string(),
+                            _ => "claude".to_string(),
                         };
                         return true;
                     }
@@ -1230,37 +1443,62 @@ impl App {
                     }
                     _ => return true,
                 },
-                InputMode::RenameSession {
+                InputMode::SessionSettings {
                     task_index,
                     session_index,
-                    text,
+                    name,
+                    idle_timeout,
+                    hidden,
+                    active_field,
                 } => match key.code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
                         return true;
                     }
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        *active_field = (*active_field + 1) % 3;
+                        return true;
+                    }
+                    KeyCode::Char(' ') if *active_field == 2 => {
+                        *hidden = !*hidden;
+                        return true;
+                    }
                     KeyCode::Enter => {
                         let ti = *task_index;
                         let si = *session_index;
-                        let new_label = text.clone();
+                        let new_name = name.clone();
+                        let new_timeout = idle_timeout.parse::<u16>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+                        let new_hidden = *hidden;
                         self.input_mode = InputMode::Normal;
-                        if !new_label.trim().is_empty() {
-                            if let Some(task) = self.tasks.get_mut(ti) {
-                                if let Some(ts) = task.sessions.get_mut(si) {
-                                    ts.label = new_label;
+                        if let Some(task) = self.tasks.get_mut(ti) {
+                            if let Some(ts) = task.sessions.get_mut(si) {
+                                if !new_name.trim().is_empty() {
+                                    ts.label = new_name;
                                 }
+                                ts.idle_timeout_secs = new_timeout;
+                                ts.hidden = new_hidden;
                             }
-                            self.save_session_manifest();
-                            self.set_status_msg("Session renamed");
                         }
+                        self.save_session_manifest();
+                        self.set_status_msg("Settings saved");
                         return true;
                     }
                     KeyCode::Backspace => {
-                        text.pop();
+                        match *active_field {
+                            0 => { name.pop(); }
+                            1 => { idle_timeout.pop(); }
+                            _ => {}
+                        }
                         return true;
                     }
                     KeyCode::Char(c) => {
-                        text.push(c);
+                        match *active_field {
+                            0 => name.push(c),
+                            1 => {
+                                if c.is_ascii_digit() { idle_timeout.push(c); }
+                            }
+                            _ => {}
+                        }
                         return true;
                     }
                     _ => return true,
@@ -1286,6 +1524,7 @@ impl App {
         self.input_mode = InputMode::NewSession {
             label_text: String::new(),
             branch_text: String::new(),
+            idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
             repo_url,
             active_field: 0,
         };
@@ -1345,6 +1584,7 @@ impl App {
         repo_url: &str,
         label: &str,
         start_branch: Option<&str>,
+        idle_timeout_secs: u16,
     ) {
         let main_repo = match worktree::find_local_repo(repo_url) {
             Some(p) => p,
@@ -1398,6 +1638,7 @@ impl App {
                     session_id: None,
                     pending_jsonl_files: Some(pending),
                     hidden: false,
+                    idle_timeout_secs: idle_timeout_secs,
                 };
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
@@ -1414,6 +1655,7 @@ impl App {
                     worktree_path: Some(worktree_path),
                     main_repo_path: Some(main_repo),
                     sessions: vec![ts],
+                    is_cloud: false,
                 });
                 self.cursor = Cursor::Session(new_ti, 0);
 
@@ -1447,7 +1689,13 @@ impl App {
             return;
         }
 
-        if let Some(vm) = self.tasks[ti].worker_vm.clone() {
+        // Cloud task but no VM assigned yet — can't open sessions.
+        if self.tasks[ti].is_cloud && self.tasks[ti].worker_vm.is_none() {
+            self.set_status_msg("Waiting for cloud VM assignment...");
+            return;
+        }
+
+        if let Some(vm) = self.tasks[ti].worker_vm.clone().filter(|s| !s.is_empty()) {
             // Cloud: SSH into the worker VM.
             let zone = self.tasks[ti]
                 .worker_zone
@@ -1476,6 +1724,7 @@ impl App {
                     session_id: None,
                     pending_jsonl_files: None,
                     hidden: false,
+                    idle_timeout_secs: 0,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1502,6 +1751,7 @@ impl App {
                     session_id: None,
                     pending_jsonl_files: Some(pending),
                     hidden: false,
+                    idle_timeout_secs: 0,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1521,6 +1771,7 @@ impl App {
                     session_id: None,
                     pending_jsonl_files: None,
                     hidden: false,
+                    idle_timeout_secs: 0,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1535,21 +1786,78 @@ impl App {
             return;
         }
 
+        // Cloud task but no VM assigned yet — can't open sessions.
+        if self.tasks[task_index].is_cloud && self.tasks[task_index].worker_vm.is_none() {
+            self.set_status_msg("Waiting for cloud VM assignment...");
+            return;
+        }
+
         let (cols, rows) = self.last_term_size;
+
+        // Cloud task with VM: SSH for bash sessions.
+        if let Some(ref vm) = self.tasks[task_index].worker_vm.clone().filter(|s| !s.is_empty()) {
+            if session_type == "bash" {
+                let zone = self.tasks[task_index]
+                    .worker_zone
+                    .clone()
+                    .unwrap_or_else(|| self.config.gcp_zone.clone());
+                let si = self.tasks[task_index].sessions.len();
+                let tmux_name = format!("bash-{}", si);
+                let args = vec![
+                    "compute".to_string(),
+                    "ssh".to_string(),
+                    vm.clone(),
+                    format!("--zone={}", zone),
+                    format!("--project={}", self.config.gcp_project),
+                    "--".to_string(),
+                    "-t".to_string(),
+                    format!(
+                        "TERM=xterm-256color sudo su - worker -c 'cd /workspace && tmux new-session -As {}'",
+                        tmux_name
+                    ),
+                ];
+                match Session::new("gcloud", &args, cols, rows, None, Default::default()) {
+                    Ok(s) => {
+                        let ts = TerminalSession {
+                            label: tmux_name,
+                            session_type: "bash".to_string(),
+                            session: s,
+                            status: SessionStatus::Running,
+                            last_write_at: None,
+                            session_id: None,
+                            pending_jsonl_files: None,
+                            hidden: false,
+                    idle_timeout_secs: 0,
+                        };
+                        let si = self.tasks[task_index].sessions.len();
+                        self.tasks[task_index].sessions.push(ts);
+                        self.cursor = Cursor::Session(task_index, si);
+                        self.save_session_manifest();
+                        self.set_status_msg("Started SSH bash session");
+                    }
+                    Err(e) => self.set_status_msg(&format!("Spawn: {}", e)),
+                }
+                return;
+            }
+        }
+
         let wt = self.tasks[task_index].worktree_path.clone();
 
-        // Record existing .jsonl files before spawning claude (for session_id detection).
-        let pending = if session_type == "claude" {
-            wt.as_ref().map(|p| Self::list_jsonl_files(p))
-        } else {
-            None
+        // Record existing session files before spawning (for session_id detection).
+        let pending = match session_type {
+            "claude" => wt.as_ref().map(|p| Self::list_jsonl_files(p)),
+            "codex" => wt.as_ref().map(|p| Self::list_codex_sessions(p)),
+            _ => None,
         };
 
         let result = match session_type {
             "claude" => {
-                // Always start fresh — no --resume.
                 let args = vec!["--dangerously-skip-permissions".to_string()];
                 Session::new("claude", &args, cols, rows, wt, Default::default())
+            }
+            "codex" => {
+                let args = vec!["--yolo".to_string()];
+                Session::new("codex", &args, cols, rows, wt, Default::default())
             }
             _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default()),
         };
@@ -1565,6 +1873,7 @@ impl App {
                     session_id: None,
                     pending_jsonl_files: pending,
                     hidden: false,
+                    idle_timeout_secs: 0,
                 };
                 let si = self.tasks[task_index].sessions.len();
                 self.tasks[task_index].sessions.push(ts);
@@ -1613,6 +1922,7 @@ impl App {
                     session_id: Some(session_id.clone()),
                     pending_jsonl_files: None,
                     hidden: false,
+                    idle_timeout_secs: 0,
                 };
 
                 // Find existing task by task_id or create new.
@@ -1625,11 +1935,13 @@ impl App {
                 };
 
                 if let Some(ti) = ti {
-                    let si = self.tasks[ti].sessions.len();
+                    // Clear old cloud sessions (e.g. SSH bash) on pull-to-local.
+                    self.tasks[ti].sessions.clear();
                     self.tasks[ti].sessions.push(ts);
                     self.tasks[ti].worktree_path = Some(worktree_path);
                     self.tasks[ti].main_repo_path = Some(main_repo);
-                    self.cursor = Cursor::Session(ti, si);
+                    self.tasks[ti].is_cloud = false;
+                    self.cursor = Cursor::Session(ti, 0);
                 } else {
                     let display_name: String =
                         prompt.chars().take(60).collect();
@@ -1648,6 +1960,7 @@ impl App {
                         worktree_path: Some(worktree_path),
                         main_repo_path: Some(main_repo),
                         sessions: vec![ts],
+                        is_cloud: false,
                     });
                     self.cursor = Cursor::Session(new_ti, 0);
                 }
@@ -1681,6 +1994,20 @@ impl App {
         self.tasks[ti].api_status = TaskStatus::Done;
         self.cursor = Cursor::Task(ti);
         self.clamp_cursor();
+
+        // Sync status to planning task if there's a matching one.
+        let task_name = self.tasks[ti].name.clone();
+        let repo_url = self.tasks[ti].repo_url.clone();
+        // Find project name from repo URL.
+        if let Some(ref url) = repo_url {
+            let project_name = self.config.repos.iter()
+                .find(|(_, v)| *v == url)
+                .map(|(k, _)| k.clone());
+            if let Some(project) = project_name {
+                self.planning.mark_task_done(&project, &task_name);
+            }
+        }
+
         self.set_status_msg("Marked done");
     }
 
@@ -1740,7 +2067,7 @@ impl App {
             None => return,
         };
 
-        if self.tasks[ti].worker_vm.is_some() {
+        if self.tasks[ti].is_cloud {
             self.set_status_msg("Can only push local sessions");
             return;
         }
@@ -1764,19 +2091,13 @@ impl App {
             .unwrap_or_else(|| self.tasks[ti].name.clone());
         let task_id = self.tasks[ti].task_id.clone();
 
-        self.backend.push(worktree_path, repo_url, name);
+        self.backend
+            .push(worktree_path, repo_url, name, task_id);
 
-        // Clear sessions, mark done.
+        // Clear local sessions, mark as cloud.
         self.tasks[ti].sessions.clear();
-        self.tasks[ti].api_status = TaskStatus::Done;
-        if let Some(ref id) = task_id {
-            let mut fields = HashMap::new();
-            fields.insert(
-                "status".to_string(),
-                serde_json::Value::String("done".to_string()),
-            );
-            self.backend.update_task(id.clone(), fields);
-        }
+        self.tasks[ti].worktree_path = None;
+        self.tasks[ti].is_cloud = true;
         self.cursor = Cursor::Task(ti);
         self.set_status_msg("Pushing to cloud...");
     }
@@ -1813,6 +2134,98 @@ impl App {
         self.set_status_msg("Pulling to local...");
     }
 
+    /// Launch a task from the planning view.
+    fn launch_from_plan(
+        &mut self,
+        project: &str,
+        slug: &str,
+        prompt: &str,
+        start_branch: Option<&str>,
+        _autostart: bool,
+    ) {
+        let repo_url = match self.config.repos.get(project) {
+            Some(url) => url.clone(),
+            None => {
+                self.set_status_msg(&format!("No repo configured for '{}'", project));
+                return;
+            }
+        };
+
+        let main_repo = match worktree::find_local_repo(&repo_url) {
+            Some(p) => p,
+            None => {
+                self.set_status_msg("Repo not found locally");
+                return;
+            }
+        };
+
+        let worktree_path = match worktree::create_worktree(&main_repo, slug, start_branch) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status_msg(&format!("Worktree: {}", e));
+                return;
+            }
+        };
+
+        worktree::setup_worktree(&main_repo, &worktree_path);
+
+        let (cols, rows) = self.last_term_size;
+        let args = vec!["--dangerously-skip-permissions".to_string()];
+        let pending = Self::list_jsonl_files(&worktree_path);
+
+        match Session::new(
+            "claude",
+            &args,
+            cols,
+            rows,
+            Some(worktree_path.clone()),
+            Default::default(),
+        ) {
+            Ok(s) => {
+                let branch = format!("cm/{}", slug);
+                let ts = TerminalSession {
+                    label: "claude".to_string(),
+                    session_type: "claude".to_string(),
+                    session: s,
+                    status: SessionStatus::Running,
+                    last_write_at: None,
+                    session_id: None,
+                    pending_jsonl_files: Some(pending),
+                    hidden: false,
+                    idle_timeout_secs: 0,
+                };
+
+                let new_ti = self.tasks.len();
+                self.tasks.push(TaskEntry {
+                    task_id: None,
+                    name: slug.to_string(),
+                    api_status: TaskStatus::Running,
+                    repo_url: Some(repo_url.clone()),
+                    prompt: Some(prompt.to_string()),
+                    wip_branch: Some(branch.clone()),
+                    session_id: None,
+                    blocked_at: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    worktree_path: Some(worktree_path),
+                    main_repo_path: Some(main_repo),
+                    sessions: vec![ts],
+                    is_cloud: false,
+                });
+
+                self.cursor = Cursor::Session(new_ti, 0);
+                self.view_mode = ViewMode::Sessions;
+
+                self.backend.create_task(slug.to_string(), repo_url, branch);
+                self.save_session_manifest();
+                self.set_status_msg("Task launched");
+            }
+            Err(e) => {
+                self.set_status_msg(&format!("Launch: {}", e));
+            }
+        }
+    }
+
     /// Handle terminal resize.
     pub fn resize_terminals(&mut self, cols: u16, rows: u16) {
         self.last_term_size = (cols, rows);
@@ -1835,46 +2248,58 @@ impl App {
         let content_area = rows[0];
         let bar_area = rows[1];
 
-        let cols =
-            Layout::horizontal([Constraint::Min(40), Constraint::Length(30)])
-                .split(content_area);
+        match self.view_mode {
+            ViewMode::Sessions => {
+                let cols =
+                    Layout::horizontal([Constraint::Min(40), Constraint::Length(30)])
+                        .split(content_area);
 
-        self.draw_terminal(frame, cols[0]);
-        self.draw_session_list(frame, cols[1]);
+                self.draw_terminal(frame, cols[0]);
+                self.draw_session_list(frame, cols[1]);
+            }
+            ViewMode::Planning => {
+                self.planning.draw(frame, content_area);
+            }
+        }
+
         self.draw_status_bar(frame, bar_area);
 
-        // Draw input overlay if active.
-        match &self.input_mode {
-            InputMode::NewSession {
-                label_text,
-                branch_text,
-                repo_url,
-                active_field,
-            } => {
-                self.draw_input_dialog(
-                    frame,
-                    area,
+        // Draw input overlay if active (sessions mode only).
+        if matches!(self.view_mode, ViewMode::Sessions) {
+            match &self.input_mode {
+                InputMode::NewSession {
                     label_text,
                     branch_text,
+                    idle_timeout_text,
                     repo_url,
-                    *active_field,
-                );
-            }
-            InputMode::NewTerminalSession {
-                task_index,
-                session_type,
-            } => {
-                self.draw_new_terminal_dialog(
-                    frame,
-                    area,
-                    *task_index,
+                    active_field,
+                } => {
+                    self.draw_input_dialog(
+                        frame,
+                        area,
+                        label_text,
+                        branch_text,
+                        idle_timeout_text,
+                        repo_url,
+                        *active_field,
+                    );
+                }
+                InputMode::NewTerminalSession {
+                    task_index,
                     session_type,
-                );
+                } => {
+                    self.draw_new_terminal_dialog(
+                        frame,
+                        area,
+                        *task_index,
+                        session_type,
+                    );
+                }
+                InputMode::SessionSettings { name, idle_timeout, hidden, active_field, .. } => {
+                    self.draw_session_settings(frame, area, name, idle_timeout, *hidden, *active_field);
+                }
+                InputMode::Normal => {}
             }
-            InputMode::RenameSession { text, .. } => {
-                self.draw_rename_dialog(frame, area, text);
-            }
-            InputMode::Normal => {}
         }
     }
 
@@ -1884,11 +2309,12 @@ impl App {
         area: Rect,
         label_text: &str,
         branch_text: &str,
+        idle_timeout_text: &str,
         repo_url: &str,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 9u16;
+        let height = 11u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -1916,8 +2342,12 @@ impl App {
             .unwrap_or(repo_url);
 
         let cursor = "\u{2588}";
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+
         let name_cursor = if active_field == 0 { cursor } else { "" };
         let branch_cursor = if active_field == 1 { cursor } else { "" };
+        let timeout_cursor = if active_field == 2 { cursor } else { "" };
 
         let branch_hint = if branch_text.is_empty() && active_field != 1 {
             "main"
@@ -1927,40 +2357,30 @@ impl App {
 
         let lines = vec![
             Line::from(vec![
-                Span::styled(
-                    "  Repo: ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(repo_name, Style::default().fg(Color::White)),
+                Span::styled("    Repo: ", dim),
+                Span::styled(repo_name, white),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled(
-                    "  Name: ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(label_text, Style::default().fg(Color::White)),
-                Span::styled(name_cursor, Style::default().fg(Color::White)),
+                Span::styled("    Name: ", dim),
+                Span::styled(label_text, white),
+                Span::styled(name_cursor, white),
             ]),
             Line::from(vec![
-                Span::styled(
-                    "Branch: ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(branch_text, Style::default().fg(Color::White)),
-                Span::styled(
-                    branch_cursor,
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(
-                    branch_hint,
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("  Branch: ", dim),
+                Span::styled(branch_text, white),
+                Span::styled(branch_cursor, white),
+                Span::styled(branch_hint, dim),
+            ]),
+            Line::from(vec![
+                Span::styled("Idle (s): ", dim),
+                Span::styled(idle_timeout_text, white),
+                Span::styled(timeout_cursor, white),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab switch field \u{00b7} Enter start \u{00b7} Esc cancel",
-                Style::default().fg(Color::DarkGray),
+                dim,
             )),
         ];
 
@@ -1975,7 +2395,7 @@ impl App {
         session_type: &str,
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
-        let height = 8u16;
+        let height = 9u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -2001,61 +2421,46 @@ impl App {
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
-        let claude_indicator = if session_type == "claude" {
-            ">"
-        } else {
-            " "
-        };
-        let bash_indicator = if session_type == "bash" { ">" } else { " " };
-
-        let claude_style = if session_type == "claude" {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let bash_style = if session_type == "bash" {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
+        let options = ["claude", "codex", "bash"];
         let max_name = (width as usize).saturating_sub(8);
         let display_name: String = task_name.chars().take(max_name).collect();
 
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("  Task: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(display_name, Style::default().fg(Color::White)),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {} ", claude_indicator),
-                    claude_style,
-                ),
-                Span::styled("claude", claude_style),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("  {} ", bash_indicator), bash_style),
-                Span::styled("bash", bash_style),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "j/k toggle \u{00b7} Enter start \u{00b7} Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
         ];
+        for opt in &options {
+            let ind = if session_type == *opt { ">" } else { " " };
+            let st = if session_type == *opt {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(format!("  {} {}", ind, opt), st)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "j/k select \u{00b7} Enter start \u{00b7} Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_rename_dialog(&self, frame: &mut Frame, area: Rect, text: &str) {
-        let width = 50u16.min(area.width.saturating_sub(4));
-        let height = 5u16;
+    fn draw_session_settings(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        name: &str,
+        idle_timeout: &str,
+        hidden: bool,
+        active_field: u8,
+    ) {
+        let width = 55u16.min(area.width.saturating_sub(4));
+        let height = 11u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -2066,7 +2471,7 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::White))
             .title(Span::styled(
-                " Rename Session ",
+                " Session Settings ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -2076,16 +2481,36 @@ impl App {
         frame.render_widget(block, dialog_area);
 
         let cursor = "\u{2588}";
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+
+        let name_cursor = if active_field == 0 { cursor } else { "" };
+        let timeout_cursor = if active_field == 1 { cursor } else { "" };
+        let hidden_marker = if hidden { "[x]" } else { "[ ]" };
+        let hidden_style = if active_field == 2 { white } else { dim };
+
         let lines = vec![
             Line::from(vec![
-                Span::styled("  Name: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(text, Style::default().fg(Color::White)),
-                Span::styled(cursor, Style::default().fg(Color::White)),
+                Span::styled("      Name: ", dim),
+                Span::styled(name, white),
+                Span::styled(name_cursor, white),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Idle (s): ", dim),
+                Span::styled(idle_timeout, white),
+                Span::styled(timeout_cursor, white),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("    Hidden: ", dim),
+                Span::styled(hidden_marker, hidden_style),
+                Span::styled(if active_field == 2 { "  Space to toggle" } else { "" }, dim),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "Enter confirm \u{00b7} Esc cancel",
-                Style::default().fg(Color::DarkGray),
+                "Tab next field \u{00b7} Enter save \u{00b7} Esc cancel",
+                dim,
             )),
         ];
 
@@ -2320,7 +2745,7 @@ impl App {
             ("A-n    new", "A-p  push"),
             ("A-s    +session", "A-l  pull"),
             ("A-w    close", "A-v  view"),
-            ("A-e    rename", "A-r  refresh"),
+            ("A-e    settings", "A-r  refresh"),
             ("A-h    hide", "A-q  quit"),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),

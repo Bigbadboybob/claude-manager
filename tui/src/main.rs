@@ -3,6 +3,7 @@ mod app;
 mod backend;
 mod config;
 mod input;
+mod planning;
 mod session;
 mod terminal_widget;
 mod worktree;
@@ -82,9 +83,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             break;
         }
 
-        // Drain events from terminal sessions and backend.
+        // Drain events from terminal sessions, backend, and planning editor.
         app.drain_terminal_events();
         app.drain_backend_events();
+        app.drain_planning_events();
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();
@@ -96,6 +98,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
                 if (term_cols, term_rows) != app.last_term_size {
                     app.resize_terminals(term_cols, term_rows);
                 }
+
+                // Update planning layout before draw.
+                app.planning.update_layout(area.width, area.height);
 
                 app.draw(frame);
             })?;
