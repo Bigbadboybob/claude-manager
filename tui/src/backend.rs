@@ -38,6 +38,25 @@ pub enum BackendCommand {
         repo_url: String,
         wip_branch: String,
     },
+    /// Create a planning task in the DB.
+    CreatePlanTask {
+        project: String,
+        repo_url: String,
+        name: String,
+        description: String,
+        status: String,
+    },
+    /// Update a planning task in the DB.
+    UpdatePlanTask {
+        id: String,
+        fields: HashMap<String, serde_json::Value>,
+    },
+    /// Delete a planning task from the DB.
+    DeletePlanTask {
+        id: String,
+    },
+    /// Fetch all planning tasks (tasks that have a project set).
+    RefreshPlanTasks,
     Shutdown,
 }
 
@@ -63,6 +82,12 @@ pub enum BackendEvent {
         repo_url: String,
         prompt: String,
     },
+    /// Planning tasks updated (all tasks with a project field).
+    PlanTasksUpdated(Vec<Task>),
+    /// A planning task was created — return the full task.
+    PlanTaskCreated(Task),
+    /// A planning task was deleted.
+    PlanTaskDeleted(String),
 }
 
 /// Handle to the background polling thread.
@@ -129,6 +154,35 @@ impl BackendHandle {
             repo_url,
             wip_branch,
         });
+    }
+
+    pub fn create_plan_task(
+        &self,
+        project: String,
+        repo_url: String,
+        name: String,
+        description: String,
+        status: String,
+    ) {
+        let _ = self.cmd_tx.send(BackendCommand::CreatePlanTask {
+            project,
+            repo_url,
+            name,
+            description,
+            status,
+        });
+    }
+
+    pub fn update_plan_task(&self, id: String, fields: HashMap<String, serde_json::Value>) {
+        let _ = self.cmd_tx.send(BackendCommand::UpdatePlanTask { id, fields });
+    }
+
+    pub fn delete_plan_task(&self, id: String) {
+        let _ = self.cmd_tx.send(BackendCommand::DeletePlanTask { id });
+    }
+
+    pub fn refresh_plan_tasks(&self) {
+        let _ = self.cmd_tx.send(BackendCommand::RefreshPlanTasks);
     }
 
     pub fn shutdown(&mut self) {
@@ -213,6 +267,39 @@ fn backend_loop(
                 );
                 do_refresh(&client, &event_tx, &mut was_connected);
             }
+            Ok(BackendCommand::CreatePlanTask {
+                project,
+                repo_url,
+                name,
+                description,
+                status,
+            }) => {
+                do_create_plan_task(
+                    &client, &event_tx, &project, &repo_url, &name, &description, &status,
+                );
+            }
+            Ok(BackendCommand::UpdatePlanTask { id, fields }) => {
+                match client.update_task(&id, &fields) {
+                    Ok(_) => do_refresh_plan_tasks(&client, &event_tx),
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+                    }
+                }
+            }
+            Ok(BackendCommand::DeletePlanTask { id }) => {
+                match client.delete_task(&id) {
+                    Ok(_) => {
+                        let _ = event_tx.send(BackendEvent::PlanTaskDeleted(id));
+                        do_refresh_plan_tasks(&client, &event_tx);
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+                    }
+                }
+            }
+            Ok(BackendCommand::RefreshPlanTasks) => {
+                do_refresh_plan_tasks(&client, &event_tx);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 do_refresh(&client, &event_tx, &mut was_connected);
             }
@@ -258,6 +345,13 @@ fn do_create_task(
         name: Some(name.to_string()),
         prompt: None,
         priority: 0,
+        project: None,
+        slug: None,
+        description: None,
+        difficulty: None,
+        depends: None,
+        source: None,
+        is_cloud: None,
     };
 
     match client.create_task(&body) {
@@ -438,6 +532,13 @@ fn do_push(
             name: Some(name.to_string()),
             prompt: None,
             priority: 0,
+            project: None,
+            slug: None,
+            description: None,
+            difficulty: None,
+            depends: None,
+            source: None,
+            is_cloud: Some(true),
         };
         match client.create_task(&body) {
             Ok(task) => {
@@ -599,4 +700,72 @@ fn do_pull(
         repo_url: task.repo_url,
         prompt: task.name.or(task.prompt).unwrap_or_default(),
     });
+}
+
+/// Create a planning task in the DB.
+fn do_create_plan_task(
+    client: &ApiClient,
+    event_tx: &mpsc::Sender<BackendEvent>,
+    project: &str,
+    repo_url: &str,
+    name: &str,
+    description: &str,
+    status: &str,
+) {
+    let body = TaskCreateBody {
+        repo_url: repo_url.to_string(),
+        repo_branch: "main".to_string(),
+        name: Some(name.to_string()),
+        prompt: None,
+        priority: 0,
+        project: Some(project.to_string()),
+        slug: None, // auto-generated by API
+        description: Some(description.to_string()),
+        difficulty: None,
+        depends: None,
+        source: None,
+        is_cloud: Some(false),
+    };
+
+    match client.create_task(&body) {
+        Ok(task) => {
+            // Set to requested status if not default.
+            if status != "backlog" && !status.is_empty() {
+                let mut fields = HashMap::new();
+                fields.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(status.to_string()),
+                );
+                let _ = client.update_task(&task.id, &fields);
+            }
+            let _ = event_tx.send(BackendEvent::PlanTaskCreated(task));
+        }
+        Err(e) => {
+            let _ = event_tx.send(BackendEvent::ApiError(format!(
+                "Create plan task: {}",
+                e
+            )));
+        }
+    }
+}
+
+/// Refresh planning tasks (all tasks that have a project field).
+fn do_refresh_plan_tasks(
+    client: &ApiClient,
+    event_tx: &mpsc::Sender<BackendEvent>,
+) {
+    // Fetch all tasks and filter to those with a project.
+    // The API doesn't have a "has project" filter, so we fetch all and filter client-side.
+    match client.list_tasks(None) {
+        Ok(tasks) => {
+            let plan_tasks: Vec<Task> = tasks
+                .into_iter()
+                .filter(|t| t.project.is_some())
+                .collect();
+            let _ = event_tx.send(BackendEvent::PlanTasksUpdated(plan_tasks));
+        }
+        Err(e) => {
+            let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+        }
+    }
 }

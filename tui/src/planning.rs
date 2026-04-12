@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::api::Task;
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 
@@ -26,8 +27,8 @@ impl PlanStatus {
     fn from_str(s: &str) -> Self {
         match s {
             "done" => Self::Done,
-            "in_progress" => Self::InProgress,
-            "backlog" => Self::Backlog,
+            "in_progress" | "running" => Self::InProgress,
+            "backlog" | "blocked" => Self::Backlog,
             _ => Self::Draft,
         }
     }
@@ -66,6 +67,7 @@ impl PlanStatus {
 }
 
 pub struct PlanTask {
+    pub id: String,
     pub slug: String,
     pub title: String,
     pub status: PlanStatus,
@@ -73,7 +75,33 @@ pub struct PlanTask {
     pub depends: Vec<String>,
     pub branch: Option<String>,
     pub created: Option<String>,
-    pub body: String,
+    pub description: String,
+    pub prompt: String,
+    pub source: String,
+    pub is_cloud: bool,
+    pub repo_url: String,
+}
+
+impl PlanTask {
+    fn from_api(task: &Task) -> Self {
+        PlanTask {
+            id: task.id.clone(),
+            slug: task.slug.clone().unwrap_or_else(|| task.id[..8].to_string()),
+            title: task.name.clone().unwrap_or_else(|| {
+                task.slug.clone().unwrap_or_else(|| "untitled".to_string())
+            }),
+            status: PlanStatus::from_str(&task.status),
+            difficulty: task.difficulty.map(|d| d as u8),
+            depends: task.depends.clone().unwrap_or_default(),
+            branch: Some(task.repo_branch.clone()),
+            created: Some(task.created_at.clone()),
+            description: task.description.clone().unwrap_or_default(),
+            prompt: task.prompt.clone().unwrap_or_default(),
+            source: task.source.clone(),
+            is_cloud: task.is_cloud,
+            repo_url: task.repo_url.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -128,71 +156,135 @@ pub enum PlanAction {
     },
     SwitchToSessions,
     Quit,
+    CreateTask {
+        project: String,
+        repo_url: String,
+        name: String,
+        description: String,
+        status: String,
+    },
+    UpdateTask {
+        id: String,
+        fields: HashMap<String, serde_json::Value>,
+    },
+    DeleteTask {
+        id: String,
+    },
+    RefreshTasks,
 }
 
-// ── YAML Frontmatter ────────────────────────────────────────
+// ── Temp File Editing ──────────────────────────────────────
 
-#[derive(serde::Deserialize, serde::Serialize, Default)]
-struct Frontmatter {
-    title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    difficulty: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    depends: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    created: Option<String>,
+/// Write a task to a temp file for editing, returns the temp path.
+fn write_temp_task(task: &PlanTask) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("cm-planning");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.md", task.slug));
+
+    let mut yaml_parts = vec![
+        format!("title: {}", task.title),
+        format!("status: {}", task.status.as_str()),
+    ];
+    if let Some(d) = task.difficulty {
+        yaml_parts.push(format!("difficulty: {}", d));
+    }
+    if !task.depends.is_empty() {
+        yaml_parts.push(format!("depends: [{}]", task.depends.join(", ")));
+    }
+    if let Some(ref branch) = task.branch {
+        yaml_parts.push(format!("branch: {}", branch));
+    }
+
+    let body = if task.description.is_empty() && task.prompt.is_empty() {
+        "## Description\n\n\n\n## Prompt\n".to_string()
+    } else {
+        let mut body = String::new();
+        if !task.description.is_empty() {
+            body.push_str(&task.description);
+        } else {
+            body.push_str("## Description\n");
+        }
+        if !task.prompt.is_empty() {
+            if !body.contains("## Prompt") {
+                body.push_str("\n\n## Prompt\n");
+            }
+            body.push_str(&task.prompt);
+        }
+        body
+    };
+
+    let content = format!("---\n{}\n---\n\n{}", yaml_parts.join("\n"), body);
+    std::fs::write(&path, content).ok()?;
+    Some(path)
 }
 
-fn parse_task_file(path: &Path) -> Option<PlanTask> {
+/// Parse a temp task file back into field updates.
+fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
     let content = std::fs::read_to_string(path).ok()?;
-    let slug = path.file_stem()?.to_str()?.to_string();
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return Some(PlanTask {
-            title: slug.replace('-', " "),
-            slug,
-            status: PlanStatus::Draft,
-            difficulty: None,
-            depends: vec![],
-            branch: None,
-            created: None,
-            body: content,
-        });
+        return None;
     }
     let after_first = &trimmed[3..];
     let end_idx = after_first.find("\n---")?;
     let yaml_str = &after_first[..end_idx];
     let body = after_first[end_idx + 4..].trim().to_string();
+
+    #[derive(serde::Deserialize)]
+    struct Frontmatter {
+        title: String,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        difficulty: Option<u8>,
+        #[serde(default)]
+        depends: Option<Vec<String>>,
+        #[serde(default)]
+        branch: Option<String>,
+    }
+
     let front: Frontmatter = serde_yaml::from_str(yaml_str).ok()?;
-    Some(PlanTask {
-        slug,
+
+    // Extract prompt section from body.
+    let mut in_prompt = false;
+    let mut prompt_lines = vec![];
+    let mut desc_lines = vec![];
+    for line in body.lines() {
+        if line.starts_with("## Prompt") {
+            in_prompt = true;
+            continue;
+        }
+        if in_prompt {
+            if line.starts_with("## ") {
+                in_prompt = false;
+                desc_lines.push(line);
+            } else {
+                prompt_lines.push(line);
+            }
+        } else {
+            desc_lines.push(line);
+        }
+    }
+
+    Some(TempTaskParsed {
         title: front.title,
-        status: PlanStatus::from_str(front.status.as_deref().unwrap_or("draft")),
+        status: front.status.unwrap_or_else(|| "draft".to_string()),
         difficulty: front.difficulty,
         depends: front.depends.unwrap_or_default(),
         branch: front.branch,
-        created: front.created,
-        body,
+        description: desc_lines.join("\n").trim().to_string(),
+        prompt: prompt_lines.join("\n").trim().to_string(),
     })
 }
 
-fn write_task_file(task: &PlanTask, dir: &Path) {
-    let front = Frontmatter {
-        title: task.title.clone(),
-        status: Some(task.status.as_str().to_string()),
-        difficulty: task.difficulty,
-        depends: if task.depends.is_empty() { None } else { Some(task.depends.clone()) },
-        branch: task.branch.clone(),
-        created: task.created.clone(),
-    };
-    let yaml = serde_yaml::to_string(&front).unwrap_or_default();
-    let content = format!("---\n{}---\n\n{}", yaml, task.body);
-    let path = dir.join(format!("{}.md", task.slug));
-    let _ = std::fs::write(path, content);
+struct TempTaskParsed {
+    title: String,
+    status: String,
+    difficulty: Option<u8>,
+    depends: Vec<String>,
+    branch: Option<String>,
+    description: String,
+    prompt: String,
 }
 
 // ── Layout Persistence ──────────────────────────────────────
@@ -242,7 +334,7 @@ fn save_layout(layout: &GridLayout, project_path: &Path) {
     }
 }
 
-// ── Project Discovery ───────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -250,78 +342,6 @@ fn home_dir() -> Option<PathBuf> {
 
 fn projects_dir() -> PathBuf {
     home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".cm/projects")
-}
-
-fn discover_projects() -> Vec<PlanProject> {
-    let base = projects_dir();
-    if !base.is_dir() { return vec![]; }
-    let mut projects = vec![];
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.join("tasks").is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    projects.push(PlanProject { name: name.to_string(), path: path.clone() });
-                }
-            }
-        }
-    }
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
-    projects
-}
-
-fn load_project_tasks(project: &PlanProject) -> Vec<PlanTask> {
-    let tasks_dir = project.path.join("tasks");
-    if !tasks_dir.is_dir() { return vec![]; }
-    let mut tasks = vec![];
-    if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Some(task) = parse_task_file(&path) {
-                    tasks.push(task);
-                }
-            }
-        }
-    }
-    tasks
-}
-
-// ── Helpers ─────────────────────────────────────────────────
-
-fn slugify(title: &str) -> String {
-    let mut result = String::new();
-    let mut last_was_hyphen = true;
-    for c in title.to_lowercase().chars() {
-        if c.is_alphanumeric() { result.push(c); last_was_hyphen = false; }
-        else if !last_was_hyphen { result.push('-'); last_was_hyphen = true; }
-    }
-    result.trim_end_matches('-').chars().take(50).collect()
-}
-
-fn extract_prompt(body: &str) -> Option<String> {
-    let mut in_prompt = false;
-    let mut lines = vec![];
-    for line in body.lines() {
-        if line.starts_with("## Prompt") { in_prompt = true; continue; }
-        if in_prompt {
-            if line.starts_with("## ") { break; }
-            lines.push(line);
-        }
-    }
-    let text = lines.join("\n").trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-fn today_str() -> String {
-    std::process::Command::new("date").arg("+%Y-%m-%d").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn save_last_project(_name: &str) {
-    // No longer used for single-project tracking, but keep for compat.
 }
 
 /// Parse a dependency reference: "slug" (same project) or "project/slug" (cross-project).
@@ -358,6 +378,24 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
     layout.columns.retain(|col| !col.is_empty());
 }
 
+/// Ensure project directory exists for layout persistence.
+fn ensure_project_dir(project_name: &str) -> PathBuf {
+    let path = projects_dir().join(project_name);
+    let _ = std::fs::create_dir_all(&path);
+    path
+}
+
+// ── REPOS mapping (matches dispatch/config.py) ─────────────
+
+fn repo_url_for_project(project: &str) -> String {
+    // Known repos — keep in sync with dispatch/config.py REPOS.
+    match project {
+        "predictionTrading" => "https://github.com/Bigbadboybob/predictionTrading.git".to_string(),
+        "claude-manager" => "https://github.com/Bigbadboybob/claude-manager.git".to_string(),
+        _ => format!("https://github.com/Bigbadboybob/{}.git", project),
+    }
+}
+
 // ── PlanningView ────────────────────────────────────────────
 
 pub struct PlanningView {
@@ -380,6 +418,7 @@ pub struct PlanningView {
     editor: Option<Session>,
     editing_slug: Option<String>,
     editing_project_idx: Option<usize>,
+    editing_temp_path: Option<PathBuf>,
     input_mode: PlanInputMode,
     pub needs_redraw: bool,
     last_editor_size: (u16, u16),
@@ -388,9 +427,8 @@ pub struct PlanningView {
 
 impl PlanningView {
     pub fn new() -> Self {
-        let projects = discover_projects();
-        let mut view = PlanningView {
-            projects: projects.clone(),
+        PlanningView {
+            projects: vec![],
             project_data: vec![],
             project_filter: None,
             unified_cols: vec![],
@@ -404,23 +442,44 @@ impl PlanningView {
             editor: None,
             editing_slug: None,
             editing_project_idx: None,
+            editing_temp_path: None,
             input_mode: PlanInputMode::Normal,
             needs_redraw: true,
             last_editor_size: (80, 24),
             initialized: false,
-        };
-        view.reload_all();
-        view
+        }
     }
 
-    fn reload_all(&mut self) {
+    /// Update planning data from API tasks. Called when BackendEvent::PlanTasksUpdated arrives.
+    pub fn update_from_api(&mut self, api_tasks: Vec<Task>) {
+        // Group tasks by project.
+        let mut by_project: HashMap<String, Vec<PlanTask>> = HashMap::new();
+        for task in &api_tasks {
+            if let Some(ref project) = task.project {
+                by_project.entry(project.clone())
+                    .or_default()
+                    .push(PlanTask::from_api(task));
+            }
+        }
+
+        // Discover projects from the API data.
+        let mut project_names: Vec<String> = by_project.keys().cloned().collect();
+        project_names.sort();
+
+        self.projects = project_names.iter().map(|name| {
+            let path = ensure_project_dir(name);
+            PlanProject { name: name.clone(), path }
+        }).collect();
+
         self.project_data.clear();
         for project in &self.projects {
-            let tasks = load_project_tasks(project);
+            let tasks = by_project.remove(&project.name).unwrap_or_default();
             let mut layout = load_layout(&project.path);
             sync_layout_with_tasks(&mut layout, &tasks);
+            save_layout(&layout, &project.path);
             self.project_data.push(ProjectData { project: project.clone(), tasks, layout });
         }
+
         self.rebuild_unified_cols();
         self.recompute_conflicts();
         if !self.initialized {
@@ -429,6 +488,85 @@ impl PlanningView {
             self.initialized = true;
         }
         self.clamp_cursor();
+        self.needs_redraw = true;
+    }
+
+    /// Handle a single task being created via the API.
+    pub fn on_task_created(&mut self, task: Task) {
+        if let Some(ref project_name) = task.project {
+            let plan_task = PlanTask::from_api(&task);
+            let slug = plan_task.slug.clone();
+
+            // Find or create the project.
+            let pi = match self.project_data.iter().position(|pd| pd.project.name == *project_name) {
+                Some(i) => i,
+                None => {
+                    let path = ensure_project_dir(project_name);
+                    let project = PlanProject { name: project_name.clone(), path };
+                    self.projects.push(project.clone());
+                    self.project_data.push(ProjectData {
+                        project,
+                        tasks: vec![],
+                        layout: GridLayout::default(),
+                    });
+                    self.project_data.len() - 1
+                }
+            };
+
+            self.project_data[pi].tasks.push(plan_task);
+
+            // Add to layout at cursor position if cursor is in this project.
+            let ci = self.unified_cols.get(self.cursor.col)
+                .filter(|(p, _)| *p == pi)
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| {
+                    if self.project_data[pi].layout.columns.is_empty() {
+                        self.project_data[pi].layout.columns.push(vec![]);
+                    }
+                    0
+                });
+            let insert_at = if self.cursor_project_idx() == Some(pi) {
+                (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len())
+            } else {
+                self.project_data[pi].layout.columns[ci].len()
+            };
+            self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Task(slug));
+            save_layout(&self.project_data[pi].layout, &self.project_data[pi].project.path);
+            self.rebuild_unified_cols();
+            self.recompute_conflicts();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Handle a task being deleted via the API.
+    pub fn on_task_deleted(&mut self, task_id: &str) {
+        for pd in &mut self.project_data {
+            if let Some(ti) = pd.tasks.iter().position(|t| t.id == task_id) {
+                let slug = pd.tasks[ti].slug.clone();
+                pd.tasks.remove(ti);
+                for col in &mut pd.layout.columns {
+                    col.retain(|item| !matches!(item, GridItem::Task(s) if s == &slug));
+                }
+                save_layout(&pd.layout, &pd.project.path);
+                break;
+            }
+        }
+        self.rebuild_unified_cols();
+        self.recompute_conflicts();
+        self.clamp_cursor();
+        self.needs_redraw = true;
+    }
+
+    /// Mark a task as done by project name and slug. Called from sessions view.
+    pub fn mark_task_done(&mut self, project_name: &str, slug: &str) {
+        for pd in &mut self.project_data {
+            if pd.project.name == project_name {
+                if let Some(task) = pd.tasks.iter_mut().find(|t| t.slug == slug) {
+                    task.status = PlanStatus::Done;
+                }
+                return;
+            }
+        }
     }
 
     fn rebuild_unified_cols(&mut self) {
@@ -539,7 +677,6 @@ impl PlanningView {
         }
     }
 
-    /// Snap cursor to nearest selectable item (task or separator, not empty).
     fn snap_cursor_to_selectable(&mut self, direction: i32) {
         if let Some(col) = self.cursor_column() {
             if col.is_empty() { return; }
@@ -563,7 +700,6 @@ impl PlanningView {
         pi != prev_pi
     }
 
-    /// Returns (start_row, end_row) inclusive of the visual selection, or None.
     fn visual_range(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
         Some((anchor.min(self.cursor.row), anchor.max(self.cursor.row)))
@@ -583,27 +719,10 @@ impl PlanningView {
 
     // ── Navigation ──────────────────────────────────────────
 
-    /// Check if an item at (global_col, row) is a task (selectable).
-    fn is_task_at(&self, gcol: usize, row: usize) -> bool {
-        if let Some(&(pi, ci)) = self.unified_cols.get(gcol) {
-            matches!(
-                self.project_data[pi].layout.columns[ci].get(row),
-                Some(GridItem::Task(_))
-            )
-        } else {
-            false
-        }
-    }
-
     fn navigate_vertical(&mut self, direction: i32) {
         if self.unified_cols.is_empty() { return; }
         let prev_slug = self.selected_slug().map(|s| s.to_string());
-
-        // In visual mode, move one row at a time (don't skip) so the user
-        // can precisely define the selection range.
         let in_visual = self.visual_anchor.is_some();
-
-        // Selectable: tasks and separators. Skip only Empty.
         let is_selectable = |item: &GridItem| !matches!(item, GridItem::Empty);
 
         if self.linear_mode && !in_visual {
@@ -628,12 +747,10 @@ impl PlanningView {
             };
             let len = col.len() as i32;
             if in_visual {
-                // Raw move, one row at a time, clamped (no wrap).
                 let next = self.cursor.row as i32 + direction;
                 if next < 0 || next >= len { return; }
                 self.cursor.row = next as usize;
             } else {
-                // Skip Empty items, stop on tasks and separators.
                 let mut next = self.cursor.row as i32;
                 for _ in 0..col.len() {
                     next = (next + direction).rem_euclid(len);
@@ -645,7 +762,6 @@ impl PlanningView {
             }
         }
         self.ensure_cursor_visible();
-        // Reset detail scroll when switching tasks.
         if self.selected_slug().map(|s| s.to_string()) != prev_slug {
             self.detail_scroll = 0;
         }
@@ -657,7 +773,6 @@ impl PlanningView {
         let len = self.unified_cols.len() as i32;
         let next = (self.cursor.col as i32 + direction).rem_euclid(len) as usize;
         self.cursor.col = next;
-        // Clamp row, then snap to nearest task.
         if let Some(col) = self.cursor_column() {
             if col.is_empty() { self.cursor.row = 0; }
             else if self.cursor.row >= col.len() { self.cursor.row = col.len() - 1; }
@@ -713,7 +828,7 @@ impl PlanningView {
                         self.input_mode = PlanInputMode::NewProject { name: String::new() };
                         return PlanAction::Consumed;
                     }
-                    KeyCode::Char('s') | KeyCode::Char('S') => { self.cycle_status(false); return PlanAction::Consumed; }
+                    KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
                     _ => {}
                 }
             }
@@ -730,7 +845,6 @@ impl PlanningView {
                     KeyCode::Backspace => { self.remove_separator(); return PlanAction::Consumed; }
                     KeyCode::Char('c') => { self.add_column(); return PlanAction::Consumed; }
                     KeyCode::Char('v') => {
-                        // Toggle visual selection mode.
                         if self.visual_anchor.is_some() {
                             self.cancel_visual();
                         } else {
@@ -744,7 +858,7 @@ impl PlanningView {
                         self.clamp_cursor();
                         return PlanAction::Consumed;
                     }
-                    KeyCode::Char('e') => { self.cancel_visual(); self.start_editor(); return PlanAction::Consumed; }
+                    KeyCode::Char('e') => { self.cancel_visual(); return self.start_editor(); }
                     KeyCode::Char('n') => {
                         self.cancel_visual();
                         if self.projects.is_empty() {
@@ -755,10 +869,11 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('o') => { self.sort_column_by_status(); return PlanAction::Consumed; }
-                    KeyCode::Char('s') => { self.cycle_status(true); return PlanAction::Consumed; }
-                    KeyCode::Char('d') => { self.cancel_visual(); self.delete_task(); return PlanAction::Consumed; }
+                    KeyCode::Char('s') => { return self.cycle_status(true); }
+                    KeyCode::Char('d') => { self.cancel_visual(); return self.delete_task(); }
                     KeyCode::Char('x') => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('l') if self.linear_mode => { self.cancel_visual(); return self.start_launch(); }
+                    KeyCode::Char('r') => { return PlanAction::RefreshTasks; }
                     KeyCode::Char('p') => {
                         self.cancel_visual();
                         let current = self.project_filter.map(|i| i + 1).unwrap_or(0);
@@ -774,7 +889,6 @@ impl PlanningView {
                 }
             }
 
-            // Plain key scrolling — detail panel.
             match key.code {
                 KeyCode::PageDown => {
                     self.detail_scroll = self.detail_scroll.saturating_add(
@@ -805,7 +919,6 @@ impl PlanningView {
                 _ => {}
             }
 
-            // Esc cancels visual mode.
             if self.visual_anchor.is_some() {
                 if let KeyCode::Esc = key.code {
                     self.cancel_visual();
@@ -818,8 +931,7 @@ impl PlanningView {
 
     fn handle_editing_event(&mut self, event: &CrosstermEvent) -> PlanAction {
         if self.editor.as_ref().map_or(false, |e| e.exited) {
-            self.stop_editor();
-            return PlanAction::Consumed;
+            return self.stop_editor();
         }
         if let CrosstermEvent::Key(key) = event {
             if key.modifiers.contains(KeyModifiers::ALT) {
@@ -880,7 +992,7 @@ impl PlanningView {
                 KeyCode::Enter => {
                     if !title.trim().is_empty() {
                         self.input_mode = PlanInputMode::Normal;
-                        self.create_task(&title);
+                        return self.create_task(&title);
                     }
                 }
                 KeyCode::Backspace => { title.pop(); self.input_mode = PlanInputMode::NewTask { title }; }
@@ -903,7 +1015,10 @@ impl PlanningView {
                     let trimmed = name.trim().to_string();
                     if !trimmed.is_empty() {
                         self.input_mode = PlanInputMode::Normal;
-                        self.create_project(&trimmed);
+                        // Create the project directory locally for layout storage.
+                        ensure_project_dir(&trimmed);
+                        // Show a "new task" prompt for the new project.
+                        self.input_mode = PlanInputMode::NewTask { title: String::new() };
                     }
                 }
                 KeyCode::Backspace => { name.pop(); self.input_mode = PlanInputMode::NewProject { name }; }
@@ -920,7 +1035,7 @@ impl PlanningView {
                 PlanInputMode::ProjectPicker { selected } => selected,
                 _ => return PlanAction::Consumed,
             };
-            let max = self.projects.len(); // 0 = All, 1..=max = projects
+            let max = self.projects.len();
             match key.code {
                 KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -962,7 +1077,11 @@ impl PlanningView {
                     if let Some(pd) = self.project_data.get_mut(project_idx) {
                         if let Some(task) = pd.tasks.get_mut(task_idx) {
                             let project = pd.project.name.clone();
-                            let prompt = extract_prompt(&task.body).unwrap_or_else(|| task.title.clone());
+                            let prompt = if task.prompt.is_empty() {
+                                task.title.clone()
+                            } else {
+                                task.prompt.clone()
+                            };
                             let slug = task.slug.clone();
                             let branch = if branch_text.trim().is_empty() {
                                 None
@@ -970,8 +1089,6 @@ impl PlanningView {
                                 Some(branch_text.trim().to_string())
                             };
                             task.status = PlanStatus::InProgress;
-                            let dir = pd.project.path.join("tasks");
-                            write_task_file(task, &dir);
                             return PlanAction::LaunchTask { project, slug, prompt, branch, autostart: false };
                         }
                     }
@@ -992,8 +1109,6 @@ impl PlanningView {
 
     // ── Task / Grid Operations ──────────────────────────────
 
-    /// Stable sort the current column by status: done → in_progress → backlog → draft.
-    /// Separators and empty rows stay in place as group boundaries.
     fn sort_column_by_status(&mut self) {
         let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
             Some(v) => *v,
@@ -1003,7 +1118,6 @@ impl PlanningView {
         let tasks = &self.project_data[pi].tasks;
         let col = &self.project_data[pi].layout.columns[ci];
 
-        // Collect task positions, slugs, and status sort keys.
         let task_entries: Vec<(usize, u8, GridItem)> = col.iter().enumerate()
             .filter_map(|(ri, item)| {
                 if let GridItem::Task(slug) = item {
@@ -1023,19 +1137,16 @@ impl PlanningView {
             })
             .collect();
 
-        // Already sorted? Nothing to do.
         if task_entries.windows(2).all(|w| w[0].1 <= w[1].1) {
             return;
         }
 
         let task_positions: Vec<usize> = task_entries.iter().map(|(ri, _, _)| *ri).collect();
 
-        // Stable sort by status key.
         let mut indices: Vec<usize> = (0..task_entries.len()).collect();
         indices.sort_by_key(|&i| task_entries[i].1);
         let sorted: Vec<GridItem> = indices.iter().map(|&i| task_entries[i].2.clone()).collect();
 
-        // Place sorted tasks back into their original positions.
         let col = &mut self.project_data[pi].layout.columns[ci];
         for (slot, item) in task_positions.iter().zip(sorted) {
             col[*slot] = item;
@@ -1045,30 +1156,20 @@ impl PlanningView {
         self.recompute_conflicts();
     }
 
-    /// Mark a task as done by project name and slug. Called from sessions view.
-    pub fn mark_task_done(&mut self, project_name: &str, slug: &str) {
-        for pd in &mut self.project_data {
-            if pd.project.name == project_name {
-                if let Some(task) = pd.tasks.iter_mut().find(|t| t.slug == slug) {
-                    task.status = PlanStatus::Done;
-                    let dir = pd.project.path.join("tasks");
-                    write_task_file(task, &dir);
-                }
-                return;
-            }
-        }
-    }
-
-    fn cycle_status(&mut self, forward: bool) {
+    fn cycle_status(&mut self, forward: bool) -> PlanAction {
         if let Some((pi, ti)) = self.selected_task_loc() {
             let task = &mut self.project_data[pi].tasks[ti];
             let new_status = if forward { task.status.next() } else { task.status.prev() };
             if new_status != task.status {
                 task.status = new_status;
-                let dir = self.project_data[pi].project.path.join("tasks");
-                write_task_file(&self.project_data[pi].tasks[ti], &dir);
+                let id = task.id.clone();
+                let status_str = task.status.as_str().to_string();
+                let mut fields = HashMap::new();
+                fields.insert("status".to_string(), serde_json::json!(status_str));
+                return PlanAction::UpdateTask { id, fields };
             }
         }
+        PlanAction::Consumed
     }
 
     fn reorder_task(&mut self, direction: i32) {
@@ -1080,10 +1181,8 @@ impl PlanningView {
         if col.is_empty() { return; }
 
         if let Some((range_start, range_end)) = self.visual_range() {
-            // Visual block move.
             self.move_visual_block(pi, ci, range_start, range_end, direction);
         } else {
-            // Single item move.
             let ri = self.cursor.row;
             let target = ri as i32 + direction;
             if target < 0 { return; }
@@ -1099,32 +1198,25 @@ impl PlanningView {
         self.ensure_cursor_visible();
     }
 
-    /// Move a contiguous block of items up or down by one position.
     fn move_visual_block(&mut self, pi: usize, ci: usize, start: usize, end: usize, direction: i32) {
         let col = &mut self.project_data[pi].layout.columns[ci];
 
         if direction > 0 {
-            // Move block down: the item below the block moves above it.
             let below = end + 1;
-            // Extend with Empty if needed.
             while below >= col.len() {
                 col.push(GridItem::Empty);
             }
-            // Rotate: move item at `below` to `start`, shifting block down by 1.
             let item = col.remove(below);
             col.insert(start, item);
-            // Shift cursor and anchor down.
             self.cursor.row += 1;
             if let Some(ref mut anchor) = self.visual_anchor {
                 *anchor += 1;
             }
         } else {
-            // Move block up: the item above the block moves below it.
             if start == 0 { return; }
             let above = start - 1;
             let item = col.remove(above);
             col.insert(end, item);
-            // Shift cursor and anchor up.
             self.cursor.row -= 1;
             if let Some(ref mut anchor) = self.visual_anchor {
                 *anchor -= 1;
@@ -1146,7 +1238,7 @@ impl PlanningView {
         if target_gcol < 0 || target_gcol >= self.unified_cols.len() as i32 { return; }
         let target_gcol = target_gcol as usize;
         let (dst_pi, dst_ci) = self.unified_cols[target_gcol];
-        if src_pi != dst_pi { return; } // Can't move between projects.
+        if src_pi != dst_pi { return; }
 
         let item = self.project_data[src_pi].layout.columns[src_ci].remove(self.cursor.row);
         let insert_at = self.cursor.row.min(self.project_data[dst_pi].layout.columns[dst_ci].len());
@@ -1204,74 +1296,38 @@ impl PlanningView {
         }
     }
 
-    fn create_task(&mut self, title: &str) {
-        // Create in the project under the cursor, or first visible project.
+    fn create_task(&mut self, title: &str) -> PlanAction {
+        // Determine the project for the new task.
         let pi = self.cursor_project_idx()
             .or_else(|| self.unified_cols.first().map(|(pi, _)| *pi))
             .unwrap_or(0);
-        if pi >= self.project_data.len() { return; }
 
-        let base_slug = slugify(title);
-        if base_slug.is_empty() { return; }
-        let mut slug = base_slug.clone();
-        let mut n = 2;
-        while self.project_data[pi].tasks.iter().any(|t| t.slug == slug) {
-            slug = format!("{}-{}", base_slug, n);
-            n += 1;
+        if pi >= self.project_data.len() {
+            return PlanAction::Consumed;
         }
 
-        let created = today_str();
-        let template = format!(
-            "---\ntitle: {}\n# status: draft | backlog | in_progress | done\nstatus: draft\n# difficulty: 1-10\n# depends: []\n# branch: main\ncreated: {}\n---\n\n## Description\n\n\n\n## Prompt\n\n",
-            title, created
-        );
+        let project = self.project_data[pi].project.name.clone();
+        let repo_url = repo_url_for_project(&project);
 
-        let tasks_dir = self.project_data[pi].project.path.join("tasks");
-        let _ = std::fs::create_dir_all(&tasks_dir);
-        let path = tasks_dir.join(format!("{}.md", slug));
-        let _ = std::fs::write(&path, &template);
-
-        let task = PlanTask {
-            slug: slug.clone(), title: title.to_string(), status: PlanStatus::Draft,
-            difficulty: None, depends: vec![], branch: None, created: Some(created),
-            body: "## Description\n\n\n\n## Prompt\n".to_string(),
-        };
-        self.project_data[pi].tasks.push(task);
-
-        // Insert into layout at cursor position.
-        let (_, ci) = self.unified_cols.get(self.cursor.col).copied()
-            .filter(|(p, _)| *p == pi)
-            .unwrap_or_else(|| {
-                if self.project_data[pi].layout.columns.is_empty() {
-                    self.project_data[pi].layout.columns.push(vec![]);
-                }
-                (pi, 0)
-            });
-        let insert_at = (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len());
-        self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Task(slug));
-        self.save_project_layout(pi);
-        self.rebuild_unified_cols();
-        // Find the new item in unified cols.
-        for (gi, &(gpi, gci)) in self.unified_cols.iter().enumerate() {
-            if gpi == pi && gci == ci {
-                self.cursor.col = gi;
-                self.cursor.row = insert_at;
-                break;
-            }
+        PlanAction::CreateTask {
+            project,
+            repo_url,
+            name: title.to_string(),
+            description: String::new(),
+            status: "draft".to_string(),
         }
-        self.recompute_conflicts();
-        self.start_editor();
     }
 
-    fn delete_task(&mut self) {
+    fn delete_task(&mut self) -> PlanAction {
         let (pi, ti) = match self.selected_task_loc() {
             Some(v) => v,
-            None => return,
+            None => return PlanAction::Consumed,
         };
-        let slug = self.project_data[pi].tasks[ti].slug.clone();
-        let dir = self.project_data[pi].project.path.join("tasks");
-        let _ = std::fs::remove_file(dir.join(format!("{}.md", slug)));
+        let task = &self.project_data[pi].tasks[ti];
+        let id = task.id.clone();
+        let slug = task.slug.clone();
 
+        // Remove from local layout immediately for responsive UI.
         for col in &mut self.project_data[pi].layout.columns {
             col.retain(|item| !matches!(item, GridItem::Task(s) if s == &slug));
         }
@@ -1280,51 +1336,96 @@ impl PlanningView {
         self.rebuild_unified_cols();
         self.recompute_conflicts();
         self.clamp_cursor();
+
+        PlanAction::DeleteTask { id }
     }
 
-    fn start_editor(&mut self) {
-        let (pi, slug, file_path) = match self.selected_task_loc() {
-            Some((pi, ti)) => {
-                let pd = &self.project_data[pi];
-                let slug = pd.tasks[ti].slug.clone();
-                let path = pd.project.path.join("tasks").join(format!("{}.md", slug));
-                (pi, slug, path)
-            }
-            None => return,
+    fn start_editor(&mut self) -> PlanAction {
+        let (pi, ti) = match self.selected_task_loc() {
+            Some(v) => v,
+            None => return PlanAction::Consumed,
         };
-        if !file_path.exists() { return; }
+        let task = &self.project_data[pi].tasks[ti];
+        let slug = task.slug.clone();
+
+        // Write task to temp file for editing.
+        let temp_path = match write_temp_task(task) {
+            Some(p) => p,
+            None => return PlanAction::Consumed,
+        };
 
         let editor_cmd = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
         let parts: Vec<&str> = editor_cmd.split_whitespace().collect();
         let program = parts[0];
         let mut args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-        args.push(file_path.to_string_lossy().to_string());
+        args.push(temp_path.to_string_lossy().to_string());
 
         let (cols, rows) = self.last_editor_size;
         if let Ok(s) = Session::new(program, &args, cols, rows, None, Default::default()) {
             self.editing_slug = Some(slug);
             self.editing_project_idx = Some(pi);
+            self.editing_temp_path = Some(temp_path);
             self.editor = Some(s);
             self.input_mode = PlanInputMode::Editing;
         }
+        PlanAction::Consumed
     }
 
-    fn stop_editor(&mut self) {
+    fn stop_editor(&mut self) -> PlanAction {
         self.editor = None;
         self.input_mode = PlanInputMode::Normal;
-        if let (Some(slug), Some(pi)) = (self.editing_slug.clone(), self.editing_project_idx) {
-            if let Some(pd) = self.project_data.get_mut(pi) {
-                let path = pd.project.path.join("tasks").join(format!("{}.md", slug));
-                if let Some(updated) = parse_task_file(&path) {
-                    if let Some(task) = pd.tasks.iter_mut().find(|t| t.slug == slug) {
-                        *task = updated;
+
+        let mut action = PlanAction::Consumed;
+
+        if let (Some(slug), Some(pi), Some(ref temp_path)) = (
+            self.editing_slug.clone(),
+            self.editing_project_idx,
+            &self.editing_temp_path.clone(),
+        ) {
+            if let Some(parsed) = parse_temp_task(temp_path) {
+                if let Some(task) = self.project_data.get_mut(pi)
+                    .and_then(|pd| pd.tasks.iter_mut().find(|t| t.slug == slug))
+                {
+                    // Update local state.
+                    task.title = parsed.title.clone();
+                    task.status = PlanStatus::from_str(&parsed.status);
+                    task.difficulty = parsed.difficulty;
+                    task.depends = parsed.depends.clone();
+                    task.branch = parsed.branch.clone();
+                    task.description = parsed.description.clone();
+                    task.prompt = parsed.prompt.clone();
+
+                    // Build fields for API update.
+                    let mut fields = HashMap::new();
+                    fields.insert("name".to_string(), serde_json::json!(parsed.title));
+                    fields.insert("status".to_string(), serde_json::json!(parsed.status));
+                    fields.insert("description".to_string(), serde_json::json!(parsed.description));
+                    fields.insert("prompt".to_string(), serde_json::json!(parsed.prompt));
+                    if let Some(d) = parsed.difficulty {
+                        fields.insert("difficulty".to_string(), serde_json::json!(d));
                     }
+                    if !parsed.depends.is_empty() {
+                        fields.insert("depends".to_string(), serde_json::json!(parsed.depends));
+                    }
+                    if let Some(ref branch) = parsed.branch {
+                        fields.insert("repo_branch".to_string(), serde_json::json!(branch));
+                    }
+
+                    action = PlanAction::UpdateTask {
+                        id: task.id.clone(),
+                        fields,
+                    };
                 }
             }
+            // Clean up temp file.
+            let _ = std::fs::remove_file(temp_path);
         }
+
         self.editing_slug = None;
         self.editing_project_idx = None;
+        self.editing_temp_path = None;
         self.recompute_conflicts();
+        action
     }
 
     fn start_launch(&mut self) -> PlanAction {
@@ -1343,7 +1444,7 @@ impl PlanningView {
             for (ri, item) in col.iter().enumerate() {
                 if let GridItem::Task(slug) = item {
                     if let Some(task) = self.project_data[pi].tasks.iter().find(|t| t.slug == *slug) {
-                        if task.title.to_lowercase().contains(&q) || task.body.to_lowercase().contains(&q) {
+                        if task.title.to_lowercase().contains(&q) || task.description.to_lowercase().contains(&q) {
                             self.cursor.col = gi;
                             self.cursor.row = ri;
                             self.ensure_cursor_visible();
@@ -1353,14 +1454,6 @@ impl PlanningView {
                 }
             }
         }
-    }
-
-    fn create_project(&mut self, name: &str) {
-        let path = projects_dir().join(name);
-        if std::fs::create_dir_all(path.join("tasks")).is_err() { return; }
-        self.projects = discover_projects();
-        self.initialized = false;
-        self.reload_all();
     }
 
     pub fn drain_editor_events(&mut self) -> bool {
@@ -1375,7 +1468,8 @@ impl PlanningView {
             }
         }
         if self.editor.as_ref().map_or(false, |e| e.exited) {
-            self.stop_editor();
+            // Note: stop_editor returns a PlanAction but we can't return it from here.
+            // The action will be picked up on the next handle_event call via handle_editing_event.
             had_event = true;
         }
         had_event
@@ -1442,7 +1536,6 @@ impl PlanningView {
         let col_width = inner.width / num_cols as u16;
         let dim = Style::default().fg(Color::DarkGray);
 
-        // Render each column.
         for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
             let pd = &self.project_data[pi];
             let column = &pd.layout.columns[ci];
@@ -1453,7 +1546,6 @@ impl PlanningView {
                 col_width.saturating_sub(1)
             };
 
-            // Always reserve first row for project header so all columns align.
             let show_headers = self.project_filter.is_none();
             if show_headers && self.is_first_col_of_project(gi) {
                 let name_display: String = pd.project.name.chars().take(w as usize).collect();
@@ -1469,9 +1561,8 @@ impl PlanningView {
             frame.render_widget(List::new(items), col_area);
         }
 
-        // Empty state.
         if self.unified_cols.is_empty() {
-            let msg = if self.projects.is_empty() { "Alt+n to create project" } else { "Alt+n to create task" };
+            let msg = if self.projects.is_empty() { "Alt+Shift+p to create project" } else { "Alt+n to create task" };
             frame.render_widget(
                 Paragraph::new(Span::styled(format!(" {}", msg), dim)),
                 Rect::new(inner.x, inner.y, inner.width, 1),
@@ -1512,7 +1603,7 @@ impl PlanningView {
                 dim,
             )),
             Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-s status \u{00b7} A-d del \u{00b7} A-x launch \u{00b7} A-c col \u{00b7} A-Ent sep \u{00b7} A-p filter \u{00b7} A-q quit",
+                " A-e edit \u{00b7} A-n new \u{00b7} A-s status \u{00b7} A-d del \u{00b7} A-x launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
                 dim,
             )),
         ]), help_area);
@@ -1635,7 +1726,6 @@ impl PlanningView {
                 flat_idx += 1;
             }
 
-            // Project header.
             if self.is_first_col_of_project(gi) && self.project_filter.is_none() {
                 if flat_idx >= self.scroll_offset && items.len() < list_height {
                     items.push(ListItem::new(Line::from(Span::styled(
@@ -1774,15 +1864,30 @@ impl PlanningView {
                     Span::styled(created.as_str(), Style::default().fg(Color::White)),
                 ]));
             }
+            // Show source indicator.
+            if task.source == "claude" {
+                lines.push(Line::from(vec![
+                    Span::styled("  Source: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("claude", Style::default().fg(Color::Magenta)),
+                ]));
+            }
             lines.push(Line::from(""));
             let sep_w = inner.width.saturating_sub(4) as usize;
             lines.push(Line::from(Span::styled(format!("  {}", "\u{2500}".repeat(sep_w)), Style::default().fg(Color::DarkGray))));
             lines.push(Line::from(""));
 
-            if task.body.is_empty() {
+            let body = if !task.description.is_empty() {
+                &task.description
+            } else if !task.prompt.is_empty() {
+                &task.prompt
+            } else {
+                ""
+            };
+
+            if body.is_empty() {
                 lines.push(Line::from(Span::styled("  No description. Press Alt+e to edit.", Style::default().fg(Color::DarkGray))));
             } else {
-                for line in task.body.lines() {
+                for line in body.lines() {
                     let style = if line.starts_with("## ") {
                         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                     } else { Style::default().fg(Color::Gray) };
@@ -1798,7 +1903,8 @@ impl PlanningView {
         } else if self.projects.is_empty() {
             frame.render_widget(Paragraph::new(vec![
                 Line::from(""),
-                Line::from(Span::styled("  No projects found. Press Alt+n to create one.", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  No tasks yet. Press Alt+Shift+p to create a project.", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  Or press Alt+r to refresh from API.", Style::default().fg(Color::DarkGray))),
             ]), inner);
         } else if self.project_data.iter().all(|pd| pd.tasks.is_empty()) {
             frame.render_widget(Paragraph::new(Span::styled(
@@ -1809,7 +1915,7 @@ impl PlanningView {
 
     fn draw_editor(&self, frame: &mut Frame, area: Rect) {
         let title = self.editing_slug.as_ref()
-            .map(|s| format!(" Editing: {}.md ", s))
+            .map(|s| format!(" Editing: {} ", s))
             .unwrap_or_else(|| " Editor ".to_string());
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1890,7 +1996,6 @@ impl PlanningView {
         frame.render_widget(block, dialog);
 
         let mut lines: Vec<Line> = vec![];
-        // "All" option at index 0.
         let all_style = if selected == 0 { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
         let all_ind = if selected == 0 { ">" } else { " " };
         lines.push(Line::from(Span::styled(format!("  {} All projects", all_ind), all_style)));

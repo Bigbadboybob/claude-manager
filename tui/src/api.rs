@@ -22,6 +22,25 @@ pub struct Task {
     pub blocked_at: Option<String>,
     pub session_id: Option<String>,
     pub wip_branch: Option<String>,
+    // Planning fields
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub difficulty: Option<i32>,
+    #[serde(default)]
+    pub depends: Option<Vec<String>>,
+    #[serde(default = "default_source")]
+    pub source: String,
+    #[serde(default)]
+    pub is_cloud: bool,
+}
+
+fn default_source() -> String {
+    "user".to_string()
 }
 
 /// Body for creating a task.
@@ -33,6 +52,21 @@ pub struct TaskCreateBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     pub priority: i32,
+    // Planning fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depends: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_cloud: Option<bool>,
 }
 
 /// Blocking HTTP client for the Claude Manager API.
@@ -77,6 +111,18 @@ impl ApiClient {
             Some(s) => format!("{}?status={}", self.url("/tasks"), s),
             None => self.url("/tasks"),
         };
+        let body = self
+            .agent
+            .get(&url)
+            .header("Authorization", &self.auth_header())
+            .call()?
+            .body_mut()
+            .read_json::<Vec<Task>>()?;
+        Ok(body)
+    }
+
+    pub fn list_tasks_by_project(&self, project: &str) -> anyhow::Result<Vec<Task>> {
+        let url = format!("{}?project={}", self.url("/tasks"), project);
         let body = self
             .agent
             .get(&url)

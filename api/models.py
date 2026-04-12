@@ -8,6 +8,14 @@ class TaskCreate(BaseModel):
     name: str | None = None
     prompt: str | None = None
     priority: int = 0
+    # Planning fields
+    project: str | None = None
+    slug: str | None = None
+    description: str | None = None
+    difficulty: int | None = None
+    depends: list[str] | None = None
+    source: str = "user"
+    is_cloud: bool = False
 
 
 class TaskUpdate(BaseModel):
@@ -22,6 +30,14 @@ class TaskUpdate(BaseModel):
     blocked_at: datetime | None = None
     session_id: str | None = None
     wip_branch: str | None = None
+    # Planning fields
+    project: str | None = None
+    slug: str | None = None
+    description: str | None = None
+    difficulty: int | None = None
+    depends: list[str] | None = None
+    source: str | None = None
+    is_cloud: bool | None = None
 
 
 class TaskResponse(BaseModel):
@@ -41,6 +57,14 @@ class TaskResponse(BaseModel):
     session_id: str | None
     wip_branch: str | None
     resume_metadata: dict | None
+    # Planning fields
+    project: str | None = None
+    slug: str | None = None
+    description: str | None = None
+    difficulty: int | None = None
+    depends: list[str] | None = None
+    source: str = "user"
+    is_cloud: bool = False
 
     class Config:
         from_attributes = True

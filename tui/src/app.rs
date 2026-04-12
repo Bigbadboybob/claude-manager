@@ -950,6 +950,15 @@ impl App {
                         prompt,
                     );
                 }
+                BackendEvent::PlanTasksUpdated(tasks) => {
+                    self.planning.update_from_api(tasks);
+                }
+                BackendEvent::PlanTaskCreated(task) => {
+                    self.planning.on_task_created(task);
+                }
+                BackendEvent::PlanTaskDeleted(id) => {
+                    self.planning.on_task_deleted(&id);
+                }
             }
         }
     }
@@ -1150,7 +1159,11 @@ impl App {
         if let CrosstermEvent::Key(key) = event {
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t') {
                 self.view_mode = match self.view_mode {
-                    ViewMode::Sessions => ViewMode::Planning,
+                    ViewMode::Sessions => {
+                        // Refresh planning tasks when switching to planning view.
+                        self.backend.refresh_plan_tasks();
+                        ViewMode::Planning
+                    }
                     ViewMode::Planning => ViewMode::Sessions,
                 };
                 return true;
@@ -1180,6 +1193,22 @@ impl App {
                 PlanAction::Quit => {
                     self.save_session_manifest();
                     self.should_quit = true;
+                    return true;
+                }
+                PlanAction::CreateTask { project, repo_url, name, description, status } => {
+                    self.backend.create_plan_task(project, repo_url, name, description, status);
+                    return true;
+                }
+                PlanAction::UpdateTask { id, fields } => {
+                    self.backend.update_plan_task(id, fields);
+                    return true;
+                }
+                PlanAction::DeleteTask { id } => {
+                    self.backend.delete_plan_task(id);
+                    return true;
+                }
+                PlanAction::RefreshTasks => {
+                    self.backend.refresh_plan_tasks();
                     return true;
                 }
             }

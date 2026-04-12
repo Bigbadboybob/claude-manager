@@ -23,36 +23,49 @@ async def init_db(pool: asyncpg.Pool):
 
 
 async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
-                   prompt: str, priority: int = 0) -> dict:
+                   prompt: str, priority: int = 0, *,
+                   project: str | None = None, slug: str | None = None,
+                   name: str | None = None, description: str | None = None,
+                   difficulty: int | None = None, depends: list[str] | None = None,
+                   source: str = "user", is_cloud: bool = False) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """INSERT INTO tasks (repo_url, repo_branch, prompt, priority)
-               VALUES ($1, $2, $3, $4)
-               RETURNING id, status, priority, prompt, repo_url, created_at""",
+            """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
+                                  project, slug, name, description, difficulty,
+                                  depends, source, is_cloud)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               RETURNING *""",
             repo_url, repo_branch, prompt, priority,
+            project, slug, name, description, difficulty,
+            depends or [], source, is_cloud,
         )
         return _serialize(dict(row))
 
 
-async def list_tasks(pool: asyncpg.Pool, status: str | None = None) -> list[dict]:
+async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
+                     project: str | None = None) -> list[dict]:
     async with pool.acquire() as conn:
+        conditions = []
+        params = []
         if status:
-            rows = await conn.fetch(
-                """SELECT * FROM tasks WHERE status = $1
-                   ORDER BY priority, created_at""",
-                status,
-            )
-        else:
-            rows = await conn.fetch(
-                """SELECT * FROM tasks ORDER BY
-                       CASE status
-                           WHEN 'blocked' THEN 0
-                           WHEN 'running' THEN 1
-                           WHEN 'backlog' THEN 2
-                           WHEN 'done' THEN 3
-                       END,
-                       priority, created_at""",
-            )
+            params.append(status)
+            conditions.append(f"status = ${len(params)}")
+        if project:
+            params.append(project)
+            conditions.append(f"project = ${len(params)}")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = await conn.fetch(
+            f"""SELECT * FROM tasks {where} ORDER BY
+                   CASE status
+                       WHEN 'blocked' THEN 0
+                       WHEN 'running' THEN 1
+                       WHEN 'backlog' THEN 2
+                       WHEN 'draft' THEN 3
+                       WHEN 'done' THEN 4
+                   END,
+                   priority, created_at""",
+            *params,
+        )
         return [_serialize(dict(r)) for r in rows]
 
 
@@ -156,13 +169,17 @@ async def find_ready_warm_vm(pool: asyncpg.Pool, repo_url: str) -> dict | None:
 
 
 async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
-    """Atomically claim the next backlog task for execution."""
+    """Atomically claim the next cloud backlog task for execution.
+
+    Only claims tasks with is_cloud=true — local planning tasks are not
+    dispatched to VMs.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """UPDATE tasks SET status = 'running', updated_at = now()
                WHERE id = (
                    SELECT id FROM tasks
-                   WHERE status = 'backlog'
+                   WHERE status = 'backlog' AND is_cloud = true
                    ORDER BY priority, created_at
                    LIMIT 1
                    FOR UPDATE SKIP LOCKED

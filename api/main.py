@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -40,6 +41,12 @@ def get_pool():
     return app.state.pool
 
 
+def _slugify(text: str) -> str:
+    """Convert text to a URL-friendly slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:50]
+
+
 # ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
@@ -48,15 +55,28 @@ def get_pool():
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     # prompt defaults to name if not provided
     prompt = body.prompt or body.name or ""
-    task = await db.add_task(pool, body.repo_url, body.repo_branch, prompt, body.priority)
-    if body.name:
-        await db.update_task(pool, str(task["id"]), name=body.name)
-    return await db.get_task(pool, str(task["id"]))
+
+    # Auto-generate slug from name if not provided
+    slug = body.slug
+    if not slug and body.name:
+        slug = _slugify(body.name)
+
+    task = await db.add_task(
+        pool, body.repo_url, body.repo_branch, prompt, body.priority,
+        project=body.project, slug=slug, name=body.name,
+        description=body.description, difficulty=body.difficulty,
+        depends=body.depends, source=body.source, is_cloud=body.is_cloud,
+    )
+    return task
 
 
 @app.get("/tasks", response_model=list[TaskResponse], dependencies=[Depends(verify_token)])
-async def list_tasks(status: str | None = Query(None), pool=Depends(get_pool)):
-    return await db.list_tasks(pool, status=status)
+async def list_tasks(
+    status: str | None = Query(None),
+    project: str | None = Query(None),
+    pool=Depends(get_pool),
+):
+    return await db.list_tasks(pool, status=status, project=project)
 
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
