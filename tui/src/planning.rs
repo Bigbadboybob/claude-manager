@@ -134,12 +134,15 @@ struct ProjectData {
     layout: GridLayout,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum NewProjectField { Name, RepoUrl }
+
 enum PlanInputMode {
     Normal,
     Editing,
     Searching { query: String },
     NewTask { title: String },
-    NewProject { name: String },
+    NewProject { name: String, repo_url: String, field: NewProjectField },
     ProjectPicker { selected: usize },
     LaunchConfirm { project_idx: usize, task_idx: usize, branch_text: String },
 }
@@ -825,7 +828,7 @@ impl PlanningView {
                     KeyCode::Char('l') | KeyCode::Char('L') => { self.move_task_to_column(1); return PlanAction::Consumed; }
                     KeyCode::Char('c') | KeyCode::Char('C') => { self.remove_column(); return PlanAction::Consumed; }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
-                        self.input_mode = PlanInputMode::NewProject { name: String::new() };
+                        self.input_mode = PlanInputMode::NewProject { name: String::new(), repo_url: String::new(), field: NewProjectField::Name };
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
@@ -862,7 +865,7 @@ impl PlanningView {
                     KeyCode::Char('n') => {
                         self.cancel_visual();
                         if self.projects.is_empty() {
-                            self.input_mode = PlanInputMode::NewProject { name: String::new() };
+                            self.input_mode = PlanInputMode::NewProject { name: String::new(), repo_url: String::new(), field: NewProjectField::Name };
                         } else {
                             self.input_mode = PlanInputMode::NewTask { title: String::new() };
                         }
@@ -1005,24 +1008,45 @@ impl PlanningView {
 
     fn handle_new_project_event(&mut self, event: &CrosstermEvent) -> PlanAction {
         if let CrosstermEvent::Key(key) = event {
-            let mut name = match &self.input_mode {
-                PlanInputMode::NewProject { name } => name.clone(),
+            let (mut name, mut repo_url, field) = match &self.input_mode {
+                PlanInputMode::NewProject { name, repo_url, field } => (name.clone(), repo_url.clone(), *field),
                 _ => return PlanAction::Consumed,
             };
             match key.code {
-                KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
+                KeyCode::Esc => { self.input_mode = PlanInputMode::Normal; }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let next = if field == NewProjectField::Name { NewProjectField::RepoUrl } else { NewProjectField::Name };
+                    // Auto-fill repo_url when tabbing away from name if repo_url is empty.
+                    if field == NewProjectField::Name && repo_url.is_empty() && !name.trim().is_empty() {
+                        repo_url = format!("https://github.com/Bigbadboybob/{}.git", name.trim());
+                    }
+                    self.input_mode = PlanInputMode::NewProject { name, repo_url, field: next };
+                }
                 KeyCode::Enter => {
                     let trimmed = name.trim().to_string();
                     if !trimmed.is_empty() {
+                        // Default repo_url if still empty.
+                        if repo_url.trim().is_empty() {
+                            repo_url = format!("https://github.com/Bigbadboybob/{}.git", trimmed);
+                        }
                         self.input_mode = PlanInputMode::Normal;
-                        // Create the project directory locally for layout storage.
-                        ensure_project_dir(&trimmed);
-                        // Show a "new task" prompt for the new project.
-                        self.input_mode = PlanInputMode::NewTask { title: String::new() };
+                        self.create_project(&trimmed, repo_url.trim());
                     }
                 }
-                KeyCode::Backspace => { name.pop(); self.input_mode = PlanInputMode::NewProject { name }; }
-                KeyCode::Char(c) => { name.push(c); self.input_mode = PlanInputMode::NewProject { name }; }
+                KeyCode::Backspace => {
+                    match field {
+                        NewProjectField::Name => { name.pop(); }
+                        NewProjectField::RepoUrl => { repo_url.pop(); }
+                    }
+                    self.input_mode = PlanInputMode::NewProject { name, repo_url, field };
+                }
+                KeyCode::Char(c) => {
+                    match field {
+                        NewProjectField::Name => { name.push(c); }
+                        NewProjectField::RepoUrl => { repo_url.push(c); }
+                    }
+                    self.input_mode = PlanInputMode::NewProject { name, repo_url, field };
+                }
                 _ => {}
             }
         }
@@ -1456,6 +1480,15 @@ impl PlanningView {
         }
     }
 
+    fn create_project(&mut self, name: &str, repo_url: &str) {
+        let path = projects_dir().join(name);
+        if std::fs::create_dir_all(path.join("tasks")).is_err() { return; }
+        let _ = std::fs::write(path.join("repo_url"), repo_url);
+        self.projects = discover_projects();
+        self.initialized = false;
+        self.reload_all();
+    }
+
     pub fn drain_editor_events(&mut self) -> bool {
         let mut had_event = false;
         if let Some(ref mut editor) = self.editor {
@@ -1506,7 +1539,7 @@ impl PlanningView {
         match &self.input_mode {
             PlanInputMode::Searching { query } => self.draw_search_overlay(frame, area, query),
             PlanInputMode::NewTask { title } => self.draw_new_task_overlay(frame, area, title),
-            PlanInputMode::NewProject { name } => self.draw_new_project_overlay(frame, area, name),
+            PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
             PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text } => self.draw_launch_confirm(frame, area, *project_idx, *task_idx, branch_text),
             _ => {}
@@ -1966,22 +1999,32 @@ impl PlanningView {
         ]), inner);
     }
 
-    fn draw_new_project_overlay(&self, frame: &mut Frame, area: Rect, name: &str) {
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 5u16);
+    fn draw_new_project_overlay(&self, frame: &mut Frame, area: Rect, name: &str, repo_url: &str, field: NewProjectField) {
+        let (w, h) = (70u16.min(area.width.saturating_sub(4)), 7u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
             .title(Span::styled(" New Project ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
+
+        let cursor = "\u{2588}";
+        let name_cursor = if field == NewProjectField::Name { cursor } else { "" };
+        let url_cursor = if field == NewProjectField::RepoUrl { cursor } else { "" };
+
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("  Name: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("     Name: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(name, Style::default().fg(Color::White)),
-                Span::styled("\u{2588}", Style::default().fg(Color::White)),
+                Span::styled(name_cursor, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Repo URL: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(repo_url, Style::default().fg(Color::White)),
+                Span::styled(url_cursor, Style::default().fg(Color::White)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Enter create \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("Tab switch \u{00b7} Enter create \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
         ]), inner);
     }
 

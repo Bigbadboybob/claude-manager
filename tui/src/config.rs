@@ -34,11 +34,27 @@ impl Config {
             }
         }
 
+        // Discover repos from ~/.cm/projects/*/repo_url files.
         let mut repos = HashMap::new();
-        repos.insert(
-            "predictionTrading".to_string(),
-            "https://github.com/Bigbadboybob/predictionTrading.git".to_string(),
-        );
+        let projects_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".cm/projects");
+        if let Ok(entries) = fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let url_file = path.join("repo_url");
+                    if let Ok(url) = fs::read_to_string(&url_file) {
+                        let url = url.trim().to_string();
+                        if !url.is_empty() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                repos.insert(name.to_string(), url);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Config {
             api_url: env::var("CM_API_URL").unwrap_or_else(|_| "http://localhost:8000".into()),

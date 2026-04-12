@@ -110,8 +110,22 @@ impl Session {
 
     /// Send raw bytes to the PTY (keyboard input).
     /// Writes directly to the PTY fd for minimal latency.
+    ///
+    /// The PTY fd is non-blocking (set by alacritty), so we must loop on
+    /// WouldBlock to avoid silently dropping data on large writes (e.g. pastes).
     pub fn write(&mut self, data: &[u8]) {
-        let _ = (&self.pty_writer).write_all(data);
+        let mut pos = 0;
+        while pos < data.len() {
+            match (&self.pty_writer).write(&data[pos..]) {
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // PTY buffer full — brief yield then retry.
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
     }
 
     /// Notify the PTY of a terminal resize.
