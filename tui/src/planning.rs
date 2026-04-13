@@ -15,7 +15,7 @@ use crate::terminal_widget::TerminalWidget;
 
 // ── Data Types ──────────────────────────────────────────────
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlanStatus {
     Done,
     InProgress,
@@ -35,7 +35,7 @@ impl PlanStatus {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Done => "done",
-            Self::InProgress => "in_progress",
+            Self::InProgress => "running",
             Self::Backlog => "backlog",
             Self::Draft => "draft",
         }
@@ -66,6 +66,7 @@ impl PlanStatus {
     }
 }
 
+#[derive(Clone)]
 pub struct PlanTask {
     pub id: String,
     pub slug: String,
@@ -458,8 +459,9 @@ impl PlanningView {
     }
 
     /// Update planning data from API tasks. Called when BackendEvent::PlanTasksUpdated arrives.
+    /// Merges API state into existing local state rather than rebuilding from scratch.
     pub fn update_from_api(&mut self, api_tasks: Vec<Task>) {
-        // Group tasks by project.
+        // Group incoming tasks by project.
         let mut by_project: HashMap<String, Vec<PlanTask>> = HashMap::new();
         for task in &api_tasks {
             if let Some(ref project) = task.project {
@@ -469,23 +471,84 @@ impl PlanningView {
             }
         }
 
-        // Discover projects from the API data.
-        let mut project_names: Vec<String> = by_project.keys().cloned().collect();
+        // Collect all project names (union of existing and incoming).
+        let mut project_names: HashSet<String> = by_project.keys().cloned().collect();
+        for pd in &self.project_data {
+            project_names.insert(pd.project.name.clone());
+        }
+        let mut project_names: Vec<String> = project_names.into_iter().collect();
         project_names.sort();
 
-        self.projects = project_names.iter().map(|name| {
+        // Build new project_data by merging.
+        let mut new_data: Vec<ProjectData> = Vec::new();
+        for name in &project_names {
             let path = ensure_project_dir(name);
-            PlanProject { name: name.clone(), path }
-        }).collect();
+            let project = PlanProject { name: name.clone(), path: path.clone() };
+            let api_tasks_for_project = by_project.remove(name).unwrap_or_default();
 
-        self.project_data.clear();
-        for project in &self.projects {
-            let tasks = by_project.remove(&project.name).unwrap_or_default();
-            let mut layout = load_layout(&project.path);
-            sync_layout_with_tasks(&mut layout, &tasks);
-            save_layout(&layout, &project.path);
-            self.project_data.push(ProjectData { project: project.clone(), tasks, layout });
+            // Find existing project data if we have it.
+            let existing = self.project_data.iter()
+                .position(|pd| pd.project.name == *name);
+
+            if let Some(ei) = existing {
+                let pd = &mut self.project_data[ei];
+
+                // Merge: update existing tasks, add new ones, remove deleted ones.
+                let api_ids: HashSet<String> = api_tasks_for_project.iter()
+                    .map(|t| t.id.clone()).collect();
+
+                // Update existing tasks from API data.
+                for api_task in &api_tasks_for_project {
+                    if let Some(local_task) = pd.tasks.iter_mut().find(|t| t.id == api_task.id) {
+                        // Overwrite local fields with API (DB is source of truth).
+                        local_task.title = api_task.title.clone();
+                        local_task.status = api_task.status;
+                        local_task.difficulty = api_task.difficulty;
+                        local_task.depends = api_task.depends.clone();
+                        local_task.branch = api_task.branch.clone();
+                        local_task.description = api_task.description.clone();
+                        local_task.prompt = api_task.prompt.clone();
+                        local_task.source = api_task.source.clone();
+                        local_task.is_cloud = api_task.is_cloud;
+                        local_task.slug = api_task.slug.clone();
+                    } else {
+                        // New task from API — add it.
+                        pd.tasks.push(api_task.clone());
+                    }
+                }
+
+                // Remove tasks that no longer exist in the API.
+                let removed_slugs: Vec<String> = pd.tasks.iter()
+                    .filter(|t| !api_ids.contains(&t.id))
+                    .map(|t| t.slug.clone())
+                    .collect();
+                pd.tasks.retain(|t| api_ids.contains(&t.id));
+                for slug in &removed_slugs {
+                    for col in &mut pd.layout.columns {
+                        col.retain(|item| !matches!(item, GridItem::Task(s) if s == slug));
+                    }
+                }
+
+                // Sync layout with current tasks (adds new tasks to layout).
+                sync_layout_with_tasks(&mut pd.layout, &pd.tasks);
+                save_layout(&pd.layout, &path);
+
+                new_data.push(ProjectData {
+                    project,
+                    tasks: pd.tasks.drain(..).collect(),
+                    layout: pd.layout.clone(),
+                });
+            } else {
+                // Brand new project — load layout from disk and build fresh.
+                let mut layout = load_layout(&path);
+                sync_layout_with_tasks(&mut layout, &api_tasks_for_project);
+                save_layout(&layout, &path);
+                new_data.push(ProjectData { project, tasks: api_tasks_for_project, layout });
+            }
         }
+
+        self.projects = new_data.iter().map(|pd| pd.project.clone()).collect();
+        self.project_data = new_data;
 
         self.rebuild_unified_cols();
         self.recompute_conflicts();
@@ -550,6 +613,29 @@ impl PlanningView {
             self.start_editor();
 
             self.needs_redraw = true;
+        }
+    }
+
+    /// Handle a single task being updated via the API response.
+    /// Merges the API state into the existing local task without rebuilding.
+    pub fn on_task_updated(&mut self, api_task: Task) {
+        for pd in &mut self.project_data {
+            if let Some(task) = pd.tasks.iter_mut().find(|t| t.id == api_task.id) {
+                task.title = api_task.name.clone().unwrap_or_else(|| {
+                    api_task.slug.clone().unwrap_or_else(|| "untitled".to_string())
+                });
+                task.status = PlanStatus::from_str(&api_task.status);
+                task.difficulty = api_task.difficulty.map(|d| d as u8);
+                task.depends = api_task.depends.clone().unwrap_or_default();
+                task.branch = Some(api_task.repo_branch.clone());
+                task.description = api_task.description.clone().unwrap_or_default();
+                task.prompt = api_task.prompt.clone().unwrap_or_default();
+                task.source = api_task.source.clone();
+                task.is_cloud = api_task.is_cloud;
+                self.recompute_conflicts();
+                self.needs_redraw = true;
+                return;
+            }
         }
     }
 

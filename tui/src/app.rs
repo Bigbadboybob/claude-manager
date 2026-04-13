@@ -953,6 +953,9 @@ impl App {
                 BackendEvent::PlanTasksUpdated(tasks) => {
                     self.planning.update_from_api(tasks);
                 }
+                BackendEvent::PlanTaskUpdated(task) => {
+                    self.planning.on_task_updated(task);
+                }
                 BackendEvent::PlanTaskCreated(task) => {
                     self.planning.on_task_created(task);
                 }

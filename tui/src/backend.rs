@@ -84,6 +84,8 @@ pub enum BackendEvent {
     },
     /// Planning tasks updated (all tasks with a project field).
     PlanTasksUpdated(Vec<Task>),
+    /// A single planning task was updated — merge into local state.
+    PlanTaskUpdated(Task),
     /// A planning task was created — return the full task.
     PlanTaskCreated(Task),
     /// A planning task was deleted.
@@ -280,7 +282,9 @@ fn backend_loop(
             }
             Ok(BackendCommand::UpdatePlanTask { id, fields }) => {
                 match client.update_task(&id, &fields) {
-                    Ok(_) => do_refresh_plan_tasks(&client, &event_tx),
+                    Ok(task) => {
+                        let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                    }
                     Err(e) => {
                         let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
                     }
@@ -302,6 +306,7 @@ fn backend_loop(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 do_refresh(&client, &event_tx, &mut was_connected);
+                do_refresh_plan_tasks(&client, &event_tx);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
