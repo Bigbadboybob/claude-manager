@@ -168,6 +168,17 @@ async def find_ready_warm_vm(pool: asyncpg.Pool, repo_url: str) -> dict | None:
         return _serialize(dict(row)) if row else None
 
 
+async def list_projects(pool: asyncpg.Pool) -> list[dict]:
+    """Return distinct project names with their repo URLs."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT project, repo_url FROM tasks
+               WHERE project IS NOT NULL
+               ORDER BY project""",
+        )
+        return [dict(r) for r in rows]
+
+
 async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
     """Atomically claim the next cloud backlog task for execution.
 

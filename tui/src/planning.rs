@@ -370,13 +370,17 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
             if let GridItem::Task(slug) = item { in_layout.insert(slug.clone()); }
         }
     }
-    let missing: Vec<String> = tasks.iter()
+    let missing: Vec<&PlanTask> = tasks.iter()
         .filter(|t| !in_layout.contains(&t.slug))
-        .map(|t| t.slug.clone())
         .collect();
     if !missing.is_empty() {
         if layout.columns.is_empty() { layout.columns.push(vec![]); }
-        for slug in missing { layout.columns[0].push(GridItem::Task(slug)); }
+        // Add user tasks first, then claude-proposed tasks at the bottom.
+        let (user_tasks, claude_tasks): (Vec<_>, Vec<_>) = missing
+            .into_iter()
+            .partition(|t| t.source != "claude");
+        for t in user_tasks { layout.columns[0].push(GridItem::Task(t.slug.clone())); }
+        for t in claude_tasks { layout.columns[0].push(GridItem::Task(t.slug.clone())); }
     }
     layout.columns.retain(|col| !col.is_empty());
 }
@@ -873,6 +877,7 @@ impl PlanningView {
                     }
                     KeyCode::Char('o') => { self.sort_column_by_status(); return PlanAction::Consumed; }
                     KeyCode::Char('s') => { return self.cycle_status(true); }
+                    KeyCode::Char('a') => { return self.accept_proposal(); }
                     KeyCode::Char('d') => { self.cancel_visual(); return self.delete_task(); }
                     KeyCode::Char('x') => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('l') if self.linear_mode => { self.cancel_visual(); return self.start_launch(); }
@@ -1190,6 +1195,20 @@ impl PlanningView {
                 let status_str = task.status.as_str().to_string();
                 let mut fields = HashMap::new();
                 fields.insert("status".to_string(), serde_json::json!(status_str));
+                return PlanAction::UpdateTask { id, fields };
+            }
+        }
+        PlanAction::Consumed
+    }
+
+    fn accept_proposal(&mut self) -> PlanAction {
+        if let Some((pi, ti)) = self.selected_task_loc() {
+            let task = &mut self.project_data[pi].tasks[ti];
+            if task.source == "claude" {
+                task.source = "user".to_string();
+                let id = task.id.clone();
+                let mut fields = HashMap::new();
+                fields.insert("source".to_string(), serde_json::json!("user"));
                 return PlanAction::UpdateTask { id, fields };
             }
         }
@@ -1662,9 +1681,9 @@ impl PlanningView {
                     let task = self.project_data.iter().find_map(|pd| {
                         if pd.project.name == project_name { pd.tasks.iter().find(|t| t.slug == *slug) } else { None }
                     });
-                    let (title_str, status) = match task {
-                        Some(t) => (t.title.as_str(), Some(&t.status)),
-                        None => (slug.as_str(), None),
+                    let (title_str, status, is_claude) = match task {
+                        Some(t) => (t.title.as_str(), Some(&t.status), t.source == "claude"),
+                        None => (slug.as_str(), None, false),
                     };
                     let indicator = match status {
                         Some(PlanStatus::Done) => "\u{2713}",
@@ -1673,23 +1692,33 @@ impl PlanningView {
                         Some(PlanStatus::Draft) => "\u{25cb}",
                         None => "?",
                     };
-                    let indicator_style = match status {
-                        Some(PlanStatus::Done) => Style::default().fg(Color::Green),
-                        Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
-                        Some(PlanStatus::Backlog) => Style::default(),
-                        Some(PlanStatus::Draft) => Style::default().fg(Color::DarkGray),
-                        None => Style::default(),
+                    let indicator_style = if is_claude {
+                        Style::default().fg(Color::Magenta)
+                    } else {
+                        match status {
+                            Some(PlanStatus::Done) => Style::default().fg(Color::Green),
+                            Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
+                            Some(PlanStatus::Backlog) => Style::default(),
+                            Some(PlanStatus::Draft) => Style::default().fg(Color::DarkGray),
+                            None => Style::default(),
+                        }
                     };
-                    let max_title = width.saturating_sub(4);
+                    let claude_prefix = if is_claude { "[C] " } else { "" };
+                    let max_title = width.saturating_sub(4 + claude_prefix.len());
                     let title_display = if title_str.len() > max_title {
                         format!("{}...", &title_str[..max_title.saturating_sub(3)])
                     } else { title_str.to_string() };
 
-                    let line = Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(format!("{} ", indicator), indicator_style),
-                        Span::raw(title_display),
-                    ]);
+                    ];
+                    if is_claude {
+                        spans.push(Span::styled(claude_prefix, Style::default().fg(Color::Magenta)));
+                    }
+                    spans.push(Span::raw(title_display));
+                    let line = Line::from(spans);
                     let conflict = self.is_conflict(project_name, slug);
+                    let base_fg = if is_claude { Color::Magenta } else { Color::Gray };
                     let style = if is_selected && in_visual {
                         Style::default().fg(Color::White).bg(Color::Rgb(50, 50, 80)).add_modifier(Modifier::BOLD)
                     } else if is_selected {
@@ -1697,7 +1726,7 @@ impl PlanningView {
                     } else if in_visual {
                         Style::default().fg(Color::White).bg(Color::Rgb(50, 50, 80))
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(base_fg)
                     };
                     let style = if conflict && is_selected {
                         style.bg(Color::Red).fg(Color::White)
@@ -1737,10 +1766,10 @@ impl PlanningView {
         let help_entries: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-d  delete"),
             ("A-J/K  reorder", "A-x  launch"),
-            ("A-e    edit", "A-p  filter"),
-            ("A-n    new", "A-t  sessions"),
+            ("A-e    edit", "A-a  accept"),
+            ("A-n    new", "A-p  filter"),
             ("A-s/S  status", "A-/  search"),
-            ("A-g    grid", "A-q  quit"),
+            ("A-g    grid", "A-t  sessions"),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 2) as usize;
@@ -1782,9 +1811,9 @@ impl PlanningView {
                 match grid_item {
                     GridItem::Task(slug) => {
                         let task = pd.tasks.iter().find(|t| t.slug == *slug);
-                        let (title_str, status) = match task {
-                            Some(t) => (t.title.as_str(), Some(&t.status)),
-                            None => (slug.as_str(), None),
+                        let (title_str, status, is_claude) = match task {
+                            Some(t) => (t.title.as_str(), Some(&t.status), t.source == "claude"),
+                            None => (slug.as_str(), None, false),
                         };
                         let indicator = match status {
                             Some(PlanStatus::Done) => "\u{2713}",
@@ -1793,25 +1822,35 @@ impl PlanningView {
                             Some(PlanStatus::Draft) => "\u{25cb}",
                             None => "?",
                         };
-                        let indicator_style = match status {
-                            Some(PlanStatus::Done) => Style::default().fg(Color::Green),
-                            Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
-                            _ => Style::default().fg(Color::DarkGray),
+                        let indicator_style = if is_claude {
+                            Style::default().fg(Color::Magenta)
+                        } else {
+                            match status {
+                                Some(PlanStatus::Done) => Style::default().fg(Color::Green),
+                                Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
+                                _ => Style::default().fg(Color::DarkGray),
+                            }
                         };
-                        let max_title = (inner.width as usize).saturating_sub(5);
+                        let claude_prefix = if is_claude { "[C] " } else { "" };
+                        let max_title = (inner.width as usize).saturating_sub(5 + claude_prefix.len());
                         let title_display = if title_str.len() > max_title {
                             format!("{}...", &title_str[..max_title.saturating_sub(3)])
                         } else { title_str.to_string() };
 
-                        let line = Line::from(vec![
+                        let mut spans = vec![
                             Span::styled(format!(" {} ", indicator), indicator_style),
-                            Span::raw(title_display),
-                        ]);
+                        ];
+                        if is_claude {
+                            spans.push(Span::styled(claude_prefix, Style::default().fg(Color::Magenta)));
+                        }
+                        spans.push(Span::raw(title_display));
+                        let line = Line::from(spans);
                         let conflict = self.is_conflict(&pd.project.name, slug);
+                        let base_fg = if is_claude { Color::Magenta } else { Color::Gray };
                         let style = if is_selected {
                             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::Gray)
+                            Style::default().fg(base_fg)
                         };
                         let style = if conflict && is_selected {
                             style.bg(Color::Red).fg(Color::White)
@@ -1902,11 +1941,11 @@ impl PlanningView {
                     Span::styled(created.as_str(), Style::default().fg(Color::White)),
                 ]));
             }
-            // Show source indicator.
             if task.source == "claude" {
                 lines.push(Line::from(vec![
-                    Span::styled("  Source: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("claude", Style::default().fg(Color::Magenta)),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(" PROPOSED ", Style::default().fg(Color::White).bg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::styled("  Alt+a to accept, Alt+d to reject", Style::default().fg(Color::DarkGray)),
                 ]));
             }
             lines.push(Line::from(""));

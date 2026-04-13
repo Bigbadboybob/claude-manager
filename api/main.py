@@ -147,6 +147,22 @@ async def delete_task(task_id: str, pool=Depends(get_pool)):
 
 
 # ---------------------------------------------------------------------------
+# Projects
+# ---------------------------------------------------------------------------
+
+@app.get("/projects", dependencies=[Depends(verify_token)])
+async def list_projects(pool=Depends(get_pool)):
+    """Return distinct project names and their repo URLs."""
+    rows = await db.list_projects(pool)
+    # A project may have multiple repo_urls (different tasks) — pick the first
+    seen = {}
+    for r in rows:
+        if r["project"] not in seen:
+            seen[r["project"]] = r["repo_url"]
+    return [{"name": name, "repo_url": url} for name, url in seen.items()]
+
+
+# ---------------------------------------------------------------------------
 # Workers
 # ---------------------------------------------------------------------------
 
