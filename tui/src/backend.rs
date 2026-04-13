@@ -284,6 +284,7 @@ fn backend_loop(
                 match client.update_task(&id, &fields) {
                     Ok(task) => {
                         let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                        do_refresh(&client, &event_tx, &mut was_connected);
                     }
                     Err(e) => {
                         let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));

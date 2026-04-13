@@ -809,6 +809,7 @@ impl App {
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 
         let mut had_event = false;
+        let mut session_id_updates: Vec<(String, String)> = Vec::new();
         for task in &mut self.tasks {
             let worktree_path = task.worktree_path.clone();
             for ts in &mut task.sessions {
@@ -879,12 +880,26 @@ impl App {
                             Self::detect_session_id(wt, existing)
                         };
                         if let Some(sid) = sid {
-                            ts.session_id = Some(sid);
+                            ts.session_id = Some(sid.clone());
                             ts.pending_jsonl_files = None;
+                            // Sync session_id to DB.
+                            if let Some(ref task_id) = task.task_id {
+                                session_id_updates.push((task_id.clone(), sid));
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // Sync any newly detected session_ids to the DB.
+        for (task_id, sid) in session_id_updates {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(sid),
+            );
+            self.backend.update_task(task_id, fields);
         }
 
         if should_check_session_ids {
@@ -1194,8 +1209,9 @@ impl App {
                     prompt,
                     branch,
                     autostart,
+                    task_id,
                 } => {
-                    self.launch_from_plan(&project, &slug, &prompt, branch.as_deref(), autostart);
+                    self.launch_from_plan(&project, &slug, &prompt, branch.as_deref(), autostart, &task_id);
                     return true;
                 }
                 PlanAction::SwitchToSessions => {
@@ -2175,6 +2191,7 @@ impl App {
         prompt: &str,
         start_branch: Option<&str>,
         _autostart: bool,
+        task_id: &str,
     ) {
         let repo_url = match self.config.repos.get(project) {
             Some(url) => url.clone(),
@@ -2230,7 +2247,7 @@ impl App {
 
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
-                    task_id: None,
+                    task_id: Some(task_id.to_string()),
                     name: slug.to_string(),
                     api_status: TaskStatus::Running,
                     repo_url: Some(repo_url.clone()),
@@ -2249,7 +2266,11 @@ impl App {
                 self.cursor = Cursor::Session(new_ti, 0);
                 self.view_mode = ViewMode::Sessions;
 
-                self.backend.create_task(slug.to_string(), repo_url, branch);
+                // Update the existing planning task to running instead of creating a new one.
+                let mut fields = std::collections::HashMap::new();
+                fields.insert("status".to_string(), serde_json::Value::String("running".to_string()));
+                fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
+                self.backend.update_plan_task(task_id.to_string(), fields);
                 self.save_session_manifest();
                 self.set_status_msg("Task launched");
             }

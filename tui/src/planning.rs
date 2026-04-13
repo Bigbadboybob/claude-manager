@@ -157,6 +157,7 @@ pub enum PlanAction {
         prompt: String,
         branch: Option<String>,
         autostart: bool,
+        task_id: String,
     },
     SwitchToSessions,
     Quit,
@@ -1207,8 +1208,9 @@ impl PlanningView {
                             } else {
                                 Some(branch_text.trim().to_string())
                             };
+                            let task_id = task.id.clone();
                             task.status = PlanStatus::InProgress;
-                            return PlanAction::LaunchTask { project, slug, prompt, branch, autostart: false };
+                            return PlanAction::LaunchTask { project, slug, prompt, branch, autostart: false, task_id };
                         }
                     }
                 }
