@@ -168,6 +168,12 @@ async def find_ready_warm_vm(pool: asyncpg.Pool, repo_url: str) -> dict | None:
         return _serialize(dict(row)) if row else None
 
 
+async def delete_task(pool: asyncpg.Pool, task_id: str):
+    """Permanently delete a task row."""
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE id = $1", task_id)
+
+
 async def list_projects(pool: asyncpg.Pool) -> list[dict]:
     """Return distinct project names with their repo URLs."""
     async with pool.acquire() as conn:

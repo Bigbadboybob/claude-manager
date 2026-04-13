@@ -141,8 +141,11 @@ async def delete_task(task_id: str, pool=Depends(get_pool)):
             except Exception:
                 logger.exception(f"Failed to delete VM {vm_name}")
         asyncio.create_task(_delete_vm(task["worker_vm"]))
-
-    await db.update_task(pool, task_id, status="done")
+        # VM tasks: mark done so dispatch daemon can clean up
+        await db.update_task(pool, task_id, status="done")
+    else:
+        # No VM: permanently delete the row
+        await db.delete_task(pool, task_id)
     return {"ok": True}
 
 
