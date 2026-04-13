@@ -1484,9 +1484,14 @@ impl PlanningView {
         let path = projects_dir().join(name);
         if std::fs::create_dir_all(path.join("tasks")).is_err() { return; }
         let _ = std::fs::write(path.join("repo_url"), repo_url);
-        self.projects = discover_projects();
-        self.initialized = false;
-        self.reload_all();
+        let project = PlanProject { name: name.to_string(), path };
+        self.projects.push(project.clone());
+        let layout = load_layout(&project.path);
+        self.project_data.push(ProjectData { project, tasks: vec![], layout });
+        self.rebuild_unified_cols();
+        self.recompute_conflicts();
+        self.clamp_cursor();
+        self.needs_redraw = true;
     }
 
     pub fn drain_editor_events(&mut self) -> bool {

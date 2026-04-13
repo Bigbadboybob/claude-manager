@@ -994,8 +994,11 @@ impl App {
             std::collections::HashSet::new();
 
         for task in &tasks {
-            if task.status == "done" {
-                continue;
+            // Only show active tasks in the sessions view.
+            // Planning tasks (draft/backlog) belong in the planning view.
+            match task.status.as_str() {
+                "running" | "blocked" => {}
+                _ => continue,
             }
             seen_ids.insert(task.id.clone());
 
