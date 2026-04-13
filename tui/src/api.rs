@@ -52,6 +52,8 @@ pub struct TaskCreateBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     pub priority: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     // Planning fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,

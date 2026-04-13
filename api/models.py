@@ -8,6 +8,7 @@ class TaskCreate(BaseModel):
     name: str | None = None
     prompt: str | None = None
     priority: int = 0
+    status: str = "backlog"
     # Planning fields
     project: str | None = None
     slug: str | None = None

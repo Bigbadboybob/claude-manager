@@ -63,7 +63,7 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
 
     task = await db.add_task(
         pool, body.repo_url, body.repo_branch, prompt, body.priority,
-        project=body.project, slug=slug, name=body.name,
+        status=body.status, project=body.project, slug=slug, name=body.name,
         description=body.description, difficulty=body.difficulty,
         depends=body.depends, source=body.source, is_cloud=body.is_cloud,
     )
@@ -233,10 +233,9 @@ async def delete_warm_pool(pool_id: str, pool=Depends(get_pool)):
 
 @app.get("/config", dependencies=[Depends(verify_token)])
 async def get_config():
-    from dispatch.config import MAX_WORKERS, ZOMBIE_TIMEOUT_MINUTES
+    from dispatch.config import MAX_WORKERS
     return {
         "max_workers": MAX_WORKERS,
-        "zombie_timeout_minutes": ZOMBIE_TIMEOUT_MINUTES,
     }
 
 

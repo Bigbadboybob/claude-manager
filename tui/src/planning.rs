@@ -541,6 +541,14 @@ impl PlanningView {
             save_layout(&self.project_data[pi].layout, &self.project_data[pi].project.path);
             self.rebuild_unified_cols();
             self.recompute_conflicts();
+
+            // Move cursor to the newly created task and open editor.
+            if let Some(uc) = self.unified_cols.iter().position(|(p, c)| *p == pi && *c == ci) {
+                self.cursor.col = uc;
+                self.cursor.row = insert_at;
+            }
+            self.start_editor();
+
             self.needs_redraw = true;
         }
     }
@@ -565,12 +573,10 @@ impl PlanningView {
     }
 
     /// Mark a task as done by project name and slug. Called from sessions view.
-    pub fn mark_task_done(&mut self, project_name: &str, slug: &str) {
+    pub fn mark_task_done_by_id(&mut self, task_id: &str) {
         for pd in &mut self.project_data {
-            if pd.project.name == project_name {
-                if let Some(task) = pd.tasks.iter_mut().find(|t| t.slug == slug) {
-                    task.status = PlanStatus::Done;
-                }
+            if let Some(task) = pd.tasks.iter_mut().find(|t| t.id == task_id) {
+                task.status = PlanStatus::Done;
                 return;
             }
         }
@@ -878,8 +884,9 @@ impl PlanningView {
                     KeyCode::Char('o') => { self.sort_column_by_status(); return PlanAction::Consumed; }
                     KeyCode::Char('s') => { return self.cycle_status(true); }
                     KeyCode::Char('a') => { return self.accept_proposal(); }
-                    KeyCode::Char('d') => { self.cancel_visual(); return self.delete_task(); }
-                    KeyCode::Char('x') => { self.cancel_visual(); return self.start_launch(); }
+                    KeyCode::Char('x') => { self.cancel_visual(); return self.delete_task(); }
+                    KeyCode::Char('d') => { return self.cycle_status_to_done(); }
+                    KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('l') if self.linear_mode => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('r') => { return PlanAction::RefreshTasks; }
                     KeyCode::Char('p') => {
@@ -938,9 +945,6 @@ impl PlanningView {
     }
 
     fn handle_editing_event(&mut self, event: &CrosstermEvent) -> PlanAction {
-        if self.editor.as_ref().map_or(false, |e| e.exited) {
-            return self.stop_editor();
-        }
         if let CrosstermEvent::Key(key) = event {
             if key.modifiers.contains(KeyModifiers::ALT) {
                 match key.code {
@@ -1195,6 +1199,20 @@ impl PlanningView {
                 let status_str = task.status.as_str().to_string();
                 let mut fields = HashMap::new();
                 fields.insert("status".to_string(), serde_json::json!(status_str));
+                return PlanAction::UpdateTask { id, fields };
+            }
+        }
+        PlanAction::Consumed
+    }
+
+    fn cycle_status_to_done(&mut self) -> PlanAction {
+        if let Some((pi, ti)) = self.selected_task_loc() {
+            let task = &mut self.project_data[pi].tasks[ti];
+            if task.status != PlanStatus::Done {
+                task.status = PlanStatus::Done;
+                let id = task.id.clone();
+                let mut fields = HashMap::new();
+                fields.insert("status".to_string(), serde_json::json!("done"));
                 return PlanAction::UpdateTask { id, fields };
             }
         }
@@ -1513,7 +1531,7 @@ impl PlanningView {
         self.needs_redraw = true;
     }
 
-    pub fn drain_editor_events(&mut self) -> bool {
+    pub fn drain_editor_events(&mut self) -> Option<PlanAction> {
         let mut had_event = false;
         if let Some(ref mut editor) = self.editor {
             while let Ok(event) = editor.event_rx.try_recv() {
@@ -1525,11 +1543,13 @@ impl PlanningView {
             }
         }
         if self.editor.as_ref().map_or(false, |e| e.exited) {
-            // Note: stop_editor returns a PlanAction but we can't return it from here.
-            // The action will be picked up on the next handle_event call via handle_editing_event.
-            had_event = true;
+            self.needs_redraw = true;
+            return Some(self.stop_editor());
         }
-        had_event
+        if had_event {
+            self.needs_redraw = true;
+        }
+        None
     }
 
     pub fn update_layout(&mut self, area_width: u16, area_height: u16) {
@@ -1660,7 +1680,7 @@ impl PlanningView {
                 dim,
             )),
             Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-s status \u{00b7} A-d del \u{00b7} A-x launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+                " A-e edit \u{00b7} A-n new \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
                 dim,
             )),
         ]), help_area);
@@ -1764,11 +1784,11 @@ impl PlanningView {
         if inner.height < 4 || inner.width < 4 { return; }
 
         let help_entries: Vec<(&str, &str)> = vec![
-            ("A-j/k  nav", "A-d  delete"),
-            ("A-J/K  reorder", "A-x  launch"),
+            ("A-j/k  nav", "A-d  done"),
+            ("A-J/K  reorder", "A-f  launch"),
             ("A-e    edit", "A-a  accept"),
-            ("A-n    new", "A-p  filter"),
-            ("A-s/S  status", "A-/  search"),
+            ("A-n    new", "A-x  delete"),
+            ("A-s/S  status", "A-p  filter"),
             ("A-g    grid", "A-t  sessions"),
         ];
         let help_rows = help_entries.len() as u16;

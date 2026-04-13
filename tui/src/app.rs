@@ -965,7 +965,13 @@ impl App {
 
     /// Process planning editor events (non-blocking).
     pub fn drain_planning_events(&mut self) {
-        if self.planning.drain_editor_events() {
+        if let Some(action) = self.planning.drain_editor_events() {
+            match action {
+                PlanAction::UpdateTask { id, fields } => {
+                    self.backend.update_plan_task(id, fields);
+                }
+                _ => {}
+            }
             self.needs_redraw = true;
         }
         if self.planning.needs_redraw {
@@ -2028,16 +2034,8 @@ impl App {
         self.clamp_cursor();
 
         // Sync status to planning task if there's a matching one.
-        let task_name = self.tasks[ti].name.clone();
-        let repo_url = self.tasks[ti].repo_url.clone();
-        // Find project name from repo URL.
-        if let Some(ref url) = repo_url {
-            let project_name = self.config.repos.iter()
-                .find(|(_, v)| *v == url)
-                .map(|(k, _)| k.clone());
-            if let Some(project) = project_name {
-                self.planning.mark_task_done(&project, &task_name);
-            }
+        if let Some(ref id) = self.tasks[ti].task_id {
+            self.planning.mark_task_done_by_id(id);
         }
 
         self.set_status_msg("Marked done");

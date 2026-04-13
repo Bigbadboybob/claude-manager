@@ -23,7 +23,6 @@ DB_DSN = os.getenv("CM_DB_DSN", "postgresql://predictionuser:oracle123@localhost
 MANAGER_URL = os.getenv("CM_API_URL", "http://localhost:8000")
 API_TOKEN = os.getenv("CM_API_TOKEN", "dev-token")
 MAX_WORKERS = int(os.getenv("CM_MAX_WORKERS", "3"))
-ZOMBIE_TIMEOUT_MINUTES = int(os.getenv("CM_ZOMBIE_TIMEOUT_MINUTES", "15"))
 
 # Repo shortnames -> full clone URLs (discovered from ~/.cm/projects/*/repo_url)
 def _discover_repos():

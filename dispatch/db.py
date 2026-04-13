@@ -24,6 +24,7 @@ async def init_db(pool: asyncpg.Pool):
 
 async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                    prompt: str, priority: int = 0, *,
+                   status: str = "backlog",
                    project: str | None = None, slug: str | None = None,
                    name: str | None = None, description: str | None = None,
                    difficulty: int | None = None, depends: list[str] | None = None,
@@ -31,13 +32,13 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
-                                  project, slug, name, description, difficulty,
-                                  depends, source, is_cloud)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                                  status, project, slug, name, description,
+                                  difficulty, depends, source, is_cloud)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                RETURNING *""",
             repo_url, repo_branch, prompt, priority,
-            project, slug, name, description, difficulty,
-            depends or [], source, is_cloud,
+            status, project, slug, name, description,
+            difficulty, depends or [], source, is_cloud,
         )
         return _serialize(dict(row))
 
@@ -188,8 +189,8 @@ async def list_projects(pool: asyncpg.Pool) -> list[dict]:
 async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
     """Atomically claim the next cloud backlog task for execution.
 
-    Only claims tasks with is_cloud=true — local planning tasks are not
-    dispatched to VMs.
+    Only claims tasks with is_cloud=true and no project — planning tasks
+    (project IS NOT NULL) are launched manually from the TUI, not auto-dispatched.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -197,6 +198,7 @@ async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
                WHERE id = (
                    SELECT id FROM tasks
                    WHERE status = 'backlog' AND is_cloud = true
+                         AND project IS NULL
                    ORDER BY priority, created_at
                    LIMIT 1
                    FOR UPDATE SKIP LOCKED

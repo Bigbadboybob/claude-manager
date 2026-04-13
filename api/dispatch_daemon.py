@@ -1,11 +1,10 @@
 import asyncio
 import logging
 import subprocess
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from dispatch import db
 from dispatch.config import (
     GCP_PROJECT, GCP_ZONE, MAX_WORKERS, MANAGER_URL, API_TOKEN,
-    ZOMBIE_TIMEOUT_MINUTES,
 )
 
 logger = logging.getLogger("cm.dispatch")
@@ -24,9 +23,6 @@ async def dispatch_loop(pool):
             if tick % 3 == 0:
                 await _maintain_warm_pools(pool)
 
-            # Zombie detection every 60s
-            if tick % 6 == 0:
-                await _detect_zombies(pool)
 
         except asyncio.CancelledError:
             logger.info("Dispatch daemon shutting down")
@@ -159,25 +155,6 @@ async def _maintain_warm_pools(pool):
                 except Exception:
                     pass
 
-
-async def _detect_zombies(pool):
-    """Detect tasks stuck in 'running' with no responding VM."""
-    running = await db.list_tasks(pool, status="running")
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=ZOMBIE_TIMEOUT_MINUTES)
-
-    for task in running:
-        if not task.get("worker_vm"):
-            continue
-        updated = task.get("updated_at")
-        if isinstance(updated, str):
-            updated = datetime.fromisoformat(updated.replace("Z", "+00:00"))
-        if updated and updated < cutoff:
-            # Check if VM is still alive
-            is_alive = await asyncio.to_thread(_check_vm_alive, task["worker_vm"])
-            if not is_alive:
-                logger.warning(f"Zombie task {task['id']} — VM {task['worker_vm']} is dead, re-queuing")
-                await db.update_task(pool, str(task["id"]),
-                                     status="backlog", worker_vm=None, ttyd_url=None)
 
 
 def _launch_worker_sync(task, branch):
