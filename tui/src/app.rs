@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::Event as TermEvent;
 use alacritty_terminal::term::TermMode;
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -71,6 +71,8 @@ pub struct TerminalSession {
     pub hidden: bool,
     /// Seconds of quiet before marking idle. 0 = use global default.
     pub idle_timeout_secs: u16,
+    /// Prompt text to prefill (without submitting) after Claude starts up.
+    pub pending_prompt: Option<(Instant, String)>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
@@ -523,6 +525,7 @@ impl App {
                         pending_jsonl_files: None,
                         hidden: entry.hidden,
                         idle_timeout_secs: entry.idle_timeout_secs,
+                        pending_prompt: None,
                     };
                     task.sessions.push(ts);
                 }
@@ -825,6 +828,30 @@ impl App {
                         TermEvent::Wakeup => {
                             ts.session.wakeup_times.push(now);
                         }
+                        TermEvent::ClipboardStore(_, text) => {
+                            // Forward OSC 52 clipboard store to the outer terminal.
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&text);
+                            let osc = format!("\x1b]52;c;{}\x07", b64);
+                            let _ = std::io::Write::write_all(
+                                &mut std::io::stdout(),
+                                osc.as_bytes(),
+                            );
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        TermEvent::ClipboardLoad(_, formatter) => {
+                            // Read clipboard via OSC 52 is unreliable; try xclip/xsel.
+                            if let Ok(output) = std::process::Command::new("xclip")
+                                .args(["-selection", "clipboard", "-o"])
+                                .output()
+                            {
+                                if output.status.success() {
+                                    let text = String::from_utf8_lossy(&output.stdout);
+                                    let response = formatter(&text);
+                                    ts.session.write(response.as_bytes());
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -863,6 +890,14 @@ impl App {
                         } else if burst && ts.status != SessionStatus::Running {
                             ts.status = SessionStatus::Running;
                         }
+                    }
+                }
+
+                // Deliver pending prompt (prefill without submitting) once delay has elapsed.
+                if let Some((deliver_at, _)) = &ts.pending_prompt {
+                    if now >= *deliver_at {
+                        let prompt_text = ts.pending_prompt.take().unwrap().1;
+                        ts.session.write(prompt_text.as_bytes());
                     }
                 }
 
@@ -1036,8 +1071,7 @@ impl App {
                 .take(60)
                 .collect::<String>();
 
-            let is_cloud = task.worker_vm.as_deref().is_some_and(|s| !s.is_empty())
-                    || task.session_id.as_deref().is_some_and(|s| !s.is_empty());
+            let is_cloud = task.is_cloud;
 
             // Detect local worktree path for non-cloud tasks.
             let is_local = !is_cloud
@@ -1095,8 +1129,7 @@ impl App {
                     None
                 };
 
-                let is_cloud = task.worker_vm.as_deref().is_some_and(|s| !s.is_empty())
-                    || task.session_id.as_deref().is_some_and(|s| !s.is_empty());
+                let is_cloud = task.is_cloud;
                 self.tasks.push(TaskEntry {
                     task_id: Some(task.id.clone()),
                     name: display_name,
@@ -1362,6 +1395,14 @@ impl App {
             }
         }
 
+        // Handle mouse events over the terminal pane: scroll wheel + click-drag selection.
+        // Always consume — un-consumed mouse events would fall through to the terminal
+        // forwarder below, which both snaps scroll to bottom and writes ANSI bytes to the PTY.
+        if let CrosstermEvent::Mouse(me) = event {
+            self.handle_terminal_mouse(me);
+            return true;
+        }
+
         // Handle bracketed paste — send entire text at once, wrapped in
         // bracket escapes if the inner program has enabled bracketed paste mode.
         if let CrosstermEvent::Paste(text) = event {
@@ -1401,6 +1442,80 @@ impl App {
         }
 
         false
+    }
+
+    /// Handle a mouse event over the terminal pane.
+    /// Returns true if the event was consumed.
+    fn handle_terminal_mouse(&mut self, me: &crossterm::event::MouseEvent) -> bool {
+        if !matches!(self.view_mode, ViewMode::Sessions) {
+            return false;
+        }
+        // Terminal inner rect (after border) sits at (1,1) with last_term_size dims.
+        let (term_cols, term_rows) = self.last_term_size;
+        if me.column < 1 || me.row < 1
+            || me.column > term_cols
+            || me.row > term_rows
+        {
+            return false;
+        }
+        let grid_col = (me.column - 1) as usize;
+        let viewport_row = (me.row - 1) as usize;
+
+        let Some(ts) = self.active_session_mut() else { return false; };
+
+        use alacritty_terminal::grid::Scroll;
+        use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        use alacritty_terminal::term::viewport_to_point;
+
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                ts.session.term.lock().scroll_display(Scroll::Delta(3));
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                ts.session.term.lock().scroll_display(Scroll::Delta(-3));
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let mut term = ts.session.term.lock();
+                let display_offset = term.grid().display_offset();
+                let point = viewport_to_point(
+                    display_offset,
+                    GridPoint::new(viewport_row, Column(grid_col)),
+                );
+                let ty = if me.modifiers.contains(KeyModifiers::ALT) {
+                    SelectionType::Block
+                } else {
+                    SelectionType::Simple
+                };
+                term.selection = Some(Selection::new(ty, point, Side::Left));
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let mut term = ts.session.term.lock();
+                let display_offset = term.grid().display_offset();
+                let point = viewport_to_point(
+                    display_offset,
+                    GridPoint::new(viewport_row, Column(grid_col)),
+                );
+                if let Some(sel) = term.selection.as_mut() {
+                    sel.update(point, Side::Right);
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let text = ts.session.term.lock().selection_to_string();
+                if let Some(text) = text {
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                        self.set_status_msg(&format!("Copied {} chars", text.len()));
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Handle events while in input mode.
@@ -1696,6 +1811,7 @@ impl App {
                     pending_jsonl_files: Some(pending),
                     hidden: false,
                     idle_timeout_secs: idle_timeout_secs,
+                    pending_prompt: None,
                 };
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
@@ -1782,6 +1898,7 @@ impl App {
                     pending_jsonl_files: None,
                     hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1809,6 +1926,7 @@ impl App {
                     pending_jsonl_files: Some(pending),
                     hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1829,6 +1947,7 @@ impl App {
                     pending_jsonl_files: None,
                     hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1885,6 +2004,7 @@ impl App {
                             pending_jsonl_files: None,
                             hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: None,
                         };
                         let si = self.tasks[task_index].sessions.len();
                         self.tasks[task_index].sessions.push(ts);
@@ -1931,6 +2051,7 @@ impl App {
                     pending_jsonl_files: pending,
                     hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: None,
                 };
                 let si = self.tasks[task_index].sessions.len();
                 self.tasks[task_index].sessions.push(ts);
@@ -1980,6 +2101,7 @@ impl App {
                     pending_jsonl_files: None,
                     hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: None,
                 };
 
                 // Find existing task by task_id or create new.
@@ -2243,6 +2365,11 @@ impl App {
                     pending_jsonl_files: Some(pending),
                     hidden: false,
                     idle_timeout_secs: 0,
+                    pending_prompt: if prompt.trim().is_empty() {
+                        None
+                    } else {
+                        Some((Instant::now() + Duration::from_secs(3), prompt.to_string()))
+                    },
                 };
 
                 let new_ti = self.tasks.len();
@@ -2911,5 +3038,18 @@ impl App {
             " Terminal ".to_string()
         }
     }
+}
+
+/// Copy text to the system clipboard via the OSC 52 escape sequence.
+/// Supported by most modern terminal emulators (kitty, wezterm, iTerm2, alacritty,
+/// xterm, and tmux with `set -g set-clipboard on`).
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let seq = format!("\x1b]52;c;{}\x1b\\", encoded);
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 

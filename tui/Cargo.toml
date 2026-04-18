@@ -25,3 +25,4 @@ serde_yaml = "0.9"
 
 # Error handling
 anyhow = "1"
+base64 = "0.22.1"

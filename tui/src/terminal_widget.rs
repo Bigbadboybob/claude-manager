@@ -1,5 +1,5 @@
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb};
 use alacritty_terminal::Term;
 use ratatui::buffer::Buffer;
@@ -28,6 +28,7 @@ impl Widget for TerminalWidget<'_> {
         let content = term.renderable_content();
         let cursor = content.cursor;
         let display_offset = content.display_offset as i32;
+        let selection = content.selection;
 
         for indexed in content.display_iter {
             let point = indexed.point;
@@ -56,11 +57,29 @@ impl Widget for TerminalWidget<'_> {
             let bg = convert_color(cell.bg);
             let modifier = convert_flags(cell.flags);
 
-            let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
+            let (mut fg, mut bg) = if cell.flags.contains(Flags::INVERSE) {
                 (bg, fg)
             } else {
                 (fg, bg)
             };
+
+            // Invert cells that fall inside an active selection range.
+            // For non-block selections, skip cells past the end of actual content so
+            // the highlight stops at the text instead of running to the right edge.
+            if let Some(range) = selection {
+                let in_range = range.contains(point);
+                let past_content = !range.is_block
+                    && point.column >= term.grid()[point.line].line_length();
+                if in_range && !past_content {
+                    std::mem::swap(&mut fg, &mut bg);
+                    if matches!(fg, Color::Reset) {
+                        fg = Color::Black;
+                    }
+                    if matches!(bg, Color::Reset) {
+                        bg = Color::White;
+                    }
+                }
+            }
 
             if let Some(ratatui_cell) = buf.cell_mut((x, y)) {
                 ratatui_cell.set_char(cell.c);

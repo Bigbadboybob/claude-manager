@@ -15,6 +15,7 @@ use crossterm::event::{
     self, Event as CrosstermEvent, KeyboardEnhancementFlags, poll as crossterm_poll,
     PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     EnableBracketedPaste, DisableBracketedPaste,
+    EnableMouseCapture, DisableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -36,6 +37,7 @@ fn main() -> anyhow::Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
@@ -51,6 +53,7 @@ fn main() -> anyhow::Result<()> {
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
