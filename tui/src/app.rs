@@ -73,14 +73,15 @@ pub struct TerminalSession {
     pub hidden: bool,
     /// Seconds of quiet before marking idle. 0 = use global default.
     pub idle_timeout_secs: u16,
-    /// Prompt text to prefill (without submitting) after Claude starts up.
+    /// Prompt text to deliver to the session after a delay. The trailing Enter
+    /// keystroke is encoded at delivery time based on the session's current
+    /// terminal mode (not at schedule time), so mode changes during the
+    /// settle delay don't break submission.
     pub pending_prompt: Option<(Instant, String)>,
-    /// A `/clear\r` (or similar) command to send before `pending_prompt`. Split
-    /// from pending_prompt so we can settle-delay them independently — writing
-    /// `/clear\r` immediately when the PTY has just been reset (or is still
-    /// settling) leaves the `\r` uninterpreted as Enter, and the text just
-    /// accumulates in the input box.
-    pub pending_clear: Option<(Instant, Vec<u8>)>,
+    /// Schedule a `/clear` submission to the session at this time. The text
+    /// and the Enter keystroke are both generated at delivery time — at
+    /// schedule time we only know we want to reset.
+    pub pending_clear: Option<Instant>,
     /// If this session is a workflow participant, the run it belongs to.
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
@@ -1027,46 +1028,57 @@ impl App {
                     }
                 }
 
-                // Deliver queued `/clear` first if its time has come.
-                if let Some((deliver_at, _)) = &ts.pending_clear {
-                    if now >= *deliver_at {
-                        let bytes = ts.pending_clear.take().unwrap().1;
+                // Deliver queued `/clear` first if its time has come. Text +
+                // Enter are encoded now using the session's *current* mode,
+                // which may have been set during the settle delay.
+                if let Some(deliver_at) = ts.pending_clear {
+                    if now >= deliver_at {
+                        ts.pending_clear = None;
+                        let enter = enter_bytes_for(&ts.session);
+                        let kitty = enter != b"\r";
                         let exited = ts.session.exited;
-                        let n = bytes.len();
-                        ts.session.write(&bytes);
+                        ts.session.write(b"/clear");
+                        ts.session.write(enter);
                         if let Some(run_id) = ts.workflow_run_id.clone() {
                             log_tick(
                                 &run_id,
                                 &format!(
-                                    "delivered pending_clear: {} bytes to session '{}' role='{}' exited={}",
-                                    n,
+                                    "delivered pending_clear to session '{}' role='{}' exited={} kitty_enter={}",
                                     ts.label,
                                     ts.workflow_role.as_deref().unwrap_or("?"),
                                     exited,
+                                    kitty,
                                 ),
                             );
                         }
                     }
                 }
 
-                // Deliver pending prompt (prefill without submitting) once delay has elapsed.
+                // Deliver pending prompt once delay has elapsed. Trailing Enter
+                // is encoded at delivery time (not schedule time) to match the
+                // session's current keyboard protocol.
                 if let Some((deliver_at, _)) = &ts.pending_prompt {
                     if now >= *deliver_at {
                         let prompt_text = ts.pending_prompt.take().unwrap().1;
-                        let n = prompt_text.len();
+                        // The stored string ends with "\r" (from fire_transition);
+                        // strip any trailing \r/\n and append a properly-encoded
+                        // Enter keystroke based on current mode.
+                        let body = prompt_text.trim_end_matches(['\r', '\n']);
+                        let enter = enter_bytes_for(&ts.session);
+                        let kitty = enter != b"\r";
                         let exited = ts.session.exited;
-                        ts.session.write(prompt_text.as_bytes());
-                        // Log delivery visible in each workflow run this session
-                        // belongs to (so we can trace prompt flow end-to-end).
+                        ts.session.write(body.as_bytes());
+                        ts.session.write(enter);
                         if let Some(run_id) = ts.workflow_run_id.clone() {
                             log_tick(
                                 &run_id,
                                 &format!(
-                                    "delivered pending_prompt: {} bytes to session '{}' role='{}' exited={}",
-                                    n,
+                                    "delivered pending_prompt: {} body bytes + enter to session '{}' role='{}' exited={} kitty_enter={}",
+                                    body.len(),
                                     ts.label,
                                     ts.workflow_role.as_deref().unwrap_or("?"),
                                     exited,
+                                    kitty,
                                 ),
                             );
                         }
@@ -4334,7 +4346,7 @@ impl App {
             return None;
         }
         let when = Instant::now() + Duration::from_secs(5);
-        ts.pending_clear = Some((when, b"/clear\r".to_vec()));
+        ts.pending_clear = Some(when);
         ts.status = SessionStatus::Idle;
         ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
             ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
@@ -4622,6 +4634,23 @@ impl App {
 
 /// Compute the workflow-level aggregate indicator.
 /// Running = any participant session active; Idle = none active; plus Paused/Done.
+/// Return the byte sequence that means "Enter" to whatever's reading the
+/// session's PTY right now. Most modern TUIs (codex, claude code) enable
+/// the Kitty keyboard protocol (CSI >1u) at startup, which encodes Enter as
+/// `\x1b[13u`, not raw `\r`. A raw `\r` written in that mode gets interpreted
+/// as a literal carriage-return character appended to the input box instead
+/// of as the Enter keystroke — which matches the "prompt shows up with a
+/// newline but isn't submitted" symptom.
+fn enter_bytes_for(session: &crate::session::Session) -> &'static [u8] {
+    let mode = *session.term.lock().mode();
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        // Kitty: Enter = CSI 13 u
+        b"\x1b[13u"
+    } else {
+        b"\r"
+    }
+}
+
 /// Append a diagnostic line for a workflow run to its `tick.log`.
 ///
 /// Lives in `~/.cm/workflow-runs/<run_id>/tick.log`. Rate-limited to at most
