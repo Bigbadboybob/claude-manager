@@ -18,6 +18,7 @@ use crate::input;
 use crate::planning::{PlanAction, PlanningView};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
+use crate::workflow::{self, toml_schema::Engine, RoleBinding, TriggerKind, Workflow, WorkflowRun};
 use crate::worktree;
 
 mod dirs {
@@ -73,6 +74,10 @@ pub struct TerminalSession {
     pub idle_timeout_secs: u16,
     /// Prompt text to prefill (without submitting) after Claude starts up.
     pub pending_prompt: Option<(Instant, String)>,
+    /// If this session is a workflow participant, the run it belongs to.
+    pub workflow_run_id: Option<String>,
+    /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
+    pub workflow_role: Option<String>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
@@ -89,6 +94,10 @@ struct ManifestEntry {
     hidden: bool,
     #[serde(default)]
     idle_timeout_secs: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_role: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
@@ -185,6 +194,31 @@ enum InputMode {
         /// 0 = name, 1 = idle timeout
         active_field: u8,
     },
+    /// Confirming launch of a workflow on a task.
+    WorkflowLaunchConfirm {
+        task_index: usize,
+        workflow_name: String,
+        /// One slot per role, in presentation order.
+        slots: Vec<WorkflowSlotChoice>,
+    },
+    /// Showing a workflow run's history.
+    WorkflowHistory {
+        run_id: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowSlotChoice {
+    pub role: String,
+    pub source: WorkflowSlotSource,
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkflowSlotSource {
+    /// Use an existing session on the task, by index within task.sessions.
+    Existing(usize),
+    /// Spawn a new session of the given engine.
+    New,
 }
 
 pub struct App {
@@ -204,6 +238,10 @@ pub struct App {
     start_time: Instant,
     sessions_restored: bool,
     last_session_id_check: Instant,
+    /// Workflow definitions loaded from `workflows/*.toml` at startup.
+    pub workflows: HashMap<String, Workflow>,
+    /// Active + recent workflow runs (persisted per run at ~/.cm/workflow-runs/).
+    pub workflow_runs: Vec<WorkflowRun>,
 }
 
 impl App {
@@ -214,6 +252,12 @@ impl App {
             Some("task") => SidebarView::Task,
             _ => SidebarView::Status,
         };
+        let (workflows, _errs) =
+            workflow::toml_schema::load_all(&workflow::toml_schema::workflows_dir());
+        let workflow_runs = workflow::run::load_all()
+            .into_iter()
+            .filter(|r| r.is_active())
+            .collect();
         App {
             tasks: Vec::new(),
             cursor: Cursor::Task(0),
@@ -231,6 +275,8 @@ impl App {
             start_time: Instant::now(),
             sessions_restored: false,
             last_session_id_check: Instant::now(),
+            workflows,
+            workflow_runs,
         }
     }
 
@@ -395,6 +441,8 @@ impl App {
                         session_id: ts.session_id.clone(),
                         hidden: ts.hidden,
                         idle_timeout_secs: ts.idle_timeout_secs,
+                        workflow_run_id: ts.workflow_run_id.clone(),
+                        workflow_role: ts.workflow_role.clone(),
                     }
                 })
                 .collect();
@@ -526,6 +574,8 @@ impl App {
                         hidden: entry.hidden,
                         idle_timeout_secs: entry.idle_timeout_secs,
                         pending_prompt: None,
+                        workflow_run_id: entry.workflow_run_id.clone(),
+                        workflow_role: entry.workflow_role.clone(),
                     };
                     task.sessions.push(ts);
                 }
@@ -943,6 +993,11 @@ impl App {
         if had_event {
             self.needs_redraw = true;
         }
+
+        // Drive workflow transitions after per-session bookkeeping — this way
+        // any session state changes above (idle detection, new session_id) are
+        // visible to the workflow engine.
+        self.tick_workflows();
     }
 
     /// Process all pending backend events (non-blocking).
@@ -1349,6 +1404,22 @@ impl App {
                         self.pull_active();
                         return true;
                     }
+                    KeyCode::Char('f') => {
+                        self.open_workflow_launch();
+                        return true;
+                    }
+                    KeyCode::Char('u') => {
+                        self.resume_workflow_for_cursor();
+                        return true;
+                    }
+                    KeyCode::Char('t') => {
+                        self.detach_workflow_for_cursor();
+                        return true;
+                    }
+                    KeyCode::Char('y') => {
+                        self.open_workflow_history();
+                        return true;
+                    }
                     _ => {}
                 }
             }
@@ -1675,6 +1746,33 @@ impl App {
                     }
                     _ => return true,
                 },
+                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots: _ } => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.input_mode = InputMode::Normal;
+                            return true;
+                        }
+                        KeyCode::Enter => {
+                            let ti = *task_index;
+                            let wf_name = workflow_name.clone();
+                            let slots_owned = match &self.input_mode {
+                                InputMode::WorkflowLaunchConfirm { slots, .. } => slots.clone(),
+                                _ => Vec::new(),
+                            };
+                            self.input_mode = InputMode::Normal;
+                            self.launch_workflow(ti, &wf_name, slots_owned);
+                            return true;
+                        }
+                        _ => return true,
+                    }
+                }
+                InputMode::WorkflowHistory { run_id: _ } => match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.input_mode = InputMode::Normal;
+                        return true;
+                    }
+                    _ => return true,
+                },
             }
         }
         true
@@ -1812,6 +1910,8 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: idle_timeout_secs,
                     pending_prompt: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
@@ -1899,6 +1999,8 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1927,6 +2029,8 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -1948,6 +2052,8 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2003,8 +2109,10 @@ impl App {
                             session_id: None,
                             pending_jsonl_files: None,
                             hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: None,
+                            idle_timeout_secs: 0,
+                            pending_prompt: None,
+                            workflow_run_id: None,
+                            workflow_role: None,
                         };
                         let si = self.tasks[task_index].sessions.len();
                         self.tasks[task_index].sessions.push(ts);
@@ -2052,6 +2160,8 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
                 let si = self.tasks[task_index].sessions.len();
                 self.tasks[task_index].sessions.push(ts);
@@ -2102,6 +2212,8 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
 
                 // Find existing task by task_id or create new.
@@ -2370,6 +2482,8 @@ impl App {
                     } else {
                         Some((Instant::now() + Duration::from_secs(3), prompt.to_string()))
                     },
+                    workflow_run_id: None,
+                    workflow_role: None,
                 };
 
                 let new_ti = self.tasks.len();
@@ -2478,6 +2592,12 @@ impl App {
                 }
                 InputMode::SessionSettings { name, idle_timeout, hidden, active_field, .. } => {
                     self.draw_session_settings(frame, area, name, idle_timeout, *hidden, *active_field);
+                }
+                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots } => {
+                    self.draw_workflow_launch(frame, area, *task_index, workflow_name, slots);
+                }
+                InputMode::WorkflowHistory { run_id } => {
+                    self.draw_workflow_history(frame, area, run_id);
                 }
                 InputMode::Normal => {}
             }
@@ -2853,6 +2973,30 @@ impl App {
                         }
                     };
 
+                    // Role badge for workflow-participant sessions, e.g. "[W]".
+                    let wf_badge: Option<(String, Style)> =
+                        if let (Some(run_id), Some(role)) =
+                            (ts.workflow_run_id.as_deref(), ts.workflow_role.as_deref())
+                        {
+                            let active = self
+                                .workflow_runs
+                                .iter()
+                                .any(|r| r.run_id == run_id && r.active_role.as_deref() == Some(role));
+                            let style = if active {
+                                Style::default().fg(Color::Yellow)
+                            } else {
+                                Style::default().fg(Color::Cyan)
+                            };
+                            let ch = role
+                                .chars()
+                                .next()
+                                .map(|c| c.to_ascii_uppercase())
+                                .unwrap_or('?');
+                            Some((format!("[{}] ", ch), style))
+                        } else {
+                            None
+                        };
+
                     let display = match self.sidebar_view {
                         SidebarView::Status => {
                             // "taskname / label"
@@ -2875,13 +3019,15 @@ impl App {
                         }
                     };
 
-                    let line = Line::from(vec![
-                        Span::styled(
-                            format!(" {} ", indicator),
-                            indicator_style,
-                        ),
-                        Span::raw(display),
-                    ]);
+                    let mut spans = vec![Span::styled(
+                        format!(" {} ", indicator),
+                        indicator_style,
+                    )];
+                    if let Some((badge, style)) = wf_badge {
+                        spans.push(Span::styled(badge, style));
+                    }
+                    spans.push(Span::raw(display));
+                    let line = Line::from(spans);
 
                     let base_style = if is_selected {
                         Style::default()
@@ -2928,6 +3074,8 @@ impl App {
             ("A-w    close", "A-v  view"),
             ("A-e    settings", "A-r  refresh"),
             ("A-h    hide", "A-q  quit"),
+            ("A-f    workflow", "A-u  resume"),
+            ("A-t    detach wf", "A-y  history"),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -3037,6 +3185,739 @@ impl App {
         } else {
             " Terminal ".to_string()
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//                            Workflow integration
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl App {
+    /// Return the task_key used to identify a task in workflow state
+    /// (matches the manifest keying convention).
+    fn task_key(task: &TaskEntry) -> Option<String> {
+        if let Some(p) = &task.worktree_path {
+            p.to_str().map(|s| s.to_string())
+        } else if let Some(id) = &task.task_id {
+            Some(format!("task:{}", id))
+        } else {
+            None
+        }
+    }
+
+    fn find_task_by_key(&self, key: &str) -> Option<usize> {
+        self.tasks
+            .iter()
+            .position(|t| Self::task_key(t).as_deref() == Some(key))
+    }
+
+    fn find_session_by_label(task: &TaskEntry, label: &str) -> Option<usize> {
+        task.sessions.iter().position(|s| s.label == label)
+    }
+
+    /// Open the launch modal for a workflow, prefilled for the focused session.
+    fn open_workflow_launch(&mut self) {
+        let (ti, focused_si) = match self.cursor.clone() {
+            Cursor::Session(ti, si) => (ti, Some(si)),
+            Cursor::Task(ti) => (ti, None),
+        };
+        if ti >= self.tasks.len() {
+            self.set_status_msg("No task selected");
+            return;
+        }
+        // For v1 we always launch "feedback" since it's our only built-in. The
+        // framework supports other workflows — extend the modal to pick one when
+        // we add them.
+        let wf_name = "feedback".to_string();
+        let Some(wf) = self.workflows.get(&wf_name).cloned() else {
+            self.set_status_msg(&format!(
+                "Workflow '{}' not found (looked in {})",
+                wf_name,
+                workflow::toml_schema::workflows_dir().display()
+            ));
+            return;
+        };
+
+        // Build default slot choices in role_order. First role -> focused session
+        // if there is one and it's compatible (persistent context). Others -> New.
+        let mut slots = Vec::new();
+        for (idx, role_name) in wf.role_order.iter().enumerate() {
+            let role = &wf.roles[role_name];
+            let source = if idx == 0 && focused_si.is_some() {
+                // Only bind an existing session for persistent-context first role.
+                if matches!(role.context, workflow::toml_schema::Context::Persistent) {
+                    WorkflowSlotSource::Existing(focused_si.unwrap())
+                } else {
+                    WorkflowSlotSource::New
+                }
+            } else {
+                WorkflowSlotSource::New
+            };
+            slots.push(WorkflowSlotChoice {
+                role: role_name.clone(),
+                source,
+            });
+        }
+        self.input_mode = InputMode::WorkflowLaunchConfirm {
+            task_index: ti,
+            workflow_name: wf_name,
+            slots,
+        };
+    }
+
+    /// Actually launch a workflow given a task and resolved slot choices.
+    fn launch_workflow(
+        &mut self,
+        task_index: usize,
+        workflow_name: &str,
+        slots: Vec<WorkflowSlotChoice>,
+    ) {
+        let Some(wf) = self.workflows.get(workflow_name).cloned() else {
+            self.set_status_msg("Workflow not found");
+            return;
+        };
+        if task_index >= self.tasks.len() {
+            return;
+        }
+
+        // Validate: `fresh` slots cannot use existing sessions.
+        for slot in &slots {
+            let role = match wf.roles.get(&slot.role) {
+                Some(r) => r,
+                None => {
+                    self.set_status_msg(&format!("Unknown role: {}", slot.role));
+                    return;
+                }
+            };
+            if matches!(role.context, workflow::toml_schema::Context::Fresh)
+                && matches!(slot.source, WorkflowSlotSource::Existing(_))
+            {
+                self.set_status_msg(&format!(
+                    "Role '{}' has fresh context; must use a new session",
+                    slot.role
+                ));
+                return;
+            }
+        }
+
+        let task_key = match Self::task_key(&self.tasks[task_index]) {
+            Some(k) => k,
+            None => {
+                self.set_status_msg("Task has no worktree or id");
+                return;
+            }
+        };
+        let run_id = workflow::run::new_run_id();
+
+        // Spawn / bind sessions for each slot and build role_sessions.
+        let mut role_sessions: std::collections::BTreeMap<String, RoleBinding> =
+            std::collections::BTreeMap::new();
+        for slot in &slots {
+            let role = &wf.roles[&slot.role];
+            let (session_label, session_id) = match &slot.source {
+                WorkflowSlotSource::Existing(si) => {
+                    // Bind existing session and tag it with workflow metadata.
+                    let ts = match self.tasks[task_index].sessions.get_mut(*si) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    ts.workflow_run_id = Some(run_id.clone());
+                    ts.workflow_role = Some(slot.role.clone());
+                    (ts.label.clone(), ts.session_id.clone())
+                }
+                WorkflowSlotSource::New => {
+                    match self.spawn_workflow_session(task_index, &slot.role, role, &run_id) {
+                        Some((label, sid)) => (label, sid),
+                        None => {
+                            self.set_status_msg(&format!("Failed to spawn {}", slot.role));
+                            return;
+                        }
+                    }
+                }
+            };
+            role_sessions.insert(
+                slot.role.clone(),
+                RoleBinding {
+                    session_label,
+                    current_session_id: session_id,
+                },
+            );
+        }
+
+        // Initial active role = first in role_order.
+        let initial_role = wf.role_order.first().cloned().unwrap_or_else(|| "worker".into());
+        let run = WorkflowRun::new(
+            run_id.clone(),
+            workflow_name.to_string(),
+            task_key,
+            role_sessions,
+            initial_role.clone(),
+        );
+        let _ = workflow::run::save(&run);
+        self.workflow_runs.push(run);
+        self.save_session_manifest();
+        self.set_status_msg(&format!(
+            "Launched {} ({} roles, initial: {})",
+            workflow_name,
+            wf.role_order.len(),
+            initial_role
+        ));
+    }
+
+    /// Spawn a new TerminalSession for a workflow role, returning (label, session_id).
+    /// The session_id is usually None immediately — it's detected later via JSONL scan.
+    fn spawn_workflow_session(
+        &mut self,
+        task_index: usize,
+        role_name: &str,
+        role: &workflow::toml_schema::Role,
+        run_id: &str,
+    ) -> Option<(String, Option<String>)> {
+        let worktree_path = self.tasks[task_index].worktree_path.clone()?;
+        let (cols, rows) = self.last_term_size;
+        let (program, args) = match workflow::spawn::build_args(
+            &role.engine,
+            run_id,
+            role_name,
+            None,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_status_msg(&format!("spawn args: {}", e));
+                return None;
+            }
+        };
+        let pending = if matches!(role.engine, Engine::ClaudeCode) {
+            Some(Self::list_jsonl_files(&worktree_path))
+        } else {
+            None
+        };
+        let sess = Session::new(
+            &program,
+            &args,
+            cols,
+            rows,
+            Some(worktree_path.clone()),
+            Default::default(),
+        )
+        .ok()?;
+        let session_type = role.engine.as_session_type().to_string();
+        let label = role_name.to_string();
+        let ts = TerminalSession {
+            label: label.clone(),
+            session_type,
+            session: sess,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            session_id: None,
+            pending_jsonl_files: pending,
+            hidden: false,
+            idle_timeout_secs: 0,
+            pending_prompt: None,
+            workflow_run_id: Some(run_id.to_string()),
+            workflow_role: Some(role_name.to_string()),
+        };
+        self.tasks[task_index].sessions.push(ts);
+        Some((label, None))
+    }
+
+    /// Called once per main loop iteration. Drives transitions for each active run:
+    ///   1. Read new events from events.jsonl; fire dynamic transitions / done.
+    ///   2. Check if the active role's session went idle; fire static transition.
+    ///   3. Auto-pause runs when the user types into a workflow session.
+    pub fn tick_workflows(&mut self) {
+        if self.workflow_runs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+
+        // Check user input → auto-pause.
+        for task in &self.tasks {
+            for ts in &task.sessions {
+                let (Some(run_id), Some(_role)) = (&ts.workflow_run_id, &ts.workflow_role) else {
+                    continue;
+                };
+                let Some(last_write) = ts.last_write_at else { continue };
+                if now.duration_since(last_write) > Duration::from_secs(30) {
+                    continue;
+                }
+                if let Some(run) = self
+                    .workflow_runs
+                    .iter_mut()
+                    .find(|r| r.run_id == *run_id)
+                {
+                    if matches!(run.status, workflow::RunStatus::Running) {
+                        run.set_paused(true);
+                        let _ = workflow::run::save(run);
+                    }
+                }
+            }
+        }
+
+        // Collect decisions first, then apply. (Avoids borrow issues with mutable
+        // access to both self.workflow_runs and self.tasks.)
+        #[derive(Debug)]
+        enum Decision {
+            ActivateStatic { run_id: String, to: String, from: String },
+            ActivateDynamic {
+                run_id: String,
+                to: String,
+                from: String,
+                prompt: String,
+                event_id: String,
+            },
+            Done { run_id: String, reason: String },
+        }
+        let mut decisions: Vec<Decision> = Vec::new();
+
+        // Snapshot run states.
+        let run_snapshots: Vec<(usize, String, u64, Option<String>, bool)> = self
+            .workflow_runs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_active())
+            .map(|(i, r)| {
+                (
+                    i,
+                    r.run_id.clone(),
+                    r.events_offset,
+                    r.active_role.clone(),
+                    r.paused,
+                )
+            })
+            .collect();
+
+        for (idx, run_id, offset, active_role, paused) in run_snapshots {
+            // Read new events regardless of paused state so the log stays in sync;
+            // events are still recorded in history but not fired while paused.
+            let (events, new_offset) = workflow::events::read_new(&run_id, offset);
+            self.workflow_runs[idx].events_offset = new_offset;
+
+            if paused {
+                continue;
+            }
+
+            for ev in &events {
+                match ev.kind() {
+                    workflow::events::EventKind::Transition { to, prompt } => {
+                        if let Some(from) = active_role.clone() {
+                            decisions.push(Decision::ActivateDynamic {
+                                run_id: run_id.clone(),
+                                to,
+                                from,
+                                prompt,
+                                event_id: ev.id.clone(),
+                            });
+                        }
+                    }
+                    workflow::events::EventKind::Done { reason } => {
+                        decisions.push(Decision::Done {
+                            run_id: run_id.clone(),
+                            reason,
+                        });
+                    }
+                    workflow::events::EventKind::Unknown => {}
+                }
+            }
+
+            // If no dynamic event fired, check for static idle transition.
+            if events.is_empty() {
+                let Some(active) = active_role.as_deref() else { continue };
+                let wf = self
+                    .workflows
+                    .get(&self.workflow_runs[idx].workflow_name)
+                    .cloned();
+                let Some(wf) = wf else { continue };
+                let Some(binding) = self.workflow_runs[idx].role_sessions.get(active).cloned() else {
+                    continue;
+                };
+                let task_key = self.workflow_runs[idx].task_key.clone();
+                let ti = match self.find_task_by_key(&task_key) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let si = match Self::find_session_by_label(&self.tasks[ti], &binding.session_label) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let session_idle = matches!(
+                    self.tasks[ti].sessions[si].status,
+                    SessionStatus::Idle
+                );
+                if session_idle {
+                    if let Some(t) = wf.static_transition_on_idle(active) {
+                        decisions.push(Decision::ActivateStatic {
+                            run_id: run_id.clone(),
+                            to: t.to.clone(),
+                            from: active.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for d in decisions {
+            match d {
+                Decision::ActivateStatic { run_id, to, from } => {
+                    self.fire_transition(
+                        &run_id,
+                        &to,
+                        TriggerKind::StaticIdle { from_role: from },
+                        None,
+                    );
+                }
+                Decision::ActivateDynamic { run_id, to, from, prompt, event_id } => {
+                    self.fire_transition(
+                        &run_id,
+                        &to,
+                        TriggerKind::McpTransition { from_role: from, prompt: prompt.clone(), event_id },
+                        Some(prompt),
+                    );
+                }
+                Decision::Done { run_id, reason } => {
+                    self.finish_run(&run_id, reason);
+                }
+            }
+        }
+    }
+
+    /// Execute a role transition: capture outgoing role's last message, render the
+    /// target role's prompt, deliver it into the PTY (respawning first if fresh).
+    fn fire_transition(
+        &mut self,
+        run_id: &str,
+        to_role: &str,
+        trigger: TriggerKind,
+        supplied_prompt: Option<String>,
+    ) {
+        let run_idx = match self.workflow_runs.iter().position(|r| r.run_id == run_id) {
+            Some(i) => i,
+            None => return,
+        };
+        let wf_name = self.workflow_runs[run_idx].workflow_name.clone();
+        let wf = match self.workflows.get(&wf_name).cloned() {
+            Some(w) => w,
+            None => return,
+        };
+        let task_key = self.workflow_runs[run_idx].task_key.clone();
+        let ti = match self.find_task_by_key(&task_key) {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Capture outgoing role's last message.
+        let from_role = self.workflow_runs[run_idx].active_role.clone();
+        let captured = if let Some(from) = &from_role {
+            if let Some(binding) = self.workflow_runs[run_idx].role_sessions.get(from).cloned() {
+                let from_role_spec = wf.roles.get(from).cloned();
+                if let (Some(spec), Some(sid)) = (from_role_spec, binding.current_session_id) {
+                    let wt = self.tasks[ti].worktree_path.clone();
+                    if let Some(wt) = wt {
+                        workflow::transcript::last_message(&spec.engine, &wt, &sid)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.workflow_runs[run_idx].close_active_role(captured);
+
+        // Render prompt for target role.
+        let target_role_spec = match wf.roles.get(to_role).cloned() {
+            Some(r) => r,
+            None => return,
+        };
+        let template_source = supplied_prompt
+            .or_else(|| target_role_spec.activation_prompt.clone())
+            .unwrap_or_default();
+        let rendered = workflow::template::render(&template_source, &self.workflow_runs[run_idx]);
+
+        // Activate the target role. For `fresh`, respawn the underlying process.
+        let binding = match self.workflow_runs[run_idx].role_sessions.get(to_role).cloned() {
+            Some(b) => b,
+            None => return,
+        };
+        let si = match Self::find_session_by_label(&self.tasks[ti], &binding.session_label) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
+            self.respawn_session_fresh(ti, si, to_role, &target_role_spec, run_id);
+        }
+
+        // Update role_sessions with (possibly new) session_id from the session.
+        let current_sid = self.tasks[ti].sessions[si].session_id.clone();
+        if let Some(b) = self.workflow_runs[run_idx].role_sessions.get_mut(to_role) {
+            b.current_session_id = current_sid;
+        }
+
+        self.workflow_runs[run_idx].activate_role(to_role.to_string(), trigger);
+        let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+
+        // Deliver prompt (queued with a small delay so the PTY is ready, esp. for
+        // freshly respawned processes).
+        if !rendered.is_empty() {
+            let when = Instant::now() + Duration::from_secs(2);
+            self.tasks[ti].sessions[si].pending_prompt = Some((when, format!("{}\r", rendered)));
+        }
+        self.save_session_manifest();
+    }
+
+    /// Kill the current PTY for a session slot and respawn the engine fresh.
+    fn respawn_session_fresh(
+        &mut self,
+        ti: usize,
+        si: usize,
+        role_name: &str,
+        role: &workflow::toml_schema::Role,
+        run_id: &str,
+    ) {
+        let (cols, rows) = self.last_term_size;
+        let worktree = self.tasks[ti].worktree_path.clone();
+        let (program, args) = match workflow::spawn::build_args(&role.engine, run_id, role_name, None) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pending = worktree.as_ref().map(|wt| Self::list_jsonl_files(wt));
+
+        // Mark the old session as exited — PTY drops when the Session is replaced.
+        if let Ok(s) = Session::new(&program, &args, cols, rows, worktree, Default::default()) {
+            let ts = &mut self.tasks[ti].sessions[si];
+            ts.session = s;
+            ts.status = SessionStatus::Running;
+            ts.last_write_at = None;
+            ts.session_id = None;
+            ts.pending_jsonl_files = pending;
+            ts.pending_prompt = None;
+        }
+    }
+
+    fn finish_run(&mut self, run_id: &str, reason: String) {
+        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+            run.mark_done(reason.clone());
+            let _ = workflow::run::save(run);
+        }
+        self.set_status_msg(&format!("Workflow done: {}", reason));
+    }
+
+    fn resume_workflow_for_cursor(&mut self) {
+        let run_id = match self.focused_session_run_id() {
+            Some(id) => id,
+            None => {
+                self.set_status_msg("Focused session is not in a workflow");
+                return;
+            }
+        };
+        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+            if matches!(run.status, workflow::RunStatus::Paused) {
+                run.set_paused(false);
+                let _ = workflow::run::save(run);
+                self.set_status_msg(&format!("Resumed workflow {}", run_id));
+            } else {
+                self.set_status_msg("Workflow is not paused");
+            }
+        }
+    }
+
+    fn detach_workflow_for_cursor(&mut self) {
+        let run_id = match self.focused_session_run_id() {
+            Some(id) => id,
+            None => {
+                self.set_status_msg("Focused session is not in a workflow");
+                return;
+            }
+        };
+        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+            run.mark_detached();
+            let _ = workflow::run::save(run);
+        }
+        // Clear workflow tags from participating sessions so they behave like normal.
+        for task in &mut self.tasks {
+            for ts in &mut task.sessions {
+                if ts.workflow_run_id.as_deref() == Some(&run_id) {
+                    ts.workflow_run_id = None;
+                    ts.workflow_role = None;
+                }
+            }
+        }
+        self.workflow_runs.retain(|r| r.run_id != run_id);
+        self.save_session_manifest();
+        self.set_status_msg("Workflow detached");
+    }
+
+    fn open_workflow_history(&mut self) {
+        let run_id = match self.focused_session_run_id() {
+            Some(id) => id,
+            None => {
+                self.set_status_msg("Focused session is not in a workflow");
+                return;
+            }
+        };
+        self.input_mode = InputMode::WorkflowHistory { run_id };
+    }
+
+    fn focused_session_run_id(&self) -> Option<String> {
+        let (ti, si) = match self.cursor.clone() {
+            Cursor::Session(ti, si) => (ti, si),
+            _ => return None,
+        };
+        self.tasks
+            .get(ti)
+            .and_then(|t| t.sessions.get(si))
+            .and_then(|s| s.workflow_run_id.clone())
+    }
+
+    /// Role name for a session, if it's a workflow participant.
+    pub fn session_workflow_role(&self, ti: usize, si: usize) -> Option<&str> {
+        self.tasks
+            .get(ti)?
+            .sessions
+            .get(si)?
+            .workflow_role
+            .as_deref()
+    }
+
+    /// Run associated with a task (by task_key), if any is active.
+    pub fn task_workflow_run(&self, ti: usize) -> Option<&WorkflowRun> {
+        let key = Self::task_key(self.tasks.get(ti)?)?;
+        self.workflow_runs
+            .iter()
+            .find(|r| r.task_key == key && r.is_active())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//                         Workflow modal rendering
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl App {
+    pub fn draw_workflow_launch(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        task_index: usize,
+        workflow_name: &str,
+        slots: &[WorkflowSlotChoice],
+    ) {
+        let width = area.width.min(70).max(40);
+        let height = (slots.len() as u16 + 7).min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let title = format!(" Launch workflow: {} ", workflow_name);
+        let task_name = self
+            .tasks
+            .get(task_index)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("Task: {}", task_name),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+        for slot in slots {
+            let src = match &slot.source {
+                WorkflowSlotSource::Existing(si) => {
+                    let label = self
+                        .tasks
+                        .get(task_index)
+                        .and_then(|t| t.sessions.get(*si))
+                        .map(|s| s.label.clone())
+                        .unwrap_or_else(|| "?".into());
+                    format!("existing session ({})", label)
+                }
+                WorkflowSlotSource::New => "new session".into(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<10}", slot.role), Style::default().fg(Color::Cyan)),
+                Span::styled(src, Style::default().fg(Color::Gray)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Enter: launch   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(Style::default().fg(Color::White));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, dialog);
+    }
+
+    pub fn draw_workflow_history(&self, frame: &mut Frame, area: Rect, run_id: &str) {
+        let width = area.width.saturating_sub(4).min(90);
+        let height = area.height.saturating_sub(4);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+        frame.render_widget(Clear, dialog);
+
+        let run = self.workflow_runs.iter().find(|r| r.run_id == run_id);
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(run) = run {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} • iter {} • status: {:?}",
+                    run.workflow_name, run.iteration, run.status
+                ),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(""));
+            for h in &run.history {
+                let msg = h
+                    .last_message
+                    .as_deref()
+                    .map(|s| {
+                        let first = s.lines().next().unwrap_or("");
+                        let trimmed: String = first.chars().take(80).collect();
+                        trimmed
+                    })
+                    .unwrap_or("(active)".into());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("[{:>3}] {:<10}", h.iteration, h.role),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(msg, Style::default().fg(Color::Gray)),
+                ]));
+            }
+            if let Some(reason) = &run.done_reason {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("done: {}", reason),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+        } else {
+            lines.push(Line::from("(run not found)"));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc / Enter: close",
+            Style::default().fg(Color::DarkGray),
+        )));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Workflow history • {} ", run_id))
+            .style(Style::default().fg(Color::White));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, dialog);
     }
 }
 

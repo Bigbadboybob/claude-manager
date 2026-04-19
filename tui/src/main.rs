@@ -6,6 +6,7 @@ mod input;
 mod planning;
 mod session;
 mod terminal_widget;
+mod workflow;
 mod worktree;
 
 use std::io;
