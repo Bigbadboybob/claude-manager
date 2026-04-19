@@ -4237,7 +4237,12 @@ impl App {
         // need a beat to reset internal state.
         if !rendered.trim().is_empty() {
             let delay = if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-                Duration::from_secs(4)
+                // Deliberately long — diagnosing whether the issue is a race
+                // between `/clear` processing and prompt delivery. If this
+                // makes the prompt show up, it's timing. If still nothing,
+                // bytes are going to the right PTY but codex is eating them
+                // for a different reason.
+                Duration::from_secs(20)
             } else {
                 Duration::from_secs(2)
             };
