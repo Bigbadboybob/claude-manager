@@ -3192,6 +3192,50 @@ impl App {
 //                            Workflow integration
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Bridges the template engine to a workflow run's roles.
+///
+/// For a given role name, looks up the engine (from `Workflow`) and session id
+/// (from `WorkflowRun.role_sessions`), then reads that session's JSONL transcript
+/// on demand. Fresh-context roles naturally expose only their current activation's
+/// messages — past activations wrote to a different session id and are no longer
+/// pointed at.
+struct WorkflowResolver<'a> {
+    wf: &'a Workflow,
+    run: &'a WorkflowRun,
+    worktree_path: Option<&'a Path>,
+}
+
+impl<'a> WorkflowResolver<'a> {
+    fn lookup(&self, role: &str) -> Option<(&'a workflow::toml_schema::Engine, &'a Path, &'a str)> {
+        let role_spec = self.wf.roles.get(role)?;
+        let binding = self.run.role_sessions.get(role)?;
+        let session_id = binding.current_session_id.as_deref()?;
+        let worktree = self.worktree_path?;
+        Some((&role_spec.engine, worktree, session_id))
+    }
+}
+
+impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
+    fn user_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        workflow::transcript::list_messages(engine, wt, sid, workflow::transcript::MessageKind::User)
+    }
+
+    fn assistant_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        workflow::transcript::list_messages(
+            engine,
+            wt,
+            sid,
+            workflow::transcript::MessageKind::Assistant,
+        )
+    }
+}
+
 impl App {
     /// Return the task_key used to identify a task in workflow state
     /// (matches the manifest keying convention).
@@ -3605,7 +3649,7 @@ impl App {
             None => return,
         };
 
-        // Capture outgoing role's last message.
+        // Capture outgoing role's last assistant message for history.
         let from_role = self.workflow_runs[run_idx].active_role.clone();
         let captured = if let Some(from) = &from_role {
             if let Some(binding) = self.workflow_runs[run_idx].role_sessions.get(from).cloned() {
@@ -3636,7 +3680,13 @@ impl App {
         let template_source = supplied_prompt
             .or_else(|| target_role_spec.activation_prompt.clone())
             .unwrap_or_default();
-        let rendered = workflow::template::render(&template_source, &self.workflow_runs[run_idx]);
+        let worktree_ref = self.tasks[ti].worktree_path.as_deref();
+        let resolver = WorkflowResolver {
+            wf: &wf,
+            run: &self.workflow_runs[run_idx],
+            worktree_path: worktree_ref,
+        };
+        let rendered = workflow::template::render(&template_source, &resolver);
 
         // Activate the target role. For `fresh`, respawn the underlying process.
         let binding = match self.workflow_runs[run_idx].role_sessions.get(to_role).cloned() {
