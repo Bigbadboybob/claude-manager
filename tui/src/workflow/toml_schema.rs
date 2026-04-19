@@ -196,19 +196,22 @@ impl Workflow {
 ///
 /// Order of preference:
 ///   1. `$CM_WORKFLOWS_DIR` env var
-///   2. `./workflows` relative to the current working directory
-///   3. `~/.cm/workflows/`
+///   2. A `workflows/` directory found by walking up from the current working directory
+///   3. A `workflows/` directory found by walking up from the binary's location
+///   4. `~/.cm/workflows/`
 pub fn workflows_dir() -> PathBuf {
     if let Ok(p) = std::env::var("CM_WORKFLOWS_DIR") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    let cwd_candidate = std::env::current_dir()
-        .ok()
-        .map(|p| p.join("workflows"));
-    if let Some(p) = cwd_candidate {
-        if p.is_dir() {
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(p) = walk_up_for(&cwd, "workflows") {
+            return p;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = walk_up_for(&exe, "workflows") {
             return p;
         }
     }
@@ -216,6 +219,19 @@ pub fn workflows_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".cm/workflows")
+}
+
+/// Walk up from `start` (inclusive) looking for a subdirectory named `name`.
+fn walk_up_for(start: &Path, name: &str) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(p) = cur {
+        let candidate = p.join(name);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        cur = p.parent();
+    }
+    None
 }
 
 /// Load all valid workflows from the workflows directory.
