@@ -108,6 +108,11 @@ pub fn codex_args(run_id: &str, role: &str, resume_session_id: Option<&str>) -> 
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let mut args: Vec<String> = Vec::new();
+    // Skip the "trust this directory?" prompt. Worktrees won't be in the user's
+    // codex trusted-projects config by default, and without this flag codex
+    // sits waiting for manual approval — the workflow tick sees the PTY alive
+    // but no JSONL rollout gets written and the agent never runs our prompt.
+    args.push("--dangerously-bypass-approvals-and-sandbox".into());
     // Register the MCP server.
     args.push("-c".into());
     args.push(r#"mcp_servers.claude-manager.command="python""#.into());
@@ -175,5 +180,17 @@ mod tests {
         // Env string embeds the run_id and role.
         assert!(args.iter().any(|a| a.contains("wf_abc")));
         assert!(args.iter().any(|a| a.contains(r#"CM_ROLE="worker""#)));
+    }
+
+    #[test]
+    fn codex_args_bypass_trust_prompt() {
+        // Worktree dirs typically aren't in the user's codex trusted-projects
+        // config. Without bypass, codex sits at a confirmation prompt and the
+        // workflow stalls indefinitely.
+        let args = codex_args("wf_abc", "worker", None);
+        assert!(
+            args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "codex_args must bypass the trust prompt"
+        );
     }
 }

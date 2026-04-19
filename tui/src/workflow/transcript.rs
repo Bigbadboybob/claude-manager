@@ -339,15 +339,25 @@ pub fn latest_plan(
 /// id (e.g. the user ran `/clear` or `/compact`, which Claude Code handles by
 /// starting a fresh session + JSONL without informing the parent PTY host).
 ///
+/// `excluded_sids` are sids that must NOT be returned — typically the sids
+/// other active sessions in the TUI are already bound to. Without this, when
+/// two claude sessions share a worktree the drift detector for session A can
+/// grab session B's current (actively-written-to) sid, causing both sessions
+/// to appear to share history.
+///
 /// Returns `Some(new_sid)` when drift is detected, `None` when the bound sid is
-/// still the most-recently-active one (or there's no clear winner). Compares
-/// the latest-entry timestamp recorded *inside* the JSONL, not filesystem
-/// mtime, because mtime can be bumped by unrelated file operations.
+/// still the most-recently-active one (or there's no unclaimed candidate).
+/// Compares the latest-entry timestamp recorded *inside* the JSONL, not
+/// filesystem mtime, because mtime can be bumped by unrelated file operations.
 ///
 /// Codex sessions are not currently checked for drift because their storage
 /// layout (`~/.codex/sessions/YYYY/MM/DD/`) makes per-worktree scanning more
 /// expensive and we haven't seen drift in practice.
-pub fn detect_claude_sid_drift(worktree_path: &Path, bound_sid: &str) -> Option<String> {
+pub fn detect_claude_sid_drift(
+    worktree_path: &Path,
+    bound_sid: &str,
+    excluded_sids: &[&str],
+) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let path_str = worktree_path.to_str()?;
     let encoded = path_str.replace('/', "-").replace('.', "-");
@@ -367,6 +377,9 @@ pub fn detect_claude_sid_drift(worktree_path: &Path, bound_sid: &str) -> Option<
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
         if stem == bound_sid {
+            continue;
+        }
+        if excluded_sids.iter().any(|s| *s == stem) {
             continue;
         }
         let Some(ts) = latest_jsonl_timestamp(&path) else { continue };
@@ -663,7 +676,7 @@ mod tests {
         let _h = HomeOverride::new(tmp);
         let wt = std::path::PathBuf::from("/tmp/repo");
 
-        let drift = detect_claude_sid_drift(&wt, "old-sid");
+        let drift = detect_claude_sid_drift(&wt, "old-sid", &[]);
         assert_eq!(
             drift.as_deref(),
             Some("new-sid"),
@@ -682,8 +695,37 @@ mod tests {
         let _h = HomeOverride::new(tmp);
         let wt = std::path::PathBuf::from("/tmp/repo");
 
-        let drift = detect_claude_sid_drift(&wt, "bound-sid");
+        let drift = detect_claude_sid_drift(&wt, "bound-sid", &[]);
         assert_eq!(drift, None, "should not migrate when bound is already newest");
+    }
+
+    /// Two sessions share a worktree ("claud" and "claude"). `"claud"`'s file
+    /// is stale, `"claude"`'s is actively being written. Without the exclusion
+    /// list, drift detection for `"claud"` would steal `"claude"`'s sid, which
+    /// is exactly the glitch reported after a TUI restart.
+    #[test]
+    fn drift_excludes_other_sessions_sids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claud_stale = r##"{"type":"user","timestamp":"2026-04-19T19:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"old claud"}]}}"##;
+        let claude_active = r##"{"type":"user","timestamp":"2026-04-19T21:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"active claude"}]}}"##;
+        write_transcript(&tmp, "-tmp-repo", "claud-sid", claud_stale);
+        write_transcript(&tmp, "-tmp-repo", "claude-sid", claude_active);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        // No exclusion: drift detector happily migrates to claude-sid. BUG.
+        assert_eq!(
+            detect_claude_sid_drift(&wt, "claud-sid", &[]).as_deref(),
+            Some("claude-sid"),
+        );
+
+        // With claude-sid excluded (because "claude" session is bound to it),
+        // drift detector correctly finds no migration candidate.
+        assert_eq!(
+            detect_claude_sid_drift(&wt, "claud-sid", &["claude-sid"]),
+            None,
+            "must not poach another session's bound sid"
+        );
     }
 
     /// Picks the newest when multiple drift candidates exist (e.g. user did
@@ -700,7 +742,7 @@ mod tests {
         let _h = HomeOverride::new(tmp);
         let wt = std::path::PathBuf::from("/tmp/repo");
 
-        let drift = detect_claude_sid_drift(&wt, "bound");
+        let drift = detect_claude_sid_drift(&wt, "bound", &[]);
         assert_eq!(drift.as_deref(), Some("cand-b"));
     }
 

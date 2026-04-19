@@ -362,6 +362,43 @@ to = "b"
         assert!(wf.static_transition_on_idle("manager").is_none());
     }
 
+    /// End-to-end template substitution — uses a synthetic template to avoid
+    /// coupling to whatever the user has in their current feedback.toml. This
+    /// proves the render path produces non-empty output when substitutions
+    /// fire, which is what fire_transition requires to set pending_prompt.
+    #[test]
+    fn full_render_pipeline_non_empty_with_substitution() {
+        use crate::workflow::template::{render, RoleResolver};
+
+        let template = "Worker: {{ roles.worker.last_message }}\nReviewer: {{ roles.reviewer.last_message }}";
+
+        struct Stub;
+        impl RoleResolver for Stub {
+            fn user_messages(&self, _: &str) -> Vec<String> { Vec::new() }
+            fn assistant_messages(&self, role: &str) -> Vec<String> {
+                match role {
+                    "worker" => vec!["did the thing".into()],
+                    "reviewer" => vec!["needs another pass".into()],
+                    _ => Vec::new(),
+                }
+            }
+            fn prior_user_messages(&self, _: &str) -> Vec<String> { Vec::new() }
+            fn prior_assistant_messages(&self, _: &str) -> Vec<String> { Vec::new() }
+            fn latest_plan(&self, _: &str) -> Option<String> { None }
+        }
+
+        let rendered = render(template, &Stub);
+        assert_eq!(rendered, "Worker: did the thing\nReviewer: needs another pass");
+
+        // Make sure what fire_transition would build is sensible:
+        //   - non-empty (otherwise pending_prompt won't be set)
+        //   - ends with \r after trim_end (so Enter submits instead of
+        //     just inserting a newline)
+        let payload = format!("{}\r", rendered.trim_end());
+        assert!(payload.ends_with('\r'));
+        assert!(!payload.ends_with("\n\r"), "trailing \\n before \\r = Enter gets swallowed");
+    }
+
     /// Sanity-check that the actual `workflows/feedback.toml` shipped in the repo
     /// loads through our loader and validates. Runs only when the file is present.
     #[test]

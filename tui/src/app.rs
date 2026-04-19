@@ -1024,7 +1024,23 @@ impl App {
                 if let Some((deliver_at, _)) = &ts.pending_prompt {
                     if now >= *deliver_at {
                         let prompt_text = ts.pending_prompt.take().unwrap().1;
+                        let n = prompt_text.len();
+                        let exited = ts.session.exited;
                         ts.session.write(prompt_text.as_bytes());
+                        // Log delivery visible in each workflow run this session
+                        // belongs to (so we can trace prompt flow end-to-end).
+                        if let Some(run_id) = ts.workflow_run_id.clone() {
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "delivered pending_prompt: {} bytes to session '{}' role='{}' exited={}",
+                                    n,
+                                    ts.label,
+                                    ts.workflow_role.as_deref().unwrap_or("?"),
+                                    exited,
+                                ),
+                            );
+                        }
                     }
                 }
 
@@ -3777,14 +3793,29 @@ impl App {
                 // fallen behind a newer one in the same project dir, migrate.
                 // Happens when claude rotates sessions via /clear, /compact,
                 // or a failed --resume. Only applies to claude sessions.
+                //
+                // Exclude any sid already bound to a DIFFERENT session in the
+                // task — otherwise, if two claude sessions share a worktree,
+                // one's drift detector can steal the other's actively-written
+                // sid and make them appear to share history.
                 if self.tasks[ti].sessions[si].session_type == "claude" {
                     let bound_sid = self.tasks[ti].sessions[si].session_id.clone();
+                    let other_sids: Vec<String> = self.tasks[ti]
+                        .sessions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(osi, ots)| {
+                            if osi == si { None } else { ots.session_id.clone() }
+                        })
+                        .collect();
                     if let (Some(bound), Some(wt)) = (
                         bound_sid.as_deref(),
                         self.tasks[ti].worktree_path.as_deref(),
                     ) {
+                        let other_refs: Vec<&str> =
+                            other_sids.iter().map(|s| s.as_str()).collect();
                         if let Some(new_sid) =
-                            workflow::transcript::detect_claude_sid_drift(wt, bound)
+                            workflow::transcript::detect_claude_sid_drift(wt, bound, &other_refs)
                         {
                             self.tasks[ti].sessions[si].session_id = Some(new_sid);
                             // Old file's counts no longer apply to the new file.
@@ -4167,7 +4198,7 @@ impl App {
         let rendered = workflow::template::render(&template_source, &resolver);
 
         if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-            self.reset_fresh_session(ti, si);
+            self.reset_fresh_session(run_id, ti, si);
         }
 
         // Update role_sessions with (possibly new) session_id from the session.
@@ -4212,43 +4243,52 @@ impl App {
             };
             let when = Instant::now() + delay;
             let payload = format!("{}\r", rendered.trim_end());
+            let label = self.tasks[ti].sessions[si].label.clone();
+            log_tick(
+                run_id,
+                &format!(
+                    "fire_transition: activated '{}' role='{}' set pending_prompt ({} bytes, delay {}s) on session '{}'",
+                    to_role,
+                    to_role,
+                    payload.len(),
+                    delay.as_secs(),
+                    label,
+                ),
+            );
             self.tasks[ti].sessions[si].pending_prompt = Some((when, payload));
+        } else {
+            log_tick(
+                run_id,
+                &format!(
+                    "fire_transition: activated '{}' but rendered prompt was EMPTY — nothing to deliver",
+                    to_role
+                ),
+            );
         }
         self.save_session_manifest();
     }
 
     /// Kill the current PTY for a session slot and respawn the engine fresh.
     /// Reset a running session's conversation without killing the process.
-    ///
-    /// Used for `context = "fresh"` role activations. Faster than killing and
-    /// respawning the PTY, and avoids the "prompt arrives before agent is
-    /// ready" race that's hard to avoid with a fresh spawn. Both Claude Code
-    /// and Codex accept `/clear` as a slash command.
-    ///
-    /// Leaves the PTY alive; the agent process rotates its internal session
-    /// id, and the drift detector migrates `ts.session_id` automatically.
-    /// We clear the pending_jsonl_files snapshot so id detection re-runs
-    /// against the newly-created JSONL.
-    fn reset_fresh_session(&mut self, ti: usize, si: usize) {
+    /// Returns true if the reset was dispatched, false if the session is gone.
+    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
         let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
+        let label = self.tasks[ti].sessions[si].label.clone();
         let ts = &mut self.tasks[ti].sessions[si];
         if ts.session.exited {
-            return;
+            log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
+            return false;
         }
-        // Send "/clear" + Enter to the running agent's PTY.
         ts.session.write(b"/clear\r");
-        // Status goes Idle while it processes the clear; real activity will
-        // flip back to Running via burst detection.
         ts.status = SessionStatus::Idle;
-        // The new conversation writes to a new JSONL. Re-enable detection so
-        // it finds the new file. Keep the OLD sid for now — drift detection
-        // will migrate once the new file has newer in-JSONL timestamps.
         ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
             ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
             ("codex", Some(wt)) => Some(Self::list_codex_sessions(wt)),
             _ => None,
         };
         ts.pending_prompt = None;
+        log_tick(run_id, &format!("reset_fresh: sent /clear to '{}'", label));
+        true
     }
 
     fn finish_run(&mut self, run_id: &str, reason: String) {
