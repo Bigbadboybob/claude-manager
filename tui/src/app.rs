@@ -75,6 +75,12 @@ pub struct TerminalSession {
     pub idle_timeout_secs: u16,
     /// Prompt text to prefill (without submitting) after Claude starts up.
     pub pending_prompt: Option<(Instant, String)>,
+    /// A `/clear\r` (or similar) command to send before `pending_prompt`. Split
+    /// from pending_prompt so we can settle-delay them independently — writing
+    /// `/clear\r` immediately when the PTY has just been reset (or is still
+    /// settling) leaves the `\r` uninterpreted as Enter, and the text just
+    /// accumulates in the input box.
+    pub pending_clear: Option<(Instant, Vec<u8>)>,
     /// If this session is a workflow participant, the run it belongs to.
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
@@ -610,6 +616,7 @@ impl App {
                         hidden: entry.hidden,
                         idle_timeout_secs: entry.idle_timeout_secs,
                         pending_prompt: None,
+                        pending_clear: None,
                         workflow_run_id: entry.workflow_run_id.clone(),
                         workflow_role: entry.workflow_role.clone(),
                     };
@@ -1016,6 +1023,28 @@ impl App {
                             ts.status = SessionStatus::Idle;
                         } else if burst && ts.status != SessionStatus::Running {
                             ts.status = SessionStatus::Running;
+                        }
+                    }
+                }
+
+                // Deliver queued `/clear` first if its time has come.
+                if let Some((deliver_at, _)) = &ts.pending_clear {
+                    if now >= *deliver_at {
+                        let bytes = ts.pending_clear.take().unwrap().1;
+                        let exited = ts.session.exited;
+                        let n = bytes.len();
+                        ts.session.write(&bytes);
+                        if let Some(run_id) = ts.workflow_run_id.clone() {
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "delivered pending_clear: {} bytes to session '{}' role='{}' exited={}",
+                                    n,
+                                    ts.label,
+                                    ts.workflow_role.as_deref().unwrap_or("?"),
+                                    exited,
+                                ),
+                            );
                         }
                     }
                 }
@@ -2039,6 +2068,7 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: idle_timeout_secs,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -2128,6 +2158,7 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -2158,6 +2189,7 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -2181,6 +2213,7 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -2240,6 +2273,7 @@ impl App {
                             hidden: false,
                             idle_timeout_secs: 0,
                             pending_prompt: None,
+                            pending_clear: None,
                             workflow_run_id: None,
                             workflow_role: None,
                         };
@@ -2289,6 +2323,7 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -2341,6 +2376,7 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -2611,6 +2647,7 @@ impl App {
                     } else {
                         Some((Instant::now() + Duration::from_secs(3), prompt.to_string()))
                     },
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
                 };
@@ -3917,6 +3954,7 @@ impl App {
             hidden: true,
             idle_timeout_secs: 0,
             pending_prompt: None,
+            pending_clear: None,
             workflow_run_id: Some(run_id.to_string()),
             workflow_role: Some(role_name.to_string()),
         };
@@ -4197,9 +4235,14 @@ impl App {
         };
         let rendered = workflow::template::render(&template_source, &resolver);
 
-        if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-            self.reset_fresh_session(run_id, ti, si);
-        }
+        let clear_scheduled_at = if matches!(
+            target_role_spec.context,
+            workflow::toml_schema::Context::Fresh
+        ) {
+            self.reset_fresh_session(run_id, ti, si)
+        } else {
+            None
+        };
 
         // Update role_sessions with (possibly new) session_id from the session.
         let current_sid = self.tasks[ti].sessions[si].session_id.clone();
@@ -4236,27 +4279,25 @@ impl App {
         // for fresh-context roles because they just received a `/clear` and
         // need a beat to reset internal state.
         if !rendered.trim().is_empty() {
-            let delay = if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-                // Deliberately long — diagnosing whether the issue is a race
-                // between `/clear` processing and prompt delivery. If this
-                // makes the prompt show up, it's timing. If still nothing,
-                // bytes are going to the right PTY but codex is eating them
-                // for a different reason.
-                Duration::from_secs(20)
+            // For fresh-context roles, the prompt has to land after /clear has
+            // been processed. `/clear` is queued for 5s from now
+            // (see reset_fresh_session); give another 4s after the scheduled
+            // clear write for the agent to reset before typing the prompt.
+            let when = if let Some(clear_at) = clear_scheduled_at {
+                clear_at + Duration::from_secs(4)
             } else {
-                Duration::from_secs(2)
+                Instant::now() + Duration::from_secs(2)
             };
-            let when = Instant::now() + delay;
             let payload = format!("{}\r", rendered.trim_end());
             let label = self.tasks[ti].sessions[si].label.clone();
             log_tick(
                 run_id,
                 &format!(
-                    "fire_transition: activated '{}' role='{}' set pending_prompt ({} bytes, delay {}s) on session '{}'",
+                    "fire_transition: activated '{}' role='{}' set pending_prompt ({} bytes, fires in {}s) on session '{}'",
                     to_role,
                     to_role,
                     payload.len(),
-                    delay.as_secs(),
+                    when.saturating_duration_since(Instant::now()).as_secs(),
                     label,
                 ),
             );
@@ -4274,17 +4315,26 @@ impl App {
     }
 
     /// Kill the current PTY for a session slot and respawn the engine fresh.
-    /// Reset a running session's conversation without killing the process.
-    /// Returns true if the reset was dispatched, false if the session is gone.
-    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
+    /// Queue a `/clear\r` write to the session's PTY after a settle delay.
+    ///
+    /// We don't write immediately because the PTY may still be finishing
+    /// startup/render after a spawn or transition — and if codex (or claude) is
+    /// mid-state, the `\r` doesn't get interpreted as Enter and the command
+    /// sits in the input box. Delaying 5s lets the TUI reach a state where
+    /// `\r` is unambiguously an Enter keystroke.
+    ///
+    /// Returns the scheduled Instant at which /clear will be written, or None
+    /// if the session is already gone.
+    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> Option<Instant> {
         let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
         let label = self.tasks[ti].sessions[si].label.clone();
         let ts = &mut self.tasks[ti].sessions[si];
         if ts.session.exited {
             log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
-            return false;
+            return None;
         }
-        ts.session.write(b"/clear\r");
+        let when = Instant::now() + Duration::from_secs(5);
+        ts.pending_clear = Some((when, b"/clear\r".to_vec()));
         ts.status = SessionStatus::Idle;
         ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
             ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
@@ -4292,8 +4342,11 @@ impl App {
             _ => None,
         };
         ts.pending_prompt = None;
-        log_tick(run_id, &format!("reset_fresh: sent /clear to '{}'", label));
-        true
+        log_tick(
+            run_id,
+            &format!("reset_fresh: scheduled /clear to '{}' (delay 5s)", label),
+        );
+        Some(when)
     }
 
     fn finish_run(&mut self, run_id: &str, reason: String) {
