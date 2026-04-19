@@ -4167,7 +4167,7 @@ impl App {
         let rendered = workflow::template::render(&template_source, &resolver);
 
         if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-            self.respawn_session_fresh(ti, si, to_role, &target_role_spec, run_id);
+            self.reset_fresh_session(ti, si);
         }
 
         // Update role_sessions with (possibly new) session_id from the session.
@@ -4198,54 +4198,57 @@ impl App {
         let from_label = from_role.as_deref().unwrap_or("?");
         self.set_status_msg(&format!("Workflow: {} → {}", from_label, to_role));
 
-        // Deliver prompt (queued with a small delay so the PTY is ready, esp. for
-        // freshly respawned processes).
-        if !rendered.is_empty() {
-            let when = Instant::now() + Duration::from_secs(2);
-            self.tasks[ti].sessions[si].pending_prompt = Some((when, format!("{}\r", rendered)));
+        // Deliver prompt. Trim trailing whitespace first so our explicit "\r"
+        // submit lands on non-newline text — otherwise a trailing "\n" in the
+        // TOML multiline string gets typed into the input box and the "\r"
+        // then only adds another newline instead of submitting. Longer delay
+        // for fresh-context roles because they just received a `/clear` and
+        // need a beat to reset internal state.
+        if !rendered.trim().is_empty() {
+            let delay = if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
+                Duration::from_secs(4)
+            } else {
+                Duration::from_secs(2)
+            };
+            let when = Instant::now() + delay;
+            let payload = format!("{}\r", rendered.trim_end());
+            self.tasks[ti].sessions[si].pending_prompt = Some((when, payload));
         }
         self.save_session_manifest();
     }
 
     /// Kill the current PTY for a session slot and respawn the engine fresh.
-    fn respawn_session_fresh(
-        &mut self,
-        ti: usize,
-        si: usize,
-        role_name: &str,
-        _role: &workflow::toml_schema::Role,
-        run_id: &str,
-    ) {
-        let (cols, rows) = self.last_term_size;
-        let worktree = self.tasks[ti].worktree_path.clone();
-        // Respawn with whatever engine the session was originally launched with
-        // (may differ from the role's TOML default if the user picked in the modal).
-        let engine = match self.tasks[ti].sessions[si].session_type.as_str() {
-            "codex" => Engine::Codex,
-            _ => Engine::ClaudeCode,
-        };
-        let (program, args) = match workflow::spawn::build_args(&engine, run_id, role_name, None) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let pending = if matches!(engine, Engine::ClaudeCode) {
-            worktree.as_ref().map(|wt| Self::list_jsonl_files(wt))
-        } else {
-            None
-        };
-
-        if let Ok(s) = Session::new(&program, &args, cols, rows, worktree, Default::default()) {
-            let ts = &mut self.tasks[ti].sessions[si];
-            ts.session = s;
-            // Start Idle — real output from the fresh agent will flip to
-            // Running via burst detection. Prevents the aggregate from spinning
-            // during the respawn itself.
-            ts.status = SessionStatus::Idle;
-            ts.last_write_at = None;
-            ts.session_id = None;
-            ts.pending_jsonl_files = pending;
-            ts.pending_prompt = None;
+    /// Reset a running session's conversation without killing the process.
+    ///
+    /// Used for `context = "fresh"` role activations. Faster than killing and
+    /// respawning the PTY, and avoids the "prompt arrives before agent is
+    /// ready" race that's hard to avoid with a fresh spawn. Both Claude Code
+    /// and Codex accept `/clear` as a slash command.
+    ///
+    /// Leaves the PTY alive; the agent process rotates its internal session
+    /// id, and the drift detector migrates `ts.session_id` automatically.
+    /// We clear the pending_jsonl_files snapshot so id detection re-runs
+    /// against the newly-created JSONL.
+    fn reset_fresh_session(&mut self, ti: usize, si: usize) {
+        let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
+        let ts = &mut self.tasks[ti].sessions[si];
+        if ts.session.exited {
+            return;
         }
+        // Send "/clear" + Enter to the running agent's PTY.
+        ts.session.write(b"/clear\r");
+        // Status goes Idle while it processes the clear; real activity will
+        // flip back to Running via burst detection.
+        ts.status = SessionStatus::Idle;
+        // The new conversation writes to a new JSONL. Re-enable detection so
+        // it finds the new file. Keep the OLD sid for now — drift detection
+        // will migrate once the new file has newer in-JSONL timestamps.
+        ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
+            ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
+            ("codex", Some(wt)) => Some(Self::list_codex_sessions(wt)),
+            _ => None,
+        };
+        ts.pending_prompt = None;
     }
 
     fn finish_run(&mut self, run_id: &str, reason: String) {
