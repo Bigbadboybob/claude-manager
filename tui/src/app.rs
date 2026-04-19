@@ -3480,6 +3480,24 @@ impl App {
         task.sessions.iter().position(|s| s.label == label)
     }
 
+    /// Locate the `(task_index, session_index)` of the session that's tagged
+    /// as `role` for workflow run `run_id`. Searches across ALL tasks — the
+    /// workflow's stored `task_key` can drift away from reality (sessions can
+    /// move, or the workflow may have been launched with a stale task key),
+    /// and the tags on the session itself are the source of truth.
+    fn locate_workflow_session(&self, run_id: &str, role: &str) -> Option<(usize, usize)> {
+        for (ti, task) in self.tasks.iter().enumerate() {
+            for (si, ts) in task.sessions.iter().enumerate() {
+                if ts.workflow_run_id.as_deref() == Some(run_id)
+                    && ts.workflow_role.as_deref() == Some(role)
+                {
+                    return Some((ti, si));
+                }
+            }
+        }
+        None
+    }
+
     /// Open the launch modal for a workflow, prefilled for the focused session.
     fn open_workflow_launch(&mut self) {
         let (ti, focused_si) = match self.cursor.clone() {
@@ -3681,6 +3699,10 @@ impl App {
                 }
             };
             // Compute baseline now, before the session does any new work.
+            // Use count_messages (counts any turn) for assistant_count so the
+            // idle gate sees a consistent picture later — it compares current
+            // count against baseline.assistant_count at start. user_count
+            // still uses list_messages (template slice uses text messages).
             let baseline = match (worktree_path.as_deref(), session_id.as_deref()) {
                 (Some(wt), Some(sid)) => MessageBaseline {
                     user_count: workflow::transcript::list_messages(
@@ -3690,13 +3712,12 @@ impl App {
                         workflow::transcript::MessageKind::User,
                     )
                     .len(),
-                    assistant_count: workflow::transcript::list_messages(
+                    assistant_count: workflow::transcript::count_messages(
                         &effective_engine,
                         wt,
                         sid,
                         workflow::transcript::MessageKind::Assistant,
-                    )
-                    .len(),
+                    ),
                 },
                 _ => MessageBaseline::default(),
             };
@@ -3740,8 +3761,7 @@ impl App {
             if !self.workflow_runs[idx].is_active() {
                 continue;
             }
-            let task_key = self.workflow_runs[idx].task_key.clone();
-            let Some(ti) = self.find_task_by_key(&task_key) else { continue };
+            let run_id = self.workflow_runs[idx].run_id.clone();
             let role_names: Vec<String> = self.workflow_runs[idx]
                 .role_sessions
                 .keys()
@@ -3749,14 +3769,58 @@ impl App {
                 .collect();
             let mut changed = false;
             for role in role_names {
-                let Some(binding) = self.workflow_runs[idx].role_sessions.get(&role).cloned() else {
+                let Some((ti, si)) = self.locate_workflow_session(&run_id, &role) else {
                     continue;
                 };
-                let Some(si) = Self::find_session_by_label(&self.tasks[ti], &binding.session_label) else {
-                    continue;
-                };
+
+                // Detect sid drift: if the bound session_id's transcript has
+                // fallen behind a newer one in the same project dir, migrate.
+                // Happens when claude rotates sessions via /clear, /compact,
+                // or a failed --resume. Only applies to claude sessions.
+                if self.tasks[ti].sessions[si].session_type == "claude" {
+                    let bound_sid = self.tasks[ti].sessions[si].session_id.clone();
+                    if let (Some(bound), Some(wt)) = (
+                        bound_sid.as_deref(),
+                        self.tasks[ti].worktree_path.as_deref(),
+                    ) {
+                        if let Some(new_sid) =
+                            workflow::transcript::detect_claude_sid_drift(wt, bound)
+                        {
+                            self.tasks[ti].sessions[si].session_id = Some(new_sid);
+                            // Old file's counts no longer apply to the new file.
+                            // Reset baseline, the role_sessions binding sid, and
+                            // the active role's start_count so the gate compares
+                            // against the new file's fresh state.
+                            let baseline = workflow::run::MessageBaseline::default();
+                            self.workflow_runs[idx]
+                                .role_baselines
+                                .insert(role.clone(), baseline);
+                            if self.workflow_runs[idx].active_role.as_deref()
+                                == Some(role.as_str())
+                            {
+                                if let Some(entry) =
+                                    self.workflow_runs[idx].history.last_mut()
+                                {
+                                    entry.assistant_count_at_start = 0;
+                                }
+                            }
+                            self.set_status_msg(&format!(
+                                "Workflow: {} session rotated (/clear or /compact)",
+                                role
+                            ));
+                            self.save_session_manifest();
+                            changed = true;
+                        }
+                    }
+                }
+
                 let live = self.tasks[ti].sessions[si].session_id.clone();
-                if live != binding.current_session_id {
+                let binding_sid = self
+                    .workflow_runs[idx]
+                    .role_sessions
+                    .get(&role)
+                    .and_then(|b| b.current_session_id.clone());
+                if live != binding_sid {
                     if let Some(b) = self.workflow_runs[idx].role_sessions.get_mut(&role) {
                         b.current_session_id = live;
                     }
@@ -3887,32 +3951,38 @@ impl App {
         for (idx, run_id, offset, active_role, paused) in run_snapshots {
             // Log per-session status so we can tell at a glance whether each
             // role ever reaches Running. Rate-limited by log_tick so this
-            // doesn't flood.
+            // doesn't flood. Now locates sessions by their workflow tags
+            // (run_id+role), which is the source of truth — the workflow's
+            // stored task_key can drift.
             {
-                let task_key = self.workflow_runs[idx].task_key.clone();
-                if let Some(ti) = self.find_task_by_key(&task_key) {
-                    let mut parts = Vec::new();
-                    for (role, binding) in &self.workflow_runs[idx].role_sessions {
-                        let status = Self::find_session_by_label(
-                            &self.tasks[ti],
-                            &binding.session_label,
-                        )
-                        .map(|si| {
+                let role_names: Vec<String> = self.workflow_runs[idx]
+                    .role_sessions
+                    .keys()
+                    .cloned()
+                    .collect();
+                let mut parts = Vec::new();
+                for role in &role_names {
+                    let status = match self.locate_workflow_session(&run_id, role) {
+                        Some((ti, si)) => {
                             let ts = &self.tasks[ti].sessions[si];
                             format!(
                                 "{:?}{}",
                                 ts.status,
                                 if ts.session.exited { "(exited)" } else { "" }
                             )
-                        })
-                        .unwrap_or_else(|| "<no session>".to_string());
-                        parts.push(format!("{}={}", role, status));
-                    }
-                    log_tick(
-                        &run_id,
-                        &format!("statuses: active={} [{}]", active_role.as_deref().unwrap_or("?"), parts.join(", ")),
-                    );
+                        }
+                        None => "<no session>".to_string(),
+                    };
+                    parts.push(format!("{}={}", role, status));
                 }
+                log_tick(
+                    &run_id,
+                    &format!(
+                        "statuses: active={} [{}]",
+                        active_role.as_deref().unwrap_or("?"),
+                        parts.join(", ")
+                    ),
+                );
             }
 
             // Read new events regardless of paused state so the log stays in sync;
@@ -3955,17 +4025,10 @@ impl App {
                     .get(&self.workflow_runs[idx].workflow_name)
                     .cloned();
                 let Some(wf) = wf else { continue };
-                let Some(binding) = self.workflow_runs[idx].role_sessions.get(active).cloned() else {
+                // Locate by workflow tags — not by task_key + session_label,
+                // which can drift.
+                let Some((ti, si)) = self.locate_workflow_session(&run_id, active) else {
                     continue;
-                };
-                let task_key = self.workflow_runs[idx].task_key.clone();
-                let ti = match self.find_task_by_key(&task_key) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let si = match Self::find_session_by_label(&self.tasks[ti], &binding.session_label) {
-                    Some(s) => s,
-                    None => continue,
                 };
                 let session_idle = matches!(
                     self.tasks[ti].sessions[si].status,
@@ -3973,9 +4036,11 @@ impl App {
                 );
                 if session_idle {
                     // Only fire the static transition if the outgoing role has
-                    // actually produced a new assistant message since its current
-                    // activation. Prevents firing on PTY startup quiet or on a
-                    // role that hasn't done any work yet this turn.
+                    // actually taken a NEW turn since its current activation.
+                    // Use `count_messages` (counts any assistant JSONL entry —
+                    // including thinking-only / tool-use-only turns) rather
+                    // than `list_messages` which skips non-text content and
+                    // would undercount real turns.
                     let start_count = self.workflow_runs[idx]
                         .active_assistant_start_count()
                         .unwrap_or(0);
@@ -3984,13 +4049,12 @@ impl App {
                         self.tasks[ti].worktree_path.as_deref(),
                         current_sid.as_deref(),
                     ) {
-                        (Some(wt), Some(sid)) => workflow::transcript::list_messages(
+                        (Some(wt), Some(sid)) => workflow::transcript::count_messages(
                             &wf.roles[active].engine,
                             wt,
                             sid,
                             workflow::transcript::MessageKind::Assistant,
-                        )
-                        .len(),
+                        ),
                         _ => 0,
                     };
                     log_tick(
@@ -4060,24 +4124,21 @@ impl App {
             Some(w) => w,
             None => return,
         };
-        let task_key = self.workflow_runs[run_idx].task_key.clone();
-        let ti = match self.find_task_by_key(&task_key) {
-            Some(t) => t,
-            None => return,
+
+        // Locate target role's session by workflow tags (source of truth).
+        let Some((ti, si)) = self.locate_workflow_session(run_id, to_role) else {
+            return;
         };
 
         // Capture outgoing role's last assistant message for history.
         let from_role = self.workflow_runs[run_idx].active_role.clone();
         let captured = if let Some(from) = &from_role {
-            if let Some(binding) = self.workflow_runs[run_idx].role_sessions.get(from).cloned() {
+            if let Some((fti, fsi)) = self.locate_workflow_session(run_id, from) {
                 let from_role_spec = wf.roles.get(from).cloned();
-                if let (Some(spec), Some(sid)) = (from_role_spec, binding.current_session_id) {
-                    let wt = self.tasks[ti].worktree_path.clone();
-                    if let Some(wt) = wt {
-                        workflow::transcript::last_message(&spec.engine, &wt, &sid)
-                    } else {
-                        None
-                    }
+                let fsid = self.tasks[fti].sessions[fsi].session_id.clone();
+                let fwt = self.tasks[fti].worktree_path.clone();
+                if let (Some(spec), Some(sid), Some(wt)) = (from_role_spec, fsid, fwt) {
+                    workflow::transcript::last_message(&spec.engine, &wt, &sid)
                 } else {
                     None
                 }
@@ -4105,16 +4166,6 @@ impl App {
         };
         let rendered = workflow::template::render(&template_source, &resolver);
 
-        // Activate the target role. For `fresh`, respawn the underlying process.
-        let binding = match self.workflow_runs[run_idx].role_sessions.get(to_role).cloned() {
-            Some(b) => b,
-            None => return,
-        };
-        let si = match Self::find_session_by_label(&self.tasks[ti], &binding.session_label) {
-            Some(s) => s,
-            None => return,
-        };
-
         if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
             self.respawn_session_fresh(ti, si, to_role, &target_role_spec, run_id);
         }
@@ -4125,19 +4176,19 @@ impl App {
             b.current_session_id = current_sid;
         }
 
-        // Snapshot the target role's current assistant count at activation.
-        // An on_idle transition out of this role will only fire once the count
-        // exceeds this — guarantees the role has produced new work first.
+        // Snapshot the target role's current assistant TURN count at activation.
+        // Uses `count_messages` (any assistant JSONL entry counts) so that
+        // downstream the idle gate compares turn-to-turn regardless of whether
+        // the agent's reply contains text, thinking, or tool_use content.
         let start_count = {
             let current_sid = self.tasks[ti].sessions[si].session_id.clone();
             match (self.tasks[ti].worktree_path.as_deref(), current_sid.as_deref()) {
-                (Some(wt), Some(sid)) => workflow::transcript::list_messages(
+                (Some(wt), Some(sid)) => workflow::transcript::count_messages(
                     &target_role_spec.engine,
                     wt,
                     sid,
                     workflow::transcript::MessageKind::Assistant,
-                )
-                .len(),
+                ),
                 _ => 0,
             }
         };

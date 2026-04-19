@@ -334,6 +334,134 @@ pub fn latest_plan(
     None
 }
 
+/// Find a Claude session id in the same worktree whose transcript has newer
+/// activity than `bound_sid`'s — evidence that the session "drifted" to a new
+/// id (e.g. the user ran `/clear` or `/compact`, which Claude Code handles by
+/// starting a fresh session + JSONL without informing the parent PTY host).
+///
+/// Returns `Some(new_sid)` when drift is detected, `None` when the bound sid is
+/// still the most-recently-active one (or there's no clear winner). Compares
+/// the latest-entry timestamp recorded *inside* the JSONL, not filesystem
+/// mtime, because mtime can be bumped by unrelated file operations.
+///
+/// Codex sessions are not currently checked for drift because their storage
+/// layout (`~/.codex/sessions/YYYY/MM/DD/`) makes per-worktree scanning more
+/// expensive and we haven't seen drift in practice.
+pub fn detect_claude_sid_drift(worktree_path: &Path, bound_sid: &str) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let path_str = worktree_path.to_str()?;
+    let encoded = path_str.replace('/', "-").replace('.', "-");
+    let dir = home.join(format!(".claude/projects/{}", encoded));
+    if !dir.is_dir() {
+        return None;
+    }
+    let bound_path = dir.join(format!("{}.jsonl", bound_sid));
+    let bound_latest = latest_jsonl_timestamp(&bound_path).unwrap_or_default();
+
+    let mut best: Option<(String, String)> = None; // (sid, latest_ts)
+    let Ok(entries) = fs::read_dir(&dir) else { return None };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if stem == bound_sid {
+            continue;
+        }
+        let Some(ts) = latest_jsonl_timestamp(&path) else { continue };
+        // Strictly newer than bound to count as drift.
+        if ts <= bound_latest {
+            continue;
+        }
+        match &best {
+            Some((_, best_ts)) if *best_ts >= ts => {}
+            _ => best = Some((stem.to_string(), ts)),
+        }
+    }
+    best.map(|(sid, _)| sid)
+}
+
+/// Return the largest `timestamp` string found in the file, or `None`.
+fn latest_jsonl_timestamp(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut latest: Option<String> = None;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+            match &latest {
+                Some(cur) if cur.as_str() >= ts => {}
+                _ => latest = Some(ts.to_string()),
+            }
+        }
+    }
+    latest
+}
+
+/// Count JSONL entries whose top-level type indicates `kind`, regardless of
+/// whether their content is text-bearing.
+///
+/// This exists because `list_messages` intentionally skips entries that only
+/// contain `thinking` or `tool_use` (they have no surfaceable text), but for
+/// the idle-transition gate we want to know "did the agent take a turn?" —
+/// which counts even thinking-only or tool-use-only turns.
+pub fn count_messages(
+    engine: &Engine,
+    worktree_path: &Path,
+    session_id: &str,
+    kind: MessageKind,
+) -> usize {
+    let want = match kind {
+        MessageKind::User => "user",
+        MessageKind::Assistant => "assistant",
+    };
+    let path = match engine {
+        Engine::ClaudeCode => claude_transcript_path(worktree_path, session_id),
+        Engine::Codex => codex_transcript_path(session_id),
+    };
+    let Some(path) = path else { return 0 };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut n = 0;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ty = match engine {
+            Engine::ClaudeCode => v.get("type").and_then(|t| t.as_str()),
+            Engine::Codex => v
+                .pointer("/payload/role")
+                .and_then(|r| r.as_str())
+                .or_else(|| v.pointer("/role").and_then(|r| r.as_str())),
+        };
+        if ty == Some(want) {
+            // Exclude Claude's synthetic user-tool-results — they aren't a
+            // real user turn. For User kind only.
+            if matches!(engine, Engine::ClaudeCode)
+                && kind == MessageKind::User
+                && is_claude_tool_result(&v)
+            {
+                continue;
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Return all messages of `kind` in the given transcript, in order.
 pub fn list_messages(
     engine: &Engine,
@@ -517,6 +645,144 @@ mod tests {
     fn codex_returns_none_for_plan() {
         let wt = std::path::PathBuf::from("/tmp/repo");
         assert!(latest_plan(&Engine::Codex, &wt, "anything").is_none());
+    }
+
+    /// Reproduces the `/clear` scenario. A claude session starts with sid
+    /// `old`, user runs `/clear` so claude starts writing to a new sid
+    /// `new` with newer in-file timestamps. Drift detection should return
+    /// `Some("new")`.
+    #[test]
+    fn detects_drift_after_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_lines = r##"{"type":"user","timestamp":"2026-04-19T20:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"assistant","timestamp":"2026-04-19T20:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"##;
+        let new_lines = r##"{"type":"user","timestamp":"2026-04-19T20:30:00.000Z","message":{"role":"user","content":[{"type":"text","text":"after /clear"}]}}
+{"type":"assistant","timestamp":"2026-04-19T20:30:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"fresh"}]}}"##;
+        write_transcript(&tmp, "-tmp-repo", "old-sid", old_lines);
+        write_transcript(&tmp, "-tmp-repo", "new-sid", new_lines);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        let drift = detect_claude_sid_drift(&wt, "old-sid");
+        assert_eq!(
+            drift.as_deref(),
+            Some("new-sid"),
+            "drift detector must find the newer sid"
+        );
+    }
+
+    /// No drift when the bound sid is already the most-recent one.
+    #[test]
+    fn no_drift_when_bound_is_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_lines = r##"{"type":"user","timestamp":"2026-04-19T19:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"old"}]}}"##;
+        let bound_lines = r##"{"type":"user","timestamp":"2026-04-19T20:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"new"}]}}"##;
+        write_transcript(&tmp, "-tmp-repo", "stale-sid", old_lines);
+        write_transcript(&tmp, "-tmp-repo", "bound-sid", bound_lines);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        let drift = detect_claude_sid_drift(&wt, "bound-sid");
+        assert_eq!(drift, None, "should not migrate when bound is already newest");
+    }
+
+    /// Picks the newest when multiple drift candidates exist (e.g. user did
+    /// `/clear` more than once or opened several claude instances).
+    #[test]
+    fn drift_picks_newest_among_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bound = r##"{"type":"user","timestamp":"2026-04-19T18:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"bound"}]}}"##;
+        let cand_a = r##"{"type":"user","timestamp":"2026-04-19T19:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"a"}]}}"##;
+        let cand_b = r##"{"type":"user","timestamp":"2026-04-19T21:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"b"}]}}"##;
+        write_transcript(&tmp, "-tmp-repo", "bound", bound);
+        write_transcript(&tmp, "-tmp-repo", "cand-a", cand_a);
+        write_transcript(&tmp, "-tmp-repo", "cand-b", cand_b);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        let drift = detect_claude_sid_drift(&wt, "bound");
+        assert_eq!(drift.as_deref(), Some("cand-b"));
+    }
+
+    /// Reproduces the production failure. Transcript has TWO assistant entries:
+    /// one thinking-only, one text-only. `list_messages` (text-extraction)
+    /// returns 1 — that's what the old gate used and why it was off-by-one.
+    /// `count_messages` returns 2 — the correct turn count for the gate.
+    #[test]
+    fn gate_undercounts_when_thinking_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = [
+            // Thinking-only assistant turn (real shape from Claude JSONL).
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"planning..."}]}}"##,
+            // Text-only assistant turn.
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"here you go"}]}}"##,
+        ];
+        write_transcript(&tmp, "-tmp-repo", "sid-x", &lines.join("\n"));
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        let text_count = list_messages(
+            &Engine::ClaudeCode,
+            &wt,
+            "sid-x",
+            MessageKind::Assistant,
+        )
+        .len();
+        let turn_count = count_messages(&Engine::ClaudeCode, &wt, "sid-x", MessageKind::Assistant);
+
+        assert_eq!(text_count, 1, "list_messages undercounts by design");
+        assert_eq!(turn_count, 2, "count_messages counts real turns");
+    }
+
+    /// End-to-end simulation: a worker session with 1 pre-launch assistant
+    /// turn. After launch (baseline=1), appending another assistant turn
+    /// should trip the gate (current=2 > baseline=1). Proves the path the
+    /// TUI uses actually fires.
+    #[test]
+    fn gate_fires_after_new_assistant_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pre = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"pre-launch response"}]}}"##;
+        write_transcript(&tmp, "-tmp-repo", "sid-x", pre);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        // At launch: baseline = current count.
+        let baseline =
+            count_messages(&Engine::ClaudeCode, &wt, "sid-x", MessageKind::Assistant);
+        assert_eq!(baseline, 1);
+
+        // Worker stops; no new turns yet.
+        let current =
+            count_messages(&Engine::ClaudeCode, &wt, "sid-x", MessageKind::Assistant);
+        assert!(
+            !(current > baseline),
+            "gate must not fire when nothing changed (current={}, baseline={})",
+            current,
+            baseline
+        );
+
+        // Worker produces a new turn — even if it's thinking-only.
+        let new_turn = "\n".to_string()
+            + r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."}]}}"##;
+        let proj_dir = std::env::var_os("HOME")
+            .map(|h| {
+                std::path::PathBuf::from(h).join(".claude/projects/-tmp-repo")
+            })
+            .unwrap();
+        let f_path = proj_dir.join("sid-x.jsonl");
+        let mut prev = std::fs::read_to_string(&f_path).unwrap();
+        prev.push_str(&new_turn);
+        std::fs::write(&f_path, prev).unwrap();
+
+        let current2 =
+            count_messages(&Engine::ClaudeCode, &wt, "sid-x", MessageKind::Assistant);
+        assert_eq!(current2, 2, "new thinking-only turn must be counted");
+        assert!(
+            current2 > baseline,
+            "gate should fire: current={} > baseline={}",
+            current2,
+            baseline
+        );
     }
 
     #[test]
