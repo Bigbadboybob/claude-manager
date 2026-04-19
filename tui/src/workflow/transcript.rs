@@ -274,6 +274,66 @@ pub enum MessageKind {
     Assistant,
 }
 
+/// Return the text of the `ExitPlanMode` plan, but ONLY if it was in the
+/// most-recent assistant message of the transcript.
+///
+/// The intended use is "the user just accepted a plan and kicked off the
+/// workflow" — in that case the last assistant line is the plan tool_use and we
+/// surface it as workflow context. If the conversation has moved past the plan
+/// (more assistant messages since), we return `None` rather than resurface a
+/// stale plan from 10 messages back.
+///
+/// The plan lives at `message.content[i].input.plan` for items with
+/// `type: "tool_use"` and `name: "ExitPlanMode"`. `list_messages(Assistant)`
+/// intentionally skips tool_use items, so the plan would otherwise be invisible
+/// to templates.
+///
+/// Codex has no equivalent structured plan, so `latest_plan` returns `None` for
+/// Codex sessions.
+pub fn latest_plan(
+    engine: &Engine,
+    worktree_path: &Path,
+    session_id: &str,
+) -> Option<String> {
+    let Engine::ClaudeCode = engine else { return None };
+    let path = claude_transcript_path(worktree_path, session_id)?;
+    let contents = fs::read_to_string(&path).ok()?;
+
+    // Find the LAST assistant line and check it. If it contains ExitPlanMode,
+    // return the plan; otherwise return None regardless of what earlier lines
+    // contained.
+    let last_assistant = contents
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                Some(v)
+            } else {
+                None
+            }
+        })?;
+
+    let arr = last_assistant
+        .pointer("/message/content")
+        .and_then(|c| c.as_array())?;
+    for item in arr {
+        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        if item.get("name").and_then(|n| n.as_str()) != Some("ExitPlanMode") {
+            continue;
+        }
+        if let Some(plan) = item.pointer("/input/plan").and_then(|p| p.as_str()) {
+            if !plan.trim().is_empty() {
+                return Some(plan.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Return all messages of `kind` in the given transcript, in order.
 pub fn list_messages(
     engine: &Engine,
@@ -358,6 +418,106 @@ fn extract_codex_line(v: &serde_json::Value, kind: MessageKind) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate the process-global HOME env var. Without
+    /// this they race each other when run in parallel and clobber the
+    /// expected `.claude/projects/...` directory layout.
+    fn home_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    struct HomeOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        old: Option<std::ffi::OsString>,
+    }
+    impl HomeOverride {
+        fn new(tmp: tempfile::TempDir) -> Self {
+            let guard = home_lock();
+            let old = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", tmp.path()); }
+            HomeOverride { _guard: guard, _tmp: tmp, old }
+        }
+    }
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            if let Some(h) = self.old.take() {
+                unsafe { std::env::set_var("HOME", h); }
+            } else {
+                unsafe { std::env::remove_var("HOME"); }
+            }
+        }
+    }
+
+    fn write_transcript(tmp: &tempfile::TempDir, encoded: &str, session_id: &str, content: &str) {
+        let proj_dir = tmp.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(proj_dir.join(format!("{}.jsonl", session_id)), content).unwrap();
+    }
+
+    /// Verify plan extraction on a real transcript line — the same shape we
+    /// confirmed by inspecting Claude Code's JSONL output.
+    #[test]
+    fn extract_plan_from_tool_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_x","name":"ExitPlanMode","input":{"plan":"# Plan\n\n1. step one\n2. step two","planFilePath":"/tmp/p.md"}}]}}"##;
+        write_transcript(&tmp, "-tmp-repo", "sid-test", line);
+        let _h = HomeOverride::new(tmp);
+        let plan = latest_plan(
+            &Engine::ClaudeCode,
+            &std::path::PathBuf::from("/tmp/repo"),
+            "sid-test",
+        );
+        assert!(plan.is_some(), "plan should be extracted");
+        let plan = plan.unwrap();
+        assert!(plan.contains("step one"), "plan was: {:?}", plan);
+        assert!(plan.contains("step two"), "plan was: {:?}", plan);
+    }
+
+    #[test]
+    fn extract_plan_returns_latest_when_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = vec![
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"first plan"}}]}}"##,
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"second plan"}}]}}"##,
+        ];
+        write_transcript(&tmp, "-tmp-repo", "sid-test", &lines.join("\n"));
+        let _h = HomeOverride::new(tmp);
+        let plan = latest_plan(
+            &Engine::ClaudeCode,
+            &std::path::PathBuf::from("/tmp/repo"),
+            "sid-test",
+        );
+        assert_eq!(plan.as_deref(), Some("second plan"));
+    }
+
+    /// If the last assistant message is NOT ExitPlanMode, an earlier plan
+    /// doesn't get resurfaced — avoids showing a stale plan the user has
+    /// already moved past.
+    #[test]
+    fn stale_plan_is_not_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = vec![
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"old plan"}}]}}"##,
+            r##"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"great, now do something else"}]}}"##,
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"started working on the new thing"}]}}"##,
+        ];
+        write_transcript(&tmp, "-tmp-repo", "sid-test", &lines.join("\n"));
+        let _h = HomeOverride::new(tmp);
+        let plan = latest_plan(
+            &Engine::ClaudeCode,
+            &std::path::PathBuf::from("/tmp/repo"),
+            "sid-test",
+        );
+        assert_eq!(plan, None, "stale plan should not be returned");
+    }
+
+    #[test]
+    fn codex_returns_none_for_plan() {
+        let wt = std::path::PathBuf::from("/tmp/repo");
+        assert!(latest_plan(&Engine::Codex, &wt, "anything").is_none());
+    }
 
     #[test]
     fn extract_text_claude_shape() {

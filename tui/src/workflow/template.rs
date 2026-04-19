@@ -3,11 +3,22 @@
 //! Template substitutions (all optional — missing keys expand to empty string):
 //!
 //! ```text
-//!   {{ roles.<role>.user[N] }}         Nth user-typed message (N < 0 from end)
-//!   {{ roles.<role>.assistant[N] }}    Nth assistant message
-//!   {{ roles.<role>.last_message }}    alias for `assistant[-1]`
-//!   {{ roles.<role>.initial_prompt }}  alias for `user[0]`
+//!   {{ roles.<role>.user[N] }}           Nth post-launch user-typed message
+//!   {{ roles.<role>.assistant[N] }}      Nth post-launch assistant message
+//!   {{ roles.<role>.prior_user[N] }}     Nth user message from BEFORE launch
+//!   {{ roles.<role>.prior_assistant[N] }} Nth assistant message from BEFORE launch
+//!   {{ roles.<role>.last_message }}      alias for `assistant[-1]`
+//!   {{ roles.<role>.initial_prompt }}    alias for `user[0]`
+//!   {{ roles.<role>.plan }}              the markdown plan from the most recent
+//!                                        ExitPlanMode tool call in that role's
+//!                                        Claude transcript (empty if never used)
 //! ```
+//!
+//! Negative indices count from the end of the respective slice (e.g.
+//! `prior_assistant[-1]` is the last assistant turn before the workflow launched).
+//! Useful when the user ran planning mode or had a long conversation with the
+//! worker before kicking the workflow off — the meaningful context lives in the
+//! pre-launch history.
 //!
 //! The template engine is deliberately small: no conditionals, loops, or filters.
 //! It calls a `RoleResolver` which the caller implements to fetch messages for a
@@ -18,12 +29,21 @@
 /// Implementors read the role's transcript and return the requested slice.
 /// Returning `None` for any accessor expands to empty string in the template.
 pub trait RoleResolver {
-    /// All user-typed turns for the role, in order. Used for `user[N]` and the
-    /// `initial_prompt` alias.
+    /// Post-launch user-typed turns for the role, in order. Used for `user[N]`
+    /// and the `initial_prompt` alias.
     fn user_messages(&self, role: &str) -> Vec<String>;
-    /// All assistant turns for the role, in order. Used for `assistant[N]` and
-    /// the `last_message` alias.
+    /// Post-launch assistant turns for the role, in order. Used for
+    /// `assistant[N]` and the `last_message` alias.
     fn assistant_messages(&self, role: &str) -> Vec<String>;
+    /// User turns from *before* the workflow launched (pre-baseline). Used for
+    /// `prior_user[N]`.
+    fn prior_user_messages(&self, role: &str) -> Vec<String>;
+    /// Assistant turns from *before* the workflow launched. Used for
+    /// `prior_assistant[N]`.
+    fn prior_assistant_messages(&self, role: &str) -> Vec<String>;
+    /// The most recent `ExitPlanMode` plan text, if any. Claude-only; returns
+    /// `None` for Codex sessions. Used for the `plan` accessor.
+    fn latest_plan(&self, role: &str) -> Option<String>;
 }
 
 pub fn render<R: RoleResolver + ?Sized>(template: &str, resolver: &R) -> String {
@@ -106,8 +126,11 @@ fn resolve<R: RoleResolver + ?Sized>(key: &str, resolver: &R) -> String {
             let msgs = resolver.user_messages(role);
             msgs.into_iter().next().unwrap_or_default()
         }
+        ("plan", None) => resolver.latest_plan(role).unwrap_or_default(),
         ("user", Some(n)) => index_into(resolver.user_messages(role), n),
         ("assistant", Some(n)) => index_into(resolver.assistant_messages(role), n),
+        ("prior_user", Some(n)) => index_into(resolver.prior_user_messages(role), n),
+        ("prior_assistant", Some(n)) => index_into(resolver.prior_assistant_messages(role), n),
         _ => String::new(),
     }
 }
@@ -127,6 +150,9 @@ mod tests {
     struct Stub {
         user: std::collections::HashMap<String, Vec<String>>,
         assistant: std::collections::HashMap<String, Vec<String>>,
+        prior_user: std::collections::HashMap<String, Vec<String>>,
+        prior_assistant: std::collections::HashMap<String, Vec<String>>,
+        plan: std::collections::HashMap<String, String>,
     }
 
     impl RoleResolver for Stub {
@@ -135,6 +161,15 @@ mod tests {
         }
         fn assistant_messages(&self, role: &str) -> Vec<String> {
             self.assistant.get(role).cloned().unwrap_or_default()
+        }
+        fn prior_user_messages(&self, role: &str) -> Vec<String> {
+            self.prior_user.get(role).cloned().unwrap_or_default()
+        }
+        fn prior_assistant_messages(&self, role: &str) -> Vec<String> {
+            self.prior_assistant.get(role).cloned().unwrap_or_default()
+        }
+        fn latest_plan(&self, role: &str) -> Option<String> {
+            self.plan.get(role).cloned()
         }
     }
 
@@ -155,7 +190,26 @@ mod tests {
             "reviewer".into(),
             vec!["LGTM but nit on line 42".into()],
         );
-        Stub { user, assistant }
+
+        let mut prior_user = std::collections::HashMap::new();
+        prior_user.insert(
+            "worker".into(),
+            vec!["let's plan".into(), "accept plan".into()],
+        );
+
+        let mut prior_assistant = std::collections::HashMap::new();
+        prior_assistant.insert(
+            "worker".into(),
+            vec![
+                "initial thoughts".into(),
+                "here's the plan: step 1 ... step 2 ...".into(),
+            ],
+        );
+
+        let mut plan = std::collections::HashMap::new();
+        plan.insert("worker".into(), "# Plan\n\n1. thing\n2. other thing".into());
+
+        Stub { user, assistant, prior_user, prior_assistant, plan }
     }
 
     #[test]
@@ -217,5 +271,39 @@ mod tests {
         let t = "Goal: {{ roles.worker.initial_prompt }}\nLast: {{ roles.worker.last_message }}";
         let s = render(t, &stub());
         assert_eq!(s, "Goal: fix the parser\nLast: fixed");
+    }
+
+    #[test]
+    fn prior_user_indexed() {
+        assert_eq!(render("{{ roles.worker.prior_user[0] }}", &stub()), "let's plan");
+        assert_eq!(render("{{ roles.worker.prior_user[-1] }}", &stub()), "accept plan");
+    }
+
+    #[test]
+    fn prior_assistant_indexed() {
+        // The plan mode case: last pre-launch assistant message is the plan.
+        assert_eq!(
+            render("{{ roles.worker.prior_assistant[-1] }}", &stub()),
+            "here's the plan: step 1 ... step 2 ..."
+        );
+        assert_eq!(
+            render("{{ roles.worker.prior_assistant[0] }}", &stub()),
+            "initial thoughts"
+        );
+    }
+
+    #[test]
+    fn prior_out_of_range_empty() {
+        assert_eq!(render("{{ roles.reviewer.prior_user[0] }}", &stub()), "");
+        assert_eq!(render("{{ roles.worker.prior_user[99] }}", &stub()), "");
+    }
+
+    #[test]
+    fn plan_accessor() {
+        assert_eq!(
+            render("{{ roles.worker.plan }}", &stub()),
+            "# Plan\n\n1. thing\n2. other thing"
+        );
+        assert_eq!(render("{{ roles.reviewer.plan }}", &stub()), "");
     }
 }
