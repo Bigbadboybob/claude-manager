@@ -311,6 +311,10 @@ pub struct App {
     pub workflows: HashMap<String, Workflow>,
     /// Active + recent workflow runs (persisted per run at ~/.cm/workflow-runs/).
     pub workflow_runs: Vec<WorkflowRun>,
+    /// Tails `~/.claude/history.jsonl` for `/clear` and `/compact` events so
+    /// we can detect when a bound workflow session rotates its transcript
+    /// file. `None` if the history file couldn't be located at startup.
+    history_watcher: Option<workflow::history::HistoryWatcher>,
 }
 
 impl App {
@@ -346,6 +350,7 @@ impl App {
             last_session_id_check: Instant::now(),
             workflows,
             workflow_runs,
+            history_watcher: workflow::history::HistoryWatcher::new(),
         }
     }
 
@@ -1153,6 +1158,7 @@ impl App {
                         }
                     }
                 }
+
             }
         }
 
@@ -1173,10 +1179,111 @@ impl App {
             self.needs_redraw = true;
         }
 
+        // Poll `~/.claude/history.jsonl` for `/clear` and `/compact` events
+        // targeting any active workflow role's bound session, and migrate
+        // to the new transcript file.
+        self.apply_history_rotations();
+
         // Drive workflow transitions after per-session bookkeeping — this way
         // any session state changes above (idle detection, new session_id) are
         // visible to the workflow engine.
         self.tick_workflows();
+    }
+
+    /// Drain new entries from `~/.claude/history.jsonl`. For each rotation-
+    /// trigger entry (`/clear`, `/compact`) whose `sessionId` matches the
+    /// bound sid of an active claude workflow role, find the new transcript
+    /// file that was produced and rebind the role to it.
+    fn apply_history_rotations(&mut self) {
+        let Some(watcher) = self.history_watcher.as_mut() else {
+            return;
+        };
+        let entries = watcher.poll();
+        if entries.is_empty() {
+            return;
+        }
+        // Build (sid → (run_id, role, worktree)) lookup for active claude roles.
+        let mut bindings: HashMap<String, (String, String, std::path::PathBuf)> = HashMap::new();
+        for run in &self.workflow_runs {
+            if !run.is_active() {
+                continue;
+            }
+            for (role, binding) in &run.role_sessions {
+                let Some(sid) = &binding.current_session_id else {
+                    continue;
+                };
+                // locate the session to recover the worktree path.
+                let Some((ti, si)) = self.locate_workflow_session(&run.run_id, role) else {
+                    continue;
+                };
+                if self.tasks[ti].sessions[si].session_type != "claude" {
+                    continue;
+                }
+                let Some(wt) = self.tasks[ti].worktree_path.clone() else {
+                    continue;
+                };
+                bindings.insert(sid.clone(), (run.run_id.clone(), role.clone(), wt));
+            }
+        }
+        if bindings.is_empty() {
+            return;
+        }
+        let mut rotations: Vec<(String, String, String, String)> = Vec::new();
+        for entry in &entries {
+            if !workflow::history::is_rotation_trigger(&entry.display) {
+                continue;
+            }
+            let Some((run_id, role, wt)) = bindings.get(&entry.session_id) else {
+                continue;
+            };
+            let Some(new_sid) =
+                workflow::history::find_post_rotation_sid(wt, entry.timestamp_ms)
+            else {
+                continue;
+            };
+            if new_sid == entry.session_id {
+                continue;
+            }
+            rotations.push((
+                run_id.clone(),
+                role.clone(),
+                entry.session_id.clone(),
+                new_sid,
+            ));
+        }
+        for (run_id, role, old_sid, new_sid) in &rotations {
+            let Some((ti, si)) = self.locate_workflow_session(run_id, role) else {
+                continue;
+            };
+            self.tasks[ti].sessions[si].session_id = Some(new_sid.clone());
+            let Some(run) = self.workflow_runs.iter_mut().find(|r| &r.run_id == run_id)
+            else {
+                continue;
+            };
+            if let Some(b) = run.role_sessions.get_mut(role) {
+                b.current_session_id = Some(new_sid.clone());
+            }
+            run.role_baselines
+                .insert(role.clone(), workflow::run::MessageBaseline::default());
+            if run.active_role.as_deref() == Some(role.as_str()) {
+                if let Some(h) = run.history.last_mut() {
+                    h.assistant_count_at_start = 0;
+                    h.session_id = Some(new_sid.clone());
+                }
+            }
+            let _ = workflow::run::save(run);
+            log_tick(
+                run_id,
+                &format!(
+                    "history-rotation: role={} {} -> {}",
+                    role, old_sid, new_sid
+                ),
+            );
+        }
+        if !rotations.is_empty() {
+            self.save_session_manifest();
+            self.set_status_msg("Workflow: session rotated (/clear or /compact)");
+        }
     }
 
     /// Process all pending backend events (non-blocking).
