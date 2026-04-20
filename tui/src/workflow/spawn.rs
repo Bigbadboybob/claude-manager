@@ -101,14 +101,16 @@ pub fn claude_args(
 
 /// Build the full argv for a workflow-participant Codex session.
 ///
-/// Codex doesn't have a --mcp-config flag; we use `-c` overrides to register a
-/// per-session MCP server with the right env vars. No global config is mutated.
-pub fn codex_args(run_id: &str, role: &str, resume_session_id: Option<&str>) -> Vec<String> {
+/// Uses `-c` overrides to register our workflow MCP server alongside whatever
+/// MCP servers the user has configured globally. No isolated CODEX_HOME —
+/// codex uses the user's `~/.codex/config.toml` as usual so its trusted-
+/// projects list, auth, and settings carry over.
+pub fn codex_args(run_id: &str, role: &str, _resume_session_id: Option<&str>) -> Vec<String> {
     let server = mcp_server_path()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let mut args: Vec<String> = Vec::new();
-    // Register the MCP server.
+    args.push("--dangerously-bypass-approvals-and-sandbox".into());
     args.push("-c".into());
     args.push(r#"mcp_servers.claude-manager.command="python""#.into());
     args.push("-c".into());
@@ -118,17 +120,13 @@ pub fn codex_args(run_id: &str, role: &str, resume_session_id: Option<&str>) -> 
         r#"mcp_servers.claude-manager.env={{CM_WORKFLOW_RUN_ID="{}",CM_ROLE="{}"}}"#,
         run_id, role
     ));
-    if let Some(sid) = resume_session_id {
-        // Codex resume takes --last for most-recent or a session-id via picker;
-        // programmatic resume by ID isn't well-supported in the CLI yet.
-        // For now we pass the session id as an env var the agent could read, and
-        // leave the interactive picker behavior as the fallback.
-        let _ = sid;
-    }
     args
 }
 
-/// Build args for an engine, dispatching on type.
+/// Build (program, argv, env) for an engine, dispatching on type.
+///
+/// `env` is any extra environment variables that should be passed to the
+/// child process — currently only Codex uses this (for `CODEX_HOME`).
 pub fn build_args(
     engine: &Engine,
     run_id: &str,
@@ -167,12 +165,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_args_register_mcp_server() {
+    fn codex_args_bypass_trust_prompt() {
         let args = codex_args("wf_abc", "worker", None);
-        // Must contain at least three -c flags for command/args/env.
+        assert!(
+            args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "codex_args must bypass approvals + sandbox"
+        );
+    }
+
+    #[test]
+    fn codex_args_register_mcp_via_overrides() {
+        // Workflow MCP registered via -c overrides alongside user's global
+        // config; env carries run_id/role for the tool handlers.
+        let args = codex_args("wf_abc", "worker", None);
         let c_count = args.iter().filter(|a| *a == "-c").count();
         assert!(c_count >= 3);
-        // Env string embeds the run_id and role.
         assert!(args.iter().any(|a| a.contains("wf_abc")));
         assert!(args.iter().any(|a| a.contains(r#"CM_ROLE="worker""#)));
     }

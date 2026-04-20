@@ -18,6 +18,7 @@ use crate::input;
 use crate::planning::{PlanAction, PlanningView};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
+use crate::workflow::run::MessageBaseline;
 use crate::workflow::{self, toml_schema::Engine, RoleBinding, TriggerKind, Workflow, WorkflowRun};
 use crate::worktree;
 
@@ -72,15 +73,69 @@ pub struct TerminalSession {
     pub hidden: bool,
     /// Seconds of quiet before marking idle. 0 = use global default.
     pub idle_timeout_secs: u16,
-    /// Prompt text to prefill (without submitting) after Claude starts up.
-    pub pending_prompt: Option<(Instant, String)>,
+    /// Prompt text to deliver to the session once it's actually ready to
+    /// receive input (see `PendingWrite`).
+    pub pending_prompt: Option<PendingWrite>,
+    /// Pending `/clear` command to send before `pending_prompt`. Sequenced:
+    /// the prompt only delivers after the clear has either been delivered or
+    /// hit its deadline.
+    pub pending_clear: Option<PendingWrite>,
     /// If this session is a workflow participant, the run it belongs to.
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
     pub workflow_role: Option<String>,
+    /// First ~120 chars of the most recent prompt we delivered via
+    /// `deliver_pending_write`, along with its delivery timestamp in unix ms.
+    /// Used to correlate a fresh claude workflow session with its new
+    /// sessionId in `~/.claude/history.jsonl`: when the same text shows up
+    /// in a history entry with project==worktree, the entry's sessionId is
+    /// ours. Cleared once sid has been bound.
+    pub last_delivery: Option<(String, u64)>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
+
+/// A byte sequence queued to be written to a session's PTY once the session
+/// is "ready" to receive input. Readiness is determined by PTY quietness —
+/// absence of wakeup events for a minimum window — which adapts to however
+/// long the underlying agent takes to finish starting up, connecting to MCP
+/// servers, rendering its banner, etc.
+///
+/// Two knobs:
+/// - `earliest_deliver_at`: floor (don't deliver before this time regardless
+///   of quietness). Used to give the user a chance to notice what's happening,
+///   and to debounce brief quiet windows during startup.
+/// - `hard_deadline`: ceiling. If the agent NEVER goes quiet (e.g. a pathological
+///   ticking spinner), deliver anyway so the workflow doesn't hang forever.
+///
+/// Between the floor and deadline, delivery fires at the first moment of
+/// `require_quiet` of uninterrupted silence.
+///
+/// `text` is the payload; if `submit` is true we append an Enter keystroke
+/// (encoded for the session's current mode) at delivery time.
+pub struct PendingWrite {
+    pub text: String,
+    pub submit: bool,
+    pub earliest_deliver_at: Instant,
+    pub require_quiet: Duration,
+    pub hard_deadline: Instant,
+}
+
+impl PendingWrite {
+    /// A write that fires at the first moment of PTY quiet (>= `quiet`
+    /// without any wakeup), bounded by `floor` (earliest) and `deadline`
+    /// (latest) from now.
+    pub fn wait_for_quiet(text: String, submit: bool, floor: Duration, quiet: Duration, deadline: Duration) -> Self {
+        let now = Instant::now();
+        PendingWrite {
+            text,
+            submit,
+            earliest_deliver_at: now + floor,
+            require_quiet: quiet,
+            hard_deadline: now + deadline,
+        }
+    }
+}
 
 /// Interval between filesystem checks for session_id detection.
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -164,6 +219,8 @@ enum VisualItem {
     TaskHeader(usize),
     Session(usize, usize),
     Separator,
+    /// Header row for a workflow grouping, followed by its participant Sessions.
+    WorkflowHeader { task_idx: usize, run_id: String },
 }
 
 /// Modal input state.
@@ -200,6 +257,8 @@ enum InputMode {
         workflow_name: String,
         /// One slot per role, in presentation order.
         slots: Vec<WorkflowSlotChoice>,
+        /// Index of the slot whose option can currently be cycled.
+        active_slot: usize,
     },
     /// Showing a workflow run's history.
     WorkflowHistory {
@@ -207,18 +266,35 @@ enum InputMode {
     },
 }
 
+/// Per-role slot in the launch modal. The user cycles through `options` with
+/// left/right; `option_index` points at the currently-selected one.
 #[derive(Clone, Debug)]
 pub struct WorkflowSlotChoice {
     pub role: String,
-    pub source: WorkflowSlotSource,
+    pub options: Vec<WorkflowSlotSource>,
+    pub option_index: usize,
+}
+
+impl WorkflowSlotChoice {
+    pub fn source(&self) -> &WorkflowSlotSource {
+        &self.options[self.option_index]
+    }
+    pub fn cycle(&mut self, delta: i32) {
+        if self.options.is_empty() {
+            return;
+        }
+        let len = self.options.len() as i32;
+        let next = ((self.option_index as i32 + delta).rem_euclid(len)) as usize;
+        self.option_index = next;
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum WorkflowSlotSource {
     /// Use an existing session on the task, by index within task.sessions.
     Existing(usize),
-    /// Spawn a new session of the given engine.
-    New,
+    /// Spawn a new session with the given engine.
+    New(Engine),
 }
 
 pub struct App {
@@ -242,6 +318,15 @@ pub struct App {
     pub workflows: HashMap<String, Workflow>,
     /// Active + recent workflow runs (persisted per run at ~/.cm/workflow-runs/).
     pub workflow_runs: Vec<WorkflowRun>,
+    /// Tails `~/.claude/history.jsonl` for `/clear` and `/compact` events so
+    /// we can detect when a bound workflow session rotates its transcript
+    /// file. `None` if the history file couldn't be located at startup.
+    history_watcher: Option<workflow::history::HistoryWatcher>,
+    /// Rotation-trigger entries we've seen but haven't resolved yet because
+    /// the new transcript file hadn't been created when we polled. Retry
+    /// each tick until resolved or aged out.
+    /// Each: (old_sid, timestamp_ms, first_seen_at).
+    pending_rotations: Vec<(String, u64, Instant)>,
 }
 
 impl App {
@@ -277,6 +362,8 @@ impl App {
             last_session_id_check: Instant::now(),
             workflows,
             workflow_runs,
+            history_watcher: workflow::history::HistoryWatcher::new(),
+            pending_rotations: Vec::new(),
         }
     }
 
@@ -366,7 +453,6 @@ impl App {
             None => return Vec::new(),
         };
         let mut ids = Vec::new();
-        // Walk YYYY/MM/DD subdirectories.
         Self::walk_codex_sessions(&sessions_dir, &wt_str, &mut ids);
         ids
     }
@@ -399,11 +485,66 @@ impl App {
         }
     }
 
-    /// Detect a new codex session_id by comparing against known IDs.
+    /// Detect a new codex session_id by comparing against known IDs. Uses the
+    /// user's default codex home.
     fn detect_codex_session_id(worktree_path: &Path, existing_ids: &[String]) -> Option<String> {
         let current = Self::list_codex_sessions(worktree_path);
-        // Return the newest one not in existing_ids.
         current.into_iter().find(|id| !existing_ids.contains(id))
+    }
+
+    /// True if the session is ready to receive a queued write. Ready means
+    /// either we've hit the hard deadline (deliver anyway), or:
+    ///   1. We've passed the earliest-deliver floor, AND
+    ///   2. The PTY has been quiet for `require_quiet` (no wakeups in that window).
+    fn ready_for_write(session: &Session, pw: &PendingWrite, now: Instant) -> bool {
+        pending_write_ready(&session.wakeup_times, pw, now)
+    }
+
+    /// Write a PendingWrite's bytes (plus correctly-encoded Enter if submit)
+    /// to the session's PTY and log the outcome.
+    ///
+    /// IMPORTANT: we sleep briefly between the body write and the enter write
+    /// so the receiving agent sees them as two separate keystroke events
+    /// rather than a single paste. Without this, codex treats the whole
+    /// sequence (body + \r) as pasted content — literal text including the
+    /// \r character — and never submits.
+    fn deliver_pending_write(ts: &mut TerminalSession, pw: &PendingWrite, kind: &str) {
+        let body = pw.text.trim_end_matches(['\r', '\n']);
+        let enter = enter_bytes_for(&ts.session);
+        let kitty = enter != b"\r";
+        let exited = ts.session.exited;
+        ts.session.write(body.as_bytes());
+        if pw.submit {
+            std::thread::sleep(Duration::from_millis(50));
+            ts.session.write(enter);
+        }
+        // Remember the first chunk of the delivered text + delivery time so
+        // an unbound workflow session can be correlated to its new sid in
+        // ~/.claude/history.jsonl. Only record for workflow sessions that
+        // still need binding.
+        if ts.workflow_run_id.is_some() && ts.session_id.is_none() {
+            let prefix: String = body.chars().take(120).collect();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            ts.last_delivery = Some((prefix, now_ms));
+        }
+        if let Some(run_id) = ts.workflow_run_id.clone() {
+            log_tick(
+                &run_id,
+                &format!(
+                    "delivered {}: {} body bytes + submit={} to session '{}' role='{}' exited={} kitty_enter={}",
+                    kind,
+                    body.len(),
+                    pw.submit,
+                    ts.label,
+                    ts.workflow_role.as_deref().unwrap_or("?"),
+                    exited,
+                    kitty,
+                ),
+            );
+        }
     }
 
     /// Path to the session manifest file.
@@ -563,6 +704,20 @@ impl App {
                 };
 
                 if let Ok(s) = result {
+                    // If the manifest didn't have a session_id for this session,
+                    // enable the detection poll with an EMPTY "pending" list so
+                    // it picks the newest JSONL in the project dir as this
+                    // session's id (best available heuristic — we've lost the
+                    // original mapping). Without this, detection is silently
+                    // skipped and anything that needs the transcript (workflow
+                    // tick, etc.) stays broken forever.
+                    let pending = if entry.session_id.is_some() {
+                        None
+                    } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
+                        Some(Vec::new())
+                    } else {
+                        None
+                    };
                     let ts = TerminalSession {
                         label: entry.label.clone(),
                         session_type: entry.session_type.clone(),
@@ -570,12 +725,14 @@ impl App {
                         status: SessionStatus::Running,
                         last_write_at: None,
                         session_id: entry.session_id.clone(),
-                        pending_jsonl_files: None,
+                        pending_jsonl_files: pending,
                         hidden: entry.hidden,
                         idle_timeout_secs: entry.idle_timeout_secs,
                         pending_prompt: None,
+                        pending_clear: None,
                         workflow_run_id: entry.workflow_run_id.clone(),
                         workflow_role: entry.workflow_role.clone(),
+                    last_delivery: None,
                     };
                     task.sessions.push(ts);
                 }
@@ -776,7 +933,8 @@ impl App {
     }
 
     /// Task view: tasks as headers with sessions indented underneath.
-    /// Within a task, running sessions first.
+    /// Sessions grouped by workflow run appear contiguously under a workflow
+    /// subheader. Standalone sessions render first; each workflow group follows.
     fn visual_items_task(&self) -> Vec<VisualItem> {
         let mut items = Vec::new();
         for (ti, task) in self.tasks.iter().enumerate() {
@@ -784,21 +942,60 @@ impl App {
                 items.push(VisualItem::Separator);
             }
             items.push(VisualItem::TaskHeader(ti));
-            // Running sessions first within the task.
-            let mut running_indices: Vec<usize> = Vec::new();
-            let mut other_indices: Vec<usize> = Vec::new();
+
+            // Partition sessions: those in workflow groups vs. standalone.
+            let mut standalone: Vec<usize> = Vec::new();
+            let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
             for (si, ts) in task.sessions.iter().enumerate() {
-                if ts.status == SessionStatus::Running {
-                    running_indices.push(si);
-                } else {
-                    other_indices.push(si);
+                match &ts.workflow_run_id {
+                    Some(run_id) => groups.entry(run_id.clone()).or_default().push(si),
+                    None => standalone.push(si),
                 }
             }
-            for si in running_indices {
+
+            // Standalone: running first, then idle.
+            let (standalone_running, standalone_other): (Vec<_>, Vec<_>) = standalone
+                .into_iter()
+                .partition(|si| task.sessions[*si].status == SessionStatus::Running);
+            for si in standalone_running {
                 items.push(VisualItem::Session(ti, si));
             }
-            for si in other_indices {
+            for si in standalone_other {
                 items.push(VisualItem::Session(ti, si));
+            }
+
+            // Workflow groups: header + sessions in role-order from the workflow def.
+            for (run_id, session_indices) in groups {
+                // Skip groups whose run is no longer active (shouldn't happen often,
+                // but the sessions might have been detached). Show them flat.
+                let is_active_run = self.workflow_runs.iter().any(|r| r.run_id == run_id);
+                if !is_active_run {
+                    for si in session_indices {
+                        items.push(VisualItem::Session(ti, si));
+                    }
+                    continue;
+                }
+                items.push(VisualItem::WorkflowHeader {
+                    task_idx: ti,
+                    run_id: run_id.clone(),
+                });
+                // Sort by role_order if we can find the workflow definition.
+                let role_order: Vec<String> = self
+                    .workflow_runs
+                    .iter()
+                    .find(|r| r.run_id == run_id)
+                    .and_then(|r| self.workflows.get(&r.workflow_name))
+                    .map(|wf| wf.role_order.clone())
+                    .unwrap_or_default();
+                let mut ordered = session_indices.clone();
+                ordered.sort_by_key(|si| {
+                    let role = task.sessions[*si].workflow_role.as_deref().unwrap_or("");
+                    role_order.iter().position(|r| r == role).unwrap_or(usize::MAX)
+                });
+                for si in ordered {
+                    items.push(VisualItem::Session(ti, si));
+                }
             }
         }
         items
@@ -817,6 +1014,7 @@ impl App {
             VisualItem::Session(_, _) => true,
             VisualItem::TaskHeader(ti) => self.tasks.get(*ti).map_or(false, |t| t.sessions.is_empty()),
             VisualItem::Separator => false,
+            VisualItem::WorkflowHeader { .. } => false,
         };
 
         // If nothing is selectable, bail.
@@ -943,16 +1141,38 @@ impl App {
                     }
                 }
 
-                // Deliver pending prompt (prefill without submitting) once delay has elapsed.
-                if let Some((deliver_at, _)) = &ts.pending_prompt {
-                    if now >= *deliver_at {
-                        let prompt_text = ts.pending_prompt.take().unwrap().1;
-                        ts.session.write(prompt_text.as_bytes());
+                // Deliver queued `/clear` first once the PTY is quiet (or
+                // the hard deadline hits). Sequenced before pending_prompt so
+                // the prompt always lands AFTER /clear has been processed.
+                if let Some(clear) = &ts.pending_clear {
+                    if Self::ready_for_write(&ts.session, clear, now) {
+                        let pw = ts.pending_clear.take().unwrap();
+                        Self::deliver_pending_write(ts, &pw, "pending_clear");
+                    }
+                }
+
+                // Only deliver the prompt once the /clear (if any) is gone.
+                if ts.pending_clear.is_none() {
+                    if let Some(prompt) = &ts.pending_prompt {
+                        if Self::ready_for_write(&ts.session, prompt, now) {
+                            let pw = ts.pending_prompt.take().unwrap();
+                            Self::deliver_pending_write(ts, &pw, "pending_prompt");
+                        }
                     }
                 }
 
                 // Detect session_id for claude/codex sessions that don't have one yet.
+                //
+                // Skip claude WORKFLOW sessions — the "newest new .jsonl"
+                // heuristic is unreliable when multiple claude processes
+                // share a project directory (another process's /clear
+                // rotation can produce a new .jsonl right when we're
+                // looking). For those we use history.jsonl correlation
+                // via `resolve_pending_deliveries` instead.
+                let skip_workflow_claude =
+                    ts.session_type == "claude" && ts.workflow_run_id.is_some();
                 if should_check_session_ids
+                    && !skip_workflow_claude
                     && (ts.session_type == "claude" || ts.session_type == "codex")
                     && ts.session_id.is_none()
                     && ts.pending_jsonl_files.is_some()
@@ -974,6 +1194,7 @@ impl App {
                         }
                     }
                 }
+
             }
         }
 
@@ -994,10 +1215,120 @@ impl App {
             self.needs_redraw = true;
         }
 
+        // Poll `~/.claude/history.jsonl` for `/clear` and `/compact` events
+        // targeting any active workflow role's bound session, and migrate
+        // to the new transcript file.
+        self.apply_history_rotations();
+
         // Drive workflow transitions after per-session bookkeeping — this way
         // any session state changes above (idle detection, new session_id) are
         // visible to the workflow engine.
         self.tick_workflows();
+    }
+
+    /// Drain new entries from `~/.claude/history.jsonl`. For each rotation-
+    /// trigger entry (`/clear`, `/compact`) whose `sessionId` matches the
+    /// bound sid of an active claude workflow role, find the new transcript
+    /// file that was produced and rebind the role to it.
+    fn apply_history_rotations(&mut self) {
+        // Drain new history.jsonl entries. Route rotation triggers to the
+        // pending queue, and feed every entry to the sid-correlation step
+        // for claude workflow sessions that haven't been bound yet.
+        let mut new_entries: Vec<workflow::history::HistoryEntry> = Vec::new();
+        if let Some(watcher) = self.history_watcher.as_mut() {
+            new_entries = watcher.poll();
+            let now = Instant::now();
+            for entry in &new_entries {
+                if workflow::history::is_rotation_trigger(&entry.display) {
+                    self.pending_rotations
+                        .push((entry.session_id.clone(), entry.timestamp_ms, now));
+                }
+            }
+        }
+        self.resolve_pending_deliveries(&new_entries);
+        if self.pending_rotations.is_empty() {
+            return;
+        }
+        // Build (sid → (run_id, role, worktree)) lookup for active claude roles.
+        let mut bindings: HashMap<String, (String, String, std::path::PathBuf)> = HashMap::new();
+        for run in &self.workflow_runs {
+            if !run.is_active() {
+                continue;
+            }
+            for (role, binding) in &run.role_sessions {
+                let Some(sid) = &binding.current_session_id else {
+                    continue;
+                };
+                let Some((ti, si)) = self.locate_workflow_session(&run.run_id, role) else {
+                    continue;
+                };
+                if self.tasks[ti].sessions[si].session_type != "claude" {
+                    continue;
+                }
+                let Some(wt) = self.tasks[ti].worktree_path.clone() else {
+                    continue;
+                };
+                bindings.insert(sid.clone(), (run.run_id.clone(), role.clone(), wt));
+            }
+        }
+        // Walk pending queue; resolve what we can, drop stale ones.
+        let now = Instant::now();
+        let max_age = Duration::from_secs(30);
+        let mut resolved: Vec<(String, String, String, String)> = Vec::new();
+        self.pending_rotations.retain(|(old_sid, ts_ms, first_seen)| {
+            if now.duration_since(*first_seen) > max_age {
+                return false;
+            }
+            let Some((run_id, role, wt)) = bindings.get(old_sid) else {
+                return true;
+            };
+            let Some(new_sid) = workflow::history::find_post_rotation_sid(wt, *ts_ms) else {
+                return true;
+            };
+            if &new_sid == old_sid {
+                return false;
+            }
+            resolved.push((
+                run_id.clone(),
+                role.clone(),
+                old_sid.clone(),
+                new_sid,
+            ));
+            false
+        });
+        for (run_id, role, old_sid, new_sid) in &resolved {
+            let Some((ti, si)) = self.locate_workflow_session(run_id, role) else {
+                continue;
+            };
+            self.tasks[ti].sessions[si].session_id = Some(new_sid.clone());
+            let Some(run) = self.workflow_runs.iter_mut().find(|r| &r.run_id == run_id)
+            else {
+                continue;
+            };
+            if let Some(b) = run.role_sessions.get_mut(role) {
+                b.current_session_id = Some(new_sid.clone());
+            }
+            run.role_baselines
+                .insert(role.clone(), workflow::run::MessageBaseline::default());
+            if run.active_role.as_deref() == Some(role.as_str()) {
+                if let Some(h) = run.history.last_mut() {
+                    h.assistant_count_at_start = 0;
+                    h.session_id = Some(new_sid.clone());
+                }
+            }
+            let _ = workflow::run::save(run);
+            log_tick(
+                run_id,
+                &format!(
+                    "history-rotation: role={} {} -> {}",
+                    role, old_sid, new_sid
+                ),
+            );
+        }
+        if !resolved.is_empty() {
+            self.save_session_manifest();
+            self.set_status_msg("Workflow: session rotated (/clear or /compact)");
+        }
     }
 
     /// Process all pending backend events (non-blocking).
@@ -1085,6 +1416,107 @@ impl App {
         if self.planning.needs_redraw {
             self.needs_redraw = true;
             self.planning.needs_redraw = false;
+        }
+    }
+
+    /// Bind freshly-spawned claude workflow sessions to their real sessionId
+    /// by matching `last_delivery` prefix against new `history.jsonl` entries.
+    ///
+    /// The "newest new .jsonl" heuristic we rely on elsewhere can race when
+    /// multiple claude processes share a project dir — another process's
+    /// `/clear` rotation can produce a new file right when we're looking.
+    /// Instead, we correlate: when we delivered a prompt whose text starts
+    /// with P to an unbound session, claude later writes a history entry
+    /// whose content starts with P; that entry's `sessionId` is ours.
+    fn resolve_pending_deliveries(&mut self, entries: &[workflow::history::HistoryEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        // Collect sids already claimed by any active workflow role so we
+        // don't re-bind a session to a sid already in use.
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for run in &self.workflow_runs {
+            if !run.is_active() {
+                continue;
+            }
+            for b in run.role_sessions.values() {
+                if let Some(sid) = &b.current_session_id {
+                    claimed.insert(sid.clone());
+                }
+            }
+        }
+        let mut to_bind: Vec<(usize, usize, String)> = Vec::new();
+        for (ti, task) in self.tasks.iter().enumerate() {
+            let Some(wt_str) = task.worktree_path.as_deref().and_then(|p| p.to_str()) else {
+                continue;
+            };
+            for (si, ts) in task.sessions.iter().enumerate() {
+                if ts.session_type != "claude"
+                    || ts.workflow_run_id.is_none()
+                    || ts.session_id.is_some()
+                {
+                    continue;
+                }
+                let Some((prefix, delivered_ms)) = ts.last_delivery.as_ref() else {
+                    continue;
+                };
+                if prefix.is_empty() {
+                    continue;
+                }
+                // Find the earliest history entry whose content starts with
+                // our prefix, in our project, on or after delivery time,
+                // with a sessionId that's not already claimed.
+                let mut best: Option<(u64, String)> = None;
+                for e in entries {
+                    if e.project != wt_str {
+                        continue;
+                    }
+                    if e.timestamp_ms + 2000 < *delivered_ms {
+                        continue;
+                    }
+                    if claimed.contains(&e.session_id) {
+                        continue;
+                    }
+                    let content_matches = e.display.starts_with(prefix.as_str())
+                        || e.paste_content.starts_with(prefix.as_str());
+                    if !content_matches {
+                        continue;
+                    }
+                    if best.as_ref().map_or(true, |(t, _)| e.timestamp_ms < *t) {
+                        best = Some((e.timestamp_ms, e.session_id.clone()));
+                    }
+                }
+                if let Some((_, sid)) = best {
+                    to_bind.push((ti, si, sid));
+                }
+            }
+        }
+        for (ti, si, sid) in to_bind {
+            let Some(ts) = self.tasks.get_mut(ti).and_then(|t| t.sessions.get_mut(si)) else {
+                continue;
+            };
+            let run_id = ts.workflow_run_id.clone();
+            let role = ts.workflow_role.clone();
+            ts.session_id = Some(sid.clone());
+            ts.pending_jsonl_files = None;
+            ts.last_delivery = None;
+            if let (Some(run_id), Some(role)) = (run_id, role) {
+                if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                    if let Some(b) = run.role_sessions.get_mut(&role) {
+                        b.current_session_id = Some(sid.clone());
+                    }
+                    if run.active_role.as_deref() == Some(role.as_str()) {
+                        if let Some(h) = run.history.last_mut() {
+                            h.session_id = Some(sid.clone());
+                        }
+                    }
+                    let _ = workflow::run::save(run);
+                    log_tick(
+                        &run_id,
+                        &format!("delivery-correlated: role={} sid={}", role, sid),
+                    );
+                }
+            }
         }
     }
 
@@ -1412,8 +1844,8 @@ impl App {
                         self.resume_workflow_for_cursor();
                         return true;
                     }
-                    KeyCode::Char('t') => {
-                        self.detach_workflow_for_cursor();
+                    KeyCode::Char('o') => {
+                        self.stop_workflow_for_cursor();
                         return true;
                     }
                     KeyCode::Char('y') => {
@@ -1492,6 +1924,17 @@ impl App {
                     ts.last_write_at = Some(Instant::now());
                     return true;
                 }
+            }
+        }
+
+        // If the focused session is part of a running workflow and the user
+        // hit Ctrl-C, pause the run. We do not swallow the keystroke — it's
+        // still forwarded below so the agent sees the interrupt as usual.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+            {
+                self.pause_focused_workflow();
             }
         }
 
@@ -1746,7 +2189,7 @@ impl App {
                     }
                     _ => return true,
                 },
-                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots: _ } => {
+                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots, active_slot } => {
                     match key.code {
                         KeyCode::Esc => {
                             self.input_mode = InputMode::Normal;
@@ -1755,12 +2198,37 @@ impl App {
                         KeyCode::Enter => {
                             let ti = *task_index;
                             let wf_name = workflow_name.clone();
-                            let slots_owned = match &self.input_mode {
-                                InputMode::WorkflowLaunchConfirm { slots, .. } => slots.clone(),
-                                _ => Vec::new(),
-                            };
+                            let slots_owned = slots.clone();
                             self.input_mode = InputMode::Normal;
                             self.launch_workflow(ti, &wf_name, slots_owned);
+                            return true;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                            if !slots.is_empty() {
+                                *active_slot = (*active_slot + 1) % slots.len();
+                            }
+                            return true;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                            if !slots.is_empty() {
+                                *active_slot = if *active_slot == 0 {
+                                    slots.len() - 1
+                                } else {
+                                    *active_slot - 1
+                                };
+                            }
+                            return true;
+                        }
+                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
+                            if let Some(slot) = slots.get_mut(*active_slot) {
+                                slot.cycle(1);
+                            }
+                            return true;
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if let Some(slot) = slots.get_mut(*active_slot) {
+                                slot.cycle(-1);
+                            }
                             return true;
                         }
                         _ => return true,
@@ -1910,8 +2378,10 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: idle_timeout_secs,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
@@ -1999,8 +2469,10 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2029,8 +2501,10 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2052,8 +2526,10 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2111,8 +2587,10 @@ impl App {
                             hidden: false,
                             idle_timeout_secs: 0,
                             pending_prompt: None,
+                            pending_clear: None,
                             workflow_run_id: None,
                             workflow_role: None,
+                        last_delivery: None,
                         };
                         let si = self.tasks[task_index].sessions.len();
                         self.tasks[task_index].sessions.push(ts);
@@ -2160,8 +2638,10 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[task_index].sessions.len();
                 self.tasks[task_index].sessions.push(ts);
@@ -2212,8 +2692,10 @@ impl App {
                     hidden: false,
                     idle_timeout_secs: 0,
                     pending_prompt: None,
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
 
                 // Find existing task by task_id or create new.
@@ -2480,10 +2962,21 @@ impl App {
                     pending_prompt: if prompt.trim().is_empty() {
                         None
                     } else {
-                        Some((Instant::now() + Duration::from_secs(3), prompt.to_string()))
+                        // Queue as a non-submitting prefill (user will hit Enter
+                        // themselves). Fires on first quiet PTY so claude has
+                        // time to finish its startup render.
+                        Some(PendingWrite::wait_for_quiet(
+                            prompt.to_string(),
+                            false,
+                            Duration::from_secs(1),
+                            Duration::from_secs(2),
+                            Duration::from_secs(60),
+                        ))
                     },
+                    pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
 
                 let new_ti = self.tasks.len();
@@ -2593,8 +3086,15 @@ impl App {
                 InputMode::SessionSettings { name, idle_timeout, hidden, active_field, .. } => {
                     self.draw_session_settings(frame, area, name, idle_timeout, *hidden, *active_field);
                 }
-                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots } => {
-                    self.draw_workflow_launch(frame, area, *task_index, workflow_name, slots);
+                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots, active_slot } => {
+                    self.draw_workflow_launch(
+                        frame,
+                        area,
+                        *task_index,
+                        workflow_name,
+                        slots,
+                        *active_slot,
+                    );
                 }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
@@ -2960,6 +3460,13 @@ impl App {
                         _ => false,
                     };
 
+                    // Find enclosing workflow run, if any — controls vertical-line
+                    // prefix for visual grouping in task view.
+                    let in_active_workflow = ts
+                        .workflow_run_id
+                        .as_deref()
+                        .is_some_and(|id| self.workflow_runs.iter().any(|r| r.run_id == id));
+
                     let (indicator, indicator_style) = if ts.hidden {
                         (" ", Style::default())
                     } else {
@@ -3023,6 +3530,14 @@ impl App {
                         format!(" {} ", indicator),
                         indicator_style,
                     )];
+                    // Vertical line prefix for sessions inside a workflow group
+                    // (only in task view where grouping makes sense visually).
+                    if in_active_workflow && self.sidebar_view == SidebarView::Task {
+                        spans.push(Span::styled(
+                            "\u{2502} ",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
                     if let Some((badge, style)) = wf_badge {
                         spans.push(Span::styled(badge, style));
                     }
@@ -3051,6 +3566,32 @@ impl App {
                     ));
                     items.push(ListItem::new(sep_line));
                 }
+                VisualItem::WorkflowHeader { task_idx, run_id } => {
+                    let task = &self.tasks[*task_idx];
+                    let run = self.workflow_runs.iter().find(|r| &r.run_id == run_id);
+                    let (agg_indicator, agg_style) = match run {
+                        Some(r) => aggregate_indicator(r, task, spinner),
+                        None => ("\u{25cf}", Style::default().fg(Color::DarkGray)),
+                    };
+                    let name = run
+                        .map(|r| r.workflow_name.clone())
+                        .unwrap_or_else(|| "workflow".into());
+                    let paused_suffix = run
+                        .map(|r| match r.status {
+                            workflow::RunStatus::Paused => " (paused)",
+                            workflow::RunStatus::Done => " (done)",
+                            _ => "",
+                        })
+                        .unwrap_or("");
+                    let line = Line::from(vec![
+                        Span::styled(format!(" {} ", agg_indicator), agg_style),
+                        Span::styled(
+                            format!("\u{256d}\u{2500} {}{}", name, paused_suffix),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                    ]);
+                    items.push(ListItem::new(line));
+                }
             }
         }
 
@@ -3075,7 +3616,7 @@ impl App {
             ("A-e    settings", "A-r  refresh"),
             ("A-h    hide", "A-q  quit"),
             ("A-f    workflow", "A-u  resume"),
-            ("A-t    detach wf", "A-y  history"),
+            ("A-o    stop wf", "A-y  history"),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -3220,19 +3761,79 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
         let Some((engine, wt, sid)) = self.lookup(role) else {
             return Vec::new();
         };
+        let offset = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.user_count)
+            .unwrap_or(0);
         workflow::transcript::list_messages(engine, wt, sid, workflow::transcript::MessageKind::User)
+            .into_iter()
+            .skip(offset)
+            .collect()
     }
 
     fn assistant_messages(&self, role: &str) -> Vec<String> {
         let Some((engine, wt, sid)) = self.lookup(role) else {
             return Vec::new();
         };
+        let offset = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.assistant_count)
+            .unwrap_or(0);
         workflow::transcript::list_messages(
             engine,
             wt,
             sid,
             workflow::transcript::MessageKind::Assistant,
         )
+        .into_iter()
+        .skip(offset)
+        .collect()
+    }
+
+    fn prior_user_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let baseline = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.user_count)
+            .unwrap_or(0);
+        workflow::transcript::list_messages(engine, wt, sid, workflow::transcript::MessageKind::User)
+            .into_iter()
+            .take(baseline)
+            .collect()
+    }
+
+    fn prior_assistant_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let baseline = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.assistant_count)
+            .unwrap_or(0);
+        workflow::transcript::list_messages(
+            engine,
+            wt,
+            sid,
+            workflow::transcript::MessageKind::Assistant,
+        )
+        .into_iter()
+        .take(baseline)
+        .collect()
+    }
+
+    fn latest_plan(&self, role: &str) -> Option<String> {
+        let (engine, wt, sid) = self.lookup(role)?;
+        workflow::transcript::latest_plan(engine, wt, sid)
     }
 }
 
@@ -3259,6 +3860,24 @@ impl App {
         task.sessions.iter().position(|s| s.label == label)
     }
 
+    /// Locate the `(task_index, session_index)` of the session that's tagged
+    /// as `role` for workflow run `run_id`. Searches across ALL tasks — the
+    /// workflow's stored `task_key` can drift away from reality (sessions can
+    /// move, or the workflow may have been launched with a stale task key),
+    /// and the tags on the session itself are the source of truth.
+    fn locate_workflow_session(&self, run_id: &str, role: &str) -> Option<(usize, usize)> {
+        for (ti, task) in self.tasks.iter().enumerate() {
+            for (si, ts) in task.sessions.iter().enumerate() {
+                if ts.workflow_run_id.as_deref() == Some(run_id)
+                    && ts.workflow_role.as_deref() == Some(role)
+                {
+                    return Some((ti, si));
+                }
+            }
+        }
+        None
+    }
+
     /// Open the launch modal for a workflow, prefilled for the focused session.
     fn open_workflow_launch(&mut self) {
         let (ti, focused_si) = match self.cursor.clone() {
@@ -3282,30 +3901,63 @@ impl App {
             return;
         };
 
-        // Build default slot choices in role_order. First role -> focused session
-        // if there is one and it's compatible (persistent context). Others -> New.
+        // Build a per-slot option cycle. For persistent-context roles, options are
+        // every existing session on the task + `new claude` + `new codex`. Fresh-
+        // context roles get only the two `new` options (existing sessions would
+        // have their history wiped by the respawn — not useful).
+        let task = &self.tasks[ti];
         let mut slots = Vec::new();
         for (idx, role_name) in wf.role_order.iter().enumerate() {
             let role = &wf.roles[role_name];
-            let source = if idx == 0 && focused_si.is_some() {
-                // Only bind an existing session for persistent-context first role.
-                if matches!(role.context, workflow::toml_schema::Context::Persistent) {
-                    WorkflowSlotSource::Existing(focused_si.unwrap())
-                } else {
-                    WorkflowSlotSource::New
+            let is_fresh = matches!(role.context, workflow::toml_schema::Context::Fresh);
+
+            let mut options: Vec<WorkflowSlotSource> = Vec::new();
+            if !is_fresh {
+                for si in 0..task.sessions.len() {
+                    // Skip sessions that are already in another active workflow.
+                    let ts = &task.sessions[si];
+                    if ts.workflow_run_id.is_some() {
+                        continue;
+                    }
+                    options.push(WorkflowSlotSource::Existing(si));
                 }
+            }
+            options.push(WorkflowSlotSource::New(Engine::ClaudeCode));
+            options.push(WorkflowSlotSource::New(Engine::Codex));
+
+            // Pick initial selection:
+            //   - Role #0 + user has a focused session + role is persistent → bind to focused
+            //   - Otherwise → the role's declared engine from the TOML (default)
+            let initial = if idx == 0
+                && focused_si.is_some()
+                && !is_fresh
+                && options
+                    .iter()
+                    .any(|o| matches!(o, WorkflowSlotSource::Existing(si) if Some(*si) == focused_si))
+            {
+                options
+                    .iter()
+                    .position(|o| matches!(o, WorkflowSlotSource::Existing(si) if Some(*si) == focused_si))
+                    .unwrap()
             } else {
-                WorkflowSlotSource::New
+                // Match the role's declared engine to one of the `New(e)` options.
+                options
+                    .iter()
+                    .position(|o| matches!(o, WorkflowSlotSource::New(e) if *e == role.engine))
+                    .unwrap_or(options.len() - 1)
             };
+
             slots.push(WorkflowSlotChoice {
                 role: role_name.clone(),
-                source,
+                options,
+                option_index: initial,
             });
         }
         self.input_mode = InputMode::WorkflowLaunchConfirm {
             task_index: ti,
             workflow_name: wf_name,
             slots,
+            active_slot: 0,
         };
     }
 
@@ -3324,7 +3976,9 @@ impl App {
             return;
         }
 
-        // Validate: `fresh` slots cannot use existing sessions.
+        // Validate: `fresh` slots cannot use existing sessions. Also reject
+        // duplicate existing-session assignments across slots.
+        let mut existing_seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for slot in &slots {
             let role = match wf.roles.get(&slot.role) {
                 Some(r) => r,
@@ -3333,14 +3987,20 @@ impl App {
                     return;
                 }
             };
-            if matches!(role.context, workflow::toml_schema::Context::Fresh)
-                && matches!(slot.source, WorkflowSlotSource::Existing(_))
-            {
-                self.set_status_msg(&format!(
-                    "Role '{}' has fresh context; must use a new session",
-                    slot.role
-                ));
-                return;
+            if let WorkflowSlotSource::Existing(si) = slot.source() {
+                if matches!(role.context, workflow::toml_schema::Context::Fresh) {
+                    self.set_status_msg(&format!(
+                        "Role '{}' has fresh context; must use a new session",
+                        slot.role
+                    ));
+                    return;
+                }
+                if !existing_seen.insert(*si) {
+                    self.set_status_msg(
+                        "Two roles can't share the same existing session",
+                    );
+                    return;
+                }
             }
         }
 
@@ -3352,26 +4012,65 @@ impl App {
             }
         };
         let run_id = workflow::run::new_run_id();
+        let worktree_path = self.tasks[task_index].worktree_path.clone();
 
         // Spawn / bind sessions for each slot and build role_sessions.
+        // For existing sessions we also snapshot the current user/assistant counts
+        // so that templates like `{{ roles.worker.initial_prompt }}` point at the
+        // first message *after* this launch, not the first message ever.
         let mut role_sessions: std::collections::BTreeMap<String, RoleBinding> =
+            std::collections::BTreeMap::new();
+        let mut role_baselines: std::collections::BTreeMap<String, MessageBaseline> =
             std::collections::BTreeMap::new();
         for slot in &slots {
             let role = &wf.roles[&slot.role];
-            let (session_label, session_id) = match &slot.source {
+            let (session_label, session_id, effective_engine) = match slot.source() {
                 WorkflowSlotSource::Existing(si) => {
-                    // Bind existing session and tag it with workflow metadata.
+                    // Tag with workflow metadata, and if sid isn't known yet,
+                    // try to detect it NOW (newest JSONL heuristic) so the
+                    // baseline below is computed from the actual transcript.
+                    // Without this, baseline stays 0 and the idle-transition
+                    // gate starts off at 0 — which means `current > start`
+                    // fires on the worker's first message regardless of
+                    // whether that message was pre- or post-launch, which
+                    // feels roughly right for new sessions but forces the
+                    // user to wait for a SECOND message on restored sessions.
+                    let worktree_for_detect = self.tasks[task_index].worktree_path.clone();
                     let ts = match self.tasks[task_index].sessions.get_mut(*si) {
                         Some(s) => s,
                         None => continue,
                     };
                     ts.workflow_run_id = Some(run_id.clone());
                     ts.workflow_role = Some(slot.role.clone());
-                    (ts.label.clone(), ts.session_id.clone())
+                    if ts.session_id.is_none() {
+                        if let Some(wt) = worktree_for_detect.as_deref() {
+                            // Use the session's own pending list (pre-launch
+                            // snapshot) if available so detection picks this
+                            // session's new JSONL rather than some other
+                            // session's in the same worktree. Empty-list
+                            // fallback picks the newest overall.
+                            let existing: Vec<String> =
+                                ts.pending_jsonl_files.clone().unwrap_or_default();
+                            let detected = match ts.session_type.as_str() {
+                                "claude" => Self::detect_session_id(wt, &existing),
+                                "codex" => Self::detect_codex_session_id(wt, &existing),
+                                _ => None,
+                            };
+                            if let Some(sid) = detected {
+                                ts.session_id = Some(sid);
+                                ts.pending_jsonl_files = None;
+                            }
+                        }
+                    }
+                    let eng = match ts.session_type.as_str() {
+                        "codex" => Engine::Codex,
+                        _ => Engine::ClaudeCode,
+                    };
+                    (ts.label.clone(), ts.session_id.clone(), eng)
                 }
-                WorkflowSlotSource::New => {
-                    match self.spawn_workflow_session(task_index, &slot.role, role, &run_id) {
-                        Some((label, sid)) => (label, sid),
+                WorkflowSlotSource::New(engine) => {
+                    match self.spawn_workflow_session(task_index, &slot.role, engine, &run_id) {
+                        Some((label, sid)) => (label, sid, engine.clone()),
                         None => {
                             self.set_status_msg(&format!("Failed to spawn {}", slot.role));
                             return;
@@ -3379,6 +4078,31 @@ impl App {
                     }
                 }
             };
+            // Compute baseline now, before the session does any new work.
+            // Use count_messages (counts any turn) for assistant_count so the
+            // idle gate sees a consistent picture later — it compares current
+            // count against baseline.assistant_count at start. user_count
+            // still uses list_messages (template slice uses text messages).
+            let baseline = match (worktree_path.as_deref(), session_id.as_deref()) {
+                (Some(wt), Some(sid)) => MessageBaseline {
+                    user_count: workflow::transcript::list_messages(
+                        &effective_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::User,
+                    )
+                    .len(),
+                    assistant_count: workflow::transcript::count_messages(
+                        &effective_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::Assistant,
+                    ),
+                },
+                _ => MessageBaseline::default(),
+            };
+            let _ = role;
+            role_baselines.insert(slot.role.clone(), baseline);
             role_sessions.insert(
                 slot.role.clone(),
                 RoleBinding {
@@ -3396,6 +4120,7 @@ impl App {
             task_key,
             role_sessions,
             initial_role.clone(),
+            role_baselines,
         );
         let _ = workflow::run::save(&run);
         self.workflow_runs.push(run);
@@ -3408,34 +4133,67 @@ impl App {
         ));
     }
 
+    /// Keep role_sessions.current_session_id aligned with the live
+    /// TerminalSession.session_id. Nothing else.
+    fn sync_role_session_ids(&mut self) {
+        let run_count = self.workflow_runs.len();
+        for idx in 0..run_count {
+            if !self.workflow_runs[idx].is_active() {
+                continue;
+            }
+            let run_id = self.workflow_runs[idx].run_id.clone();
+            let role_names: Vec<String> = self.workflow_runs[idx]
+                .role_sessions
+                .keys()
+                .cloned()
+                .collect();
+            let mut changed = false;
+            for role in role_names {
+                let Some((ti, si)) = self.locate_workflow_session(&run_id, &role) else {
+                    continue;
+                };
+
+                let live = self.tasks[ti].sessions[si].session_id.clone();
+                let binding_sid = self
+                    .workflow_runs[idx]
+                    .role_sessions
+                    .get(&role)
+                    .and_then(|b| b.current_session_id.clone());
+                if live != binding_sid {
+                    if let Some(b) = self.workflow_runs[idx].role_sessions.get_mut(&role) {
+                        b.current_session_id = live;
+                    }
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = workflow::run::save(&self.workflow_runs[idx]);
+            }
+        }
+    }
+
     /// Spawn a new TerminalSession for a workflow role, returning (label, session_id).
     /// The session_id is usually None immediately — it's detected later via JSONL scan.
     fn spawn_workflow_session(
         &mut self,
         task_index: usize,
         role_name: &str,
-        role: &workflow::toml_schema::Role,
+        engine: &Engine,
         run_id: &str,
     ) -> Option<(String, Option<String>)> {
         let worktree_path = self.tasks[task_index].worktree_path.clone()?;
         let (cols, rows) = self.last_term_size;
-        let (program, args) = match workflow::spawn::build_args(
-            &role.engine,
-            run_id,
-            role_name,
-            None,
-        ) {
+        let (program, args) = match workflow::spawn::build_args(engine, run_id, role_name, None) {
             Ok(v) => v,
             Err(e) => {
                 self.set_status_msg(&format!("spawn args: {}", e));
                 return None;
             }
         };
-        let pending = if matches!(role.engine, Engine::ClaudeCode) {
-            Some(Self::list_jsonl_files(&worktree_path))
-        } else {
-            None
-        };
+        let pending = Some(match engine {
+            Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
+            Engine::Codex => Self::list_codex_sessions(&worktree_path),
+        });
         let sess = Session::new(
             &program,
             &args,
@@ -3445,21 +4203,29 @@ impl App {
             Default::default(),
         )
         .ok()?;
-        let session_type = role.engine.as_session_type().to_string();
+        let session_type = engine.as_session_type().to_string();
         let label = role_name.to_string();
         let ts = TerminalSession {
             label: label.clone(),
             session_type,
             session: sess,
-            status: SessionStatus::Running,
+            // Start Idle — PTY startup noise is not "work". A wakeup burst from
+            // the agent actually responding will flip it to Running naturally
+            // (see drain_terminal_events). Keeps the workflow header aggregate
+            // from briefly spinning during process start.
+            status: SessionStatus::Idle,
             last_write_at: None,
             session_id: None,
             pending_jsonl_files: pending,
-            hidden: false,
+            // Per-session indicators default to hidden inside a workflow — the
+            // workflow header carries the aggregate. Toggle per session with A-h.
+            hidden: true,
             idle_timeout_secs: 0,
             pending_prompt: None,
+            pending_clear: None,
             workflow_run_id: Some(run_id.to_string()),
             workflow_role: Some(role_name.to_string()),
+        last_delivery: None,
         };
         self.tasks[task_index].sessions.push(ts);
         Some((label, None))
@@ -3473,30 +4239,14 @@ impl App {
         if self.workflow_runs.is_empty() {
             return;
         }
-        let now = Instant::now();
 
-        // Check user input → auto-pause.
-        for task in &self.tasks {
-            for ts in &task.sessions {
-                let (Some(run_id), Some(_role)) = (&ts.workflow_run_id, &ts.workflow_role) else {
-                    continue;
-                };
-                let Some(last_write) = ts.last_write_at else { continue };
-                if now.duration_since(last_write) > Duration::from_secs(30) {
-                    continue;
-                }
-                if let Some(run) = self
-                    .workflow_runs
-                    .iter_mut()
-                    .find(|r| r.run_id == *run_id)
-                {
-                    if matches!(run.status, workflow::RunStatus::Running) {
-                        run.set_paused(true);
-                        let _ = workflow::run::save(run);
-                    }
-                }
-            }
-        }
+        // Keep role_sessions.current_session_id in sync with whatever the
+        // live TerminalSession.session_id is. Needed because templating
+        // (WorkflowResolver) reads from role_sessions, and sessions may get
+        // their sid detected asynchronously (5-second poll) after launch.
+        // This is a pure sync — no baseline / start_count mutation, which
+        // would shift gates unpredictably.
+        self.sync_role_session_ids();
 
         // Collect decisions first, then apply. (Avoids borrow issues with mutable
         // access to both self.workflow_runs and self.tasks.)
@@ -3532,6 +4282,42 @@ impl App {
             .collect();
 
         for (idx, run_id, offset, active_role, paused) in run_snapshots {
+            // Log per-session status so we can tell at a glance whether each
+            // role ever reaches Running. Rate-limited by log_tick so this
+            // doesn't flood. Now locates sessions by their workflow tags
+            // (run_id+role), which is the source of truth — the workflow's
+            // stored task_key can drift.
+            {
+                let role_names: Vec<String> = self.workflow_runs[idx]
+                    .role_sessions
+                    .keys()
+                    .cloned()
+                    .collect();
+                let mut parts = Vec::new();
+                for role in &role_names {
+                    let status = match self.locate_workflow_session(&run_id, role) {
+                        Some((ti, si)) => {
+                            let ts = &self.tasks[ti].sessions[si];
+                            format!(
+                                "{:?}{}",
+                                ts.status,
+                                if ts.session.exited { "(exited)" } else { "" }
+                            )
+                        }
+                        None => "<no session>".to_string(),
+                    };
+                    parts.push(format!("{}={}", role, status));
+                }
+                log_tick(
+                    &run_id,
+                    &format!(
+                        "statuses: active={} [{}]",
+                        active_role.as_deref().unwrap_or("?"),
+                        parts.join(", ")
+                    ),
+                );
+            }
+
             // Read new events regardless of paused state so the log stays in sync;
             // events are still recorded in history but not fired while paused.
             let (events, new_offset) = workflow::events::read_new(&run_id, offset);
@@ -3572,29 +4358,57 @@ impl App {
                     .get(&self.workflow_runs[idx].workflow_name)
                     .cloned();
                 let Some(wf) = wf else { continue };
-                let Some(binding) = self.workflow_runs[idx].role_sessions.get(active).cloned() else {
+                // Locate by workflow tags — not by task_key + session_label,
+                // which can drift.
+                let Some((ti, si)) = self.locate_workflow_session(&run_id, active) else {
                     continue;
-                };
-                let task_key = self.workflow_runs[idx].task_key.clone();
-                let ti = match self.find_task_by_key(&task_key) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let si = match Self::find_session_by_label(&self.tasks[ti], &binding.session_label) {
-                    Some(s) => s,
-                    None => continue,
                 };
                 let session_idle = matches!(
                     self.tasks[ti].sessions[si].status,
                     SessionStatus::Idle
                 );
                 if session_idle {
-                    if let Some(t) = wf.static_transition_on_idle(active) {
-                        decisions.push(Decision::ActivateStatic {
-                            run_id: run_id.clone(),
-                            to: t.to.clone(),
-                            from: active.to_string(),
-                        });
+                    // Only fire the static transition if the outgoing role has
+                    // actually taken a NEW turn since its current activation.
+                    // Use `count_messages` (counts any assistant JSONL entry —
+                    // including thinking-only / tool-use-only turns) rather
+                    // than `list_messages` which skips non-text content and
+                    // would undercount real turns.
+                    let start_count = self.workflow_runs[idx]
+                        .active_assistant_start_count()
+                        .unwrap_or(0);
+                    let current_sid = self.tasks[ti].sessions[si].session_id.clone();
+                    let current_count = match (
+                        self.tasks[ti].worktree_path.as_deref(),
+                        current_sid.as_deref(),
+                    ) {
+                        (Some(wt), Some(sid)) => workflow::transcript::count_messages(
+                            &wf.roles[active].engine,
+                            wt,
+                            sid,
+                            workflow::transcript::MessageKind::Assistant,
+                        ),
+                        _ => 0,
+                    };
+                    log_tick(
+                        &run_id,
+                        &format!(
+                            "idle check: role={} sid={:?} start={} current={} will_fire={}",
+                            active,
+                            current_sid.as_deref().unwrap_or("<none>"),
+                            start_count,
+                            current_count,
+                            current_count > start_count,
+                        ),
+                    );
+                    if current_count > start_count {
+                        if let Some(t) = wf.static_transition_on_idle(active) {
+                            decisions.push(Decision::ActivateStatic {
+                                run_id: run_id.clone(),
+                                to: t.to.clone(),
+                                from: active.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -3643,24 +4457,21 @@ impl App {
             Some(w) => w,
             None => return,
         };
-        let task_key = self.workflow_runs[run_idx].task_key.clone();
-        let ti = match self.find_task_by_key(&task_key) {
-            Some(t) => t,
-            None => return,
+
+        // Locate target role's session by workflow tags (source of truth).
+        let Some((ti, si)) = self.locate_workflow_session(run_id, to_role) else {
+            return;
         };
 
         // Capture outgoing role's last assistant message for history.
         let from_role = self.workflow_runs[run_idx].active_role.clone();
         let captured = if let Some(from) = &from_role {
-            if let Some(binding) = self.workflow_runs[run_idx].role_sessions.get(from).cloned() {
+            if let Some((fti, fsi)) = self.locate_workflow_session(run_id, from) {
                 let from_role_spec = wf.roles.get(from).cloned();
-                if let (Some(spec), Some(sid)) = (from_role_spec, binding.current_session_id) {
-                    let wt = self.tasks[ti].worktree_path.clone();
-                    if let Some(wt) = wt {
-                        workflow::transcript::last_message(&spec.engine, &wt, &sid)
-                    } else {
-                        None
-                    }
+                let fsid = self.tasks[fti].sessions[fsi].session_id.clone();
+                let fwt = self.tasks[fti].worktree_path.clone();
+                if let (Some(spec), Some(sid), Some(wt)) = (from_role_spec, fsid, fwt) {
+                    workflow::transcript::last_message(&spec.engine, &wt, &sid)
                 } else {
                     None
                 }
@@ -3688,18 +4499,8 @@ impl App {
         };
         let rendered = workflow::template::render(&template_source, &resolver);
 
-        // Activate the target role. For `fresh`, respawn the underlying process.
-        let binding = match self.workflow_runs[run_idx].role_sessions.get(to_role).cloned() {
-            Some(b) => b,
-            None => return,
-        };
-        let si = match Self::find_session_by_label(&self.tasks[ti], &binding.session_label) {
-            Some(s) => s,
-            None => return,
-        };
-
         if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-            self.respawn_session_fresh(ti, si, to_role, &target_role_spec, run_id);
+            self.reset_fresh_session(run_id, ti, si);
         }
 
         // Update role_sessions with (possibly new) session_id from the session.
@@ -3708,45 +4509,129 @@ impl App {
             b.current_session_id = current_sid;
         }
 
-        self.workflow_runs[run_idx].activate_role(to_role.to_string(), trigger);
-        let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+        // Snapshot the target role's current assistant TURN count at activation.
+        // Uses `count_messages` (any assistant JSONL entry counts) so that
+        // downstream the idle gate compares turn-to-turn regardless of whether
+        // the agent's reply contains text, thinking, or tool_use content.
+        let start_count = {
+            let current_sid = self.tasks[ti].sessions[si].session_id.clone();
+            match (self.tasks[ti].worktree_path.as_deref(), current_sid.as_deref()) {
+                (Some(wt), Some(sid)) => workflow::transcript::count_messages(
+                    &target_role_spec.engine,
+                    wt,
+                    sid,
+                    workflow::transcript::MessageKind::Assistant,
+                ),
+                _ => 0,
+            }
+        };
 
-        // Deliver prompt (queued with a small delay so the PTY is ready, esp. for
-        // freshly respawned processes).
-        if !rendered.is_empty() {
-            let when = Instant::now() + Duration::from_secs(2);
-            self.tasks[ti].sessions[si].pending_prompt = Some((when, format!("{}\r", rendered)));
+        self.workflow_runs[run_idx].activate_role(to_role.to_string(), trigger, start_count);
+        let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+        let from_label = from_role.as_deref().unwrap_or("?");
+        self.set_status_msg(&format!("Workflow: {} → {}", from_label, to_role));
+
+        // Deliver prompt. Trim trailing whitespace first so our explicit "\r"
+        // submit lands on non-newline text — otherwise a trailing "\n" in the
+        // TOML multiline string gets typed into the input box and the "\r"
+        // then only adds another newline instead of submitting. Longer delay
+        // for fresh-context roles because they just received a `/clear` and
+        // need a beat to reset internal state.
+        if !rendered.trim().is_empty() {
+            // Queue the prompt to fire at the first moment of PTY quiet.
+            // Delivery is sequenced AFTER pending_clear (if any) in the
+            // drain loop, so we don't need to pre-compute a "start after
+            // clear" time here.
+            let pw = PendingWrite::wait_for_quiet(
+                rendered.trim_end().to_string(),
+                true,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(180),
+            );
+            let label = self.tasks[ti].sessions[si].label.clone();
+            log_tick(
+                run_id,
+                &format!(
+                    "fire_transition: activated '{}' queued prompt ({} bytes, fires on quiet PTY) on session '{}'",
+                    to_role,
+                    pw.text.len(),
+                    label,
+                ),
+            );
+            self.tasks[ti].sessions[si].pending_prompt = Some(pw);
+        } else {
+            log_tick(
+                run_id,
+                &format!(
+                    "fire_transition: activated '{}' but rendered prompt was EMPTY — nothing to deliver",
+                    to_role
+                ),
+            );
         }
         self.save_session_manifest();
     }
 
-    /// Kill the current PTY for a session slot and respawn the engine fresh.
-    fn respawn_session_fresh(
-        &mut self,
-        ti: usize,
-        si: usize,
-        role_name: &str,
-        role: &workflow::toml_schema::Role,
-        run_id: &str,
-    ) {
-        let (cols, rows) = self.last_term_size;
-        let worktree = self.tasks[ti].worktree_path.clone();
-        let (program, args) = match workflow::spawn::build_args(&role.engine, run_id, role_name, None) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let pending = worktree.as_ref().map(|wt| Self::list_jsonl_files(wt));
-
-        // Mark the old session as exited — PTY drops when the Session is replaced.
-        if let Ok(s) = Session::new(&program, &args, cols, rows, worktree, Default::default()) {
-            let ts = &mut self.tasks[ti].sessions[si];
-            ts.session = s;
-            ts.status = SessionStatus::Running;
-            ts.last_write_at = None;
-            ts.session_id = None;
-            ts.pending_jsonl_files = pending;
-            ts.pending_prompt = None;
+    /// Queue `/clear` to reset a fresh-context role's agent. Delivery is
+    /// gated on PTY quiet (see `PendingWrite`) so we don't try to type the
+    /// command while the agent is still painting its startup UI — that's
+    /// when `\r` gets buffered into the input box instead of interpreted
+    /// as submit.
+    ///
+    /// Also invalidates the session's bound sid and role baseline because
+    /// claude rotates its transcript file on `/clear`; the new file's sid
+    /// is picked up later by the history.jsonl correlator.
+    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
+        let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
+        let label = self.tasks[ti].sessions[si].label.clone();
+        let role_label = label.clone();
+        let ts = &mut self.tasks[ti].sessions[si];
+        if ts.session.exited {
+            log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
+            return false;
         }
+        // Queue /clear to fire when the PTY first goes quiet. Floor of 1s so
+        // we don't fire during the PTY startup noise. Hard deadline 120s in
+        // case the agent never goes quiet.
+        ts.pending_clear = Some(PendingWrite::wait_for_quiet(
+            "/clear".to_string(),
+            true,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(120),
+        ));
+        ts.status = SessionStatus::Idle;
+        // Refresh the pending-jsonl baseline to the current files so the new
+        // file created by /clear shows up as new, and clear session_id so the
+        // detection poll rebinds to it. Without this the detector treats the
+        // pre-/clear file as still bound.
+        ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
+            ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
+            ("codex", Some(wt)) => Some(Self::list_codex_sessions(wt)),
+            _ => None,
+        };
+        ts.session_id = None;
+        ts.pending_prompt = None;
+        // Old file's turn counts no longer apply to the new file — reset the
+        // role's message baseline so templates slice from 0 post-/clear.
+        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+            run.role_baselines.insert(
+                role_label.clone(),
+                workflow::run::MessageBaseline::default(),
+            );
+            if let Some(b) = run.role_sessions.get_mut(&role_label) {
+                b.current_session_id = None;
+            }
+        }
+        self.save_session_manifest();
+        log_tick(
+            run_id,
+            &format!(
+                "reset_fresh: queued /clear for '{}' (fires on first quiet PTY)",
+                label
+            ),
+        );
+        true
     }
 
     fn finish_run(&mut self, run_id: &str, reason: String) {
@@ -3755,6 +4640,26 @@ impl App {
             let _ = workflow::run::save(run);
         }
         self.set_status_msg(&format!("Workflow done: {}", reason));
+    }
+
+    /// Mark the focused session's workflow run as paused. No-op if the focused
+    /// session isn't in a workflow or the run is already paused/done.
+    ///
+    /// Called when the user hits Ctrl-C on a participant session — the
+    /// keystroke itself is still forwarded to the PTY so the agent receives
+    /// the interrupt as it would in a normal terminal.
+    fn pause_focused_workflow(&mut self) {
+        let run_id = match self.focused_session_run_id() {
+            Some(id) => id,
+            None => return,
+        };
+        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+            if matches!(run.status, workflow::RunStatus::Running) {
+                run.set_paused(true);
+                let _ = workflow::run::save(run);
+                self.set_status_msg("Workflow paused (A-u to resume)");
+            }
+        }
     }
 
     fn resume_workflow_for_cursor(&mut self) {
@@ -3776,7 +4681,13 @@ impl App {
         }
     }
 
-    fn detach_workflow_for_cursor(&mut self) {
+    /// Stop the workflow the focused session belongs to.
+    ///
+    /// The workflow run is marked detached (no more transitions will fire) and
+    /// the participating sessions have their workflow tags cleared so they
+    /// behave like normal standalone sessions from here on. The sessions
+    /// themselves stay open and their transcripts are preserved.
+    fn stop_workflow_for_cursor(&mut self) {
         let run_id = match self.focused_session_run_id() {
             Some(id) => id,
             None => {
@@ -3788,18 +4699,21 @@ impl App {
             run.mark_detached();
             let _ = workflow::run::save(run);
         }
-        // Clear workflow tags from participating sessions so they behave like normal.
+        // Clear workflow tags from participating sessions so they behave like
+        // normal standalone sessions. Also un-hide their per-session indicators
+        // (we hid them on launch since the workflow header carried the aggregate).
         for task in &mut self.tasks {
             for ts in &mut task.sessions {
                 if ts.workflow_run_id.as_deref() == Some(&run_id) {
                     ts.workflow_run_id = None;
                     ts.workflow_role = None;
+                    ts.hidden = false;
                 }
             }
         }
         self.workflow_runs.retain(|r| r.run_id != run_id);
         self.save_session_manifest();
-        self.set_status_msg("Workflow detached");
+        self.set_status_msg("Workflow stopped");
     }
 
     fn open_workflow_history(&mut self) {
@@ -3855,9 +4769,10 @@ impl App {
         task_index: usize,
         workflow_name: &str,
         slots: &[WorkflowSlotChoice],
+        active_slot: usize,
     ) {
-        let width = area.width.min(70).max(40);
-        let height = (slots.len() as u16 + 7).min(area.height.saturating_sub(2));
+        let width = area.width.min(72).max(44);
+        let height = (slots.len() as u16 + 8).min(area.height.saturating_sub(2));
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let dialog = Rect { x, y, width, height };
@@ -3877,8 +4792,9 @@ impl App {
             Style::default().fg(Color::White),
         )));
         lines.push(Line::from(""));
-        for slot in slots {
-            let src = match &slot.source {
+        for (idx, slot) in slots.iter().enumerate() {
+            let is_active = idx == active_slot;
+            let src_label = match slot.source() {
                 WorkflowSlotSource::Existing(si) => {
                     let label = self
                         .tasks
@@ -3886,18 +4802,36 @@ impl App {
                         .and_then(|t| t.sessions.get(*si))
                         .map(|s| s.label.clone())
                         .unwrap_or_else(|| "?".into());
-                    format!("existing session ({})", label)
+                    format!("existing ({})", label)
                 }
-                WorkflowSlotSource::New => "new session".into(),
+                WorkflowSlotSource::New(Engine::ClaudeCode) => "new claude".into(),
+                WorkflowSlotSource::New(Engine::Codex) => "new codex".into(),
+            };
+            let cursor = if is_active { "▸ " } else { "  " };
+            let role_style = if is_active {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let value_style = if is_active {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let decorator = if is_active && slot.options.len() > 1 {
+                format!("◂ {} ▸", src_label)
+            } else {
+                src_label.clone()
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<10}", slot.role), Style::default().fg(Color::Cyan)),
-                Span::styled(src, Style::default().fg(Color::Gray)),
+                Span::raw(cursor),
+                Span::styled(format!("{:<10}", slot.role), role_style),
+                Span::styled(decorator, value_style),
             ]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Enter: launch   Esc: cancel",
+            "\u{2191}\u{2193} slot   \u{2190}\u{2192} choice   Enter: launch   Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -3971,6 +4905,105 @@ impl App {
     }
 }
 
+/// Compute the workflow-level aggregate indicator.
+/// Running = any participant session active; Idle = none active; plus Paused/Done.
+/// Core readiness predicate for a queued PendingWrite. Pure over inputs so
+/// the semantics can be unit-tested without a real PTY.
+fn pending_write_ready(wakeups: &[Instant], pw: &PendingWrite, now: Instant) -> bool {
+    if now >= pw.hard_deadline {
+        return true;
+    }
+    if now < pw.earliest_deliver_at {
+        return false;
+    }
+    let window = pw.require_quiet;
+    !wakeups.iter().any(|t| now.duration_since(*t) < window)
+}
+
+/// Return the byte sequence that means "Enter" to whatever's reading the
+/// session's PTY right now. Most modern TUIs (codex, claude code) enable
+/// the Kitty keyboard protocol (CSI >1u) at startup, which encodes Enter as
+/// `\x1b[13u`, not raw `\r`. A raw `\r` written in that mode gets interpreted
+/// as a literal carriage-return character appended to the input box instead
+/// of as the Enter keystroke — which matches the "prompt shows up with a
+/// newline but isn't submitted" symptom.
+fn enter_bytes_for(session: &crate::session::Session) -> &'static [u8] {
+    let mode = *session.term.lock().mode();
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        // Kitty: Enter = CSI 13 u
+        b"\x1b[13u"
+    } else {
+        b"\r"
+    }
+}
+
+/// Append a diagnostic line for a workflow run to its `tick.log`.
+///
+/// Lives in `~/.cm/workflow-runs/<run_id>/tick.log`. Rate-limited to at most
+/// one distinct message per run per second to avoid spamming the file on every
+/// tick of the main loop. Best-effort — ignores all I/O errors.
+fn log_tick(run_id: &str, msg: &str) {
+    use std::io::Write as _;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Rate-limit: remember the last (run_id, msg) logged and when. Skip if we
+    // logged the same thing within the last second.
+    static LAST: std::sync::OnceLock<Mutex<Option<(String, String, u64)>>> =
+        std::sync::OnceLock::new();
+    let lock = LAST.get_or_init(|| Mutex::new(None));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    {
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some((last_run, last_msg, last_ts)) = guard.as_ref() {
+            if last_run == run_id && last_msg == msg && now.saturating_sub(*last_ts) < 1 {
+                return;
+            }
+        }
+        *guard = Some((run_id.to_string(), msg.to_string(), now));
+    }
+
+    let path = workflow::run::run_dir(run_id).join("tick.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {}", now, msg);
+    }
+}
+
+fn aggregate_indicator(
+    run: &WorkflowRun,
+    task: &TaskEntry,
+    spinner: &'static str,
+) -> (&'static str, Style) {
+    match run.status {
+        workflow::RunStatus::Done => ("\u{2713}", Style::default().fg(Color::Green)),
+        workflow::RunStatus::Paused => ("\u{25cf}", Style::default().fg(Color::Yellow)),
+        _ => {
+            // Match the per-session indicator logic exactly: `ts.status == Running`.
+            // That status already accounts for the wakeup-burst threshold and the
+            // user-typing freeze, so the aggregate stays quiet while you're typing.
+            let any_running = task.sessions.iter().any(|ts| {
+                ts.workflow_run_id.as_ref() == Some(&run.run_id)
+                    && ts.status == SessionStatus::Running
+                    && !ts.session.exited
+            });
+            if any_running {
+                (spinner, Style::default().fg(Color::Green))
+            } else {
+                ("\u{25cf}", Style::default().fg(Color::White))
+            }
+        }
+    }
+}
+
 /// Copy text to the system clipboard via the OSC 52 escape sequence.
 /// Supported by most modern terminal emulators (kitty, wezterm, iTerm2, alacritty,
 /// xterm, and tmux with `set -g set-clipboard on`).
@@ -3982,5 +5015,65 @@ fn copy_to_clipboard(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::*;
+
+    fn pw(floor_secs: u64, quiet_secs: u64, deadline_secs: u64) -> (PendingWrite, Instant) {
+        let now = Instant::now();
+        (
+            PendingWrite {
+                text: "hi".into(),
+                submit: true,
+                earliest_deliver_at: now + Duration::from_secs(floor_secs),
+                require_quiet: Duration::from_secs(quiet_secs),
+                hard_deadline: now + Duration::from_secs(deadline_secs),
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn not_ready_before_floor() {
+        let (p, now) = pw(5, 2, 60);
+        // Early — floor not reached
+        assert!(!pending_write_ready(&[], &p, now));
+        // At floor with no wakeups — ready
+        assert!(pending_write_ready(&[], &p, now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn not_ready_while_pty_noisy() {
+        let (p, now) = pw(1, 2, 60);
+        let check_at = now + Duration::from_secs(3);
+        // Wakeup 0.5s ago — still within quiet window
+        let recent = check_at - Duration::from_millis(500);
+        assert!(!pending_write_ready(&[recent], &p, check_at));
+    }
+
+    #[test]
+    fn ready_after_pty_goes_quiet() {
+        let (p, now) = pw(1, 2, 60);
+        let check_at = now + Duration::from_secs(10);
+        // Last wakeup 5s ago — outside 2s quiet window
+        let old = check_at - Duration::from_secs(5);
+        assert!(pending_write_ready(&[old], &p, check_at));
+    }
+
+    #[test]
+    fn deadline_forces_delivery_even_if_noisy() {
+        let (p, now) = pw(1, 2, 10);
+        let check_at = now + Duration::from_secs(11);
+        let recent = check_at - Duration::from_millis(100); // noisy
+        assert!(pending_write_ready(&[recent], &p, check_at));
+    }
+
+    #[test]
+    fn empty_wakeups_is_ready_past_floor() {
+        let (p, now) = pw(1, 2, 60);
+        assert!(pending_write_ready(&[], &p, now + Duration::from_secs(2)));
+    }
 }
 

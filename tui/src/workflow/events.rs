@@ -106,6 +106,10 @@ mod tests {
     use std::io::Write;
 
     fn with_temp_home<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        // Serialize HOME env mutation across all tests in the crate that
+        // touch it — there's a shared mutex over HOME.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let orig = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", tmp.path()); }

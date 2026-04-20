@@ -6,6 +6,7 @@
 //! (dynamic transitions).
 
 pub mod events;
+pub mod history;
 pub mod run;
 pub mod spawn;
 pub mod template;

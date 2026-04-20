@@ -48,6 +48,12 @@ pub struct HistoryEntry {
     pub activated_at: u64,
     pub deactivated_at: Option<u64>,
     pub trigger: TriggerKind,
+    /// Snapshot of the role's cumulative assistant message count at the moment
+    /// this activation started. An `on_idle` transition only fires once the
+    /// current count exceeds this — prevents firing on mere PTY startup activity
+    /// or on a role that hasn't produced any new work yet.
+    #[serde(default)]
+    pub assistant_count_at_start: usize,
 }
 
 /// How a role is bound to a concrete TerminalSession in the TUI.
@@ -60,6 +66,18 @@ pub struct RoleBinding {
     pub session_label: String,
     #[serde(default)]
     pub current_session_id: Option<String>,
+}
+
+/// Message counts at the moment the workflow run was launched. Later reads of
+/// the role's transcript subtract these offsets so that `{{ roles.X.user[0] }}`
+/// refers to the first message sent *after* the workflow started — not the
+/// first message ever in that session.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MessageBaseline {
+    #[serde(default)]
+    pub user_count: usize,
+    #[serde(default)]
+    pub assistant_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,6 +100,10 @@ pub struct WorkflowRun {
     /// after a TUI restart without re-firing old events.
     #[serde(default)]
     pub events_offset: u64,
+    /// Snapshot of each role's transcript message counts at launch time. Used to
+    /// slice out pre-launch history when templates reference role messages.
+    #[serde(default)]
+    pub role_baselines: BTreeMap<String, MessageBaseline>,
 }
 
 impl WorkflowRun {
@@ -91,8 +113,13 @@ impl WorkflowRun {
         task_key: String,
         role_sessions: BTreeMap<String, RoleBinding>,
         initial_role: String,
+        role_baselines: BTreeMap<String, MessageBaseline>,
     ) -> Self {
         let now = now_unix();
+        let initial_assistant_count = role_baselines
+            .get(&initial_role)
+            .map(|b| b.assistant_count)
+            .unwrap_or(0);
         let initial_history = HistoryEntry {
             iteration: 1,
             role: initial_role.clone(),
@@ -103,6 +130,7 @@ impl WorkflowRun {
             activated_at: now,
             deactivated_at: None,
             trigger: TriggerKind::Initial,
+            assistant_count_at_start: initial_assistant_count,
         };
         WorkflowRun {
             run_id,
@@ -117,6 +145,7 @@ impl WorkflowRun {
             started_at: now,
             done_reason: None,
             events_offset: 0,
+            role_baselines,
         }
     }
 
@@ -149,7 +178,12 @@ impl WorkflowRun {
     }
 
     /// Append a new activation history entry and update active_role/iteration.
-    pub fn activate_role(&mut self, role: String, trigger: TriggerKind) {
+    pub fn activate_role(
+        &mut self,
+        role: String,
+        trigger: TriggerKind,
+        assistant_count_at_start: usize,
+    ) {
         // Iteration increments when we cycle back to the first role in role_order.
         // For simplicity here, iteration tracks total activations / roles.len(), but
         // we leave precise iteration accounting to the caller that holds the Workflow.
@@ -166,8 +200,17 @@ impl WorkflowRun {
             activated_at: now_unix(),
             deactivated_at: None,
             trigger,
+            assistant_count_at_start,
         });
         self.active_role = Some(role);
+    }
+
+    /// Assistant count captured when the currently-active role last activated.
+    pub fn active_assistant_start_count(&self) -> Option<usize> {
+        self.history
+            .last()
+            .filter(|h| Some(&h.role) == self.active_role.as_ref())
+            .map(|h| h.assistant_count_at_start)
     }
 
     pub fn mark_done(&mut self, reason: String) {
@@ -327,6 +370,7 @@ mod tests {
             "/tmp/repo".into(),
             roles,
             "worker".into(),
+            BTreeMap::new(),
         )
     }
 
@@ -340,6 +384,7 @@ mod tests {
         run.activate_role(
             "reviewer".into(),
             TriggerKind::StaticIdle { from_role: "worker".into() },
+            0,
         );
         assert_eq!(run.active_role.as_deref(), Some("reviewer"));
         assert_eq!(run.history.len(), 2);
