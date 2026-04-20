@@ -315,6 +315,11 @@ pub struct App {
     /// we can detect when a bound workflow session rotates its transcript
     /// file. `None` if the history file couldn't be located at startup.
     history_watcher: Option<workflow::history::HistoryWatcher>,
+    /// Rotation-trigger entries we've seen but haven't resolved yet because
+    /// the new transcript file hadn't been created when we polled. Retry
+    /// each tick until resolved or aged out.
+    /// Each: (old_sid, timestamp_ms, first_seen_at).
+    pending_rotations: Vec<(String, u64, Instant)>,
 }
 
 impl App {
@@ -351,6 +356,7 @@ impl App {
             workflows,
             workflow_runs,
             history_watcher: workflow::history::HistoryWatcher::new(),
+            pending_rotations: Vec::new(),
         }
     }
 
@@ -1195,11 +1201,18 @@ impl App {
     /// bound sid of an active claude workflow role, find the new transcript
     /// file that was produced and rebind the role to it.
     fn apply_history_rotations(&mut self) {
-        let Some(watcher) = self.history_watcher.as_mut() else {
-            return;
-        };
-        let entries = watcher.poll();
-        if entries.is_empty() {
+        // Drain new history.jsonl entries and queue any rotation triggers.
+        if let Some(watcher) = self.history_watcher.as_mut() {
+            let entries = watcher.poll();
+            let now = Instant::now();
+            for entry in entries {
+                if workflow::history::is_rotation_trigger(&entry.display) {
+                    self.pending_rotations
+                        .push((entry.session_id, entry.timestamp_ms, now));
+                }
+            }
+        }
+        if self.pending_rotations.is_empty() {
             return;
         }
         // Build (sid → (run_id, role, worktree)) lookup for active claude roles.
@@ -1212,7 +1225,6 @@ impl App {
                 let Some(sid) = &binding.current_session_id else {
                     continue;
                 };
-                // locate the session to recover the worktree path.
                 let Some((ti, si)) = self.locate_workflow_session(&run.run_id, role) else {
                     continue;
                 };
@@ -1225,33 +1237,32 @@ impl App {
                 bindings.insert(sid.clone(), (run.run_id.clone(), role.clone(), wt));
             }
         }
-        if bindings.is_empty() {
-            return;
-        }
-        let mut rotations: Vec<(String, String, String, String)> = Vec::new();
-        for entry in &entries {
-            if !workflow::history::is_rotation_trigger(&entry.display) {
-                continue;
+        // Walk pending queue; resolve what we can, drop stale ones.
+        let now = Instant::now();
+        let max_age = Duration::from_secs(30);
+        let mut resolved: Vec<(String, String, String, String)> = Vec::new();
+        self.pending_rotations.retain(|(old_sid, ts_ms, first_seen)| {
+            if now.duration_since(*first_seen) > max_age {
+                return false;
             }
-            let Some((run_id, role, wt)) = bindings.get(&entry.session_id) else {
-                continue;
+            let Some((run_id, role, wt)) = bindings.get(old_sid) else {
+                return true;
             };
-            let Some(new_sid) =
-                workflow::history::find_post_rotation_sid(wt, entry.timestamp_ms)
-            else {
-                continue;
+            let Some(new_sid) = workflow::history::find_post_rotation_sid(wt, *ts_ms) else {
+                return true;
             };
-            if new_sid == entry.session_id {
-                continue;
+            if &new_sid == old_sid {
+                return false;
             }
-            rotations.push((
+            resolved.push((
                 run_id.clone(),
                 role.clone(),
-                entry.session_id.clone(),
+                old_sid.clone(),
                 new_sid,
             ));
-        }
-        for (run_id, role, old_sid, new_sid) in &rotations {
+            false
+        });
+        for (run_id, role, old_sid, new_sid) in &resolved {
             let Some((ti, si)) = self.locate_workflow_session(run_id, role) else {
                 continue;
             };
@@ -1280,7 +1291,7 @@ impl App {
                 ),
             );
         }
-        if !rotations.is_empty() {
+        if !resolved.is_empty() {
             self.save_session_manifest();
             self.set_status_msg("Workflow: session rotated (/clear or /compact)");
         }
