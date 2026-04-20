@@ -515,7 +515,12 @@ impl App {
         let exited = ts.session.exited;
         ts.session.write(body.as_bytes());
         if pw.submit {
-            std::thread::sleep(Duration::from_millis(50));
+            // Gap between body and Enter so codex classifies Enter as a
+            // keystroke, not the tail of a paste. 50ms was enough for small
+            // prompts but fails for multi-KB ones where codex is still
+            // absorbing the body when Enter lands. 2s is well above the
+            // observed threshold and trivial against the workflow cycle.
+            std::thread::sleep(Duration::from_millis(2000));
             ts.session.write(enter);
         }
         // Remember the first chunk of the delivered text + delivery time so
