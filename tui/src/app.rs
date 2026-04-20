@@ -84,6 +84,13 @@ pub struct TerminalSession {
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
     pub workflow_role: Option<String>,
+    /// First ~120 chars of the most recent prompt we delivered via
+    /// `deliver_pending_write`, along with its delivery timestamp in unix ms.
+    /// Used to correlate a fresh claude workflow session with its new
+    /// sessionId in `~/.claude/history.jsonl`: when the same text shows up
+    /// in a history entry with project==worktree, the entry's sessionId is
+    /// ours. Cleared once sid has been bound.
+    pub last_delivery: Option<(String, u64)>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
@@ -511,6 +518,18 @@ impl App {
             std::thread::sleep(Duration::from_millis(50));
             ts.session.write(enter);
         }
+        // Remember the first chunk of the delivered text + delivery time so
+        // an unbound workflow session can be correlated to its new sid in
+        // ~/.claude/history.jsonl. Only record for workflow sessions that
+        // still need binding.
+        if ts.workflow_run_id.is_some() && ts.session_id.is_none() {
+            let prefix: String = body.chars().take(120).collect();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            ts.last_delivery = Some((prefix, now_ms));
+        }
         if let Some(run_id) = ts.workflow_run_id.clone() {
             log_tick(
                 &run_id,
@@ -713,6 +732,7 @@ impl App {
                         pending_clear: None,
                         workflow_run_id: entry.workflow_run_id.clone(),
                         workflow_role: entry.workflow_role.clone(),
+                    last_delivery: None,
                     };
                     task.sessions.push(ts);
                 }
@@ -1142,7 +1162,17 @@ impl App {
                 }
 
                 // Detect session_id for claude/codex sessions that don't have one yet.
+                //
+                // Skip claude WORKFLOW sessions — the "newest new .jsonl"
+                // heuristic is unreliable when multiple claude processes
+                // share a project directory (another process's /clear
+                // rotation can produce a new .jsonl right when we're
+                // looking). For those we use history.jsonl correlation
+                // via `resolve_pending_deliveries` instead.
+                let skip_workflow_claude =
+                    ts.session_type == "claude" && ts.workflow_run_id.is_some();
                 if should_check_session_ids
+                    && !skip_workflow_claude
                     && (ts.session_type == "claude" || ts.session_type == "codex")
                     && ts.session_id.is_none()
                     && ts.pending_jsonl_files.is_some()
@@ -1201,17 +1231,21 @@ impl App {
     /// bound sid of an active claude workflow role, find the new transcript
     /// file that was produced and rebind the role to it.
     fn apply_history_rotations(&mut self) {
-        // Drain new history.jsonl entries and queue any rotation triggers.
+        // Drain new history.jsonl entries. Route rotation triggers to the
+        // pending queue, and feed every entry to the sid-correlation step
+        // for claude workflow sessions that haven't been bound yet.
+        let mut new_entries: Vec<workflow::history::HistoryEntry> = Vec::new();
         if let Some(watcher) = self.history_watcher.as_mut() {
-            let entries = watcher.poll();
+            new_entries = watcher.poll();
             let now = Instant::now();
-            for entry in entries {
+            for entry in &new_entries {
                 if workflow::history::is_rotation_trigger(&entry.display) {
                     self.pending_rotations
-                        .push((entry.session_id, entry.timestamp_ms, now));
+                        .push((entry.session_id.clone(), entry.timestamp_ms, now));
                 }
             }
         }
+        self.resolve_pending_deliveries(&new_entries);
         if self.pending_rotations.is_empty() {
             return;
         }
@@ -1382,6 +1416,107 @@ impl App {
         if self.planning.needs_redraw {
             self.needs_redraw = true;
             self.planning.needs_redraw = false;
+        }
+    }
+
+    /// Bind freshly-spawned claude workflow sessions to their real sessionId
+    /// by matching `last_delivery` prefix against new `history.jsonl` entries.
+    ///
+    /// The "newest new .jsonl" heuristic we rely on elsewhere can race when
+    /// multiple claude processes share a project dir — another process's
+    /// `/clear` rotation can produce a new file right when we're looking.
+    /// Instead, we correlate: when we delivered a prompt whose text starts
+    /// with P to an unbound session, claude later writes a history entry
+    /// whose content starts with P; that entry's `sessionId` is ours.
+    fn resolve_pending_deliveries(&mut self, entries: &[workflow::history::HistoryEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        // Collect sids already claimed by any active workflow role so we
+        // don't re-bind a session to a sid already in use.
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for run in &self.workflow_runs {
+            if !run.is_active() {
+                continue;
+            }
+            for b in run.role_sessions.values() {
+                if let Some(sid) = &b.current_session_id {
+                    claimed.insert(sid.clone());
+                }
+            }
+        }
+        let mut to_bind: Vec<(usize, usize, String)> = Vec::new();
+        for (ti, task) in self.tasks.iter().enumerate() {
+            let Some(wt_str) = task.worktree_path.as_deref().and_then(|p| p.to_str()) else {
+                continue;
+            };
+            for (si, ts) in task.sessions.iter().enumerate() {
+                if ts.session_type != "claude"
+                    || ts.workflow_run_id.is_none()
+                    || ts.session_id.is_some()
+                {
+                    continue;
+                }
+                let Some((prefix, delivered_ms)) = ts.last_delivery.as_ref() else {
+                    continue;
+                };
+                if prefix.is_empty() {
+                    continue;
+                }
+                // Find the earliest history entry whose content starts with
+                // our prefix, in our project, on or after delivery time,
+                // with a sessionId that's not already claimed.
+                let mut best: Option<(u64, String)> = None;
+                for e in entries {
+                    if e.project != wt_str {
+                        continue;
+                    }
+                    if e.timestamp_ms + 2000 < *delivered_ms {
+                        continue;
+                    }
+                    if claimed.contains(&e.session_id) {
+                        continue;
+                    }
+                    let content_matches = e.display.starts_with(prefix.as_str())
+                        || e.paste_content.starts_with(prefix.as_str());
+                    if !content_matches {
+                        continue;
+                    }
+                    if best.as_ref().map_or(true, |(t, _)| e.timestamp_ms < *t) {
+                        best = Some((e.timestamp_ms, e.session_id.clone()));
+                    }
+                }
+                if let Some((_, sid)) = best {
+                    to_bind.push((ti, si, sid));
+                }
+            }
+        }
+        for (ti, si, sid) in to_bind {
+            let Some(ts) = self.tasks.get_mut(ti).and_then(|t| t.sessions.get_mut(si)) else {
+                continue;
+            };
+            let run_id = ts.workflow_run_id.clone();
+            let role = ts.workflow_role.clone();
+            ts.session_id = Some(sid.clone());
+            ts.pending_jsonl_files = None;
+            ts.last_delivery = None;
+            if let (Some(run_id), Some(role)) = (run_id, role) {
+                if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                    if let Some(b) = run.role_sessions.get_mut(&role) {
+                        b.current_session_id = Some(sid.clone());
+                    }
+                    if run.active_role.as_deref() == Some(role.as_str()) {
+                        if let Some(h) = run.history.last_mut() {
+                            h.session_id = Some(sid.clone());
+                        }
+                    }
+                    let _ = workflow::run::save(run);
+                    log_tick(
+                        &run_id,
+                        &format!("delivery-correlated: role={} sid={}", role, sid),
+                    );
+                }
+            }
         }
     }
 
@@ -2246,6 +2381,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let new_ti = self.tasks.len();
                 self.tasks.push(TaskEntry {
@@ -2336,6 +2472,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2367,6 +2504,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2391,6 +2529,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[ti].sessions.len();
                 self.tasks[ti].sessions.push(ts);
@@ -2451,6 +2590,7 @@ impl App {
                             pending_clear: None,
                             workflow_run_id: None,
                             workflow_role: None,
+                        last_delivery: None,
                         };
                         let si = self.tasks[task_index].sessions.len();
                         self.tasks[task_index].sessions.push(ts);
@@ -2501,6 +2641,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
                 let si = self.tasks[task_index].sessions.len();
                 self.tasks[task_index].sessions.push(ts);
@@ -2554,6 +2695,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
 
                 // Find existing task by task_id or create new.
@@ -2834,6 +2976,7 @@ impl App {
                     pending_clear: None,
                     workflow_run_id: None,
                     workflow_role: None,
+                last_delivery: None,
                 };
 
                 let new_ti = self.tasks.len();
@@ -4082,6 +4225,7 @@ impl App {
             pending_clear: None,
             workflow_run_id: Some(run_id.to_string()),
             workflow_role: Some(role_name.to_string()),
+        last_delivery: None,
         };
         self.tasks[task_index].sessions.push(ts);
         Some((label, None))
@@ -4095,11 +4239,6 @@ impl App {
         if self.workflow_runs.is_empty() {
             return;
         }
-        let now = Instant::now();
-
-        // Pausing a workflow is an explicit action now (Ctrl-C on a
-        // participant session) — see the key-forwarding path. No per-tick
-        // auto-pause.
 
         // Keep role_sessions.current_session_id in sync with whatever the
         // live TerminalSession.session_id is. Needed because templating
@@ -4433,17 +4572,15 @@ impl App {
         self.save_session_manifest();
     }
 
-    /// Kill the current PTY for a session slot and respawn the engine fresh.
-    /// Queue a `/clear\r` write to the session's PTY after a settle delay.
+    /// Queue `/clear` to reset a fresh-context role's agent. Delivery is
+    /// gated on PTY quiet (see `PendingWrite`) so we don't try to type the
+    /// command while the agent is still painting its startup UI — that's
+    /// when `\r` gets buffered into the input box instead of interpreted
+    /// as submit.
     ///
-    /// We don't write immediately because the PTY may still be finishing
-    /// startup/render after a spawn or transition — and if codex (or claude) is
-    /// mid-state, the `\r` doesn't get interpreted as Enter and the command
-    /// sits in the input box. Delaying 5s lets the TUI reach a state where
-    /// `\r` is unambiguously an Enter keystroke.
-    ///
-    /// Returns the scheduled Instant at which /clear will be written, or None
-    /// if the session is already gone.
+    /// Also invalidates the session's bound sid and role baseline because
+    /// claude rotates its transcript file on `/clear`; the new file's sid
+    /// is picked up later by the history.jsonl correlator.
     fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
         let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
         let label = self.tasks[ti].sessions[si].label.clone();

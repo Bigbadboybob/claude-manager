@@ -22,6 +22,11 @@ pub struct HistoryEntry {
     pub timestamp_ms: u64,
     pub project: String,
     pub session_id: String,
+    /// Concatenated text from `pastedContents.<k>.content` fields. Claude
+    /// moves large/multiline inputs out of `display` (which becomes a
+    /// placeholder like `[Pasted text #1 +10 lines]`) and into this map.
+    /// Empty string if no paste content was present.
+    pub paste_content: String,
 }
 
 pub struct HistoryWatcher {
@@ -96,11 +101,23 @@ fn parse_entries(buf: &str) -> Vec<HistoryEntry> {
         if session_id.is_empty() {
             continue;
         }
+        let mut paste_content = String::new();
+        if let Some(map) = v.get("pastedContents").and_then(|x| x.as_object()) {
+            for (_, val) in map {
+                if let Some(s) = val.get("content").and_then(|x| x.as_str()) {
+                    if !paste_content.is_empty() {
+                        paste_content.push('\n');
+                    }
+                    paste_content.push_str(s);
+                }
+            }
+        }
         out.push(HistoryEntry {
             display,
             timestamp_ms,
             project,
             session_id,
+            paste_content,
         });
     }
     out
@@ -245,6 +262,15 @@ mod tests {
         assert_eq!(parsed[0].timestamp_ms, 1776659853477);
         assert_eq!(parsed[0].project, "/tmp/foo");
         assert_eq!(parsed[0].session_id, "abc");
+        assert_eq!(parsed[0].paste_content, "");
+    }
+
+    #[test]
+    fn parse_entry_extracts_paste_content() {
+        let line = r#"{"display":"[Pasted text #1 +2 lines]","pastedContents":{"1":{"id":1,"type":"text","content":"hello world"}},"timestamp":1,"project":"/p","sessionId":"s"}"#;
+        let parsed = parse_entries(line);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].paste_content, "hello world");
     }
 
     #[test]
