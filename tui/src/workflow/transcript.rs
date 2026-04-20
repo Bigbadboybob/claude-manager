@@ -438,8 +438,24 @@ fn extract_claude_line(v: &serde_json::Value, kind: MessageKind) -> Option<Strin
     if v.get("type").and_then(|t| t.as_str()) != Some(want) {
         return None;
     }
-    if kind == MessageKind::User && is_claude_tool_result(v) {
-        return None;
+    if kind == MessageKind::User {
+        if is_claude_tool_result(v) {
+            return None;
+        }
+        // Skip entries claude marks as meta (e.g. the `<local-command-caveat>`
+        // prelude it injects post-`/clear`) and slash-command invocations
+        // (`<command-name>/clear</command-name>` records) — these are not
+        // real user-typed turns and would otherwise take the `user[0]` slot
+        // in a freshly-cleared session, so `{{ initial_prompt }}` would
+        // expand to `/clear` instead of the user's first real prompt.
+        if v.get("isMeta").and_then(|m| m.as_bool()) == Some(true) {
+            return None;
+        }
+        if let Some(s) = v.pointer("/message/content").and_then(|c| c.as_str()) {
+            if s.trim_start().starts_with("<command-name>") {
+                return None;
+            }
+        }
     }
     let content = v.pointer("/message/content");
     match kind {
@@ -655,6 +671,32 @@ mod tests {
             current2,
             baseline
         );
+    }
+
+    /// After `/clear`, claude rotates the transcript file. The new file
+    /// starts with (1) a `<local-command-caveat>` meta record and (2) the
+    /// `<command-name>/clear</command-name>` slash-command record before
+    /// any real user input lands. `list_messages(User)` must skip both so
+    /// `{{ roles.X.initial_prompt }}` (which is `user[0]` post-baseline)
+    /// returns the user's first *real* prompt, not `/clear`.
+    #[test]
+    fn user_list_skips_meta_and_slash_command_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines = [
+            r##"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ..."}}"##,
+            r##"{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>"}}"##,
+            r##"{"type":"user","message":{"role":"user","content":"real prompt from user"}}"##,
+        ]
+        .join("\n");
+        write_transcript(&tmp, "-tmp-repo", "sid-c", &lines);
+        let _h = HomeOverride::new(tmp);
+        let msgs = list_messages(
+            &Engine::ClaudeCode,
+            &std::path::PathBuf::from("/tmp/repo"),
+            "sid-c",
+            MessageKind::User,
+        );
+        assert_eq!(msgs, vec!["real prompt from user".to_string()]);
     }
 
     #[test]
