@@ -1,6 +1,8 @@
 # Claude Manager
 
-Task orchestration system for dispatching Claude coding tasks to ephemeral GCP VMs, with a local TUI for planning and session management.
+Task orchestration system for planning and running Claude coding sessions. Primarily used **locally with git worktrees** for day-to-day work; cloud dispatch to ephemeral GCP VMs is still supported for cases where it's useful (long-running tasks, isolation, running things away from the local machine).
+
+> **Note:** This project started out cloud-first, but in practice local + worktrees turned out to be much smoother and is now the default mode. Cloud support is retained but secondary. When working on this project, assume local usage unless the user explicitly mentions cloud.
 
 ## Project overview
 
