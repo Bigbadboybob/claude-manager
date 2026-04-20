@@ -3892,62 +3892,6 @@ impl App {
                     continue;
                 };
 
-                // Detect sid drift: if the bound session_id's transcript has
-                // fallen behind a newer one in the same project dir, migrate.
-                // Happens when claude rotates sessions via /clear, /compact,
-                // or a failed --resume. Only applies to claude sessions.
-                //
-                // Exclude any sid already bound to a DIFFERENT session in the
-                // task — otherwise, if two claude sessions share a worktree,
-                // one's drift detector can steal the other's actively-written
-                // sid and make them appear to share history.
-                if self.tasks[ti].sessions[si].session_type == "claude" {
-                    let bound_sid = self.tasks[ti].sessions[si].session_id.clone();
-                    let other_sids: Vec<String> = self.tasks[ti]
-                        .sessions
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(osi, ots)| {
-                            if osi == si { None } else { ots.session_id.clone() }
-                        })
-                        .collect();
-                    if let (Some(bound), Some(wt)) = (
-                        bound_sid.as_deref(),
-                        self.tasks[ti].worktree_path.as_deref(),
-                    ) {
-                        let other_refs: Vec<&str> =
-                            other_sids.iter().map(|s| s.as_str()).collect();
-                        if let Some(new_sid) =
-                            workflow::transcript::detect_claude_sid_drift(wt, bound, &other_refs)
-                        {
-                            self.tasks[ti].sessions[si].session_id = Some(new_sid);
-                            // Old file's counts no longer apply to the new file.
-                            // Reset baseline, the role_sessions binding sid, and
-                            // the active role's start_count so the gate compares
-                            // against the new file's fresh state.
-                            let baseline = workflow::run::MessageBaseline::default();
-                            self.workflow_runs[idx]
-                                .role_baselines
-                                .insert(role.clone(), baseline);
-                            if self.workflow_runs[idx].active_role.as_deref()
-                                == Some(role.as_str())
-                            {
-                                if let Some(entry) =
-                                    self.workflow_runs[idx].history.last_mut()
-                                {
-                                    entry.assistant_count_at_start = 0;
-                                }
-                            }
-                            self.set_status_msg(&format!(
-                                "Workflow: {} session rotated (/clear or /compact)",
-                                role
-                            ));
-                            self.save_session_manifest();
-                            changed = true;
-                        }
-                    }
-                }
-
                 let live = self.tasks[ti].sessions[si].session_id.clone();
                 let binding_sid = self
                     .workflow_runs[idx]
@@ -4385,6 +4329,7 @@ impl App {
     fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
         let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
         let label = self.tasks[ti].sessions[si].label.clone();
+        let role_label = label.clone();
         let ts = &mut self.tasks[ti].sessions[si];
         if ts.session.exited {
             log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
@@ -4401,12 +4346,29 @@ impl App {
             Duration::from_secs(120),
         ));
         ts.status = SessionStatus::Idle;
+        // Refresh the pending-jsonl baseline to the current files so the new
+        // file created by /clear shows up as new, and clear session_id so the
+        // detection poll rebinds to it. Without this the detector treats the
+        // pre-/clear file as still bound.
         ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
             ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
             ("codex", Some(wt)) => Some(Self::list_codex_sessions(wt)),
             _ => None,
         };
+        ts.session_id = None;
         ts.pending_prompt = None;
+        // Old file's turn counts no longer apply to the new file — reset the
+        // role's message baseline so templates slice from 0 post-/clear.
+        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+            run.role_baselines.insert(
+                role_label.clone(),
+                workflow::run::MessageBaseline::default(),
+            );
+            if let Some(b) = run.role_sessions.get_mut(&role_label) {
+                b.current_session_id = None;
+            }
+        }
+        self.save_session_manifest();
         log_tick(
             run_id,
             &format!(
