@@ -73,15 +73,13 @@ pub struct TerminalSession {
     pub hidden: bool,
     /// Seconds of quiet before marking idle. 0 = use global default.
     pub idle_timeout_secs: u16,
-    /// Prompt text to deliver to the session after a delay. The trailing Enter
-    /// keystroke is encoded at delivery time based on the session's current
-    /// terminal mode (not at schedule time), so mode changes during the
-    /// settle delay don't break submission.
-    pub pending_prompt: Option<(Instant, String)>,
-    /// Schedule a `/clear` submission to the session at this time. The text
-    /// and the Enter keystroke are both generated at delivery time — at
-    /// schedule time we only know we want to reset.
-    pub pending_clear: Option<Instant>,
+    /// Prompt text to deliver to the session once it's actually ready to
+    /// receive input (see `PendingWrite`).
+    pub pending_prompt: Option<PendingWrite>,
+    /// Pending `/clear` command to send before `pending_prompt`. Sequenced:
+    /// the prompt only delivers after the clear has either been delivered or
+    /// hit its deadline.
+    pub pending_clear: Option<PendingWrite>,
     /// If this session is a workflow participant, the run it belongs to.
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
@@ -89,6 +87,48 @@ pub struct TerminalSession {
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
+
+/// A byte sequence queued to be written to a session's PTY once the session
+/// is "ready" to receive input. Readiness is determined by PTY quietness —
+/// absence of wakeup events for a minimum window — which adapts to however
+/// long the underlying agent takes to finish starting up, connecting to MCP
+/// servers, rendering its banner, etc.
+///
+/// Two knobs:
+/// - `earliest_deliver_at`: floor (don't deliver before this time regardless
+///   of quietness). Used to give the user a chance to notice what's happening,
+///   and to debounce brief quiet windows during startup.
+/// - `hard_deadline`: ceiling. If the agent NEVER goes quiet (e.g. a pathological
+///   ticking spinner), deliver anyway so the workflow doesn't hang forever.
+///
+/// Between the floor and deadline, delivery fires at the first moment of
+/// `require_quiet` of uninterrupted silence.
+///
+/// `text` is the payload; if `submit` is true we append an Enter keystroke
+/// (encoded for the session's current mode) at delivery time.
+pub struct PendingWrite {
+    pub text: String,
+    pub submit: bool,
+    pub earliest_deliver_at: Instant,
+    pub require_quiet: Duration,
+    pub hard_deadline: Instant,
+}
+
+impl PendingWrite {
+    /// A write that fires at the first moment of PTY quiet (>= `quiet`
+    /// without any wakeup), bounded by `floor` (earliest) and `deadline`
+    /// (latest) from now.
+    pub fn wait_for_quiet(text: String, submit: bool, floor: Duration, quiet: Duration, deadline: Duration) -> Self {
+        let now = Instant::now();
+        PendingWrite {
+            text,
+            submit,
+            earliest_deliver_at: now + floor,
+            require_quiet: quiet,
+            hard_deadline: now + deadline,
+        }
+    }
+}
 
 /// Interval between filesystem checks for session_id detection.
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -395,7 +435,6 @@ impl App {
             None => return Vec::new(),
         };
         let mut ids = Vec::new();
-        // Walk YYYY/MM/DD subdirectories.
         Self::walk_codex_sessions(&sessions_dir, &wt_str, &mut ids);
         ids
     }
@@ -428,11 +467,54 @@ impl App {
         }
     }
 
-    /// Detect a new codex session_id by comparing against known IDs.
+    /// Detect a new codex session_id by comparing against known IDs. Uses the
+    /// user's default codex home.
     fn detect_codex_session_id(worktree_path: &Path, existing_ids: &[String]) -> Option<String> {
         let current = Self::list_codex_sessions(worktree_path);
-        // Return the newest one not in existing_ids.
         current.into_iter().find(|id| !existing_ids.contains(id))
+    }
+
+    /// True if the session is ready to receive a queued write. Ready means
+    /// either we've hit the hard deadline (deliver anyway), or:
+    ///   1. We've passed the earliest-deliver floor, AND
+    ///   2. The PTY has been quiet for `require_quiet` (no wakeups in that window).
+    fn ready_for_write(session: &Session, pw: &PendingWrite, now: Instant) -> bool {
+        pending_write_ready(&session.wakeup_times, pw, now)
+    }
+
+    /// Write a PendingWrite's bytes (plus correctly-encoded Enter if submit)
+    /// to the session's PTY and log the outcome.
+    ///
+    /// IMPORTANT: we sleep briefly between the body write and the enter write
+    /// so the receiving agent sees them as two separate keystroke events
+    /// rather than a single paste. Without this, codex treats the whole
+    /// sequence (body + \r) as pasted content — literal text including the
+    /// \r character — and never submits.
+    fn deliver_pending_write(ts: &mut TerminalSession, pw: &PendingWrite, kind: &str) {
+        let body = pw.text.trim_end_matches(['\r', '\n']);
+        let enter = enter_bytes_for(&ts.session);
+        let kitty = enter != b"\r";
+        let exited = ts.session.exited;
+        ts.session.write(body.as_bytes());
+        if pw.submit {
+            std::thread::sleep(Duration::from_millis(50));
+            ts.session.write(enter);
+        }
+        if let Some(run_id) = ts.workflow_run_id.clone() {
+            log_tick(
+                &run_id,
+                &format!(
+                    "delivered {}: {} body bytes + submit={} to session '{}' role='{}' exited={} kitty_enter={}",
+                    kind,
+                    body.len(),
+                    pw.submit,
+                    ts.label,
+                    ts.workflow_role.as_deref().unwrap_or("?"),
+                    exited,
+                    kitty,
+                ),
+            );
+        }
     }
 
     /// Path to the session manifest file.
@@ -1028,59 +1110,22 @@ impl App {
                     }
                 }
 
-                // Deliver queued `/clear` first if its time has come. Text +
-                // Enter are encoded now using the session's *current* mode,
-                // which may have been set during the settle delay.
-                if let Some(deliver_at) = ts.pending_clear {
-                    if now >= deliver_at {
-                        ts.pending_clear = None;
-                        let enter = enter_bytes_for(&ts.session);
-                        let kitty = enter != b"\r";
-                        let exited = ts.session.exited;
-                        ts.session.write(b"/clear");
-                        ts.session.write(enter);
-                        if let Some(run_id) = ts.workflow_run_id.clone() {
-                            log_tick(
-                                &run_id,
-                                &format!(
-                                    "delivered pending_clear to session '{}' role='{}' exited={} kitty_enter={}",
-                                    ts.label,
-                                    ts.workflow_role.as_deref().unwrap_or("?"),
-                                    exited,
-                                    kitty,
-                                ),
-                            );
-                        }
+                // Deliver queued `/clear` first once the PTY is quiet (or
+                // the hard deadline hits). Sequenced before pending_prompt so
+                // the prompt always lands AFTER /clear has been processed.
+                if let Some(clear) = &ts.pending_clear {
+                    if Self::ready_for_write(&ts.session, clear, now) {
+                        let pw = ts.pending_clear.take().unwrap();
+                        Self::deliver_pending_write(ts, &pw, "pending_clear");
                     }
                 }
 
-                // Deliver pending prompt once delay has elapsed. Trailing Enter
-                // is encoded at delivery time (not schedule time) to match the
-                // session's current keyboard protocol.
-                if let Some((deliver_at, _)) = &ts.pending_prompt {
-                    if now >= *deliver_at {
-                        let prompt_text = ts.pending_prompt.take().unwrap().1;
-                        // The stored string ends with "\r" (from fire_transition);
-                        // strip any trailing \r/\n and append a properly-encoded
-                        // Enter keystroke based on current mode.
-                        let body = prompt_text.trim_end_matches(['\r', '\n']);
-                        let enter = enter_bytes_for(&ts.session);
-                        let kitty = enter != b"\r";
-                        let exited = ts.session.exited;
-                        ts.session.write(body.as_bytes());
-                        ts.session.write(enter);
-                        if let Some(run_id) = ts.workflow_run_id.clone() {
-                            log_tick(
-                                &run_id,
-                                &format!(
-                                    "delivered pending_prompt: {} body bytes + enter to session '{}' role='{}' exited={} kitty_enter={}",
-                                    body.len(),
-                                    ts.label,
-                                    ts.workflow_role.as_deref().unwrap_or("?"),
-                                    exited,
-                                    kitty,
-                                ),
-                            );
+                // Only deliver the prompt once the /clear (if any) is gone.
+                if ts.pending_clear.is_none() {
+                    if let Some(prompt) = &ts.pending_prompt {
+                        if Self::ready_for_write(&ts.session, prompt, now) {
+                            let pw = ts.pending_prompt.take().unwrap();
+                            Self::deliver_pending_write(ts, &pw, "pending_prompt");
                         }
                     }
                 }
@@ -2657,7 +2702,16 @@ impl App {
                     pending_prompt: if prompt.trim().is_empty() {
                         None
                     } else {
-                        Some((Instant::now() + Duration::from_secs(3), prompt.to_string()))
+                        // Queue as a non-submitting prefill (user will hit Enter
+                        // themselves). Fires on first quiet PTY so claude has
+                        // time to finish its startup render.
+                        Some(PendingWrite::wait_for_quiet(
+                            prompt.to_string(),
+                            false,
+                            Duration::from_secs(1),
+                            Duration::from_secs(2),
+                            Duration::from_secs(60),
+                        ))
                     },
                     pending_clear: None,
                     workflow_run_id: None,
@@ -3931,9 +3985,6 @@ impl App {
                 return None;
             }
         };
-        // Pre-spawn snapshot of existing sessions so the detection poll can
-        // find the NEW one created by this spawn. Covers both Claude (project
-        // JSONLs) and Codex (session ids under ~/.codex/sessions/).
         let pending = Some(match engine {
             Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
             Engine::Codex => Self::list_codex_sessions(&worktree_path),
@@ -4247,14 +4298,9 @@ impl App {
         };
         let rendered = workflow::template::render(&template_source, &resolver);
 
-        let clear_scheduled_at = if matches!(
-            target_role_spec.context,
-            workflow::toml_schema::Context::Fresh
-        ) {
-            self.reset_fresh_session(run_id, ti, si)
-        } else {
-            None
-        };
+        if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
+            self.reset_fresh_session(run_id, ti, si);
+        }
 
         // Update role_sessions with (possibly new) session_id from the session.
         let current_sid = self.tasks[ti].sessions[si].session_id.clone();
@@ -4291,29 +4337,28 @@ impl App {
         // for fresh-context roles because they just received a `/clear` and
         // need a beat to reset internal state.
         if !rendered.trim().is_empty() {
-            // For fresh-context roles, the prompt has to land after /clear has
-            // been processed. `/clear` is queued for 5s from now
-            // (see reset_fresh_session); give another 4s after the scheduled
-            // clear write for the agent to reset before typing the prompt.
-            let when = if let Some(clear_at) = clear_scheduled_at {
-                clear_at + Duration::from_secs(4)
-            } else {
-                Instant::now() + Duration::from_secs(2)
-            };
-            let payload = format!("{}\r", rendered.trim_end());
+            // Queue the prompt to fire at the first moment of PTY quiet.
+            // Delivery is sequenced AFTER pending_clear (if any) in the
+            // drain loop, so we don't need to pre-compute a "start after
+            // clear" time here.
+            let pw = PendingWrite::wait_for_quiet(
+                rendered.trim_end().to_string(),
+                true,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(180),
+            );
             let label = self.tasks[ti].sessions[si].label.clone();
             log_tick(
                 run_id,
                 &format!(
-                    "fire_transition: activated '{}' role='{}' set pending_prompt ({} bytes, fires in {}s) on session '{}'",
+                    "fire_transition: activated '{}' queued prompt ({} bytes, fires on quiet PTY) on session '{}'",
                     to_role,
-                    to_role,
-                    payload.len(),
-                    when.saturating_duration_since(Instant::now()).as_secs(),
+                    pw.text.len(),
                     label,
                 ),
             );
-            self.tasks[ti].sessions[si].pending_prompt = Some((when, payload));
+            self.tasks[ti].sessions[si].pending_prompt = Some(pw);
         } else {
             log_tick(
                 run_id,
@@ -4337,16 +4382,24 @@ impl App {
     ///
     /// Returns the scheduled Instant at which /clear will be written, or None
     /// if the session is already gone.
-    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> Option<Instant> {
+    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
         let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
         let label = self.tasks[ti].sessions[si].label.clone();
         let ts = &mut self.tasks[ti].sessions[si];
         if ts.session.exited {
             log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
-            return None;
+            return false;
         }
-        let when = Instant::now() + Duration::from_secs(5);
-        ts.pending_clear = Some(when);
+        // Queue /clear to fire when the PTY first goes quiet. Floor of 1s so
+        // we don't fire during the PTY startup noise. Hard deadline 120s in
+        // case the agent never goes quiet.
+        ts.pending_clear = Some(PendingWrite::wait_for_quiet(
+            "/clear".to_string(),
+            true,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(120),
+        ));
         ts.status = SessionStatus::Idle;
         ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
             ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
@@ -4356,9 +4409,12 @@ impl App {
         ts.pending_prompt = None;
         log_tick(
             run_id,
-            &format!("reset_fresh: scheduled /clear to '{}' (delay 5s)", label),
+            &format!(
+                "reset_fresh: queued /clear for '{}' (fires on first quiet PTY)",
+                label
+            ),
         );
-        Some(when)
+        true
     }
 
     fn finish_run(&mut self, run_id: &str, reason: String) {
@@ -4634,6 +4690,19 @@ impl App {
 
 /// Compute the workflow-level aggregate indicator.
 /// Running = any participant session active; Idle = none active; plus Paused/Done.
+/// Core readiness predicate for a queued PendingWrite. Pure over inputs so
+/// the semantics can be unit-tested without a real PTY.
+fn pending_write_ready(wakeups: &[Instant], pw: &PendingWrite, now: Instant) -> bool {
+    if now >= pw.hard_deadline {
+        return true;
+    }
+    if now < pw.earliest_deliver_at {
+        return false;
+    }
+    let window = pw.require_quiet;
+    !wakeups.iter().any(|t| now.duration_since(*t) < window)
+}
+
 /// Return the byte sequence that means "Enter" to whatever's reading the
 /// session's PTY right now. Most modern TUIs (codex, claude code) enable
 /// the Kitty keyboard protocol (CSI >1u) at startup, which encodes Enter as
@@ -4729,5 +4798,65 @@ fn copy_to_clipboard(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::*;
+
+    fn pw(floor_secs: u64, quiet_secs: u64, deadline_secs: u64) -> (PendingWrite, Instant) {
+        let now = Instant::now();
+        (
+            PendingWrite {
+                text: "hi".into(),
+                submit: true,
+                earliest_deliver_at: now + Duration::from_secs(floor_secs),
+                require_quiet: Duration::from_secs(quiet_secs),
+                hard_deadline: now + Duration::from_secs(deadline_secs),
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn not_ready_before_floor() {
+        let (p, now) = pw(5, 2, 60);
+        // Early — floor not reached
+        assert!(!pending_write_ready(&[], &p, now));
+        // At floor with no wakeups — ready
+        assert!(pending_write_ready(&[], &p, now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn not_ready_while_pty_noisy() {
+        let (p, now) = pw(1, 2, 60);
+        let check_at = now + Duration::from_secs(3);
+        // Wakeup 0.5s ago — still within quiet window
+        let recent = check_at - Duration::from_millis(500);
+        assert!(!pending_write_ready(&[recent], &p, check_at));
+    }
+
+    #[test]
+    fn ready_after_pty_goes_quiet() {
+        let (p, now) = pw(1, 2, 60);
+        let check_at = now + Duration::from_secs(10);
+        // Last wakeup 5s ago — outside 2s quiet window
+        let old = check_at - Duration::from_secs(5);
+        assert!(pending_write_ready(&[old], &p, check_at));
+    }
+
+    #[test]
+    fn deadline_forces_delivery_even_if_noisy() {
+        let (p, now) = pw(1, 2, 10);
+        let check_at = now + Duration::from_secs(11);
+        let recent = check_at - Duration::from_millis(100); // noisy
+        assert!(pending_write_ready(&[recent], &p, check_at));
+    }
+
+    #[test]
+    fn empty_wakeups_is_ready_past_floor() {
+        let (p, now) = pw(1, 2, 60);
+        assert!(pending_write_ready(&[], &p, now + Duration::from_secs(2)));
+    }
 }
 

@@ -183,6 +183,7 @@ dependencies = [
  "anyhow",
  "base64",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
