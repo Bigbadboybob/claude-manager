@@ -4934,18 +4934,36 @@ impl App {
                         ),
                         _ => 0,
                     };
+                    // PTY quiet + new-turn isn't enough — claude pauses between
+                    // thinking/tool_use steps, and a slow tool call can exceed
+                    // idle_timeout without the turn actually being over.
+                    // Additionally require the agent's own "I'm done with this
+                    // turn" signal before firing.
+                    let turn_complete = match (
+                        self.tasks[ti].worktree_path.as_deref(),
+                        current_sid.as_deref(),
+                    ) {
+                        (Some(wt), Some(sid)) => workflow::transcript::role_turn_complete(
+                            &wf.roles[active].engine,
+                            wt,
+                            sid,
+                        ),
+                        _ => false,
+                    };
+                    let will_fire = current_count > start_count && turn_complete;
                     log_tick(
                         &run_id,
                         &format!(
-                            "idle check: role={} sid={:?} start={} current={} will_fire={}",
+                            "idle check: role={} sid={:?} start={} current={} turn_complete={} will_fire={}",
                             active,
                             current_sid.as_deref().unwrap_or("<none>"),
                             start_count,
                             current_count,
-                            current_count > start_count,
+                            turn_complete,
+                            will_fire,
                         ),
                     );
-                    if current_count > start_count {
+                    if will_fire {
                         if let Some(t) = wf.static_transition_on_idle(active) {
                             decisions.push(Decision::ActivateStatic {
                                 run_id: run_id.clone(),

@@ -23,8 +23,11 @@ activation_prompt = """You are the manager of a feedback-mode workflow. Your job
 
 The user may have had a conversation with the worker BEFORE launching this workflow — often planning mode, where the worker proposed a plan the user accepted. All three context fields below may be empty; read whichever ones are populated.
 
-Goal the user set for this run (falls back to the first post-launch user message if no explicit goal was provided):
+GOAL:
 {{ goal }}
+
+If the goal references a file make sure to read the file and gather all context before judging if it was met.
+*DO NOT stop* until the goal has been completed in its enirety. If there are multiple phases keep going until all phases are complete. Only stop early if there is a hard blocker.
 
 Plan (populated only when the worker's last pre-launch action was an ExitPlanMode tool call — i.e. the user accepted a plan right before launching; empty otherwise):
 {{ roles.worker.plan }}
@@ -46,9 +49,7 @@ Decide:
 
 Call exactly one tool. Do not write code yourself.
 """
-subsequent_activation_prompt = """Next round. You already have the full context from your previous turns; focus on what's new.
-
-Goal:
+subsequent_activation_prompt = """Goal:
 {{ goal }}
 
 Worker's most recent message (this iteration):

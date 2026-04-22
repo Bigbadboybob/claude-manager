@@ -334,6 +334,95 @@ pub fn latest_plan(
     None
 }
 
+/// True if the agent has fully finished its most recent turn — not merely
+/// paused between steps. Used by the idle-transition gate to avoid firing
+/// mid-turn (long tool calls, thinking pauses) which would otherwise put the
+/// next role into action while the outgoing role is still producing output.
+///
+/// - Claude: the most recent assistant JSONL record has
+///   `message.stop_reason == "end_turn"`. `tool_use`, `null`, or anything
+///   else means the agent still has work to do.
+/// - Codex: the LAST non-token-count event in the rollout is
+///   `event_msg` with `payload.type == "task_complete"`. If a
+///   `response_item` of type `function_call`, `reasoning`, or `message`
+///   follows the most recent `task_complete`, the agent started another
+///   step and isn't done yet.
+///
+/// Returns `false` (conservative — don't fire gate) on any parse failure
+/// or missing signal.
+pub fn role_turn_complete(
+    engine: &Engine,
+    worktree_path: &Path,
+    session_id: &str,
+) -> bool {
+    match engine {
+        Engine::ClaudeCode => claude_turn_complete(worktree_path, session_id),
+        Engine::Codex => codex_turn_complete(session_id),
+    }
+}
+
+fn claude_turn_complete(worktree_path: &Path, session_id: &str) -> bool {
+    let Some(path) = claude_transcript_path(worktree_path, session_id) else {
+        return false;
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return false;
+    };
+    // Walk backwards for the most recent assistant record.
+    for line in contents.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let stop_reason = v
+            .pointer("/message/stop_reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        return stop_reason == "end_turn";
+    }
+    false
+}
+
+fn codex_turn_complete(session_id: &str) -> bool {
+    let Some(path) = codex_transcript_path(session_id) else {
+        return false;
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return false;
+    };
+    // Scan backwards. First relevant event wins:
+    //   - task_complete  → done
+    //   - response_item (function_call / reasoning / message) → still working
+    // Everything else (token_count, exec_command_*, function_call_output)
+    // is noise for this purpose.
+    for line in contents.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let top = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let ptype = v.pointer("/payload/type").and_then(|t| t.as_str()).unwrap_or("");
+        if top == "event_msg" && ptype == "task_complete" {
+            return true;
+        }
+        if top == "response_item"
+            && matches!(ptype, "function_call" | "reasoning" | "message")
+        {
+            return false;
+        }
+    }
+    false
+}
+
 /// Count JSONL entries whose top-level type indicates `kind`, regardless of
 /// whether their content is text-bearing.
 ///
@@ -671,6 +760,30 @@ mod tests {
             current2,
             baseline
         );
+    }
+
+    #[test]
+    fn claude_turn_complete_only_when_end_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two session files under the same HomeOverride — can't hold two
+        // overrides at once (the guard mutex serializes them).
+        let lines_busy = [
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"}}"##,
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}],"stop_reason":"tool_use"}}"##,
+        ]
+        .join("\n");
+        let lines_done = [
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}],"stop_reason":"tool_use"}}"##,
+            r##"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}"##,
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}"##,
+        ]
+        .join("\n");
+        write_transcript(&tmp, "-tmp-repo", "sid-busy", &lines_busy);
+        write_transcript(&tmp, "-tmp-repo", "sid-done", &lines_done);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+        assert!(!role_turn_complete(&Engine::ClaudeCode, &wt, "sid-busy"));
+        assert!(role_turn_complete(&Engine::ClaudeCode, &wt, "sid-done"));
     }
 
     /// After `/clear`, claude rotates the transcript file. The new file
