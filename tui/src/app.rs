@@ -4940,7 +4940,7 @@ impl App {
                     // Additionally require the agent's own "I'm done with this
                     // turn" signal before firing.
                     let turn_complete = match (
-                        self.tasks[ti].worktree_path.as_deref(),
+                        self.workspaces[ti].worktree_path.as_deref(),
                         current_sid.as_deref(),
                     ) {
                         (Some(wt), Some(sid)) => workflow::transcript::role_turn_complete(
