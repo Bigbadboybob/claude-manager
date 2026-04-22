@@ -15,7 +15,7 @@ use crate::api::Task;
 use crate::backend::{BackendEvent, BackendHandle};
 use crate::config::Config;
 use crate::input;
-use crate::planning::{PlanAction, PlanningView};
+use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::workflow::run::MessageBaseline;
@@ -155,14 +155,84 @@ struct ManifestEntry {
     workflow_role: Option<String>,
 }
 
+/// Persisted workspace metadata. Lives in `Manifest::workspaces` keyed by the
+/// workspace's stable id (or, for legacy manifests, by worktree path / task:id
+/// before being re-keyed on load).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+struct ManifestWorkspace {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    is_closed: bool,
+    #[serde(default)]
+    is_cloud: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_repo_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_vm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_zone: Option<String>,
+    #[serde(default)]
+    sessions: Vec<ManifestEntry>,
+    // Legacy v2 fields — read for migration into the v3 `bindings` map, never
+    // written back.
+    #[serde(default, skip_serializing)]
+    extra_bound_tasks: Vec<BoundTaskLegacy>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+struct BoundTaskLegacy {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    title: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct Manifest {
-    #[serde(default)]
+    /// v1 legacy shape — flat session list keyed by worktree path / task:id.
+    /// Read for migration; never written.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     sessions: HashMap<String, Vec<ManifestEntry>>,
+    /// Workspaces keyed by stable workspace id (v3) or legacy key (v1/v2,
+    /// rekeyed on load).
+    #[serde(default)]
+    workspaces: HashMap<String, ManifestWorkspace>,
+    /// `task_id` → `workspace_id` bindings. A task present here is bound to
+    /// the referenced workspace (primary or extra — no distinction).
+    #[serde(default)]
+    bindings: HashMap<String, String>,
     #[serde(default)]
     view: Option<String>,
 }
 
+/// An execution context: a worktree (local) or cloud worker (remote) plus
+/// the sessions running in it. Any number of `TaskEntry`s can point at a
+/// workspace via `TaskEntry::workspace_id`; none is also valid (standalone
+/// workspace created via A-n).
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    pub is_closed: bool,
+    pub is_cloud: bool,
+    pub repo_url: Option<String>,
+    pub worktree_path: Option<PathBuf>,
+    pub main_repo_path: Option<PathBuf>,
+    pub worker_vm: Option<String>,
+    pub worker_zone: Option<String>,
+    pub sessions: Vec<TerminalSession>,
+}
+
+/// A task tracked in the planning/API layer. Pure metadata — no execution
+/// state. `workspace_id` points at the Workspace this task has been launched
+/// into (None when still in backlog / never launched).
 pub struct TaskEntry {
     pub task_id: Option<String>,
     pub name: String,
@@ -172,33 +242,53 @@ pub struct TaskEntry {
     pub wip_branch: Option<String>,
     pub session_id: Option<String>,
     pub blocked_at: Option<String>,
-    pub worker_vm: Option<String>,
-    pub worker_zone: Option<String>,
-    pub worktree_path: Option<PathBuf>,
-    pub main_repo_path: Option<PathBuf>,
-    pub sessions: Vec<TerminalSession>,
-    /// Whether this task has been pushed to cloud (as opposed to running locally).
     pub is_cloud: bool,
+    /// FK to `App.workspaces`. None = task in backlog, not bound yet.
+    pub workspace_id: Option<String>,
 }
 
-impl TaskEntry {
-    pub fn status(&self) -> TaskStatus {
-        if self.sessions.iter().any(|s| s.status == SessionStatus::Running) {
-            TaskStatus::Running
-        } else if self.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
-            TaskStatus::Blocked
-        } else if self.worker_vm.as_deref().is_some_and(|s| !s.is_empty()) {
-            self.api_status.clone()
-        } else {
-            // No local sessions and no cloud worker — show as waiting.
-            TaskStatus::Blocked
-        }
+/// Build a TerminalSession wrapping a freshly-spawned PTY with default state.
+/// Used by attach/spawn flows that don't need pending prompts or workflow tags.
+fn make_simple_session(
+    label: &str,
+    session_type: &str,
+    session: Session,
+    pending_jsonl_files: Option<Vec<String>>,
+) -> TerminalSession {
+    TerminalSession {
+        label: label.to_string(),
+        session_type: session_type.to_string(),
+        session,
+        status: SessionStatus::Running,
+        last_write_at: None,
+        session_id: None,
+        pending_jsonl_files,
+        hidden: false,
+        idle_timeout_secs: 0,
+        pending_prompt: None,
+        pending_clear: None,
+        workflow_run_id: None,
+        workflow_role: None,
+        last_delivery: None,
     }
+}
+
+/// Generate a fresh workspace id. Not cryptographic — just collision-avoidance
+/// across the user's manifest via nanosecond timestamp.
+fn new_workspace_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("ws-{:x}", nanos)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cursor {
-    Task(usize),
+    /// Cursor is on a workspace header (by workspace index).
+    Workspace(usize),
+    /// Cursor is on a session within a workspace (workspace index, session index).
     Session(usize, usize),
 }
 
@@ -216,11 +306,11 @@ pub enum ViewMode {
 
 #[derive(Clone, Debug)]
 enum VisualItem {
-    TaskHeader(usize),
+    WorkspaceHeader(usize),
     Session(usize, usize),
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
-    WorkflowHeader { task_idx: usize, run_id: String },
+    WorkflowHeader { ws_idx: usize, run_id: String },
 }
 
 /// Modal input state.
@@ -236,14 +326,14 @@ enum InputMode {
         /// 0 = name, 1 = branch, 2 = idle timeout
         active_field: u8,
     },
-    /// Picking a session type to add to a task.
+    /// Picking a session type to add to a workspace.
     NewTerminalSession {
-        task_index: usize,
+        ws_index: usize,
         session_type: String,
     },
     /// Editing session settings.
     SessionSettings {
-        task_index: usize,
+        ws_index: usize,
         session_index: usize,
         name: String,
         idle_timeout: String,
@@ -251,9 +341,15 @@ enum InputMode {
         /// 0 = name, 1 = idle timeout
         active_field: u8,
     },
-    /// Confirming launch of a workflow on a task.
+    /// Renaming a workspace. Only the display label changes — the branch
+    /// and worktree path stay the same.
+    WorkspaceSettings {
+        ws_index: usize,
+        name: String,
+    },
+    /// Confirming launch of a workflow on a workspace.
     WorkflowLaunchConfirm {
-        task_index: usize,
+        ws_index: usize,
         workflow_name: String,
         /// One slot per role, in presentation order.
         slots: Vec<WorkflowSlotChoice>,
@@ -291,7 +387,7 @@ impl WorkflowSlotChoice {
 
 #[derive(Clone, Debug)]
 pub enum WorkflowSlotSource {
-    /// Use an existing session on the task, by index within task.sessions.
+    /// Use an existing session on the workspace, by index within `ws.sessions`.
     Existing(usize),
     /// Spawn a new session with the given engine.
     New(Engine),
@@ -299,6 +395,8 @@ pub enum WorkflowSlotSource {
 
 pub struct App {
     pub tasks: Vec<TaskEntry>,
+    /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
+    pub workspaces: Vec<Workspace>,
     pub cursor: Cursor,
     pub sidebar_view: SidebarView,
     pub view_mode: ViewMode,
@@ -345,7 +443,8 @@ impl App {
             .collect();
         App {
             tasks: Vec::new(),
-            cursor: Cursor::Task(0),
+            workspaces: Vec::new(),
+            cursor: Cursor::Workspace(0),
             sidebar_view,
             view_mode: ViewMode::Sessions,
             planning: PlanningView::new(),
@@ -561,38 +660,44 @@ impl App {
 
     /// Save session manifest to disk.
     fn save_session_manifest(&self) {
-        let mut sessions: HashMap<String, Vec<ManifestEntry>> = HashMap::new();
-        for task in &self.tasks {
-            // Key by worktree_path for local tasks, task_id for cloud tasks.
-            let key = if let Some(p) = &task.worktree_path {
-                match p.to_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                }
-            } else if let Some(id) = &task.task_id {
-                format!("task:{}", id)
-            } else {
-                continue;
-            };
-            if task.sessions.is_empty() {
-                continue;
-            }
-            let entries: Vec<ManifestEntry> = task
+        let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
+        for ws in &self.workspaces {
+            let entries: Vec<ManifestEntry> = ws
                 .sessions
                 .iter()
-                .map(|ts| {
-                    ManifestEntry {
-                        label: ts.label.clone(),
-                        session_type: ts.session_type.clone(),
-                        session_id: ts.session_id.clone(),
-                        hidden: ts.hidden,
-                        idle_timeout_secs: ts.idle_timeout_secs,
-                        workflow_run_id: ts.workflow_run_id.clone(),
-                        workflow_role: ts.workflow_role.clone(),
-                    }
+                .map(|ts| ManifestEntry {
+                    label: ts.label.clone(),
+                    session_type: ts.session_type.clone(),
+                    session_id: ts.session_id.clone(),
+                    hidden: ts.hidden,
+                    idle_timeout_secs: ts.idle_timeout_secs,
+                    workflow_run_id: ts.workflow_run_id.clone(),
+                    workflow_role: ts.workflow_role.clone(),
                 })
                 .collect();
-            sessions.insert(key, entries);
+            workspaces.insert(
+                ws.id.clone(),
+                ManifestWorkspace {
+                    id: ws.id.clone(),
+                    name: ws.name.clone(),
+                    is_closed: ws.is_closed,
+                    is_cloud: ws.is_cloud,
+                    worktree_path: ws.worktree_path.clone(),
+                    main_repo_path: ws.main_repo_path.clone(),
+                    repo_url: ws.repo_url.clone(),
+                    worker_vm: ws.worker_vm.clone(),
+                    worker_zone: ws.worker_zone.clone(),
+                    sessions: entries,
+                    extra_bound_tasks: Vec::new(),
+                },
+            );
+        }
+
+        let mut bindings: HashMap<String, String> = HashMap::new();
+        for task in &self.tasks {
+            if let (Some(tid), Some(wsid)) = (&task.task_id, &task.workspace_id) {
+                bindings.insert(tid.clone(), wsid.clone());
+            }
         }
 
         let view = match self.sidebar_view {
@@ -600,7 +705,9 @@ impl App {
             SidebarView::Task => "task",
         };
         let manifest = Manifest {
-            sessions,
+            sessions: HashMap::new(),
+            workspaces,
+            bindings,
             view: Some(view.to_string()),
         };
 
@@ -622,183 +729,287 @@ impl App {
         }
     }
 
-    /// Restore sessions from the manifest after tasks are populated.
+    /// Normalize a manifest across format versions:
+    ///   - v1: flat `sessions` map, keyed by worktree/task:id, no workspaces.
+    ///   - v2: `workspaces` keyed by worktree/task:id, with extras + is_standalone.
+    ///   - v3: `workspaces` keyed by workspace_id, plus `bindings` map.
+    ///
+    /// After migration: each workspace entry is keyed by its stable id; legacy
+    /// `extra_bound_tasks` get folded into the `bindings` map.
+    fn migrate_manifest(mut m: Manifest) -> Manifest {
+        // v1 → v2: legacy sessions map → synthetic workspace entries.
+        for (key, sessions) in m.sessions.drain() {
+            m.workspaces
+                .entry(key)
+                .or_insert_with(ManifestWorkspace::default)
+                .sessions = sessions;
+        }
+
+        // v1/v2 → v3: rekey by workspace_id (assigning one if missing) and
+        // fold extras into the bindings map.
+        let mut rekeyed: HashMap<String, ManifestWorkspace> = HashMap::new();
+        for (legacy_key, mut mw) in m.workspaces.drain() {
+            if mw.id.is_empty() {
+                mw.id = new_workspace_id();
+            }
+            // Seed worktree_path / is_cloud from the legacy key if they're
+            // missing — this matters for v1 manifests that only had the key.
+            if mw.worktree_path.is_none() && !legacy_key.starts_with("task:") {
+                mw.worktree_path = Some(PathBuf::from(&legacy_key));
+            }
+            if legacy_key.starts_with("task:") {
+                mw.is_cloud = true;
+            }
+            for bt in mw.extra_bound_tasks.drain(..) {
+                if !bt.id.is_empty() {
+                    m.bindings.insert(bt.id, mw.id.clone());
+                }
+            }
+            // For v2 cloud workspaces keyed by task:{id}, that task_id is
+            // also a binding (it was the "primary" in v2).
+            if let Some(task_id) = legacy_key.strip_prefix("task:") {
+                m.bindings
+                    .entry(task_id.to_string())
+                    .or_insert_with(|| mw.id.clone());
+            }
+            rekeyed.insert(mw.id.clone(), mw);
+        }
+        m.workspaces = rekeyed;
+        m
+    }
+
+    /// Restore workspaces + sessions from the manifest. Runs after an
+    /// initial API tasks fetch so `bindings` can be cross-referenced with
+    /// real tasks, but also works standalone (workspaces without any bound
+    /// tasks are legal).
     fn restore_sessions(&mut self) {
-        let manifest = Self::load_manifest();
-        if manifest.sessions.is_empty() {
+        let manifest = Self::migrate_manifest(Self::load_manifest());
+        if manifest.workspaces.is_empty() && manifest.bindings.is_empty() {
             return;
         }
 
         let (cols, rows) = self.last_term_size;
 
-        for task in &mut self.tasks {
-            // Skip tasks that already have sessions.
-            if !task.sessions.is_empty() {
+        // Rebuild self.workspaces from the manifest. Closed workspaces are
+        // loaded with empty sessions (their PTY state is gone anyway).
+        for (_, mw) in manifest.workspaces.iter() {
+            let already = self.workspaces.iter().any(|w| w.id == mw.id);
+            if already {
                 continue;
             }
-
-            // Try worktree key first (local tasks), then task_id key (cloud tasks).
-            let entries = task
-                .worktree_path
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .and_then(|key| manifest.sessions.get(key))
-                .or_else(|| {
-                    task.task_id
+            let mut ws = Workspace {
+                id: mw.id.clone(),
+                name: if mw.name.is_empty() {
+                    mw.worktree_path
                         .as_ref()
-                        .and_then(|id| manifest.sessions.get(&format!("task:{}", id)))
-                })
-                .cloned()
-                .unwrap_or_default();
-
-            if entries.is_empty() {
-                continue;
-            }
-
-            let cloud_vm = task.worker_vm.as_deref().filter(|s| !s.is_empty());
-
-            for entry in entries {
-                let result = if cloud_vm.is_some() && entry.session_type == "bash" {
-                    // Restore SSH bash session for cloud tasks.
-                    let vm = cloud_vm.unwrap().to_string();
-                    let zone = task
-                        .worker_zone
-                        .clone()
-                        .unwrap_or_else(|| self.config.gcp_zone.clone());
-                    let tmux_name = &entry.label;
-                    let args = vec![
-                        "compute".to_string(),
-                        "ssh".to_string(),
-                        vm.clone(),
-                        format!("--zone={}", zone),
-                        format!("--project={}", self.config.gcp_project),
-                        "--".to_string(),
-                        "-t".to_string(),
-                        format!(
-                            "TERM=xterm-256color sudo su - worker -c 'cd /workspace && tmux new-session -As {}'",
-                            tmux_name
-                        ),
-                    ];
-                    Session::new("gcloud", &args, cols, rows, None, Default::default())
-                } else if entry.session_type == "claude" {
-                    let wt = task.worktree_path.clone();
-                    let mut args = vec!["--dangerously-skip-permissions".to_string()];
-                    if let Some(ref sid) = entry.session_id {
-                        args.push("--resume".to_string());
-                        args.push(sid.clone());
-                    }
-                    Session::new("claude", &args, cols, rows, wt, Default::default())
-                } else if entry.session_type == "codex" {
-                    let wt = task.worktree_path.clone();
-                    let mut args = vec!["--yolo".to_string()];
-                    if let Some(ref sid) = entry.session_id {
-                        args.push("resume".to_string());
-                        args.push(sid.clone());
-                    }
-                    Session::new("codex", &args, cols, rows, wt, Default::default())
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("workspace")
+                        .to_string()
                 } else {
-                    let wt = task.worktree_path.clone();
-                    Session::new(
-                        "/bin/bash",
-                        &[],
-                        cols,
-                        rows,
-                        wt,
-                        Default::default(),
-                    )
-                };
-
-                if let Ok(s) = result {
-                    // If the manifest didn't have a session_id for this session,
-                    // enable the detection poll with an EMPTY "pending" list so
-                    // it picks the newest JSONL in the project dir as this
-                    // session's id (best available heuristic — we've lost the
-                    // original mapping). Without this, detection is silently
-                    // skipped and anything that needs the transcript (workflow
-                    // tick, etc.) stays broken forever.
-                    let pending = if entry.session_id.is_some() {
-                        None
-                    } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
-                        Some(Vec::new())
-                    } else {
-                        None
-                    };
-                    let ts = TerminalSession {
-                        label: entry.label.clone(),
-                        session_type: entry.session_type.clone(),
-                        session: s,
-                        status: SessionStatus::Running,
-                        last_write_at: None,
-                        session_id: entry.session_id.clone(),
-                        pending_jsonl_files: pending,
-                        hidden: entry.hidden,
-                        idle_timeout_secs: entry.idle_timeout_secs,
-                        pending_prompt: None,
-                        pending_clear: None,
-                        workflow_run_id: entry.workflow_run_id.clone(),
-                        workflow_role: entry.workflow_role.clone(),
-                    last_delivery: None,
-                    };
-                    task.sessions.push(ts);
+                    mw.name.clone()
+                },
+                is_closed: mw.is_closed,
+                is_cloud: mw.is_cloud,
+                repo_url: mw.repo_url.clone(),
+                worktree_path: mw.worktree_path.clone(),
+                main_repo_path: mw.main_repo_path.clone(),
+                worker_vm: mw.worker_vm.clone(),
+                worker_zone: mw.worker_zone.clone(),
+                sessions: vec![],
+            };
+            if !ws.is_closed {
+                for entry in &mw.sessions {
+                    let ts = Self::spawn_restored_session(
+                        entry,
+                        &ws,
+                        (cols, rows),
+                        &self.config,
+                    );
+                    if let Some(ts) = ts {
+                        ws.sessions.push(ts);
+                    }
                 }
+            }
+            self.workspaces.push(ws);
+        }
+
+        // Apply task bindings onto any existing TaskEntries (from the API
+        // fetch). Tasks that aren't in self.tasks yet (task still backlog
+        // or API hasn't come back) will get their workspace_id set later
+        // in reconcile_tasks when they arrive.
+        for (task_id, ws_id) in &manifest.bindings {
+            if let Some(task) = self
+                .tasks
+                .iter_mut()
+                .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+            {
+                task.workspace_id = Some(ws_id.clone());
             }
         }
 
-        // If we restored sessions, put cursor on the first session found.
-        for (ti, task) in self.tasks.iter().enumerate() {
-            if !task.sessions.is_empty() {
-                self.cursor = Cursor::Session(ti, 0);
+        // If we restored sessions, put cursor on the first workspace with one.
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if !ws.sessions.is_empty() {
+                self.cursor = Cursor::Session(wi, 0);
                 break;
             }
         }
-
-        // Clear the manifest file since we've restored.
-        // It will be re-saved on quit or changes.
     }
 
-    /// Open session settings for the focused session.
+    /// Spawn a session from a ManifestEntry within a Workspace context.
+    /// Extracted so both restore + manual creation paths can share it.
+    fn spawn_restored_session(
+        entry: &ManifestEntry,
+        ws: &Workspace,
+        (cols, rows): (u16, u16),
+        config: &Config,
+    ) -> Option<TerminalSession> {
+        let cloud_vm = ws.worker_vm.as_deref().filter(|s| !s.is_empty());
+        let result = if cloud_vm.is_some() && entry.session_type == "bash" {
+            let vm = cloud_vm.unwrap().to_string();
+            let zone = ws
+                .worker_zone
+                .clone()
+                .unwrap_or_else(|| config.gcp_zone.clone());
+            let tmux_name = &entry.label;
+            let args = vec![
+                "compute".to_string(),
+                "ssh".to_string(),
+                vm,
+                format!("--zone={}", zone),
+                format!("--project={}", config.gcp_project),
+                "--".to_string(),
+                "-t".to_string(),
+                format!(
+                    "TERM=xterm-256color sudo su - worker -c 'cd /workspace && tmux new-session -As {}'",
+                    tmux_name
+                ),
+            ];
+            Session::new("gcloud", &args, cols, rows, None, Default::default())
+        } else if entry.session_type == "claude" {
+            let wt = ws.worktree_path.clone();
+            let mut args = vec!["--dangerously-skip-permissions".to_string()];
+            if let Some(ref sid) = entry.session_id {
+                args.push("--resume".to_string());
+                args.push(sid.clone());
+            }
+            Session::new("claude", &args, cols, rows, wt, Default::default())
+        } else if entry.session_type == "codex" {
+            let wt = ws.worktree_path.clone();
+            let mut args = vec!["--yolo".to_string()];
+            if let Some(ref sid) = entry.session_id {
+                args.push("resume".to_string());
+                args.push(sid.clone());
+            }
+            Session::new("codex", &args, cols, rows, wt, Default::default())
+        } else {
+            let wt = ws.worktree_path.clone();
+            Session::new("/bin/bash", &[], cols, rows, wt, Default::default())
+        };
+        let s = result.ok()?;
+        let pending = if entry.session_id.is_some() {
+            None
+        } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
+            Some(Vec::new())
+        } else {
+            None
+        };
+        Some(TerminalSession {
+            label: entry.label.clone(),
+            session_type: entry.session_type.clone(),
+            session: s,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            session_id: entry.session_id.clone(),
+            pending_jsonl_files: pending,
+            hidden: entry.hidden,
+            idle_timeout_secs: entry.idle_timeout_secs,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: entry.workflow_run_id.clone(),
+            workflow_role: entry.workflow_role.clone(),
+            last_delivery: None,
+        })
+    }
+
+    /// Open settings for whatever the cursor is focused on — a workspace
+    /// (rename) when on a header, a session (label / idle / hidden) when on
+    /// a specific session.
     fn open_session_settings(&mut self) {
-        let (ti, si) = match self.cursor {
-            Cursor::Session(ti, si) => (ti, si),
-            Cursor::Task(ti) => {
-                if self.tasks.get(ti).map_or(false, |t| t.sessions.len() == 1) {
-                    (ti, 0)
-                } else {
-                    return;
+        match self.cursor.clone() {
+            Cursor::Session(wi, si) => {
+                if let Some(ws) = self.workspaces.get(wi) {
+                    if let Some(ts) = ws.sessions.get(si) {
+                        let timeout = ts.idle_timeout_secs;
+                        self.input_mode = InputMode::SessionSettings {
+                            ws_index: wi,
+                            session_index: si,
+                            name: ts.label.clone(),
+                            idle_timeout: if timeout == 0 {
+                                DEFAULT_IDLE_TIMEOUT_SECS.to_string()
+                            } else {
+                                timeout.to_string()
+                            },
+                            hidden: ts.hidden,
+                            active_field: 0,
+                        };
+                    }
                 }
             }
-        };
-        if let Some(task) = self.tasks.get(ti) {
-            if let Some(ts) = task.sessions.get(si) {
-                let timeout = ts.idle_timeout_secs;
-                self.input_mode = InputMode::SessionSettings {
-                    task_index: ti,
-                    session_index: si,
-                    name: ts.label.clone(),
-                    idle_timeout: if timeout == 0 {
-                        DEFAULT_IDLE_TIMEOUT_SECS.to_string()
-                    } else {
-                        timeout.to_string()
-                    },
-                    hidden: ts.hidden,
-                    active_field: 0,
-                };
+            Cursor::Workspace(wi) => {
+                if let Some(ws) = self.workspaces.get(wi) {
+                    self.input_mode = InputMode::WorkspaceSettings {
+                        ws_index: wi,
+                        name: ws.name.clone(),
+                    };
+                }
             }
         }
     }
 
+    /// Soft-close the workspace under the cursor: kill its session PTYs
+    /// and hide from the sidebar. Worktree stays on disk; bindings persist.
+    fn close_active_workspace(&mut self) {
+        let Some(wi) = self.active_workspace_index() else {
+            return;
+        };
+        if let Some(ws) = self.workspaces.get_mut(wi) {
+            for ts in &mut ws.sessions {
+                ts.session.exited = true;
+            }
+            ws.sessions.clear();
+            ws.is_closed = true;
+        }
+        self.save_session_manifest();
+        if let Some((nwi, _)) = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .find(|(_, w)| !w.is_closed)
+        {
+            self.cursor = Cursor::Workspace(nwi);
+        }
+        self.clamp_cursor();
+        self.set_status_msg("Workspace closed");
+    }
+
     fn toggle_session_hidden(&mut self) {
-        let (ti, si) = match self.cursor {
-            Cursor::Session(ti, si) => (ti, si),
-            Cursor::Task(ti) => {
-                if self.tasks.get(ti).map_or(false, |t| t.sessions.len() == 1) {
-                    (ti, 0)
+        let (wi, si) = match self.cursor {
+            Cursor::Session(wi, si) => (wi, si),
+            Cursor::Workspace(wi) => {
+                if self.workspaces.get(wi).map_or(false, |w| w.sessions.len() == 1) {
+                    (wi, 0)
                 } else {
                     return;
                 }
             }
         };
-        if let Some(ts) = self.tasks.get_mut(ti).and_then(|t| t.sessions.get_mut(si)) {
+        if let Some(ts) = self
+            .workspaces
+            .get_mut(wi)
+            .and_then(|w| w.sessions.get_mut(si))
+        {
             ts.hidden = !ts.hidden;
             self.save_session_manifest();
             self.needs_redraw = true;
@@ -807,42 +1018,30 @@ impl App {
 
     // ── Cursor helpers ──────────────────────────────────────────────
 
-    /// Return the task index the cursor is currently on.
-    fn active_task_index(&self) -> Option<usize> {
-        if self.tasks.is_empty() {
+    /// Return the workspace index the cursor is currently on.
+    fn active_workspace_index(&self) -> Option<usize> {
+        if self.workspaces.is_empty() {
             return None;
         }
-        match self.cursor {
-            Cursor::Task(ti) => {
-                if ti < self.tasks.len() {
-                    Some(ti)
-                } else {
-                    None
-                }
-            }
-            Cursor::Session(ti, _) => {
-                if ti < self.tasks.len() {
-                    Some(ti)
-                } else {
-                    None
-                }
-            }
-        }
+        let wi = match self.cursor {
+            Cursor::Workspace(wi) => wi,
+            Cursor::Session(wi, _) => wi,
+        };
+        (wi < self.workspaces.len()).then_some(wi)
     }
 
-    /// Return a reference to the active terminal session (task + session).
-    fn active_session(&self) -> Option<(&TaskEntry, &TerminalSession)> {
+    /// Return a reference to the active terminal session (workspace + session).
+    fn active_session(&self) -> Option<(&Workspace, &TerminalSession)> {
         match self.cursor {
-            Cursor::Session(ti, si) => {
-                let task = self.tasks.get(ti)?;
-                let ts = task.sessions.get(si)?;
-                Some((task, ts))
+            Cursor::Session(wi, si) => {
+                let ws = self.workspaces.get(wi)?;
+                let ts = ws.sessions.get(si)?;
+                Some((ws, ts))
             }
-            Cursor::Task(ti) => {
-                // If the task has exactly one session, return it.
-                let task = self.tasks.get(ti)?;
-                if task.sessions.len() == 1 {
-                    Some((task, &task.sessions[0]))
+            Cursor::Workspace(wi) => {
+                let ws = self.workspaces.get(wi)?;
+                if ws.sessions.len() == 1 {
+                    Some((ws, &ws.sessions[0]))
                 } else {
                     None
                 }
@@ -853,14 +1052,14 @@ impl App {
     /// Return a mutable reference to the active terminal session.
     fn active_session_mut(&mut self) -> Option<&mut TerminalSession> {
         match self.cursor {
-            Cursor::Session(ti, si) => {
-                let task = self.tasks.get_mut(ti)?;
-                task.sessions.get_mut(si)
+            Cursor::Session(wi, si) => {
+                let ws = self.workspaces.get_mut(wi)?;
+                ws.sessions.get_mut(si)
             }
-            Cursor::Task(ti) => {
-                let task = self.tasks.get_mut(ti)?;
-                if task.sessions.len() == 1 {
-                    Some(&mut task.sessions[0])
+            Cursor::Workspace(wi) => {
+                let ws = self.workspaces.get_mut(wi)?;
+                if ws.sessions.len() == 1 {
+                    Some(&mut ws.sessions[0])
                 } else {
                     None
                 }
@@ -868,26 +1067,74 @@ impl App {
         }
     }
 
+    // ── Workspace / task lookup helpers ─────────────────────────────
+
+    fn workspace_index_by_id(&self, id: &str) -> Option<usize> {
+        self.workspaces.iter().position(|w| w.id == id)
+    }
+
+    /// First task bound to the given workspace, if any. Used by push/pull
+    /// (which need *a* representative task) and the detail panel (shows one
+    /// prompt). Multi-task workspaces have no canonical ordering; first-
+    /// insertion-wins.
+    fn first_task_for_ws(&self, ws_id: &str) -> Option<&TaskEntry> {
+        self.tasks
+            .iter()
+            .find(|t| t.workspace_id.as_deref() == Some(ws_id))
+    }
+
+    /// All task names bound to the given workspace, in binding order.
+    /// Used for the subtitle line under the workspace header.
+    fn task_names_for_ws(&self, ws_id: &str) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(ws_id))
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    /// Compute effective task status: derived from the workspace's sessions
+    /// if bound, otherwise falls back to api_status.
+    fn task_status(&self, task: &TaskEntry) -> TaskStatus {
+        if let Some(ws) = task
+            .workspace_id
+            .as_deref()
+            .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
+        {
+            if ws.sessions.iter().any(|s| s.status == SessionStatus::Running) {
+                return TaskStatus::Running;
+            }
+            if ws.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
+                return TaskStatus::Blocked;
+            }
+            if ws.worker_vm.as_deref().is_some_and(|s| !s.is_empty()) {
+                return task.api_status.clone();
+            }
+        }
+        task.api_status.clone()
+    }
+
     /// Clamp cursor so it points to a valid item.
     fn clamp_cursor(&mut self) {
-        if self.tasks.is_empty() {
-            self.cursor = Cursor::Task(0);
+        if self.workspaces.is_empty() {
+            self.cursor = Cursor::Workspace(0);
             return;
         }
+        let max = self.workspaces.len() - 1;
         match self.cursor {
-            Cursor::Task(ti) => {
-                if ti >= self.tasks.len() {
-                    self.cursor = Cursor::Task(self.tasks.len() - 1);
+            Cursor::Workspace(wi) => {
+                if wi > max {
+                    self.cursor = Cursor::Workspace(max);
                 }
             }
-            Cursor::Session(ti, si) => {
-                if ti >= self.tasks.len() {
-                    self.cursor = Cursor::Task(self.tasks.len() - 1);
-                } else if self.tasks[ti].sessions.is_empty() {
-                    self.cursor = Cursor::Task(ti);
-                } else if si >= self.tasks[ti].sessions.len() {
+            Cursor::Session(wi, si) => {
+                if wi > max {
+                    self.cursor = Cursor::Workspace(max);
+                } else if self.workspaces[wi].sessions.is_empty() {
+                    self.cursor = Cursor::Workspace(wi);
+                } else if si >= self.workspaces[wi].sessions.len() {
                     self.cursor =
-                        Cursor::Session(ti, self.tasks[ti].sessions.len() - 1);
+                        Cursor::Session(wi, self.workspaces[wi].sessions.len() - 1);
                 }
             }
         }
@@ -902,18 +1149,21 @@ impl App {
     }
 
     /// Status view: flat list of sessions grouped by status.
-    /// Running sessions first, then idle, then tasks with no sessions.
+    /// Running sessions first, then idle, then workspaces with no sessions.
     fn visual_items_status(&self) -> Vec<VisualItem> {
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
 
-        for (ti, task) in self.tasks.iter().enumerate() {
-            if task.sessions.is_empty() {
-                no_session.push(VisualItem::TaskHeader(ti));
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            if ws.sessions.is_empty() {
+                no_session.push(VisualItem::WorkspaceHeader(wi));
             } else {
-                for (si, ts) in task.sessions.iter().enumerate() {
-                    let item = VisualItem::Session(ti, si);
+                for (si, ts) in ws.sessions.iter().enumerate() {
+                    let item = VisualItem::Session(wi, si);
                     match ts.status {
                         SessionStatus::Running => running.push(item),
                         SessionStatus::Idle => idle.push(item),
@@ -937,22 +1187,27 @@ impl App {
         items
     }
 
-    /// Task view: tasks as headers with sessions indented underneath.
+    /// Task view: workspace headers with sessions indented underneath.
     /// Sessions grouped by workflow run appear contiguously under a workflow
     /// subheader. Standalone sessions render first; each workflow group follows.
     fn visual_items_task(&self) -> Vec<VisualItem> {
         let mut items = Vec::new();
-        for (ti, task) in self.tasks.iter().enumerate() {
-            if ti > 0 {
+        let mut first = true;
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            if !first {
                 items.push(VisualItem::Separator);
             }
-            items.push(VisualItem::TaskHeader(ti));
+            first = false;
+            items.push(VisualItem::WorkspaceHeader(wi));
 
             // Partition sessions: those in workflow groups vs. standalone.
             let mut standalone: Vec<usize> = Vec::new();
             let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
                 std::collections::BTreeMap::new();
-            for (si, ts) in task.sessions.iter().enumerate() {
+            for (si, ts) in ws.sessions.iter().enumerate() {
                 match &ts.workflow_run_id {
                     Some(run_id) => groups.entry(run_id.clone()).or_default().push(si),
                     None => standalone.push(si),
@@ -962,30 +1217,27 @@ impl App {
             // Standalone: running first, then idle.
             let (standalone_running, standalone_other): (Vec<_>, Vec<_>) = standalone
                 .into_iter()
-                .partition(|si| task.sessions[*si].status == SessionStatus::Running);
+                .partition(|si| ws.sessions[*si].status == SessionStatus::Running);
             for si in standalone_running {
-                items.push(VisualItem::Session(ti, si));
+                items.push(VisualItem::Session(wi, si));
             }
             for si in standalone_other {
-                items.push(VisualItem::Session(ti, si));
+                items.push(VisualItem::Session(wi, si));
             }
 
             // Workflow groups: header + sessions in role-order from the workflow def.
             for (run_id, session_indices) in groups {
-                // Skip groups whose run is no longer active (shouldn't happen often,
-                // but the sessions might have been detached). Show them flat.
                 let is_active_run = self.workflow_runs.iter().any(|r| r.run_id == run_id);
                 if !is_active_run {
                     for si in session_indices {
-                        items.push(VisualItem::Session(ti, si));
+                        items.push(VisualItem::Session(wi, si));
                     }
                     continue;
                 }
                 items.push(VisualItem::WorkflowHeader {
-                    task_idx: ti,
+                    ws_idx: wi,
                     run_id: run_id.clone(),
                 });
-                // Sort by role_order if we can find the workflow definition.
                 let role_order: Vec<String> = self
                     .workflow_runs
                     .iter()
@@ -995,11 +1247,11 @@ impl App {
                     .unwrap_or_default();
                 let mut ordered = session_indices.clone();
                 ordered.sort_by_key(|si| {
-                    let role = task.sessions[*si].workflow_role.as_deref().unwrap_or("");
+                    let role = ws.sessions[*si].workflow_role.as_deref().unwrap_or("");
                     role_order.iter().position(|r| r == role).unwrap_or(usize::MAX)
                 });
                 for si in ordered {
-                    items.push(VisualItem::Session(ti, si));
+                    items.push(VisualItem::Session(wi, si));
                 }
             }
         }
@@ -1007,39 +1259,40 @@ impl App {
     }
 
     /// Navigate the cursor up or down. +1 = down, -1 = up.
-    /// Skips non-selectable items (Separators, TaskHeaders in task view).
+    /// Skips non-selectable items (Separators, headers with sessions).
     fn navigate(&mut self, direction: i32) {
         let items = self.visual_items();
         if items.is_empty() {
             return;
         }
 
-        // TaskHeaders are selectable only if the task has no sessions (so you can still interact).
+        // Workspace headers are selectable only when the workspace has no
+        // sessions (otherwise the cursor lives on a child session).
         let is_selectable = |item: &VisualItem| match item {
             VisualItem::Session(_, _) => true,
-            VisualItem::TaskHeader(ti) => self.tasks.get(*ti).map_or(false, |t| t.sessions.is_empty()),
+            VisualItem::WorkspaceHeader(wi) => self
+                .workspaces
+                .get(*wi)
+                .map_or(false, |w| w.sessions.is_empty()),
             VisualItem::Separator => false,
             VisualItem::WorkflowHeader { .. } => false,
         };
 
-        // If nothing is selectable, bail.
         if !items.iter().any(is_selectable) {
             return;
         }
 
-        // Find current position in visual items.
         let cur_pos = items
             .iter()
             .position(|item| match (&self.cursor, item) {
-                (Cursor::Task(ti), VisualItem::TaskHeader(vti)) => ti == vti,
-                (Cursor::Session(ti, si), VisualItem::Session(vti, vsi)) => {
-                    ti == vti && si == vsi
+                (Cursor::Workspace(wi), VisualItem::WorkspaceHeader(vwi)) => wi == vwi,
+                (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi)) => {
+                    wi == vwi && si == vsi
                 }
                 _ => false,
             })
             .unwrap_or(0);
 
-        // Move in the given direction, skipping non-selectable items.
         let len = items.len() as i32;
         let mut next = cur_pos as i32;
         for _ in 0..items.len() {
@@ -1050,8 +1303,8 @@ impl App {
         }
 
         match &items[next as usize] {
-            VisualItem::Session(ti, si) => self.cursor = Cursor::Session(*ti, *si),
-            VisualItem::TaskHeader(ti) => self.cursor = Cursor::Task(*ti),
+            VisualItem::Session(wi, si) => self.cursor = Cursor::Session(*wi, *si),
+            VisualItem::WorkspaceHeader(wi) => self.cursor = Cursor::Workspace(*wi),
             _ => {}
         }
     }
@@ -1065,10 +1318,14 @@ impl App {
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 
         let mut had_event = false;
-        let mut session_id_updates: Vec<(String, String)> = Vec::new();
-        for task in &mut self.tasks {
-            let worktree_path = task.worktree_path.clone();
-            for ts in &mut task.sessions {
+        // Collected during the loop: (ws_id, session_id) pairs for sessions
+        // whose session_id was freshly detected. Resolved to task_id after
+        // the loop so we don't double-borrow self.
+        let mut ws_sid_updates: Vec<(String, String)> = Vec::new();
+        for ws in &mut self.workspaces {
+            let ws_id_here = ws.id.clone();
+            let worktree_path = ws.worktree_path.clone();
+            for ts in &mut ws.sessions {
                 while let Ok(event) = ts.session.event_rx.try_recv() {
                     had_event = true;
                     match event {
@@ -1192,10 +1449,7 @@ impl App {
                         if let Some(sid) = sid {
                             ts.session_id = Some(sid.clone());
                             ts.pending_jsonl_files = None;
-                            // Sync session_id to DB.
-                            if let Some(ref task_id) = task.task_id {
-                                session_id_updates.push((task_id.clone(), sid));
-                            }
+                            ws_sid_updates.push((ws_id_here.clone(), sid));
                         }
                     }
                 }
@@ -1203,14 +1457,23 @@ impl App {
             }
         }
 
-        // Sync any newly detected session_ids to the DB.
-        for (task_id, sid) in session_id_updates {
-            let mut fields = HashMap::new();
-            fields.insert(
-                "session_id".to_string(),
-                serde_json::Value::String(sid),
-            );
-            self.backend.update_task(task_id, fields);
+        // Sync any newly detected session_ids to the DB. Resolve each ws_id
+        // to bound tasks and push an update per bound task.
+        for (ws_id, sid) in ws_sid_updates {
+            for task in &self.tasks {
+                if task.workspace_id.as_deref() != Some(&ws_id) {
+                    continue;
+                }
+                let Some(task_id) = task.task_id.clone() else {
+                    continue;
+                };
+                let mut fields = HashMap::new();
+                fields.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(sid.clone()),
+                );
+                self.backend.update_task(task_id, fields);
+            }
         }
 
         if should_check_session_ids {
@@ -1264,13 +1527,13 @@ impl App {
                 let Some(sid) = &binding.current_session_id else {
                     continue;
                 };
-                let Some((ti, si)) = self.locate_workflow_session(&run.run_id, role) else {
+                let Some((wi, si)) = self.locate_workflow_session(&run.run_id, role) else {
                     continue;
                 };
-                if self.tasks[ti].sessions[si].session_type != "claude" {
+                if self.workspaces[wi].sessions[si].session_type != "claude" {
                     continue;
                 }
-                let Some(wt) = self.tasks[ti].worktree_path.clone() else {
+                let Some(wt) = self.workspaces[wi].worktree_path.clone() else {
                     continue;
                 };
                 bindings.insert(sid.clone(), (run.run_id.clone(), role.clone(), wt));
@@ -1302,10 +1565,10 @@ impl App {
             false
         });
         for (run_id, role, old_sid, new_sid) in &resolved {
-            let Some((ti, si)) = self.locate_workflow_session(run_id, role) else {
+            let Some((wi, si)) = self.locate_workflow_session(run_id, role) else {
                 continue;
             };
-            self.tasks[ti].sessions[si].session_id = Some(new_sid.clone());
+            self.workspaces[wi].sessions[si].session_id = Some(new_sid.clone());
             let Some(run) = self.workflow_runs.iter_mut().find(|r| &r.run_id == run_id)
             else {
                 continue;
@@ -1363,16 +1626,6 @@ impl App {
                 }
                 BackendEvent::Progress(msg) => {
                     self.set_status_msg(&msg);
-                }
-                BackendEvent::TaskCreated { name, task_id } => {
-                    // Find the local entry by name and assign the DB task_id.
-                    if let Some(task) = self
-                        .tasks
-                        .iter_mut()
-                        .find(|t| t.task_id.is_none() && t.name == name)
-                    {
-                        task.task_id = Some(task_id);
-                    }
                 }
                 BackendEvent::PullComplete {
                     task_id,
@@ -1451,11 +1704,11 @@ impl App {
             }
         }
         let mut to_bind: Vec<(usize, usize, String)> = Vec::new();
-        for (ti, task) in self.tasks.iter().enumerate() {
-            let Some(wt_str) = task.worktree_path.as_deref().and_then(|p| p.to_str()) else {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            let Some(wt_str) = ws.worktree_path.as_deref().and_then(|p| p.to_str()) else {
                 continue;
             };
-            for (si, ts) in task.sessions.iter().enumerate() {
+            for (si, ts) in ws.sessions.iter().enumerate() {
                 if ts.session_type != "claude"
                     || ts.workflow_run_id.is_none()
                     || ts.session_id.is_some()
@@ -1468,9 +1721,6 @@ impl App {
                 if prefix.is_empty() {
                     continue;
                 }
-                // Find the earliest history entry whose content starts with
-                // our prefix, in our project, on or after delivery time,
-                // with a sessionId that's not already claimed.
                 let mut best: Option<(u64, String)> = None;
                 for e in entries {
                     if e.project != wt_str {
@@ -1492,12 +1742,16 @@ impl App {
                     }
                 }
                 if let Some((_, sid)) = best {
-                    to_bind.push((ti, si, sid));
+                    to_bind.push((wi, si, sid));
                 }
             }
         }
-        for (ti, si, sid) in to_bind {
-            let Some(ts) = self.tasks.get_mut(ti).and_then(|t| t.sessions.get_mut(si)) else {
+        for (wi, si, sid) in to_bind {
+            let Some(ts) = self
+                .workspaces
+                .get_mut(wi)
+                .and_then(|w| w.sessions.get_mut(si))
+            else {
                 continue;
             };
             let run_id = ts.workflow_run_id.clone();
@@ -1525,18 +1779,20 @@ impl App {
         }
     }
 
-    /// Reconcile API tasks with local task entries.
+    /// Reconcile API tasks with local task entries + auto-provision a
+    /// Workspace for each running/blocked task that doesn't have one bound.
     fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
-        // Save cursor context for restoration.
-        let saved_task_id = match &self.cursor {
-            Cursor::Task(ti) => self.tasks.get(*ti).and_then(|t| t.task_id.clone()),
-            Cursor::Session(ti, _) => self.tasks.get(*ti).and_then(|t| t.task_id.clone()),
+        // Save cursor context for restoration: remember the workspace id and
+        // session label the cursor was on.
+        let saved_ws_id = match &self.cursor {
+            Cursor::Workspace(wi) => self.workspaces.get(*wi).map(|w| w.id.clone()),
+            Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
         };
         let saved_session_label = match &self.cursor {
-            Cursor::Session(ti, si) => self
-                .tasks
-                .get(*ti)
-                .and_then(|t| t.sessions.get(*si))
+            Cursor::Session(wi, si) => self
+                .workspaces
+                .get(*wi)
+                .and_then(|w| w.sessions.get(*si))
                 .map(|s| s.label.clone()),
             _ => None,
         };
@@ -1545,15 +1801,14 @@ impl App {
             std::collections::HashSet::new();
 
         for task in &tasks {
-            // Only show active tasks in the sessions view.
-            // Planning tasks (draft/backlog) belong in the planning view.
+            // Only show active tasks in the sessions view; backlog/draft/done
+            // stay in the planning view.
             match task.status.as_str() {
                 "running" | "blocked" => {}
                 _ => continue,
             }
             seen_ids.insert(task.id.clone());
 
-            // Display name: prefer name field, fall back to prompt, then id prefix.
             let display_name = task
                 .name
                 .as_deref()
@@ -1564,24 +1819,20 @@ impl App {
                 .collect::<String>();
 
             let is_cloud = task.is_cloud;
-
-            // Detect local worktree path for non-cloud tasks.
             let is_local = !is_cloud
                 && task
                     .wip_branch
                     .as_ref()
                     .map_or(false, |b| b.starts_with("cm/"));
 
+            // Upsert TaskEntry.
             if let Some(entry) = self
                 .tasks
                 .iter_mut()
                 .find(|e| e.task_id.as_deref() == Some(&task.id))
             {
-                // Update API fields. DON'T touch sessions.
-                entry.name = display_name;
+                entry.name = display_name.clone();
                 entry.api_status = TaskStatus::from_api(&task.status);
-                entry.worker_vm = task.worker_vm.clone();
-                entry.worker_zone = task.worker_zone.clone();
                 entry.repo_url = Some(task.repo_url.clone());
                 entry.prompt = task.prompt.clone();
                 entry.wip_branch = task.wip_branch.clone();
@@ -1589,10 +1840,39 @@ impl App {
                 entry.blocked_at = task.blocked_at.clone();
                 entry.is_cloud = is_cloud;
             } else {
-                // For local tasks, try to find the worktree on disk.
-                let worktree_path = if is_local {
-                    if let Some(ref branch) = task.wip_branch {
-                        let slug = branch.strip_prefix("cm/").unwrap_or(branch);
+                self.tasks.push(TaskEntry {
+                    task_id: Some(task.id.clone()),
+                    name: display_name.clone(),
+                    api_status: TaskStatus::from_api(&task.status),
+                    repo_url: Some(task.repo_url.clone()),
+                    prompt: task.prompt.clone(),
+                    wip_branch: task.wip_branch.clone(),
+                    session_id: task.session_id.clone(),
+                    blocked_at: task.blocked_at.clone(),
+                    is_cloud,
+                    workspace_id: None,
+                });
+            }
+
+            // Link (or create) a Workspace for this task if it doesn't already
+            // have one. Multi-task workspaces: users explicitly bind via the
+            // launch-into-workspace picker, so we only auto-bind when the
+            // task's own worktree (local) or VM (cloud) matches.
+            let task_idx = self
+                .tasks
+                .iter()
+                .position(|t| t.task_id.as_deref() == Some(&task.id))
+                .expect("just inserted");
+            if self.tasks[task_idx].workspace_id.is_some() {
+                continue;
+            }
+
+            let (worktree_path, main_repo_path) = if is_local {
+                let wt = task
+                    .wip_branch
+                    .as_ref()
+                    .and_then(|b| {
+                        let slug = b.strip_prefix("cm/").unwrap_or(b);
                         let repo_name = task
                             .repo_url
                             .trim_end_matches('/')
@@ -1603,87 +1883,144 @@ impl App {
                         let path = dirs::home_dir()
                             .unwrap_or_default()
                             .join(format!(".cm/worktrees/{}-{}", repo_name, slug));
-                        if path.exists() {
-                            Some(path)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                        path.exists().then_some(path)
+                    });
+                let main = wt.is_some().then(|| worktree::find_local_repo(&task.repo_url)).flatten();
+                (wt, main)
+            } else {
+                (None, None)
+            };
 
-                let main_repo_path = if worktree_path.is_some() {
-                    worktree::find_local_repo(&task.repo_url)
-                } else {
-                    None
-                };
+            // Match an existing workspace:
+            //   - local: same worktree_path
+            //   - cloud: same worker_vm (VM uniquely identifies the cloud workspace)
+            let existing_ws_idx = if is_cloud {
+                task.worker_vm.as_deref().filter(|s| !s.is_empty()).and_then(|vm| {
+                    self.workspaces
+                        .iter()
+                        .position(|w| w.is_cloud && w.worker_vm.as_deref() == Some(vm))
+                })
+            } else {
+                worktree_path.as_ref().and_then(|wt| {
+                    self.workspaces
+                        .iter()
+                        .position(|w| w.worktree_path.as_deref() == Some(wt.as_path()))
+                })
+            };
 
-                let is_cloud = task.is_cloud;
-                self.tasks.push(TaskEntry {
-                    task_id: Some(task.id.clone()),
-                    name: display_name,
-                    api_status: TaskStatus::from_api(&task.status),
+            let ws_id = if let Some(wi) = existing_ws_idx {
+                self.workspaces[wi].id.clone()
+            } else if is_cloud || worktree_path.is_some() {
+                // Auto-provision a workspace so this task gets a sidebar row.
+                let ws = Workspace {
+                    id: new_workspace_id(),
+                    name: display_name.clone(),
+                    is_closed: false,
+                    is_cloud,
                     repo_url: Some(task.repo_url.clone()),
-                    prompt: task.prompt.clone(),
-                    wip_branch: task.wip_branch.clone(),
-                    session_id: task.session_id.clone(),
-                    blocked_at: task.blocked_at.clone(),
-                    worker_vm: task.worker_vm.clone(),
-                    worker_zone: task.worker_zone.clone(),
                     worktree_path,
                     main_repo_path,
+                    worker_vm: task.worker_vm.clone(),
+                    worker_zone: task.worker_zone.clone(),
                     sessions: vec![],
-                    is_cloud,
-                });
-            }
+                };
+                let id = ws.id.clone();
+                self.workspaces.push(ws);
+                id
+            } else {
+                continue;
+            };
+            self.tasks[task_idx].workspace_id = Some(ws_id);
         }
 
-        // Retain: keep tasks in seen_ids OR that have sessions.
+        // Retain tasks: keep those still seen by the API, plus anything still
+        // referenced by a workspace (in case a bound task temporarily vanished
+        // from the API — unlikely but defensive).
+        let ws_bound_task_ids: std::collections::HashSet<String> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| {
+                self.tasks
+                    .iter()
+                    .filter(move |t| t.workspace_id.as_deref() == Some(&w.id))
+                    .filter_map(|t| t.task_id.clone())
+            })
+            .collect();
         self.tasks.retain(|t| {
-            if t.api_status == TaskStatus::Done && t.sessions.is_empty() {
+            if t.api_status == TaskStatus::Done {
                 return false;
             }
             match &t.task_id {
-                Some(id) => seen_ids.contains(id) || !t.sessions.is_empty(),
-                None => true,
-            }
-        });
-
-        // Sort tasks: Running first, then Blocked, Backlog, Done.
-        self.tasks.sort_by(|a, b| {
-            fn status_rank(s: &TaskStatus) -> u8 {
-                match s {
-                    TaskStatus::Running => 0,
-                    TaskStatus::Blocked => 1,
-                    TaskStatus::Backlog => 2,
-                    TaskStatus::Done => 3,
+                Some(id) => {
+                    seen_ids.contains(id)
+                        || ws_bound_task_ids.contains(id)
                 }
+                None => false,
             }
-            status_rank(&a.status()).cmp(&status_rank(&b.status()))
         });
 
-        // Restore cursor.
-        if let Some(ref id) = saved_task_id {
-            if let Some(ti) = self
-                .tasks
+        // Also GC workspaces whose worker_vm-based cloud task is gone.
+        // Keep local workspaces always (they survive task lifecycle).
+        self.workspaces.retain(|w| {
+            if !w.is_cloud {
+                return true;
+            }
+            let vm = match w.worker_vm.as_deref() {
+                Some(vm) if !vm.is_empty() => vm,
+                _ => return true,
+            };
+            tasks.iter().any(|t| {
+                t.is_cloud
+                    && t.worker_vm.as_deref() == Some(vm)
+                    && matches!(t.status.as_str(), "running" | "blocked")
+            })
+        });
+
+        // Sort workspaces by effective status (via their first bound task if
+        // any). No bound task → put last.
+        let status_rank = |s: &TaskStatus| -> u8 {
+            match s {
+                TaskStatus::Running => 0,
+                TaskStatus::Blocked => 1,
+                TaskStatus::Backlog => 2,
+                TaskStatus::Done => 3,
+            }
+        };
+        let workspace_rank: Vec<(String, u8)> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                let rank = self
+                    .first_task_for_ws(&w.id)
+                    .map(|t| status_rank(&self.task_status(t)))
+                    .unwrap_or(4);
+                (w.id.clone(), rank)
+            })
+            .collect();
+        let rank_of = |id: &str| -> u8 {
+            workspace_rank
                 .iter()
-                .position(|t| t.task_id.as_deref() == Some(id))
-            {
+                .find(|(i, _)| i == id)
+                .map(|(_, r)| *r)
+                .unwrap_or(4)
+        };
+        self.workspaces.sort_by_key(|w| rank_of(&w.id));
+
+        // Restore cursor by workspace id.
+        if let Some(ref id) = saved_ws_id {
+            if let Some(wi) = self.workspaces.iter().position(|w| &w.id == id) {
                 if let Some(ref label) = saved_session_label {
-                    if let Some(si) = self.tasks[ti]
+                    if let Some(si) = self.workspaces[wi]
                         .sessions
                         .iter()
                         .position(|s| &s.label == label)
                     {
-                        self.cursor = Cursor::Session(ti, si);
+                        self.cursor = Cursor::Session(wi, si);
                     } else {
-                        self.cursor = Cursor::Task(ti);
+                        self.cursor = Cursor::Workspace(wi);
                     }
                 } else {
-                    self.cursor = Cursor::Task(ti);
+                    self.cursor = Cursor::Workspace(wi);
                 }
             }
         }
@@ -1724,6 +2061,10 @@ impl App {
 
         // Delegate to planning view when in Planning mode.
         if self.view_mode == ViewMode::Planning {
+            // Keep planning's workspace picker in sync with the current
+            // set of open workspaces before it sees the event.
+            let candidates = self.collect_workspace_candidates();
+            self.planning.set_workspace_candidates(candidates);
             let action = self.planning.handle_event(event);
             match action {
                 PlanAction::Consumed => return true,
@@ -1737,6 +2078,26 @@ impl App {
                     task_id,
                 } => {
                     self.launch_from_plan(&project, &slug, &prompt, branch.as_deref(), autostart, &task_id);
+                    return true;
+                }
+                PlanAction::LaunchTaskIntoWorkspace {
+                    workspace_id,
+                    task_id,
+                    task_title,
+                    task_repo_url,
+                    prompt,
+                } => {
+                    self.launch_into_workspace(
+                        &workspace_id,
+                        &task_id,
+                        &task_title,
+                        &task_repo_url,
+                        &prompt,
+                    );
+                    return true;
+                }
+                PlanAction::UnbindTask { task_id } => {
+                    self.unbind_task_from_workspace(&task_id);
                     return true;
                 }
                 PlanAction::SwitchToSessions => {
@@ -1798,6 +2159,19 @@ impl App {
                     }
                     KeyCode::Char('s') => {
                         self.start_new_terminal_session();
+                        return true;
+                    }
+                    // A-W (close workspace) vs A-w (close session). Terminals
+                    // differ on whether Shift is baked into the char case or
+                    // reported as a modifier — accept both forms.
+                    KeyCode::Char('W') => {
+                        self.close_active_workspace();
+                        return true;
+                    }
+                    KeyCode::Char('w')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.close_active_workspace();
                         return true;
                     }
                     KeyCode::Char('w') => {
@@ -2102,7 +2476,7 @@ impl App {
                     _ => return true,
                 },
                 InputMode::NewTerminalSession {
-                    task_index,
+                    ws_index,
                     session_type,
                 } => match key.code {
                     KeyCode::Esc => {
@@ -2126,16 +2500,16 @@ impl App {
                         return true;
                     }
                     KeyCode::Enter => {
-                        let ti = *task_index;
+                        let wi = *ws_index;
                         let st = session_type.clone();
                         self.input_mode = InputMode::Normal;
-                        self.spawn_session_on_task(ti, &st);
+                        self.spawn_session_on_workspace(wi, &st);
                         return true;
                     }
                     _ => return true,
                 },
                 InputMode::SessionSettings {
-                    task_index,
+                    ws_index,
                     session_index,
                     name,
                     idle_timeout,
@@ -2155,14 +2529,14 @@ impl App {
                         return true;
                     }
                     KeyCode::Enter => {
-                        let ti = *task_index;
+                        let wi = *ws_index;
                         let si = *session_index;
                         let new_name = name.clone();
                         let new_timeout = idle_timeout.parse::<u16>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
                         let new_hidden = *hidden;
                         self.input_mode = InputMode::Normal;
-                        if let Some(task) = self.tasks.get_mut(ti) {
-                            if let Some(ts) = task.sessions.get_mut(si) {
+                        if let Some(ws) = self.workspaces.get_mut(wi) {
+                            if let Some(ts) = ws.sessions.get_mut(si) {
                                 if !new_name.trim().is_empty() {
                                     ts.label = new_name;
                                 }
@@ -2194,18 +2568,46 @@ impl App {
                     }
                     _ => return true,
                 },
-                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots, active_slot } => {
+                InputMode::WorkspaceSettings { ws_index, name } => match key.code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                        return true;
+                    }
+                    KeyCode::Enter => {
+                        let wi = *ws_index;
+                        let new_name = name.trim().to_string();
+                        self.input_mode = InputMode::Normal;
+                        if !new_name.is_empty() {
+                            if let Some(ws) = self.workspaces.get_mut(wi) {
+                                ws.name = new_name;
+                            }
+                            self.save_session_manifest();
+                            self.set_status_msg("Workspace renamed");
+                        }
+                        return true;
+                    }
+                    KeyCode::Backspace => {
+                        name.pop();
+                        return true;
+                    }
+                    KeyCode::Char(c) => {
+                        name.push(c);
+                        return true;
+                    }
+                    _ => return true,
+                },
+                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot } => {
                     match key.code {
                         KeyCode::Esc => {
                             self.input_mode = InputMode::Normal;
                             return true;
                         }
                         KeyCode::Enter => {
-                            let ti = *task_index;
+                            let wi = *ws_index;
                             let wf_name = workflow_name.clone();
                             let slots_owned = slots.clone();
                             self.input_mode = InputMode::Normal;
-                            self.launch_workflow(ti, &wf_name, slots_owned);
+                            self.launch_workflow(wi, &wf_name, slots_owned);
                             return true;
                         }
                         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
@@ -2253,7 +2655,7 @@ impl App {
 
     // ── Session management ──────────────────────────────────────────
 
-    /// Enter input mode to create a new local session.
+    /// Enter input mode to create a new workspace (empty, no task binding).
     fn start_new_session(&mut self) {
         // Use the first repo from config.
         let (_repo_name, repo_url) = match self.config.repos.iter().next() {
@@ -2273,46 +2675,44 @@ impl App {
         };
     }
 
-    /// Enter input mode to add a terminal session to the active task.
+    /// Enter input mode to add a terminal session to the active workspace.
     fn start_new_terminal_session(&mut self) {
-        let ti = match self.active_task_index() {
-            Some(ti) => ti,
+        let wi = match self.active_workspace_index() {
+            Some(wi) => wi,
             None => {
-                self.set_status_msg("No task selected");
+                self.set_status_msg("No workspace selected");
                 return;
             }
         };
         self.input_mode = InputMode::NewTerminalSession {
-            task_index: ti,
+            ws_index: wi,
             session_type: "claude".to_string(),
         };
     }
 
-    /// Close the current session (remove from task.sessions).
+    /// Close the current session (remove from workspace.sessions).
     fn close_active_session(&mut self) {
         match self.cursor.clone() {
-            Cursor::Session(ti, si) => {
-                if let Some(task) = self.tasks.get_mut(ti) {
-                    if si < task.sessions.len() {
-                        task.sessions.remove(si);
-                        // Move cursor to task header or previous session.
-                        if task.sessions.is_empty() {
-                            self.cursor = Cursor::Task(ti);
+            Cursor::Session(wi, si) => {
+                if let Some(ws) = self.workspaces.get_mut(wi) {
+                    if si < ws.sessions.len() {
+                        ws.sessions.remove(si);
+                        if ws.sessions.is_empty() {
+                            self.cursor = Cursor::Workspace(wi);
                         } else {
-                            let new_si = si.min(task.sessions.len() - 1);
-                            self.cursor = Cursor::Session(ti, new_si);
+                            let new_si = si.min(ws.sessions.len() - 1);
+                            self.cursor = Cursor::Session(wi, new_si);
                         }
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
                     }
                 }
             }
-            Cursor::Task(ti) => {
-                // If task has one session, close it.
-                if let Some(task) = self.tasks.get_mut(ti) {
-                    if task.sessions.len() == 1 {
-                        task.sessions.remove(0);
-                        self.cursor = Cursor::Task(ti);
+            Cursor::Workspace(wi) => {
+                if let Some(ws) = self.workspaces.get_mut(wi) {
+                    if ws.sessions.len() == 1 {
+                        ws.sessions.remove(0);
+                        self.cursor = Cursor::Workspace(wi);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
                     }
@@ -2321,7 +2721,7 @@ impl App {
         }
     }
 
-    /// Create a local Claude session in a worktree (new task).
+    /// Create a fresh standalone workspace — A-n flow. No task binding.
     fn create_local_session(
         &mut self,
         repo_url: &str,
@@ -2343,233 +2743,146 @@ impl App {
             return;
         }
 
-        let worktree_path =
-            match worktree::create_worktree(&main_repo, &slug, start_branch) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.set_status_msg(&format!("Worktree: {}", e));
-                    return;
-                }
-            };
-
+        let worktree_path = match worktree::create_worktree(&main_repo, &slug, start_branch) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status_msg(&format!("Worktree: {}", e));
+                return;
+            }
+        };
         worktree::setup_worktree(&main_repo, &worktree_path);
 
-        // Launch Claude Code fresh (no --resume for new tasks).
         let (cols, rows) = self.last_term_size;
         let args = vec!["--dangerously-skip-permissions".to_string()];
         let pending = Self::list_jsonl_files(&worktree_path);
 
-        let session = Session::new(
+        let Ok(s) = Session::new(
             "claude",
             &args,
             cols,
             rows,
             Some(worktree_path.clone()),
             Default::default(),
-        );
-
-        let branch = format!("cm/{}", slug);
-
-        match session {
-            Ok(s) => {
-                let ts = TerminalSession {
-                    label: "claude".to_string(),
-                    session_type: "claude".to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: None,
-                    pending_jsonl_files: Some(pending),
-                    hidden: false,
-                    idle_timeout_secs: idle_timeout_secs,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
-                let new_ti = self.tasks.len();
-                self.tasks.push(TaskEntry {
-                    task_id: None,
-                    name: label.to_string(),
-                    api_status: TaskStatus::Running,
-                    repo_url: Some(repo_url.to_string()),
-                    prompt: None,
-                    wip_branch: Some(branch.clone()),
-                    session_id: None,
-                    blocked_at: None,
-                    worker_vm: None,
-                    worker_zone: None,
-                    worktree_path: Some(worktree_path),
-                    main_repo_path: Some(main_repo),
-                    sessions: vec![ts],
-                    is_cloud: false,
-                });
-                self.cursor = Cursor::Session(new_ti, 0);
-
-                // Create task in DB (async, background).
-                self.backend.create_task(
-                    label.to_string(),
-                    repo_url.to_string(),
-                    branch,
-                );
-                self.save_session_manifest();
-                self.set_status_msg("Local session started");
-            }
-            Err(e) => {
-                self.set_status_msg(&format!("Spawn: {}", e));
-            }
-        }
-    }
-
-    /// Attach to the active task (SSH for cloud, claude for local worktree, bash fallback).
-    fn attach_active(&mut self) {
-        let ti = match self.active_task_index() {
-            Some(ti) => ti,
-            None => return,
+        ) else {
+            self.set_status_msg("Spawn failed");
+            return;
         };
 
-        let (cols, rows) = self.last_term_size;
+        let ts = TerminalSession {
+            label: "claude".to_string(),
+            session_type: "claude".to_string(),
+            session: s,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            session_id: None,
+            pending_jsonl_files: Some(pending),
+            hidden: false,
+            idle_timeout_secs,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            last_delivery: None,
+        };
+        let ws = Workspace {
+            id: new_workspace_id(),
+            name: label.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: Some(repo_url.to_string()),
+            worktree_path: Some(worktree_path),
+            main_repo_path: Some(main_repo),
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![ts],
+        };
+        let new_wi = self.workspaces.len();
+        self.workspaces.push(ws);
+        self.cursor = Cursor::Session(new_wi, 0);
+        self.save_session_manifest();
+        self.set_status_msg("Workspace created");
+    }
 
-        // If task already has sessions, just report.
-        if !self.tasks[ti].sessions.is_empty() {
-            self.set_status_msg("Task already has sessions");
+    /// Attach to the active workspace (SSH for cloud, claude for local, bash fallback).
+    fn attach_active(&mut self) {
+        let wi = match self.active_workspace_index() {
+            Some(wi) => wi,
+            None => return,
+        };
+        let (cols, rows) = self.last_term_size;
+        let ws = &self.workspaces[wi];
+
+        if !ws.sessions.is_empty() {
+            self.set_status_msg("Workspace already has sessions");
             return;
         }
-
-        // Cloud task but no VM assigned yet — can't open sessions.
-        if self.tasks[ti].is_cloud && self.tasks[ti].worker_vm.is_none() {
+        if ws.is_cloud && ws.worker_vm.is_none() {
             self.set_status_msg("Waiting for cloud VM assignment...");
             return;
         }
 
-        if let Some(vm) = self.tasks[ti].worker_vm.clone().filter(|s| !s.is_empty()) {
-            // Cloud: SSH into the worker VM.
-            let zone = self.tasks[ti]
+        let ts = if let Some(vm) = ws.worker_vm.clone().filter(|s| !s.is_empty()) {
+            let zone = ws
                 .worker_zone
                 .clone()
                 .unwrap_or_else(|| self.config.gcp_zone.clone());
             let args = vec![
                 "compute".to_string(),
                 "ssh".to_string(),
-                vm.clone(),
+                vm,
                 format!("--zone={}", zone),
                 format!("--project={}", self.config.gcp_project),
                 "--".to_string(),
                 "-t".to_string(),
-                "TERM=xterm-256color sudo su - worker -c 'tmux attach -t claude'"
-                    .to_string(),
+                "TERM=xterm-256color sudo su - worker -c 'tmux attach -t claude'".to_string(),
             ];
-            if let Ok(s) =
-                Session::new("gcloud", &args, cols, rows, None, Default::default())
-            {
-                let ts = TerminalSession {
-                    label: "ssh".to_string(),
-                    session_type: "bash".to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: None,
-                    pending_jsonl_files: None,
-                    hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
-                let si = self.tasks[ti].sessions.len();
-                self.tasks[ti].sessions.push(ts);
-                self.cursor = Cursor::Session(ti, si);
-            }
-        } else if let Some(wt) = self.tasks[ti].worktree_path.clone() {
-            // Local worktree: launch Claude Code fresh.
+            Session::new("gcloud", &args, cols, rows, None, Default::default())
+                .ok()
+                .map(|s| make_simple_session("ssh", "bash", s, None))
+        } else if let Some(wt) = ws.worktree_path.clone() {
             let args = vec!["--dangerously-skip-permissions".to_string()];
             let pending = Self::list_jsonl_files(&wt);
-            if let Ok(s) = Session::new(
-                "claude",
-                &args,
-                cols,
-                rows,
-                Some(wt.clone()),
-                Default::default(),
-            ) {
-                let ts = TerminalSession {
-                    label: "claude".to_string(),
-                    session_type: "claude".to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: None,
-                    pending_jsonl_files: Some(pending),
-                    hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
-                let si = self.tasks[ti].sessions.len();
-                self.tasks[ti].sessions.push(ts);
-                self.cursor = Cursor::Session(ti, si);
-            }
+            Session::new("claude", &args, cols, rows, Some(wt), Default::default())
+                .ok()
+                .map(|s| make_simple_session("claude", "claude", s, Some(pending)))
         } else {
-            // Fallback: bash shell.
-            if let Ok(s) =
-                Session::new("/bin/bash", &[], cols, rows, None, Default::default())
-            {
-                let ts = TerminalSession {
-                    label: "bash".to_string(),
-                    session_type: "bash".to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: None,
-                    pending_jsonl_files: None,
-                    hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
-                let si = self.tasks[ti].sessions.len();
-                self.tasks[ti].sessions.push(ts);
-                self.cursor = Cursor::Session(ti, si);
-            }
+            Session::new("/bin/bash", &[], cols, rows, None, Default::default())
+                .ok()
+                .map(|s| make_simple_session("bash", "bash", s, None))
+        };
+
+        if let Some(ts) = ts {
+            let si = self.workspaces[wi].sessions.len();
+            self.workspaces[wi].sessions.push(ts);
+            self.cursor = Cursor::Session(wi, si);
         }
     }
 
-    /// Spawn a session on an existing task by type ("claude" or "bash").
-    fn spawn_session_on_task(&mut self, task_index: usize, session_type: &str) {
-        if task_index >= self.tasks.len() {
+    /// Spawn a session on an existing workspace by type ("claude" / "codex" / "bash").
+    fn spawn_session_on_workspace(&mut self, ws_index: usize, session_type: &str) {
+        if ws_index >= self.workspaces.len() {
             return;
         }
-
-        // Cloud task but no VM assigned yet — can't open sessions.
-        if self.tasks[task_index].is_cloud && self.tasks[task_index].worker_vm.is_none() {
+        if self.workspaces[ws_index].is_cloud && self.workspaces[ws_index].worker_vm.is_none() {
             self.set_status_msg("Waiting for cloud VM assignment...");
             return;
         }
 
         let (cols, rows) = self.last_term_size;
 
-        // Cloud task with VM: SSH for bash sessions.
-        if let Some(ref vm) = self.tasks[task_index].worker_vm.clone().filter(|s| !s.is_empty()) {
+        // Cloud workspace + bash session type → SSH into the VM.
+        if let Some(vm) = self.workspaces[ws_index].worker_vm.clone().filter(|s| !s.is_empty()) {
             if session_type == "bash" {
-                let zone = self.tasks[task_index]
+                let zone = self.workspaces[ws_index]
                     .worker_zone
                     .clone()
                     .unwrap_or_else(|| self.config.gcp_zone.clone());
-                let si = self.tasks[task_index].sessions.len();
+                let si = self.workspaces[ws_index].sessions.len();
                 let tmux_name = format!("bash-{}", si);
                 let args = vec![
                     "compute".to_string(),
                     "ssh".to_string(),
-                    vm.clone(),
+                    vm,
                     format!("--zone={}", zone),
                     format!("--project={}", self.config.gcp_project),
                     "--".to_string(),
@@ -2581,25 +2894,10 @@ impl App {
                 ];
                 match Session::new("gcloud", &args, cols, rows, None, Default::default()) {
                     Ok(s) => {
-                        let ts = TerminalSession {
-                            label: tmux_name,
-                            session_type: "bash".to_string(),
-                            session: s,
-                            status: SessionStatus::Running,
-                            last_write_at: None,
-                            session_id: None,
-                            pending_jsonl_files: None,
-                            hidden: false,
-                            idle_timeout_secs: 0,
-                            pending_prompt: None,
-                            pending_clear: None,
-                            workflow_run_id: None,
-                            workflow_role: None,
-                        last_delivery: None,
-                        };
-                        let si = self.tasks[task_index].sessions.len();
-                        self.tasks[task_index].sessions.push(ts);
-                        self.cursor = Cursor::Session(task_index, si);
+                        let ts = make_simple_session(&tmux_name, "bash", s, None);
+                        let si = self.workspaces[ws_index].sessions.len();
+                        self.workspaces[ws_index].sessions.push(ts);
+                        self.cursor = Cursor::Session(ws_index, si);
                         self.save_session_manifest();
                         self.set_status_msg("Started SSH bash session");
                     }
@@ -2609,15 +2907,12 @@ impl App {
             }
         }
 
-        let wt = self.tasks[task_index].worktree_path.clone();
-
-        // Record existing session files before spawning (for session_id detection).
+        let wt = self.workspaces[ws_index].worktree_path.clone();
         let pending = match session_type {
             "claude" => wt.as_ref().map(|p| Self::list_jsonl_files(p)),
             "codex" => wt.as_ref().map(|p| Self::list_codex_sessions(p)),
             _ => None,
         };
-
         let result = match session_type {
             "claude" => {
                 let args = vec!["--dangerously-skip-permissions".to_string()];
@@ -2629,34 +2924,16 @@ impl App {
             }
             _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default()),
         };
-
         match result {
             Ok(s) => {
-                let ts = TerminalSession {
-                    label: session_type.to_string(),
-                    session_type: session_type.to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: None,
-                    pending_jsonl_files: pending,
-                    hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
-                let si = self.tasks[task_index].sessions.len();
-                self.tasks[task_index].sessions.push(ts);
-                self.cursor = Cursor::Session(task_index, si);
+                let ts = make_simple_session(session_type, session_type, s, pending);
+                let si = self.workspaces[ws_index].sessions.len();
+                self.workspaces[ws_index].sessions.push(ts);
+                self.cursor = Cursor::Session(ws_index, si);
                 self.save_session_manifest();
                 self.set_status_msg(&format!("Started {} session", session_type));
             }
-            Err(e) => {
-                self.set_status_msg(&format!("Spawn: {}", e));
-            }
+            Err(e) => self.set_status_msg(&format!("Spawn: {}", e)),
         }
     }
 
@@ -2686,62 +2963,67 @@ impl App {
             Default::default(),
         ) {
             Ok(s) => {
-                let ts = TerminalSession {
-                    label: "claude".to_string(),
-                    session_type: "claude".to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: Some(session_id.clone()),
-                    pending_jsonl_files: None,
-                    hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
+                let mut ts = make_simple_session("claude", "claude", s, None);
+                ts.session_id = Some(session_id.clone());
 
-                // Find existing task by task_id or create new.
-                let ti = if let Some(ref id) = task_id {
-                    self.tasks
-                        .iter()
-                        .position(|t| t.task_id.as_deref() == Some(id))
-                } else {
-                    None
-                };
+                // If we have a task_id, find the TaskEntry and its (cloud)
+                // workspace; replace that workspace with a local one.
+                let target_ti = task_id
+                    .as_ref()
+                    .and_then(|id| {
+                        self.tasks
+                            .iter()
+                            .position(|t| t.task_id.as_deref() == Some(id))
+                    });
 
-                if let Some(ti) = ti {
-                    // Clear old cloud sessions (e.g. SSH bash) on pull-to-local.
-                    self.tasks[ti].sessions.clear();
-                    self.tasks[ti].sessions.push(ts);
-                    self.tasks[ti].worktree_path = Some(worktree_path);
-                    self.tasks[ti].main_repo_path = Some(main_repo);
+                let local_ws = Workspace {
+                    id: new_workspace_id(),
+                    name: task_id
+                        .as_deref()
+                        .and_then(|id| {
+                            self.tasks
+                                .iter()
+                                .find(|t| t.task_id.as_deref() == Some(id))
+                                .map(|t| t.name.clone())
+                        })
+                        .unwrap_or_else(|| prompt.chars().take(60).collect()),
+                    is_closed: false,
+                    is_cloud: false,
+                    repo_url: Some(repo_url.clone()),
+                    worktree_path: Some(worktree_path.clone()),
+                    main_repo_path: Some(main_repo.clone()),
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: vec![ts],
+                };
+                let ws_id = local_ws.id.clone();
+
+                if let Some(ti) = target_ti {
+                    // Remove the old (cloud) workspace if one was linked.
+                    if let Some(old_id) = self.tasks[ti].workspace_id.clone() {
+                        self.workspaces.retain(|w| w.id != old_id);
+                    }
                     self.tasks[ti].is_cloud = false;
-                    self.cursor = Cursor::Session(ti, 0);
+                    self.tasks[ti].session_id = Some(session_id);
+                    self.tasks[ti].workspace_id = Some(ws_id.clone());
                 } else {
-                    let display_name: String =
-                        prompt.chars().take(60).collect();
-                    let new_ti = self.tasks.len();
+                    // No matching task — create one.
                     self.tasks.push(TaskEntry {
                         task_id,
-                        name: display_name,
+                        name: local_ws.name.clone(),
                         api_status: TaskStatus::Running,
                         repo_url: Some(repo_url),
                         prompt: Some(prompt),
                         wip_branch: None,
                         session_id: Some(session_id),
                         blocked_at: None,
-                        worker_vm: None,
-                        worker_zone: None,
-                        worktree_path: Some(worktree_path),
-                        main_repo_path: Some(main_repo),
-                        sessions: vec![ts],
                         is_cloud: false,
+                        workspace_id: Some(ws_id.clone()),
                     });
-                    self.cursor = Cursor::Session(new_ti, 0);
                 }
+                self.workspaces.push(local_ws);
+                let new_wi = self.workspaces.len() - 1;
+                self.cursor = Cursor::Session(new_wi, 0);
                 self.save_session_manifest();
                 self.set_status_msg("Resumed locally");
             }
@@ -2751,62 +3033,80 @@ impl App {
         }
     }
 
-    /// Mark the active task as done via the API.
+    /// Mark the first task bound to the active workspace as done via the API.
+    /// Does nothing if the workspace has zero or multiple bound tasks (ambiguous).
     fn mark_active_done(&mut self) {
-        let ti = match self.active_task_index() {
-            Some(ti) => ti,
-            None => return,
+        let Some(wi) = self.active_workspace_index() else {
+            return;
         };
-
-        // Drop all sessions.
-        self.tasks[ti].sessions.clear();
-
-        if let Some(ref id) = self.tasks[ti].task_id {
+        let ws_id = self.workspaces[wi].id.clone();
+        let bound: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
+            .filter_map(|t| t.task_id.clone())
+            .collect();
+        if bound.len() > 1 {
+            self.set_status_msg("Multiple tasks bound — use planning view");
+            return;
+        }
+        if let Some(tid) = bound.first().cloned() {
             let mut fields = HashMap::new();
             fields.insert(
                 "status".to_string(),
                 serde_json::Value::String("done".to_string()),
             );
-            self.backend.update_task(id.clone(), fields);
+            self.backend.update_task(tid.clone(), fields);
+            self.planning.mark_task_done_by_id(&tid);
+            if let Some(task) = self
+                .tasks
+                .iter_mut()
+                .find(|t| t.task_id.as_deref() == Some(&tid))
+            {
+                task.api_status = TaskStatus::Done;
+            }
         }
-        self.tasks[ti].api_status = TaskStatus::Done;
-        self.cursor = Cursor::Task(ti);
+        // Drop sessions and leave workspace alive; user can explicitly close
+        // via A-W if desired.
+        self.workspaces[wi].sessions.clear();
+        self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
-
-        // Sync status to planning task if there's a matching one.
-        if let Some(ref id) = self.tasks[ti].task_id {
-            self.planning.mark_task_done_by_id(id);
-        }
-
         self.set_status_msg("Marked done");
     }
 
-    /// Delete the active task: close sessions, remove worktree + branch, delete from API.
+    /// Delete the active workspace: close sessions, remove worktree + branch,
+    /// delete any bound tasks from the API, drop the workspace.
     fn delete_active(&mut self) {
-        let ti = match self.active_task_index() {
-            Some(ti) => ti,
-            None => return,
+        let Some(wi) = self.active_workspace_index() else {
+            return;
         };
+        let ws_id = self.workspaces[wi].id.clone();
+        let worktree_path = self.workspaces[wi].worktree_path.clone();
+        let main_repo_path = self.workspaces[wi].main_repo_path.clone();
+        let bound_task_ids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
+            .filter_map(|t| t.task_id.clone())
+            .collect();
 
-        let task_id = self.tasks[ti].task_id.clone();
-        let worktree_path = self.tasks[ti].worktree_path.clone();
-        let main_repo = self.tasks[ti].main_repo_path.clone();
-        let wip_branch = self.tasks[ti].wip_branch.clone();
+        // Determine the branch to delete from any bound task's wip_branch.
+        let wip_branch = self
+            .tasks
+            .iter()
+            .find(|t| t.workspace_id.as_deref() == Some(&ws_id))
+            .and_then(|t| t.wip_branch.clone());
 
-        // Delete worktree.
-        if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo) {
+        if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo_path) {
             worktree::remove_worktree(repo, wt);
         }
-
-        // Delete branch locally. Only delete remote if it was pushed.
-        if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo) {
+        if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo_path) {
             let _ = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
                 .args(["branch", "-D", branch])
                 .output();
-            // Only delete remote branch if the task was pushed to cloud.
-            if task_id.is_some() {
+            if !bound_task_ids.is_empty() {
                 let _ = std::process::Command::new("git")
                     .arg("-C")
                     .arg(repo)
@@ -2815,79 +3115,86 @@ impl App {
             }
         }
 
-        // Delete from API.
-        if let Some(ref id) = task_id {
-            self.backend.delete_task(id.clone());
+        for tid in &bound_task_ids {
+            self.backend.delete_task(tid.clone());
         }
-
-        // Remove from local list.
-        self.tasks.remove(ti);
-        if !self.tasks.is_empty() {
-            self.cursor = Cursor::Task(ti.min(self.tasks.len() - 1));
-        } else {
-            self.cursor = Cursor::Task(0);
-        }
+        self.tasks.retain(|t| !bound_task_ids.iter().any(|id| t.task_id.as_deref() == Some(id)));
+        self.workspaces.remove(wi);
+        self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
         self.set_status_msg("Deleted");
     }
 
-    /// Push the active local session to the cloud.
+    /// Push the active local workspace to the cloud. If a task is bound to
+    /// the workspace, its id is included so the cloud side can reuse it;
+    /// otherwise a new cloud task is created from the workspace's name.
     fn push_active(&mut self) {
-        let ti = match self.active_task_index() {
-            Some(ti) => ti,
-            None => return,
+        let Some(wi) = self.active_workspace_index() else {
+            return;
         };
-
-        if self.tasks[ti].is_cloud {
-            self.set_status_msg("Can only push local sessions");
+        if self.workspaces[wi].is_cloud {
+            self.set_status_msg("Can only push local workspaces");
             return;
         }
-        let worktree_path = match &self.tasks[ti].worktree_path {
+        let worktree_path = match &self.workspaces[wi].worktree_path {
             Some(p) => p.clone(),
             None => {
                 self.set_status_msg("No worktree to push");
                 return;
             }
         };
-        let repo_url = match &self.tasks[ti].repo_url {
+        let repo_url = match &self.workspaces[wi].repo_url {
             Some(u) => u.clone(),
             None => {
                 self.set_status_msg("No repo URL");
                 return;
             }
         };
-        let name = self.tasks[ti]
-            .prompt
-            .clone()
-            .unwrap_or_else(|| self.tasks[ti].name.clone());
-        let task_id = self.tasks[ti].task_id.clone();
+        let ws_id = self.workspaces[wi].id.clone();
+        let ws_name = self.workspaces[wi].name.clone();
+        let first = self.first_task_for_ws(&ws_id);
+        let name = first.and_then(|t| t.prompt.clone()).unwrap_or(ws_name);
+        let task_id = first.and_then(|t| t.task_id.clone());
 
-        self.backend
-            .push(worktree_path, repo_url, name, task_id);
+        self.backend.push(worktree_path, repo_url, name, task_id);
 
-        // Clear local sessions, mark as cloud.
-        self.tasks[ti].sessions.clear();
-        self.tasks[ti].worktree_path = None;
-        self.tasks[ti].is_cloud = true;
-        self.cursor = Cursor::Task(ti);
+        // Clear local sessions and worktree; mark workspace as cloud.
+        self.workspaces[wi].sessions.clear();
+        self.workspaces[wi].worktree_path = None;
+        self.workspaces[wi].is_cloud = true;
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.workspace_id.as_deref() == Some(&ws_id))
+        {
+            task.is_cloud = true;
+        }
+        self.cursor = Cursor::Workspace(wi);
         self.set_status_msg("Pushing to cloud...");
     }
 
-    /// Pull the active cloud task to local.
+    /// Pull the active cloud workspace to local (uses the first bound task).
     fn pull_active(&mut self) {
-        let ti = match self.active_task_index() {
-            Some(ti) => ti,
-            None => return,
+        let Some(wi) = self.active_workspace_index() else {
+            return;
         };
-
-        let task_id = match &self.tasks[ti].task_id {
-            Some(id) => id.clone(),
+        let ws_id = self.workspaces[wi].id.clone();
+        let Some(task) = self
+            .tasks
+            .iter()
+            .find(|t| t.workspace_id.as_deref() == Some(&ws_id))
+        else {
+            self.set_status_msg("No task bound to pull");
+            return;
+        };
+        let task_id = match task.task_id.clone() {
+            Some(id) => id,
             None => {
-                self.set_status_msg("Can only pull cloud tasks");
+                self.set_status_msg("Task has no id");
                 return;
             }
         };
-        let repo_url = match &self.tasks[ti].repo_url {
-            Some(u) => u.clone(),
+        let repo_url = match task.repo_url.clone() {
+            Some(u) => u,
             None => {
                 self.set_status_msg("No repo URL on task");
                 return;
@@ -2954,37 +3261,33 @@ impl App {
         ) {
             Ok(s) => {
                 let branch = format!("cm/{}", slug);
-                let ts = TerminalSession {
-                    label: "claude".to_string(),
-                    session_type: "claude".to_string(),
-                    session: s,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    session_id: None,
-                    pending_jsonl_files: Some(pending),
-                    hidden: false,
-                    idle_timeout_secs: 0,
-                    pending_prompt: if prompt.trim().is_empty() {
-                        None
-                    } else {
-                        // Queue as a non-submitting prefill (user will hit Enter
-                        // themselves). Fires on first quiet PTY so claude has
-                        // time to finish its startup render.
-                        Some(PendingWrite::wait_for_quiet(
-                            prompt.to_string(),
-                            false,
-                            Duration::from_secs(1),
-                            Duration::from_secs(2),
-                            Duration::from_secs(60),
-                        ))
-                    },
-                    pending_clear: None,
-                    workflow_run_id: None,
-                    workflow_role: None,
-                last_delivery: None,
-                };
+                let mut ts = make_simple_session("claude", "claude", s, Some(pending));
+                if !prompt.trim().is_empty() {
+                    ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
+                        prompt.to_string(),
+                        false,
+                        Duration::from_secs(1),
+                        Duration::from_secs(2),
+                        Duration::from_secs(60),
+                    ));
+                }
 
-                let new_ti = self.tasks.len();
+                let ws = Workspace {
+                    id: new_workspace_id(),
+                    name: slug.to_string(),
+                    is_closed: false,
+                    is_cloud: false,
+                    repo_url: Some(repo_url.clone()),
+                    worktree_path: Some(worktree_path),
+                    main_repo_path: Some(main_repo),
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: vec![ts],
+                };
+                let ws_id = ws.id.clone();
+                self.workspaces.push(ws);
+                let new_wi = self.workspaces.len() - 1;
+
                 self.tasks.push(TaskEntry {
                     task_id: Some(task_id.to_string()),
                     name: slug.to_string(),
@@ -2994,18 +3297,13 @@ impl App {
                     wip_branch: Some(branch.clone()),
                     session_id: None,
                     blocked_at: None,
-                    worker_vm: None,
-                    worker_zone: None,
-                    worktree_path: Some(worktree_path),
-                    main_repo_path: Some(main_repo),
-                    sessions: vec![ts],
                     is_cloud: false,
+                    workspace_id: Some(ws_id),
                 });
 
-                self.cursor = Cursor::Session(new_ti, 0);
+                self.cursor = Cursor::Session(new_wi, 0);
                 self.view_mode = ViewMode::Sessions;
 
-                // Update the existing planning task to running instead of creating a new one.
                 let mut fields = std::collections::HashMap::new();
                 fields.insert("status".to_string(), serde_json::Value::String("running".to_string()));
                 fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
@@ -3019,11 +3317,127 @@ impl App {
         }
     }
 
+    /// Open workspaces the planning picker can target. Skips closed workspaces
+    /// and cloud workspaces (those have no worktree to share).
+    fn collect_workspace_candidates(&self) -> Vec<WorkspaceCandidate> {
+        self.workspaces
+            .iter()
+            .filter(|w| !w.is_closed && w.worktree_path.is_some())
+            .map(|w| WorkspaceCandidate {
+                workspace_id: w.id.clone(),
+                name: w.name.clone(),
+                repo_url: w.repo_url.clone(),
+            })
+            .collect()
+    }
+
+    /// Spawn a new Claude session in an existing workspace and bind the
+    /// given task to it. No new worktree — the workspace already has one.
+    fn launch_into_workspace(
+        &mut self,
+        workspace_id: &str,
+        task_id: &str,
+        task_title: &str,
+        task_repo_url: &str,
+        prompt: &str,
+    ) {
+        let Some(wi) = self.workspace_index_by_id(workspace_id) else {
+            self.set_status_msg("Workspace no longer exists");
+            return;
+        };
+        let Some(worktree_path) = self.workspaces[wi].worktree_path.clone() else {
+            self.set_status_msg("Workspace has no worktree");
+            return;
+        };
+
+        let (cols, rows) = self.last_term_size;
+        let args = vec!["--dangerously-skip-permissions".to_string()];
+        let pending = Self::list_jsonl_files(&worktree_path);
+        match Session::new(
+            "claude",
+            &args,
+            cols,
+            rows,
+            Some(worktree_path),
+            Default::default(),
+        ) {
+            Ok(s) => {
+                let mut ts = make_simple_session("claude", "claude", s, Some(pending));
+                if !prompt.trim().is_empty() {
+                    ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
+                        prompt.to_string(),
+                        false,
+                        Duration::from_secs(1),
+                        Duration::from_secs(2),
+                        Duration::from_secs(60),
+                    ));
+                }
+                let si = self.workspaces[wi].sessions.len();
+                self.workspaces[wi].sessions.push(ts);
+
+                // The task may be in backlog (not yet in self.tasks because
+                // reconcile only pulls running/blocked). Upsert a stub with
+                // the workspace binding set; a later reconcile will fill in
+                // the remaining API fields without clobbering workspace_id.
+                if let Some(task) = self
+                    .tasks
+                    .iter_mut()
+                    .find(|t| t.task_id.as_deref() == Some(task_id))
+                {
+                    task.workspace_id = Some(workspace_id.to_string());
+                } else {
+                    self.tasks.push(TaskEntry {
+                        task_id: Some(task_id.to_string()),
+                        name: task_title.to_string(),
+                        api_status: TaskStatus::Running,
+                        repo_url: Some(task_repo_url.to_string()),
+                        prompt: Some(prompt.to_string()),
+                        wip_branch: None,
+                        session_id: None,
+                        blocked_at: None,
+                        is_cloud: false,
+                        workspace_id: Some(workspace_id.to_string()),
+                    });
+                }
+                self.cursor = Cursor::Session(wi, si);
+                self.view_mode = ViewMode::Sessions;
+
+                let mut fields = std::collections::HashMap::new();
+                fields.insert(
+                    "status".to_string(),
+                    serde_json::Value::String("running".to_string()),
+                );
+                self.backend
+                    .update_plan_task(task_id.to_string(), fields);
+                self.save_session_manifest();
+                self.set_status_msg("Task launched into workspace");
+            }
+            Err(e) => {
+                self.set_status_msg(&format!("Launch: {}", e));
+            }
+        }
+    }
+
+    /// Clear a task's workspace binding. Task status is left alone.
+    fn unbind_task_from_workspace(&mut self, task_id: &str) {
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+        {
+            if task.workspace_id.is_some() {
+                task.workspace_id = None;
+                self.save_session_manifest();
+                self.set_status_msg("Task unbound from workspace");
+            }
+        }
+    }
+
     /// Handle terminal resize.
     pub fn resize_terminals(&mut self, cols: u16, rows: u16) {
         self.last_term_size = (cols, rows);
-        for task in &mut self.tasks {
-            for ts in &mut task.sessions {
+        for ws in &mut self.workspaces {
+            for ts in &mut ws.sessions {
                 ts.session.resize(cols, rows);
             }
         }
@@ -3078,24 +3492,27 @@ impl App {
                     );
                 }
                 InputMode::NewTerminalSession {
-                    task_index,
+                    ws_index,
                     session_type,
                 } => {
                     self.draw_new_terminal_dialog(
                         frame,
                         area,
-                        *task_index,
+                        *ws_index,
                         session_type,
                     );
                 }
                 InputMode::SessionSettings { name, idle_timeout, hidden, active_field, .. } => {
                     self.draw_session_settings(frame, area, name, idle_timeout, *hidden, *active_field);
                 }
-                InputMode::WorkflowLaunchConfirm { task_index, workflow_name, slots, active_slot } => {
+                InputMode::WorkspaceSettings { name, .. } => {
+                    self.draw_workspace_settings(frame, area, name);
+                }
+                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot } => {
                     self.draw_workflow_launch(
                         frame,
                         area,
-                        *task_index,
+                        *ws_index,
                         workflow_name,
                         slots,
                         *active_slot,
@@ -3131,7 +3548,7 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::White))
             .title(Span::styled(
-                " New Local Session ",
+                " New Workspace ",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -3197,7 +3614,7 @@ impl App {
         &self,
         frame: &mut Frame,
         area: Rect,
-        task_index: usize,
+        ws_index: usize,
         session_type: &str,
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
@@ -3208,10 +3625,10 @@ impl App {
 
         frame.render_widget(Clear, dialog_area);
 
-        let task_name = self
-            .tasks
-            .get(task_index)
-            .map(|t| t.name.as_str())
+        let ws_name = self
+            .workspaces
+            .get(ws_index)
+            .map(|w| w.name.as_str())
             .unwrap_or("?");
 
         let block = Block::default()
@@ -3229,7 +3646,7 @@ impl App {
 
         let options = ["claude", "codex", "bash"];
         let max_name = (width as usize).saturating_sub(8);
-        let display_name: String = task_name.chars().take(max_name).collect();
+        let display_name: String = ws_name.chars().take(max_name).collect();
 
         let mut lines = vec![
             Line::from(vec![
@@ -3323,6 +3740,44 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn draw_workspace_settings(&self, frame: &mut Frame, area: Rect, name: &str) {
+        let width = 55u16.min(area.width.saturating_sub(4));
+        let height = 7u16;
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let dialog_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White))
+            .title(Span::styled(
+                " Rename Workspace ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("  Name: ", dim),
+                Span::styled(name, white),
+                Span::styled("\u{2588}", white),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter save \u{00b7} Esc cancel  (branch name unchanged)",
+                dim,
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_terminal(&self, frame: &mut Frame, area: Rect) {
         let has_session = self.active_session().is_some();
 
@@ -3343,23 +3798,26 @@ impl App {
         if let Some((_, ts)) = self.active_session() {
             let widget = TerminalWidget::new(&ts.session.term, true);
             frame.render_widget(widget, inner);
-        } else if let Some(ti) = self.active_task_index() {
-            let task = &self.tasks[ti];
+        } else if let Some(wi) = self.active_workspace_index() {
+            let ws = &self.workspaces[wi];
             let mut lines = vec![];
-            if let Some(ref prompt) = task.prompt {
-                lines.push(Line::from(Span::styled(
-                    prompt.as_str(),
-                    Style::default().fg(Color::White),
-                )));
-                lines.push(Line::from(""));
+            // Show prompt + repo from first bound task, if any.
+            if let Some(task) = self.first_task_for_ws(&ws.id) {
+                if let Some(ref prompt) = task.prompt {
+                    lines.push(Line::from(Span::styled(
+                        prompt.as_str(),
+                        Style::default().fg(Color::White),
+                    )));
+                    lines.push(Line::from(""));
+                }
             }
-            if let Some(ref repo) = task.repo_url {
+            if let Some(ref repo) = ws.repo_url {
                 lines.push(Line::from(Span::styled(
                     format!("Repo: {}", repo),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            if let Some(ref vm) = task.worker_vm {
+            if let Some(ref vm) = ws.worker_vm {
                 lines.push(Line::from(Span::styled(
                     format!("VM: {}", vm),
                     Style::default().fg(Color::DarkGray),
@@ -3369,7 +3827,7 @@ impl App {
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(Span::styled(
-                if task.worker_vm.is_some() {
+                if ws.worker_vm.is_some() {
                     "Press Alt+A to SSH into this session"
                 } else {
                     "Press Alt+A to attach"
@@ -3426,24 +3884,21 @@ impl App {
                 break;
             }
             match vi {
-                VisualItem::TaskHeader(ti) => {
-                    let task = &self.tasks[*ti];
+                VisualItem::WorkspaceHeader(wi) => {
+                    let ws = &self.workspaces[*wi];
                     let is_selected = match &self.cursor {
-                        Cursor::Task(cti) => cti == ti,
+                        Cursor::Workspace(cwi) => cwi == wi,
                         _ => false,
                     };
 
                     let max_name = (inner.width as usize).saturating_sub(2);
-                    let name = if task.name.len() > max_name {
-                        format!(
-                            "{}...",
-                            &task.name[..max_name.saturating_sub(3)]
-                        )
+                    let name = if ws.name.len() > max_name {
+                        format!("{}...", &ws.name[..max_name.saturating_sub(3)])
                     } else {
-                        task.name.clone()
+                        ws.name.clone()
                     };
 
-                    let line = Line::from(vec![
+                    let header_line = Line::from(vec![
                         Span::raw(" "),
                         Span::raw(name),
                     ]);
@@ -3455,13 +3910,33 @@ impl App {
                     } else {
                         Style::default().fg(Color::Gray)
                     };
-                    items.push(ListItem::new(line).style(base_style));
+
+                    // If any task is bound, show titles as a dim subtitle.
+                    let bound = self.task_names_for_ws(&ws.id);
+                    if !bound.is_empty() && self.sidebar_view == SidebarView::Task {
+                        let joined = bound.join(" \u{00b7} ");
+                        let budget = (inner.width as usize).saturating_sub(5);
+                        let subtitle = if joined.len() > budget {
+                            format!(" \u{00b7} {}...", &joined[..budget.saturating_sub(6)])
+                        } else {
+                            format!(" \u{00b7} {}", joined)
+                        };
+                        let sub_line = Line::from(Span::styled(
+                            format!("   {}", subtitle),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        items.push(
+                            ListItem::new(vec![header_line, sub_line]).style(base_style),
+                        );
+                    } else {
+                        items.push(ListItem::new(header_line).style(base_style));
+                    }
                 }
-                VisualItem::Session(ti, si) => {
-                    let task = &self.tasks[*ti];
-                    let ts = &task.sessions[*si];
+                VisualItem::Session(wi, si) => {
+                    let ws = &self.workspaces[*wi];
+                    let ts = &ws.sessions[*si];
                     let is_selected = match &self.cursor {
-                        Cursor::Session(cti, csi) => cti == ti && csi == si,
+                        Cursor::Session(cwi, csi) => cwi == wi && csi == si,
                         _ => false,
                     };
 
@@ -3511,11 +3986,9 @@ impl App {
 
                     let display = match self.sidebar_view {
                         SidebarView::Status => {
-                            // "taskname / label"
                             let max_name =
                                 (inner.width as usize).saturating_sub(8);
-                            let full =
-                                format!("{} / {}", task.name, ts.label);
+                            let full = format!("{} / {}", ws.name, ts.label);
                             if full.len() > max_name {
                                 format!(
                                     "{}...",
@@ -3571,11 +4044,11 @@ impl App {
                     ));
                     items.push(ListItem::new(sep_line));
                 }
-                VisualItem::WorkflowHeader { task_idx, run_id } => {
-                    let task = &self.tasks[*task_idx];
+                VisualItem::WorkflowHeader { ws_idx, run_id } => {
+                    let ws = &self.workspaces[*ws_idx];
                     let run = self.workflow_runs.iter().find(|r| &r.run_id == run_id);
                     let (agg_indicator, agg_style) = match run {
-                        Some(r) => aggregate_indicator(r, task, spinner),
+                        Some(r) => aggregate_indicator(r, ws, spinner),
                         None => ("\u{25cf}", Style::default().fg(Color::DarkGray)),
                     };
                     let name = run
@@ -3615,13 +4088,14 @@ impl App {
         let help_entries: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-d  done"),
             ("A-a    attach", "A-x  delete"),
-            ("A-n    new", "A-p  push"),
+            ("A-n    new ws", "A-p  push"),
             ("A-s    +session", "A-l  pull"),
-            ("A-w    close", "A-v  view"),
-            ("A-e    settings", "A-r  refresh"),
-            ("A-h    hide", "A-q  quit"),
+            ("A-w    close sess", "A-v  view"),
+            ("A-W    close ws", "A-r  refresh"),
+            ("A-e    settings", "A-q  quit"),
+            ("A-h    hide", "A-y  history"),
             ("A-f    workflow", "A-u  resume"),
-            ("A-o    stop wf", "A-y  history"),
+            ("A-o    stop wf", ""),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -3658,17 +4132,17 @@ impl App {
         let running = self
             .tasks
             .iter()
-            .filter(|t| matches!(t.status(), TaskStatus::Running))
+            .filter(|t| matches!(self.task_status(t), TaskStatus::Running))
             .count();
         let blocked = self
             .tasks
             .iter()
-            .filter(|t| matches!(t.status(), TaskStatus::Blocked))
+            .filter(|t| matches!(self.task_status(t), TaskStatus::Blocked))
             .count();
         let backlog = self
             .tasks
             .iter()
-            .filter(|t| matches!(t.status(), TaskStatus::Backlog))
+            .filter(|t| matches!(self.task_status(t), TaskStatus::Backlog))
             .count();
 
         let conn_indicator = if self.connected { "\u{25cf}" } else { "\u{25cb}" };
@@ -3724,10 +4198,10 @@ impl App {
     }
 
     fn active_title(&self) -> String {
-        if let Some((task, ts)) = self.active_session() {
-            format!(" {} / {} ", task.name, ts.label)
-        } else if let Some(ti) = self.active_task_index() {
-            format!(" {} ", self.tasks[ti].name)
+        if let Some((ws, ts)) = self.active_session() {
+            format!(" {} / {} ", ws.name, ts.label)
+        } else if let Some(wi) = self.active_workspace_index() {
+            format!(" {} ", self.workspaces[wi].name)
         } else {
             " Terminal ".to_string()
         }
@@ -3843,26 +4317,12 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
 }
 
 impl App {
-    /// Return the task_key used to identify a task in workflow state
-    /// (matches the manifest keying convention).
-    fn task_key(task: &TaskEntry) -> Option<String> {
-        if let Some(p) = &task.worktree_path {
-            p.to_str().map(|s| s.to_string())
-        } else if let Some(id) = &task.task_id {
-            Some(format!("task:{}", id))
-        } else {
-            None
-        }
-    }
-
-    fn find_task_by_key(&self, key: &str) -> Option<usize> {
-        self.tasks
-            .iter()
-            .position(|t| Self::task_key(t).as_deref() == Some(key))
-    }
-
-    fn find_session_by_label(task: &TaskEntry, label: &str) -> Option<usize> {
-        task.sessions.iter().position(|s| s.label == label)
+    /// The stable key a workflow run stores to refer back to its workspace.
+    /// With the v3 data model this is the workspace id directly — no more
+    /// worktree-path / `task:{id}` special-casing. Name retained for
+    /// compatibility with the `WorkflowRun::task_key` field on disk.
+    fn workspace_key(ws: &Workspace) -> String {
+        ws.id.clone()
     }
 
     /// Locate the `(task_index, session_index)` of the session that's tagged
@@ -3871,12 +4331,12 @@ impl App {
     /// move, or the workflow may have been launched with a stale task key),
     /// and the tags on the session itself are the source of truth.
     fn locate_workflow_session(&self, run_id: &str, role: &str) -> Option<(usize, usize)> {
-        for (ti, task) in self.tasks.iter().enumerate() {
-            for (si, ts) in task.sessions.iter().enumerate() {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            for (si, ts) in ws.sessions.iter().enumerate() {
                 if ts.workflow_run_id.as_deref() == Some(run_id)
                     && ts.workflow_role.as_deref() == Some(role)
                 {
-                    return Some((ti, si));
+                    return Some((wi, si));
                 }
             }
         }
@@ -3885,17 +4345,14 @@ impl App {
 
     /// Open the launch modal for a workflow, prefilled for the focused session.
     fn open_workflow_launch(&mut self) {
-        let (ti, focused_si) = match self.cursor.clone() {
-            Cursor::Session(ti, si) => (ti, Some(si)),
-            Cursor::Task(ti) => (ti, None),
+        let (wi, focused_si) = match self.cursor.clone() {
+            Cursor::Session(wi, si) => (wi, Some(si)),
+            Cursor::Workspace(wi) => (wi, None),
         };
-        if ti >= self.tasks.len() {
-            self.set_status_msg("No task selected");
+        if wi >= self.workspaces.len() {
+            self.set_status_msg("No workspace selected");
             return;
         }
-        // For v1 we always launch "feedback" since it's our only built-in. The
-        // framework supports other workflows — extend the modal to pick one when
-        // we add them.
         let wf_name = "feedback".to_string();
         let Some(wf) = self.workflows.get(&wf_name).cloned() else {
             self.set_status_msg(&format!(
@@ -3906,11 +4363,7 @@ impl App {
             return;
         };
 
-        // Build a per-slot option cycle. For persistent-context roles, options are
-        // every existing session on the task + `new claude` + `new codex`. Fresh-
-        // context roles get only the two `new` options (existing sessions would
-        // have their history wiped by the respawn — not useful).
-        let task = &self.tasks[ti];
+        let ws = &self.workspaces[wi];
         let mut slots = Vec::new();
         for (idx, role_name) in wf.role_order.iter().enumerate() {
             let role = &wf.roles[role_name];
@@ -3918,9 +4371,8 @@ impl App {
 
             let mut options: Vec<WorkflowSlotSource> = Vec::new();
             if !is_fresh {
-                for si in 0..task.sessions.len() {
-                    // Skip sessions that are already in another active workflow.
-                    let ts = &task.sessions[si];
+                for si in 0..ws.sessions.len() {
+                    let ts = &ws.sessions[si];
                     if ts.workflow_run_id.is_some() {
                         continue;
                     }
@@ -3930,9 +4382,6 @@ impl App {
             options.push(WorkflowSlotSource::New(Engine::ClaudeCode));
             options.push(WorkflowSlotSource::New(Engine::Codex));
 
-            // Pick initial selection:
-            //   - Role #0 + user has a focused session + role is persistent → bind to focused
-            //   - Otherwise → the role's declared engine from the TOML (default)
             let initial = if idx == 0
                 && focused_si.is_some()
                 && !is_fresh
@@ -3945,7 +4394,6 @@ impl App {
                     .position(|o| matches!(o, WorkflowSlotSource::Existing(si) if Some(*si) == focused_si))
                     .unwrap()
             } else {
-                // Match the role's declared engine to one of the `New(e)` options.
                 options
                     .iter()
                     .position(|o| matches!(o, WorkflowSlotSource::New(e) if *e == role.engine))
@@ -3959,17 +4407,17 @@ impl App {
             });
         }
         self.input_mode = InputMode::WorkflowLaunchConfirm {
-            task_index: ti,
+            ws_index: wi,
             workflow_name: wf_name,
             slots,
             active_slot: 0,
         };
     }
 
-    /// Actually launch a workflow given a task and resolved slot choices.
+    /// Actually launch a workflow given a workspace and resolved slot choices.
     fn launch_workflow(
         &mut self,
-        task_index: usize,
+        ws_index: usize,
         workflow_name: &str,
         slots: Vec<WorkflowSlotChoice>,
     ) {
@@ -3977,7 +4425,7 @@ impl App {
             self.set_status_msg("Workflow not found");
             return;
         };
-        if task_index >= self.tasks.len() {
+        if ws_index >= self.workspaces.len() {
             return;
         }
 
@@ -4009,15 +4457,9 @@ impl App {
             }
         }
 
-        let task_key = match Self::task_key(&self.tasks[task_index]) {
-            Some(k) => k,
-            None => {
-                self.set_status_msg("Task has no worktree or id");
-                return;
-            }
-        };
+        let task_key = Self::workspace_key(&self.workspaces[ws_index]);
         let run_id = workflow::run::new_run_id();
-        let worktree_path = self.tasks[task_index].worktree_path.clone();
+        let worktree_path = self.workspaces[ws_index].worktree_path.clone();
 
         // Spawn / bind sessions for each slot and build role_sessions.
         // For existing sessions we also snapshot the current user/assistant counts
@@ -4034,14 +4476,8 @@ impl App {
                     // Tag with workflow metadata, and if sid isn't known yet,
                     // try to detect it NOW (newest JSONL heuristic) so the
                     // baseline below is computed from the actual transcript.
-                    // Without this, baseline stays 0 and the idle-transition
-                    // gate starts off at 0 — which means `current > start`
-                    // fires on the worker's first message regardless of
-                    // whether that message was pre- or post-launch, which
-                    // feels roughly right for new sessions but forces the
-                    // user to wait for a SECOND message on restored sessions.
-                    let worktree_for_detect = self.tasks[task_index].worktree_path.clone();
-                    let ts = match self.tasks[task_index].sessions.get_mut(*si) {
+                    let worktree_for_detect = self.workspaces[ws_index].worktree_path.clone();
+                    let ts = match self.workspaces[ws_index].sessions.get_mut(*si) {
                         Some(s) => s,
                         None => continue,
                     };
@@ -4074,7 +4510,7 @@ impl App {
                     (ts.label.clone(), ts.session_id.clone(), eng)
                 }
                 WorkflowSlotSource::New(engine) => {
-                    match self.spawn_workflow_session(task_index, &slot.role, engine, &run_id) {
+                    match self.spawn_workflow_session(ws_index, &slot.role, engine, &run_id) {
                         Some((label, sid)) => (label, sid, engine.clone()),
                         None => {
                             self.set_status_msg(&format!("Failed to spawn {}", slot.role));
@@ -4158,7 +4594,7 @@ impl App {
                     continue;
                 };
 
-                let live = self.tasks[ti].sessions[si].session_id.clone();
+                let live = self.workspaces[ti].sessions[si].session_id.clone();
                 let binding_sid = self
                     .workflow_runs[idx]
                     .role_sessions
@@ -4181,12 +4617,12 @@ impl App {
     /// The session_id is usually None immediately — it's detected later via JSONL scan.
     fn spawn_workflow_session(
         &mut self,
-        task_index: usize,
+        ws_index: usize,
         role_name: &str,
         engine: &Engine,
         run_id: &str,
     ) -> Option<(String, Option<String>)> {
-        let worktree_path = self.tasks[task_index].worktree_path.clone()?;
+        let worktree_path = self.workspaces[ws_index].worktree_path.clone()?;
         let (cols, rows) = self.last_term_size;
         let (program, args) = match workflow::spawn::build_args(engine, run_id, role_name, None) {
             Ok(v) => v,
@@ -4214,25 +4650,23 @@ impl App {
             label: label.clone(),
             session_type,
             session: sess,
-            // Start Idle — PTY startup noise is not "work". A wakeup burst from
-            // the agent actually responding will flip it to Running naturally
-            // (see drain_terminal_events). Keeps the workflow header aggregate
-            // from briefly spinning during process start.
+            // Start Idle — PTY startup noise isn't "work". Wakeup-burst
+            // detection will flip to Running when the agent actually responds.
             status: SessionStatus::Idle,
             last_write_at: None,
             session_id: None,
             pending_jsonl_files: pending,
-            // Per-session indicators default to hidden inside a workflow — the
-            // workflow header carries the aggregate. Toggle per session with A-h.
+            // Participants default hidden — the workflow header carries the
+            // aggregate indicator. Toggle per session with A-h.
             hidden: true,
             idle_timeout_secs: 0,
             pending_prompt: None,
             pending_clear: None,
             workflow_run_id: Some(run_id.to_string()),
             workflow_role: Some(role_name.to_string()),
-        last_delivery: None,
+            last_delivery: None,
         };
-        self.tasks[task_index].sessions.push(ts);
+        self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
     }
 
@@ -4302,7 +4736,7 @@ impl App {
                 for role in &role_names {
                     let status = match self.locate_workflow_session(&run_id, role) {
                         Some((ti, si)) => {
-                            let ts = &self.tasks[ti].sessions[si];
+                            let ts = &self.workspaces[ti].sessions[si];
                             format!(
                                 "{:?}{}",
                                 ts.status,
@@ -4369,7 +4803,7 @@ impl App {
                     continue;
                 };
                 let session_idle = matches!(
-                    self.tasks[ti].sessions[si].status,
+                    self.workspaces[ti].sessions[si].status,
                     SessionStatus::Idle
                 );
                 if session_idle {
@@ -4382,9 +4816,9 @@ impl App {
                     let start_count = self.workflow_runs[idx]
                         .active_assistant_start_count()
                         .unwrap_or(0);
-                    let current_sid = self.tasks[ti].sessions[si].session_id.clone();
+                    let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
                     let current_count = match (
-                        self.tasks[ti].worktree_path.as_deref(),
+                        self.workspaces[ti].worktree_path.as_deref(),
                         current_sid.as_deref(),
                     ) {
                         (Some(wt), Some(sid)) => workflow::transcript::count_messages(
@@ -4473,8 +4907,8 @@ impl App {
         let captured = if let Some(from) = &from_role {
             if let Some((fti, fsi)) = self.locate_workflow_session(run_id, from) {
                 let from_role_spec = wf.roles.get(from).cloned();
-                let fsid = self.tasks[fti].sessions[fsi].session_id.clone();
-                let fwt = self.tasks[fti].worktree_path.clone();
+                let fsid = self.workspaces[fti].sessions[fsi].session_id.clone();
+                let fwt = self.workspaces[fti].worktree_path.clone();
                 if let (Some(spec), Some(sid), Some(wt)) = (from_role_spec, fsid, fwt) {
                     workflow::transcript::last_message(&spec.engine, &wt, &sid)
                 } else {
@@ -4496,7 +4930,7 @@ impl App {
         let template_source = supplied_prompt
             .or_else(|| target_role_spec.activation_prompt.clone())
             .unwrap_or_default();
-        let worktree_ref = self.tasks[ti].worktree_path.as_deref();
+        let worktree_ref = self.workspaces[ti].worktree_path.as_deref();
         let resolver = WorkflowResolver {
             wf: &wf,
             run: &self.workflow_runs[run_idx],
@@ -4509,7 +4943,7 @@ impl App {
         }
 
         // Update role_sessions with (possibly new) session_id from the session.
-        let current_sid = self.tasks[ti].sessions[si].session_id.clone();
+        let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
         if let Some(b) = self.workflow_runs[run_idx].role_sessions.get_mut(to_role) {
             b.current_session_id = current_sid;
         }
@@ -4519,8 +4953,8 @@ impl App {
         // downstream the idle gate compares turn-to-turn regardless of whether
         // the agent's reply contains text, thinking, or tool_use content.
         let start_count = {
-            let current_sid = self.tasks[ti].sessions[si].session_id.clone();
-            match (self.tasks[ti].worktree_path.as_deref(), current_sid.as_deref()) {
+            let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
+            match (self.workspaces[ti].worktree_path.as_deref(), current_sid.as_deref()) {
                 (Some(wt), Some(sid)) => workflow::transcript::count_messages(
                     &target_role_spec.engine,
                     wt,
@@ -4554,7 +4988,7 @@ impl App {
                 Duration::from_secs(2),
                 Duration::from_secs(180),
             );
-            let label = self.tasks[ti].sessions[si].label.clone();
+            let label = self.workspaces[ti].sessions[si].label.clone();
             log_tick(
                 run_id,
                 &format!(
@@ -4564,7 +4998,7 @@ impl App {
                     label,
                 ),
             );
-            self.tasks[ti].sessions[si].pending_prompt = Some(pw);
+            self.workspaces[ti].sessions[si].pending_prompt = Some(pw);
         } else {
             log_tick(
                 run_id,
@@ -4587,10 +5021,10 @@ impl App {
     /// claude rotates its transcript file on `/clear`; the new file's sid
     /// is picked up later by the history.jsonl correlator.
     fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
-        let wt = self.tasks[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
-        let label = self.tasks[ti].sessions[si].label.clone();
+        let wt = self.workspaces[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
+        let label = self.workspaces[ti].sessions[si].label.clone();
         let role_label = label.clone();
-        let ts = &mut self.tasks[ti].sessions[si];
+        let ts = &mut self.workspaces[ti].sessions[si];
         if ts.session.exited {
             log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
             return false;
@@ -4706,9 +5140,9 @@ impl App {
         }
         // Clear workflow tags from participating sessions so they behave like
         // normal standalone sessions. Also un-hide their per-session indicators
-        // (we hid them on launch since the workflow header carried the aggregate).
-        for task in &mut self.tasks {
-            for ts in &mut task.sessions {
+        // (hidden on launch since the workflow header carries the aggregate).
+        for ws in &mut self.workspaces {
+            for ts in &mut ws.sessions {
                 if ts.workflow_run_id.as_deref() == Some(&run_id) {
                     ts.workflow_run_id = None;
                     ts.workflow_role = None;
@@ -4733,29 +5167,31 @@ impl App {
     }
 
     fn focused_session_run_id(&self) -> Option<String> {
-        let (ti, si) = match self.cursor.clone() {
-            Cursor::Session(ti, si) => (ti, si),
+        let (wi, si) = match self.cursor.clone() {
+            Cursor::Session(wi, si) => (wi, si),
             _ => return None,
         };
-        self.tasks
-            .get(ti)
-            .and_then(|t| t.sessions.get(si))
+        self.workspaces
+            .get(wi)
+            .and_then(|w| w.sessions.get(si))
             .and_then(|s| s.workflow_run_id.clone())
     }
 
     /// Role name for a session, if it's a workflow participant.
-    pub fn session_workflow_role(&self, ti: usize, si: usize) -> Option<&str> {
-        self.tasks
-            .get(ti)?
+    #[allow(dead_code)]
+    pub fn session_workflow_role(&self, wi: usize, si: usize) -> Option<&str> {
+        self.workspaces
+            .get(wi)?
             .sessions
             .get(si)?
             .workflow_role
             .as_deref()
     }
 
-    /// Run associated with a task (by task_key), if any is active.
-    pub fn task_workflow_run(&self, ti: usize) -> Option<&WorkflowRun> {
-        let key = Self::task_key(self.tasks.get(ti)?)?;
+    /// Run associated with a workspace, if any is active.
+    #[allow(dead_code)]
+    pub fn workspace_workflow_run(&self, wi: usize) -> Option<&WorkflowRun> {
+        let key = Self::workspace_key(self.workspaces.get(wi)?);
         self.workflow_runs
             .iter()
             .find(|r| r.task_key == key && r.is_active())
@@ -4771,7 +5207,7 @@ impl App {
         &self,
         frame: &mut Frame,
         area: Rect,
-        task_index: usize,
+        ws_index: usize,
         workflow_name: &str,
         slots: &[WorkflowSlotChoice],
         active_slot: usize,
@@ -4785,15 +5221,15 @@ impl App {
         frame.render_widget(Clear, dialog);
 
         let title = format!(" Launch workflow: {} ", workflow_name);
-        let task_name = self
-            .tasks
-            .get(task_index)
-            .map(|t| t.name.clone())
+        let ws_name = self
+            .workspaces
+            .get(ws_index)
+            .map(|w| w.name.clone())
             .unwrap_or_default();
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            format!("Task: {}", task_name),
+            format!("Workspace: {}", ws_name),
             Style::default().fg(Color::White),
         )));
         lines.push(Line::from(""));
@@ -4802,9 +5238,9 @@ impl App {
             let src_label = match slot.source() {
                 WorkflowSlotSource::Existing(si) => {
                     let label = self
-                        .tasks
-                        .get(task_index)
-                        .and_then(|t| t.sessions.get(*si))
+                        .workspaces
+                        .get(ws_index)
+                        .and_then(|w| w.sessions.get(*si))
                         .map(|s| s.label.clone())
                         .unwrap_or_else(|| "?".into());
                     format!("existing ({})", label)
@@ -4985,17 +5421,16 @@ fn log_tick(run_id: &str, msg: &str) {
 
 fn aggregate_indicator(
     run: &WorkflowRun,
-    task: &TaskEntry,
+    ws: &Workspace,
     spinner: &'static str,
 ) -> (&'static str, Style) {
     match run.status {
         workflow::RunStatus::Done => ("\u{2713}", Style::default().fg(Color::Green)),
         workflow::RunStatus::Paused => ("\u{25cf}", Style::default().fg(Color::Yellow)),
         _ => {
-            // Match the per-session indicator logic exactly: `ts.status == Running`.
-            // That status already accounts for the wakeup-burst threshold and the
-            // user-typing freeze, so the aggregate stays quiet while you're typing.
-            let any_running = task.sessions.iter().any(|ts| {
+            // Match the per-session indicator logic: active iff any participant
+            // session tagged with this run_id is Running and not exited.
+            let any_running = ws.sessions.iter().any(|ts| {
                 ts.workflow_run_id.as_ref() == Some(&run.run_id)
                     && ts.status == SessionStatus::Running
                     && !ts.session.exited

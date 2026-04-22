@@ -32,12 +32,6 @@ pub enum BackendCommand {
         task_id: String,
         main_repo: PathBuf,
     },
-    /// Create a task in the DB for a local session.
-    CreateTask {
-        name: String,
-        repo_url: String,
-        wip_branch: String,
-    },
     /// Create a planning task in the DB.
     CreatePlanTask {
         project: String,
@@ -68,11 +62,6 @@ pub enum BackendEvent {
     Disconnected,
     /// Progress message for multi-step operations.
     Progress(String),
-    /// Task created in DB — main thread should update the entry's task_id.
-    TaskCreated {
-        name: String,
-        task_id: String,
-    },
     /// Pull completed — main thread should spawn a local claude --resume session.
     PullComplete {
         task_id: String,
@@ -148,14 +137,6 @@ impl BackendHandle {
 
     pub fn pull(&self, task_id: String, main_repo: PathBuf) {
         let _ = self.cmd_tx.send(BackendCommand::Pull { task_id, main_repo });
-    }
-
-    pub fn create_task(&self, name: String, repo_url: String, wip_branch: String) {
-        let _ = self.cmd_tx.send(BackendCommand::CreateTask {
-            name,
-            repo_url,
-            wip_branch,
-        });
     }
 
     pub fn create_plan_task(
@@ -250,14 +231,6 @@ fn backend_loop(
                 );
                 do_refresh(&client, &event_tx, &mut was_connected);
             }
-            Ok(BackendCommand::CreateTask {
-                name,
-                repo_url,
-                wip_branch,
-            }) => {
-                do_create_task(&client, &event_tx, &name, &repo_url, &wip_branch);
-                do_refresh(&client, &event_tx, &mut was_connected);
-            }
             Ok(BackendCommand::Pull { task_id, main_repo }) => {
                 do_pull(
                     &client,
@@ -333,57 +306,6 @@ fn do_refresh(
                 *was_connected = false;
             }
             let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
-        }
-    }
-}
-
-/// Create a task in the DB for a local session.
-fn do_create_task(
-    client: &ApiClient,
-    event_tx: &mpsc::Sender<BackendEvent>,
-    name: &str,
-    repo_url: &str,
-    wip_branch: &str,
-) {
-    let body = TaskCreateBody {
-        repo_url: repo_url.to_string(),
-        repo_branch: wip_branch.to_string(),
-        name: Some(name.to_string()),
-        prompt: None,
-        priority: 0,
-        status: None,
-        project: None,
-        slug: None,
-        description: None,
-        difficulty: None,
-        depends: None,
-        source: None,
-        is_cloud: None,
-    };
-
-    match client.create_task(&body) {
-        Ok(task) => {
-            // Set wip_branch and status to running (it's a local active session).
-            let mut fields = HashMap::new();
-            fields.insert(
-                "wip_branch".to_string(),
-                serde_json::Value::String(wip_branch.to_string()),
-            );
-            fields.insert(
-                "status".to_string(),
-                serde_json::Value::String("running".to_string()),
-            );
-            let _ = client.update_task(&task.id, &fields);
-            let _ = event_tx.send(BackendEvent::TaskCreated {
-                name: name.to_string(),
-                task_id: task.id,
-            });
-        }
-        Err(e) => {
-            let _ = event_tx.send(BackendEvent::ApiError(format!(
-                "Create task: {}",
-                e
-            )));
         }
     }
 }

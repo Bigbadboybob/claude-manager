@@ -145,7 +145,19 @@ enum PlanInputMode {
     NewTask { title: String },
     NewProject { name: String, repo_url: String, field: NewProjectField },
     ProjectPicker { selected: usize },
+    /// Before LaunchConfirm: pick either "new workspace" or an existing one.
+    /// Selected is an index into [NewWorkspace, ...workspace_candidates].
+    WorkspacePicker { project_idx: usize, task_idx: usize, selected: usize },
     LaunchConfirm { project_idx: usize, task_idx: usize, branch_text: String },
+}
+
+/// An open workspace the planning view can offer as a launch target.
+/// Populated by the App from its current workspace list each event cycle.
+#[derive(Clone, Debug)]
+pub struct WorkspaceCandidate {
+    pub workspace_id: String,
+    pub name: String,
+    pub repo_url: Option<String>,
 }
 
 pub enum PlanAction {
@@ -157,6 +169,19 @@ pub enum PlanAction {
         prompt: String,
         branch: Option<String>,
         autostart: bool,
+        task_id: String,
+    },
+    /// Bind a task to an existing workspace and spawn a session there
+    /// (no new worktree, no branch input).
+    LaunchTaskIntoWorkspace {
+        workspace_id: String,
+        task_id: String,
+        task_title: String,
+        task_repo_url: String,
+        prompt: String,
+    },
+    /// Clear a task's `workspace_id`. Task status is not affected.
+    UnbindTask {
         task_id: String,
     },
     SwitchToSessions,
@@ -432,6 +457,9 @@ pub struct PlanningView {
     pub needs_redraw: bool,
     last_editor_size: (u16, u16),
     initialized: bool,
+    /// Open workspaces the user can launch a task into. Populated by App
+    /// before each planning event / render.
+    workspace_candidates: Vec<WorkspaceCandidate>,
 }
 
 impl PlanningView {
@@ -456,6 +484,7 @@ impl PlanningView {
             needs_redraw: true,
             last_editor_size: (80, 24),
             initialized: false,
+            workspace_candidates: vec![],
         }
     }
 
@@ -906,6 +935,7 @@ impl PlanningView {
             PlanInputMode::NewTask { .. } => self.handle_new_task_event(event),
             PlanInputMode::NewProject { .. } => self.handle_new_project_event(event),
             PlanInputMode::ProjectPicker { .. } => self.handle_project_picker_event(event),
+            PlanInputMode::WorkspacePicker { .. } => self.handle_workspace_picker_event(event),
             PlanInputMode::LaunchConfirm { .. } => self.handle_launch_confirm_event(event),
             PlanInputMode::Normal => self.handle_normal_event(event),
         }
@@ -974,7 +1004,15 @@ impl PlanningView {
                     KeyCode::Char('x') => { self.cancel_visual(); return self.delete_task(); }
                     KeyCode::Char('d') => { return self.cycle_status_to_done(); }
                     KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
-                    KeyCode::Char('l') if self.linear_mode => { self.cancel_visual(); return self.start_launch(); }
+                    KeyCode::Char('u') => {
+                        self.cancel_visual();
+                        if let Some((pi, ti)) = self.selected_task_loc() {
+                            if let Some(task) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)) {
+                                return PlanAction::UnbindTask { task_id: task.id.clone() };
+                            }
+                        }
+                        return PlanAction::Consumed;
+                    }
                     KeyCode::Char('r') => { return PlanAction::RefreshTasks; }
                     KeyCode::Char('p') => {
                         self.cancel_visual();
@@ -1175,6 +1213,89 @@ impl PlanningView {
                     }
                     self.rebuild_unified_cols();
                     self.clamp_cursor();
+                }
+                _ => {}
+            }
+        }
+        PlanAction::Consumed
+    }
+
+    fn handle_workspace_picker_event(&mut self, event: &CrosstermEvent) -> PlanAction {
+        let (project_idx, task_idx, mut selected) = match self.input_mode {
+            PlanInputMode::WorkspacePicker {
+                project_idx,
+                task_idx,
+                selected,
+            } => (project_idx, task_idx, selected),
+            _ => return PlanAction::Consumed,
+        };
+        let num_candidates = self.candidates_for(project_idx, task_idx).len();
+        // Option 0 is always "New workspace"; options 1..=num_candidates are
+        // existing workspaces.
+        let total = num_candidates + 1;
+
+        if let CrosstermEvent::Key(key) = event {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = PlanInputMode::Normal;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = (selected + total - 1) % total;
+                    self.input_mode = PlanInputMode::WorkspacePicker {
+                        project_idx,
+                        task_idx,
+                        selected,
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1) % total;
+                    self.input_mode = PlanInputMode::WorkspacePicker {
+                        project_idx,
+                        task_idx,
+                        selected,
+                    };
+                }
+                KeyCode::Enter => {
+                    if selected == 0 {
+                        // Fall through to branch-input dialog (current flow).
+                        let branch_text = self.project_data[project_idx].tasks[task_idx]
+                            .branch
+                            .clone()
+                            .unwrap_or_default();
+                        self.input_mode = PlanInputMode::LaunchConfirm {
+                            project_idx,
+                            task_idx,
+                            branch_text,
+                        };
+                    } else {
+                        // Bind task to the selected existing workspace.
+                        let ws = {
+                            let cands = self.candidates_for(project_idx, task_idx);
+                            cands.get(selected - 1).map(|c| (*c).clone())
+                        };
+                        let Some(ws) = ws else {
+                            self.input_mode = PlanInputMode::Normal;
+                            return PlanAction::Consumed;
+                        };
+                        self.input_mode = PlanInputMode::Normal;
+                        if let Some(pd) = self.project_data.get_mut(project_idx) {
+                            if let Some(task) = pd.tasks.get_mut(task_idx) {
+                                let prompt = if task.prompt.is_empty() {
+                                    task.title.clone()
+                                } else {
+                                    task.prompt.clone()
+                                };
+                                task.status = PlanStatus::InProgress;
+                                return PlanAction::LaunchTaskIntoWorkspace {
+                                    workspace_id: ws.workspace_id,
+                                    task_id: task.id.clone(),
+                                    task_title: task.title.clone(),
+                                    task_repo_url: task.repo_url.clone(),
+                                    prompt,
+                                };
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1577,12 +1698,41 @@ impl PlanningView {
         action
     }
 
+    /// Workspace candidates visible for launching `task_idx` of `project_idx`
+    /// — filtered to those in the same repo so the worktree is meaningful.
+    fn candidates_for(&self, project_idx: usize, task_idx: usize) -> Vec<&WorkspaceCandidate> {
+        let Some(pd) = self.project_data.get(project_idx) else {
+            return vec![];
+        };
+        let Some(task) = pd.tasks.get(task_idx) else {
+            return vec![];
+        };
+        let task_repo = task.repo_url.as_str();
+        self.workspace_candidates
+            .iter()
+            .filter(|c| {
+                c.repo_url
+                    .as_deref()
+                    .map_or(false, |u| u == task_repo)
+            })
+            .collect()
+    }
+
     fn start_launch(&mut self) -> PlanAction {
         if let Some((pi, ti)) = self.selected_task_loc() {
-            let branch_text = self.project_data[pi].tasks[ti].branch.clone().unwrap_or_default();
-            self.input_mode = PlanInputMode::LaunchConfirm { project_idx: pi, task_idx: ti, branch_text };
+            self.input_mode = PlanInputMode::WorkspacePicker {
+                project_idx: pi,
+                task_idx: ti,
+                selected: 0,
+            };
         }
         PlanAction::Consumed
+    }
+
+    /// Sync the list of open workspaces for the picker. Called by App each
+    /// event cycle before the picker is drawn or handled.
+    pub fn set_workspace_candidates(&mut self, candidates: Vec<WorkspaceCandidate>) {
+        self.workspace_candidates = candidates;
     }
 
     fn apply_search(&mut self, query: &str) {
@@ -1673,6 +1823,7 @@ impl PlanningView {
             PlanInputMode::NewTask { title } => self.draw_new_task_overlay(frame, area, title),
             PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
+            PlanInputMode::WorkspacePicker { project_idx, task_idx, selected } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected),
             PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text } => self.draw_launch_confirm(frame, area, *project_idx, *task_idx, branch_text),
             _ => {}
         }
@@ -2203,6 +2354,81 @@ impl PlanningView {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("j/k navigate \u{00b7} Enter select \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_workspace_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        project_idx: usize,
+        task_idx: usize,
+        selected: usize,
+    ) {
+        let task_name = self
+            .project_data
+            .get(project_idx)
+            .and_then(|pd| pd.tasks.get(task_idx))
+            .map(|t| t.title.as_str())
+            .unwrap_or("?");
+        let candidates = self.candidates_for(project_idx, task_idx);
+        let rows = 5 + candidates.len() as u16 + 2;
+        let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
+        let dialog = Rect::new(
+            (area.width - w) / 2,
+            (area.height.saturating_sub(h)) / 2,
+            w,
+            h,
+        );
+        frame.render_widget(Clear, dialog);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White))
+            .title(Span::styled(
+                " Launch Into ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+
+        let display_name: String = task_name
+            .chars()
+            .take((w as usize).saturating_sub(10))
+            .collect();
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("  Task: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(display_name, Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(""));
+        let row = |label: &str, idx: usize| -> Line<'static> {
+            let is_sel = idx == selected;
+            let ind = if is_sel { ">" } else { " " };
+            let st = if is_sel {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(format!("  {} {}", ind, label), st))
+        };
+        lines.push(row("+ New workspace (create worktree)", 0));
+        for (i, c) in candidates.iter().enumerate() {
+            let label = if c.name.len() > (w as usize).saturating_sub(8) {
+                format!("{}...", &c.name[..(w as usize).saturating_sub(11)])
+            } else {
+                c.name.clone()
+            };
+            lines.push(row(&label, i + 1));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  j/k navigate \u{00b7} Enter select \u{00b7} Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
