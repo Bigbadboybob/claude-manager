@@ -84,6 +84,11 @@ pub struct TerminalSession {
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
     pub workflow_role: Option<String>,
+    /// Task this session belongs to. None = workspace-level (ad-hoc) session
+    /// not tied to any task. Sessions launched from the planning view (A-f / A-l)
+    /// inherit the launched task's id; manually added sessions (A-s) inherit
+    /// the task_id of the cursor's current task scope, or None.
+    pub task_id: Option<String>,
     /// First ~120 chars of the most recent prompt we delivered via
     /// `deliver_pending_write`, along with its delivery timestamp in unix ms.
     /// Used to correlate a fresh claude workflow session with its new
@@ -153,6 +158,8 @@ struct ManifestEntry {
     workflow_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
 }
 
 /// Persisted workspace metadata. Lives in `Manifest::workspaces` keyed by the
@@ -270,6 +277,7 @@ fn make_simple_session(
         workflow_run_id: None,
         workflow_role: None,
         last_delivery: None,
+        task_id: None,
     }
 }
 
@@ -288,6 +296,10 @@ fn new_workspace_id() -> String {
 pub enum Cursor {
     /// Cursor is on a workspace header (by workspace index).
     Workspace(usize),
+    /// Cursor is on a task subheader within a workspace. Identified by
+    /// workspace index plus task_id (tasks can move / be renumbered, so an
+    /// index wouldn't be stable).
+    Task { ws_idx: usize, task_id: String },
     /// Cursor is on a session within a workspace (workspace index, session index).
     Session(usize, usize),
 }
@@ -307,6 +319,9 @@ pub enum ViewMode {
 #[derive(Clone, Debug)]
 enum VisualItem {
     WorkspaceHeader(usize),
+    /// Subheader for a task inside a workspace. Sessions tagged with this
+    /// task_id follow immediately after.
+    TaskHeader { ws_idx: usize, task_id: String },
     Session(usize, usize),
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
@@ -330,6 +345,9 @@ enum InputMode {
     NewTerminalSession {
         ws_index: usize,
         session_type: String,
+        /// Task scope inherited from the cursor when A-s was pressed. None =
+        /// workspace-level session (no task subheader).
+        task_id: Option<String>,
     },
     /// Editing session settings.
     SessionSettings {
@@ -345,6 +363,12 @@ enum InputMode {
     /// and worktree path stay the same.
     WorkspaceSettings {
         ws_index: usize,
+        name: String,
+    },
+    /// Renaming a task (updates the `name` field via the planning API and
+    /// updates the local TaskEntry so the sidebar subheader refreshes).
+    TaskSettings {
+        task_id: String,
         name: String,
     },
     /// Confirming launch of a workflow on a workspace.
@@ -676,6 +700,7 @@ impl App {
                     idle_timeout_secs: ts.idle_timeout_secs,
                     workflow_run_id: ts.workflow_run_id.clone(),
                     workflow_role: ts.workflow_role.clone(),
+                    task_id: ts.task_id.clone(),
                 })
                 .collect();
             workspaces.insert(
@@ -974,6 +999,7 @@ impl App {
             workflow_run_id: entry.workflow_run_id.clone(),
             workflow_role: entry.workflow_role.clone(),
             last_delivery: None,
+            task_id: entry.task_id.clone(),
         })
     }
 
@@ -1009,6 +1035,18 @@ impl App {
                     };
                 }
             }
+            Cursor::Task { task_id, .. } => {
+                let current_name = self
+                    .tasks
+                    .iter()
+                    .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                self.input_mode = InputMode::TaskSettings {
+                    task_id,
+                    name: current_name,
+                };
+            }
         }
     }
 
@@ -1039,14 +1077,41 @@ impl App {
     }
 
     fn toggle_session_hidden(&mut self) {
-        let (wi, si) = match self.cursor {
-            Cursor::Session(wi, si) => (wi, si),
+        let (wi, si) = match &self.cursor {
+            Cursor::Session(wi, si) => (*wi, *si),
             Cursor::Workspace(wi) => {
+                let wi = *wi;
                 if self.workspaces.get(wi).map_or(false, |w| w.sessions.len() == 1) {
                     (wi, 0)
                 } else {
                     return;
                 }
+            }
+            Cursor::Task { ws_idx, task_id } => {
+                // Toggle hidden on every session belonging to the task.
+                // Uses the majority-hidden state as the "current" so one
+                // keypress always flips everything in unison.
+                let wi = *ws_idx;
+                let tid = task_id.clone();
+                let Some(ws) = self.workspaces.get_mut(wi) else {
+                    return;
+                };
+                let matching: Vec<&mut TerminalSession> = ws
+                    .sessions
+                    .iter_mut()
+                    .filter(|ts| ts.task_id.as_deref() == Some(tid.as_str()))
+                    .collect();
+                if matching.is_empty() {
+                    return;
+                }
+                let hidden_count = matching.iter().filter(|ts| ts.hidden).count();
+                let new_hidden = hidden_count * 2 < matching.len();
+                for ts in matching {
+                    ts.hidden = new_hidden;
+                }
+                self.save_session_manifest();
+                self.needs_redraw = true;
+                return;
             }
         };
         if let Some(ts) = self
@@ -1067,25 +1132,55 @@ impl App {
         if self.workspaces.is_empty() {
             return None;
         }
-        let wi = match self.cursor {
-            Cursor::Workspace(wi) => wi,
-            Cursor::Session(wi, _) => wi,
+        let wi = match &self.cursor {
+            Cursor::Workspace(wi) => *wi,
+            Cursor::Task { ws_idx, .. } => *ws_idx,
+            Cursor::Session(wi, _) => *wi,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
 
+    /// Return the task_id for the cursor's current task scope, if any:
+    ///   - Cursor::Task → the task_id on the cursor
+    ///   - Cursor::Session → the session's task_id (may be None)
+    ///   - Cursor::Workspace → None (not task-scoped, even if one task is bound)
+    fn cursor_task_id(&self) -> Option<String> {
+        match &self.cursor {
+            Cursor::Task { task_id, .. } => Some(task_id.clone()),
+            Cursor::Session(wi, si) => self
+                .workspaces
+                .get(*wi)
+                .and_then(|w| w.sessions.get(*si))
+                .and_then(|ts| ts.task_id.clone()),
+            Cursor::Workspace(_) => None,
+        }
+    }
+
     /// Return a reference to the active terminal session (workspace + session).
     fn active_session(&self) -> Option<(&Workspace, &TerminalSession)> {
-        match self.cursor {
+        match &self.cursor {
             Cursor::Session(wi, si) => {
-                let ws = self.workspaces.get(wi)?;
-                let ts = ws.sessions.get(si)?;
+                let ws = self.workspaces.get(*wi)?;
+                let ts = ws.sessions.get(*si)?;
                 Some((ws, ts))
             }
             Cursor::Workspace(wi) => {
-                let ws = self.workspaces.get(wi)?;
+                let ws = self.workspaces.get(*wi)?;
                 if ws.sessions.len() == 1 {
                     Some((ws, &ws.sessions[0]))
+                } else {
+                    None
+                }
+            }
+            Cursor::Task { ws_idx, task_id } => {
+                let ws = self.workspaces.get(*ws_idx)?;
+                let matches: Vec<&TerminalSession> = ws
+                    .sessions
+                    .iter()
+                    .filter(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
+                    .collect();
+                if matches.len() == 1 {
+                    Some((ws, matches[0]))
                 } else {
                     None
                 }
@@ -1095,18 +1190,35 @@ impl App {
 
     /// Return a mutable reference to the active terminal session.
     fn active_session_mut(&mut self) -> Option<&mut TerminalSession> {
-        match self.cursor {
+        match &self.cursor {
             Cursor::Session(wi, si) => {
-                let ws = self.workspaces.get_mut(wi)?;
-                ws.sessions.get_mut(si)
+                let ws = self.workspaces.get_mut(*wi)?;
+                ws.sessions.get_mut(*si)
             }
             Cursor::Workspace(wi) => {
-                let ws = self.workspaces.get_mut(wi)?;
+                let ws = self.workspaces.get_mut(*wi)?;
                 if ws.sessions.len() == 1 {
                     Some(&mut ws.sessions[0])
                 } else {
                     None
                 }
+            }
+            Cursor::Task { ws_idx, task_id } => {
+                let task_id = task_id.clone();
+                let ws = self.workspaces.get_mut(*ws_idx)?;
+                let mut found_idx = None;
+                let mut count = 0;
+                for (i, ts) in ws.sessions.iter().enumerate() {
+                    if ts.task_id.as_deref() == Some(task_id.as_str()) {
+                        count += 1;
+                        if count == 1 {
+                            found_idx = Some(i);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                ws.sessions.get_mut(found_idx?)
             }
         }
     }
@@ -1165,13 +1277,15 @@ impl App {
             return;
         }
         let max = self.workspaces.len() - 1;
-        match self.cursor {
+        match &self.cursor {
             Cursor::Workspace(wi) => {
-                if wi > max {
+                if *wi > max {
                     self.cursor = Cursor::Workspace(max);
                 }
             }
             Cursor::Session(wi, si) => {
+                let wi = *wi;
+                let si = *si;
                 if wi > max {
                     self.cursor = Cursor::Workspace(max);
                 } else if self.workspaces[wi].sessions.is_empty() {
@@ -1179,6 +1293,20 @@ impl App {
                 } else if si >= self.workspaces[wi].sessions.len() {
                     self.cursor =
                         Cursor::Session(wi, self.workspaces[wi].sessions.len() - 1);
+                }
+            }
+            Cursor::Task { ws_idx, task_id } => {
+                let wi = *ws_idx;
+                let tid = task_id.clone();
+                if wi > max {
+                    self.cursor = Cursor::Workspace(max);
+                } else if !self
+                    .tasks
+                    .iter()
+                    .any(|t| t.task_id.as_deref() == Some(tid.as_str()))
+                {
+                    // Task disappeared — fall back to workspace.
+                    self.cursor = Cursor::Workspace(wi);
                 }
             }
         }
@@ -1247,55 +1375,103 @@ impl App {
             first = false;
             items.push(VisualItem::WorkspaceHeader(wi));
 
-            // Partition sessions: those in workflow groups vs. standalone.
-            let mut standalone: Vec<usize> = Vec::new();
-            let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+            // Partition sessions by task_id bucket. Unbound sessions live in
+            // the `None` bucket and render at workspace level (no subheader).
+            let mut by_task: std::collections::BTreeMap<Option<String>, Vec<usize>> =
                 std::collections::BTreeMap::new();
             for (si, ts) in ws.sessions.iter().enumerate() {
-                match &ts.workflow_run_id {
-                    Some(run_id) => groups.entry(run_id.clone()).or_default().push(si),
-                    None => standalone.push(si),
+                by_task.entry(ts.task_id.clone()).or_default().push(si);
+            }
+
+            // Render buckets: unbound first, then task buckets in binding order.
+            let task_order: Vec<Option<String>> = {
+                let mut ordered: Vec<Option<String>> = Vec::new();
+                if by_task.contains_key(&None) {
+                    ordered.push(None);
                 }
-            }
+                // Tasks bound to this workspace, in insertion order of self.tasks.
+                for task in &self.tasks {
+                    if task.workspace_id.as_deref() != Some(ws.id.as_str()) {
+                        continue;
+                    }
+                    let Some(tid) = task.task_id.as_deref() else { continue };
+                    let key = Some(tid.to_string());
+                    if by_task.contains_key(&key) && !ordered.contains(&key) {
+                        ordered.push(key);
+                    }
+                }
+                // Catch any orphaned task_ids tagged on sessions but not in
+                // self.tasks (stale API state) — render them too so they don't
+                // silently disappear.
+                let mut tail: Vec<Option<String>> = by_task
+                    .keys()
+                    .filter(|k| k.is_some() && !ordered.contains(k))
+                    .cloned()
+                    .collect();
+                tail.sort();
+                ordered.extend(tail);
+                ordered
+            };
 
-            // Standalone: running first, then idle.
-            let (standalone_running, standalone_other): (Vec<_>, Vec<_>) = standalone
-                .into_iter()
-                .partition(|si| ws.sessions[*si].status == SessionStatus::Running);
-            for si in standalone_running {
-                items.push(VisualItem::Session(wi, si));
-            }
-            for si in standalone_other {
-                items.push(VisualItem::Session(wi, si));
-            }
+            for bucket_key in task_order {
+                // Emit task subheader for task-scoped buckets.
+                if let Some(tid) = bucket_key.as_deref() {
+                    items.push(VisualItem::TaskHeader {
+                        ws_idx: wi,
+                        task_id: tid.to_string(),
+                    });
+                }
+                let indices = by_task.remove(&bucket_key).unwrap_or_default();
 
-            // Workflow groups: header + sessions in role-order from the workflow def.
-            for (run_id, session_indices) in groups {
-                let is_active_run = self.workflow_runs.iter().any(|r| r.run_id == run_id);
-                if !is_active_run {
-                    for si in session_indices {
+                // Split each bucket into standalone + workflow groups.
+                let mut standalone: Vec<usize> = Vec::new();
+                let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+                    std::collections::BTreeMap::new();
+                for si in &indices {
+                    match &ws.sessions[*si].workflow_run_id {
+                        Some(run_id) => groups.entry(run_id.clone()).or_default().push(*si),
+                        None => standalone.push(*si),
+                    }
+                }
+                // Standalone: running first, then idle.
+                let (run_, other): (Vec<_>, Vec<_>) = standalone
+                    .into_iter()
+                    .partition(|si| ws.sessions[*si].status == SessionStatus::Running);
+                for si in run_ {
+                    items.push(VisualItem::Session(wi, si));
+                }
+                for si in other {
+                    items.push(VisualItem::Session(wi, si));
+                }
+                // Workflow groups.
+                for (run_id, session_indices) in groups {
+                    let is_active_run =
+                        self.workflow_runs.iter().any(|r| r.run_id == run_id);
+                    if !is_active_run {
+                        for si in session_indices {
+                            items.push(VisualItem::Session(wi, si));
+                        }
+                        continue;
+                    }
+                    items.push(VisualItem::WorkflowHeader {
+                        ws_idx: wi,
+                        run_id: run_id.clone(),
+                    });
+                    let role_order: Vec<String> = self
+                        .workflow_runs
+                        .iter()
+                        .find(|r| r.run_id == run_id)
+                        .and_then(|r| self.workflows.get(&r.workflow_name))
+                        .map(|wf| wf.role_order.clone())
+                        .unwrap_or_default();
+                    let mut ordered = session_indices.clone();
+                    ordered.sort_by_key(|si| {
+                        let role = ws.sessions[*si].workflow_role.as_deref().unwrap_or("");
+                        role_order.iter().position(|r| r == role).unwrap_or(usize::MAX)
+                    });
+                    for si in ordered {
                         items.push(VisualItem::Session(wi, si));
                     }
-                    continue;
-                }
-                items.push(VisualItem::WorkflowHeader {
-                    ws_idx: wi,
-                    run_id: run_id.clone(),
-                });
-                let role_order: Vec<String> = self
-                    .workflow_runs
-                    .iter()
-                    .find(|r| r.run_id == run_id)
-                    .and_then(|r| self.workflows.get(&r.workflow_name))
-                    .map(|wf| wf.role_order.clone())
-                    .unwrap_or_default();
-                let mut ordered = session_indices.clone();
-                ordered.sort_by_key(|si| {
-                    let role = ws.sessions[*si].workflow_role.as_deref().unwrap_or("");
-                    role_order.iter().position(|r| r == role).unwrap_or(usize::MAX)
-                });
-                for si in ordered {
-                    items.push(VisualItem::Session(wi, si));
                 }
             }
         }
@@ -1312,12 +1488,15 @@ impl App {
 
         // Workspace headers are selectable only when the workspace has no
         // sessions (otherwise the cursor lives on a child session).
+        // Task headers are always selectable — they support A-d / A-x / A-e
+        // etc. even when they have sessions underneath.
         let is_selectable = |item: &VisualItem| match item {
             VisualItem::Session(_, _) => true,
             VisualItem::WorkspaceHeader(wi) => self
                 .workspaces
                 .get(*wi)
                 .map_or(false, |w| w.sessions.is_empty()),
+            VisualItem::TaskHeader { .. } => true,
             VisualItem::Separator => false,
             VisualItem::WorkflowHeader { .. } => false,
         };
@@ -1333,6 +1512,10 @@ impl App {
                 (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi)) => {
                     wi == vwi && si == vsi
                 }
+                (
+                    Cursor::Task { ws_idx, task_id },
+                    VisualItem::TaskHeader { ws_idx: vwi, task_id: vtid },
+                ) => ws_idx == vwi && task_id == vtid,
                 _ => false,
             })
             .unwrap_or(0);
@@ -1349,6 +1532,12 @@ impl App {
         match &items[next as usize] {
             VisualItem::Session(wi, si) => self.cursor = Cursor::Session(*wi, *si),
             VisualItem::WorkspaceHeader(wi) => self.cursor = Cursor::Workspace(*wi),
+            VisualItem::TaskHeader { ws_idx, task_id } => {
+                self.cursor = Cursor::Task {
+                    ws_idx: *ws_idx,
+                    task_id: task_id.clone(),
+                };
+            }
             _ => {}
         }
     }
@@ -1831,6 +2020,7 @@ impl App {
         let saved_ws_id = match &self.cursor {
             Cursor::Workspace(wi) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
+            Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
         };
         let saved_session_label = match &self.cursor {
             Cursor::Session(wi, si) => self
@@ -2522,6 +2712,7 @@ impl App {
                 InputMode::NewTerminalSession {
                     ws_index,
                     session_type,
+                    task_id,
                 } => match key.code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
@@ -2546,8 +2737,9 @@ impl App {
                     KeyCode::Enter => {
                         let wi = *ws_index;
                         let st = session_type.clone();
+                        let tid = task_id.clone();
                         self.input_mode = InputMode::Normal;
-                        self.spawn_session_on_workspace(wi, &st);
+                        self.spawn_session_on_workspace(wi, &st, tid);
                         return true;
                     }
                     _ => return true,
@@ -2627,6 +2819,43 @@ impl App {
                             }
                             self.save_session_manifest();
                             self.set_status_msg("Workspace renamed");
+                        }
+                        return true;
+                    }
+                    KeyCode::Backspace => {
+                        name.pop();
+                        return true;
+                    }
+                    KeyCode::Char(c) => {
+                        name.push(c);
+                        return true;
+                    }
+                    _ => return true,
+                },
+                InputMode::TaskSettings { task_id, name } => match key.code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                        return true;
+                    }
+                    KeyCode::Enter => {
+                        let tid = task_id.clone();
+                        let new_name = name.trim().to_string();
+                        self.input_mode = InputMode::Normal;
+                        if !new_name.is_empty() {
+                            if let Some(task) = self
+                                .tasks
+                                .iter_mut()
+                                .find(|t| t.task_id.as_deref() == Some(tid.as_str()))
+                            {
+                                task.name = new_name.clone();
+                            }
+                            let mut fields = HashMap::new();
+                            fields.insert(
+                                "name".to_string(),
+                                serde_json::Value::String(new_name),
+                            );
+                            self.backend.update_plan_task(tid, fields);
+                            self.set_status_msg("Task renamed");
                         }
                         return true;
                     }
@@ -2773,6 +3002,8 @@ impl App {
     }
 
     /// Enter input mode to add a terminal session to the active workspace.
+    /// If the cursor is inside a task scope, the new session inherits that
+    /// task_id so it appears under the task subheader.
     fn start_new_terminal_session(&mut self) {
         let wi = match self.active_workspace_index() {
             Some(wi) => wi,
@@ -2781,9 +3012,11 @@ impl App {
                 return;
             }
         };
+        let task_id = self.cursor_task_id();
         self.input_mode = InputMode::NewTerminalSession {
             ws_index: wi,
             session_type: "claude".to_string(),
+            task_id,
         };
     }
 
@@ -2812,6 +3045,19 @@ impl App {
                         self.cursor = Cursor::Workspace(wi);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
+                    }
+                }
+            }
+            Cursor::Task { ws_idx, task_id } => {
+                // Close every session belonging to the task. The task remains
+                // in the sidebar (as an empty subheader) until A-x removes it.
+                if let Some(ws) = self.workspaces.get_mut(ws_idx) {
+                    let before = ws.sessions.len();
+                    ws.sessions.retain(|ts| ts.task_id.as_deref() != Some(task_id.as_str()));
+                    let removed = before - ws.sessions.len();
+                    if removed > 0 {
+                        self.save_session_manifest();
+                        self.set_status_msg(&format!("Closed {} session(s)", removed));
                     }
                 }
             }
@@ -2880,6 +3126,7 @@ impl App {
             workflow_run_id: None,
             workflow_role: None,
             last_delivery: None,
+            task_id: None,
         };
         let ws = Workspace {
             id: new_workspace_id(),
@@ -2956,7 +3203,14 @@ impl App {
     }
 
     /// Spawn a session on an existing workspace by type ("claude" / "codex" / "bash").
-    fn spawn_session_on_workspace(&mut self, ws_index: usize, session_type: &str) {
+    /// If `task_id` is Some, the new session is tagged with that task so it
+    /// appears under the corresponding task subheader.
+    fn spawn_session_on_workspace(
+        &mut self,
+        ws_index: usize,
+        session_type: &str,
+        task_id: Option<String>,
+    ) {
         if ws_index >= self.workspaces.len() {
             return;
         }
@@ -2991,7 +3245,8 @@ impl App {
                 ];
                 match Session::new("gcloud", &args, cols, rows, None, Default::default()) {
                     Ok(s) => {
-                        let ts = make_simple_session(&tmux_name, "bash", s, None);
+                        let mut ts = make_simple_session(&tmux_name, "bash", s, None);
+                        ts.task_id = task_id.clone();
                         let si = self.workspaces[ws_index].sessions.len();
                         self.workspaces[ws_index].sessions.push(ts);
                         self.cursor = Cursor::Session(ws_index, si);
@@ -3023,7 +3278,8 @@ impl App {
         };
         match result {
             Ok(s) => {
-                let ts = make_simple_session(session_type, session_type, s, pending);
+                let mut ts = make_simple_session(session_type, session_type, s, pending);
+                ts.task_id = task_id;
                 let si = self.workspaces[ws_index].sessions.len();
                 self.workspaces[ws_index].sessions.push(ts);
                 self.cursor = Cursor::Session(ws_index, si);
@@ -3062,6 +3318,7 @@ impl App {
             Ok(s) => {
                 let mut ts = make_simple_session("claude", "claude", s, None);
                 ts.session_id = Some(session_id.clone());
+                ts.task_id = task_id.clone();
 
                 // If we have a task_id, find the TaskEntry and its (cloud)
                 // workspace; replace that workspace with a local one.
@@ -3136,47 +3393,91 @@ impl App {
         let Some(wi) = self.active_workspace_index() else {
             return;
         };
+
+        // Task-scoped: if the cursor is on a task header, or on a session
+        // tagged with a task, mark THAT task done (and close only its
+        // sessions). If the cursor is workspace-scoped, fall back to the
+        // old "single bound task" logic.
+        let scoped_tid = self.cursor_task_id();
+
         let ws_id = self.workspaces[wi].id.clone();
-        let bound: Vec<String> = self
-            .tasks
-            .iter()
-            .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
-            .filter_map(|t| t.task_id.clone())
-            .collect();
-        if bound.len() > 1 {
-            self.set_status_msg("Multiple tasks bound — use planning view");
-            return;
-        }
-        if let Some(tid) = bound.first().cloned() {
-            let mut fields = HashMap::new();
-            fields.insert(
-                "status".to_string(),
-                serde_json::Value::String("done".to_string()),
-            );
-            self.backend.update_task(tid.clone(), fields);
-            self.planning.mark_task_done_by_id(&tid);
-            if let Some(task) = self
-                .tasks
-                .iter_mut()
-                .find(|t| t.task_id.as_deref() == Some(&tid))
-            {
-                task.api_status = TaskStatus::Done;
+        let tid = match scoped_tid {
+            Some(t) => t,
+            None => {
+                let bound: Vec<String> = self
+                    .tasks
+                    .iter()
+                    .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
+                    .filter_map(|t| t.task_id.clone())
+                    .collect();
+                if bound.len() > 1 {
+                    self.set_status_msg("Multiple tasks bound — pick one (A-d on its header)");
+                    return;
+                }
+                match bound.into_iter().next() {
+                    Some(t) => t,
+                    None => {
+                        // No task — just drop sessions as a soft close.
+                        self.workspaces[wi].sessions.clear();
+                        self.cursor = Cursor::Workspace(wi);
+                        self.clamp_cursor();
+                        self.set_status_msg("Cleared sessions");
+                        return;
+                    }
+                }
             }
+        };
+
+        let mut fields = HashMap::new();
+        fields.insert(
+            "status".to_string(),
+            serde_json::Value::String("done".to_string()),
+        );
+        self.backend.update_task(tid.clone(), fields);
+        self.planning.mark_task_done_by_id(&tid);
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.task_id.as_deref() == Some(&tid))
+        {
+            task.api_status = TaskStatus::Done;
         }
-        // Drop sessions and leave workspace alive; user can explicitly close
-        // via A-W if desired.
-        self.workspaces[wi].sessions.clear();
+        // Drop sessions tagged with this task. Other task-scoped and
+        // workspace-level sessions in the same workspace stay running.
+        self.workspaces[wi]
+            .sessions
+            .retain(|ts| ts.task_id.as_deref() != Some(tid.as_str()));
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
         self.set_status_msg("Marked done");
     }
 
-    /// Delete the active workspace: close sessions, remove worktree + branch,
-    /// delete any bound tasks from the API, drop the workspace.
+    /// Delete whatever the cursor resolves to:
+    ///   - Cursor::Task → delete just that task (close its sessions, remove
+    ///     from backend + local TaskEntry). The workspace, worktree, and any
+    ///     other tasks / workspace-level sessions survive.
+    ///   - Cursor::Session on a task-tagged session → same as Cursor::Task.
+    ///   - Otherwise → delete the whole workspace: close sessions, remove
+    ///     worktree + branch, delete any bound tasks from the API.
     fn delete_active(&mut self) {
         let Some(wi) = self.active_workspace_index() else {
             return;
         };
+
+        // Task-scoped delete path.
+        if let Some(tid) = self.cursor_task_id() {
+            self.workspaces[wi]
+                .sessions
+                .retain(|ts| ts.task_id.as_deref() != Some(tid.as_str()));
+            self.backend.delete_task(tid.clone());
+            self.tasks.retain(|t| t.task_id.as_deref() != Some(tid.as_str()));
+            self.cursor = Cursor::Workspace(wi);
+            self.clamp_cursor();
+            self.set_status_msg("Task deleted");
+            self.save_session_manifest();
+            return;
+        }
+
         let ws_id = self.workspaces[wi].id.clone();
         let worktree_path = self.workspaces[wi].worktree_path.clone();
         let main_repo_path = self.workspaces[wi].main_repo_path.clone();
@@ -3358,7 +3659,8 @@ impl App {
         ) {
             Ok(s) => {
                 let branch = format!("cm/{}", slug);
-                let mut ts = make_simple_session("claude", "claude", s, Some(pending));
+                let mut ts = make_simple_session(slug, "claude", s, Some(pending));
+                ts.task_id = Some(task_id.to_string());
                 if !prompt.trim().is_empty() {
                     ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
                         prompt.to_string(),
@@ -3459,7 +3761,8 @@ impl App {
             Default::default(),
         ) {
             Ok(s) => {
-                let mut ts = make_simple_session("claude", "claude", s, Some(pending));
+                let mut ts = make_simple_session(task_title, "claude", s, Some(pending));
+                ts.task_id = Some(task_id.to_string());
                 if !prompt.trim().is_empty() {
                     ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
                         prompt.to_string(),
@@ -3591,6 +3894,7 @@ impl App {
                 InputMode::NewTerminalSession {
                     ws_index,
                     session_type,
+                    ..
                 } => {
                     self.draw_new_terminal_dialog(
                         frame,
@@ -3616,12 +3920,37 @@ impl App {
                         goal,
                     );
                 }
+                InputMode::TaskSettings { name, .. } => {
+                    self.draw_task_settings(frame, area, name);
+                }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
                 }
                 InputMode::Normal => {}
             }
         }
+    }
+
+    /// Minimal dialog for renaming a task from the sidebar.
+    fn draw_task_settings(&self, frame: &mut Frame, area: Rect, name: &str) {
+        let width = 60u16.min(area.width.saturating_sub(4));
+        let height = 5u16;
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let dialog_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White))
+            .title(" Rename task ");
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let para = Paragraph::new(format!("Name: {}_", name))
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(para, inner);
     }
 
     fn draw_input_dialog(
@@ -4009,26 +4338,7 @@ impl App {
                         Style::default().fg(Color::Gray)
                     };
 
-                    // If any task is bound, show titles as a dim subtitle.
-                    let bound = self.task_names_for_ws(&ws.id);
-                    if !bound.is_empty() && self.sidebar_view == SidebarView::Task {
-                        let joined = bound.join(" \u{00b7} ");
-                        let budget = (inner.width as usize).saturating_sub(5);
-                        let subtitle = if joined.len() > budget {
-                            format!(" \u{00b7} {}...", &joined[..budget.saturating_sub(6)])
-                        } else {
-                            format!(" \u{00b7} {}", joined)
-                        };
-                        let sub_line = Line::from(Span::styled(
-                            format!("   {}", subtitle),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                        items.push(
-                            ListItem::new(vec![header_line, sub_line]).style(base_style),
-                        );
-                    } else {
-                        items.push(ListItem::new(header_line).style(base_style));
-                    }
+                    items.push(ListItem::new(header_line).style(base_style));
                 }
                 VisualItem::Session(wi, si) => {
                     let ws = &self.workspaces[*wi];
@@ -4097,8 +4407,14 @@ impl App {
                             }
                         }
                         SidebarView::Task => {
-                            // "  label" indented
-                            format!("  {}", ts.label)
+                            // Workspace-level sessions: 2-space indent.
+                            // Task-scoped sessions: 4-space indent so they
+                            // visually nest under their task subheader.
+                            if ts.task_id.is_some() {
+                                format!("    {}", ts.label)
+                            } else {
+                                format!("  {}", ts.label)
+                            }
                         }
                     };
 
@@ -4167,6 +4483,38 @@ impl App {
                         ),
                     ]);
                     items.push(ListItem::new(line));
+                }
+                VisualItem::TaskHeader { ws_idx, task_id } => {
+                    let is_selected = match &self.cursor {
+                        Cursor::Task { ws_idx: cwi, task_id: ctid } => {
+                            cwi == ws_idx && ctid == task_id
+                        }
+                        _ => false,
+                    };
+                    let name = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+                        .map(|t| t.name.clone())
+                        .unwrap_or_else(|| "task".into());
+                    let max_name = (inner.width as usize).saturating_sub(4);
+                    let name = if name.len() > max_name {
+                        format!("{}...", &name[..max_name.saturating_sub(3)])
+                    } else {
+                        name
+                    };
+                    let base_style = if is_selected {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    let line = Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(name, Style::default().fg(Color::Cyan)),
+                    ]);
+                    items.push(ListItem::new(line).style(base_style));
                 }
             }
         }
@@ -4450,6 +4798,19 @@ impl App {
         let (wi, focused_si) = match self.cursor.clone() {
             Cursor::Session(wi, si) => (wi, Some(si)),
             Cursor::Workspace(wi) => (wi, None),
+            Cursor::Task { ws_idx, task_id } => {
+                // Focus on the first running session of the task so the
+                // launch modal can prefill a reasonable worker slot.
+                let si = self
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|w| {
+                        w.sessions
+                            .iter()
+                            .position(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
+                    });
+                (ws_idx, si)
+            }
         };
         if wi >= self.workspaces.len() {
             self.set_status_msg("No workspace selected");
@@ -4565,6 +4926,20 @@ impl App {
         let run_id = workflow::run::new_run_id();
         let worktree_path = self.workspaces[ws_index].worktree_path.clone();
 
+        // Inherit task_id from the first existing session in a slot so new
+        // workflow participants sit under the same task subheader in the
+        // sidebar. If all slots are fresh, participants are workspace-level.
+        let inherit_task_id: Option<String> = slots.iter().find_map(|slot| {
+            if let WorkflowSlotSource::Existing(si) = slot.source() {
+                self.workspaces[ws_index]
+                    .sessions
+                    .get(*si)
+                    .and_then(|ts| ts.task_id.clone())
+            } else {
+                None
+            }
+        });
+
         // Spawn / bind sessions for each slot and build role_sessions.
         // For existing sessions we also snapshot the current user/assistant counts
         // so that templates like `{{ roles.worker.initial_prompt }}` point at the
@@ -4614,7 +4989,7 @@ impl App {
                     (ts.label.clone(), ts.session_id.clone(), eng)
                 }
                 WorkflowSlotSource::New(engine) => {
-                    match self.spawn_workflow_session(ws_index, &slot.role, engine, &run_id) {
+                    match self.spawn_workflow_session(ws_index, &slot.role, engine, &run_id, inherit_task_id.clone()) {
                         Some((label, sid)) => (label, sid, engine.clone()),
                         None => {
                             self.set_status_msg(&format!("Failed to spawn {}", slot.role));
@@ -4726,6 +5101,7 @@ impl App {
         role_name: &str,
         engine: &Engine,
         run_id: &str,
+        task_id: Option<String>,
     ) -> Option<(String, Option<String>)> {
         let worktree_path = self.workspaces[ws_index].worktree_path.clone()?;
         let (cols, rows) = self.last_term_size;
@@ -4770,6 +5146,7 @@ impl App {
             workflow_run_id: Some(run_id.to_string()),
             workflow_role: Some(role_name.to_string()),
             last_delivery: None,
+            task_id,
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -5304,14 +5681,24 @@ impl App {
     }
 
     fn focused_session_run_id(&self) -> Option<String> {
-        let (wi, si) = match self.cursor.clone() {
-            Cursor::Session(wi, si) => (wi, si),
-            _ => return None,
-        };
-        self.workspaces
-            .get(wi)
-            .and_then(|w| w.sessions.get(si))
-            .and_then(|s| s.workflow_run_id.clone())
+        match self.cursor.clone() {
+            Cursor::Session(wi, si) => self
+                .workspaces
+                .get(wi)
+                .and_then(|w| w.sessions.get(si))
+                .and_then(|s| s.workflow_run_id.clone()),
+            Cursor::Task { ws_idx, task_id } => {
+                // Return the first workflow run_id seen on any session tagged
+                // with this task. Usually unique per task.
+                self.workspaces.get(ws_idx).and_then(|w| {
+                    w.sessions
+                        .iter()
+                        .filter(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
+                        .find_map(|ts| ts.workflow_run_id.clone())
+                })
+            }
+            Cursor::Workspace(_) => None,
+        }
     }
 
     /// Role name for a session, if it's a workflow participant.
