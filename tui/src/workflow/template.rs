@@ -44,6 +44,10 @@ pub trait RoleResolver {
     /// The most recent `ExitPlanMode` plan text, if any. Claude-only; returns
     /// `None` for Codex sessions. Used for the `plan` accessor.
     fn latest_plan(&self, role: &str) -> Option<String>;
+    /// Run-level goal string set by the user at launch. Used by the bare
+    /// `{{ goal }}` template var. Return `None` to fall back to the worker's
+    /// `initial_prompt`.
+    fn goal(&self) -> Option<String>;
 }
 
 pub fn render<R: RoleResolver + ?Sized>(template: &str, resolver: &R) -> String {
@@ -114,6 +118,16 @@ fn norm_index(len: usize, idx: isize) -> Option<usize> {
 }
 
 fn resolve<R: RoleResolver + ?Sized>(key: &str, resolver: &R) -> String {
+    // Bare run-level vars (no `roles.` prefix).
+    if key == "goal" {
+        if let Some(g) = resolver.goal() {
+            if !g.trim().is_empty() {
+                return g;
+            }
+        }
+        // Fall back to the worker's initial_prompt when no explicit goal was set.
+        return resolver.user_messages("worker").into_iter().next().unwrap_or_default();
+    }
     let Some((role, accessor, idx)) = parse_key(key) else {
         return String::new();
     };
@@ -153,6 +167,7 @@ mod tests {
         prior_user: std::collections::HashMap<String, Vec<String>>,
         prior_assistant: std::collections::HashMap<String, Vec<String>>,
         plan: std::collections::HashMap<String, String>,
+        goal: Option<String>,
     }
 
     impl RoleResolver for Stub {
@@ -170,6 +185,9 @@ mod tests {
         }
         fn latest_plan(&self, role: &str) -> Option<String> {
             self.plan.get(role).cloned()
+        }
+        fn goal(&self) -> Option<String> {
+            self.goal.clone()
         }
     }
 
@@ -209,7 +227,28 @@ mod tests {
         let mut plan = std::collections::HashMap::new();
         plan.insert("worker".into(), "# Plan\n\n1. thing\n2. other thing".into());
 
-        Stub { user, assistant, prior_user, prior_assistant, plan }
+        Stub { user, assistant, prior_user, prior_assistant, plan, goal: None }
+    }
+
+    #[test]
+    fn goal_explicit_overrides_initial_prompt() {
+        let mut s = stub();
+        s.goal = Some("migrate storage to particle filter".into());
+        let out = render("{{ goal }}", &s);
+        assert_eq!(out, "migrate storage to particle filter");
+    }
+
+    #[test]
+    fn goal_falls_back_to_worker_initial_prompt() {
+        let out = render("{{ goal }}", &stub());
+        assert_eq!(out, "fix the parser");
+    }
+
+    #[test]
+    fn goal_empty_string_falls_back() {
+        let mut s = stub();
+        s.goal = Some("   ".into());
+        assert_eq!(render("{{ goal }}", &s), "fix the parser");
     }
 
     #[test]

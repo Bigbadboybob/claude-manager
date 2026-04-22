@@ -104,6 +104,13 @@ pub struct WorkflowRun {
     /// slice out pre-launch history when templates reference role messages.
     #[serde(default)]
     pub role_baselines: BTreeMap<String, MessageBaseline>,
+    /// Optional run-level goal set at launch (via the launch modal). When
+    /// present, templates' `{{ goal }}` expands to this; otherwise it falls
+    /// back to the worker's `initial_prompt`. Useful when the workflow is
+    /// restarted mid-task — `initial_prompt` then points to the latest
+    /// user message, which may not reflect the original objective.
+    #[serde(default)]
+    pub goal: Option<String>,
 }
 
 impl WorkflowRun {
@@ -114,6 +121,7 @@ impl WorkflowRun {
         role_sessions: BTreeMap<String, RoleBinding>,
         initial_role: String,
         role_baselines: BTreeMap<String, MessageBaseline>,
+        goal: Option<String>,
     ) -> Self {
         let now = now_unix();
         let initial_assistant_count = role_baselines
@@ -146,6 +154,7 @@ impl WorkflowRun {
             done_reason: None,
             events_offset: 0,
             role_baselines,
+            goal,
         }
     }
 
@@ -371,6 +380,7 @@ mod tests {
             roles,
             "worker".into(),
             BTreeMap::new(),
+            None,
         )
     }
 

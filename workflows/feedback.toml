@@ -12,7 +12,7 @@ engine = "codex"
 context = "fresh"
 activation_prompt = """Original task I'm working on:
 
-{{ roles.worker.initial_prompt }}
+{{ goal }}
 
 Can you review unstaged changes"""
 
@@ -23,8 +23,8 @@ activation_prompt = """You are the manager of a feedback-mode workflow. Your job
 
 The user may have had a conversation with the worker BEFORE launching this workflow — often planning mode, where the worker proposed a plan the user accepted. All three context fields below may be empty; read whichever ones are populated.
 
-Launch-time prompt (first user message after the workflow was kicked off — often just "go" if a plan preceded it):
-{{ roles.worker.initial_prompt }}
+Goal the user set for this run (falls back to the first post-launch user message if no explicit goal was provided):
+{{ goal }}
 
 Plan (populated only when the worker's last pre-launch action was an ExitPlanMode tool call — i.e. the user accepted a plan right before launching; empty otherwise):
 {{ roles.worker.plan }}
@@ -46,6 +46,18 @@ Decide:
 
 Call exactly one tool. Do not write code yourself.
 """
+subsequent_activation_prompt = """Next round. You already have the full context from your previous turns; focus on what's new.
+
+Goal:
+{{ goal }}
+
+Worker's most recent message (this iteration):
+{{ roles.worker.last_message }}
+
+Reviewer's most recent review:
+{{ roles.reviewer.last_message }}
+
+Same decision rules as before. Remember the reviewer lacks goal context — only relay essential or low-effort fixes that serve the original goal. If the worker did something well this round, acknowledge it. Call exactly one tool (`workflow_transition` or `workflow_done`)."""
 
 [[transitions]]
 from = "worker"

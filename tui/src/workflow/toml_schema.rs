@@ -51,12 +51,19 @@ pub enum TriggerOn {
 pub struct Role {
     pub engine: Engine,
     pub context: Context,
-    /// Optional prompt rendered and delivered to the PTY each time this role activates.
-    /// Supports `{{ roles.<role>.last_message }}` substitutions. Roles whose prompts
-    /// always come from the previous role's tool call (e.g. the worker in feedback mode)
-    /// can omit this.
+    /// Optional prompt rendered and delivered to the PTY on the FIRST activation
+    /// of this role. Supports `{{ roles.<role>.last_message }}` and `{{ goal }}`
+    /// substitutions. Roles whose prompts always come from the previous role's
+    /// tool call (e.g. the worker in feedback mode) can omit this.
     #[serde(default)]
     pub activation_prompt: Option<String>,
+    /// Optional prompt for second+ activations. When set, persistent-context
+    /// roles that already saw the first activation template don't need to re-
+    /// render the full context (they have it in their conversation history);
+    /// this can be a much shorter prompt that just surfaces the new material.
+    /// If omitted, `activation_prompt` is reused each time.
+    #[serde(default)]
+    pub subsequent_activation_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -385,6 +392,7 @@ to = "b"
             fn prior_user_messages(&self, _: &str) -> Vec<String> { Vec::new() }
             fn prior_assistant_messages(&self, _: &str) -> Vec<String> { Vec::new() }
             fn latest_plan(&self, _: &str) -> Option<String> { None }
+            fn goal(&self) -> Option<String> { None }
         }
 
         let rendered = render(template, &Stub);

@@ -353,8 +353,12 @@ enum InputMode {
         workflow_name: String,
         /// One slot per role, in presentation order.
         slots: Vec<WorkflowSlotChoice>,
-        /// Index of the slot whose option can currently be cycled.
+        /// Index of the slot whose option can currently be cycled. When equal
+        /// to `slots.len()`, focus is on the goal text field.
         active_slot: usize,
+        /// Optional run-level goal typed by the user. Persists on the run so
+        /// templates' `{{ goal }}` expands to it across restarts.
+        goal: String,
     },
     /// Showing a workflow run's history.
     WorkflowHistory {
@@ -615,11 +619,10 @@ impl App {
         ts.session.write(body.as_bytes());
         if pw.submit {
             // Gap between body and Enter so codex classifies Enter as a
-            // keystroke, not the tail of a paste. 50ms was enough for small
-            // prompts but fails for multi-KB ones where codex is still
-            // absorbing the body when Enter lands. 2s is well above the
-            // observed threshold and trivial against the workflow cycle.
-            std::thread::sleep(Duration::from_millis(2000));
+            // keystroke, not the tail of a paste. Intentionally generous
+            // (10s) while we confirm the paste-vs-typing theory for
+            // multi-KB prompts — trivial against the overall workflow cycle.
+            std::thread::sleep(Duration::from_millis(10_000));
             ts.session.write(enter);
         }
         // Remember the first chunk of the delivered text + delivery time so
@@ -889,19 +892,60 @@ impl App {
             Session::new("gcloud", &args, cols, rows, None, Default::default())
         } else if entry.session_type == "claude" {
             let wt = ws.worktree_path.clone();
-            let mut args = vec!["--dangerously-skip-permissions".to_string()];
-            if let Some(ref sid) = entry.session_id {
-                args.push("--resume".to_string());
-                args.push(sid.clone());
-            }
+            // Workflow participants must respawn with the workflow MCP
+            // config so the agent keeps access to workflow_transition /
+            // workflow_done. Without this the restored manager can't
+            // advance the workflow.
+            let args = match (
+                entry.workflow_run_id.as_deref(),
+                entry.workflow_role.as_deref(),
+            ) {
+                (Some(run_id), Some(role)) => {
+                    if let Ok(cfg_path) = workflow::spawn::write_claude_mcp_config(run_id, role) {
+                        workflow::spawn::claude_args(
+                            &cfg_path,
+                            entry.session_id.as_deref(),
+                            &[],
+                        )
+                    } else {
+                        let mut args = vec!["--dangerously-skip-permissions".to_string()];
+                        if let Some(ref sid) = entry.session_id {
+                            args.push("--resume".to_string());
+                            args.push(sid.clone());
+                        }
+                        args
+                    }
+                }
+                _ => {
+                    let mut args = vec!["--dangerously-skip-permissions".to_string()];
+                    if let Some(ref sid) = entry.session_id {
+                        args.push("--resume".to_string());
+                        args.push(sid.clone());
+                    }
+                    args
+                }
+            };
             Session::new("claude", &args, cols, rows, wt, Default::default())
         } else if entry.session_type == "codex" {
             let wt = ws.worktree_path.clone();
-            let mut args = vec!["--yolo".to_string()];
-            if let Some(ref sid) = entry.session_id {
-                args.push("resume".to_string());
-                args.push(sid.clone());
-            }
+            let args = match (
+                entry.workflow_run_id.as_deref(),
+                entry.workflow_role.as_deref(),
+            ) {
+                (Some(run_id), Some(role)) => workflow::spawn::codex_args(
+                    run_id,
+                    role,
+                    entry.session_id.as_deref(),
+                ),
+                _ => {
+                    let mut args = vec!["--yolo".to_string()];
+                    if let Some(ref sid) = entry.session_id {
+                        args.push("resume".to_string());
+                        args.push(sid.clone());
+                    }
+                    args
+                }
+            };
             Session::new("codex", &args, cols, rows, wt, Default::default())
         } else {
             let wt = ws.worktree_path.clone();
@@ -2596,7 +2640,17 @@ impl App {
                     }
                     _ => return true,
                 },
-                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot } => {
+                InputMode::WorkflowLaunchConfirm {
+                    ws_index,
+                    workflow_name,
+                    slots,
+                    active_slot,
+                    goal,
+                } => {
+                    // `active_slot == slots.len()` means the goal text field
+                    // is focused; typing goes there instead of cycling slots.
+                    let goal_focused = *active_slot == slots.len();
+                    let positions = slots.len() + 1;
                     match key.code {
                         KeyCode::Esc => {
                             self.input_mode = InputMode::Normal;
@@ -2606,35 +2660,78 @@ impl App {
                             let wi = *ws_index;
                             let wf_name = workflow_name.clone();
                             let slots_owned = slots.clone();
+                            let goal_owned = goal.trim().to_string();
                             self.input_mode = InputMode::Normal;
-                            self.launch_workflow(wi, &wf_name, slots_owned);
+                            let goal_opt = if goal_owned.is_empty() {
+                                None
+                            } else {
+                                Some(goal_owned)
+                            };
+                            self.launch_workflow(wi, &wf_name, slots_owned, goal_opt);
                             return true;
                         }
-                        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                            if !slots.is_empty() {
-                                *active_slot = (*active_slot + 1) % slots.len();
+                        KeyCode::Down | KeyCode::Tab => {
+                            *active_slot = (*active_slot + 1) % positions;
+                            return true;
+                        }
+                        KeyCode::Up | KeyCode::BackTab => {
+                            *active_slot = if *active_slot == 0 {
+                                positions - 1
+                            } else {
+                                *active_slot - 1
+                            };
+                            return true;
+                        }
+                        KeyCode::Right => {
+                            if !goal_focused {
+                                if let Some(slot) = slots.get_mut(*active_slot) {
+                                    slot.cycle(1);
+                                }
                             }
                             return true;
                         }
-                        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                            if !slots.is_empty() {
-                                *active_slot = if *active_slot == 0 {
-                                    slots.len() - 1
-                                } else {
-                                    *active_slot - 1
-                                };
+                        KeyCode::Left => {
+                            if !goal_focused {
+                                if let Some(slot) = slots.get_mut(*active_slot) {
+                                    slot.cycle(-1);
+                                }
                             }
                             return true;
                         }
-                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
-                            if let Some(slot) = slots.get_mut(*active_slot) {
-                                slot.cycle(1);
+                        KeyCode::Backspace => {
+                            if goal_focused {
+                                goal.pop();
                             }
                             return true;
                         }
-                        KeyCode::Left | KeyCode::Char('h') => {
-                            if let Some(slot) = slots.get_mut(*active_slot) {
-                                slot.cycle(-1);
+                        KeyCode::Char(c) => {
+                            if goal_focused {
+                                goal.push(c);
+                            } else {
+                                // Slot navigation shorthands (only when the
+                                // goal field isn't focused, so characters
+                                // in the goal don't get consumed as commands).
+                                match c {
+                                    'j' => *active_slot = (*active_slot + 1) % positions,
+                                    'k' => {
+                                        *active_slot = if *active_slot == 0 {
+                                            positions - 1
+                                        } else {
+                                            *active_slot - 1
+                                        };
+                                    }
+                                    'l' | ' ' => {
+                                        if let Some(slot) = slots.get_mut(*active_slot) {
+                                            slot.cycle(1);
+                                        }
+                                    }
+                                    'h' => {
+                                        if let Some(slot) = slots.get_mut(*active_slot) {
+                                            slot.cycle(-1);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                             return true;
                         }
@@ -3508,7 +3605,7 @@ impl App {
                 InputMode::WorkspaceSettings { name, .. } => {
                     self.draw_workspace_settings(frame, area, name);
                 }
-                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot } => {
+                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot, goal } => {
                     self.draw_workflow_launch(
                         frame,
                         area,
@@ -3516,6 +3613,7 @@ impl App {
                         workflow_name,
                         slots,
                         *active_slot,
+                        goal,
                     );
                 }
                 InputMode::WorkflowHistory { run_id } => {
@@ -4314,6 +4412,10 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
         let (engine, wt, sid) = self.lookup(role)?;
         workflow::transcript::latest_plan(engine, wt, sid)
     }
+
+    fn goal(&self) -> Option<String> {
+        self.run.goal.clone()
+    }
 }
 
 impl App {
@@ -4411,6 +4513,7 @@ impl App {
             workflow_name: wf_name,
             slots,
             active_slot: 0,
+            goal: String::new(),
         };
     }
 
@@ -4420,6 +4523,7 @@ impl App {
         ws_index: usize,
         workflow_name: &str,
         slots: Vec<WorkflowSlotChoice>,
+        goal: Option<String>,
     ) {
         let Some(wf) = self.workflows.get(workflow_name).cloned() else {
             self.set_status_msg("Workflow not found");
@@ -4562,6 +4666,7 @@ impl App {
             role_sessions,
             initial_role.clone(),
             role_baselines,
+            goal,
         );
         let _ = workflow::run::save(&run);
         self.workflow_runs.push(run);
@@ -4922,14 +5027,28 @@ impl App {
         };
         self.workflow_runs[run_idx].close_active_role(captured);
 
-        // Render prompt for target role.
+        // Render prompt for target role. After the first activation of this
+        // role in the run, prefer `subsequent_activation_prompt` if set —
+        // persistent roles already have the first-activation context in
+        // their conversation history and don't need it re-rendered.
         let target_role_spec = match wf.roles.get(to_role).cloned() {
             Some(r) => r,
             None => return,
         };
-        let template_source = supplied_prompt
-            .or_else(|| target_role_spec.activation_prompt.clone())
-            .unwrap_or_default();
+        let prior_activations = self.workflow_runs[run_idx]
+            .history
+            .iter()
+            .filter(|h| h.role == to_role)
+            .count();
+        let default_template = if prior_activations > 0 {
+            target_role_spec
+                .subsequent_activation_prompt
+                .clone()
+                .or_else(|| target_role_spec.activation_prompt.clone())
+        } else {
+            target_role_spec.activation_prompt.clone()
+        };
+        let template_source = supplied_prompt.or(default_template).unwrap_or_default();
         let worktree_ref = self.workspaces[ti].worktree_path.as_deref();
         let resolver = WorkflowResolver {
             wf: &wf,
@@ -5211,9 +5330,11 @@ impl App {
         workflow_name: &str,
         slots: &[WorkflowSlotChoice],
         active_slot: usize,
+        goal: &str,
     ) {
         let width = area.width.min(72).max(44);
-        let height = (slots.len() as u16 + 8).min(area.height.saturating_sub(2));
+        // +10 leaves room for the goal field row and the hint footer.
+        let height = (slots.len() as u16 + 10).min(area.height.saturating_sub(2));
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let dialog = Rect { x, y, width, height };
@@ -5271,8 +5392,34 @@ impl App {
             ]));
         }
         lines.push(Line::from(""));
+        // Goal field (optional). Focused when `active_slot == slots.len()`.
+        let goal_focused = active_slot == slots.len();
+        let goal_cursor = if goal_focused { "▸ " } else { "  " };
+        let goal_label_style = if goal_focused {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let goal_value_style = if goal_focused {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let goal_display: String = if goal.is_empty() {
+            "(optional — overrides {{ goal }})".into()
+        } else if goal_focused {
+            format!("{}\u{258f}", goal)
+        } else {
+            goal.to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(goal_cursor),
+            Span::styled(format!("{:<10}", "goal"), goal_label_style),
+            Span::styled(goal_display, goal_value_style),
+        ]));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "\u{2191}\u{2193} slot   \u{2190}\u{2192} choice   Enter: launch   Esc: cancel",
+            "\u{2191}\u{2193} field   \u{2190}\u{2192} choice   Enter: launch   Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
