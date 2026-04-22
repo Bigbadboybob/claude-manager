@@ -4503,16 +4503,19 @@ impl App {
                     } else {
                         name
                     };
+                    // Style lives on the ListItem so selection highlight can
+                    // override. Using Span::styled with a fixed color here
+                    // would mask the base_style on selection.
                     let base_style = if is_selected {
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(Color::Cyan)
                     };
                     let line = Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(name, Style::default().fg(Color::Cyan)),
+                        Span::raw(name),
                     ]);
                     items.push(ListItem::new(line).style(base_style));
                 }
