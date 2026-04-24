@@ -1,0 +1,32 @@
+name = "review"
+description = "Reviewer audits; worker implements; reviewer decides whether to iterate or stop."
+
+role_order = ["reviewer", "worker"]
+
+[roles.reviewer]
+engine = "claude-code"
+context = "persistent"
+subsequent_activation_prompt = """Take another look.
+
+Worker's latest message:
+{{ roles.worker.last_message }}
+
+If you're satisfied, call the `workflow_done` tool with a short `reason`. Otherwise, write your review — it will be sent to the worker automatically."""
+
+[roles.worker]
+engine = "claude-code"
+context = "persistent"
+activation_prompt = """Reviewer's feedback:
+{{ roles.reviewer.last_message }}
+
+Address it. If you need to discuss before touching code, call the `workflow_transition` tool with `to = "reviewer"` and your question as `prompt`."""
+
+[[transitions]]
+from = "reviewer"
+on = "idle"
+to = "worker"
+
+[[transitions]]
+from = "worker"
+on = "idle"
+to = "reviewer"

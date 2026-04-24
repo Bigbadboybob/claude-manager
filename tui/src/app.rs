@@ -371,6 +371,13 @@ enum InputMode {
         task_id: String,
         name: String,
     },
+    /// Picking which workflow to launch when more than one is defined.
+    WorkflowPicker {
+        ws_index: usize,
+        focused_si: Option<usize>,
+        names: Vec<String>,
+        selected: usize,
+    },
     /// Confirming launch of a workflow on a workspace.
     WorkflowLaunchConfirm {
         ws_index: usize,
@@ -3017,6 +3024,63 @@ impl App {
                         _ => return true,
                     }
                 }
+                InputMode::WorkflowPicker {
+                    ws_index,
+                    focused_si,
+                    names,
+                    selected,
+                } => {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.input_mode = InputMode::Normal;
+                            return true;
+                        }
+                        KeyCode::Enter => {
+                            let Some(wf_name) = names.get(*selected).cloned() else {
+                                self.input_mode = InputMode::Normal;
+                                return true;
+                            };
+                            let wi = *ws_index;
+                            let fs = *focused_si;
+                            self.input_mode = InputMode::Normal;
+                            self.enter_workflow_launch_confirm(wi, fs, wf_name);
+                            return true;
+                        }
+                        KeyCode::Down | KeyCode::Tab => {
+                            if !names.is_empty() {
+                                *selected = (*selected + 1) % names.len();
+                            }
+                            return true;
+                        }
+                        KeyCode::Up | KeyCode::BackTab => {
+                            if !names.is_empty() {
+                                *selected = if *selected == 0 {
+                                    names.len() - 1
+                                } else {
+                                    *selected - 1
+                                };
+                            }
+                            return true;
+                        }
+                        KeyCode::Char('j') => {
+                            if !names.is_empty() {
+                                *selected = (*selected + 1) % names.len();
+                            }
+                            return true;
+                        }
+                        KeyCode::Char('k') => {
+                            if !names.is_empty() {
+                                *selected = if *selected == 0 {
+                                    names.len() - 1
+                                } else {
+                                    *selected - 1
+                                };
+                            }
+                            return true;
+                        }
+                        _ => return true,
+                    }
+                }
                 InputMode::WorkflowHistory { run_id: _ } => match key.code {
                     KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                         self.input_mode = InputMode::Normal;
@@ -3959,6 +4023,9 @@ impl App {
                 InputMode::WorkspaceSettings { name, .. } => {
                     self.draw_workspace_settings(frame, area, name);
                 }
+                InputMode::WorkflowPicker { names, selected, .. } => {
+                    self.draw_workflow_picker(frame, area, names, *selected);
+                }
                 InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot, goal } => {
                     self.draw_workflow_launch(
                         frame,
@@ -4869,7 +4936,40 @@ impl App {
             self.set_status_msg("No workspace selected");
             return;
         }
-        let wf_name = "feedback".to_string();
+
+        let mut names: Vec<String> = self.workflows.keys().cloned().collect();
+        names.sort();
+        match names.len() {
+            0 => {
+                self.set_status_msg(&format!(
+                    "No workflows found in {}",
+                    workflow::toml_schema::workflows_dir().display()
+                ));
+            }
+            1 => {
+                let only = names.into_iter().next().unwrap();
+                self.enter_workflow_launch_confirm(wi, focused_si, only);
+            }
+            _ => {
+                self.input_mode = InputMode::WorkflowPicker {
+                    ws_index: wi,
+                    focused_si,
+                    names,
+                    selected: 0,
+                };
+            }
+        }
+    }
+
+    /// Build the per-role slot list for `wf_name` and enter the launch-confirm
+    /// modal. Called both from the single-workflow fast path and after the
+    /// user picks a workflow in `WorkflowPicker`.
+    fn enter_workflow_launch_confirm(
+        &mut self,
+        wi: usize,
+        focused_si: Option<usize>,
+        wf_name: String,
+    ) {
         let Some(wf) = self.workflows.get(&wf_name).cloned() else {
             self.set_status_msg(&format!(
                 "Workflow '{}' not found (looked in {})",
@@ -5780,6 +5880,63 @@ impl App {
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl App {
+    pub fn draw_workflow_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        names: &[String],
+        selected: usize,
+    ) {
+        let width = area.width.min(60).max(36);
+        let height = (names.len() as u16 + 5).min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (idx, name) in names.iter().enumerate() {
+            let is_active = idx == selected;
+            let cursor = if is_active { "▸ " } else { "  " };
+            let desc = self
+                .workflows
+                .get(name)
+                .map(|w| w.description.clone())
+                .unwrap_or_default();
+            let name_style = if is_active {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let desc_style = if is_active {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mut spans = vec![
+                Span::raw(cursor),
+                Span::styled(format!("{:<12}", name), name_style),
+            ];
+            if !desc.is_empty() {
+                spans.push(Span::styled(desc, desc_style));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "\u{2191}\u{2193} select   Enter: choose   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Pick workflow ")
+            .style(Style::default().fg(Color::White));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, dialog);
+    }
+
     pub fn draw_workflow_launch(
         &self,
         frame: &mut Frame,
