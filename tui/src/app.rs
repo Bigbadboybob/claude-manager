@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -439,6 +439,11 @@ pub struct App {
     input_mode: InputMode,
     start_time: Instant,
     sessions_restored: bool,
+    /// Task→workspace bindings loaded from the manifest at startup. Consulted
+    /// by reconcile_tasks before auto-provisioning so tasks that were already
+    /// bound to a workspace don't spawn orphan duplicates when reconcile runs
+    /// before restore_sessions populates self.workspaces.
+    manifest_bindings: HashMap<String, String>,
     last_session_id_check: Instant,
     /// Workflow definitions loaded from `workflows/*.toml` at startup.
     pub workflows: HashMap<String, Workflow>,
@@ -463,6 +468,16 @@ impl App {
             Some("task") => SidebarView::Task,
             _ => SidebarView::Status,
         };
+        // Only keep bindings whose target workspace still exists in the
+        // manifest — otherwise we'd set workspace_id to a dangling id that
+        // nothing resolves to.
+        let known_ws_ids: HashSet<&String> = manifest.workspaces.keys().collect();
+        let manifest_bindings: HashMap<String, String> = manifest
+            .bindings
+            .iter()
+            .filter(|(_, ws_id)| known_ws_ids.contains(ws_id))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let (workflows, _errs) =
             workflow::toml_schema::load_all(&workflow::toml_schema::workflows_dir());
         let workflow_runs = workflow::run::load_all()
@@ -486,6 +501,7 @@ impl App {
             input_mode: InputMode::Normal,
             start_time: Instant::now(),
             sessions_restored: false,
+            manifest_bindings,
             last_session_id_check: Instant::now(),
             workflows,
             workflow_runs,
@@ -818,11 +834,36 @@ impl App {
 
         let (cols, rows) = self.last_term_size;
 
+        // Identify worktree paths that are "covered" by a useful workspace —
+        // one with sessions or referenced in bindings. We use this to drop
+        // orphan-duplicate empty workspaces that accumulated from the pre-fix
+        // auto-provision-before-restore bug.
+        let bound_ws_ids: HashSet<&String> = manifest.bindings.values().collect();
+        let useful_worktree_paths: HashSet<PathBuf> = manifest
+            .workspaces
+            .values()
+            .filter(|w| !w.sessions.is_empty() || bound_ws_ids.contains(&w.id))
+            .filter_map(|w| w.worktree_path.clone())
+            .collect();
+
         // Rebuild self.workspaces from the manifest. Closed workspaces are
         // loaded with empty sessions (their PTY state is gone anyway).
         for (_, mw) in manifest.workspaces.iter() {
             let already = self.workspaces.iter().any(|w| w.id == mw.id);
             if already {
+                continue;
+            }
+            // Skip orphan-duplicate: empty, open, not in bindings, and shares a
+            // worktree_path with a useful sibling. User-closed workspaces are
+            // preserved (is_closed=true) since closing is an explicit action.
+            if !mw.is_closed
+                && mw.sessions.is_empty()
+                && !bound_ws_ids.contains(&mw.id)
+                && mw
+                    .worktree_path
+                    .as_ref()
+                    .map_or(false, |p| useful_worktree_paths.contains(p))
+            {
                 continue;
             }
             let mut ws = Workspace {
@@ -2098,6 +2139,15 @@ impl App {
                 .position(|t| t.task_id.as_deref() == Some(&task.id))
                 .expect("just inserted");
             if self.tasks[task_idx].workspace_id.is_some() {
+                continue;
+            }
+
+            // Honor manifest binding before auto-provisioning. On the first
+            // reconcile tick self.workspaces is still empty (restore_sessions
+            // runs right after), so without this we'd spawn an orphan that
+            // restore_sessions later supersedes via bindings.
+            if let Some(ws_id) = self.manifest_bindings.get(&task.id) {
+                self.tasks[task_idx].workspace_id = Some(ws_id.clone());
                 continue;
             }
 
