@@ -972,6 +972,7 @@ impl PlanningView {
                     KeyCode::Char('h') => { self.navigate_horizontal(-1); return PlanAction::Consumed; }
                     KeyCode::Char('l') if !self.linear_mode => { self.navigate_horizontal(1); return PlanAction::Consumed; }
                     KeyCode::Enter => { self.insert_separator(); return PlanAction::Consumed; }
+                    KeyCode::Char(' ') => { self.insert_empty(); return PlanAction::Consumed; }
                     KeyCode::Backspace => { self.remove_separator(); return PlanAction::Consumed; }
                     KeyCode::Char('c') => { self.add_column(); return PlanAction::Consumed; }
                     KeyCode::Char('v') => {
@@ -1001,7 +1002,19 @@ impl PlanningView {
                     KeyCode::Char('o') => { self.sort_column_by_status(); return PlanAction::Consumed; }
                     KeyCode::Char('s') => { return self.cycle_status(true); }
                     KeyCode::Char('a') => { return self.accept_proposal(); }
-                    KeyCode::Char('x') => { self.cancel_visual(); return self.delete_task(); }
+                    KeyCode::Char('x') => {
+                        self.cancel_visual();
+                        if let Some((pi, ci)) = self.unified_cols.get(self.cursor.col).copied() {
+                            if matches!(
+                                self.project_data[pi].layout.columns[ci].get(self.cursor.row),
+                                Some(GridItem::Separator | GridItem::Empty)
+                            ) {
+                                self.remove_separator();
+                                return PlanAction::Consumed;
+                            }
+                        }
+                        return self.delete_task();
+                    }
                     KeyCode::Char('d') => { return self.cycle_status_to_done(); }
                     KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('u') => {
@@ -1530,6 +1543,16 @@ impl PlanningView {
         self.save_project_layout(pi);
     }
 
+    fn insert_empty(&mut self) {
+        let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
+            Some(v) => *v,
+            None => return,
+        };
+        let insert_at = (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len());
+        self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Empty);
+        self.save_project_layout(pi);
+    }
+
     fn remove_separator(&mut self) {
         let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
             Some(v) => *v,
@@ -1919,7 +1942,7 @@ impl PlanningView {
                 dim,
             )),
             Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+                " A-e edit \u{00b7} A-n new \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
                 dim,
             )),
         ]), help_area);
@@ -2023,12 +2046,13 @@ impl PlanningView {
         if inner.height < 4 || inner.width < 4 { return; }
 
         let help_entries: Vec<(&str, &str)> = vec![
-            ("A-j/k  nav", "A-d  done"),
-            ("A-J/K  reorder", "A-f  launch"),
-            ("A-e    edit", "A-a  accept"),
-            ("A-n    new", "A-x  delete"),
-            ("A-s/S  status", "A-p  filter"),
-            ("A-g    grid", "A-t  sessions"),
+            ("A-j/k  nav", "A-d    done"),
+            ("A-J/K  reorder", "A-f    launch"),
+            ("A-e    edit", "A-a    accept"),
+            ("A-n    new", "A-x    delete"),
+            ("A-Ent  sep", "A-Spc  empty"),
+            ("A-s/S  status", "A-p    filter"),
+            ("A-g    grid", "A-t    sessions"),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 2) as usize;

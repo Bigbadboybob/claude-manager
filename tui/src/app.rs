@@ -63,6 +63,10 @@ pub enum SessionStatus {
 }
 
 pub struct TerminalSession {
+    /// Stable per-session id, generated at creation. Used to track the cursor
+    /// across reconciles so duplicate labels don't confuse restoration.
+    /// In-memory only; not persisted.
+    pub uid: String,
     pub label: String,
     pub session_type: String, // "claude" or "bash" — immutable, survives renames
     pub session: Session,
@@ -263,6 +267,7 @@ fn make_simple_session(
     pending_jsonl_files: Option<Vec<String>>,
 ) -> TerminalSession {
     TerminalSession {
+        uid: new_session_uid(),
         label: label.to_string(),
         session_type: session_type.to_string(),
         session,
@@ -290,6 +295,29 @@ fn new_workspace_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("ws-{:x}", nanos)
+}
+
+/// Map a TerminalSession's `session_type` ("claude" | "codex" | "bash") to the
+/// `Engine` used by transcript readers. Workflow code must derive engine from
+/// the actual bound session (not from the workflow TOML role spec) since the
+/// user can bind, e.g., a codex session into a role declared as "claude-code".
+fn engine_for_session_type(session_type: &str) -> workflow::toml_schema::Engine {
+    match session_type {
+        "codex" => workflow::toml_schema::Engine::Codex,
+        _ => workflow::toml_schema::Engine::ClaudeCode,
+    }
+}
+
+fn new_session_uid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ts-{:x}-{:x}", nanos, n)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1033,6 +1061,7 @@ impl App {
             None
         };
         Some(TerminalSession {
+            uid: new_session_uid(),
             label: entry.label.clone(),
             session_type: entry.session_type.clone(),
             session: s,
@@ -2070,12 +2099,12 @@ impl App {
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
         };
-        let saved_session_label = match &self.cursor {
+        let saved_session_uid = match &self.cursor {
             Cursor::Session(wi, si) => self
                 .workspaces
                 .get(*wi)
                 .and_then(|w| w.sessions.get(*si))
-                .map(|s| s.label.clone()),
+                .map(|s| s.uid.clone()),
             _ => None,
         };
 
@@ -2300,11 +2329,11 @@ impl App {
         // Restore cursor by workspace id.
         if let Some(ref id) = saved_ws_id {
             if let Some(wi) = self.workspaces.iter().position(|w| &w.id == id) {
-                if let Some(ref label) = saved_session_label {
+                if let Some(ref uid) = saved_session_uid {
                     if let Some(si) = self.workspaces[wi]
                         .sessions
                         .iter()
-                        .position(|s| &s.label == label)
+                        .position(|s| &s.uid == uid)
                     {
                         self.cursor = Cursor::Session(wi, si);
                     } else {
@@ -3226,6 +3255,7 @@ impl App {
         };
 
         let ts = TerminalSession {
+            uid: new_session_uid(),
             label: "claude".to_string(),
             session_type: "claude".to_string(),
             session: s,
@@ -4780,24 +4810,28 @@ impl App {
 
 /// Bridges the template engine to a workflow run's roles.
 ///
-/// For a given role name, looks up the engine (from `Workflow`) and session id
-/// (from `WorkflowRun.role_sessions`), then reads that session's JSONL transcript
-/// on demand. Fresh-context roles naturally expose only their current activation's
-/// messages — past activations wrote to a different session id and are no longer
-/// pointed at.
+/// For a given role name, looks up the engine (from the actual bound session's
+/// `session_type`, NOT the workflow TOML — the user can bind a codex session
+/// into a role declared as `claude-code`) and session id (from
+/// `WorkflowRun.role_sessions`), then reads that session's JSONL transcript on
+/// demand. Fresh-context roles naturally expose only their current activation's
+/// messages — past activations wrote to a different session id and are no
+/// longer pointed at.
 struct WorkflowResolver<'a> {
-    wf: &'a Workflow,
     run: &'a WorkflowRun,
     worktree_path: Option<&'a Path>,
+    /// Engine to use for each role, derived from the actual bound session's
+    /// `session_type` at resolver construction time.
+    role_engines: std::collections::BTreeMap<String, workflow::toml_schema::Engine>,
 }
 
 impl<'a> WorkflowResolver<'a> {
-    fn lookup(&self, role: &str) -> Option<(&'a workflow::toml_schema::Engine, &'a Path, &'a str)> {
-        let role_spec = self.wf.roles.get(role)?;
+    fn lookup(&self, role: &str) -> Option<(workflow::toml_schema::Engine, &'a Path, &'a str)> {
+        let engine = self.role_engines.get(role).cloned()?;
         let binding = self.run.role_sessions.get(role)?;
         let session_id = binding.current_session_id.as_deref()?;
         let worktree = self.worktree_path?;
-        Some((&role_spec.engine, worktree, session_id))
+        Some((engine, worktree, session_id))
     }
 }
 
@@ -4812,7 +4846,7 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
             .get(role)
             .map(|b| b.user_count)
             .unwrap_or(0);
-        workflow::transcript::list_messages(engine, wt, sid, workflow::transcript::MessageKind::User)
+        workflow::transcript::list_messages(&engine, wt, sid, workflow::transcript::MessageKind::User)
             .into_iter()
             .skip(offset)
             .collect()
@@ -4829,7 +4863,7 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
             .map(|b| b.assistant_count)
             .unwrap_or(0);
         workflow::transcript::list_messages(
-            engine,
+            &engine,
             wt,
             sid,
             workflow::transcript::MessageKind::Assistant,
@@ -4849,7 +4883,7 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
             .get(role)
             .map(|b| b.user_count)
             .unwrap_or(0);
-        workflow::transcript::list_messages(engine, wt, sid, workflow::transcript::MessageKind::User)
+        workflow::transcript::list_messages(&engine, wt, sid, workflow::transcript::MessageKind::User)
             .into_iter()
             .take(baseline)
             .collect()
@@ -4866,7 +4900,7 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
             .map(|b| b.assistant_count)
             .unwrap_or(0);
         workflow::transcript::list_messages(
-            engine,
+            &engine,
             wt,
             sid,
             workflow::transcript::MessageKind::Assistant,
@@ -4878,7 +4912,7 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
 
     fn latest_plan(&self, role: &str) -> Option<String> {
         let (engine, wt, sid) = self.lookup(role)?;
-        workflow::transcript::latest_plan(engine, wt, sid)
+        workflow::transcript::latest_plan(&engine, wt, sid)
     }
 
     fn goal(&self) -> Option<String> {
@@ -5281,6 +5315,7 @@ impl App {
         let session_type = engine.as_session_type().to_string();
         let label = role_name.to_string();
         let ts = TerminalSession {
+            uid: new_session_uid(),
             label: label.clone(),
             session_type,
             session: sess,
@@ -5452,12 +5487,14 @@ impl App {
                         .active_assistant_start_count()
                         .unwrap_or(0);
                     let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
+                    let session_engine =
+                        engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
                     let current_count = match (
                         self.workspaces[ti].worktree_path.as_deref(),
                         current_sid.as_deref(),
                     ) {
                         (Some(wt), Some(sid)) => workflow::transcript::count_messages(
-                            &wf.roles[active].engine,
+                            &session_engine,
                             wt,
                             sid,
                             workflow::transcript::MessageKind::Assistant,
@@ -5474,7 +5511,7 @@ impl App {
                         current_sid.as_deref(),
                     ) {
                         (Some(wt), Some(sid)) => workflow::transcript::role_turn_complete(
-                            &wf.roles[active].engine,
+                            &session_engine,
                             wt,
                             sid,
                         ),
@@ -5598,10 +5635,25 @@ impl App {
         };
         let template_source = supplied_prompt.or(default_template).unwrap_or_default();
         let worktree_ref = self.workspaces[ti].worktree_path.as_deref();
+        // Build role → actual-engine map by walking each role's bound session.
+        // Falls back to the workflow TOML's declared engine if no session is
+        // currently bound for that role (e.g. fresh-context roles before first
+        // activation, or pre-launch).
+        let mut role_engines: std::collections::BTreeMap<String, workflow::toml_schema::Engine> =
+            std::collections::BTreeMap::new();
+        for role_name in wf.roles.keys() {
+            let engine = match self.locate_workflow_session(run_id, role_name) {
+                Some((wi, sj)) => engine_for_session_type(
+                    &self.workspaces[wi].sessions[sj].session_type,
+                ),
+                None => wf.roles[role_name].engine.clone(),
+            };
+            role_engines.insert(role_name.clone(), engine);
+        }
         let resolver = WorkflowResolver {
-            wf: &wf,
             run: &self.workflow_runs[run_idx],
             worktree_path: worktree_ref,
+            role_engines,
         };
         let rendered = workflow::template::render(&template_source, &resolver);
 
@@ -5621,9 +5673,11 @@ impl App {
         // the agent's reply contains text, thinking, or tool_use content.
         let start_count = {
             let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
+            let session_engine =
+                engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
             match (self.workspaces[ti].worktree_path.as_deref(), current_sid.as_deref()) {
                 (Some(wt), Some(sid)) => workflow::transcript::count_messages(
-                    &target_role_spec.engine,
+                    &session_engine,
                     wt,
                     sid,
                     workflow::transcript::MessageKind::Assistant,
