@@ -3999,6 +3999,14 @@ impl App {
         let content_area = rows[0];
         let bar_area = rows[1];
 
+        // Wipe the content area first so stale cells from a previous frame's
+        // wider/taller widgets don't bleed through when a new panel renders
+        // less content. Ratatui only diffs touched cells; without this, the
+        // user sees artifacts in the gaps after switching views/panels (the
+        // status bar is fully painted by draw_status_bar so it doesn't need
+        // clearing here).
+        frame.render_widget(Clear, content_area);
+
         match self.view_mode {
             ViewMode::Sessions => {
                 let cols =
