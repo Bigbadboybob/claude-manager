@@ -8,9 +8,23 @@
 //! fine.
 
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use crate::workflow::toml_schema::Engine;
+
+/// Read just the first line of a file. Used to inspect Codex JSONL session
+/// metadata (which lives on the first line) without slurping the whole
+/// transcript — these files routinely grow to many MB and the codex session
+/// directory accumulates hundreds of them, so the per-file read+parse cost
+/// matters when walking the tree to find or list sessions.
+pub fn read_first_line(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = String::new();
+    reader.read_line(&mut buf).ok()?;
+    Some(buf)
+}
 
 /// Path to the Claude JSONL for a session id in a given worktree.
 fn claude_transcript_path(worktree_path: &Path, session_id: &str) -> Option<PathBuf> {
@@ -43,14 +57,10 @@ fn find_codex_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
                 return Some(hit);
             }
         } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                if let Some(first) = contents.lines().next() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(first) {
-                        if v.pointer("/payload/id").and_then(|v| v.as_str()) == Some(session_id) {
-                            return Some(path);
-                        }
-                    }
-                }
+            let Some(first) = read_first_line(&path) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(first.trim()) else { continue };
+            if v.pointer("/payload/id").and_then(|v| v.as_str()) == Some(session_id) {
+                return Some(path);
             }
         }
     }
@@ -151,38 +161,6 @@ pub fn last_message(
     }
 }
 
-/// Extract the first user-typed message from a Claude JSONL transcript.
-///
-/// We skip messages that look synthetic (tool results, system-prompt echoes, empty).
-pub fn claude_first_user_message(worktree_path: &Path, session_id: &str) -> Option<String> {
-    let path = claude_transcript_path(worktree_path, session_id)?;
-    let contents = fs::read_to_string(&path).ok()?;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
-            continue;
-        }
-        // Skip tool_result continuations — we want a real user turn.
-        if is_claude_tool_result(&v) {
-            continue;
-        }
-        if let Some(text) = extract_user_text(v.pointer("/message/content")) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn is_claude_tool_result(v: &serde_json::Value) -> bool {
     v.pointer("/message/content")
         .and_then(|c| c.as_array())
@@ -191,42 +169,6 @@ fn is_claude_tool_result(v: &serde_json::Value) -> bool {
                 item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
             })
         })
-}
-
-/// Extract the first user message from a Codex transcript.
-pub fn codex_first_user_message(session_id: &str) -> Option<String> {
-    let path = codex_transcript_path(session_id)?;
-    let contents = fs::read_to_string(&path).ok()?;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let role = v
-            .pointer("/payload/role")
-            .and_then(|r| r.as_str())
-            .or_else(|| v.pointer("/role").and_then(|r| r.as_str()));
-        if role != Some("user") {
-            continue;
-        }
-        if let Some(text) = extract_user_text(v.pointer("/payload/content")) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-        if let Some(s) = v.pointer("/payload/content").and_then(|v| v.as_str()) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// User content may be a plain string OR an array of {type, text} items.
@@ -251,18 +193,6 @@ fn extract_user_text(content: Option<&serde_json::Value>) -> Option<String> {
         }
     }
     if buf.is_empty() { None } else { Some(buf) }
-}
-
-/// Dispatch: return the first user-typed message for the given engine + session.
-pub fn first_user_message(
-    engine: &Engine,
-    worktree_path: &Path,
-    session_id: &str,
-) -> Option<String> {
-    match engine {
-        Engine::ClaudeCode => claude_first_user_message(worktree_path, session_id),
-        Engine::Codex => codex_first_user_message(session_id),
-    }
 }
 
 /// Which kind of message to extract when listing from a transcript.

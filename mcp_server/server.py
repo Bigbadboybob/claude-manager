@@ -53,6 +53,31 @@ def _append_event(tool: str, args: dict) -> dict:
     return event
 
 
+_BRIEF_FIELDS = (
+    "id", "slug", "project", "name", "status", "source",
+    "priority", "difficulty", "is_cloud",
+)
+_FULL_EXTRA_FIELDS = (
+    "description", "prompt", "depends", "repo_url", "repo_branch",
+    "wip_branch", "session_id", "ttyd_url", "worker_vm",
+    "blocked_at", "created_at", "updated_at",
+)
+
+
+def _shape_task(task: dict, *, full: bool) -> dict:
+    """Project an API task dict to a stable shape for MCP responses.
+
+    `source` is always present — "user" for tasks created by the human owner
+    in the TUI, "claude" for tasks proposed by an agent. Agents should check
+    this to distinguish the two.
+    """
+    out = {k: task.get(k) for k in _BRIEF_FIELDS}
+    if full:
+        for k in _FULL_EXTRA_FIELDS:
+            out[k] = task.get(k)
+    return out
+
+
 @mcp.tool()
 def propose_task(
     project: str,
@@ -95,6 +120,103 @@ def list_projects() -> list[dict]:
     """
     client = PlanningClient()
     return client.list_projects()
+
+
+@mcp.tool()
+def list_tasks(
+    project: str | None = None,
+    status: str | None = None,
+    source: str | None = None,
+) -> list[dict]:
+    """List tasks across the planning system.
+
+    Returns BOTH human-created and agent-proposed tasks by default. Each
+    entry exposes a `source` field:
+      - "user"   — created by the human owner in the TUI
+      - "claude" — proposed by a Claude agent via `propose_task`
+
+    Inspect that field to tell them apart, and prefer leaving user tasks
+    untouched unless the user explicitly asked you to modify them.
+
+    Args:
+        project: Optional project name filter.
+        status: Optional status filter ("draft", "backlog", "running",
+            "blocked", "done").
+        source: Optional source filter ("user" or "claude"). Default returns both.
+    """
+    client = PlanningClient()
+    tasks = client.list_tasks(project=project, status=status)
+    if source:
+        tasks = [t for t in tasks if t.get("source") == source]
+    return [_shape_task(t, full=False) for t in tasks]
+
+
+@mcp.tool()
+def get_task(task_id: str) -> dict:
+    """Get full details of a single task by its UUID.
+
+    The returned object includes a `source` field — "user" for tasks
+    created by the human owner, "claude" for agent-proposed tasks.
+
+    Args:
+        task_id: Task UUID (find one via `list_tasks`).
+    """
+    client = PlanningClient()
+    return _shape_task(client.get_task(task_id), full=True)
+
+
+@mcp.tool()
+def update_task(
+    task_id: str,
+    name: str | None = None,
+    description: str | None = None,
+    prompt: str | None = None,
+    status: str | None = None,
+    priority: int | None = None,
+    difficulty: int | None = None,
+    project: str | None = None,
+    depends: list[str] | None = None,
+) -> dict:
+    """Edit a task's planning fields.
+
+    This tool can modify ANY task — including tasks created by the human
+    owner (source="user"). That power cuts both ways: be conservative when
+    touching user tasks. Don't rewrite their prompt, change scope, or move
+    them between statuses unless the user explicitly asked you to. Agent-
+    proposed tasks (source="claude") are fair game for self-revision.
+
+    The returned object includes the `source` field so you can confirm
+    what you just modified.
+
+    Only the fields you pass (non-None) will be updated.
+
+    Args:
+        task_id: Task UUID.
+        name: New title.
+        description: New description.
+        prompt: New launch prompt.
+        status: "draft", "backlog", "running", "blocked", or "done".
+        priority: Lower number = higher priority.
+        difficulty: 1-10.
+        project: Reassign to a different project.
+        depends: Replace the dependency list (task slugs).
+    """
+    fields = {
+        k: v for k, v in {
+            "name": name,
+            "description": description,
+            "prompt": prompt,
+            "status": status,
+            "priority": priority,
+            "difficulty": difficulty,
+            "project": project,
+            "depends": depends,
+        }.items() if v is not None
+    }
+    if not fields:
+        raise ValueError("No fields to update — pass at least one field.")
+    client = PlanningClient()
+    return _shape_task(client.update_task(task_id, **fields), full=True)
 
 
 @mcp.tool()

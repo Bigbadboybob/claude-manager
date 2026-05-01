@@ -160,6 +160,28 @@ pub struct WorkspaceCandidate {
     pub repo_url: Option<String>,
 }
 
+/// Reduce a repo URL to a comparable form so SSH and HTTPS pointers to the
+/// same repo match. `git@github.com:org/repo.git` and
+/// `https://github.com/org/repo.git` both collapse to `github.com/org/repo`.
+/// Used when matching task→workspace at launch time, where the task's URL
+/// often comes from `git remote get-url origin` (SSH) and the workspace's
+/// from `~/.cm/projects/*/repo_url` (HTTPS).
+fn normalize_repo_url(url: &str) -> String {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .or_else(|| s.strip_prefix("ssh://"))
+        .or_else(|| s.strip_prefix("git@"))
+        .unwrap_or(s);
+    // SSH form `host:org/repo` — turn the first ':' into '/' so it lines up
+    // with HTTPS form `host/org/repo`.
+    let s = s.replacen(':', "/", 1);
+    let s = s.strip_suffix(".git").unwrap_or(&s).to_string();
+    let s = s.trim_end_matches('/').to_string();
+    s.to_lowercase()
+}
+
 pub enum PlanAction {
     Consumed,
     Ignored,
@@ -1730,13 +1752,13 @@ impl PlanningView {
         let Some(task) = pd.tasks.get(task_idx) else {
             return vec![];
         };
-        let task_repo = task.repo_url.as_str();
+        let task_repo = normalize_repo_url(&task.repo_url);
         self.workspace_candidates
             .iter()
             .filter(|c| {
                 c.repo_url
                     .as_deref()
-                    .map_or(false, |u| u == task_repo)
+                    .map_or(false, |u| normalize_repo_url(u) == task_repo)
             })
             .collect()
     }

@@ -28,5 +28,8 @@ toml = "0.8"
 anyhow = "1"
 base64 = "0.22.1"
 
+# Desktop notifications (used for per-session idle notifications)
+notify-rust = "4"
+
 [dev-dependencies]
 tempfile = "3"

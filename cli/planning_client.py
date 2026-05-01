@@ -64,3 +64,24 @@ class PlanningClient:
         r = self._client.client.get("/projects")
         r.raise_for_status()
         return r.json()
+
+    def list_tasks(self, project: str | None = None,
+                   status: str | None = None) -> list[dict]:
+        params: dict = {}
+        if project:
+            params["project"] = project
+        if status:
+            params["status"] = status
+        r = self._client.client.get("/tasks", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def get_task(self, task_id: str) -> dict:
+        r = self._client.client.get(f"/tasks/{task_id}")
+        r.raise_for_status()
+        return r.json()
+
+    def update_task(self, task_id: str, **fields) -> dict:
+        r = self._client.client.patch(f"/tasks/{task_id}", json=fields)
+        r.raise_for_status()
+        return r.json()

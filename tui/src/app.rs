@@ -31,8 +31,6 @@ mod dirs {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
-/// Duration of the rolling window for Wakeup burst detection.
-const WAKEUP_WINDOW: Duration = Duration::from_secs(2);
 /// Minimum Wakeups within the window to consider a session actively working.
 const WAKEUP_BURST_THRESHOLD: usize = 5;
 
@@ -77,6 +75,10 @@ pub struct TerminalSession {
     pub hidden: bool,
     /// Seconds of quiet before marking idle. 0 = use global default.
     pub idle_timeout_secs: u16,
+    /// Wakeups required within the 2s activity window to flip Idle → Running.
+    /// 0 = use global default (`WAKEUP_BURST_THRESHOLD`). Lower = more sensitive,
+    /// useful for slow-streaming bash scripts that produce one line at a time.
+    pub burst_threshold: u16,
     /// Prompt text to deliver to the session once it's actually ready to
     /// receive input (see `PendingWrite`).
     pub pending_prompt: Option<PendingWrite>,
@@ -100,6 +102,34 @@ pub struct TerminalSession {
     /// in a history entry with project==worktree, the entry's sessionId is
     /// ours. Cleared once sid has been bound.
     pub last_delivery: Option<(String, u64)>,
+    /// If true, fire a desktop notification each time this session
+    /// transitions Running → Idle. Off by default; toggled in A-e settings.
+    pub notify_on_idle: bool,
+    /// Marker that an Enter keystroke is queued to be written to the PTY at
+    /// or after `fire_at`. Used to introduce a deliberate gap between the body
+    /// of a multi-KB workflow prompt and the trailing Enter so the receiving
+    /// agent (notably codex) classifies Enter as a fresh keystroke rather than
+    /// the tail of a paste. Done as a deferred write rather than
+    /// `thread::sleep` so the UI thread keeps draining events.
+    ///
+    /// We deliberately do NOT store the Enter bytes — the encoding (raw `\r`
+    /// vs Kitty `\x1b[13u`) depends on the terminal mode at submit time. The
+    /// agent often enables Kitty mode AFTER we've written the body but BEFORE
+    /// the deferred Enter fires; if we used bytes captured at body-write time
+    /// we'd send the wrong encoding and the prompt wouldn't submit.
+    pub pending_enter: Option<PendingEnter>,
+    /// Wall-clock instant when this TerminalSession was constructed.
+    /// Used as a tie-breaker in session_id detection so when two sessions in
+    /// the same worktree race for a newly-written transcript, the one that
+    /// has been waiting longer (and is therefore more likely to actually own
+    /// the file) gets first pick.
+    pub created_at: Instant,
+}
+
+/// Marker that an Enter keystroke is queued to fire at or after `fire_at`. The
+/// actual bytes are computed from the current terminal mode at submit time.
+pub struct PendingEnter {
+    pub fire_at: Instant,
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
@@ -149,6 +179,19 @@ impl PendingWrite {
 /// Interval between filesystem checks for session_id detection.
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Per-file cap on `~/.cm/workflow-runs/<run-id>/tick.log`. When `log_tick`
+/// is about to write and the file is at or over this size, it truncates and
+/// starts fresh (with a marker line). Generous because these logs are useful
+/// debugging artifacts; this exists only to bound runaway growth from
+/// pathologically chatty runs.
+const TICK_LOG_MAX_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Gap between writing a workflow prompt body and the trailing Enter. Implemented
+/// as a deferred write (not `thread::sleep`) so the UI thread keeps draining
+/// events. Generous to leave codex's PTY paste detector no doubt about Enter
+/// being a fresh keystroke.
+const ENTER_GAP: Duration = Duration::from_secs(10);
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct ManifestEntry {
     label: String,
@@ -158,17 +201,20 @@ struct ManifestEntry {
     hidden: bool,
     #[serde(default)]
     idle_timeout_secs: u16,
+    #[serde(default)]
+    burst_threshold: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
+    #[serde(default)]
+    notify_on_idle: bool,
 }
 
 /// Persisted workspace metadata. Lives in `Manifest::workspaces` keyed by the
-/// workspace's stable id (or, for legacy manifests, by worktree path / task:id
-/// before being re-keyed on load).
+/// workspace's stable id.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct ManifestWorkspace {
     #[serde(default)]
@@ -191,33 +237,15 @@ struct ManifestWorkspace {
     worker_zone: Option<String>,
     #[serde(default)]
     sessions: Vec<ManifestEntry>,
-    // Legacy v2 fields — read for migration into the v3 `bindings` map, never
-    // written back.
-    #[serde(default, skip_serializing)]
-    extra_bound_tasks: Vec<BoundTaskLegacy>,
-}
-
-#[derive(serde::Deserialize, Clone, Debug, Default)]
-struct BoundTaskLegacy {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    title: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct Manifest {
-    /// v1 legacy shape — flat session list keyed by worktree path / task:id.
-    /// Read for migration; never written.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    sessions: HashMap<String, Vec<ManifestEntry>>,
-    /// Workspaces keyed by stable workspace id (v3) or legacy key (v1/v2,
-    /// rekeyed on load).
+    /// Workspaces keyed by stable workspace id.
     #[serde(default)]
     workspaces: HashMap<String, ManifestWorkspace>,
     /// `task_id` → `workspace_id` bindings. A task present here is bound to
-    /// the referenced workspace (primary or extra — no distinction).
+    /// the referenced workspace.
     #[serde(default)]
     bindings: HashMap<String, String>,
     #[serde(default)]
@@ -277,13 +305,31 @@ fn make_simple_session(
         pending_jsonl_files,
         hidden: false,
         idle_timeout_secs: 0,
+        burst_threshold: 0,
         pending_prompt: None,
         pending_clear: None,
         workflow_run_id: None,
         workflow_role: None,
         last_delivery: None,
         task_id: None,
+        notify_on_idle: false,
+        pending_enter: None,
+        created_at: Instant::now(),
     }
+}
+
+/// Fire a desktop notification announcing that a session went idle. Spawned
+/// onto a detached thread so a slow/blocked dbus call can't stall the UI loop.
+/// Errors are intentionally swallowed — a missing notification daemon is not
+/// a reason to surface anything to the user.
+fn notify_session_idle(label: &str) {
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary("Claude Manager")
+            .body(&format!("Session idle: {}", label))
+            .show();
+    });
 }
 
 /// Generate a fresh workspace id. Not cryptographic — just collision-avoidance
@@ -297,6 +343,17 @@ fn new_workspace_id() -> String {
     format!("ws-{:x}", nanos)
 }
 
+/// Repo URLs in deterministic order (sorted by repo name). Used by the New
+/// Workspace picker so the dropdown is stable across launches and the ←/→
+/// cycle order matches what the user sees. Free function (vs `&self` method)
+/// so it composes with split borrows when callers already hold `&mut
+/// self.input_mode`.
+fn sorted_repo_urls(repos: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<(&String, &String)> = repos.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries.into_iter().map(|(_, url)| url.clone()).collect()
+}
+
 /// Map a TerminalSession's `session_type` ("claude" | "codex" | "bash") to the
 /// `Engine` used by transcript readers. Workflow code must derive engine from
 /// the actual bound session (not from the workflow TOML role spec) since the
@@ -306,6 +363,74 @@ fn engine_for_session_type(session_type: &str) -> workflow::toml_schema::Engine 
         "codex" => workflow::toml_schema::Engine::Codex,
         _ => workflow::toml_schema::Engine::ClaudeCode,
     }
+}
+
+/// Kill the agent process inside `ts` and respawn it under the same PTY slot
+/// with workflow MCP config + resume args, so the role can call
+/// `workflow_transition` / `workflow_done`. The user-launched session was
+/// started without `--mcp-config`; this is what gives it the workflow tools.
+///
+/// Returns `None` on success, `Some(message)` on any failure (caller decides
+/// whether to surface to the status bar). On failure the existing `Session`
+/// is left untouched — we only swap if `Session::new` succeeds.
+fn respawn_existing_with_workflow_mcp(
+    ts: &mut TerminalSession,
+    engine: &workflow::toml_schema::Engine,
+    run_id: &str,
+    role: &str,
+    session_id: Option<&str>,
+    worktree: Option<&Path>,
+    pending_baseline: Option<Vec<String>>,
+    cols: u16,
+    rows: u16,
+) -> Option<String> {
+    let (sid, wt) = match (session_id, worktree) {
+        (Some(sid), Some(wt)) => (sid, wt),
+        _ => {
+            return Some(format!(
+                "Skipping reload of {}: session_id not detected — workflow MCP tools unavailable",
+                role
+            ));
+        }
+    };
+    let (program, args) = match workflow::spawn::build_args(engine, run_id, role, Some(sid)) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(format!(
+                "MCP config build failed for {}: {} — workflow MCP tools unavailable",
+                role, e
+            ));
+        }
+    };
+    let new_sess = match Session::new(
+        &program,
+        &args,
+        cols,
+        rows,
+        Some(wt.to_path_buf()),
+        Default::default(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(format!(
+                "Reload failed for {}: {} — workflow MCP tools unavailable",
+                role, e
+            ));
+        }
+    };
+    // Swap the Session: dropping the old one closes its PTY which reaps the
+    // old agent process. The conversation history comes back via the engine's
+    // resume; the new transcript file the resume writes will be picked up by
+    // the session_id detector on a future tick.
+    ts.session = new_sess;
+    ts.session_id = None;
+    ts.pending_jsonl_files = pending_baseline;
+    ts.pending_prompt = None;
+    ts.pending_clear = None;
+    ts.pending_enter = None;
+    ts.last_delivery = None;
+    ts.status = SessionStatus::Idle;
+    None
 }
 
 fn new_session_uid() -> String {
@@ -366,7 +491,7 @@ enum InputMode {
         branch_text: String,
         idle_timeout_text: String,
         repo_url: String,
-        /// 0 = name, 1 = branch, 2 = idle timeout
+        /// 0 = repo (←/→ to cycle), 1 = name, 2 = branch, 3 = idle timeout
         active_field: u8,
     },
     /// Picking a session type to add to a workspace.
@@ -383,8 +508,10 @@ enum InputMode {
         session_index: usize,
         name: String,
         idle_timeout: String,
+        burst_threshold: String,
         hidden: bool,
-        /// 0 = name, 1 = idle timeout
+        notify_on_idle: bool,
+        /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden, 4 = notify on idle
         active_field: u8,
     },
     /// Renaming a workspace. Only the display label changes — the branch
@@ -423,6 +550,18 @@ enum InputMode {
     WorkflowHistory {
         run_id: String,
     },
+    /// Generic y/N confirmation overlay. The action runs only on `y`/`Y`/Enter;
+    /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-d, A-x).
+    Confirm {
+        prompt: String,
+        action: ConfirmAction,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum ConfirmAction {
+    MarkDone,
+    Delete,
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -493,6 +632,10 @@ pub struct App {
     /// each tick until resolved or aged out.
     /// Each: (old_sid, timestamp_ms, first_seen_at).
     pending_rotations: Vec<(String, u64, Instant)>,
+    /// Mouse capture state. When false, `DisableMouseCapture` has been sent so
+    /// the user can use the terminal's native selection (including block-select
+    /// chords). Toggle with Alt+m.
+    pub mouse_capture_enabled: bool,
 }
 
 impl App {
@@ -542,6 +685,7 @@ impl App {
             workflow_runs,
             history_watcher: workflow::history::HistoryWatcher::new(),
             pending_rotations: Vec::new(),
+            mouse_capture_enabled: true,
         }
     }
 
@@ -645,19 +789,15 @@ impl App {
             if path.is_dir() {
                 Self::walk_codex_sessions(&path, wt_str, ids);
             } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                // Read first line to check cwd.
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Some(first_line) = content.lines().next() {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(first_line) {
-                            if let Some(cwd) = val.pointer("/payload/cwd").and_then(|v| v.as_str()) {
-                                if cwd == wt_str {
-                                    if let Some(id) = val.pointer("/payload/id").and_then(|v| v.as_str()) {
-                                        ids.push(id.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // Read just the first line — the JSONL files grow into the
+                // megabytes and there are hundreds of them.
+                let Some(first) = workflow::transcript::read_first_line(&path) else { continue };
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(first.trim()) else { continue };
+                if val.pointer("/payload/cwd").and_then(|v| v.as_str()) != Some(wt_str) {
+                    continue;
+                }
+                if let Some(id) = val.pointer("/payload/id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
                 }
             }
         }
@@ -681,11 +821,13 @@ impl App {
     /// Write a PendingWrite's bytes (plus correctly-encoded Enter if submit)
     /// to the session's PTY and log the outcome.
     ///
-    /// IMPORTANT: we sleep briefly between the body write and the enter write
-    /// so the receiving agent sees them as two separate keystroke events
-    /// rather than a single paste. Without this, codex treats the whole
-    /// sequence (body + \r) as pasted content — literal text including the
-    /// \r character — and never submits.
+    /// IMPORTANT: a deliberate gap separates the body write from the Enter
+    /// write so the receiving agent sees them as two separate keystroke
+    /// events rather than a single paste. Without this, codex treats the
+    /// whole sequence (body + \r) as pasted content — literal text including
+    /// the \r character — and never submits. The gap is implemented by
+    /// queueing the Enter into `ts.pending_enter` and letting the main drain
+    /// loop fire it after `fire_at`. We MUST NOT block the UI thread here.
     fn deliver_pending_write(ts: &mut TerminalSession, pw: &PendingWrite, kind: &str) {
         let body = pw.text.trim_end_matches(['\r', '\n']);
         let enter = enter_bytes_for(&ts.session);
@@ -693,12 +835,9 @@ impl App {
         let exited = ts.session.exited;
         ts.session.write(body.as_bytes());
         if pw.submit {
-            // Gap between body and Enter so codex classifies Enter as a
-            // keystroke, not the tail of a paste. Intentionally generous
-            // (10s) while we confirm the paste-vs-typing theory for
-            // multi-KB prompts — trivial against the overall workflow cycle.
-            std::thread::sleep(Duration::from_millis(10_000));
-            ts.session.write(enter);
+            ts.pending_enter = Some(PendingEnter {
+                fire_at: Instant::now() + ENTER_GAP,
+            });
         }
         // Remember the first chunk of the delivered text + delivery time so
         // an unbound workflow session can be correlated to its new sid in
@@ -749,9 +888,11 @@ impl App {
                     session_id: ts.session_id.clone(),
                     hidden: ts.hidden,
                     idle_timeout_secs: ts.idle_timeout_secs,
+                    burst_threshold: ts.burst_threshold,
                     workflow_run_id: ts.workflow_run_id.clone(),
                     workflow_role: ts.workflow_role.clone(),
                     task_id: ts.task_id.clone(),
+                    notify_on_idle: ts.notify_on_idle,
                 })
                 .collect();
             workspaces.insert(
@@ -767,7 +908,6 @@ impl App {
                     worker_vm: ws.worker_vm.clone(),
                     worker_zone: ws.worker_zone.clone(),
                     sessions: entries,
-                    extra_bound_tasks: Vec::new(),
                 },
             );
         }
@@ -784,7 +924,6 @@ impl App {
             SidebarView::Task => "task",
         };
         let manifest = Manifest {
-            sessions: HashMap::new(),
             workspaces,
             bindings,
             view: Some(view.to_string()),
@@ -808,61 +947,12 @@ impl App {
         }
     }
 
-    /// Normalize a manifest across format versions:
-    ///   - v1: flat `sessions` map, keyed by worktree/task:id, no workspaces.
-    ///   - v2: `workspaces` keyed by worktree/task:id, with extras + is_standalone.
-    ///   - v3: `workspaces` keyed by workspace_id, plus `bindings` map.
-    ///
-    /// After migration: each workspace entry is keyed by its stable id; legacy
-    /// `extra_bound_tasks` get folded into the `bindings` map.
-    fn migrate_manifest(mut m: Manifest) -> Manifest {
-        // v1 → v2: legacy sessions map → synthetic workspace entries.
-        for (key, sessions) in m.sessions.drain() {
-            m.workspaces
-                .entry(key)
-                .or_insert_with(ManifestWorkspace::default)
-                .sessions = sessions;
-        }
-
-        // v1/v2 → v3: rekey by workspace_id (assigning one if missing) and
-        // fold extras into the bindings map.
-        let mut rekeyed: HashMap<String, ManifestWorkspace> = HashMap::new();
-        for (legacy_key, mut mw) in m.workspaces.drain() {
-            if mw.id.is_empty() {
-                mw.id = new_workspace_id();
-            }
-            // Seed worktree_path / is_cloud from the legacy key if they're
-            // missing — this matters for v1 manifests that only had the key.
-            if mw.worktree_path.is_none() && !legacy_key.starts_with("task:") {
-                mw.worktree_path = Some(PathBuf::from(&legacy_key));
-            }
-            if legacy_key.starts_with("task:") {
-                mw.is_cloud = true;
-            }
-            for bt in mw.extra_bound_tasks.drain(..) {
-                if !bt.id.is_empty() {
-                    m.bindings.insert(bt.id, mw.id.clone());
-                }
-            }
-            // For v2 cloud workspaces keyed by task:{id}, that task_id is
-            // also a binding (it was the "primary" in v2).
-            if let Some(task_id) = legacy_key.strip_prefix("task:") {
-                m.bindings
-                    .entry(task_id.to_string())
-                    .or_insert_with(|| mw.id.clone());
-            }
-            rekeyed.insert(mw.id.clone(), mw);
-        }
-        m.workspaces = rekeyed;
-        m
-    }
-
     /// Restore workspaces + sessions from the manifest. Runs after an
     /// initial API tasks fetch so `bindings` can be cross-referenced with
     /// real tasks, but also works standalone (workspaces without any bound
     /// tasks are legal).
     fn restore_sessions(&mut self) {
-        let manifest = Self::migrate_manifest(Self::load_manifest());
+        let manifest = Self::load_manifest();
         if manifest.workspaces.is_empty() && manifest.bindings.is_empty() {
             return;
         }
@@ -1071,12 +1161,16 @@ impl App {
             pending_jsonl_files: pending,
             hidden: entry.hidden,
             idle_timeout_secs: entry.idle_timeout_secs,
+            burst_threshold: entry.burst_threshold,
             pending_prompt: None,
             pending_clear: None,
             workflow_run_id: entry.workflow_run_id.clone(),
             workflow_role: entry.workflow_role.clone(),
             last_delivery: None,
             task_id: entry.task_id.clone(),
+            notify_on_idle: entry.notify_on_idle,
+            pending_enter: None,
+            created_at: Instant::now(),
         })
     }
 
@@ -1089,6 +1183,7 @@ impl App {
                 if let Some(ws) = self.workspaces.get(wi) {
                     if let Some(ts) = ws.sessions.get(si) {
                         let timeout = ts.idle_timeout_secs;
+                        let burst = ts.burst_threshold;
                         self.input_mode = InputMode::SessionSettings {
                             ws_index: wi,
                             session_index: si,
@@ -1098,7 +1193,13 @@ impl App {
                             } else {
                                 timeout.to_string()
                             },
+                            burst_threshold: if burst == 0 {
+                                WAKEUP_BURST_THRESHOLD.to_string()
+                            } else {
+                                burst.to_string()
+                            },
                             hidden: ts.hidden,
+                            notify_on_idle: ts.notify_on_idle,
                             active_field: 0,
                         };
                     }
@@ -1314,16 +1415,6 @@ impl App {
         self.tasks
             .iter()
             .find(|t| t.workspace_id.as_deref() == Some(ws_id))
-    }
-
-    /// All task names bound to the given workspace, in binding order.
-    /// Used for the subtitle line under the workspace header.
-    fn task_names_for_ws(&self, ws_id: &str) -> Vec<String> {
-        self.tasks
-            .iter()
-            .filter(|t| t.workspace_id.as_deref() == Some(ws_id))
-            .map(|t| t.name.clone())
-            .collect()
     }
 
     /// Compute effective task status: derived from the workspace's sessions
@@ -1632,9 +1723,18 @@ impl App {
         // whose session_id was freshly detected. Resolved to task_id after
         // the loop so we don't double-borrow self.
         let mut ws_sid_updates: Vec<(String, String)> = Vec::new();
+        // Sids already bound to some live session in this TUI. The detector
+        // must exclude these so two sessions sharing a worktree (e.g. a
+        // workflow reviewer + a regular codex pane) can't both pick the
+        // same newly-written transcript file. Updated as the loop binds new
+        // sids so later iterations see them too.
+        let mut bound_sids: std::collections::HashSet<String> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .filter_map(|s| s.session_id.clone())
+            .collect();
         for ws in &mut self.workspaces {
-            let ws_id_here = ws.id.clone();
-            let worktree_path = ws.worktree_path.clone();
             for ts in &mut ws.sessions {
                 while let Ok(event) = ts.session.event_rx.try_recv() {
                     had_event = true;
@@ -1702,11 +1802,19 @@ impl App {
                         let recent_count = ts.session.wakeup_times.iter()
                             .filter(|t| now.duration_since(**t) < activity_window)
                             .count();
-                        let burst = recent_count >= WAKEUP_BURST_THRESHOLD;
+                        let burst_threshold = if ts.burst_threshold > 0 {
+                            ts.burst_threshold as usize
+                        } else {
+                            WAKEUP_BURST_THRESHOLD
+                        };
+                        let burst = recent_count >= burst_threshold;
                         // Quiet = no wakeups at all in the full idle window → mark idle.
                         let quiet = ts.session.wakeup_times.is_empty();
                         if quiet && ts.status == SessionStatus::Running {
                             ts.status = SessionStatus::Idle;
+                            if ts.notify_on_idle {
+                                notify_session_idle(&ts.label);
+                            }
                         } else if burst && ts.status != SessionStatus::Running {
                             ts.status = SessionStatus::Running;
                         }
@@ -1733,37 +1841,97 @@ impl App {
                     }
                 }
 
-                // Detect session_id for claude/codex sessions that don't have one yet.
+                // Fire any deferred Enter that's reached its `fire_at`. The
+                // body of the prompt has already gone to the PTY; this writes
+                // just the Enter keystroke separately so codex doesn't classify
+                // it as paste tail. See `deliver_pending_write` for context.
                 //
-                // Skip claude WORKFLOW sessions — the "newest new .jsonl"
-                // heuristic is unreliable when multiple claude processes
-                // share a project directory (another process's /clear
-                // rotation can produce a new .jsonl right when we're
-                // looking). For those we use history.jsonl correlation
-                // via `resolve_pending_deliveries` instead.
-                let skip_workflow_claude =
-                    ts.session_type == "claude" && ts.workflow_run_id.is_some();
-                if should_check_session_ids
-                    && !skip_workflow_claude
-                    && (ts.session_type == "claude" || ts.session_type == "codex")
-                    && ts.session_id.is_none()
-                    && ts.pending_jsonl_files.is_some()
-                {
-                    if let Some(ref wt) = worktree_path {
-                        let existing = ts.pending_jsonl_files.as_ref().unwrap();
-                        let sid = if ts.session_type == "codex" {
-                            Self::detect_codex_session_id(wt, existing)
-                        } else {
-                            Self::detect_session_id(wt, existing)
-                        };
-                        if let Some(sid) = sid {
-                            ts.session_id = Some(sid.clone());
-                            ts.pending_jsonl_files = None;
-                            ws_sid_updates.push((ws_id_here.clone(), sid));
+                // Encoding is recomputed here (not snapshotted at body-write
+                // time) because the agent often flips to Kitty keyboard mode
+                // during the gap; the Enter keystroke must match the mode in
+                // effect right now or the agent treats it as a literal `\r`.
+                if let Some(pe) = &ts.pending_enter {
+                    if now >= pe.fire_at {
+                        ts.pending_enter = None;
+                        let enter = enter_bytes_for(&ts.session);
+                        let mode_label = if enter == b"\r" { "raw" } else { "kitty" };
+                        ts.session.write(enter);
+                        if let Some(run_id) = ts.workflow_run_id.clone() {
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "enter_fired mode={} session='{}' role='{}'",
+                                    mode_label,
+                                    ts.label,
+                                    ts.workflow_role.as_deref().unwrap_or("?"),
+                                ),
+                            );
                         }
                     }
                 }
 
+                // Session-id detection is run in a separate ordered pass
+                // after this loop (see below) so older sessions get first
+                // pick when two sessions in the same worktree race for the
+                // same newly-written transcript file.
+
+            }
+        }
+
+        // Session-id detection: oldest-first, so when two sessions in the
+        // same worktree race for the same newly-written transcript, the one
+        // that's been waiting longer (and is therefore more likely to
+        // actually own the file) wins. `bound_sids` is also extended as we
+        // go so once a sid is taken, no other session can claim it on this
+        // tick.
+        //
+        // Skip claude WORKFLOW sessions when there's a pending delivery —
+        // those rely on history.jsonl correlation via
+        // `resolve_pending_deliveries`, which is more reliable than the
+        // listing heuristic when /clear rotations or other claude processes
+        // are racing the project directory. After a workflow-launch respawn
+        // (Existing claude slot) we don't deliver an activation prompt, so
+        // there's nothing for the correlator to match — fall back to the
+        // listing detector in that case.
+        if should_check_session_ids {
+            let mut detection_order: Vec<(usize, usize, Instant)> = Vec::new();
+            for (wi, ws) in self.workspaces.iter().enumerate() {
+                for (si, ts) in ws.sessions.iter().enumerate() {
+                    let skip_workflow_claude = ts.session_type == "claude"
+                        && ts.workflow_run_id.is_some()
+                        && ts.last_delivery.is_some();
+                    if skip_workflow_claude {
+                        continue;
+                    }
+                    if !matches!(ts.session_type.as_str(), "claude" | "codex") {
+                        continue;
+                    }
+                    if ts.session_id.is_some() || ts.pending_jsonl_files.is_none() {
+                        continue;
+                    }
+                    detection_order.push((wi, si, ts.created_at));
+                }
+            }
+            detection_order.sort_by_key(|t| t.2);
+            for (wi, si, _) in detection_order {
+                let Some(ws) = self.workspaces.get(wi) else { continue };
+                let ws_id_here = ws.id.clone();
+                let Some(wt) = ws.worktree_path.clone() else { continue };
+                let Some(ts) = self.workspaces[wi].sessions.get_mut(si) else { continue };
+                let mut existing: Vec<String> =
+                    ts.pending_jsonl_files.as_ref().cloned().unwrap_or_default();
+                existing.extend(bound_sids.iter().cloned());
+                let sid = if ts.session_type == "codex" {
+                    Self::detect_codex_session_id(&wt, &existing)
+                } else {
+                    Self::detect_session_id(&wt, &existing)
+                };
+                if let Some(sid) = sid {
+                    ts.session_id = Some(sid.clone());
+                    ts.pending_jsonl_files = None;
+                    bound_sids.insert(sid.clone());
+                    ws_sid_updates.push((ws_id_here, sid));
+                }
             }
         }
 
@@ -2351,6 +2519,24 @@ impl App {
         self.status_msg = Some((msg.to_string(), Instant::now()));
     }
 
+    /// Toggle terminal mouse capture. When off, mouse events go to the
+    /// terminal emulator instead of the TUI, so the user can use native
+    /// selection (including block-select chords like Ctrl+Shift+drag).
+    fn toggle_mouse_capture(&mut self) {
+        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        use crossterm::execute;
+        let mut stdout = std::io::stdout();
+        if self.mouse_capture_enabled {
+            let _ = execute!(stdout, DisableMouseCapture);
+            self.mouse_capture_enabled = false;
+            self.set_status_msg("Mouse capture OFF — use terminal's native selection (Alt+m to re-enable)");
+        } else {
+            let _ = execute!(stdout, EnableMouseCapture);
+            self.mouse_capture_enabled = true;
+            self.set_status_msg("Mouse capture ON");
+        }
+    }
+
     // ── Input handling ──────────────────────────────────────────────
 
     /// Handle a crossterm event. Returns true if consumed.
@@ -2375,6 +2561,15 @@ impl App {
                     }
                     ViewMode::Planning => ViewMode::Sessions,
                 };
+                return true;
+            }
+        }
+
+        // Alt+m toggles mouse capture so the user can use their terminal's
+        // native selection (including block-select chords).
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
+                self.toggle_mouse_capture();
                 return true;
             }
         }
@@ -2503,11 +2698,22 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('d') => {
-                        self.mark_active_done();
+                        self.input_mode = InputMode::Confirm {
+                            prompt: "Mark task done? Sessions for this task will close.".to_string(),
+                            action: ConfirmAction::MarkDone,
+                        };
                         return true;
                     }
                     KeyCode::Char('x') => {
-                        self.delete_active();
+                        let prompt = if self.cursor_task_id().is_some() {
+                            "Delete this task and close its sessions?".to_string()
+                        } else {
+                            "Delete this workspace? Worktree, branch, and any bound tasks will be removed.".to_string()
+                        };
+                        self.input_mode = InputMode::Confirm {
+                            prompt,
+                            action: ConfirmAction::Delete,
+                        };
                         return true;
                     }
                     KeyCode::Char('r') => {
@@ -2748,11 +2954,26 @@ impl App {
                         return true;
                     }
                     KeyCode::Tab => {
-                        *active_field = (*active_field + 1) % 3;
+                        *active_field = (*active_field + 1) % 4;
                         return true;
                     }
                     KeyCode::BackTab => {
-                        *active_field = if *active_field == 0 { 2 } else { *active_field - 1 };
+                        *active_field = if *active_field == 0 { 3 } else { *active_field - 1 };
+                        return true;
+                    }
+                    KeyCode::Left | KeyCode::Right if *active_field == 0 => {
+                        // Direct field access (`&self.config.repos`) lets the
+                        // borrow checker split the borrow vs `&mut self.input_mode`.
+                        let urls = sorted_repo_urls(&self.config.repos);
+                        if let Some(cur) = urls.iter().position(|u| u == repo_url) {
+                            let n = urls.len();
+                            let next = if matches!(key.code, KeyCode::Right) {
+                                (cur + 1) % n
+                            } else {
+                                (cur + n - 1) % n
+                            };
+                            *repo_url = urls[next].clone();
+                        }
                         return true;
                     }
                     KeyCode::Enter => {
@@ -2777,18 +2998,18 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         match *active_field {
-                            0 => { label_text.pop(); }
-                            1 => { branch_text.pop(); }
-                            2 => { idle_timeout_text.pop(); }
+                            1 => { label_text.pop(); }
+                            2 => { branch_text.pop(); }
+                            3 => { idle_timeout_text.pop(); }
                             _ => {}
                         }
                         return true;
                     }
                     KeyCode::Char(c) => {
                         match *active_field {
-                            0 => label_text.push(c),
-                            1 => branch_text.push(c),
-                            2 => { if c.is_ascii_digit() { idle_timeout_text.push(c); } }
+                            1 => label_text.push(c),
+                            2 => branch_text.push(c),
+                            3 => { if c.is_ascii_digit() { idle_timeout_text.push(c); } }
                             _ => {}
                         }
                         return true;
@@ -2835,7 +3056,9 @@ impl App {
                     session_index,
                     name,
                     idle_timeout,
+                    burst_threshold,
                     hidden,
+                    notify_on_idle,
                     active_field,
                 } => match key.code {
                     KeyCode::Esc => {
@@ -2843,11 +3066,15 @@ impl App {
                         return true;
                     }
                     KeyCode::Tab | KeyCode::BackTab => {
-                        *active_field = (*active_field + 1) % 3;
+                        *active_field = (*active_field + 1) % 5;
                         return true;
                     }
-                    KeyCode::Char(' ') if *active_field == 2 => {
+                    KeyCode::Char(' ') if *active_field == 3 => {
                         *hidden = !*hidden;
+                        return true;
+                    }
+                    KeyCode::Char(' ') if *active_field == 4 => {
+                        *notify_on_idle = !*notify_on_idle;
                         return true;
                     }
                     KeyCode::Enter => {
@@ -2855,7 +3082,12 @@ impl App {
                         let si = *session_index;
                         let new_name = name.clone();
                         let new_timeout = idle_timeout.parse::<u16>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+                        let new_burst = burst_threshold
+                            .parse::<u16>()
+                            .unwrap_or(WAKEUP_BURST_THRESHOLD as u16)
+                            .max(1);
                         let new_hidden = *hidden;
+                        let new_notify = *notify_on_idle;
                         self.input_mode = InputMode::Normal;
                         if let Some(ws) = self.workspaces.get_mut(wi) {
                             if let Some(ts) = ws.sessions.get_mut(si) {
@@ -2863,7 +3095,9 @@ impl App {
                                     ts.label = new_name;
                                 }
                                 ts.idle_timeout_secs = new_timeout;
+                                ts.burst_threshold = new_burst;
                                 ts.hidden = new_hidden;
+                                ts.notify_on_idle = new_notify;
                             }
                         }
                         self.save_session_manifest();
@@ -2874,6 +3108,7 @@ impl App {
                         match *active_field {
                             0 => { name.pop(); }
                             1 => { idle_timeout.pop(); }
+                            2 => { burst_threshold.pop(); }
                             _ => {}
                         }
                         return true;
@@ -2883,6 +3118,9 @@ impl App {
                             0 => name.push(c),
                             1 => {
                                 if c.is_ascii_digit() { idle_timeout.push(c); }
+                            }
+                            2 => {
+                                if c.is_ascii_digit() { burst_threshold.push(c); }
                             }
                             _ => {}
                         }
@@ -3117,6 +3355,22 @@ impl App {
                     }
                     _ => return true,
                 },
+                InputMode::Confirm { action, .. } => match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        let action = action.clone();
+                        self.input_mode = InputMode::Normal;
+                        match action {
+                            ConfirmAction::MarkDone => self.mark_active_done(),
+                            ConfirmAction::Delete => self.delete_active(),
+                        }
+                        return true;
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.input_mode = InputMode::Normal;
+                        return true;
+                    }
+                    _ => return true,
+                },
             }
         }
         true
@@ -3126,9 +3380,10 @@ impl App {
 
     /// Enter input mode to create a new workspace (empty, no task binding).
     fn start_new_session(&mut self) {
-        // Use the first repo from config.
-        let (_repo_name, repo_url) = match self.config.repos.iter().next() {
-            Some((name, url)) => (name.clone(), url.clone()),
+        // Seed with the first repo from config, sorted by name so the picker
+        // is deterministic. ←/→ cycles through the rest.
+        let repo_url = match sorted_repo_urls(&self.config.repos).first() {
+            Some(url) => url.clone(),
             None => {
                 self.set_status_msg("No repos configured");
                 return;
@@ -3143,6 +3398,7 @@ impl App {
             active_field: 0,
         };
     }
+
 
     /// Enter input mode to add a terminal session to the active workspace.
     /// If the cursor is inside a task scope, the new session inherits that
@@ -3265,12 +3521,16 @@ impl App {
             pending_jsonl_files: Some(pending),
             hidden: false,
             idle_timeout_secs,
+            burst_threshold: 0,
             pending_prompt: None,
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
             last_delivery: None,
             task_id: None,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
         };
         let ws = Workspace {
             id: new_workspace_id(),
@@ -4055,8 +4315,8 @@ impl App {
                         session_type,
                     );
                 }
-                InputMode::SessionSettings { name, idle_timeout, hidden, active_field, .. } => {
-                    self.draw_session_settings(frame, area, name, idle_timeout, *hidden, *active_field);
+                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, active_field, .. } => {
+                    self.draw_session_settings(frame, area, name, idle_timeout, burst_threshold, *hidden, *notify_on_idle, *active_field);
                 }
                 InputMode::WorkspaceSettings { name, .. } => {
                     self.draw_workspace_settings(frame, area, name);
@@ -4080,6 +4340,9 @@ impl App {
                 }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
+                }
+                InputMode::Confirm { prompt, .. } => {
+                    self.draw_confirm(frame, area, prompt);
                 }
                 InputMode::Normal => {}
             }
@@ -4106,6 +4369,32 @@ impl App {
         let para = Paragraph::new(format!("Name: {}_", name))
             .style(Style::default().fg(Color::White));
         frame.render_widget(para, inner);
+    }
+
+    fn draw_confirm(&self, frame: &mut Frame, area: Rect, prompt: &str) {
+        let width = 70u16.min(area.width.saturating_sub(4));
+        let height = 5u16;
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let dialog_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Confirm ");
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+        let lines = vec![
+            Line::from(Span::styled(prompt.to_string(), white)),
+            Line::from(""),
+            Line::from(Span::styled("y/Enter confirm \u{00b7} n/Esc cancel", dim)),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), inner);
     }
 
     fn draw_input_dialog(
@@ -4149,12 +4438,21 @@ impl App {
         let cursor = "\u{2588}";
         let dim = Style::default().fg(Color::DarkGray);
         let white = Style::default().fg(Color::White);
+        let highlight = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
 
-        let name_cursor = if active_field == 0 { cursor } else { "" };
-        let branch_cursor = if active_field == 1 { cursor } else { "" };
-        let timeout_cursor = if active_field == 2 { cursor } else { "" };
+        let repo_style = if active_field == 0 { highlight } else { white };
+        let repo_hint = if active_field == 0 && self.config.repos.len() > 1 {
+            "  \u{2190}/\u{2192} change"
+        } else {
+            ""
+        };
+        let name_cursor = if active_field == 1 { cursor } else { "" };
+        let branch_cursor = if active_field == 2 { cursor } else { "" };
+        let timeout_cursor = if active_field == 3 { cursor } else { "" };
 
-        let branch_hint = if branch_text.is_empty() && active_field != 1 {
+        let branch_hint = if branch_text.is_empty() && active_field != 2 {
             "main"
         } else {
             ""
@@ -4163,7 +4461,8 @@ impl App {
         let lines = vec![
             Line::from(vec![
                 Span::styled("    Repo: ", dim),
-                Span::styled(repo_name, white),
+                Span::styled(repo_name, repo_style),
+                Span::styled(repo_hint, dim),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -4261,11 +4560,13 @@ impl App {
         area: Rect,
         name: &str,
         idle_timeout: &str,
+        burst_threshold: &str,
         hidden: bool,
+        notify_on_idle: bool,
         active_field: u8,
     ) {
         let width = 55u16.min(area.width.saturating_sub(4));
-        let height = 11u16;
+        let height = 15u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -4291,26 +4592,41 @@ impl App {
 
         let name_cursor = if active_field == 0 { cursor } else { "" };
         let timeout_cursor = if active_field == 1 { cursor } else { "" };
+        let burst_cursor = if active_field == 2 { cursor } else { "" };
         let hidden_marker = if hidden { "[x]" } else { "[ ]" };
-        let hidden_style = if active_field == 2 { white } else { dim };
+        let hidden_style = if active_field == 3 { white } else { dim };
+        let notify_marker = if notify_on_idle { "[x]" } else { "[ ]" };
+        let notify_style = if active_field == 4 { white } else { dim };
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("      Name: ", dim),
+                Span::styled("           Name: ", dim),
                 Span::styled(name, white),
                 Span::styled(name_cursor, white),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Idle (s): ", dim),
+                Span::styled("       Idle (s): ", dim),
                 Span::styled(idle_timeout, white),
                 Span::styled(timeout_cursor, white),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("    Hidden: ", dim),
+                Span::styled("Burst (wakeups): ", dim),
+                Span::styled(burst_threshold, white),
+                Span::styled(burst_cursor, white),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("         Hidden: ", dim),
                 Span::styled(hidden_marker, hidden_style),
-                Span::styled(if active_field == 2 { "  Space to toggle" } else { "" }, dim),
+                Span::styled(if active_field == 3 { "  Space to toggle" } else { "" }, dim),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Notify on idle: ", dim),
+                Span::styled(notify_marker, notify_style),
+                Span::styled(if active_field == 4 { "  Space to toggle" } else { "" }, dim),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -4454,8 +4770,28 @@ impl App {
         }
 
         let spinner = self.spinner_frame();
-        let list_height = inner.height.saturating_sub(8);
         let dim = Style::default().fg(Color::DarkGray);
+
+        // Help text — two columns. Defined up here so `list_height` can size
+        // itself around the help footer (otherwise the help overdraws the
+        // bottom rows of the list and indicators vanish).
+        let help_entries: Vec<(&str, &str)> = vec![
+            ("A-j/k  nav", "A-d  done"),
+            ("A-a    attach", "A-x  delete"),
+            ("A-n    new ws", "A-p  push"),
+            ("A-s    +session", "A-l  pull"),
+            ("A-w    close sess", "A-v  view"),
+            ("A-W    close ws", "A-r  refresh"),
+            ("A-e    settings", "A-q  quit"),
+            ("A-h    hide", "A-y  history"),
+            ("A-f    workflow", "A-u  resume"),
+            ("A-o    stop wf", ""),
+            ("PgUp   scroll up", ""),
+            ("PgDn   scroll dn", ""),
+            ("A-Ent  newline", ""),
+        ];
+        let help_rows = help_entries.len() as u16;
+        let list_height = inner.height.saturating_sub(help_rows + 1);
 
         let visual = self.visual_items();
         let mut items: Vec<ListItem> = Vec::new();
@@ -4688,23 +5024,6 @@ impl App {
             },
         );
 
-        // Help text — two columns.
-        let help_entries: Vec<(&str, &str)> = vec![
-            ("A-j/k  nav", "A-d  done"),
-            ("A-a    attach", "A-x  delete"),
-            ("A-n    new ws", "A-p  push"),
-            ("A-s    +session", "A-l  pull"),
-            ("A-w    close sess", "A-v  view"),
-            ("A-W    close ws", "A-r  refresh"),
-            ("A-e    settings", "A-q  quit"),
-            ("A-h    hide", "A-y  history"),
-            ("A-f    workflow", "A-u  resume"),
-            ("A-o    stop wf", ""),
-            ("PgUp   scroll up", ""),
-            ("PgDn   scroll dn", ""),
-            ("A-Ent  newline", ""),
-        ];
-        let help_rows = help_entries.len() as u16;
         let help_y = inner.y + inner.height.saturating_sub(help_rows + 1);
         let help_area = Rect {
             x: inner.x,
@@ -4713,7 +5032,6 @@ impl App {
             height: help_rows + 1,
         };
 
-        let dim = Style::default().fg(Color::DarkGray);
         let sep = Line::from(Span::styled(
             "\u{2500}".repeat(inner.width as usize),
             dim,
@@ -4766,14 +5084,18 @@ impl App {
             String::new()
         };
 
+        let mouse_off = !self.mouse_capture_enabled;
+        let mouse_indicator = if mouse_off { " [mouse off] " } else { "" };
+
         let right = format!(" {}r {}b {}q ", running, blocked, backlog);
 
         let right_width = right.chars().count() as u16;
         let center_width = center.len() as u16;
+        let mouse_width = mouse_indicator.chars().count() as u16;
         let left_used = 18u16; // " ● claude-manager "
         let pad = area
             .width
-            .saturating_sub(left_used + right_width + center_width);
+            .saturating_sub(left_used + right_width + center_width + mouse_width);
         let pad_left = pad / 2;
         let pad_right = pad - pad_left;
 
@@ -4785,6 +5107,10 @@ impl App {
             Span::styled(
                 "claude-manager ",
                 Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                mouse_indicator,
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 " ".repeat(pad_left as usize),
@@ -5143,6 +5469,18 @@ impl App {
             std::collections::BTreeMap::new();
         let mut role_baselines: std::collections::BTreeMap<String, MessageBaseline> =
             std::collections::BTreeMap::new();
+        // Sids already claimed by some live session in the TUI. Detection
+        // below excludes these so an Existing-bound role with an empty pending
+        // snapshot (e.g. a freshly-created pane that hasn't written its
+        // transcript yet) can't accidentally claim a sid that already belongs
+        // to a sibling session in the same worktree. Updated as the loop
+        // binds new sids so later slots see them too.
+        let mut bound_sids: std::collections::HashSet<String> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .filter_map(|s| s.session_id.clone())
+            .collect();
         for slot in &slots {
             let role = &wf.roles[&slot.role];
             let (session_label, session_id, effective_engine) = match slot.source() {
@@ -5151,6 +5489,7 @@ impl App {
                     // try to detect it NOW (newest JSONL heuristic) so the
                     // baseline below is computed from the actual transcript.
                     let worktree_for_detect = self.workspaces[ws_index].worktree_path.clone();
+                    let (cols, rows) = self.last_term_size;
                     let ts = match self.workspaces[ws_index].sessions.get_mut(*si) {
                         Some(s) => s,
                         None => continue,
@@ -5159,29 +5498,51 @@ impl App {
                     ts.workflow_role = Some(slot.role.clone());
                     if ts.session_id.is_none() {
                         if let Some(wt) = worktree_for_detect.as_deref() {
-                            // Use the session's own pending list (pre-launch
-                            // snapshot) if available so detection picks this
-                            // session's new JSONL rather than some other
-                            // session's in the same worktree. Empty-list
-                            // fallback picks the newest overall.
-                            let existing: Vec<String> =
+                            // Augment the per-session pre-launch snapshot with
+                            // sids already bound to other sessions so we don't
+                            // accidentally claim a sibling's sid (e.g. when
+                            // this pane was created before any transcript file
+                            // existed and a sibling pane wrote its transcript
+                            // between then and now).
+                            let mut existing: Vec<String> =
                                 ts.pending_jsonl_files.clone().unwrap_or_default();
+                            existing.extend(bound_sids.iter().cloned());
                             let detected = match ts.session_type.as_str() {
                                 "claude" => Self::detect_session_id(wt, &existing),
                                 "codex" => Self::detect_codex_session_id(wt, &existing),
                                 _ => None,
                             };
                             if let Some(sid) = detected {
+                                bound_sids.insert(sid.clone());
                                 ts.session_id = Some(sid);
                                 ts.pending_jsonl_files = None;
                             }
                         }
                     }
-                    let eng = match ts.session_type.as_str() {
-                        "codex" => Engine::Codex,
-                        _ => Engine::ClaudeCode,
+                    let eng = engine_for_session_type(&ts.session_type);
+                    let pending_baseline = match (&eng, worktree_for_detect.as_deref()) {
+                        (Engine::ClaudeCode, Some(wt)) => Some(Self::list_jsonl_files(wt)),
+                        (Engine::Codex, Some(wt)) => Some(Self::list_codex_sessions(wt)),
+                        _ => None,
                     };
-                    (ts.label.clone(), ts.session_id.clone(), eng)
+                    let sid = ts.session_id.clone();
+                    let respawn_warning = respawn_existing_with_workflow_mcp(
+                        ts,
+                        &eng,
+                        &run_id,
+                        &slot.role,
+                        sid.as_deref(),
+                        worktree_for_detect.as_deref(),
+                        pending_baseline,
+                        cols,
+                        rows,
+                    );
+                    let session_label_clone = ts.label.clone();
+                    let session_id_clone = ts.session_id.clone();
+                    if let Some(msg) = respawn_warning {
+                        self.set_status_msg(&msg);
+                    }
+                    (session_label_clone, session_id_clone, eng)
                 }
                 WorkflowSlotSource::New(engine) => {
                     match self.spawn_workflow_session(ws_index, &slot.role, engine, &run_id, inherit_task_id.clone()) {
@@ -5337,12 +5698,16 @@ impl App {
             // aggregate indicator. Toggle per session with A-h.
             hidden: true,
             idle_timeout_secs: 0,
+            burst_threshold: 0,
             pending_prompt: None,
             pending_clear: None,
             workflow_run_id: Some(run_id.to_string()),
             workflow_role: Some(role_name.to_string()),
             last_delivery: None,
             task_id,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -5916,25 +6281,6 @@ impl App {
         }
     }
 
-    /// Role name for a session, if it's a workflow participant.
-    #[allow(dead_code)]
-    pub fn session_workflow_role(&self, wi: usize, si: usize) -> Option<&str> {
-        self.workspaces
-            .get(wi)?
-            .sessions
-            .get(si)?
-            .workflow_role
-            .as_deref()
-    }
-
-    /// Run associated with a workspace, if any is active.
-    #[allow(dead_code)]
-    pub fn workspace_workflow_run(&self, wi: usize) -> Option<&WorkflowRun> {
-        let key = Self::workspace_key(self.workspaces.get(wi)?);
-        self.workflow_runs
-            .iter()
-            .find(|r| r.task_key == key && r.is_active())
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6193,7 +6539,12 @@ fn pending_write_ready(wakeups: &[Instant], pw: &PendingWrite, now: Instant) -> 
 /// of as the Enter keystroke — which matches the "prompt shows up with a
 /// newline but isn't submitted" symptom.
 fn enter_bytes_for(session: &crate::session::Session) -> &'static [u8] {
-    let mode = *session.term.lock().mode();
+    enter_bytes_for_mode(*session.term.lock().mode())
+}
+
+/// Pure mode → Enter-encoding mapping. Split out from `enter_bytes_for` so
+/// the encoding choice is unit-testable without constructing a real `Term`.
+fn enter_bytes_for_mode(mode: TermMode) -> &'static [u8] {
     if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
         // Kitty: Enter = CSI 13 u
         b"\x1b[13u"
@@ -6238,7 +6589,24 @@ fn log_tick(run_id: &str, msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    let truncate = std::fs::metadata(&path)
+        .map(|m| m.len() >= TICK_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true);
+    if truncate {
+        opts.write(true).truncate(true);
+    } else {
+        opts.append(true);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        if truncate {
+            let _ = writeln!(
+                f,
+                "{} (log truncated: cap {} bytes hit)",
+                now, TICK_LOG_MAX_BYTES
+            );
+        }
         let _ = writeln!(f, "{} {}", now, msg);
     }
 }
@@ -6338,6 +6706,33 @@ mod ready_tests {
     fn empty_wakeups_is_ready_past_floor() {
         let (p, now) = pw(1, 2, 60);
         assert!(pending_write_ready(&[], &p, now + Duration::from_secs(2)));
+    }
+}
+
+#[cfg(test)]
+mod enter_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn raw_cr_when_kitty_mode_off() {
+        let mode = TermMode::empty();
+        assert_eq!(enter_bytes_for_mode(mode), b"\r");
+    }
+
+    #[test]
+    fn kitty_csi_when_disambiguate_on() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(enter_bytes_for_mode(mode), b"\x1b[13u");
+    }
+
+    #[test]
+    fn kitty_csi_when_disambiguate_set_alongside_other_modes() {
+        // Real sessions carry many mode bits at once. We only care about the
+        // one that drives Enter encoding.
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES
+            | TermMode::ALT_SCREEN
+            | TermMode::BRACKETED_PASTE;
+        assert_eq!(enter_bytes_for_mode(mode), b"\x1b[13u");
     }
 }
 

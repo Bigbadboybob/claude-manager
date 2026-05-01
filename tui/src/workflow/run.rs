@@ -162,19 +162,6 @@ impl WorkflowRun {
         matches!(self.status, RunStatus::Running | RunStatus::Paused)
     }
 
-    pub fn role_binding(&self, role: &str) -> Option<&RoleBinding> {
-        self.role_sessions.get(role)
-    }
-
-    /// Most recent captured `last_message` for a given role. Used by prompt templating.
-    pub fn last_message_for(&self, role: &str) -> Option<&str> {
-        self.history
-            .iter()
-            .rev()
-            .find(|h| h.role == role && h.last_message.is_some())
-            .and_then(|h| h.last_message.as_deref())
-    }
-
     /// Close out the active role's history entry with a captured last_message and
     /// timestamp. Used when transitioning away.
     pub fn close_active_role(&mut self, last_message: Option<String>) {
@@ -256,10 +243,6 @@ pub fn events_path(run_id: &str) -> PathBuf {
     run_dir(run_id).join("events.jsonl")
 }
 
-fn state_path(run_id: &str) -> PathBuf {
-    run_dir(run_id).join("state.json")
-}
-
 pub fn new_run_id() -> String {
     // Compact base36-ish: seconds + a bit of randomness from the OS.
     let secs = now_unix();
@@ -319,12 +302,6 @@ pub fn save(run: &WorkflowRun) -> Result<(), PersistError> {
     fs::write(&tmp, json)?;
     fs::rename(&tmp, &final_path)?;
     Ok(())
-}
-
-pub fn load(run_id: &str) -> Result<WorkflowRun, PersistError> {
-    let path = state_path(run_id);
-    let contents = fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&contents)?)
 }
 
 /// Load all persisted runs. Invalid/unreadable state.json files are skipped.
@@ -398,7 +375,13 @@ mod tests {
         );
         assert_eq!(run.active_role.as_deref(), Some("reviewer"));
         assert_eq!(run.history.len(), 2);
-        assert_eq!(run.last_message_for("worker"), Some("worker was here"));
+        let worker_last = run
+            .history
+            .iter()
+            .rev()
+            .find(|h| h.role == "worker")
+            .and_then(|h| h.last_message.as_deref());
+        assert_eq!(worker_last, Some("worker was here"));
     }
 
     #[test]

@@ -105,11 +105,21 @@ pub fn claude_args(
 /// MCP servers the user has configured globally. No isolated CODEX_HOME —
 /// codex uses the user's `~/.codex/config.toml` as usual so its trusted-
 /// projects list, auth, and settings carry over.
-pub fn codex_args(run_id: &str, role: &str, _resume_session_id: Option<&str>) -> Vec<String> {
+///
+/// When `resume_session_id` is `Some(sid)`, the argv is built for the
+/// `codex resume` subcommand: `resume <OPTIONS...> <SESSION_ID>`. The
+/// subcommand keyword goes first; positional `SESSION_ID` goes last so it
+/// doesn't get consumed as the value of a preceding flag. `-c` overrides
+/// (and our MCP registration) work the same on the resume subcommand as
+/// they do on the bare `codex` invocation.
+pub fn codex_args(run_id: &str, role: &str, resume_session_id: Option<&str>) -> Vec<String> {
     let server = mcp_server_path()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let mut args: Vec<String> = Vec::new();
+    if resume_session_id.is_some() {
+        args.push("resume".into());
+    }
     args.push("--dangerously-bypass-approvals-and-sandbox".into());
     args.push("-c".into());
     args.push(r#"mcp_servers.claude-manager.command="python""#.into());
@@ -120,6 +130,9 @@ pub fn codex_args(run_id: &str, role: &str, _resume_session_id: Option<&str>) ->
         r#"mcp_servers.claude-manager.env={{CM_WORKFLOW_RUN_ID="{}",CM_ROLE="{}"}}"#,
         run_id, role
     ));
+    if let Some(sid) = resume_session_id {
+        args.push(sid.to_string());
+    }
     args
 }
 
@@ -182,5 +195,34 @@ mod tests {
         assert!(c_count >= 3);
         assert!(args.iter().any(|a| a.contains("wf_abc")));
         assert!(args.iter().any(|a| a.contains(r#"CM_ROLE="worker""#)));
+    }
+
+    #[test]
+    fn codex_args_no_resume_subcommand_when_none() {
+        let args = codex_args("wf_abc", "worker", None);
+        assert!(!args.iter().any(|a| a == "resume"));
+        assert!(!args.iter().any(|a| a == "01234567-89ab-cdef-0123-456789abcdef"));
+    }
+
+    #[test]
+    fn codex_args_resume_subcommand_when_some() {
+        let sid = "01234567-89ab-cdef-0123-456789abcdef";
+        let args = codex_args("wf_abc", "manager", Some(sid));
+        // `resume` must be the FIRST arg (subcommand position).
+        assert_eq!(args.first().map(|s| s.as_str()), Some("resume"));
+        // SESSION_ID is positional; must appear AFTER all -c overrides so it
+        // isn't consumed as a flag value.
+        let sid_pos = args.iter().position(|a| a == sid).expect("sid in args");
+        let last_dash_c = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-c")
+            .map(|(i, _)| i)
+            .last()
+            .expect("at least one -c");
+        assert!(sid_pos > last_dash_c, "session id must follow all -c overrides");
+        // MCP overrides still present when resuming.
+        assert!(args.iter().any(|a| a.contains("wf_abc")));
+        assert!(args.iter().any(|a| a.contains(r#"CM_ROLE="manager""#)));
     }
 }

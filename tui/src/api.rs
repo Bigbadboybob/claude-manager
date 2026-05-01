@@ -4,21 +4,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-/// Task as returned by the API.
+/// Task as returned by the API. `serde` ignores unknown fields by default, so
+/// dropping fields here just means we stop deserializing them — the API
+/// schema can keep returning them.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Task {
     pub id: String,
     pub created_at: String,
-    pub updated_at: String,
     pub repo_url: String,
     pub repo_branch: String,
     pub name: Option<String>,
     pub prompt: Option<String>,
     pub status: String,
-    pub priority: i32,
     pub worker_vm: Option<String>,
     pub worker_zone: Option<String>,
-    pub ttyd_url: Option<String>,
     pub blocked_at: Option<String>,
     pub session_id: Option<String>,
     pub wip_branch: Option<String>,
@@ -100,31 +99,11 @@ impl ApiClient {
         format!("Bearer {}", self.token)
     }
 
-    pub fn health(&self) -> anyhow::Result<()> {
-        self.agent
-            .get(&self.url("/health"))
-            .header("Authorization", &self.auth_header())
-            .call()?;
-        Ok(())
-    }
-
     pub fn list_tasks(&self, status: Option<&str>) -> anyhow::Result<Vec<Task>> {
         let url = match status {
             Some(s) => format!("{}?status={}", self.url("/tasks"), s),
             None => self.url("/tasks"),
         };
-        let body = self
-            .agent
-            .get(&url)
-            .header("Authorization", &self.auth_header())
-            .call()?
-            .body_mut()
-            .read_json::<Vec<Task>>()?;
-        Ok(body)
-    }
-
-    pub fn list_tasks_by_project(&self, project: &str) -> anyhow::Result<Vec<Task>> {
-        let url = format!("{}?project={}", self.url("/tasks"), project);
         let body = self
             .agent
             .get(&url)
