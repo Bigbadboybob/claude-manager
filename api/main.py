@@ -53,8 +53,7 @@ def _slugify(text: str) -> str:
 
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
-    # prompt defaults to name if not provided
-    prompt = body.prompt or body.name or ""
+    prompt = body.prompt or ""
 
     # Auto-generate slug from name if not provided
     slug = body.slug

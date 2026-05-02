@@ -1628,7 +1628,7 @@ impl PlanningView {
             project,
             repo_url,
             name: title.to_string(),
-            description: String::new(),
+            description: title.to_string(),
             status: "draft".to_string(),
         }
     }
