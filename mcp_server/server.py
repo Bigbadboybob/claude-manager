@@ -141,7 +141,7 @@ def list_tasks(
     Args:
         project: Optional project name filter.
         status: Optional status filter ("draft", "backlog", "running",
-            "blocked", "done").
+            "blocked", "done", "archived").
         source: Optional source filter ("user" or "claude"). Default returns both.
     """
     client = PlanningClient()
@@ -195,7 +195,7 @@ def update_task(
         name: New title.
         description: New description.
         prompt: New launch prompt.
-        status: "draft", "backlog", "running", "blocked", or "done".
+        status: "draft", "backlog", "running", "blocked", "done", or "archived".
         priority: Lower number = higher priority.
         difficulty: 1-10.
         project: Reassign to a different project.

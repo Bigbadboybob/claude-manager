@@ -21,6 +21,7 @@ pub enum PlanStatus {
     InProgress,
     Backlog,
     Draft,
+    Archived,
 }
 
 impl PlanStatus {
@@ -29,6 +30,7 @@ impl PlanStatus {
             "done" => Self::Done,
             "in_progress" | "running" => Self::InProgress,
             "backlog" | "blocked" => Self::Backlog,
+            "archived" => Self::Archived,
             _ => Self::Draft,
         }
     }
@@ -38,6 +40,7 @@ impl PlanStatus {
             Self::InProgress => "running",
             Self::Backlog => "backlog",
             Self::Draft => "draft",
+            Self::Archived => "archived",
         }
     }
     fn label(&self) -> &'static str {
@@ -46,14 +49,18 @@ impl PlanStatus {
             Self::InProgress => "in progress",
             Self::Backlog => "backlog",
             Self::Draft => "draft",
+            Self::Archived => "archived",
         }
     }
     fn next(&self) -> Self {
+        // Archived is reachable only via the bulk-archive shortcut, never via
+        // normal alt+s cycling. Both ends of the cycle stay put.
         match self {
             Self::Draft => Self::Backlog,
             Self::Backlog => Self::InProgress,
             Self::InProgress => Self::Done,
             Self::Done => Self::Done,
+            Self::Archived => Self::Archived,
         }
     }
     fn prev(&self) -> Self {
@@ -62,6 +69,7 @@ impl PlanStatus {
             Self::InProgress => Self::Backlog,
             Self::Backlog => Self::Draft,
             Self::Draft => Self::Draft,
+            Self::Archived => Self::Archived,
         }
     }
 }
@@ -116,6 +124,7 @@ enum GridItem {
     Task(String),
     Separator,
     Empty,
+    Header(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -143,6 +152,9 @@ enum PlanInputMode {
     Editing,
     Searching { query: String },
     NewTask { title: String },
+    NewHeader { text: String },
+    EditingHeader { text: String },
+    BulkArchiveConfirm { project_idx: usize, count: usize },
     NewProject { name: String, repo_url: String, field: NewProjectField },
     ProjectPicker { selected: usize },
     /// Before LaunchConfirm: pick either "new workspace" or an existing one.
@@ -217,6 +229,12 @@ pub enum PlanAction {
     },
     UpdateTask {
         id: String,
+        fields: HashMap<String, serde_json::Value>,
+    },
+    /// Apply the same field update to a list of tasks. Used by bulk-archive.
+    /// The app loop iterates and PATCHes each id with `fields.clone()`.
+    BulkUpdateTasks {
+        ids: Vec<String>,
         fields: HashMap<String, serde_json::Value>,
     },
     DeleteTask {
@@ -352,10 +370,11 @@ fn load_layout(project_path: &Path) -> GridLayout {
         if let Ok(raw) = serde_json::from_str::<LayoutRaw>(&s) {
             return GridLayout {
                 columns: raw.columns.into_iter().map(|col| {
-                    col.into_iter().map(|s| match s.as_str() {
-                        "---" => GridItem::Separator,
-                        "___" => GridItem::Empty,
-                        _ => GridItem::Task(s),
+                    col.into_iter().map(|s| {
+                        if s == "---" { GridItem::Separator }
+                        else if s == "___" { GridItem::Empty }
+                        else if let Some(text) = s.strip_prefix("# ") { GridItem::Header(text.to_string()) }
+                        else { GridItem::Task(s) }
                     }).collect()
                 }).collect(),
             };
@@ -377,6 +396,7 @@ fn save_layout(layout: &GridLayout, project_path: &Path) {
                 GridItem::Task(slug) => slug.clone(),
                 GridItem::Separator => "---".to_string(),
                 GridItem::Empty => "___".to_string(),
+                GridItem::Header(text) => format!("# {}", text),
             }).collect()
         }).collect(),
     };
@@ -410,7 +430,7 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
     for col in &mut layout.columns {
         col.retain(|item| match item {
             GridItem::Task(slug) => task_slugs.contains(slug.as_str()),
-            GridItem::Separator | GridItem::Empty => true,
+            GridItem::Separator | GridItem::Empty | GridItem::Header(_) => true,
         });
     }
     let mut in_layout: HashSet<String> = HashSet::new();
@@ -482,6 +502,9 @@ pub struct PlanningView {
     /// Open workspaces the user can launch a task into. Populated by App
     /// before each planning event / render.
     workspace_candidates: Vec<WorkspaceCandidate>,
+    /// When false, archived tasks are skipped from rendering and cursor
+    /// navigation. Toggled with alt+shift+v.
+    show_archived: bool,
 }
 
 impl PlanningView {
@@ -507,6 +530,7 @@ impl PlanningView {
             last_editor_size: (80, 24),
             initialized: false,
             workspace_candidates: vec![],
+            show_archived: false,
         }
     }
 
@@ -785,7 +809,15 @@ impl PlanningView {
         let col = self.cursor_column()?;
         match col.get(self.cursor.row)? {
             GridItem::Task(slug) => Some(slug),
-            GridItem::Separator | GridItem::Empty => None,
+            GridItem::Separator | GridItem::Empty | GridItem::Header(_) => None,
+        }
+    }
+
+    fn selected_header_text(&self) -> Option<String> {
+        let col = self.cursor_column()?;
+        match col.get(self.cursor.row)? {
+            GridItem::Header(text) => Some(text.clone()),
+            _ => None,
         }
     }
 
@@ -828,19 +860,55 @@ impl PlanningView {
         }
     }
 
-    fn snap_cursor_to_selectable(&mut self, direction: i32) {
-        if let Some(col) = self.cursor_column() {
-            if col.is_empty() { return; }
-            let len = col.len() as i32;
-            let start = (self.cursor.row as i32).min(len - 1);
-            let mut pos = start;
-            for _ in 0..col.len() {
-                if !matches!(col.get(pos as usize), Some(GridItem::Empty)) {
-                    self.cursor.row = pos as usize;
-                    return;
+    /// Whether the cursor is allowed to land on an item.
+    /// Skips Empty rows always; skips archived task rows when show_archived is false.
+    fn is_item_selectable(&self, pi: usize, item: &GridItem) -> bool {
+        match item {
+            GridItem::Empty => false,
+            GridItem::Task(slug) => {
+                if self.show_archived {
+                    return true;
                 }
-                pos = (pos + direction).rem_euclid(len);
+                let pd = match self.project_data.get(pi) {
+                    Some(pd) => pd,
+                    None => return true,
+                };
+                match pd.tasks.iter().find(|t| t.slug == *slug) {
+                    Some(t) => t.status != PlanStatus::Archived,
+                    None => true,
+                }
             }
+            GridItem::Separator | GridItem::Header(_) => true,
+        }
+    }
+
+    fn snap_cursor_to_selectable(&mut self, direction: i32) {
+        let pi = match self.cursor_project_idx() {
+            Some(p) => p,
+            None => return,
+        };
+        let ci = match self.unified_cols.get(self.cursor.col) {
+            Some((_, ci)) => *ci,
+            None => return,
+        };
+        let col_len = match self.project_data.get(pi).and_then(|pd| pd.layout.columns.get(ci)) {
+            Some(c) if !c.is_empty() => c.len(),
+            _ => return,
+        };
+        let len = col_len as i32;
+        let start = (self.cursor.row as i32).min(len - 1);
+        let mut pos = start;
+        for _ in 0..col_len {
+            let selectable = self.project_data[pi].layout.columns[ci]
+                .get(pos as usize)
+                .cloned()
+                .map(|item| self.is_item_selectable(pi, &item))
+                .unwrap_or(false);
+            if selectable {
+                self.cursor.row = pos as usize;
+                return;
+            }
+            pos = (pos + direction).rem_euclid(len);
         }
     }
 
@@ -874,16 +942,17 @@ impl PlanningView {
         if self.unified_cols.is_empty() { return; }
         let prev_slug = self.selected_slug().map(|s| s.to_string());
         let in_visual = self.visual_anchor.is_some();
-        let is_selectable = |item: &GridItem| !matches!(item, GridItem::Empty);
 
         if self.linear_mode && !in_visual {
-            let selectable_positions: Vec<(usize, usize)> = self.unified_cols.iter().enumerate()
-                .flat_map(|(gi, (pi, ci))| {
-                    let col = &self.project_data[*pi].layout.columns[*ci];
-                    col.iter().enumerate()
-                        .filter(|(_, item)| is_selectable(item))
-                        .map(move |(ri, _)| (gi, ri))
-                }).collect();
+            let mut selectable_positions: Vec<(usize, usize)> = Vec::new();
+            for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
+                let col = &self.project_data[pi].layout.columns[ci];
+                for (ri, item) in col.iter().enumerate() {
+                    if self.is_item_selectable(pi, item) {
+                        selectable_positions.push((gi, ri));
+                    }
+                }
+            }
             if selectable_positions.is_empty() { return; }
             let cur = selectable_positions.iter()
                 .position(|&(c, r)| c == self.cursor.col && r == self.cursor.row)
@@ -892,20 +961,29 @@ impl PlanningView {
             self.cursor.col = selectable_positions[next].0;
             self.cursor.row = selectable_positions[next].1;
         } else {
-            let col = match self.cursor_column() {
-                Some(c) if !c.is_empty() => c,
+            let pi = match self.cursor_project_idx() {
+                Some(p) => p,
+                None => return,
+            };
+            let ci = match self.unified_cols.get(self.cursor.col) {
+                Some((_, ci)) => *ci,
+                None => return,
+            };
+            let col_len = match self.project_data.get(pi).and_then(|pd| pd.layout.columns.get(ci)) {
+                Some(c) if !c.is_empty() => c.len(),
                 _ => return,
             };
-            let len = col.len() as i32;
+            let len = col_len as i32;
             if in_visual {
                 let next = self.cursor.row as i32 + direction;
                 if next < 0 || next >= len { return; }
                 self.cursor.row = next as usize;
             } else {
                 let mut next = self.cursor.row as i32;
-                for _ in 0..col.len() {
+                for _ in 0..col_len {
                     next = (next + direction).rem_euclid(len);
-                    if is_selectable(&col[next as usize]) {
+                    let item = self.project_data[pi].layout.columns[ci][next as usize].clone();
+                    if self.is_item_selectable(pi, &item) {
                         break;
                     }
                 }
@@ -955,6 +1033,9 @@ impl PlanningView {
             PlanInputMode::Editing => self.handle_editing_event(event),
             PlanInputMode::Searching { .. } => self.handle_search_event(event),
             PlanInputMode::NewTask { .. } => self.handle_new_task_event(event),
+            PlanInputMode::NewHeader { .. } => self.handle_new_header_event(event),
+            PlanInputMode::EditingHeader { .. } => self.handle_editing_header_event(event),
+            PlanInputMode::BulkArchiveConfirm { .. } => self.handle_bulk_archive_confirm_event(event),
             PlanInputMode::NewProject { .. } => self.handle_new_project_event(event),
             PlanInputMode::ProjectPicker { .. } => self.handle_project_picker_event(event),
             PlanInputMode::WorkspacePicker { .. } => self.handle_workspace_picker_event(event),
@@ -981,6 +1062,25 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.cancel_visual();
+                        if let Some(pi) = self.cursor_project_idx() {
+                            let count = self.project_data[pi].tasks.iter()
+                                .filter(|t| t.status == PlanStatus::Done).count();
+                            if count > 0 {
+                                self.input_mode = PlanInputMode::BulkArchiveConfirm { project_idx: pi, count };
+                            }
+                        }
+                        return PlanAction::Consumed;
+                    }
+                    KeyCode::Char('v') | KeyCode::Char('V') => {
+                        self.cancel_visual();
+                        self.show_archived = !self.show_archived;
+                        if !self.show_archived {
+                            self.snap_cursor_to_selectable(1);
+                        }
+                        return PlanAction::Consumed;
+                    }
                     _ => {}
                 }
             }
@@ -1011,7 +1111,19 @@ impl PlanningView {
                         self.clamp_cursor();
                         return PlanAction::Consumed;
                     }
-                    KeyCode::Char('e') => { self.cancel_visual(); return self.start_editor(); }
+                    KeyCode::Char('e') => {
+                        self.cancel_visual();
+                        if let Some(text) = self.selected_header_text() {
+                            self.input_mode = PlanInputMode::EditingHeader { text };
+                            return PlanAction::Consumed;
+                        }
+                        return self.start_editor();
+                    }
+                    KeyCode::Char('i') => {
+                        self.cancel_visual();
+                        self.input_mode = PlanInputMode::NewHeader { text: String::new() };
+                        return PlanAction::Consumed;
+                    }
                     KeyCode::Char('n') => {
                         self.cancel_visual();
                         if self.projects.is_empty() {
@@ -1029,7 +1141,7 @@ impl PlanningView {
                         if let Some((pi, ci)) = self.unified_cols.get(self.cursor.col).copied() {
                             if matches!(
                                 self.project_data[pi].layout.columns[ci].get(self.cursor.row),
-                                Some(GridItem::Separator | GridItem::Empty)
+                                Some(GridItem::Separator | GridItem::Empty | GridItem::Header(_))
                             ) {
                                 self.remove_separator();
                                 return PlanAction::Consumed;
@@ -1169,6 +1281,86 @@ impl PlanningView {
                 }
                 KeyCode::Backspace => { title.pop(); self.input_mode = PlanInputMode::NewTask { title }; }
                 KeyCode::Char(c) => { title.push(c); self.input_mode = PlanInputMode::NewTask { title }; }
+                _ => {}
+            }
+        }
+        PlanAction::Consumed
+    }
+
+    fn handle_new_header_event(&mut self, event: &CrosstermEvent) -> PlanAction {
+        if let CrosstermEvent::Key(key) = event {
+            let mut text = match &self.input_mode {
+                PlanInputMode::NewHeader { text } => text.clone(),
+                _ => return PlanAction::Consumed,
+            };
+            match key.code {
+                KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
+                KeyCode::Enter => {
+                    if !text.trim().is_empty() {
+                        self.input_mode = PlanInputMode::Normal;
+                        self.insert_header(text.trim().to_string());
+                    }
+                }
+                KeyCode::Backspace => { text.pop(); self.input_mode = PlanInputMode::NewHeader { text }; }
+                KeyCode::Char(c) => { text.push(c); self.input_mode = PlanInputMode::NewHeader { text }; }
+                _ => {}
+            }
+        }
+        PlanAction::Consumed
+    }
+
+    fn handle_editing_header_event(&mut self, event: &CrosstermEvent) -> PlanAction {
+        if let CrosstermEvent::Key(key) = event {
+            let mut text = match &self.input_mode {
+                PlanInputMode::EditingHeader { text } => text.clone(),
+                _ => return PlanAction::Consumed,
+            };
+            match key.code {
+                KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
+                KeyCode::Enter => {
+                    if !text.trim().is_empty() {
+                        self.input_mode = PlanInputMode::Normal;
+                        self.update_header_at_cursor(text.trim().to_string());
+                    }
+                }
+                KeyCode::Backspace => { text.pop(); self.input_mode = PlanInputMode::EditingHeader { text }; }
+                KeyCode::Char(c) => { text.push(c); self.input_mode = PlanInputMode::EditingHeader { text }; }
+                _ => {}
+            }
+        }
+        PlanAction::Consumed
+    }
+
+    fn handle_bulk_archive_confirm_event(&mut self, event: &CrosstermEvent) -> PlanAction {
+        if let CrosstermEvent::Key(key) = event {
+            let project_idx = match &self.input_mode {
+                PlanInputMode::BulkArchiveConfirm { project_idx, .. } => *project_idx,
+                _ => return PlanAction::Consumed,
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = PlanInputMode::Normal;
+                }
+                KeyCode::Enter => {
+                    self.input_mode = PlanInputMode::Normal;
+                    let mut ids: Vec<String> = Vec::new();
+                    if let Some(pd) = self.project_data.get_mut(project_idx) {
+                        for task in &mut pd.tasks {
+                            if task.status == PlanStatus::Done {
+                                task.status = PlanStatus::Archived;
+                                ids.push(task.id.clone());
+                            }
+                        }
+                    }
+                    if ids.is_empty() {
+                        return PlanAction::Consumed;
+                    }
+                    // Cursor may have been on one of the just-archived tasks; snap to a still-visible row.
+                    self.snap_cursor_to_selectable(1);
+                    let mut fields = HashMap::new();
+                    fields.insert("status".to_string(), serde_json::json!("archived"));
+                    return PlanAction::BulkUpdateTasks { ids, fields };
+                }
                 _ => {}
             }
         }
@@ -1405,8 +1597,9 @@ impl PlanningView {
                             PlanStatus::InProgress => 1,
                             PlanStatus::Backlog => 2,
                             PlanStatus::Draft => 3,
+                            PlanStatus::Archived => 4,
                         })
-                        .unwrap_or(4);
+                        .unwrap_or(5);
                     Some((ri, key, item.clone()))
                 } else {
                     None
@@ -1535,21 +1728,42 @@ impl PlanningView {
             Some(v) => *v,
             None => return,
         };
-        match self.project_data[src_pi].layout.columns[src_ci].get(self.cursor.row) {
-            Some(GridItem::Task(_)) => {}
-            _ => return,
-        }
         let target_gcol = self.cursor.col as i32 + direction;
         if target_gcol < 0 || target_gcol >= self.unified_cols.len() as i32 { return; }
         let target_gcol = target_gcol as usize;
         let (dst_pi, dst_ci) = self.unified_cols[target_gcol];
         if src_pi != dst_pi { return; }
 
-        let item = self.project_data[src_pi].layout.columns[src_ci].remove(self.cursor.row);
-        let insert_at = self.cursor.row.min(self.project_data[dst_pi].layout.columns[dst_ci].len());
-        self.project_data[dst_pi].layout.columns[dst_ci].insert(insert_at, item);
-        self.cursor.col = target_gcol;
-        self.cursor.row = insert_at;
+        if let Some((range_start, range_end)) = self.visual_range() {
+            let src_len = self.project_data[src_pi].layout.columns[src_ci].len();
+            if range_end >= src_len { return; }
+            let items: Vec<GridItem> = self.project_data[src_pi].layout.columns[src_ci]
+                .drain(range_start..=range_end)
+                .collect();
+            let dst_len = self.project_data[dst_pi].layout.columns[dst_ci].len();
+            let insert_at = range_start.min(dst_len);
+            for (offset, item) in items.into_iter().enumerate() {
+                self.project_data[dst_pi].layout.columns[dst_ci].insert(insert_at + offset, item);
+            }
+            let cursor_offset = self.cursor.row.saturating_sub(range_start);
+            self.cursor.col = target_gcol;
+            self.cursor.row = insert_at + cursor_offset;
+            if let Some(ref mut anchor) = self.visual_anchor {
+                let anchor_offset = anchor.saturating_sub(range_start);
+                *anchor = insert_at + anchor_offset;
+            }
+        } else {
+            match self.project_data[src_pi].layout.columns[src_ci].get(self.cursor.row) {
+                Some(GridItem::Task(_)) | Some(GridItem::Header(_)) => {}
+                _ => return,
+            }
+            let item = self.project_data[src_pi].layout.columns[src_ci].remove(self.cursor.row);
+            let insert_at = self.cursor.row.min(self.project_data[dst_pi].layout.columns[dst_ci].len());
+            self.project_data[dst_pi].layout.columns[dst_ci].insert(insert_at, item);
+            self.cursor.col = target_gcol;
+            self.cursor.row = insert_at;
+        }
+
         self.save_project_layout(src_pi);
         self.recompute_conflicts();
         self.clamp_cursor();
@@ -1575,12 +1789,35 @@ impl PlanningView {
         self.save_project_layout(pi);
     }
 
+    fn insert_header(&mut self, text: String) {
+        let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
+            Some(v) => *v,
+            None => return,
+        };
+        let insert_at = (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len());
+        self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Header(text));
+        self.save_project_layout(pi);
+    }
+
+    fn update_header_at_cursor(&mut self, text: String) {
+        let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
+            Some(v) => *v,
+            None => return,
+        };
+        if let Some(item) = self.project_data[pi].layout.columns[ci].get_mut(self.cursor.row) {
+            if matches!(item, GridItem::Header(_)) {
+                *item = GridItem::Header(text);
+                self.save_project_layout(pi);
+            }
+        }
+    }
+
     fn remove_separator(&mut self) {
         let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
             Some(v) => *v,
             None => return,
         };
-        if matches!(self.project_data[pi].layout.columns[ci].get(self.cursor.row), Some(GridItem::Separator | GridItem::Empty)) {
+        if matches!(self.project_data[pi].layout.columns[ci].get(self.cursor.row), Some(GridItem::Separator | GridItem::Empty | GridItem::Header(_))) {
             self.project_data[pi].layout.columns[ci].remove(self.cursor.row);
             self.save_project_layout(pi);
             self.clamp_cursor();
@@ -1866,6 +2103,9 @@ impl PlanningView {
         match &self.input_mode {
             PlanInputMode::Searching { query } => self.draw_search_overlay(frame, area, query),
             PlanInputMode::NewTask { title } => self.draw_new_task_overlay(frame, area, title),
+            PlanInputMode::NewHeader { text } => self.draw_new_header_overlay(frame, area, text, false),
+            PlanInputMode::EditingHeader { text } => self.draw_new_header_overlay(frame, area, text, true),
+            PlanInputMode::BulkArchiveConfirm { project_idx, count } => self.draw_bulk_archive_confirm(frame, area, *project_idx, *count),
             PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
             PlanInputMode::WorkspacePicker { project_idx, task_idx, selected } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected),
@@ -1964,7 +2204,7 @@ impl PlanningView {
                 dim,
             )),
             Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+                " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
                 dim,
             )),
         ]), help_area);
@@ -1980,6 +2220,15 @@ impl PlanningView {
         for ri in start..end {
             let is_selected = self.cursor.col == col_idx && self.cursor.row == ri;
             let in_visual = self.is_in_visual_range(col_idx, ri);
+            // Skip archived task rows when show_archived is off.
+            if !self.show_archived {
+                if let GridItem::Task(slug) = &column[ri] {
+                    let archived = self.project_data.iter().find_map(|pd| {
+                        if pd.project.name == project_name { pd.tasks.iter().find(|t| t.slug == *slug) } else { None }
+                    }).map(|t| t.status == PlanStatus::Archived).unwrap_or(false);
+                    if archived { continue; }
+                }
+            }
             match &column[ri] {
                 GridItem::Task(slug) => {
                     let task = self.project_data.iter().find_map(|pd| {
@@ -1994,6 +2243,7 @@ impl PlanningView {
                         Some(PlanStatus::InProgress) => "\u{25c9}",
                         Some(PlanStatus::Backlog) => " ",
                         Some(PlanStatus::Draft) => "\u{25cb}",
+                        Some(PlanStatus::Archived) => "\u{25a1}",
                         None => "?",
                     };
                     let indicator_style = if is_claude {
@@ -2004,6 +2254,7 @@ impl PlanningView {
                             Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
                             Some(PlanStatus::Backlog) => Style::default(),
                             Some(PlanStatus::Draft) => Style::default().fg(Color::DarkGray),
+                            Some(PlanStatus::Archived) => Style::default().fg(Color::DarkGray),
                             None => Style::default(),
                         }
                     };
@@ -2047,6 +2298,25 @@ impl PlanningView {
                 GridItem::Empty => {
                     items.push(ListItem::new(Line::from("")));
                 }
+                GridItem::Header(text) => {
+                    let base_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+                    let style = if is_selected && in_visual {
+                        base_style.bg(Color::Rgb(50, 50, 80))
+                    } else if is_selected {
+                        base_style.bg(Color::Rgb(40, 40, 50))
+                    } else if in_visual {
+                        base_style.bg(Color::Rgb(50, 50, 80))
+                    } else {
+                        base_style
+                    };
+                    let max_text = width.saturating_sub(1);
+                    let display = if text.len() > max_text {
+                        format!("{}...", &text[..max_text.saturating_sub(3)])
+                    } else {
+                        text.clone()
+                    };
+                    items.push(ListItem::new(Line::from(Span::styled(display, style))));
+                }
             }
         }
         items
@@ -2073,8 +2343,10 @@ impl PlanningView {
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
             ("A-Ent  sep", "A-Spc  empty"),
-            ("A-s/S  status", "A-p    filter"),
+            ("A-i    header", "A-A    archive done"),
+            ("A-s/S  status", "A-V    show arch"),
             ("A-g    grid", "A-t    sessions"),
+            ("A-p    filter", ""),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 2) as usize;
@@ -2113,6 +2385,15 @@ impl PlanningView {
                 if items.len() >= list_height { break; }
                 let is_selected = self.cursor.col == gi && self.cursor.row == ri;
 
+                // Skip archived task rows when show_archived is off.
+                if !self.show_archived {
+                    if let GridItem::Task(slug) = grid_item {
+                        let archived = pd.tasks.iter().find(|t| t.slug == *slug)
+                            .map(|t| t.status == PlanStatus::Archived).unwrap_or(false);
+                        if archived { flat_idx += 1; continue; }
+                    }
+                }
+
                 match grid_item {
                     GridItem::Task(slug) => {
                         let task = pd.tasks.iter().find(|t| t.slug == *slug);
@@ -2125,6 +2406,7 @@ impl PlanningView {
                             Some(PlanStatus::InProgress) => "\u{25c9}",
                             Some(PlanStatus::Backlog) => " ",
                             Some(PlanStatus::Draft) => "\u{25cb}",
+                            Some(PlanStatus::Archived) => "\u{25a1}",
                             None => "?",
                         };
                         let indicator_style = if is_claude {
@@ -2174,6 +2456,21 @@ impl PlanningView {
                     GridItem::Empty => {
                         items.push(ListItem::new(Line::from("")));
                     }
+                    GridItem::Header(text) => {
+                        let base_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+                        let style = if is_selected {
+                            base_style.bg(Color::Rgb(40, 40, 50))
+                        } else {
+                            base_style
+                        };
+                        let max_text = (inner.width as usize).saturating_sub(2);
+                        let display = if text.len() > max_text {
+                            format!("{}...", &text[..max_text.saturating_sub(3)])
+                        } else {
+                            text.clone()
+                        };
+                        items.push(ListItem::new(Line::from(Span::styled(format!(" {}", display), style))));
+                    }
                 }
                 flat_idx += 1;
             }
@@ -2222,6 +2519,7 @@ impl PlanningView {
             let status_color = match task.status {
                 PlanStatus::Done => Color::Green, PlanStatus::InProgress => Color::Yellow,
                 PlanStatus::Backlog => Color::White, PlanStatus::Draft => Color::DarkGray,
+                PlanStatus::Archived => Color::DarkGray,
             };
             let mut meta = vec![
                 Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
@@ -2345,6 +2643,26 @@ impl PlanningView {
             ]),
             Line::from(""),
             Line::from(Span::styled("Enter create \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+        ]), inner);
+    }
+
+    fn draw_new_header_overlay(&self, frame: &mut Frame, area: Rect, text: &str, editing: bool) {
+        let title = if editing { " Edit Header " } else { " New Header " };
+        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 5u16);
+        let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
+        frame.render_widget(Clear, dialog);
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
+            .title(Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+        frame.render_widget(Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("  Text: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(text, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled("\u{2588}", Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Enter save \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
         ]), inner);
     }
 
@@ -2476,6 +2794,29 @@ impl PlanningView {
             Style::default().fg(Color::DarkGray),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_bulk_archive_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, count: usize) {
+        let project_name = self.project_data.get(project_idx)
+            .map(|pd| pd.project.name.as_str())
+            .unwrap_or("?");
+        let (w, h) = (62u16.min(area.width.saturating_sub(4)), 7u16);
+        let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
+        frame.render_widget(Clear, dialog);
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
+            .title(Span::styled(" Archive Done Tasks ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+        frame.render_widget(Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("  Archive {} done task{} in ", count, if count == 1 { "" } else { "s" }), Style::default().fg(Color::White)),
+                Span::styled(project_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("?", Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("  Enter confirm \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+        ]), inner);
     }
 
     fn draw_launch_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, task_idx: usize, branch_text: &str) {

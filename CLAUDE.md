@@ -81,7 +81,7 @@ Sessions view:
 - `A-r` — refresh
 
 Planning view:
-- `A-e` edit, `A-n` new, `A-s/S` cycle status, `A-f` launch (cloud), `A-g` grid/linear toggle
+- `A-e` edit, `A-n` new, `A-a` accept (claim claude-proposed task), `A-i` insert header (bold-text section label), `A-A` bulk-archive done tasks in current project (with confirm), `A-V` toggle archived task visibility, `A-s/S` cycle status, `A-f` launch (cloud), `A-g` grid/linear toggle
 
 ## Cloud mode (optional, secondary)
 
@@ -99,7 +99,7 @@ Workers run Claude in tmux, accessible via ttyd on port 8080. The dispatch daemo
 
 ### Deploying API changes
 
-The API runs from `/opt/claude-manager/` on `cm-manager`.
+The API runs from `/opt/claude-manager/` on `cm-manager` as a systemd service (`claude-manager.service`, `Restart=always`). The unit file at `/etc/systemd/system/claude-manager.service` sets `CM_DB_DSN`, `CM_API_TOKEN`, etc. as `Environment=` directives — no inline env vars or `nohup` needed at restart time. Logs go to `/var/log/claude-manager.log`.
 
 ```bash
 gcloud compute scp <local-file> cm-manager:/tmp/<file> --zone=us-east4-a --project=claude-manager-prod
@@ -107,12 +107,12 @@ gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
   --command="sudo cp /tmp/<file> /opt/claude-manager/<path>"
 
 gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
-  --command="sudo pkill -f uvicorn"
-gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
-  --command='sudo bash -c '"'"'cd /opt/claude-manager && CM_DB_DSN="postgresql://cmuser:D8tO2oHwlCU%2FNLhH8GkkjdLeS69xQqjR@10.150.0.2/claude_manager" CM_API_TOKEN="HfxQJ9mAdZ3LUeZQNjvCDrvgR/GhBETvWtMlSVxBj2w=" CM_API_URL="http://34.11.80.141:8000" CM_GCP_PROJECT="claude-manager-prod" CM_GCP_ZONE="us-east4-a" CM_MAX_WORKERS=3 nohup /opt/claude-manager/.venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000 > /var/log/claude-manager.log 2>&1 &'"'"''
+  --command="sudo systemctl restart claude-manager"
 ```
 
-Changes to Python files under `api/`, `dispatch/`, `mcp_server/`, or `cli/` need a redeploy + restart. The TUI and local `workflows/` are built and run locally — no deploy needed.
+Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server runs locally on user machines (cm-manager has no `mcp_server/` directory), so changes there take effect on next local MCP spawn. The TUI and local `workflows/` are built and run locally — no deploy needed.
+
+**Don't `pkill -f uvicorn`** — the systemd unit auto-respawns immediately, so a manual nohup launch fights the systemd-spawned one for port 8000. Also, `pkill -f uvicorn` over `gcloud ssh` self-matches on the SSH command line (which contains "uvicorn") and kills its own shell, returning exit 255. Use `systemctl restart` instead.
 
 ### Database
 

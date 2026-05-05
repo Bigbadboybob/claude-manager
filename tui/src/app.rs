@@ -380,7 +380,6 @@ fn respawn_existing_with_workflow_mcp(
     role: &str,
     session_id: Option<&str>,
     worktree: Option<&Path>,
-    pending_baseline: Option<Vec<String>>,
     cols: u16,
     rows: u16,
 ) -> Option<String> {
@@ -419,12 +418,16 @@ fn respawn_existing_with_workflow_mcp(
         }
     };
     // Swap the Session: dropping the old one closes its PTY which reaps the
-    // old agent process. The conversation history comes back via the engine's
-    // resume; the new transcript file the resume writes will be picked up by
-    // the session_id detector on a future tick.
+    // old agent process. We just spawned the new agent with `--resume <sid>`
+    // (or `codex resume <sid>`), which appends to the EXISTING transcript file
+    // — no new file is written, so we keep the sid bound. Clearing it here
+    // and relying on the listing detector to rebind would never resolve,
+    // because `pending_baseline` already contains the only transcript that
+    // exists; nothing would ever look "new" and the workflow idle gate would
+    // stay closed forever.
     ts.session = new_sess;
-    ts.session_id = None;
-    ts.pending_jsonl_files = pending_baseline;
+    ts.session_id = Some(sid.to_string());
+    ts.pending_jsonl_files = None;
     ts.pending_prompt = None;
     ts.pending_clear = None;
     ts.pending_enter = None;
@@ -562,6 +565,7 @@ enum InputMode {
 pub enum ConfirmAction {
     MarkDone,
     Delete,
+    StopWorkflow { run_id: String },
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -1831,8 +1835,13 @@ impl App {
                     }
                 }
 
-                // Only deliver the prompt once the /clear (if any) is gone.
-                if ts.pending_clear.is_none() {
+                // Only deliver the prompt once the /clear (if any) is gone
+                // AND its trailing Enter has fired. Without the pending_enter
+                // gate, the prompt's deliver_pending_write call would overwrite
+                // ts.pending_enter before the clear's Enter ever fires —
+                // codex then sees `/clearCan you review unstaged changes...\r`
+                // as a single slash command and rejects it.
+                if ts.pending_clear.is_none() && ts.pending_enter.is_none() {
                     if let Some(prompt) = &ts.pending_prompt {
                         if Self::ready_for_write(&ts.session, prompt, now) {
                             let pw = ts.pending_prompt.take().unwrap();
@@ -2632,6 +2641,12 @@ impl App {
                     self.backend.update_plan_task(id, fields);
                     return true;
                 }
+                PlanAction::BulkUpdateTasks { ids, fields } => {
+                    for id in ids {
+                        self.backend.update_plan_task(id, fields.clone());
+                    }
+                    return true;
+                }
                 PlanAction::DeleteTask { id } => {
                     self.backend.delete_plan_task(id);
                     return true;
@@ -2750,7 +2765,14 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('o') => {
-                        self.stop_workflow_for_cursor();
+                        if let Some(run_id) = self.focused_session_run_id() {
+                            self.input_mode = InputMode::Confirm {
+                                prompt: "Stop workflow? Sessions stay open; run can't resume.".to_string(),
+                                action: ConfirmAction::StopWorkflow { run_id },
+                            };
+                        } else {
+                            self.set_status_msg("Focused session is not in a workflow");
+                        }
                         return true;
                     }
                     KeyCode::Char('y') => {
@@ -3362,6 +3384,9 @@ impl App {
                         match action {
                             ConfirmAction::MarkDone => self.mark_active_done(),
                             ConfirmAction::Delete => self.delete_active(),
+                            ConfirmAction::StopWorkflow { run_id } => {
+                                self.stop_workflow_run(&run_id);
+                            }
                         }
                         return true;
                     }
@@ -5520,11 +5545,6 @@ impl App {
                         }
                     }
                     let eng = engine_for_session_type(&ts.session_type);
-                    let pending_baseline = match (&eng, worktree_for_detect.as_deref()) {
-                        (Engine::ClaudeCode, Some(wt)) => Some(Self::list_jsonl_files(wt)),
-                        (Engine::Codex, Some(wt)) => Some(Self::list_codex_sessions(wt)),
-                        _ => None,
-                    };
                     let sid = ts.session_id.clone();
                     let respawn_warning = respawn_existing_with_workflow_mcp(
                         ts,
@@ -5533,7 +5553,6 @@ impl App {
                         &slot.role,
                         sid.as_deref(),
                         worktree_for_detect.as_deref(),
-                        pending_baseline,
                         cols,
                         rows,
                     );
@@ -6214,30 +6233,20 @@ impl App {
         }
     }
 
-    /// Stop the workflow the focused session belongs to.
+    /// Stop a workflow by run id.
     ///
     /// The workflow run is marked detached (no more transitions will fire) and
     /// the participating sessions have their workflow tags cleared so they
     /// behave like normal standalone sessions from here on. The sessions
     /// themselves stay open and their transcripts are preserved.
-    fn stop_workflow_for_cursor(&mut self) {
-        let run_id = match self.focused_session_run_id() {
-            Some(id) => id,
-            None => {
-                self.set_status_msg("Focused session is not in a workflow");
-                return;
-            }
-        };
+    fn stop_workflow_run(&mut self, run_id: &str) {
         if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
             run.mark_detached();
             let _ = workflow::run::save(run);
         }
-        // Clear workflow tags from participating sessions so they behave like
-        // normal standalone sessions. Also un-hide their per-session indicators
-        // (hidden on launch since the workflow header carries the aggregate).
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {
-                if ts.workflow_run_id.as_deref() == Some(&run_id) {
+                if ts.workflow_run_id.as_deref() == Some(run_id) {
                     ts.workflow_run_id = None;
                     ts.workflow_role = None;
                     ts.hidden = false;

@@ -52,7 +52,12 @@ impl Session {
         let (event_tx, event_rx) = mpsc::channel();
         let event_proxy = EventProxy { tx: event_tx };
 
-        let config = TermConfig::default();
+        // Enable Kitty keyboard protocol tracking so alacritty actually
+        // records `\x1b[>Nu` push/pop sequences from agents like codex —
+        // otherwise `term.mode()` never reflects DISAMBIGUATE_ESC_CODES
+        // and our Enter encoding logic in app.rs has nothing to react to.
+        let mut config = TermConfig::default();
+        config.kitty_keyboard = true;
 
         let size = TermSize {
             columns: cols as usize,

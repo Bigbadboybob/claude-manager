@@ -9,13 +9,10 @@ context = "persistent"
 
 [roles.reviewer]
 engine = "codex"
-context = "persistent"
-activation_prompt = """Original task I'm working on:
+context = "fresh"
+activation_prompt = """Can you review unstaged changes.
 
-{{ goal }}
-
-Can you review unstaged changes"""
-subsequent_activation_prompt = "review again"
+Only report findings you're at least 80% confident are real issues. Always surface security or correctness bugs. Consolidate similar findings into one. Prioritize real bugs over style nitpicks."""
 
 [roles.manager]
 engine = "claude-code"

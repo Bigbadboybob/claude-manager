@@ -63,6 +63,7 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
                        WHEN 'backlog' THEN 2
                        WHEN 'draft' THEN 3
                        WHEN 'done' THEN 4
+                       WHEN 'archived' THEN 5
                    END,
                    priority, created_at""",
             *params,

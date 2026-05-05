@@ -114,6 +114,10 @@ Statuses can move in any direction (e.g. done → backlog to reopen).
 ├────────────────────┤                                                  │
 │ A-j/k nav          │                                                  │
 │ A-e  edit (vim)    │                                                  │
+│ A-a  accept        │                                                  │
+│ A-i  header        │                                                  │
+│ A-A  archive done  │                                                  │
+│ A-V  show arch     │                                                  │
 │ A-n  new task      │                                                  │
 │ A-l  launch        │                                                  │
 │ A-p  project       │                                                  │
