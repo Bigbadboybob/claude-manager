@@ -1,11 +1,16 @@
+mod agent;
 mod api;
 mod app;
 mod backend;
 mod config;
+mod control;
 mod input;
+mod mcp_config;
 mod planning;
 mod session;
 mod terminal_widget;
+#[cfg(test)]
+mod test_support;
 mod workflow;
 mod worktree;
 
@@ -102,6 +107,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_planning_events();
         log_slow_phase("drain_planning_events", t.elapsed());
+
+        let t = Instant::now();
+        app.drain_control_events();
+        log_slow_phase("drain_control_events", t.elapsed());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

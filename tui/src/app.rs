@@ -70,7 +70,14 @@ pub struct TerminalSession {
     pub session: Session,
     pub status: SessionStatus,
     pub last_write_at: Option<Instant>,
-    pub session_id: Option<String>,
+    /// Current transcript file UUID (the JSONL filename). Unstable: `None`
+    /// until the detector binds to a fresh file, and reset to `None` on
+    /// `/clear` while the detector rebinds. For stable identity, use `uid`.
+    pub transcript_id: Option<String>,
+    /// Bumps every time `transcript_id` rebinds (e.g. on `/clear`). Used to
+    /// detect cursor-vs-file mismatch when reading transcripts. In-memory
+    /// only for now; Phase 2 will mirror it into the manifest.
+    pub generation: u64,
     pub pending_jsonl_files: Option<Vec<String>>,
     pub hidden: bool,
     /// Seconds of quiet before marking idle. 0 = use global default.
@@ -124,6 +131,24 @@ pub struct TerminalSession {
     /// has been waiting longer (and is therefore more likely to actually own
     /// the file) gets first pick.
     pub created_at: Instant,
+    /// UID of the agent session that spawned/owns this one. Set when a
+    /// session is spawned via the agent-orchestration MCP tools; None
+    /// for user-created sessions. Persisted across TUI restart.
+    pub managed_by_uid: Option<String>,
+}
+
+impl TerminalSession {
+    /// Rebind the session to a new transcript file (or `None` to mark the
+    /// session as transcript-less while a fresh one is being detected).
+    /// Bumps `generation` so any reader holding a cursor against the old
+    /// transcript detects the rebind and restarts at offset 0 of the new
+    /// file. Use at every site that mutates `transcript_id` AFTER an
+    /// initial bind — the initial `None → Some(...)` transition has no
+    /// prior readers and skips the bump.
+    pub fn rebind_transcript(&mut self, new_sid: Option<String>) {
+        self.transcript_id = new_sid;
+        self.generation = self.generation.saturating_add(1);
+    }
 }
 
 /// Marker that an Enter keystroke is queued to fire at or after `fire_at`. The
@@ -194,9 +219,28 @@ const ENTER_GAP: Duration = Duration::from_secs(10);
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct ManifestEntry {
+    /// Stable per-session UID generated at creation. Persisted (Phase 2a)
+    /// so MCP env's `CM_TUI_SESSION_ID` survives TUI restart and the
+    /// agent's tool calls keep authorizing. Backfill rule: missing on
+    /// load → generate fresh and re-save.
+    #[serde(default)]
+    uid: String,
+    /// UID of the agent session that spawned/owns this one. Used by
+    /// the descendant-only auth check in Phase 3 and by sidebar
+    /// "managed-by" markers later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_by_uid: Option<String>,
+    /// Bumps every time `transcript_id` rebinds. Persisted so a
+    /// pre-restart cursor against an old transcript correctly mismatches
+    /// the post-restart generation and resets to offset 0.
+    #[serde(default)]
+    generation: u64,
     label: String,
     session_type: String,
-    session_id: Option<String>,
+    /// Current transcript file UUID. Older manifests stored this as
+    /// `session_id`; the alias keeps backfill correct across upgrade.
+    #[serde(alias = "session_id")]
+    transcript_id: Option<String>,
     #[serde(default)]
     hidden: bool,
     #[serde(default)]
@@ -237,7 +281,57 @@ struct ManifestWorkspace {
     worker_zone: Option<String>,
     #[serde(default)]
     sessions: Vec<ManifestEntry>,
+    /// Recently-closed sessions kept around so `read_session_output` can
+    /// resolve a transcript path even after the session is gone. Pruned
+    /// on TUI startup; see `TOMBSTONE_RETENTION_SECS`.
+    #[serde(default)]
+    tombstones: Vec<SessionTombstone>,
 }
+
+/// Lightweight record of a session that's been closed. Holds only what
+/// the resolver and sidebar need; the live `TerminalSession` (which owns
+/// PTY resources) is dropped at close time. Keeping the full struct
+/// alive after exit would leak the PTY writer file descriptor.
+///
+/// **Self-contained**: every field needed to resolve `transcript_path`
+/// for an `exited`-state read is on the tombstone itself, not on the
+/// workspace. This matters because workspace state mutates after a
+/// session closes (e.g. `push_active` clears `worktree_path` when a
+/// local workspace gets uploaded to cloud). If resolution depended on
+/// the workspace's *current* `worktree_path`, those tombstones would
+/// silently stop resolving even though the on-disk transcript file
+/// still exists at the path captured at exit time.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct SessionTombstone {
+    pub uid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by_uid: Option<String>,
+    pub label: String,
+    /// "claude" / "codex" / "bash"
+    pub session_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Last transcript file UUID this session was bound to. Used by the
+    /// resolver to compute a `transcript_path` for `state: "exited"`
+    /// reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transcript_id: Option<String>,
+    /// Worktree path captured at exit time. Snapshot, not a live
+    /// reference — survives subsequent mutations of the workspace's
+    /// `worktree_path`. Required to compute Claude Code transcript
+    /// paths (Codex's path scheme is per-user-and-date and ignores it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
+    pub generation: u64,
+    /// Unix-timestamp seconds when the session exited. Used for the
+    /// retention prune.
+    pub exited_at: f64,
+}
+
+/// How long tombstones live before the startup prune drops them. 30 days
+/// is generous because the data is small and these are exactly the
+/// records an agent might want to look at later.
+const TOMBSTONE_RETENTION_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct Manifest {
@@ -267,6 +361,11 @@ pub struct Workspace {
     pub worker_vm: Option<String>,
     pub worker_zone: Option<String>,
     pub sessions: Vec<TerminalSession>,
+    /// Records of closed sessions in this workspace. Resolver consults
+    /// these (after `sessions`) to answer `read_session_output` for an
+    /// already-exited session — its last-known transcript file remains
+    /// on disk and the `last_transcript_id` field gives us the path.
+    pub tombstones: Vec<SessionTombstone>,
 }
 
 /// A task tracked in the planning/API layer. Pure metadata — no execution
@@ -284,6 +383,28 @@ pub struct TaskEntry {
     pub is_cloud: bool,
     /// FK to `App.workspaces`. None = task in backlog, not bound yet.
     pub workspace_id: Option<String>,
+    /// FK to another `TaskEntry` (by `task_id`). None = top-level task.
+    /// Phase 5 uses this for the subtask MCP tools and the planning-view
+    /// tree. Set when an agent calls `create_subtask` or when the user
+    /// creates a subtask in the planning view.
+    pub parent_task_id: Option<String>,
+    /// Worktree behavior for subtasks. Only meaningful when
+    /// `parent_task_id` is set:
+    ///   - "inherit" (default): sessions spawn in the parent's worktree.
+    ///   - "branch": a new worktree is created off the parent's branch
+    ///     with name `cm-sub/<slug-chain>-<short_id>`.
+    pub worktree_mode: WorktreeMode,
+}
+
+/// How a subtask's worktree relates to its parent. Default = `Inherit`
+/// per the design discussion (the common case is "go do this side thing
+/// in the same codebase").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeMode {
+    #[default]
+    Inherit,
+    Branch,
 }
 
 /// Build a TerminalSession wrapping a freshly-spawned PTY with default state.
@@ -294,14 +415,28 @@ fn make_simple_session(
     session: Session,
     pending_jsonl_files: Option<Vec<String>>,
 ) -> TerminalSession {
+    make_simple_session_with_uid(new_session_uid(), label, session_type, session, pending_jsonl_files)
+}
+
+/// Variant for spawn paths that pre-generate the uid so they can wire it
+/// into MCP config env (`CM_TUI_SESSION_ID` must match `ts.uid`). Without
+/// matching values, the agent's tool calls fail authorization.
+fn make_simple_session_with_uid(
+    uid: String,
+    label: &str,
+    session_type: &str,
+    session: Session,
+    pending_jsonl_files: Option<Vec<String>>,
+) -> TerminalSession {
     TerminalSession {
-        uid: new_session_uid(),
+        uid,
         label: label.to_string(),
         session_type: session_type.to_string(),
         session,
         status: SessionStatus::Running,
         last_write_at: None,
-        session_id: None,
+        transcript_id: None,
+        generation: 0,
         pending_jsonl_files,
         hidden: false,
         idle_timeout_secs: 0,
@@ -315,6 +450,7 @@ fn make_simple_session(
         notify_on_idle: false,
         pending_enter: None,
         created_at: Instant::now(),
+        managed_by_uid: None,
     }
 }
 
@@ -358,6 +494,63 @@ fn sorted_repo_urls(repos: &HashMap<String, String>) -> Vec<String> {
 /// `Engine` used by transcript readers. Workflow code must derive engine from
 /// the actual bound session (not from the workflow TOML role spec) since the
 /// user can bind, e.g., a codex session into a role declared as "claude-code".
+/// Per-session info needed to resolve a `/clear` or `/compact` rotation
+/// detected via `~/.claude/history.jsonl`. Built fresh each tick from
+/// the current workspace state.
+pub(crate) struct RotationBinding {
+    pub wi: usize,
+    pub si: usize,
+    /// `(run_id, role)` when the session is a workflow participant,
+    /// `None` otherwise (regular `A-n` / planning panes). The fix was
+    /// to also include non-workflow sessions — they need rotation
+    /// rebinds too so `read_session_output` doesn't stall on the
+    /// pre-rotation transcript file.
+    pub workflow: Option<(String, String)>,
+    pub worktree: std::path::PathBuf,
+}
+
+/// Build the (sid → RotationBinding) map for every live Claude session.
+/// Extracted from the rotation-resolve loop in `drain_terminal_events`
+/// so it can be tested without spinning up an App. Skips sessions
+/// without a `transcript_id` (nothing to rebind), without a worktree
+/// (no project dir to scan), or whose `session_type` isn't `"claude"`
+/// (Codex doesn't go through the history.jsonl rotation path).
+pub(crate) fn collect_rotation_bindings(
+    workspaces: &[Workspace],
+) -> HashMap<String, RotationBinding> {
+    let mut out: HashMap<String, RotationBinding> = HashMap::new();
+    for (wi, ws) in workspaces.iter().enumerate() {
+        let Some(wt) = ws.worktree_path.clone() else {
+            continue;
+        };
+        for (si, ts) in ws.sessions.iter().enumerate() {
+            if ts.session_type != "claude" {
+                continue;
+            }
+            let Some(sid) = &ts.transcript_id else {
+                continue;
+            };
+            let workflow = match (
+                ts.workflow_run_id.as_deref(),
+                ts.workflow_role.as_deref(),
+            ) {
+                (Some(rid), Some(role)) => Some((rid.to_string(), role.to_string())),
+                _ => None,
+            };
+            out.insert(
+                sid.clone(),
+                RotationBinding {
+                    wi,
+                    si,
+                    workflow,
+                    worktree: wt.clone(),
+                },
+            );
+        }
+    }
+    out
+}
+
 fn engine_for_session_type(session_type: &str) -> workflow::toml_schema::Engine {
     match session_type {
         "codex" => workflow::toml_schema::Engine::Codex,
@@ -392,7 +585,13 @@ fn respawn_existing_with_workflow_mcp(
             ));
         }
     };
-    let (program, args) = match workflow::spawn::build_args(engine, run_id, role, Some(sid)) {
+    let workflow_meta = crate::mcp_config::WorkflowMeta { run_id, role };
+    let (program, args) = match crate::mcp_config::build_args(
+        engine,
+        &ts.uid,
+        Some(workflow_meta),
+        Some(sid),
+    ) {
         Ok(v) => v,
         Err(e) => {
             return Some(format!(
@@ -426,7 +625,7 @@ fn respawn_existing_with_workflow_mcp(
     // exists; nothing would ever look "new" and the workflow idle gate would
     // stay closed forever.
     ts.session = new_sess;
-    ts.session_id = Some(sid.to_string());
+    ts.transcript_id = Some(sid.to_string());
     ts.pending_jsonl_files = None;
     ts.pending_prompt = None;
     ts.pending_clear = None;
@@ -640,6 +839,10 @@ pub struct App {
     /// the user can use the terminal's native selection (including block-select
     /// chords). Toggle with Alt+m.
     pub mouse_capture_enabled: bool,
+    /// Pending requests from the control socket. Drained each tick by the
+    /// main loop and dispatched to method handlers. The server thread
+    /// pushes; the main loop pops + replies. See `tui/src/control/`.
+    control_queue: crate::control::queue::Queue,
 }
 
 impl App {
@@ -666,6 +869,17 @@ impl App {
             .into_iter()
             .filter(|r| r.is_active())
             .collect();
+        // Start the control socket. Failures aren't fatal — the TUI runs
+        // fine without it; only MCP-driven control becomes unavailable.
+        let control_queue = crate::control::queue::Queue::new();
+        match crate::control::server::start(control_queue.clone()) {
+            Ok(path) => {
+                eprintln!("control socket bound at {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("control socket failed to start: {}", e);
+            }
+        }
         App {
             tasks: Vec::new(),
             workspaces: Vec::new(),
@@ -690,6 +904,7 @@ impl App {
             history_watcher: workflow::history::HistoryWatcher::new(),
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
+            control_queue,
         }
     }
 
@@ -850,7 +1065,7 @@ impl App {
         // an unbound workflow session can be correlated to its new sid in
         // ~/.claude/history.jsonl. Only record for workflow sessions that
         // still need binding.
-        if ts.workflow_run_id.is_some() && ts.session_id.is_none() {
+        if ts.workflow_run_id.is_some() && ts.transcript_id.is_none() {
             let prefix: String = body.chars().take(120).collect();
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -884,16 +1099,19 @@ impl App {
     }
 
     /// Save session manifest to disk.
-    fn save_session_manifest(&self) {
+    pub(crate) fn save_session_manifest(&self) {
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
             let entries: Vec<ManifestEntry> = ws
                 .sessions
                 .iter()
                 .map(|ts| ManifestEntry {
+                    uid: ts.uid.clone(),
+                    managed_by_uid: ts.managed_by_uid.clone(),
+                    generation: ts.generation,
                     label: ts.label.clone(),
                     session_type: ts.session_type.clone(),
-                    session_id: ts.session_id.clone(),
+                    transcript_id: ts.transcript_id.clone(),
                     hidden: ts.hidden,
                     idle_timeout_secs: ts.idle_timeout_secs,
                     burst_threshold: ts.burst_threshold,
@@ -916,6 +1134,7 @@ impl App {
                     worker_vm: ws.worker_vm.clone(),
                     worker_zone: ws.worker_zone.clone(),
                     sessions: entries,
+                    tombstones: ws.tombstones.clone(),
                 },
             );
         }
@@ -999,6 +1218,19 @@ impl App {
             {
                 continue;
             }
+            // Prune tombstones older than the retention window before
+            // copying them into the live workspace. Cheap — these lists
+            // stay small in normal use.
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let restored_tombstones: Vec<SessionTombstone> = mw
+                .tombstones
+                .iter()
+                .filter(|t| now_secs - t.exited_at < TOMBSTONE_RETENTION_SECS)
+                .cloned()
+                .collect();
             let mut ws = Workspace {
                 id: mw.id.clone(),
                 name: if mw.name.is_empty() {
@@ -1019,6 +1251,7 @@ impl App {
                 worker_vm: mw.worker_vm.clone(),
                 worker_zone: mw.worker_zone.clone(),
                 sessions: vec![],
+                tombstones: restored_tombstones,
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
@@ -1067,6 +1300,17 @@ impl App {
         (cols, rows): (u16, u16),
         config: &Config,
     ) -> Option<TerminalSession> {
+        // Resolve the UID ONCE here so the MCP config and the
+        // TerminalSession agree. Earlier this had two separate
+        // `new_session_uid()` calls — they generated different values
+        // for legacy manifests (no `entry.uid`), which made the agent's
+        // env-supplied CM_TUI_SESSION_ID never match `ts.uid` and every
+        // tool call from a restored session failed `caller_ctx`.
+        let restored_uid = if entry.uid.is_empty() {
+            new_session_uid()
+        } else {
+            entry.uid.clone()
+        };
         let cloud_vm = ws.worker_vm.as_deref().filter(|s| !s.is_empty());
         let result = if cloud_vm.is_some() && entry.session_type == "bash" {
             let vm = cloud_vm.unwrap().to_string();
@@ -1089,83 +1333,88 @@ impl App {
                 ),
             ];
             Session::new("gcloud", &args, cols, rows, None, Default::default())
-        } else if entry.session_type == "claude" {
+        } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
             let wt = ws.worktree_path.clone();
-            // Workflow participants must respawn with the workflow MCP
-            // config so the agent keeps access to workflow_transition /
-            // workflow_done. Without this the restored manager can't
-            // advance the workflow.
-            let args = match (
+            let engine = if entry.session_type == "codex" {
+                workflow::toml_schema::Engine::Codex
+            } else {
+                workflow::toml_schema::Engine::ClaudeCode
+            };
+            // Use the resolved-up-front UID so the MCP env's
+            // CM_TUI_SESSION_ID matches what the TerminalSession will hold.
+            let session_uid_for_mcp = restored_uid.clone();
+            let workflow_meta = match (
                 entry.workflow_run_id.as_deref(),
                 entry.workflow_role.as_deref(),
             ) {
                 (Some(run_id), Some(role)) => {
-                    if let Ok(cfg_path) = workflow::spawn::write_claude_mcp_config(run_id, role) {
-                        workflow::spawn::claude_args(
-                            &cfg_path,
-                            entry.session_id.as_deref(),
-                            &[],
-                        )
-                    } else {
-                        let mut args = vec!["--dangerously-skip-permissions".to_string()];
-                        if let Some(ref sid) = entry.session_id {
-                            args.push("--resume".to_string());
-                            args.push(sid.clone());
-                        }
-                        args
-                    }
+                    Some(crate::mcp_config::WorkflowMeta { run_id, role })
                 }
-                _ => {
-                    let mut args = vec!["--dangerously-skip-permissions".to_string()];
-                    if let Some(ref sid) = entry.session_id {
-                        args.push("--resume".to_string());
-                        args.push(sid.clone());
-                    }
-                    args
-                }
+                _ => None,
             };
-            Session::new("claude", &args, cols, rows, wt, Default::default())
-        } else if entry.session_type == "codex" {
-            let wt = ws.worktree_path.clone();
-            let args = match (
-                entry.workflow_run_id.as_deref(),
-                entry.workflow_role.as_deref(),
+            match crate::mcp_config::build_args(
+                &engine,
+                &session_uid_for_mcp,
+                workflow_meta,
+                entry.transcript_id.as_deref(),
             ) {
-                (Some(run_id), Some(role)) => workflow::spawn::codex_args(
-                    run_id,
-                    role,
-                    entry.session_id.as_deref(),
+                Ok((program, args)) => Session::new(
+                    &program,
+                    &args,
+                    cols,
+                    rows,
+                    wt,
+                    Default::default(),
                 ),
-                _ => {
-                    let mut args = vec!["--yolo".to_string()];
-                    if let Some(ref sid) = entry.session_id {
-                        args.push("resume".to_string());
+                Err(_) => {
+                    // Fallback: spawn without MCP. Agent loses access to
+                    // workflow + control-socket tools but the session
+                    // still runs.
+                    let program = if entry.session_type == "codex" {
+                        "codex"
+                    } else {
+                        "claude"
+                    };
+                    let mut args: Vec<String> = if entry.session_type == "codex" {
+                        vec!["--yolo".into()]
+                    } else {
+                        vec!["--dangerously-skip-permissions".into()]
+                    };
+                    if let Some(ref sid) = entry.transcript_id {
+                        if entry.session_type == "codex" {
+                            args.push("resume".into());
+                        } else {
+                            args.push("--resume".into());
+                        }
                         args.push(sid.clone());
                     }
-                    args
+                    Session::new(program, &args, cols, rows, wt, Default::default())
                 }
-            };
-            Session::new("codex", &args, cols, rows, wt, Default::default())
+            }
         } else {
             let wt = ws.worktree_path.clone();
             Session::new("/bin/bash", &[], cols, rows, wt, Default::default())
         };
         let s = result.ok()?;
-        let pending = if entry.session_id.is_some() {
+        let pending = if entry.transcript_id.is_some() {
             None
         } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
             Some(Vec::new())
         } else {
             None
         };
+        // `restored_uid` was computed at the top of this function — same
+        // value used in `session_uid_for_mcp` above. Don't generate a
+        // fresh one here.
         Some(TerminalSession {
-            uid: new_session_uid(),
+            uid: restored_uid,
             label: entry.label.clone(),
             session_type: entry.session_type.clone(),
             session: s,
             status: SessionStatus::Running,
             last_write_at: None,
-            session_id: entry.session_id.clone(),
+            transcript_id: entry.transcript_id.clone(),
+            generation: entry.generation,
             pending_jsonl_files: pending,
             hidden: entry.hidden,
             idle_timeout_secs: entry.idle_timeout_secs,
@@ -1179,6 +1428,7 @@ impl App {
             notify_on_idle: entry.notify_on_idle,
             pending_enter: None,
             created_at: Instant::now(),
+            managed_by_uid: entry.managed_by_uid.clone(),
         })
     }
 
@@ -1238,17 +1488,21 @@ impl App {
 
     /// Soft-close the workspace under the cursor: kill its session PTYs
     /// and hide from the sidebar. Worktree stays on disk; bindings persist.
+    /// Each closed session leaves behind a `SessionTombstone` so the
+    /// resolver can still answer `read_session_output` for it.
     fn close_active_workspace(&mut self) {
         let Some(wi) = self.active_workspace_index() else {
             return;
         };
+        // Tombstone every session before dropping. Helper persists the
+        // manifest as a side-effect so a TUI crash mid-close doesn't
+        // resurrect tombstoned sessions.
+        self.tombstone_and_remove(wi, |_| true);
         if let Some(ws) = self.workspaces.get_mut(wi) {
-            for ts in &mut ws.sessions {
-                ts.session.exited = true;
-            }
-            ws.sessions.clear();
             ws.is_closed = true;
         }
+        // Persist again in case `is_closed` flipped after the helper
+        // already saved (cheap, just rewrites the same JSON).
         self.save_session_manifest();
         if let Some((nwi, _)) = self
             .workspaces
@@ -1740,7 +1994,7 @@ impl App {
             .workspaces
             .iter()
             .flat_map(|w| w.sessions.iter())
-            .filter_map(|s| s.session_id.clone())
+            .filter_map(|s| s.transcript_id.clone())
             .collect();
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {
@@ -1919,7 +2173,7 @@ impl App {
                     if !matches!(ts.session_type.as_str(), "claude" | "codex") {
                         continue;
                     }
-                    if ts.session_id.is_some() || ts.pending_jsonl_files.is_none() {
+                    if ts.transcript_id.is_some() || ts.pending_jsonl_files.is_none() {
                         continue;
                     }
                     detection_order.push((wi, si, ts.created_at));
@@ -1940,7 +2194,7 @@ impl App {
                     Self::detect_session_id(&wt, &existing)
                 };
                 if let Some(sid) = sid {
-                    ts.session_id = Some(sid.clone());
+                    ts.transcript_id = Some(sid.clone());
                     ts.pending_jsonl_files = None;
                     bound_sids.insert(sid.clone());
                     ws_sid_updates.push((ws_id_here, sid));
@@ -2008,85 +2262,87 @@ impl App {
         if self.pending_rotations.is_empty() {
             return;
         }
-        // Build (sid → (run_id, role, worktree)) lookup for active claude roles.
-        let mut bindings: HashMap<String, (String, String, std::path::PathBuf)> = HashMap::new();
-        for run in &self.workflow_runs {
-            if !run.is_active() {
-                continue;
-            }
-            for (role, binding) in &run.role_sessions {
-                let Some(sid) = &binding.current_session_id else {
-                    continue;
-                };
-                let Some((wi, si)) = self.locate_workflow_session(&run.run_id, role) else {
-                    continue;
-                };
-                if self.workspaces[wi].sessions[si].session_type != "claude" {
-                    continue;
-                }
-                let Some(wt) = self.workspaces[wi].worktree_path.clone() else {
-                    continue;
-                };
-                bindings.insert(sid.clone(), (run.run_id.clone(), role.clone(), wt));
-            }
-        }
+        // Build (sid → binding) lookup for every claude session — both
+        // workflow participants AND regular `A-n` / planning panes. The
+        // pre-fix version only included workflow roles, which meant a
+        // regular pane running `/clear` or `/compact` kept resolving to
+        // the *old* transcript file forever and `read_session_output`
+        // returned stale data on what looked like a healthy session.
+        let bindings = collect_rotation_bindings(&self.workspaces);
         // Walk pending queue; resolve what we can, drop stale ones.
         let now = Instant::now();
         let max_age = Duration::from_secs(30);
-        let mut resolved: Vec<(String, String, String, String)> = Vec::new();
+        struct ResolvedRotation {
+            wi: usize,
+            si: usize,
+            workflow: Option<(String, String)>,
+            old_sid: String,
+            new_sid: String,
+        }
+        let mut resolved: Vec<ResolvedRotation> = Vec::new();
         self.pending_rotations.retain(|(old_sid, ts_ms, first_seen)| {
             if now.duration_since(*first_seen) > max_age {
                 return false;
             }
-            let Some((run_id, role, wt)) = bindings.get(old_sid) else {
+            let Some(binding) = bindings.get(old_sid) else {
                 return true;
             };
-            let Some(new_sid) = workflow::history::find_post_rotation_sid(wt, *ts_ms) else {
+            let Some(new_sid) =
+                workflow::history::find_post_rotation_sid(&binding.worktree, *ts_ms)
+            else {
                 return true;
             };
             if &new_sid == old_sid {
                 return false;
             }
-            resolved.push((
-                run_id.clone(),
-                role.clone(),
-                old_sid.clone(),
+            resolved.push(ResolvedRotation {
+                wi: binding.wi,
+                si: binding.si,
+                workflow: binding.workflow.clone(),
+                old_sid: old_sid.clone(),
                 new_sid,
-            ));
+            });
             false
         });
-        for (run_id, role, old_sid, new_sid) in &resolved {
-            let Some((wi, si)) = self.locate_workflow_session(run_id, role) else {
-                continue;
-            };
-            self.workspaces[wi].sessions[si].session_id = Some(new_sid.clone());
-            let Some(run) = self.workflow_runs.iter_mut().find(|r| &r.run_id == run_id)
-            else {
-                continue;
-            };
-            if let Some(b) = run.role_sessions.get_mut(role) {
-                b.current_session_id = Some(new_sid.clone());
-            }
-            run.role_baselines
-                .insert(role.clone(), workflow::run::MessageBaseline::default());
-            if run.active_role.as_deref() == Some(role.as_str()) {
-                if let Some(h) = run.history.last_mut() {
-                    h.assistant_count_at_start = 0;
-                    h.session_id = Some(new_sid.clone());
+        for r in &resolved {
+            // Rebind via the helper so `generation` bumps. Without this,
+            // a reader holding a cursor for the pre-rotation transcript
+            // would skip messages in the new file (cursor offset N from
+            // the old file applied to the new file).
+            self.workspaces[r.wi].sessions[r.si]
+                .rebind_transcript(Some(r.new_sid.clone()));
+            // Workflow-specific bookkeeping only when the session is a
+            // workflow participant — non-workflow rebinds just need the
+            // transcript_id swap + generation bump above.
+            if let Some((run_id, role)) = &r.workflow {
+                if let Some(run) =
+                    self.workflow_runs.iter_mut().find(|run| &run.run_id == run_id)
+                {
+                    if let Some(b) = run.role_sessions.get_mut(role) {
+                        b.current_session_id = Some(r.new_sid.clone());
+                    }
+                    run.role_baselines
+                        .insert(role.clone(), workflow::run::MessageBaseline::default());
+                    if run.active_role.as_deref() == Some(role.as_str()) {
+                        if let Some(h) = run.history.last_mut() {
+                            h.assistant_count_at_start = 0;
+                            h.session_id = Some(r.new_sid.clone());
+                        }
+                    }
+                    let _ = workflow::run::save(run);
+                    log_tick(
+                        run_id,
+                        &format!(
+                            "history-rotation: role={} {} -> {}",
+                            role, r.old_sid, r.new_sid
+                        ),
+                    );
                 }
             }
-            let _ = workflow::run::save(run);
-            log_tick(
-                run_id,
-                &format!(
-                    "history-rotation: role={} {} -> {}",
-                    role, old_sid, new_sid
-                ),
-            );
         }
         if !resolved.is_empty() {
             self.save_session_manifest();
-            self.set_status_msg("Workflow: session rotated (/clear or /compact)");
+            self.set_status_msg("Session rotated (/clear or /compact)");
         }
     }
 
@@ -2151,6 +2407,148 @@ impl App {
         }
     }
 
+    /// Process pending control-socket requests. The socket server thread
+    /// pushes (Request, reply_tx) tuples onto a shared queue; we pop each
+    /// one, dispatch to a method handler, and send the Response back.
+    /// Handlers run on the main loop so they have free `&mut self` access
+    /// to App state without any extra locking.
+    pub fn drain_control_events(&mut self) {
+        let pending = self.control_queue.drain();
+        if pending.is_empty() {
+            return;
+        }
+        for entry in pending {
+            let resp = self.dispatch_control(&entry.request);
+            let _ = entry.reply.send(resp);
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Dispatch a single control-socket request to its method handler.
+    /// New handlers are added here as Phases 1+3 fill out the surface.
+    ///
+    /// **Persistence invariant**: any handler that mutates state which
+    /// lives in `ManifestEntry` / `Workspace.tombstones` MUST call
+    /// `self.save_session_manifest()` before returning Ok. A TUI crash
+    /// between the mutation and the next unrelated save would otherwise
+    /// lose the change — most painfully for tombstones, where a killed
+    /// session would restore as live on next boot. Handlers that only
+    /// touch in-memory state (`pending_prompt`, runtime status) don't
+    /// need the save.
+    fn dispatch_control(
+        &mut self,
+        req: &crate::control::protocol::Request,
+    ) -> crate::control::protocol::Response {
+        use crate::control::methods;
+        use crate::control::protocol::{ErrorCode, Response};
+        let caller = req.caller.session_uid.as_str();
+        let result: methods::MethodResult = match req.method.as_str() {
+            "ping" => Ok(serde_json::json!({
+                "pong": true,
+                "uid": req.caller.session_uid,
+            })),
+            "resolve_authorized_session" => {
+                methods::resolve_authorized_session(self, caller, &req.params)
+            }
+            "list_sessions" => methods::list_sessions(self, caller, &req.params),
+            "send_input" => methods::send_input(self, caller, &req.params),
+            "kill_session" => methods::kill_session(self, caller, &req.params),
+            "start_session" => methods::start_session(self, caller, &req.params),
+            other => Err((
+                ErrorCode::UnknownMethod,
+                format!("unknown method: {}", other),
+            )),
+        };
+        match result {
+            Ok(value) => Response::ok(req.id.clone(), value),
+            Err((code, msg)) => Response::err(req.id.clone(), code, msg),
+        }
+    }
+
+    /// Spawn a new agent session in the given workspace, owned by the
+    /// caller (managed_by_uid recorded). Used by the `start_session`
+    /// MCP tool. Returns the new session's UID.
+    pub fn spawn_managed_session(
+        &mut self,
+        ws_index: usize,
+        caller_uid: &str,
+        type_: &str,
+        label: &str,
+        task_id: Option<String>,
+        prompt: Option<&str>,
+    ) -> std::io::Result<String> {
+        let worktree_path = self.workspaces[ws_index]
+            .worktree_path
+            .clone()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workspace has no worktree",
+                )
+            })?;
+        let (cols, rows) = self.last_term_size;
+        let session_uid = new_session_uid();
+        let engine = match type_ {
+            "codex" => workflow::toml_schema::Engine::Codex,
+            _ => workflow::toml_schema::Engine::ClaudeCode,
+        };
+        let (program, args) =
+            crate::mcp_config::build_args(&engine, &session_uid, None, None)?;
+        let pending = match engine {
+            workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
+            workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
+        };
+        let session = Session::new(
+            &program,
+            &args,
+            cols,
+            rows,
+            Some(worktree_path),
+            Default::default(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let session_type = engine.as_session_type().to_string();
+        let mut pending_prompt = None;
+        if let Some(text) = prompt {
+            if !text.trim().is_empty() {
+                pending_prompt = Some(PendingWrite::wait_for_quiet(
+                    text.trim_end().to_string(),
+                    true,
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                    Duration::from_secs(180),
+                ));
+            }
+        }
+        let ts = TerminalSession {
+            uid: session_uid.clone(),
+            label: label.to_string(),
+            session_type,
+            session,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            transcript_id: None,
+            generation: 0,
+            pending_jsonl_files: Some(pending),
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            last_delivery: None,
+            task_id,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: Some(caller_uid.to_string()),
+        };
+        self.workspaces[ws_index].sessions.push(ts);
+        self.save_session_manifest();
+        Ok(session_uid)
+    }
+
     /// Process planning editor events (non-blocking).
     pub fn drain_planning_events(&mut self) {
         if let Some(action) = self.planning.drain_editor_events() {
@@ -2202,7 +2600,7 @@ impl App {
             for (si, ts) in ws.sessions.iter().enumerate() {
                 if ts.session_type != "claude"
                     || ts.workflow_run_id.is_none()
-                    || ts.session_id.is_some()
+                    || ts.transcript_id.is_some()
                 {
                     continue;
                 }
@@ -2247,7 +2645,7 @@ impl App {
             };
             let run_id = ts.workflow_run_id.clone();
             let role = ts.workflow_role.clone();
-            ts.session_id = Some(sid.clone());
+            ts.transcript_id = Some(sid.clone());
             ts.pending_jsonl_files = None;
             ts.last_delivery = None;
             if let (Some(run_id), Some(role)) = (run_id, role) {
@@ -2343,6 +2741,8 @@ impl App {
                     blocked_at: task.blocked_at.clone(),
                     is_cloud,
                     workspace_id: None,
+                    parent_task_id: None,
+                    worktree_mode: WorktreeMode::Inherit,
                 });
             }
 
@@ -2424,6 +2824,7 @@ impl App {
                     worker_vm: task.worker_vm.clone(),
                     worker_zone: task.worker_zone.clone(),
                     sessions: vec![],
+                    tombstones: Vec::new(),
                 };
                 let id = ws.id.clone();
                 self.workspaces.push(ws);
@@ -3452,12 +3853,90 @@ impl App {
         };
     }
 
-    /// Close the current session (remove from workspace.sessions).
+    /// Public wrapper exposed to the control-socket method handlers
+    /// (which live in `crate::control::methods`).
+    pub(crate) fn tombstone_session_pub(ws: &mut Workspace, si: usize) {
+        Self::tombstone_session(ws, si);
+    }
+
+    /// Bulk session removal that preserves the tombstone invariant.
+    /// Walks `ws.sessions`, tombstones each entry where `should_drop`
+    /// returns true, marks the PTY exited, and removes it. Use this
+    /// instead of `ws.sessions.retain(...)` or `ws.sessions.clear()` —
+    /// otherwise `read_session_output` for the closed sessions returns
+    /// `not_found` instead of `state: "exited"`.
+    ///
+    /// **Persists the manifest before returning** when anything was
+    /// removed. This is deliberate — every previous round of review
+    /// found another caller that forgot to persist, breaking Phase 2b
+    /// across TUI crashes. Pushing the save into the helper makes it
+    /// impossible to forget. Callers can ignore the return value if
+    /// they don't need the count; the persist is unconditional.
+    fn tombstone_and_remove(
+        &mut self,
+        ws_index: usize,
+        mut should_drop: impl FnMut(&TerminalSession) -> bool,
+    ) -> usize {
+        let Some(ws) = self.workspaces.get_mut(ws_index) else {
+            return 0;
+        };
+        let mut removed = 0;
+        let mut i = 0;
+        while i < ws.sessions.len() {
+            if should_drop(&ws.sessions[i]) {
+                Self::tombstone_session(ws, i);
+                ws.sessions[i].session.exited = true;
+                ws.sessions.remove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if removed > 0 {
+            self.save_session_manifest();
+        }
+        removed
+    }
+
+    /// Build a tombstone from `ws.sessions[si]` and push it onto
+    /// `ws.tombstones`. Doesn't remove the session — caller does that
+    /// to keep the borrow flow simple. Snapshots the workspace's
+    /// `worktree_path` into the tombstone so post-close mutations of
+    /// the workspace (e.g. `push_active` clearing the path) don't
+    /// silently break `read_session_output`.
+    fn tombstone_session(ws: &mut Workspace, si: usize) {
+        let Some(ts) = ws.sessions.get(si) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let worktree_snapshot = ws.worktree_path.clone();
+        ws.tombstones.push(SessionTombstone {
+            uid: ts.uid.clone(),
+            managed_by_uid: ts.managed_by_uid.clone(),
+            label: ts.label.clone(),
+            session_type: ts.session_type.clone(),
+            task_id: ts.task_id.clone(),
+            last_transcript_id: ts.transcript_id.clone(),
+            worktree_path: worktree_snapshot,
+            generation: ts.generation,
+            exited_at: now,
+        });
+    }
+
+    /// Close the current session: extract a `SessionTombstone` from its
+    /// metadata, push it onto the workspace's tombstone list, then drop
+    /// the live entry (which tears down the PTY). The resolver can still
+    /// answer `read_session_output` for the closed session via the
+    /// tombstone.
     fn close_active_session(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
                     if si < ws.sessions.len() {
+                        Self::tombstone_session(ws, si);
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
                             self.cursor = Cursor::Workspace(wi);
@@ -3473,6 +3952,7 @@ impl App {
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
                     if ws.sessions.len() == 1 {
+                        Self::tombstone_session(ws, 0);
                         ws.sessions.remove(0);
                         self.cursor = Cursor::Workspace(wi);
                         self.save_session_manifest();
@@ -3483,12 +3963,14 @@ impl App {
             Cursor::Task { ws_idx, task_id } => {
                 // Close every session belonging to the task. The task remains
                 // in the sidebar (as an empty subheader) until A-x removes it.
-                if let Some(ws) = self.workspaces.get_mut(ws_idx) {
-                    let before = ws.sessions.len();
-                    ws.sessions.retain(|ts| ts.task_id.as_deref() != Some(task_id.as_str()));
-                    let removed = before - ws.sessions.len();
+                // Tombstone each so `read_session_output` keeps working.
+                if ws_idx < self.workspaces.len() {
+                    let target = task_id.clone();
+                    let removed = self.tombstone_and_remove(ws_idx, |ts| {
+                        ts.task_id.as_deref() == Some(target.as_str())
+                    });
                     if removed > 0 {
-                        self.save_session_manifest();
+                        // Helper already saved the manifest.
                         self.set_status_msg(&format!("Closed {} session(s)", removed));
                     }
                 }
@@ -3528,11 +4010,26 @@ impl App {
         worktree::setup_worktree(&main_repo, &worktree_path);
 
         let (cols, rows) = self.last_term_size;
-        let args = vec!["--dangerously-skip-permissions".to_string()];
+        // Generate uid first so the MCP config carries the matching
+        // CM_TUI_SESSION_ID. A-n sessions are taskless — pass None for
+        // workflow meta.
+        let session_uid = new_session_uid();
+        let (program, args) = crate::mcp_config::build_args(
+            &workflow::toml_schema::Engine::ClaudeCode,
+            &session_uid,
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| {
+            (
+                "claude".to_string(),
+                vec!["--dangerously-skip-permissions".to_string()],
+            )
+        });
         let pending = Self::list_jsonl_files(&worktree_path);
 
         let Ok(s) = Session::new(
-            "claude",
+            &program,
             &args,
             cols,
             rows,
@@ -3544,13 +4041,14 @@ impl App {
         };
 
         let ts = TerminalSession {
-            uid: new_session_uid(),
+            uid: session_uid,
             label: "claude".to_string(),
             session_type: "claude".to_string(),
             session: s,
             status: SessionStatus::Running,
             last_write_at: None,
-            session_id: None,
+            transcript_id: None,
+            generation: 0,
             pending_jsonl_files: Some(pending),
             hidden: false,
             idle_timeout_secs,
@@ -3564,6 +4062,7 @@ impl App {
             notify_on_idle: false,
             pending_enter: None,
             created_at: Instant::now(),
+            managed_by_uid: None,
         };
         let ws = Workspace {
             id: new_workspace_id(),
@@ -3576,6 +4075,7 @@ impl App {
             worker_vm: None,
             worker_zone: None,
             sessions: vec![ts],
+            tombstones: Vec::new(),
         };
         let new_wi = self.workspaces.len();
         self.workspaces.push(ws);
@@ -3621,11 +4121,21 @@ impl App {
                 .ok()
                 .map(|s| make_simple_session("ssh", "bash", s, None))
         } else if let Some(wt) = ws.worktree_path.clone() {
-            let args = vec!["--dangerously-skip-permissions".to_string()];
+            let session_uid = new_session_uid();
+            let (program, args) = crate::mcp_config::build_args(
+                &workflow::toml_schema::Engine::ClaudeCode,
+                &session_uid,
+                None,
+                None,
+            )
+            .unwrap_or_else(|_| (
+                "claude".to_string(),
+                vec!["--dangerously-skip-permissions".to_string()],
+            ));
             let pending = Self::list_jsonl_files(&wt);
-            Session::new("claude", &args, cols, rows, Some(wt), Default::default())
+            Session::new(&program, &args, cols, rows, Some(wt), Default::default())
                 .ok()
-                .map(|s| make_simple_session("claude", "claude", s, Some(pending)))
+                .map(|s| make_simple_session_with_uid(session_uid, "claude", "claude", s, Some(pending)))
         } else {
             Session::new("/bin/bash", &[], cols, rows, None, Default::default())
                 .ok()
@@ -3702,20 +4212,53 @@ impl App {
             "codex" => wt.as_ref().map(|p| Self::list_codex_sessions(p)),
             _ => None,
         };
+        // Pre-generate uid so MCP env carries the same CM_TUI_SESSION_ID
+        // the TerminalSession will hold. Sessions added on a workspace
+        // are taskless from MCP's POV (they inherit a task_id below for
+        // sidebar grouping but no workflow context).
+        let session_uid_pre = new_session_uid();
         let result = match session_type {
             "claude" => {
-                let args = vec!["--dangerously-skip-permissions".to_string()];
-                Session::new("claude", &args, cols, rows, wt, Default::default())
+                let (program, args) = crate::mcp_config::build_args(
+                    &workflow::toml_schema::Engine::ClaudeCode,
+                    &session_uid_pre,
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|_| (
+                    "claude".to_string(),
+                    vec!["--dangerously-skip-permissions".to_string()],
+                ));
+                Session::new(&program, &args, cols, rows, wt, Default::default())
             }
             "codex" => {
-                let args = vec!["--yolo".to_string()];
-                Session::new("codex", &args, cols, rows, wt, Default::default())
+                let (program, args) = crate::mcp_config::build_args(
+                    &workflow::toml_schema::Engine::Codex,
+                    &session_uid_pre,
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|_| (
+                    "codex".to_string(),
+                    vec!["--yolo".to_string()],
+                ));
+                Session::new(&program, &args, cols, rows, wt, Default::default())
             }
             _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default()),
         };
         match result {
             Ok(s) => {
-                let mut ts = make_simple_session(session_type, session_type, s, pending);
+                // Use the same uid we baked into MCP env for claude/codex.
+                // bash sessions don't have MCP config and the uid is just
+                // for sidebar tracking — but we still use the pre-gen one
+                // for consistency.
+                let mut ts = make_simple_session_with_uid(
+                    session_uid_pre,
+                    session_type,
+                    session_type,
+                    s,
+                    pending,
+                );
                 ts.task_id = task_id;
                 let si = self.workspaces[ws_index].sessions.len();
                 self.workspaces[ws_index].sessions.push(ts);
@@ -3738,14 +4281,30 @@ impl App {
         prompt: String,
     ) {
         let (cols, rows) = self.last_term_size;
-        let args = vec![
-            "--dangerously-skip-permissions".to_string(),
-            "--resume".to_string(),
-            session_id.clone(),
-        ];
+        // Pre-generate the session UID so the per-session MCP config
+        // bakes the matching CM_TUI_SESSION_ID. Without this, a pulled
+        // session can spawn but its agent has no MCP config and any
+        // tool call would fail auth as `not_found`.
+        let session_uid = new_session_uid();
+        let (program, args) = match crate::mcp_config::build_args(
+            &workflow::toml_schema::Engine::ClaudeCode,
+            &session_uid,
+            None,
+            Some(session_id.as_str()),
+        ) {
+            Ok(v) => v,
+            Err(_) => (
+                "claude".to_string(),
+                vec![
+                    "--dangerously-skip-permissions".to_string(),
+                    "--resume".to_string(),
+                    session_id.clone(),
+                ],
+            ),
+        };
 
         match Session::new(
-            "claude",
+            &program,
             &args,
             cols,
             rows,
@@ -3753,8 +4312,14 @@ impl App {
             Default::default(),
         ) {
             Ok(s) => {
-                let mut ts = make_simple_session("claude", "claude", s, None);
-                ts.session_id = Some(session_id.clone());
+                let mut ts = make_simple_session_with_uid(
+                    session_uid,
+                    "claude",
+                    "claude",
+                    s,
+                    None,
+                );
+                ts.transcript_id = Some(session_id.clone());
                 ts.task_id = task_id.clone();
 
                 // If we have a task_id, find the TaskEntry and its (cloud)
@@ -3786,6 +4351,7 @@ impl App {
                     worker_vm: None,
                     worker_zone: None,
                     sessions: vec![ts],
+                    tombstones: Vec::new(),
                 };
                 let ws_id = local_ws.id.clone();
 
@@ -3810,6 +4376,8 @@ impl App {
                         blocked_at: None,
                         is_cloud: false,
                         workspace_id: Some(ws_id.clone()),
+                        parent_task_id: None,
+                        worktree_mode: WorktreeMode::Inherit,
                     });
                 }
                 self.workspaces.push(local_ws);
@@ -3854,8 +4422,11 @@ impl App {
                 match bound.into_iter().next() {
                     Some(t) => t,
                     None => {
-                        // No task — just drop sessions as a soft close.
-                        self.workspaces[wi].sessions.clear();
+                        // No task — soft-close every session in the
+                        // workspace. Tombstone each so the resolver
+                        // can still answer `read_session_output`.
+                        // Helper persists the manifest internally.
+                        self.tombstone_and_remove(wi, |_| true);
                         self.cursor = Cursor::Workspace(wi);
                         self.clamp_cursor();
                         self.set_status_msg("Cleared sessions");
@@ -3881,9 +4452,12 @@ impl App {
         }
         // Drop sessions tagged with this task. Other task-scoped and
         // workspace-level sessions in the same workspace stay running.
-        self.workspaces[wi]
-            .sessions
-            .retain(|ts| ts.task_id.as_deref() != Some(tid.as_str()));
+        // Tombstone each so post-done `read_session_output` keeps working.
+        // Helper persists the manifest before returning.
+        let target = tid.clone();
+        self.tombstone_and_remove(wi, |ts| {
+            ts.task_id.as_deref() == Some(target.as_str())
+        });
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
         self.set_status_msg("Marked done");
@@ -3903,9 +4477,12 @@ impl App {
 
         // Task-scoped delete path.
         if let Some(tid) = self.cursor_task_id() {
-            self.workspaces[wi]
-                .sessions
-                .retain(|ts| ts.task_id.as_deref() != Some(tid.as_str()));
+            // Tombstone-then-drop the task's sessions so the resolver
+            // can still answer for them post-delete. Helper persists.
+            let target = tid.clone();
+            self.tombstone_and_remove(wi, |ts| {
+                ts.task_id.as_deref() == Some(target.as_str())
+            });
             self.backend.delete_task(tid.clone());
             self.tasks.retain(|t| t.task_id.as_deref() != Some(tid.as_str()));
             self.cursor = Cursor::Workspace(wi);
@@ -3993,7 +4570,15 @@ impl App {
         self.backend.push(worktree_path, repo_url, name, task_id);
 
         // Clear local sessions and worktree; mark workspace as cloud.
-        self.workspaces[wi].sessions.clear();
+        // Tombstone first — the helper saves the manifest with each
+        // tombstone's `worktree_path` snapshotted at the current value.
+        // We then mutate workspace + task state and save AGAIN so the
+        // post-push state (no worktree, is_cloud=true) is durable too.
+        // Without the second save, a crash here would leave the manifest
+        // with valid tombstones but the workspace still flagged local
+        // with a stale `worktree_path` — the worst kind of half-state
+        // because it looks valid on restart.
+        self.tombstone_and_remove(wi, |_| true);
         self.workspaces[wi].worktree_path = None;
         self.workspaces[wi].is_cloud = true;
         if let Some(task) = self
@@ -4003,6 +4588,7 @@ impl App {
         {
             task.is_cloud = true;
         }
+        self.save_session_manifest();
         self.cursor = Cursor::Workspace(wi);
         self.set_status_msg("Pushing to cloud...");
     }
@@ -4083,11 +4669,24 @@ impl App {
         worktree::setup_worktree(&main_repo, &worktree_path);
 
         let (cols, rows) = self.last_term_size;
-        let args = vec!["--dangerously-skip-permissions".to_string()];
+        // Pre-generate UID + route through the shared MCP config helper
+        // so the planning-launched agent gets `--mcp-config` + matching
+        // CM_TUI_SESSION_ID — the Phase 1 "MCP-everywhere" invariant.
+        let session_uid = new_session_uid();
+        let (program, args) = crate::mcp_config::build_args(
+            &workflow::toml_schema::Engine::ClaudeCode,
+            &session_uid,
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| (
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+        ));
         let pending = Self::list_jsonl_files(&worktree_path);
 
         match Session::new(
-            "claude",
+            &program,
             &args,
             cols,
             rows,
@@ -4096,7 +4695,13 @@ impl App {
         ) {
             Ok(s) => {
                 let branch = format!("cm/{}", slug);
-                let mut ts = make_simple_session(slug, "claude", s, Some(pending));
+                let mut ts = make_simple_session_with_uid(
+                    session_uid,
+                    slug,
+                    "claude",
+                    s,
+                    Some(pending),
+                );
                 ts.task_id = Some(task_id.to_string());
                 if !prompt.trim().is_empty() {
                     ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
@@ -4119,6 +4724,7 @@ impl App {
                     worker_vm: None,
                     worker_zone: None,
                     sessions: vec![ts],
+                    tombstones: Vec::new(),
                 };
                 let ws_id = ws.id.clone();
                 self.workspaces.push(ws);
@@ -4135,6 +4741,8 @@ impl App {
                     blocked_at: None,
                     is_cloud: false,
                     workspace_id: Some(ws_id),
+                    parent_task_id: None,
+                    worktree_mode: WorktreeMode::Inherit,
                 });
 
                 self.cursor = Cursor::Session(new_wi, 0);
@@ -4187,10 +4795,24 @@ impl App {
         };
 
         let (cols, rows) = self.last_term_size;
-        let args = vec!["--dangerously-skip-permissions".to_string()];
+        // Pre-generate UID so the per-session MCP config carries the
+        // matching CM_TUI_SESSION_ID. Phase 1 "MCP-everywhere" — without
+        // this, a session launched into an existing workspace can't call
+        // any orchestration tool.
+        let session_uid = new_session_uid();
+        let (program, args) = crate::mcp_config::build_args(
+            &workflow::toml_schema::Engine::ClaudeCode,
+            &session_uid,
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| (
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+        ));
         let pending = Self::list_jsonl_files(&worktree_path);
         match Session::new(
-            "claude",
+            &program,
             &args,
             cols,
             rows,
@@ -4198,7 +4820,13 @@ impl App {
             Default::default(),
         ) {
             Ok(s) => {
-                let mut ts = make_simple_session(task_title, "claude", s, Some(pending));
+                let mut ts = make_simple_session_with_uid(
+                    session_uid,
+                    task_title,
+                    "claude",
+                    s,
+                    Some(pending),
+                );
                 ts.task_id = Some(task_id.to_string());
                 if !prompt.trim().is_empty() {
                     ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
@@ -4234,6 +4862,8 @@ impl App {
                         blocked_at: None,
                         is_cloud: false,
                         workspace_id: Some(workspace_id.to_string()),
+                        parent_task_id: None,
+                        worktree_mode: WorktreeMode::Inherit,
                     });
                 }
                 self.cursor = Cursor::Session(wi, si);
@@ -4285,12 +4915,14 @@ impl App {
             });
 
         if let Some(ws_id) = ws_id {
-            if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == ws_id) {
-                for ts in &mut ws.sessions {
-                    ts.session.exited = true;
+            if let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) {
+                // Tombstone each session before dropping so post-unlaunch
+                // `read_session_output` works for the closed sessions.
+                // Helper persists the manifest internally.
+                self.tombstone_and_remove(wi, |_| true);
+                if let Some(ws) = self.workspaces.get_mut(wi) {
+                    ws.is_closed = true;
                 }
-                ws.sessions.clear();
-                ws.is_closed = true;
             }
         }
         self.save_session_manifest();
@@ -5556,7 +6188,7 @@ impl App {
             .workspaces
             .iter()
             .flat_map(|w| w.sessions.iter())
-            .filter_map(|s| s.session_id.clone())
+            .filter_map(|s| s.transcript_id.clone())
             .collect();
         for slot in &slots {
             let role = &wf.roles[&slot.role];
@@ -5573,7 +6205,7 @@ impl App {
                     };
                     ts.workflow_run_id = Some(run_id.clone());
                     ts.workflow_role = Some(slot.role.clone());
-                    if ts.session_id.is_none() {
+                    if ts.transcript_id.is_none() {
                         if let Some(wt) = worktree_for_detect.as_deref() {
                             // Augment the per-session pre-launch snapshot with
                             // sids already bound to other sessions so we don't
@@ -5591,13 +6223,13 @@ impl App {
                             };
                             if let Some(sid) = detected {
                                 bound_sids.insert(sid.clone());
-                                ts.session_id = Some(sid);
+                                ts.transcript_id = Some(sid);
                                 ts.pending_jsonl_files = None;
                             }
                         }
                     }
                     let eng = engine_for_session_type(&ts.session_type);
-                    let sid = ts.session_id.clone();
+                    let sid = ts.transcript_id.clone();
                     // Respawn-with-`--resume` only happens when the role
                     // genuinely needs the workflow MCP server wired in.
                     // Skipping it for `needs_mcp = false` roles (e.g. the
@@ -5618,7 +6250,7 @@ impl App {
                         None
                     };
                     let session_label_clone = ts.label.clone();
-                    let session_id_clone = ts.session_id.clone();
+                    let session_id_clone = ts.transcript_id.clone();
                     if let Some(msg) = respawn_warning {
                         self.set_status_msg(&msg);
                     }
@@ -5721,7 +6353,7 @@ impl App {
                     continue;
                 };
 
-                let live = self.workspaces[ti].sessions[si].session_id.clone();
+                let live = self.workspaces[ti].sessions[si].transcript_id.clone();
                 let binding_sid = self
                     .workflow_runs[idx]
                     .role_sessions
@@ -5752,7 +6384,19 @@ impl App {
     ) -> Option<(String, Option<String>)> {
         let worktree_path = self.workspaces[ws_index].worktree_path.clone()?;
         let (cols, rows) = self.last_term_size;
-        let (program, args) = match workflow::spawn::build_args(engine, run_id, role_name, None) {
+        // Generate the uid first so the MCP config bakes the same value
+        // the TerminalSession ends up holding.
+        let session_uid = new_session_uid();
+        let workflow_meta = crate::mcp_config::WorkflowMeta {
+            run_id,
+            role: role_name,
+        };
+        let (program, args) = match crate::mcp_config::build_args(
+            engine,
+            &session_uid,
+            Some(workflow_meta),
+            None,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 self.set_status_msg(&format!("spawn args: {}", e));
@@ -5775,7 +6419,7 @@ impl App {
         let session_type = engine.as_session_type().to_string();
         let label = role_name.to_string();
         let ts = TerminalSession {
-            uid: new_session_uid(),
+            uid: session_uid,
             label: label.clone(),
             session_type,
             session: sess,
@@ -5783,7 +6427,8 @@ impl App {
             // detection will flip to Running when the agent actually responds.
             status: SessionStatus::Idle,
             last_write_at: None,
-            session_id: None,
+            transcript_id: None,
+            generation: 0,
             pending_jsonl_files: pending,
             // Participants default hidden — the workflow header carries the
             // aggregate indicator. Toggle per session with A-h.
@@ -5799,6 +6444,7 @@ impl App {
             notify_on_idle: false,
             pending_enter: None,
             created_at: Instant::now(),
+            managed_by_uid: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -5941,47 +6587,33 @@ impl App {
                     SessionStatus::Idle
                 );
                 if session_idle {
-                    // Only fire the static transition if the outgoing role has
-                    // actually taken a NEW turn since its current activation.
-                    // Use `count_messages` (counts any assistant JSONL entry —
-                    // including thinking-only / tool-use-only turns) rather
-                    // than `list_messages` which skips non-text content and
-                    // would undercount real turns.
+                    // Combined turn-complete + new-turn-since-baseline check
+                    // routes through `Agent::assistant_turn_completed_since`.
+                    // Activation baseline (start_count) is still snapshotted
+                    // by app.rs at activation time; the trait helper just
+                    // wraps the count > baseline && is_idle predicate.
                     let start_count = self.workflow_runs[idx]
                         .active_assistant_start_count()
                         .unwrap_or(0);
-                    let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
-                    let session_engine =
-                        engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
-                    let current_count = match (
-                        self.workspaces[ti].worktree_path.as_deref(),
-                        current_sid.as_deref(),
-                    ) {
-                        (Some(wt), Some(sid)) => workflow::transcript::count_messages(
-                            &session_engine,
-                            wt,
-                            sid,
-                            workflow::transcript::MessageKind::Assistant,
-                        ),
-                        _ => 0,
+                    let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
+                    let session_type = self.workspaces[ti].sessions[si].session_type.clone();
+                    let agent = crate::agent::agent_for(&session_type);
+                    let (will_fire, current_count, turn_complete) = match self.workspaces[ti]
+                        .worktree_path
+                        .as_deref()
+                    {
+                        Some(wt) => {
+                            let ctx = crate::agent::AgentCtx {
+                                ts: &self.workspaces[ti].sessions[si],
+                                worktree_path: wt,
+                            };
+                            let count = agent.count_assistant_turns(ctx);
+                            let complete = agent.is_idle(ctx);
+                            let fire = agent.assistant_turn_completed_since(ctx, start_count);
+                            (fire, count, complete)
+                        }
+                        None => (false, 0, false),
                     };
-                    // PTY quiet + new-turn isn't enough — claude pauses between
-                    // thinking/tool_use steps, and a slow tool call can exceed
-                    // idle_timeout without the turn actually being over.
-                    // Additionally require the agent's own "I'm done with this
-                    // turn" signal before firing.
-                    let turn_complete = match (
-                        self.workspaces[ti].worktree_path.as_deref(),
-                        current_sid.as_deref(),
-                    ) {
-                        (Some(wt), Some(sid)) => workflow::transcript::role_turn_complete(
-                            &session_engine,
-                            wt,
-                            sid,
-                        ),
-                        _ => false,
-                    };
-                    let will_fire = current_count > start_count && turn_complete;
                     log_tick(
                         &run_id,
                         &format!(
@@ -6061,7 +6693,7 @@ impl App {
         let captured = if let Some(from) = &from_role {
             if let Some((fti, fsi)) = self.locate_workflow_session(run_id, from) {
                 let from_role_spec = wf.roles.get(from).cloned();
-                let fsid = self.workspaces[fti].sessions[fsi].session_id.clone();
+                let fsid = self.workspaces[fti].sessions[fsi].transcript_id.clone();
                 let fwt = self.workspaces[fti].worktree_path.clone();
                 if let (Some(spec), Some(sid), Some(wt)) = (from_role_spec, fsid, fwt) {
                     workflow::transcript::last_message(&spec.engine, &wt, &sid)
@@ -6126,7 +6758,7 @@ impl App {
         }
 
         // Update role_sessions with (possibly new) session_id from the session.
-        let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
+        let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
         if let Some(b) = self.workflow_runs[run_idx].role_sessions.get_mut(to_role) {
             b.current_session_id = current_sid;
         }
@@ -6136,7 +6768,7 @@ impl App {
         // downstream the idle gate compares turn-to-turn regardless of whether
         // the agent's reply contains text, thinking, or tool_use content.
         let start_count = {
-            let current_sid = self.workspaces[ti].sessions[si].session_id.clone();
+            let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
             let session_engine =
                 engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
             match (self.workspaces[ti].worktree_path.as_deref(), current_sid.as_deref()) {
@@ -6162,28 +6794,37 @@ impl App {
         // for fresh-context roles because they just received a `/clear` and
         // need a beat to reset internal state.
         if !rendered.trim().is_empty() {
-            // Queue the prompt to fire at the first moment of PTY quiet.
-            // Delivery is sequenced AFTER pending_clear (if any) in the
-            // drain loop, so we don't need to pre-compute a "start after
-            // clear" time here.
-            let pw = PendingWrite::wait_for_quiet(
-                rendered.trim_end().to_string(),
-                true,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(180),
-            );
+            // Route through Agent::submit_prompt — same PendingWrite shape
+            // as before, but engine-specific knobs (Codex's longer settle
+            // delay, kitty Enter encoding, etc.) live in the Agent impl
+            // rather than scattered through this function.
+            let session_type = self.workspaces[ti].sessions[si].session_type.clone();
             let label = self.workspaces[ti].sessions[si].label.clone();
+            let body_len = rendered.trim_end().len();
             log_tick(
                 run_id,
                 &format!(
                     "fire_transition: activated '{}' queued prompt ({} bytes, fires on quiet PTY) on session '{}'",
-                    to_role,
-                    pw.text.len(),
-                    label,
+                    to_role, body_len, label,
                 ),
             );
-            self.workspaces[ti].sessions[si].pending_prompt = Some(pw);
+            let ws = &mut self.workspaces[ti];
+            let wt = ws.worktree_path.clone().unwrap_or_default();
+            let ts = &mut ws.sessions[si];
+            let ctx = crate::agent::AgentCtxMut {
+                ts,
+                worktree_path: &wt,
+            };
+            let agent = crate::agent::agent_for(&session_type);
+            if let Err(e) = agent.submit_prompt(ctx, &rendered) {
+                log_tick(
+                    run_id,
+                    &format!(
+                        "fire_transition: submit_prompt error on '{}': {}",
+                        label, e
+                    ),
+                );
+            }
         } else {
             log_tick(
                 run_id,
@@ -6234,7 +6875,10 @@ impl App {
             ("codex", Some(wt)) => Some(Self::list_codex_sessions(wt)),
             _ => None,
         };
-        ts.session_id = None;
+        // Rebind to None — bumps generation so any in-flight transcript
+        // reads see the rebind and reset their cursor offsets to the new
+        // file once the detector picks it up.
+        ts.rebind_transcript(None);
         ts.pending_prompt = None;
         // Old file's turn counts no longer apply to the new file — reset the
         // role's message baseline so templates slice from 0 post-/clear.
@@ -6921,6 +7565,250 @@ mod body_delivery_tests {
         let out = format_body_for_delivery(body, mode);
         let expected = format!("\x1b[200~{}\x1b[201~", body);
         assert_eq!(out, expected.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod transcript_rebind_tests {
+    //! Pins down the invariant that any rebind of `transcript_id` after
+    //! the initial bind bumps `generation`. Without this, a reader holding
+    //! a cursor against the pre-rebind file would skip messages in the new
+    //! file (cursor offset N applied to a different file).
+
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_test_session(transcript_id: Option<&str>, generation: u64) -> TerminalSession {
+        // /bin/true exits immediately; the PTY/Session shell is harmless
+        // for a value-only test that never reads the PTY.
+        let session =
+            crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+                .expect("session for test");
+        TerminalSession {
+            uid: "uid".into(),
+            label: "test".into(),
+            session_type: "claude".into(),
+            session,
+            status: SessionStatus::Idle,
+            last_write_at: None,
+            transcript_id: transcript_id.map(str::to_string),
+            generation,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            last_delivery: None,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+        }
+    }
+
+    #[test]
+    fn rebind_to_new_sid_bumps_generation() {
+        let mut ts = make_test_session(Some("old-sid"), 5);
+        ts.rebind_transcript(Some("new-sid".into()));
+        assert_eq!(ts.transcript_id.as_deref(), Some("new-sid"));
+        assert_eq!(ts.generation, 6);
+    }
+
+    #[test]
+    fn rebind_to_none_bumps_generation() {
+        // /clear path: transcript becomes None until the detector picks
+        // up the freshly-rotated file. Generation must bump immediately
+        // so cursors held by readers are invalidated before the next
+        // file binds.
+        let mut ts = make_test_session(Some("old-sid"), 1);
+        ts.rebind_transcript(None);
+        assert!(ts.transcript_id.is_none());
+        assert_eq!(ts.generation, 2);
+    }
+
+    #[test]
+    fn rebind_saturates_at_u64_max() {
+        let mut ts = make_test_session(Some("old"), u64::MAX);
+        ts.rebind_transcript(Some("new".into()));
+        assert_eq!(ts.generation, u64::MAX, "must not panic on overflow");
+    }
+}
+
+#[cfg(test)]
+mod rotation_binding_tests {
+    //! Regression tests for the `/clear` and `/compact` rotation rebind
+    //! path. The pre-fix version only rebound workflow roles, so a
+    //! regular `A-n` Claude pane that ran `/clear` would keep resolving
+    //! to the *old* transcript file forever and `read_session_output`
+    //! returned stale data on what looked like a healthy session.
+
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn dummy_session() -> Session {
+        Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+            .expect("dummy session")
+    }
+
+    fn ts_with(
+        sid: Option<&str>,
+        workflow: Option<(&str, &str)>,
+    ) -> TerminalSession {
+        TerminalSession {
+            uid: "uid".into(),
+            label: "test".into(),
+            session_type: "claude".into(),
+            session: dummy_session(),
+            status: SessionStatus::Idle,
+            last_write_at: None,
+            transcript_id: sid.map(str::to_string),
+            generation: 0,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: workflow.map(|(r, _)| r.to_string()),
+            workflow_role: workflow.map(|(_, role)| role.to_string()),
+            task_id: None,
+            last_delivery: None,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+        }
+    }
+
+    fn ws_with(sessions: Vec<TerminalSession>) -> Workspace {
+        Workspace {
+            id: "ws-1".into(),
+            name: "ws".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(PathBuf::from("/tmp/ws")),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions,
+            tombstones: vec![],
+        }
+    }
+
+    #[test]
+    fn binding_includes_non_workflow_claude_session() {
+        // The fix: a regular pane (no workflow_run_id/role) with a
+        // bound transcript_id must still appear in the rotation
+        // bindings map. Without this, `/clear` from that pane never
+        // rebound and `read_session_output` stalled on the old file.
+        let ws = ws_with(vec![ts_with(Some("solo-sid"), None)]);
+        let bindings = collect_rotation_bindings(&[ws]);
+        assert!(
+            bindings.contains_key("solo-sid"),
+            "non-workflow session must be tracked for rotation; got keys {:?}",
+            bindings.keys().collect::<Vec<_>>(),
+        );
+        let b = bindings.get("solo-sid").unwrap();
+        assert!(b.workflow.is_none());
+    }
+
+    #[test]
+    fn binding_includes_workflow_claude_session() {
+        let ws = ws_with(vec![ts_with(
+            Some("worker-sid"),
+            Some(("wf_1", "worker")),
+        )]);
+        let bindings = collect_rotation_bindings(&[ws]);
+        let b = bindings
+            .get("worker-sid")
+            .expect("workflow session must still be tracked");
+        assert_eq!(
+            b.workflow.as_ref().map(|(r, role)| (r.as_str(), role.as_str())),
+            Some(("wf_1", "worker"))
+        );
+    }
+
+    #[test]
+    fn binding_skips_session_without_transcript_id() {
+        // No bound transcript yet — nothing to rotate from.
+        let ws = ws_with(vec![ts_with(None, None)]);
+        assert!(collect_rotation_bindings(&[ws]).is_empty());
+    }
+
+    #[test]
+    fn binding_skips_codex_session() {
+        // Codex doesn't go through history.jsonl rotation — its session
+        // metadata is in the rollout file itself. Skip from this map.
+        let mut ts = ts_with(Some("codex-sid"), None);
+        ts.session_type = "codex".into();
+        let ws = ws_with(vec![ts]);
+        assert!(collect_rotation_bindings(&[ws]).is_empty());
+    }
+
+    #[test]
+    fn binding_skips_workspace_without_worktree() {
+        // Cloud workspaces clear `worktree_path` after `push_active`.
+        // Without the path we can't compute the project dir, so skip.
+        let mut ws = ws_with(vec![ts_with(Some("sid"), None)]);
+        ws.worktree_path = None;
+        assert!(collect_rotation_bindings(&[ws]).is_empty());
+    }
+
+    /// End-to-end-ish: write two sequential transcript files for the
+    /// same logical session under `~/.claude/projects/<encoded>/`,
+    /// confirm `find_post_rotation_sid` picks up the newer one given
+    /// a rotation timestamp between the two file timestamps.
+    #[test]
+    fn find_post_rotation_picks_newer_transcript() {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let worktree = std::path::PathBuf::from("/tmp/myrepo");
+        // Encoded path matches the agent module's rule: '/' and '.' → '-'.
+        let encoded = "-tmp-myrepo";
+        let proj = tmp.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Old transcript: 2026-01-01T00:00:01Z = 1767225601000 ms.
+        let old_line = r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"user","message":{"role":"user","content":"old"}}"#;
+        std::fs::write(proj.join("old-sid.jsonl"), old_line).unwrap();
+
+        // Rotation marker between the two transcripts. With the 2s
+        // slack in `find_post_rotation_sid`, the old file's
+        // `first_ts + 2000 < after_ms` filter requires after_ms to be
+        // strictly greater than 1767225603000.
+        let rotation_at = 1767225604000_u64;
+
+        // New transcript: 2026-01-01T00:00:06Z = 1767225606000 ms.
+        let new_line = r#"{"timestamp":"2026-01-01T00:00:06.000Z","type":"user","message":{"role":"user","content":"new"}}"#;
+        std::fs::write(proj.join("new-sid.jsonl"), new_line).unwrap();
+
+        let found = workflow::history::find_post_rotation_sid(&worktree, rotation_at);
+
+        unsafe {
+            if let Some(h) = old_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+
+        assert_eq!(
+            found.as_deref(),
+            Some("new-sid"),
+            "must pick the newer transcript (timestamp >= rotation)",
+        );
     }
 }
 

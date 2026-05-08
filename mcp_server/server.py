@@ -13,6 +13,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from mcp.server.fastmcp import FastMCP
 
 from cli.planning_client import PlanningClient
+from mcp_server import control_client
+from mcp_server.transcripts import claude_code as transcripts_claude
+from mcp_server.transcripts import codex as transcripts_codex
 
 mcp = FastMCP("claude-manager")
 
@@ -217,6 +220,177 @@ def update_task(
         raise ValueError("No fields to update — pass at least one field.")
     client = PlanningClient()
     return _shape_task(client.update_task(task_id, **fields), full=True)
+
+
+@mcp.tool()
+def ping() -> dict:
+    """Check connectivity to the host TUI's control socket.
+
+    Returns the TUI's pong response, including the `session_uid` it sees
+    you as. Useful as a smoke test that the agent's MCP env was wired up
+    correctly (CM_TUI_SESSION_ID + CM_TUI_SOCKET must be set by the TUI
+    at spawn time).
+    """
+    try:
+        return control_client.call("ping")
+    except control_client.ControlError as e:
+        return {"ok": False, "error": str(e)}
+    except control_client.TransportError as e:
+        return {"ok": False, "transport_error": str(e)}
+
+
+@mcp.tool()
+def list_sessions(
+    task_id: str | None = None,
+    include_exited: bool = False,
+) -> list[dict]:
+    """List sessions visible to you (your own task tree, or your whole
+    workspace if you have no task).
+
+    Args:
+        task_id: Optional explicit task scope. Leave unset to use the
+            default (your task, or whole workspace if taskless). A taskless
+            caller passing `task_id` gets `unauthorized`.
+        include_exited: When true, also include closed sessions
+            (state=`exited`). Default false. Read-after-exit still
+            works via `read_session_output` regardless of this flag.
+
+    Returns: list of {session_uid, label, type, state, idle, managed_by_uid}.
+        state ∈ {"ready", "pending", "exited"}.
+    """
+    params: dict = {"include_exited": include_exited}
+    if task_id:
+        params["task_id"] = task_id
+    return control_client.call("list_sessions", params)
+
+
+@mcp.tool()
+def start_session(
+    type: str,
+    label: str,
+    prompt: str = "",
+    task_id: str | None = None,
+) -> dict:
+    """Spawn a new agent session in your workspace.
+
+    Args:
+        type: "claude-code" or "codex". Bash sessions are user-only.
+        label: Sidebar label for the new session.
+        prompt: Optional initial prompt to deliver once the agent is
+            ready (queued via the same PendingWrite drainer the workflow
+            activation flow uses).
+        task_id: Optional task to bind to. Omitted = your own task (if
+            any) or no task. Cross-task binding is rejected.
+
+    Returns: {"session_uid": "<uid>"} for the freshly-spawned session.
+
+    State your intent in plain language and ask the user to confirm
+    before calling this tool. The user expects to be in the loop on
+    every spawn.
+    """
+    params: dict = {"type": type, "label": label}
+    if prompt:
+        params["prompt"] = prompt
+    if task_id:
+        params["task_id"] = task_id
+    return control_client.call("start_session", params)
+
+
+@mcp.tool()
+def send_input(session_uid: str, text: str, submit: bool = True) -> dict:
+    """Deliver a prompt to a session you can see.
+
+    Args:
+        session_uid: Target session's stable UID (from list_sessions).
+        text: Body to send.
+        submit: True (default) appends Enter so the agent receives the
+            input as a fresh keystroke; the body and Enter are separated
+            in time by the TUI drainer to avoid the body being seen as
+            a multi-line paste.
+
+    State your intent and ask the user before calling this tool.
+    """
+    return control_client.call(
+        "send_input",
+        {"session_uid": session_uid, "text": text, "submit": submit},
+    )
+
+
+@mcp.tool()
+def kill_session(session_uid: str) -> dict:
+    """Close a session you can see. The PTY is torn down and a tombstone
+    is recorded so `read_session_output` still works for the closed
+    session's transcript.
+
+    Ask the user before calling. Killing a session is destructive —
+    pending work in that agent stops.
+    """
+    return control_client.call("kill_session", {"session_uid": session_uid})
+
+
+@mcp.tool()
+def read_session_output(
+    session_uid: str,
+    since_cursor: str | None = None,
+    max_messages: int = 20,
+) -> dict:
+    """Read transcript messages from a session you can see.
+
+    Two-step: first calls `resolve_authorized_session` to authorize and
+    get the transcript path; then reads the file directly with the
+    Python parser (no per-message round-trip through the TUI). Cursors
+    encode the session's generation; mismatch (e.g. after `/clear`)
+    silently restarts at offset 0 of the new transcript.
+
+    Args:
+        session_uid: Target session's stable UID.
+        since_cursor: Cursor returned by a previous call, or None to
+            start from the beginning of the current transcript.
+        max_messages: Stop after this many messages. Default 20.
+
+    Returns: {messages, cursor, generation, state, idle}.
+        - messages: list of {role, content, ts}
+        - cursor: opaque, pass back on next call
+        - state: "ready" | "pending" | "exited"
+        - When state="pending", messages is empty and you can poll again.
+    """
+    try:
+        resolved = control_client.call(
+            "resolve_authorized_session",
+            {"session_uid": session_uid},
+        )
+    except control_client.ControlError as e:
+        return {"error": e.code, "message": e.message}
+
+    state = resolved.get("state", "pending")
+    engine = resolved.get("engine", "claude-code")
+    transcript_path = resolved.get("transcript_path")
+    generation = int(resolved.get("generation", 0))
+    idle = bool(resolved.get("idle", False))
+
+    if state == "pending" or transcript_path is None:
+        return {
+            "messages": [],
+            "cursor": None,
+            "generation": generation,
+            "state": state,
+            "idle": idle,
+        }
+
+    parser = transcripts_codex if engine == "codex" else transcripts_claude
+    messages, cursor = parser.read_messages(
+        transcript_path,
+        generation,
+        since_cursor,
+        max_messages,
+    )
+    return {
+        "messages": [m.to_dict() for m in messages],
+        "cursor": cursor,
+        "generation": generation,
+        "state": state,
+        "idle": idle,
+    }
 
 
 @mcp.tool()

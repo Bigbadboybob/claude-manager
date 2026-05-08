@@ -98,6 +98,11 @@ pub fn claude_last_message(worktree_path: &Path, session_id: &str) -> Option<Str
 /// Codex line shapes we've seen:
 ///   {"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"..."}]}}
 ///   {"payload":{"role":"assistant","content":"..."}}   (older shape)
+///
+/// `event_msg`/`agent_message` records are intentionally **skipped**: they
+/// mirror the canonical `response_item` (verified 1:1 across real Codex
+/// sessions), and surfacing both would expose duplicate turns to workflow
+/// templates and the manager→worker handoff.
 pub fn codex_last_message(session_id: &str) -> Option<String> {
     let path = codex_transcript_path(session_id)?;
     let contents = fs::read_to_string(&path).ok()?;
@@ -110,6 +115,7 @@ pub fn codex_last_message(session_id: &str) -> Option<String> {
             Ok(v) => v,
             Err(_) => continue,
         };
+
         let role = v
             .pointer("/payload/role")
             .and_then(|r| r.as_str())
@@ -394,6 +400,13 @@ pub fn count_messages(
                 .pointer("/payload/role")
                 .and_then(|r| r.as_str())
                 .or_else(|| v.pointer("/role").and_then(|r| r.as_str())),
+            // NOTE: do NOT match `event_msg`/`agent_message` here.
+            // Codex emits agent_message as a streaming sidecar that
+            // mirrors a later `response_item` with role=="assistant"
+            // 1:1 (verified empirically across 20+ sessions, diff=0
+            // in every file, identical text in the pair). Counting
+            // both would double the assistant turn count and fire
+            // the on_idle gate one turn early.
         };
         if ty == Some(want) {
             // Exclude Claude's synthetic user-tool-results — they aren't a
@@ -488,6 +501,11 @@ fn extract_codex_line(v: &serde_json::Value, kind: MessageKind) -> Option<String
         MessageKind::User => "user",
         MessageKind::Assistant => "assistant",
     };
+
+    // `event_msg`/`agent_message` is intentionally NOT surfaced here:
+    // it mirrors a `response_item` assistant message 1:1, so emitting
+    // both would duplicate every assistant turn in `list_messages`
+    // (and shift `{{ roles.X.assistant[N] }}` indexing).
     let role = v
         .pointer("/payload/role")
         .and_then(|r| r.as_str())
@@ -511,12 +529,11 @@ fn extract_codex_line(v: &serde_json::Value, kind: MessageKind) -> Option<String
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the process-global HOME env var. Without
-    /// this they race each other when run in parallel and clobber the
-    /// expected `.claude/projects/...` directory layout.
+    /// Serializes tests that mutate the process-global HOME env var.
+    /// Routes through the shared crate-wide lock so tests in this module
+    /// serialize against HOME-mutating tests in other modules too.
     fn home_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        crate::test_support::home_lock()
     }
 
     struct HomeOverride {
@@ -766,5 +783,125 @@ mod tests {
             {"type": "text", "text": "real text"}
         ]);
         assert_eq!(extract_text_from_content(Some(&v)), Some("real text".into()));
+    }
+
+    /// Write a Codex JSONL rollout under the temp HOME for tests. First
+    /// line is a session_meta carrying the requested `id`; subsequent
+    /// lines are appended verbatim (each on its own line).
+    fn write_codex_transcript(tmp: &tempfile::TempDir, sid: &str, body_lines: &[&str]) {
+        let dir = tmp.path().join(".codex/sessions/2026/01/15");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", sid));
+        let mut content = format!(
+            r##"{{"payload":{{"id":"{}","type":"session_meta"}}}}"##,
+            sid
+        );
+        for line in body_lines {
+            content.push('\n');
+            content.push_str(line);
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// `codex_last_message` returns the canonical `response_item`
+    /// assistant text. `agent_message` event_msg records that mirror
+    /// it must NOT be considered (they're a streaming sidecar). The
+    /// `response_item` always lands AFTER the mirror per real Codex
+    /// output, so walking backwards we hit it first either way — but
+    /// the explicit skip in the parser guarantees the correct answer
+    /// even if hypothetical orderings reverse.
+    #[test]
+    fn codex_last_message_returns_canonical_response_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_codex_transcript(
+            &tmp,
+            "sid-canon",
+            &[
+                r##"{"type":"event_msg","payload":{"type":"agent_message","message":"the answer"}}"##,
+                r##"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"the answer"}]}}"##,
+            ],
+        );
+        let _h = HomeOverride::new(tmp);
+        assert_eq!(
+            codex_last_message("sid-canon").as_deref(),
+            Some("the answer")
+        );
+    }
+
+    /// Regression for the dedup case the prior tests masked by using
+    /// different text in each shape. With identical text in the pair
+    /// (matching real Codex output), `count_messages(Assistant)` must
+    /// return exactly 1 — counting both would be the off-by-one bug.
+    #[test]
+    fn count_messages_assistant_dedupes_mirrored_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_codex_transcript(
+            &tmp,
+            "sid-dedupe",
+            &[
+                r##"{"type":"event_msg","payload":{"type":"agent_message","message":"same text"}}"##,
+                r##"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same text"}]}}"##,
+                r##"{"type":"event_msg","payload":{"type":"task_complete"}}"##,
+            ],
+        );
+        let _h = HomeOverride::new(tmp);
+        let n = count_messages(
+            &Engine::Codex,
+            std::path::Path::new("/ignored-by-codex"),
+            "sid-dedupe",
+            MessageKind::Assistant,
+        );
+        assert_eq!(n, 1, "single logical turn must count exactly once");
+    }
+
+    /// `list_messages(Assistant)` must surface exactly one entry per
+    /// logical turn even when both record shapes are present — i.e.
+    /// the canonical `response_item`.
+    #[test]
+    fn list_messages_assistant_dedupes_mirrored_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_codex_transcript(
+            &tmp,
+            "sid-list-dedupe",
+            &[
+                r##"{"type":"event_msg","payload":{"type":"agent_message","message":"reply one"}}"##,
+                r##"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reply one"}]}}"##,
+                r##"{"type":"event_msg","payload":{"type":"agent_message","message":"reply two"}}"##,
+                r##"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reply two"}]}}"##,
+            ],
+        );
+        let _h = HomeOverride::new(tmp);
+        let msgs = list_messages(
+            &Engine::Codex,
+            std::path::Path::new("/ignored-by-codex"),
+            "sid-list-dedupe",
+            MessageKind::Assistant,
+        );
+        assert_eq!(
+            msgs,
+            vec!["reply one".to_string(), "reply two".to_string()]
+        );
+    }
+
+    /// User-kind extraction is unaffected by the change.
+    #[test]
+    fn list_messages_user_does_not_pick_up_agent_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_codex_transcript(
+            &tmp,
+            "sid-user",
+            &[
+                r##"{"type":"event_msg","payload":{"type":"agent_message","message":"shouldnt-appear"}}"##,
+                r##"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"real user"}]}}"##,
+            ],
+        );
+        let _h = HomeOverride::new(tmp);
+        let msgs = list_messages(
+            &Engine::Codex,
+            std::path::Path::new("/ignored-by-codex"),
+            "sid-user",
+            MessageKind::User,
+        );
+        assert_eq!(msgs, vec!["real user".to_string()]);
     }
 }
