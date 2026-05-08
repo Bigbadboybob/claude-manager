@@ -837,7 +837,10 @@ impl App {
         let enter = enter_bytes_for(&ts.session);
         let kitty = enter != b"\r";
         let exited = ts.session.exited;
-        ts.session.write(body.as_bytes());
+        let term_mode = *ts.session.term.lock().mode();
+        let payload = format_body_for_delivery(body, term_mode);
+        let bracketed = payload.len() != body.len();
+        ts.session.write(&payload);
         if pw.submit {
             ts.pending_enter = Some(PendingEnter {
                 fire_at: Instant::now() + ENTER_GAP,
@@ -859,7 +862,7 @@ impl App {
             log_tick(
                 &run_id,
                 &format!(
-                    "delivered {}: {} body bytes + submit={} to session '{}' role='{}' exited={} kitty_enter={}",
+                    "delivered {}: {} body bytes + submit={} to session '{}' role='{}' exited={} kitty_enter={} bracketed={}",
                     kind,
                     body.len(),
                     pw.submit,
@@ -867,6 +870,7 @@ impl App {
                     ts.workflow_role.as_deref().unwrap_or("?"),
                     exited,
                     kitty,
+                    bracketed,
                 ),
             );
         }
@@ -2624,6 +2628,10 @@ impl App {
                     self.unbind_task_from_workspace(&task_id);
                     return true;
                 }
+                PlanAction::UnlaunchTask { task_id } => {
+                    self.unlaunch_task(&task_id);
+                    return true;
+                }
                 PlanAction::SwitchToSessions => {
                     self.view_mode = ViewMode::Sessions;
                     return true;
@@ -4262,6 +4270,34 @@ impl App {
         }
     }
 
+    fn unlaunch_task(&mut self, task_id: &str) {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("status".to_string(), serde_json::Value::String("backlog".to_string()));
+        self.backend.update_plan_task(task_id.to_string(), fields);
+
+        let ws_id = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+            .and_then(|t| {
+                t.api_status = TaskStatus::Backlog;
+                t.workspace_id.take()
+            });
+
+        if let Some(ws_id) = ws_id {
+            if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == ws_id) {
+                for ts in &mut ws.sessions {
+                    ts.session.exited = true;
+                }
+                ws.sessions.clear();
+                ws.is_closed = true;
+            }
+        }
+        self.save_session_manifest();
+        self.clamp_cursor();
+        self.set_status_msg("Task unlaunched \u{2192} backlog");
+    }
+
     /// Handle terminal resize.
     pub fn resize_terminals(&mut self, cols: u16, rows: u16) {
         self.last_term_size = (cols, rows);
@@ -5270,6 +5306,15 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
     }
 
     fn latest_plan(&self, role: &str) -> Option<String> {
+        // Prefer the launch-time snapshot. The live-transcript fallback only
+        // returns Some when the role's last assistant line is still an
+        // ExitPlanMode tool_use, which usually isn't true by the time
+        // downstream roles activate.
+        if let Some(plan) = self.run.role_plans.get(role) {
+            if !plan.is_empty() {
+                return Some(plan.clone());
+            }
+        }
         let (engine, wt, sid) = self.lookup(role)?;
         workflow::transcript::latest_plan(&engine, wt, sid)
     }
@@ -5494,6 +5539,13 @@ impl App {
             std::collections::BTreeMap::new();
         let mut role_baselines: std::collections::BTreeMap<String, MessageBaseline> =
             std::collections::BTreeMap::new();
+        // Captured at launch from each role's pre-launch transcript tail. Lets
+        // `{{ roles.<role>.plan }}` keep returning the plan the user accepted
+        // even after the worker has produced more turns and the live
+        // transcript's last assistant line is no longer the ExitPlanMode
+        // tool_use.
+        let mut role_plans: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         // Sids already claimed by some live session in the TUI. Detection
         // below excludes these so an Existing-bound role with an empty pending
         // snapshot (e.g. a freshly-created pane that hasn't written its
@@ -5546,16 +5598,25 @@ impl App {
                     }
                     let eng = engine_for_session_type(&ts.session_type);
                     let sid = ts.session_id.clone();
-                    let respawn_warning = respawn_existing_with_workflow_mcp(
-                        ts,
-                        &eng,
-                        &run_id,
-                        &slot.role,
-                        sid.as_deref(),
-                        worktree_for_detect.as_deref(),
-                        cols,
-                        rows,
-                    );
+                    // Respawn-with-`--resume` only happens when the role
+                    // genuinely needs the workflow MCP server wired in.
+                    // Skipping it for `needs_mcp = false` roles (e.g. the
+                    // feedback worker) preserves ephemeral process state
+                    // — most importantly plan-mode UI — across launch.
+                    let respawn_warning = if role.needs_mcp {
+                        respawn_existing_with_workflow_mcp(
+                            ts,
+                            &eng,
+                            &run_id,
+                            &slot.role,
+                            sid.as_deref(),
+                            worktree_for_detect.as_deref(),
+                            cols,
+                            rows,
+                        )
+                    } else {
+                        None
+                    };
                     let session_label_clone = ts.label.clone();
                     let session_id_clone = ts.session_id.clone();
                     if let Some(msg) = respawn_warning {
@@ -5597,6 +5658,16 @@ impl App {
                 _ => MessageBaseline::default(),
             };
             let _ = role;
+            // Snapshot the role's most-recent pre-launch ExitPlanMode plan, if
+            // any. This must run BEFORE the role produces any new turns —
+            // i.e. right here at launch, before activation prompts fire.
+            if let (Some(wt), Some(sid)) = (worktree_path.as_deref(), session_id.as_deref()) {
+                if let Some(plan) =
+                    workflow::transcript::latest_plan(&effective_engine, wt, sid)
+                {
+                    role_plans.insert(slot.role.clone(), plan);
+                }
+            }
             role_baselines.insert(slot.role.clone(), baseline);
             role_sessions.insert(
                 slot.role.clone(),
@@ -5617,6 +5688,7 @@ impl App {
             initial_role.clone(),
             role_baselines,
             goal,
+            role_plans,
         );
         let _ = workflow::run::save(&run);
         self.workflow_runs.push(run);
@@ -6562,6 +6634,33 @@ fn enter_bytes_for_mode(mode: TermMode) -> &'static [u8] {
     }
 }
 
+/// Decide the actual byte sequence to write for a workflow delivery body,
+/// given the inner program's current terminal mode.
+///
+/// When the inner program has enabled bracketed-paste mode (`\x1b[?2004h`)
+/// AND the body contains at least one newline, wrap the body in
+/// `\x1b[200~ … \x1b[201~`. This matches the wrapping used for user-typed
+/// pastes (`CrosstermEvent::Paste` handler) and is what codex's input
+/// handler expects for large multi-line input. Without it, codex can wedge
+/// in a state where the trailing Enter is ignored — the symptom that
+/// motivated this helper (see `wf_69fd318f1ad8c4d0` tick.log).
+///
+/// Single-line bodies stay raw so slash commands like `/clear` aren't
+/// rendered as pasted text — the agent needs to recognise them as typed
+/// commands. The newline test is conservative: real activation prompts
+/// always span multiple lines.
+fn format_body_for_delivery(body: &str, term_mode: TermMode) -> Vec<u8> {
+    if body.contains('\n') && term_mode.contains(TermMode::BRACKETED_PASTE) {
+        let mut out = Vec::with_capacity(body.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(body.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        body.as_bytes().to_vec()
+    }
+}
+
 /// Append a diagnostic line for a workflow run to its `tick.log`.
 ///
 /// Lives in `~/.cm/workflow-runs/<run_id>/tick.log`. Rate-limited to at most
@@ -6742,6 +6841,86 @@ mod enter_encoding_tests {
             | TermMode::ALT_SCREEN
             | TermMode::BRACKETED_PASTE;
         assert_eq!(enter_bytes_for_mode(mode), b"\x1b[13u");
+    }
+}
+
+#[cfg(test)]
+mod body_delivery_tests {
+    //! Pins down the byte-formatting we use when delivering a workflow
+    //! activation prompt body to a session's PTY. The hypothesis driving
+    //! these tests: codex's input handler wedges on large multi-line raw
+    //! writes — the trailing Enter is ignored — but accepts the same content
+    //! cleanly when wrapped in bracketed-paste markers (`\x1b[200~ … \x1b[201~`),
+    //! the same wrapping we already use for user-typed pastes (see the
+    //! `CrosstermEvent::Paste` handler).
+    //!
+    //! These are unit tests over the byte-formatting helper alone; they
+    //! don't validate codex's runtime behavior. Final confirmation is a
+    //! manual reproduction in the TUI against a real codex worker session.
+
+    use super::*;
+
+    #[test]
+    fn multiline_body_wrapped_when_bracketed_paste_enabled() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES | TermMode::BRACKETED_PASTE;
+        let body = "do thing\n\nstep 1\nstep 2";
+        let out = format_body_for_delivery(body, mode);
+        assert!(
+            out.starts_with(b"\x1b[200~"),
+            "multi-line body should start with paste-begin marker: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.ends_with(b"\x1b[201~"),
+            "multi-line body should end with paste-end marker: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let expected = format!("\x1b[200~{}\x1b[201~", body);
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn multiline_body_raw_when_bracketed_paste_disabled() {
+        // Older / non-bracket-paste-aware agents see raw bytes. We must not
+        // emit paste markers because the agent would render them as literal
+        // `[200~`, `[201~` in its input box.
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES; // no BRACKETED_PASTE
+        let body = "do thing\nstep 1\nstep 2";
+        let out = format_body_for_delivery(body, mode);
+        assert_eq!(out, body.as_bytes());
+    }
+
+    #[test]
+    fn single_line_body_stays_raw_even_with_bracketed_paste() {
+        // Slash commands (`/clear`, `/compact`, etc.) are always single-line.
+        // Wrapping them in paste markers risks the agent treating them as
+        // pasted text instead of a typed command. Newline absence is the
+        // signal: real activation prompts always span multiple lines.
+        let mode = TermMode::BRACKETED_PASTE;
+        let body = "/clear";
+        let out = format_body_for_delivery(body, mode);
+        assert_eq!(out, body.as_bytes());
+    }
+
+    #[test]
+    fn empty_body_stays_raw() {
+        let mode = TermMode::BRACKETED_PASTE;
+        let out = format_body_for_delivery("", mode);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn embedded_paste_end_marker_is_preserved_verbatim() {
+        // We don't try to escape an embedded \x1b[201~ in the body — if the
+        // user really included one in an activation prompt, the agent would
+        // see paste-end early. This test pins that we do NOT silently
+        // mutate the body; if escaping is ever needed, this test will be
+        // the place to revisit.
+        let mode = TermMode::BRACKETED_PASTE;
+        let body = "line one\nweird \x1b[201~ marker\nline three";
+        let out = format_body_for_delivery(body, mode);
+        let expected = format!("\x1b[200~{}\x1b[201~", body);
+        assert_eq!(out, expected.as_bytes());
     }
 }
 

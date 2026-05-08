@@ -64,6 +64,19 @@ pub struct Role {
     /// If omitted, `activation_prompt` is reused each time.
     #[serde(default)]
     pub subsequent_activation_prompt: Option<String>,
+    /// Whether this role needs the per-run workflow MCP server wired in (so it
+    /// can call `workflow_transition` / `workflow_done`). When `false`, an
+    /// *existing* persistent session bound to this role at launch is left
+    /// running as-is — no `--resume`-respawn just to inject the MCP config.
+    /// That preserves ephemeral process state like plan-mode UI. Roles that
+    /// only transition via static `on_idle` (e.g. the feedback worker) can
+    /// safely set this to `false`. Default `true` preserves prior behavior.
+    #[serde(default = "default_needs_mcp")]
+    pub needs_mcp: bool,
+}
+
+fn default_needs_mcp() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

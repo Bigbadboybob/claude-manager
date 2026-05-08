@@ -218,6 +218,12 @@ pub enum PlanAction {
     UnbindTask {
         task_id: String,
     },
+    /// Send a running task back to backlog: PATCH status, clear workspace_id
+    /// on the local TaskEntry, and close the bound workspace. Worktree and
+    /// branch are left on disk.
+    UnlaunchTask {
+        task_id: String,
+    },
     SwitchToSessions,
     Quit,
     CreateTask {
@@ -1062,6 +1068,7 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
+                    KeyCode::Char('u') | KeyCode::Char('U') => { return self.unlaunch_task(); }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         self.cancel_visual();
                         if let Some(pi) = self.cursor_project_idx() {
@@ -1642,6 +1649,19 @@ impl PlanningView {
         PlanAction::Consumed
     }
 
+    fn unlaunch_task(&mut self) -> PlanAction {
+        let (pi, ti) = match self.selected_task_loc() {
+            Some(v) => v,
+            None => return PlanAction::Consumed,
+        };
+        let task = &mut self.project_data[pi].tasks[ti];
+        if task.status != PlanStatus::InProgress {
+            return PlanAction::Consumed;
+        }
+        task.status = PlanStatus::Backlog;
+        PlanAction::UnlaunchTask { task_id: task.id.clone() }
+    }
+
     fn cycle_status_to_done(&mut self) -> PlanAction {
         if let Some((pi, ti)) = self.selected_task_loc() {
             let task = &mut self.project_data[pi].tasks[ti];
@@ -2204,7 +2224,7 @@ impl PlanningView {
                 dim,
             )),
             Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+                " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
                 dim,
             )),
         ]), help_area);
@@ -2342,6 +2362,7 @@ impl PlanningView {
             ("A-J/K  reorder", "A-f    launch"),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
+            ("A-u    unbind", "A-U    unlaunch"),
             ("A-Ent  sep", "A-Spc  empty"),
             ("A-i    header", "A-A    archive done"),
             ("A-s/S  status", "A-V    show arch"),

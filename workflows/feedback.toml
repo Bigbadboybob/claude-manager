@@ -6,6 +6,11 @@ role_order = ["worker", "reviewer", "manager"]
 [roles.worker]
 engine = "claude-code"
 context = "persistent"
+# Worker hands off via static `on_idle` to reviewer — never calls workflow MCP
+# tools itself. Keeping needs_mcp=false means launching the workflow on an
+# existing worker session doesn't `--resume`-respawn it, preserving plan-mode
+# UI and any other live process state.
+needs_mcp = false
 
 [roles.reviewer]
 engine = "codex"

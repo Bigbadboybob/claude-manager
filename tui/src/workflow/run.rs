@@ -111,6 +111,13 @@ pub struct WorkflowRun {
     /// user message, which may not reflect the original objective.
     #[serde(default)]
     pub goal: Option<String>,
+    /// Plan text snapshotted per role at launch — captured from the role's
+    /// most recent pre-launch `ExitPlanMode` tool_use, if any. Lets templates
+    /// resolve `{{ roles.<role>.plan }}` to the plan the user accepted right
+    /// before launching, even after the worker has produced more turns and
+    /// the live transcript's tail is no longer the plan tool_use.
+    #[serde(default)]
+    pub role_plans: BTreeMap<String, String>,
 }
 
 impl WorkflowRun {
@@ -122,6 +129,7 @@ impl WorkflowRun {
         initial_role: String,
         role_baselines: BTreeMap<String, MessageBaseline>,
         goal: Option<String>,
+        role_plans: BTreeMap<String, String>,
     ) -> Self {
         let now = now_unix();
         let initial_assistant_count = role_baselines
@@ -155,6 +163,7 @@ impl WorkflowRun {
             events_offset: 0,
             role_baselines,
             goal,
+            role_plans,
         }
     }
 
@@ -358,6 +367,7 @@ mod tests {
             "worker".into(),
             BTreeMap::new(),
             None,
+            BTreeMap::new(),
         )
     }
 
