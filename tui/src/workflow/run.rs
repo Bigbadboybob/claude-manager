@@ -321,6 +321,16 @@ pub fn save(run: &WorkflowRun) -> Result<(), PersistError> {
     Ok(())
 }
 
+/// Load a single persisted run by id. Returns None if the file is
+/// missing or can't be parsed. Used by the MCP read tools to surface
+/// runs that have been pruned from `app.workflow_runs` (e.g. after
+/// `stop_workflow_run`) but whose state.json is intact on disk.
+pub fn load_one(run_id: &str) -> Option<WorkflowRun> {
+    let path = run_dir(run_id).join("state.json");
+    let contents = fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<WorkflowRun>(&contents).ok()
+}
+
 /// Load all persisted runs. Invalid/unreadable state.json files are skipped.
 pub fn load_all() -> Vec<WorkflowRun> {
     let dir = runs_dir();
