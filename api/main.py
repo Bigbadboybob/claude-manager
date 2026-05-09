@@ -16,11 +16,37 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cm.api")
 
 
+async def _delete_vm_bg(vm_name: str) -> None:
+    """Delete a worker VM via gcloud, swallowing failures with a logged exception.
+
+    Fire-and-forget helper used by request handlers that want VM teardown to
+    happen out of band. Callers should schedule this with
+    ``_spawn_vm_deletion(vm_name)`` so the task handle is tracked on
+    ``app.state.pending_vm_deletions`` and awaited at shutdown.
+    """
+    try:
+        from dispatch.vm import delete_worker
+        await asyncio.to_thread(delete_worker, vm_name)
+        logger.info(f"Deleted VM {vm_name}")
+    except Exception:
+        logger.exception(f"Failed to delete VM {vm_name}")
+
+
+def _spawn_vm_deletion(vm_name: str) -> asyncio.Task:
+    """Schedule a background VM deletion and track the handle for shutdown."""
+    pending = app.state.pending_vm_deletions
+    task = asyncio.create_task(_delete_vm_bg(vm_name))
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+    return task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     app.state.pool = await db.get_pool()
     await db.init_db(app.state.pool)
+    app.state.pending_vm_deletions: set[asyncio.Task] = set()
     # Two independent loops so a slow warm-pool maintenance pass (serial
     # gcloud probes, gcloud instances create) doesn't drift the dispatch
     # cadence past its 10s target.
@@ -36,6 +62,10 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+    if app.state.pending_vm_deletions:
+        await asyncio.gather(
+            *app.state.pending_vm_deletions, return_exceptions=True
+        )
     await app.state.pool.close()
     logger.info("API server stopped")
 
@@ -114,14 +144,7 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
                                     status="ready", current_task_id=None)
             logger.info(f"Released warm VM {task['worker_vm']} back to ready")
         else:
-            async def _delete_vm(vm_name):
-                try:
-                    from dispatch.vm import delete_worker
-                    await asyncio.to_thread(delete_worker, vm_name)
-                    logger.info(f"Deleted VM {vm_name}")
-                except Exception:
-                    logger.exception(f"Failed to delete VM {vm_name}")
-            asyncio.create_task(_delete_vm(task["worker_vm"]))
+            _spawn_vm_deletion(task["worker_vm"])
 
     # Auto-set blocked_at when transitioning to blocked
     if fields.get("status") == "blocked" and "blocked_at" not in fields:
@@ -140,14 +163,7 @@ async def delete_task(task_id: str, pool=Depends(get_pool)):
         raise HTTPException(status_code=404, detail="Task not found")
 
     if task["worker_vm"]:
-        async def _delete_vm(vm_name):
-            try:
-                from dispatch.vm import delete_worker
-                await asyncio.to_thread(delete_worker, vm_name)
-                logger.info(f"Deleted VM {vm_name}")
-            except Exception:
-                logger.exception(f"Failed to delete VM {vm_name}")
-        asyncio.create_task(_delete_vm(task["worker_vm"]))
+        _spawn_vm_deletion(task["worker_vm"])
         # VM tasks: mark done so dispatch daemon can clean up
         await db.update_task(pool, task_id, status="done")
     else:
@@ -222,13 +238,7 @@ async def delete_warm_pool(pool_id: str, pool=Depends(get_pool)):
     vms = await db.list_warm_vms(pool, pool_id=pool_id)
     for vm in vms:
         if vm["status"] != "dead":
-            async def _delete(vm_name):
-                try:
-                    from dispatch.vm import delete_worker
-                    await asyncio.to_thread(delete_worker, vm_name)
-                except Exception:
-                    pass
-            asyncio.create_task(_delete(vm["vm_name"]))
+            _spawn_vm_deletion(vm["vm_name"])
         await db.delete_warm_vm(pool, vm["id"])
     await db.delete_warm_pool(pool, pool_id)
     return {"ok": True}
