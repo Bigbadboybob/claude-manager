@@ -87,6 +87,22 @@ def _slugify(text: str) -> str:
 # Tasks
 # ---------------------------------------------------------------------------
 
+# Columns where NULL is a legal value in the DB. PATCH callers are allowed
+# to send explicit JSON null for these to clear the column. Everything
+# else in TaskUpdate maps to a NOT NULL column; an explicit null there is
+# a client bug and we reject it with 400 rather than letting Postgres
+# raise a generic 500.
+# Note: ``prompt`` is column-nullable but treated as a string downstream
+# (cli list views, /workers preview, dispatch_daemon), so allowing null
+# would just shift the 500 from Postgres to a TypeError elsewhere.
+NULLABLE_TASK_FIELDS = frozenset({
+    "name",
+    "worker_vm", "worker_zone", "ttyd_url",
+    "blocked_at", "session_id", "wip_branch",
+    "project", "slug", "description", "difficulty", "depends",
+    "parent_task_id",
+})
+
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     prompt = body.prompt or ""
@@ -130,7 +146,24 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    fields = body.model_dump(exclude_none=True)
+    # Use model_fields_set so explicit JSON nulls (clear-the-field intent)
+    # are kept and omitted fields are dropped. exclude_none=True collapsed
+    # both into "missing", which made nullable columns un-clearable once set.
+    dumped = body.model_dump(exclude_unset=True)
+    fields = {k: dumped[k] for k in body.model_fields_set if k in dumped}
+
+    bad = sorted(
+        k for k, v in fields.items()
+        if v is None and k not in NULLABLE_TASK_FIELDS
+    )
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"cannot set non-nullable field(s) to null: {', '.join(bad)}"
+            ),
+        )
+
     if not fields:
         return task
 
