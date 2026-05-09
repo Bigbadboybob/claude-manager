@@ -82,6 +82,43 @@ def _shape_task(task: dict, *, full: bool) -> dict:
     return out
 
 
+# Substrings that indicate the caller confused the tool-call wrapper syntax
+# (`<parameter name="X">VALUE</parameter>`) with the task model fields, and
+# stuffed nested tag-shaped content into a single string parameter. Caught at
+# write time, BEFORE the bad row hits the planning queue and someone launches
+# it. See the discussion at <2026-05-09 propose_task miswrite>.
+_PARAMETER_CONFUSION_MARKERS = (
+    "<prompt>",
+    "</prompt>",
+    "<description>",
+    "</description>",
+    "<difficulty>",
+    "</difficulty>",
+    "</invoke>",
+    "<parameter name=",
+)
+
+
+def _check_parameter_confusion(field_name: str, value: str) -> None:
+    """Raise ValueError if `value` looks like the caller serialized other
+    parameters as nested XML inside this string. The most common shape:
+    `description` ends with literal `</description><prompt>...</prompt>`
+    because the caller forgot that `prompt` is a separate top-level
+    parameter, not a nested child."""
+    if not value:
+        return
+    for marker in _PARAMETER_CONFUSION_MARKERS:
+        if marker in value:
+            raise ValueError(
+                f"propose_task: `{field_name}` contains literal '{marker}'. "
+                f"`description`, `prompt`, and `difficulty` are SEPARATE "
+                f"top-level parameters of this tool, not nested fields. "
+                f"Pass each as its own parameter; do not embed XML-style "
+                f"tags inside one string. Re-call the tool with the fields "
+                f"split out."
+            )
+
+
 @mcp.tool()
 def propose_task(
     project: str,
@@ -96,14 +133,28 @@ def propose_task(
     The task is created with source='claude' in draft status.
     The project owner will review and accept or reject it in the TUI.
 
+    `description` and `prompt` serve different purposes — set BOTH:
+      - `description`: what the user sees in the planning queue when
+        deciding whether to accept the task. Context, motivation,
+        background. The user reads this.
+      - `prompt`: the launch instructions the worker agent receives when
+        the task is accepted and launched. Concrete steps, files to
+        touch, constraints. The agent reads this.
+    They are SEPARATE top-level parameters. Do NOT serialize one inside
+    the other — calls that contain literal `<prompt>`, `</prompt>`,
+    `<description>`, etc. inside a string field will be rejected.
+
     Args:
         project: Project name (use list_projects to see valid names)
         name: Short task title
-        description: Detailed description of what needs to be done
-        prompt: Instructions for the Claude instance that will work on this task
+        description: Background/motivation shown to the user in the queue
+        prompt: Launch instructions delivered to the worker agent
         difficulty: Optional difficulty rating (1-10)
         depends: Optional list of task slugs this depends on
     """
+    _check_parameter_confusion("description", description)
+    _check_parameter_confusion("prompt", prompt)
+    _check_parameter_confusion("name", name)
     client = PlanningClient()
     task = client.propose_task(
         project=project,
@@ -113,7 +164,15 @@ def propose_task(
         difficulty=difficulty,
         depends=depends,
     )
-    return f"Proposed task '{name}' in project '{project}' (id: {task['id']})"
+    # Inline round-trip preview so the caller sees what actually landed
+    # without an extra get_task. Truncated to keep the response readable.
+    desc_preview = (description or "")[:140]
+    prompt_preview = (prompt or "")[:140]
+    return (
+        f"Proposed task '{name}' in project '{project}' (id: {task['id']})\n"
+        f"  description ({len(description)} chars): {desc_preview}{'...' if len(description) > 140 else ''}\n"
+        f"  prompt ({len(prompt)} chars): {prompt_preview}{'...' if len(prompt) > 140 else ''}"
+    )
 
 
 @mcp.tool()
