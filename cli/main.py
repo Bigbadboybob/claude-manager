@@ -283,7 +283,7 @@ def _find_latest_session(cwd: str) -> tuple[str, str] | None:
     return session_id, str(jsonl_files[0])
 
 
-GCS_BUCKET = "gs://cm-sessions-claude-manager"
+GCS_BUCKET = "gs://cm-sessions"
 
 
 @cli.command()
@@ -537,7 +537,6 @@ def config():
     client = get_client()
     cfg = client.get_config()
     click.echo(f"  Max workers:     {cfg['max_workers']}")
-    click.echo(f"  Zombie timeout:  {cfg['zombie_timeout_minutes']}m")
 
 
 if __name__ == "__main__":
