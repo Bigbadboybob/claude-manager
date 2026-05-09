@@ -117,6 +117,12 @@ impl PlanTask {
 pub struct PlanProject {
     pub name: String,
     pub path: PathBuf,
+    /// Persisted by `create_project` to `<path>/repo_url`. Empty when the
+    /// project predates that file or was hydrated purely from API tasks
+    /// without a backing local directory. `create_task` prefers this
+    /// over `repo_url_for_project` so non-github / forked / renamed
+    /// remotes don't get silently rewritten to the github default.
+    pub repo_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -491,6 +497,16 @@ fn ensure_project_dir(project_name: &str) -> PathBuf {
     path
 }
 
+/// Read the persisted `repo_url` for a project from
+/// `<project_path>/repo_url`. Returns an empty string when the file is
+/// absent or unreadable; callers fall back to `repo_url_for_project`
+/// in that case.
+fn read_project_repo_url(project_path: &Path) -> String {
+    std::fs::read_to_string(project_path.join("repo_url"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 // ── REPOS mapping (matches dispatch/config.py) ─────────────
 
 fn repo_url_for_project(project: &str) -> String {
@@ -589,8 +605,42 @@ impl PlanningView {
         let mut new_data: Vec<ProjectData> = Vec::new();
         for name in &project_names {
             let path = ensure_project_dir(name);
-            let project = PlanProject { name: name.clone(), path: path.clone() };
             let api_tasks_for_project = by_project.remove(name).unwrap_or_default();
+            // Fallback chain: disk file → API task → previously
+            // hydrated value → empty. The disk file (written by
+            // `create_project`) is the source of truth for locally-
+            // created projects. The API-task fallback covers projects
+            // discovered purely from the API where no local file
+            // exists. Preserving the previously-hydrated value matters
+            // because a later refresh that returns no tasks for this
+            // project (or tasks whose URLs are blank) would otherwise
+            // clobber a known-good URL — sending the next
+            // `create_task` back to the hardcoded github fallback.
+            // Empty stays empty as a final fallback so `create_task`
+            // can defer to `repo_url_for_project` for genuinely fresh
+            // projects with no remote yet.
+            let mut repo_url = read_project_repo_url(&path);
+            if repo_url.is_empty() {
+                if let Some(t) = api_tasks_for_project
+                    .iter()
+                    .find(|t| !t.repo_url.trim().is_empty())
+                {
+                    repo_url = t.repo_url.trim().to_string();
+                }
+            }
+            if repo_url.is_empty() {
+                if let Some(prev) = self
+                    .project_data
+                    .iter()
+                    .find(|pd| pd.project.name == *name)
+                    .map(|pd| pd.project.repo_url.trim().to_string())
+                {
+                    if !prev.is_empty() {
+                        repo_url = prev;
+                    }
+                }
+            }
+            let project = PlanProject { name: name.clone(), path: path.clone(), repo_url };
 
             // Find existing project data if we have it.
             let existing = self.project_data.iter()
@@ -678,7 +728,17 @@ impl PlanningView {
                 Some(i) => i,
                 None => {
                     let path = ensure_project_dir(project_name);
-                    let project = PlanProject { name: project_name.clone(), path };
+                    // Disk file wins; otherwise inherit from the
+                    // just-created task so API-discovered projects
+                    // pick up their actual remote (forked / renamed
+                    // / non-github URLs) instead of being silently
+                    // rewritten to the github default at task-create
+                    // time.
+                    let mut repo_url = read_project_repo_url(&path);
+                    if repo_url.is_empty() && !task.repo_url.trim().is_empty() {
+                        repo_url = task.repo_url.trim().to_string();
+                    }
+                    let project = PlanProject { name: project_name.clone(), path, repo_url };
                     self.projects.push(project.clone());
                     self.project_data.push(ProjectData {
                         project,
@@ -1961,7 +2021,18 @@ impl PlanningView {
         }
 
         let project = self.project_data[pi].project.name.clone();
-        let repo_url = repo_url_for_project(&project);
+        // Prefer the project's persisted repo_url (written by
+        // `create_project` to `<projects_dir>/<name>/repo_url`) so
+        // non-github / forked / renamed remotes survive task
+        // creation. Fall back to the hardcoded github default only
+        // when nothing is stored — mostly for fresh projects that
+        // pre-date the stored field.
+        let stored = self.project_data[pi].project.repo_url.trim();
+        let repo_url = if stored.is_empty() {
+            repo_url_for_project(&project)
+        } else {
+            stored.to_string()
+        };
 
         // Subtasks default to inherit-mode worktree (share parent's). The
         // user can change this on the API row later if they want a
@@ -2154,7 +2225,11 @@ impl PlanningView {
         let path = projects_dir().join(name);
         if std::fs::create_dir_all(path.join("tasks")).is_err() { return; }
         let _ = std::fs::write(path.join("repo_url"), repo_url);
-        let project = PlanProject { name: name.to_string(), path };
+        let project = PlanProject {
+            name: name.to_string(),
+            path,
+            repo_url: repo_url.to_string(),
+        };
         self.projects.push(project.clone());
         let layout = load_layout(&project.path);
         self.project_data.push(ProjectData { project, tasks: vec![], layout });
@@ -3011,5 +3086,213 @@ impl PlanningView {
             Line::from(""),
             Line::from(Span::styled("  Enter launch \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
         ]), inner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pins down that task creation honors the project's persisted
+    //! `repo_url` (written by `create_project` to
+    //! `<projects_dir>/<name>/repo_url`) instead of always rewriting
+    //! it from the project name via `repo_url_for_project`. Pre-fix,
+    //! a project pointing at a non-github / forked / renamed remote
+    //! silently produced new tasks with the wrong URL.
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_project(name: &str, repo_url: &str) -> ProjectData {
+        ProjectData {
+            project: PlanProject {
+                name: name.to_string(),
+                path: PathBuf::from("/dev/null"),
+                repo_url: repo_url.to_string(),
+            },
+            tasks: vec![],
+            layout: GridLayout::default(),
+        }
+    }
+
+    fn extract_create(action: PlanAction) -> (String, String, Option<String>) {
+        match action {
+            PlanAction::CreateTask {
+                project,
+                repo_url,
+                parent_task_id,
+                ..
+            } => (project, repo_url, parent_task_id),
+            other => panic!("expected CreateTask, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn create_task_uses_stored_repo_url() {
+        let mut view = PlanningView::new();
+        let stored = "git@gitlab.example.com:org/repo.git";
+        view.project_data.push(make_project("repo", stored));
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+
+        let (project, repo_url, parent) = extract_create(view.create_task("Task title", None));
+
+        assert_eq!(project, "repo");
+        assert_eq!(repo_url, stored);
+        assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn create_task_falls_back_when_stored_repo_url_is_empty() {
+        let mut view = PlanningView::new();
+        // Empty stored URL → fallback to `repo_url_for_project`,
+        // which derives a github URL from the project name. The
+        // hardcoded helper is the right answer for fresh projects
+        // that don't yet have a remote on disk.
+        view.project_data.push(make_project("brand-new", ""));
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+
+        let (_, repo_url, _) = extract_create(view.create_task("Task title", None));
+
+        assert_eq!(repo_url, repo_url_for_project("brand-new"));
+        assert!(repo_url.starts_with("https://github.com/"));
+    }
+
+    /// Build a minimal `Task` with the planning fields the loader cares
+    /// about. Anything outside that path is filled with sensible defaults.
+    fn api_task(id: &str, project: &str, repo_url: &str) -> crate::api::Task {
+        crate::api::Task {
+            id: id.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            repo_url: repo_url.to_string(),
+            repo_branch: "main".to_string(),
+            name: Some(format!("Task {}", id)),
+            prompt: None,
+            status: "backlog".to_string(),
+            worker_vm: None,
+            worker_zone: None,
+            blocked_at: None,
+            session_id: None,
+            wip_branch: None,
+            project: Some(project.to_string()),
+            slug: Some(format!("task-{}", id)),
+            description: None,
+            difficulty: None,
+            depends: None,
+            source: "user".to_string(),
+            is_cloud: false,
+            parent_task_id: None,
+            worktree_mode: "inherit".to_string(),
+        }
+    }
+
+    #[test]
+    fn api_loaded_project_inherits_repo_url_from_task_when_disk_file_missing() {
+        // Projects discovered via API tasks (no local `create_project`
+        // run) have no `~/.cm/projects/<name>/repo_url` file. Pre-fix,
+        // `repo_url` stayed empty and `create_task` silently rewrote
+        // the URL via `repo_url_for_project` — defeating the goal for
+        // exactly the case it was meant to fix. Verify the fall-back
+        // chain: disk → API task → empty.
+        let _lock = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let stored = "git@gitlab.example.com:org/api-only.git";
+        let mut view = PlanningView::new();
+        view.update_from_api(vec![api_task("t1", "api-only", stored)]);
+
+        // The freshly-built project record carries the API URL.
+        let pd = view
+            .project_data
+            .iter()
+            .find(|pd| pd.project.name == "api-only")
+            .expect("project loaded from api");
+        assert_eq!(pd.project.repo_url, stored);
+
+        // create_task on this project must propagate the API URL
+        // (NOT the github fallback derived from the project name).
+        let (project, repo_url, _) = extract_create(view.create_task("New", None));
+        assert_eq!(project, "api-only");
+        assert_eq!(repo_url, stored);
+        assert_ne!(repo_url, repo_url_for_project("api-only"));
+
+        if let Some(p) = prev {
+            std::env::set_var("HOME", p);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn update_from_api_preserves_previously_hydrated_repo_url() {
+        // A project hydrated earlier with a good URL must not lose it
+        // when a later API refresh returns no tasks for it AND there
+        // is no disk file. Pre-fix, the in-memory URL got clobbered
+        // to empty and the next `create_task` fell back to the
+        // hardcoded github helper — re-introducing the original bug
+        // for the same project the prior round had just fixed.
+        let _lock = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let stored = "git@example.com:x/y.git";
+        let mut view = PlanningView::new();
+        view.project_data.push(make_project("y", stored));
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+
+        // Refresh with no tasks — and crucially, no disk file under
+        // the temp HOME. Without the existing-value fallback, the
+        // freshly-built project record would land with an empty URL.
+        view.update_from_api(vec![]);
+
+        let pd = view
+            .project_data
+            .iter()
+            .find(|pd| pd.project.name == "y")
+            .expect("project survived refresh");
+        assert_eq!(pd.project.repo_url, stored);
+
+        let (_, repo_url, _) = extract_create(view.create_task("New", None));
+        assert_eq!(repo_url, stored);
+
+        if let Some(p) = prev {
+            std::env::set_var("HOME", p);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn create_subtask_uses_parent_projects_stored_repo_url() {
+        // Subtask path: pi is resolved by walking project_data for
+        // the task whose id == parent_task_id. We stage a parent task
+        // in a project with a custom stored repo_url and confirm the
+        // subtask inherits that URL (not the github fallback).
+        let mut view = PlanningView::new();
+        let stored = "git@gitlab.example.com:org/forked-repo.git";
+        let mut pd = make_project("forked-repo", stored);
+        pd.tasks.push(PlanTask {
+            id: "parent-id-123".to_string(),
+            slug: "parent".to_string(),
+            title: "Parent task".to_string(),
+            status: PlanStatus::Backlog,
+            difficulty: None,
+            depends: vec![],
+            branch: None,
+            created: None,
+            description: String::new(),
+            prompt: String::new(),
+            source: "user".to_string(),
+            is_cloud: false,
+            repo_url: stored.to_string(),
+        });
+        view.project_data.push(pd);
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+
+        let (project, repo_url, parent) =
+            extract_create(view.create_task("Sub task", Some("parent-id-123".to_string())));
+
+        assert_eq!(project, "forked-repo");
+        assert_eq!(repo_url, stored);
+        assert_eq!(parent, Some("parent-id-123".to_string()));
     }
 }
