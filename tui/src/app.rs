@@ -19,7 +19,7 @@ use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::workflow::run::MessageBaseline;
-use crate::workflow::{self, toml_schema::Engine, RoleBinding, TriggerKind, Workflow, WorkflowRun};
+use crate::workflow::{self, toml_schema::Engine, RoleBinding, Workflow, WorkflowRun};
 use crate::worktree;
 
 mod dirs {
@@ -583,7 +583,7 @@ pub(crate) fn collect_rotation_bindings(
     out
 }
 
-fn engine_for_session_type(session_type: &str) -> workflow::toml_schema::Engine {
+pub(crate) fn engine_for_session_type(session_type: &str) -> workflow::toml_schema::Engine {
     match session_type {
         "codex" => workflow::toml_schema::Engine::Codex,
         _ => workflow::toml_schema::Engine::ClaudeCode,
@@ -1797,7 +1797,7 @@ impl App {
 
 
     /// List all .jsonl file stems in the Claude project directory for a worktree.
-    fn list_jsonl_files(worktree_path: &Path) -> Vec<String> {
+    pub(crate) fn list_jsonl_files(worktree_path: &Path) -> Vec<String> {
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => return Vec::new(),
@@ -1856,7 +1856,7 @@ impl App {
     }
 
     /// List codex session IDs (UUIDs) that were started in the given worktree.
-    fn list_codex_sessions(worktree_path: &Path) -> Vec<String> {
+    pub(crate) fn list_codex_sessions(worktree_path: &Path) -> Vec<String> {
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => return Vec::new(),
@@ -6870,127 +6870,6 @@ impl App {
 //                            Workflow integration
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Bridges the template engine to a workflow run's roles.
-///
-/// For a given role name, looks up the engine (from the actual bound session's
-/// `session_type`, NOT the workflow TOML — the user can bind a codex session
-/// into a role declared as `claude-code`) and session id (from
-/// `WorkflowRun.role_sessions`), then reads that session's JSONL transcript on
-/// demand. Fresh-context roles naturally expose only their current activation's
-/// messages — past activations wrote to a different session id and are no
-/// longer pointed at.
-struct WorkflowResolver<'a> {
-    run: &'a WorkflowRun,
-    worktree_path: Option<&'a Path>,
-    /// Engine to use for each role, derived from the actual bound session's
-    /// `session_type` at resolver construction time.
-    role_engines: std::collections::BTreeMap<String, workflow::toml_schema::Engine>,
-}
-
-impl<'a> WorkflowResolver<'a> {
-    fn lookup(&self, role: &str) -> Option<(workflow::toml_schema::Engine, &'a Path, &'a str)> {
-        let engine = self.role_engines.get(role).cloned()?;
-        let binding = self.run.role_sessions.get(role)?;
-        let session_id = binding.current_session_id.as_deref()?;
-        let worktree = self.worktree_path?;
-        Some((engine, worktree, session_id))
-    }
-}
-
-impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
-    fn user_messages(&self, role: &str) -> Vec<String> {
-        let Some((engine, wt, sid)) = self.lookup(role) else {
-            return Vec::new();
-        };
-        let offset = self
-            .run
-            .role_baselines
-            .get(role)
-            .map(|b| b.user_count)
-            .unwrap_or(0);
-        workflow::transcript::list_messages(&engine, wt, sid, workflow::transcript::MessageKind::User)
-            .into_iter()
-            .skip(offset)
-            .collect()
-    }
-
-    fn assistant_messages(&self, role: &str) -> Vec<String> {
-        let Some((engine, wt, sid)) = self.lookup(role) else {
-            return Vec::new();
-        };
-        let offset = self
-            .run
-            .role_baselines
-            .get(role)
-            .map(|b| b.assistant_count)
-            .unwrap_or(0);
-        workflow::transcript::list_messages(
-            &engine,
-            wt,
-            sid,
-            workflow::transcript::MessageKind::Assistant,
-        )
-        .into_iter()
-        .skip(offset)
-        .collect()
-    }
-
-    fn prior_user_messages(&self, role: &str) -> Vec<String> {
-        let Some((engine, wt, sid)) = self.lookup(role) else {
-            return Vec::new();
-        };
-        let baseline = self
-            .run
-            .role_baselines
-            .get(role)
-            .map(|b| b.user_count)
-            .unwrap_or(0);
-        workflow::transcript::list_messages(&engine, wt, sid, workflow::transcript::MessageKind::User)
-            .into_iter()
-            .take(baseline)
-            .collect()
-    }
-
-    fn prior_assistant_messages(&self, role: &str) -> Vec<String> {
-        let Some((engine, wt, sid)) = self.lookup(role) else {
-            return Vec::new();
-        };
-        let baseline = self
-            .run
-            .role_baselines
-            .get(role)
-            .map(|b| b.assistant_count)
-            .unwrap_or(0);
-        workflow::transcript::list_messages(
-            &engine,
-            wt,
-            sid,
-            workflow::transcript::MessageKind::Assistant,
-        )
-        .into_iter()
-        .take(baseline)
-        .collect()
-    }
-
-    fn latest_plan(&self, role: &str) -> Option<String> {
-        // Prefer the launch-time snapshot. The live-transcript fallback only
-        // returns Some when the role's last assistant line is still an
-        // ExitPlanMode tool_use, which usually isn't true by the time
-        // downstream roles activate.
-        if let Some(plan) = self.run.role_plans.get(role) {
-            if !plan.is_empty() {
-                return Some(plan.clone());
-            }
-        }
-        let (engine, wt, sid) = self.lookup(role)?;
-        workflow::transcript::latest_plan(&engine, wt, sid)
-    }
-
-    fn goal(&self) -> Option<String> {
-        self.run.goal.clone()
-    }
-}
-
 impl App {
     /// The stable key a workflow run stores to refer back to its workspace.
     /// With the v3 data model this is the workspace id directly — no more
@@ -6998,24 +6877,6 @@ impl App {
     /// compatibility with the `WorkflowRun::task_key` field on disk.
     fn workspace_key(ws: &Workspace) -> String {
         ws.id.clone()
-    }
-
-    /// Locate the `(task_index, session_index)` of the session that's tagged
-    /// as `role` for workflow run `run_id`. Searches across ALL tasks — the
-    /// workflow's stored `task_key` can drift away from reality (sessions can
-    /// move, or the workflow may have been launched with a stale task key),
-    /// and the tags on the session itself are the source of truth.
-    fn locate_workflow_session(&self, run_id: &str, role: &str) -> Option<(usize, usize)> {
-        for (wi, ws) in self.workspaces.iter().enumerate() {
-            for (si, ts) in ws.sessions.iter().enumerate() {
-                if ts.workflow_run_id.as_deref() == Some(run_id)
-                    && ts.workflow_role.as_deref() == Some(role)
-                {
-                    return Some((wi, si));
-                }
-            }
-        }
-        None
     }
 
     /// Open the launch modal for a workflow, prefilled for the focused session.
@@ -7472,148 +7333,56 @@ impl App {
         Ok(run_id)
     }
 
+    /// Build a `WorkflowControllerCtx` borrowing this `App`'s workflow
+    /// state, run a controller method via `f`, then dispatch the
+    /// returned actions back through `App` (status bar, manifest
+    /// persistence). Borrows split here so the closure has a `&mut`
+    /// view of just the controller-relevant fields; status_msg and
+    /// manifest writes happen on the App after the borrow ends.
+    fn run_workflow_controller<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut workflow::controller::WorkflowControllerCtx<'_>) -> Vec<workflow::controller::WorkflowAction>,
+    {
+        let actions = {
+            let mut ctx = workflow::controller::WorkflowControllerCtx {
+                workflow_runs: &mut self.workflow_runs,
+                workspaces: &mut self.workspaces,
+                workflows: &self.workflows,
+            };
+            f(&mut ctx)
+        };
+        self.apply_workflow_actions(actions);
+    }
+
+    /// Apply each `WorkflowAction` the controller emitted. One arm per
+    /// variant — same one-line dispatcher pattern F4's
+    /// `handle_input_event` ended up with.
+    fn apply_workflow_actions(&mut self, actions: Vec<workflow::controller::WorkflowAction>) {
+        for action in actions {
+            match action {
+                workflow::controller::WorkflowAction::SaveSessionManifest => {
+                    self.save_session_manifest();
+                }
+                workflow::controller::WorkflowAction::SetStatusMsg(msg) => {
+                    self.set_status_msg(&msg);
+                }
+            }
+        }
+    }
+
     /// Deliver the very first activation prompt to the initial role's
     /// session in a freshly-launched workflow. Called only by the MCP
     /// launch path (`start_workflow_run`); UI launches don't need this
     /// because the user types directly into the session.
-    ///
-    /// Uses the same `Agent::submit_prompt` queue path as the on_idle
-    /// transition — body + Enter separation, quiet-window timing, all
-    /// inherited automatically.
     fn deliver_initial_workflow_prompt(
         &mut self,
         run_id: &str,
         role_name: &str,
         ws_index: usize,
     ) {
-        let run_idx = match self.workflow_runs.iter().position(|r| r.run_id == run_id) {
-            Some(i) => i,
-            None => return,
-        };
-        let wf_name = self.workflow_runs[run_idx].workflow_name.clone();
-        let wf = match self.workflows.get(&wf_name).cloned() {
-            Some(w) => w,
-            None => return,
-        };
-        let role = match wf.roles.get(role_name) {
-            Some(r) => r.clone(),
-            None => return,
-        };
-        let goal = self.workflow_runs[run_idx].goal.clone();
-        let rendered = prepare_initial_prompt(
-            role.activation_prompt.as_deref(),
-            goal.as_deref(),
-            // Lazy renderer — only built if `activation_prompt` is
-            // set. Goal-only callers don't pay for the resolver.
-            |template| {
-                let worktree_ref = self.workspaces[ws_index].worktree_path.as_deref();
-                let mut role_engines: std::collections::BTreeMap<
-                    String,
-                    workflow::toml_schema::Engine,
-                > = std::collections::BTreeMap::new();
-                for r in wf.roles.keys() {
-                    let engine = match self.locate_workflow_session(run_id, r) {
-                        Some((wi, sj)) => engine_for_session_type(
-                            &self.workspaces[wi].sessions[sj].session_type,
-                        ),
-                        None => wf.roles[r].engine.clone(),
-                    };
-                    role_engines.insert(r.clone(), engine);
-                }
-                let resolver = WorkflowResolver {
-                    run: &self.workflow_runs[run_idx],
-                    worktree_path: worktree_ref,
-                    role_engines,
-                };
-                workflow::template::render(template, &resolver)
-            },
-        );
-        let rendered = match rendered {
-            Some(s) => s,
-            None => {
-                log_tick(
-                    run_id,
-                    &format!(
-                        "start_workflow: no activation prompt or goal for initial role '{}' — workflow will idle",
-                        role_name
-                    ),
-                );
-                return;
-            }
-        };
-
-        // Locate the initial role's session and queue the prompt via
-        // the same Agent::submit_prompt path the on_idle gate uses.
-        let Some((ti, si)) = self.locate_workflow_session(run_id, role_name) else {
-            return;
-        };
-        let session_type = self.workspaces[ti].sessions[si].session_type.clone();
-        let label = self.workspaces[ti].sessions[si].label.clone();
-        log_tick(
-            run_id,
-            &format!(
-                "start_workflow: queued initial prompt for role='{}' session='{}' ({} bytes)",
-                role_name,
-                label,
-                rendered.trim_end().len(),
-            ),
-        );
-        let ws = &mut self.workspaces[ti];
-        let wt = ws.worktree_path.clone().unwrap_or_default();
-        let ts = &mut ws.sessions[si];
-        let ctx = crate::agent::AgentCtxMut {
-            ts,
-            worktree_path: &wt,
-        };
-        let agent = crate::agent::agent_for(&session_type);
-        if let Err(e) = agent.submit_prompt(ctx, &rendered) {
-            log_tick(
-                run_id,
-                &format!(
-                    "start_workflow: submit_prompt error on initial role '{}': {}",
-                    role_name, e
-                ),
-            );
-        }
-    }
-
-    /// Keep role_sessions.current_session_id aligned with the live
-    /// TerminalSession.session_id. Nothing else.
-    fn sync_role_session_ids(&mut self) {
-        let run_count = self.workflow_runs.len();
-        for idx in 0..run_count {
-            if !self.workflow_runs[idx].is_active() {
-                continue;
-            }
-            let run_id = self.workflow_runs[idx].run_id.clone();
-            let role_names: Vec<String> = self.workflow_runs[idx]
-                .role_sessions
-                .keys()
-                .cloned()
-                .collect();
-            let mut changed = false;
-            for role in role_names {
-                let Some((ti, si)) = self.locate_workflow_session(&run_id, &role) else {
-                    continue;
-                };
-
-                let live = self.workspaces[ti].sessions[si].transcript_id.clone();
-                let binding_sid = self
-                    .workflow_runs[idx]
-                    .role_sessions
-                    .get(&role)
-                    .and_then(|b| b.current_session_id.clone());
-                if live != binding_sid {
-                    if let Some(b) = self.workflow_runs[idx].role_sessions.get_mut(&role) {
-                        b.current_session_id = live;
-                    }
-                    changed = true;
-                }
-            }
-            if changed {
-                let _ = workflow::run::save(&self.workflow_runs[idx]);
-            }
-        }
+        self.run_workflow_controller(|ctx| {
+            ctx.deliver_initial_workflow_prompt(run_id, role_name, ws_index)
+        });
     }
 
     /// Spawn a new TerminalSession for a workflow role, returning (label, session_id).
@@ -7694,464 +7463,13 @@ impl App {
         Some((label, None))
     }
 
-    /// Called once per main loop iteration. Drives transitions for each active run:
-    ///   1. Read new events from events.jsonl; fire dynamic transitions / done.
-    ///   2. Check if the active role's session went idle; fire static transition.
-    ///   3. Auto-pause runs when the user types into a workflow session.
+    /// Called once per main loop iteration. Drives transitions for each
+    /// active workflow run. Real implementation lives in
+    /// `workflow::controller::WorkflowControllerCtx::tick`; this is a
+    /// thin dispatcher: build the controller's reference bag, run it,
+    /// apply the resulting actions.
     pub fn tick_workflows(&mut self) {
-        if self.workflow_runs.is_empty() {
-            return;
-        }
-
-        // Keep role_sessions.current_session_id in sync with whatever the
-        // live TerminalSession.session_id is. Needed because templating
-        // (WorkflowResolver) reads from role_sessions, and sessions may get
-        // their sid detected asynchronously (5-second poll) after launch.
-        // This is a pure sync — no baseline / start_count mutation, which
-        // would shift gates unpredictably.
-        self.sync_role_session_ids();
-
-        // Collect decisions first, then apply. (Avoids borrow issues with mutable
-        // access to both self.workflow_runs and self.tasks.)
-        #[derive(Debug)]
-        enum Decision {
-            ActivateStatic { run_id: String, to: String, from: String },
-            ActivateDynamic {
-                run_id: String,
-                to: String,
-                from: String,
-                prompt: String,
-                event_id: String,
-            },
-            Done { run_id: String, reason: String },
-        }
-        let mut decisions: Vec<Decision> = Vec::new();
-
-        // Snapshot run states.
-        let run_snapshots: Vec<(usize, String, u64, Option<String>, bool)> = self
-            .workflow_runs
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.is_active())
-            .map(|(i, r)| {
-                (
-                    i,
-                    r.run_id.clone(),
-                    r.events_offset,
-                    r.active_role.clone(),
-                    r.paused,
-                )
-            })
-            .collect();
-
-        for (idx, run_id, offset, active_role, paused) in run_snapshots {
-            // Log per-session status so we can tell at a glance whether each
-            // role ever reaches Running. Rate-limited by log_tick so this
-            // doesn't flood. Now locates sessions by their workflow tags
-            // (run_id+role), which is the source of truth — the workflow's
-            // stored task_key can drift.
-            {
-                let role_names: Vec<String> = self.workflow_runs[idx]
-                    .role_sessions
-                    .keys()
-                    .cloned()
-                    .collect();
-                let mut parts = Vec::new();
-                for role in &role_names {
-                    let status = match self.locate_workflow_session(&run_id, role) {
-                        Some((ti, si)) => {
-                            let ts = &self.workspaces[ti].sessions[si];
-                            format!(
-                                "{:?}{}",
-                                ts.status,
-                                if ts.session.exited { "(exited)" } else { "" }
-                            )
-                        }
-                        None => "<no session>".to_string(),
-                    };
-                    parts.push(format!("{}={}", role, status));
-                }
-                log_tick(
-                    &run_id,
-                    &format!(
-                        "statuses: active={} [{}]",
-                        active_role.as_deref().unwrap_or("?"),
-                        parts.join(", ")
-                    ),
-                );
-            }
-
-            // Read new events regardless of paused state so the log stays in sync;
-            // events are still recorded in history but not fired while paused.
-            let (events, new_offset) = workflow::events::read_new(&run_id, offset);
-            self.workflow_runs[idx].events_offset = new_offset;
-
-            if paused {
-                continue;
-            }
-
-            for ev in &events {
-                match ev.kind() {
-                    workflow::events::EventKind::Transition { to, prompt } => {
-                        if let Some(from) = active_role.clone() {
-                            decisions.push(Decision::ActivateDynamic {
-                                run_id: run_id.clone(),
-                                to,
-                                from,
-                                prompt,
-                                event_id: ev.id.clone(),
-                            });
-                        }
-                    }
-                    workflow::events::EventKind::Done { reason } => {
-                        decisions.push(Decision::Done {
-                            run_id: run_id.clone(),
-                            reason,
-                        });
-                    }
-                    workflow::events::EventKind::Unknown => {}
-                }
-            }
-
-            // If no dynamic event fired, check for static idle transition.
-            if events.is_empty() {
-                let Some(active) = active_role.as_deref() else { continue };
-                let wf = self
-                    .workflows
-                    .get(&self.workflow_runs[idx].workflow_name)
-                    .cloned();
-                let Some(wf) = wf else { continue };
-                // Locate by workflow tags — not by task_key + session_label,
-                // which can drift.
-                let Some((ti, si)) = self.locate_workflow_session(&run_id, active) else {
-                    continue;
-                };
-                let session_idle = matches!(
-                    self.workspaces[ti].sessions[si].status,
-                    SessionStatus::Idle
-                );
-                if session_idle {
-                    // Combined turn-complete + new-turn-since-baseline check
-                    // routes through `Agent::assistant_turn_completed_since`.
-                    // Activation baseline (start_count) is still snapshotted
-                    // by app.rs at activation time; the trait helper just
-                    // wraps the count > baseline && is_idle predicate.
-                    let start_count = self.workflow_runs[idx]
-                        .active_assistant_start_count()
-                        .unwrap_or(0);
-                    let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
-                    let session_type = self.workspaces[ti].sessions[si].session_type.clone();
-                    let agent = crate::agent::agent_for(&session_type);
-                    let (will_fire, current_count, turn_complete) = match self.workspaces[ti]
-                        .worktree_path
-                        .as_deref()
-                    {
-                        Some(wt) => {
-                            let ctx = crate::agent::AgentCtx {
-                                ts: &self.workspaces[ti].sessions[si],
-                                worktree_path: wt,
-                            };
-                            let count = agent.count_assistant_turns(ctx);
-                            let complete = agent.is_idle(ctx);
-                            let fire = agent.assistant_turn_completed_since(ctx, start_count);
-                            (fire, count, complete)
-                        }
-                        None => (false, 0, false),
-                    };
-                    log_tick(
-                        &run_id,
-                        &format!(
-                            "idle check: role={} sid={:?} start={} current={} turn_complete={} will_fire={}",
-                            active,
-                            current_sid.as_deref().unwrap_or("<none>"),
-                            start_count,
-                            current_count,
-                            turn_complete,
-                            will_fire,
-                        ),
-                    );
-                    if will_fire {
-                        if let Some(t) = wf.static_transition_on_idle(active) {
-                            decisions.push(Decision::ActivateStatic {
-                                run_id: run_id.clone(),
-                                to: t.to.clone(),
-                                from: active.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        for d in decisions {
-            match d {
-                Decision::ActivateStatic { run_id, to, from } => {
-                    self.fire_transition(
-                        &run_id,
-                        &to,
-                        TriggerKind::StaticIdle { from_role: from },
-                        None,
-                    );
-                }
-                Decision::ActivateDynamic { run_id, to, from, prompt, event_id } => {
-                    self.fire_transition(
-                        &run_id,
-                        &to,
-                        TriggerKind::McpTransition { from_role: from, prompt: prompt.clone(), event_id },
-                        Some(prompt),
-                    );
-                }
-                Decision::Done { run_id, reason } => {
-                    self.finish_run(&run_id, reason);
-                }
-            }
-        }
-    }
-
-    /// Execute a role transition: capture outgoing role's last message, render the
-    /// target role's prompt, deliver it into the PTY (respawning first if fresh).
-    fn fire_transition(
-        &mut self,
-        run_id: &str,
-        to_role: &str,
-        trigger: TriggerKind,
-        supplied_prompt: Option<String>,
-    ) {
-        let run_idx = match self.workflow_runs.iter().position(|r| r.run_id == run_id) {
-            Some(i) => i,
-            None => return,
-        };
-        let wf_name = self.workflow_runs[run_idx].workflow_name.clone();
-        let wf = match self.workflows.get(&wf_name).cloned() {
-            Some(w) => w,
-            None => return,
-        };
-
-        // Locate target role's session by workflow tags (source of truth).
-        let Some((ti, si)) = self.locate_workflow_session(run_id, to_role) else {
-            return;
-        };
-
-        // Capture outgoing role's last assistant message for history.
-        let from_role = self.workflow_runs[run_idx].active_role.clone();
-        let captured = if let Some(from) = &from_role {
-            if let Some((fti, fsi)) = self.locate_workflow_session(run_id, from) {
-                let from_role_spec = wf.roles.get(from).cloned();
-                let fsid = self.workspaces[fti].sessions[fsi].transcript_id.clone();
-                let fwt = self.workspaces[fti].worktree_path.clone();
-                if let (Some(spec), Some(sid), Some(wt)) = (from_role_spec, fsid, fwt) {
-                    workflow::transcript::last_message(&spec.engine, &wt, &sid)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        self.workflow_runs[run_idx].close_active_role(captured);
-
-        // Render prompt for target role. After the first activation of this
-        // role in the run, prefer `subsequent_activation_prompt` if set —
-        // persistent roles already have the first-activation context in
-        // their conversation history and don't need it re-rendered.
-        let target_role_spec = match wf.roles.get(to_role).cloned() {
-            Some(r) => r,
-            None => return,
-        };
-        let prior_activations = self.workflow_runs[run_idx]
-            .history
-            .iter()
-            .filter(|h| h.role == to_role)
-            .count();
-        let default_template = if prior_activations > 0 {
-            target_role_spec
-                .subsequent_activation_prompt
-                .clone()
-                .or_else(|| target_role_spec.activation_prompt.clone())
-        } else {
-            target_role_spec.activation_prompt.clone()
-        };
-        let template_source = supplied_prompt.or(default_template).unwrap_or_default();
-        let worktree_ref = self.workspaces[ti].worktree_path.as_deref();
-        // Build role → actual-engine map by walking each role's bound session.
-        // Falls back to the workflow TOML's declared engine if no session is
-        // currently bound for that role (e.g. fresh-context roles before first
-        // activation, or pre-launch).
-        let mut role_engines: std::collections::BTreeMap<String, workflow::toml_schema::Engine> =
-            std::collections::BTreeMap::new();
-        for role_name in wf.roles.keys() {
-            let engine = match self.locate_workflow_session(run_id, role_name) {
-                Some((wi, sj)) => engine_for_session_type(
-                    &self.workspaces[wi].sessions[sj].session_type,
-                ),
-                None => wf.roles[role_name].engine.clone(),
-            };
-            role_engines.insert(role_name.clone(), engine);
-        }
-        let resolver = WorkflowResolver {
-            run: &self.workflow_runs[run_idx],
-            worktree_path: worktree_ref,
-            role_engines,
-        };
-        let rendered = workflow::template::render(&template_source, &resolver);
-
-        if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-            self.reset_fresh_session(run_id, ti, si);
-        }
-
-        // Update role_sessions with (possibly new) session_id from the session.
-        let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
-        if let Some(b) = self.workflow_runs[run_idx].role_sessions.get_mut(to_role) {
-            b.current_session_id = current_sid;
-        }
-
-        // Snapshot the target role's current assistant TURN count at activation.
-        // Uses `count_messages` (any assistant JSONL entry counts) so that
-        // downstream the idle gate compares turn-to-turn regardless of whether
-        // the agent's reply contains text, thinking, or tool_use content.
-        let start_count = {
-            let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
-            let session_engine =
-                engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
-            match (self.workspaces[ti].worktree_path.as_deref(), current_sid.as_deref()) {
-                (Some(wt), Some(sid)) => workflow::transcript::count_messages(
-                    &session_engine,
-                    wt,
-                    sid,
-                    workflow::transcript::MessageKind::Assistant,
-                ),
-                _ => 0,
-            }
-        };
-
-        self.workflow_runs[run_idx].activate_role(to_role.to_string(), trigger, start_count);
-        let _ = workflow::run::save(&self.workflow_runs[run_idx]);
-        let from_label = from_role.as_deref().unwrap_or("?");
-        self.set_status_msg(&format!("Workflow: {} → {}", from_label, to_role));
-
-        // Deliver prompt. Trim trailing whitespace first so our explicit "\r"
-        // submit lands on non-newline text — otherwise a trailing "\n" in the
-        // TOML multiline string gets typed into the input box and the "\r"
-        // then only adds another newline instead of submitting. Longer delay
-        // for fresh-context roles because they just received a `/clear` and
-        // need a beat to reset internal state.
-        if !rendered.trim().is_empty() {
-            // Route through Agent::submit_prompt — same PendingWrite shape
-            // as before, but engine-specific knobs (Codex's longer settle
-            // delay, kitty Enter encoding, etc.) live in the Agent impl
-            // rather than scattered through this function.
-            let session_type = self.workspaces[ti].sessions[si].session_type.clone();
-            let label = self.workspaces[ti].sessions[si].label.clone();
-            let body_len = rendered.trim_end().len();
-            log_tick(
-                run_id,
-                &format!(
-                    "fire_transition: activated '{}' queued prompt ({} bytes, fires on quiet PTY) on session '{}'",
-                    to_role, body_len, label,
-                ),
-            );
-            let ws = &mut self.workspaces[ti];
-            let wt = ws.worktree_path.clone().unwrap_or_default();
-            let ts = &mut ws.sessions[si];
-            let ctx = crate::agent::AgentCtxMut {
-                ts,
-                worktree_path: &wt,
-            };
-            let agent = crate::agent::agent_for(&session_type);
-            if let Err(e) = agent.submit_prompt(ctx, &rendered) {
-                log_tick(
-                    run_id,
-                    &format!(
-                        "fire_transition: submit_prompt error on '{}': {}",
-                        label, e
-                    ),
-                );
-            }
-        } else {
-            log_tick(
-                run_id,
-                &format!(
-                    "fire_transition: activated '{}' but rendered prompt was EMPTY — nothing to deliver",
-                    to_role
-                ),
-            );
-        }
-        self.save_session_manifest();
-    }
-
-    /// Queue `/clear` to reset a fresh-context role's agent. Delivery is
-    /// gated on PTY quiet (see `PendingWrite`) so we don't try to type the
-    /// command while the agent is still painting its startup UI — that's
-    /// when `\r` gets buffered into the input box instead of interpreted
-    /// as submit.
-    ///
-    /// Also invalidates the session's bound sid and role baseline because
-    /// claude rotates its transcript file on `/clear`; the new file's sid
-    /// is picked up later by the history.jsonl correlator.
-    fn reset_fresh_session(&mut self, run_id: &str, ti: usize, si: usize) -> bool {
-        let wt = self.workspaces[ti].worktree_path.as_deref().map(|p| p.to_path_buf());
-        let label = self.workspaces[ti].sessions[si].label.clone();
-        let role_label = label.clone();
-        let ts = &mut self.workspaces[ti].sessions[si];
-        if ts.session.exited {
-            log_tick(run_id, &format!("reset_fresh: session '{}' already exited", label));
-            return false;
-        }
-        // Queue /clear to fire when the PTY first goes quiet. Floor of 1s so
-        // we don't fire during the PTY startup noise. Hard deadline 120s in
-        // case the agent never goes quiet.
-        ts.pending_clear = Some(PendingWrite::wait_for_quiet(
-            "/clear".to_string(),
-            true,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            Duration::from_secs(120),
-        ));
-        ts.status = SessionStatus::Idle;
-        // Refresh the pending-jsonl baseline to the current files so the new
-        // file created by /clear shows up as new, and clear session_id so the
-        // detection poll rebinds to it. Without this the detector treats the
-        // pre-/clear file as still bound.
-        ts.pending_jsonl_files = match (ts.session_type.as_str(), wt.as_deref()) {
-            ("claude", Some(wt)) => Some(Self::list_jsonl_files(wt)),
-            ("codex", Some(wt)) => Some(Self::list_codex_sessions(wt)),
-            _ => None,
-        };
-        // Rebind to None — bumps generation so any in-flight transcript
-        // reads see the rebind and reset their cursor offsets to the new
-        // file once the detector picks it up.
-        ts.rebind_transcript(None);
-        ts.pending_prompt = None;
-        // Old file's turn counts no longer apply to the new file — reset the
-        // role's message baseline so templates slice from 0 post-/clear.
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            run.role_baselines.insert(
-                role_label.clone(),
-                workflow::run::MessageBaseline::default(),
-            );
-            if let Some(b) = run.role_sessions.get_mut(&role_label) {
-                b.current_session_id = None;
-            }
-        }
-        self.save_session_manifest();
-        log_tick(
-            run_id,
-            &format!(
-                "reset_fresh: queued /clear for '{}' (fires on first quiet PTY)",
-                label
-            ),
-        );
-        true
-    }
-
-    fn finish_run(&mut self, run_id: &str, reason: String) {
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            run.mark_done(reason.clone());
-            let _ = workflow::run::save(run);
-        }
-        self.set_status_msg(&format!("Workflow done: {}", reason));
+        self.run_workflow_controller(|ctx| ctx.tick());
     }
 
     /// Mark the focused session's workflow run as paused. No-op if the focused
@@ -8635,7 +7953,7 @@ fn format_body_for_delivery(body: &str, term_mode: TermMode) -> Vec<u8> {
 /// Lives in `~/.cm/workflow-runs/<run_id>/tick.log`. Rate-limited to at most
 /// one distinct message per run per second to avoid spamming the file on every
 /// tick of the main loop. Best-effort — ignores all I/O errors.
-fn log_tick(run_id: &str, msg: &str) {
+pub(crate) fn log_tick(run_id: &str, msg: &str) {
     use std::io::Write as _;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};

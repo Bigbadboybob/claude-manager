@@ -5,6 +5,7 @@
 //! idle detection (static transitions from the TOML) or by MCP tool calls the agent makes
 //! (dynamic transitions).
 
+pub mod controller;
 pub mod events;
 pub mod history;
 pub mod run;
