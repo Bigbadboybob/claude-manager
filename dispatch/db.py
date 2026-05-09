@@ -32,21 +32,73 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                    parent_task_id: str | None = None,
                    worktree_mode: str = "inherit",
                    wip_branch: str | None = None) -> dict:
+    """Insert a task. If `slug` collides with an existing row in the same
+    project (idx_tasks_project_slug), auto-increment by appending `-2`,
+    `-3`, ... until a free slot is found.
+
+    Background: archived tasks keep their slug, and the unique index has
+    no status filter, so re-proposing a task with the same name as an
+    archived one used to 500 with a UniqueViolationError. Auto-increment
+    handles both that case AND legitimate concurrent inserts (the second
+    insert hits the constraint, retries, and lands on slug-2).
+    """
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
-                                  status, project, slug, name, description,
-                                  difficulty, depends, source, is_cloud,
-                                  parent_task_id, worktree_mode, wip_branch)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                       $14, $15, $16)
-               RETURNING *""",
-            repo_url, repo_branch, prompt, priority,
-            status, project, slug, name, description,
-            difficulty, depends or [], source, is_cloud,
-            parent_task_id, worktree_mode, wip_branch,
+        # Slug-less rows can't trip the (project, slug) WHERE slug IS NOT
+        # NULL index, so the simple path is fine for them.
+        if slug is None or project is None:
+            row = await conn.fetchrow(
+                """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
+                                      status, project, slug, name, description,
+                                      difficulty, depends, source, is_cloud,
+                                      parent_task_id, worktree_mode, wip_branch)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                           $14, $15, $16)
+                   RETURNING *""",
+                repo_url, repo_branch, prompt, priority,
+                status, project, slug, name, description,
+                difficulty, depends or [], source, is_cloud,
+                parent_task_id, worktree_mode, wip_branch,
+            )
+            return _serialize(dict(row))
+
+        # Slug is set — try the original first, then -2, -3, ... up to a
+        # cap. The cap is defensive; a project legitimately needing 100
+        # variants of the same slug is a sign of something else wrong.
+        max_attempts = 100
+        attempt_slug = slug
+        last_err: Exception | None = None
+        for n in range(max_attempts):
+            try:
+                row = await conn.fetchrow(
+                    """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
+                                          status, project, slug, name, description,
+                                          difficulty, depends, source, is_cloud,
+                                          parent_task_id, worktree_mode, wip_branch)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                               $14, $15, $16)
+                       RETURNING *""",
+                    repo_url, repo_branch, prompt, priority,
+                    status, project, attempt_slug, name, description,
+                    difficulty, depends or [], source, is_cloud,
+                    parent_task_id, worktree_mode, wip_branch,
+                )
+                return _serialize(dict(row))
+            except asyncpg.UniqueViolationError as e:
+                # Only retry on the (project, slug) index. Other unique
+                # violations (e.g. the future tasks_pkey if a UUID
+                # collision ever happened, or any new constraint) should
+                # propagate so the caller sees the real cause.
+                if "idx_tasks_project_slug" not in str(e):
+                    raise
+                last_err = e
+                attempt_slug = f"{slug}-{n + 2}"
+
+        # Should be unreachable in practice — 100 colliding slugs in one
+        # project means something is very wrong upstream.
+        raise RuntimeError(
+            f"add_task: slug collision after {max_attempts} attempts for "
+            f"project={project!r}, base_slug={slug!r}. Last error: {last_err}"
         )
-        return _serialize(dict(row))
 
 
 async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
