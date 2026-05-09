@@ -1760,7 +1760,8 @@ fn serialize_workflow_run(run: &crate::workflow::run::WorkflowRun) -> Value {
                 "last_message": h.last_message,
                 "activated_at": h.activated_at,
                 "deactivated_at": h.deactivated_at,
-                "trigger": format!("{:?}", h.trigger),
+                "trigger": serde_json::to_value(&h.trigger)
+                    .unwrap_or_else(|_| Value::Null),
                 "assistant_count_at_start": h.assistant_count_at_start,
             })
         })

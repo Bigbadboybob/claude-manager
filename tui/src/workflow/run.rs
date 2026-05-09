@@ -21,6 +21,21 @@ pub enum RunStatus {
 }
 
 /// What caused a role's most recent activation.
+///
+/// **Wire shape (stable):** internally tagged on `kind` with `snake_case`
+/// variant names. This is the contract surfaced via the MCP tools
+/// (`list_workflows`, `get_workflow_state`) and persisted in
+/// `state.json` history entries. Renaming a variant or field without a
+/// corresponding `#[serde(rename = ...)]` is a breaking change.
+///
+/// ```json
+/// {"kind": "initial"}
+/// {"kind": "static_idle", "from_role": "worker"}
+/// {"kind": "mcp_transition", "from_role": "manager", "prompt": "...", "event_id": "..."}
+/// ```
+///
+/// The `serialize_trigger_wire_shape` test in this module pins the JSON
+/// for every variant — update it deliberately when the schema changes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerKind {
@@ -428,5 +443,64 @@ mod tests {
         assert_eq!(run.status, RunStatus::Done);
         assert!(run.active_role.is_none());
         assert!(!run.is_active());
+    }
+
+    /// Pins the JSON wire shape that MCP consumers rely on. If you find
+    /// yourself updating this test, you are changing a public contract —
+    /// bump the schema deliberately, don't just retune the assertions.
+    #[test]
+    fn serialize_trigger_wire_shape() {
+        let initial = serde_json::to_value(&TriggerKind::Initial).unwrap();
+        assert_eq!(initial, serde_json::json!({"kind": "initial"}));
+
+        let static_idle = serde_json::to_value(&TriggerKind::StaticIdle {
+            from_role: "worker".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            static_idle,
+            serde_json::json!({"kind": "static_idle", "from_role": "worker"})
+        );
+
+        let mcp = serde_json::to_value(&TriggerKind::McpTransition {
+            from_role: "manager".into(),
+            prompt: "iterate".into(),
+            event_id: "evt_1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            mcp,
+            serde_json::json!({
+                "kind": "mcp_transition",
+                "from_role": "manager",
+                "prompt": "iterate",
+                "event_id": "evt_1",
+            })
+        );
+    }
+
+    /// Round-trip every variant so a careless rename shows up here too.
+    #[test]
+    fn trigger_round_trips_through_json() {
+        let cases = vec![
+            TriggerKind::Initial,
+            TriggerKind::StaticIdle {
+                from_role: "worker".into(),
+            },
+            TriggerKind::McpTransition {
+                from_role: "manager".into(),
+                prompt: "again".into(),
+                event_id: "evt_2".into(),
+            },
+        ];
+        for t in cases {
+            let s = serde_json::to_string(&t).unwrap();
+            let back: TriggerKind = serde_json::from_str(&s).unwrap();
+            // Compare via JSON since TriggerKind doesn't impl PartialEq.
+            assert_eq!(
+                serde_json::to_value(&t).unwrap(),
+                serde_json::to_value(&back).unwrap(),
+            );
+        }
     }
 }
