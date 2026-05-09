@@ -130,6 +130,26 @@ pub fn is_rotation_trigger(display: &str) -> bool {
     d == "/clear" || d == "/compact" || d.starts_with("/clear ") || d.starts_with("/compact ")
 }
 
+/// True if `display` is the redacted placeholder Claude Code writes when a
+/// large/multiline input was pasted.
+///
+/// The newer Claude Code schema stows paste payloads as
+/// `pastedContents.<k>.contentHash` (a hash reference) rather than the
+/// older `.content` (the raw text). When that happens, `display` becomes
+/// `"[Pasted text #N +M lines]"` and we have no text to match against.
+/// Treating the placeholder itself as a correlation signal lets the
+/// `resolve_pending_deliveries` workflow-binding correlator still find a
+/// match using project + delivery-window — which is enough to identify
+/// the right session, since each branch-mode subtask has its own worktree
+/// and only one workflow worker is awaiting binding in it at a time.
+///
+/// Pre-fix, all 5 workflow workers in the overnight cleanup orchestration
+/// got stuck on iteration 1 because their goal prompts were >5 lines, all
+/// triggered paste-redaction, and the prefix match never landed.
+pub fn is_paste_placeholder(display: &str) -> bool {
+    display.starts_with("[Pasted text #")
+}
+
 /// Find the transcript `.jsonl` in `worktree`'s project dir whose earliest
 /// recorded timestamp is at or after `after_ms`. Returns the file stem (sid).
 ///
@@ -286,5 +306,49 @@ mod tests {
         assert!(is_rotation_trigger("/compact some notes"));
         assert!(!is_rotation_trigger("clear this please"));
         assert!(!is_rotation_trigger("/help"));
+    }
+
+    #[test]
+    fn is_paste_placeholder_detects_redacted_pastes() {
+        // Exact form Claude Code writes for redacted pastes (post-2025
+        // schema, as observed in production history.jsonl during the
+        // overnight cleanup orchestration).
+        assert!(is_paste_placeholder("[Pasted text #1 +11 lines]"));
+        assert!(is_paste_placeholder("[Pasted text #2 +27 lines]"));
+        // A paste followed by typed text after — still starts with the
+        // placeholder, still a redacted-paste signal.
+        assert!(is_paste_placeholder(
+            "[Pasted text #1 +5 lines] some trailing typed text"
+        ));
+        // Non-pastes must not match — these are the inputs prefix-match
+        // already handles.
+        assert!(!is_paste_placeholder("Fix two real bugs in the CLI"));
+        assert!(!is_paste_placeholder("/clear"));
+        assert!(!is_paste_placeholder(""));
+    }
+
+    #[test]
+    fn parse_entry_handles_post_2025_paste_schema() {
+        // Real shape observed in ~/.claude/history.jsonl during the
+        // overnight cleanup test: pastedContents carries only
+        // `contentHash`, no `content`. Parser yields paste_content="" —
+        // which is the regression that broke the workflow correlator,
+        // since prefix-match on `display` (the placeholder) and on
+        // `paste_content` (empty) both fail.
+        //
+        // Pin this so a future schema-tightening doesn't silently
+        // re-break the bind path.
+        let line = r#"{"display":"[Pasted text #1 +11 lines]","pastedContents":{"1":{"id":1,"type":"text","contentHash":"d07c78137ebcc578"}},"timestamp":1778301350854,"project":"/home/u/cm/sub","sessionId":"abc"}"#;
+        let parsed = parse_entries(line);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].display, "[Pasted text #1 +11 lines]");
+        assert_eq!(
+            parsed[0].paste_content, "",
+            "no `content` field present — paste_content must be empty"
+        );
+        assert!(
+            is_paste_placeholder(&parsed[0].display),
+            "placeholder detector must catch the new schema's display"
+        );
     }
 }
