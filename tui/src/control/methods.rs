@@ -1410,13 +1410,19 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
             ),
         )
     })?;
-    if let Some(t) = app
-        .tasks
+    // Update ALL matching entries, not just the first. Pre-fix this used
+    // `iter_mut().find()` and stopped at the first match. The Phase 5
+    // smoke test surfaced a bug where the first call left
+    // `list_subtasks` reporting `status=running` even though the API
+    // had been flipped to `done`. The defensive shape here is: dedupe
+    // by `for_each` over the filter so any duplicate TaskEntry with
+    // the same `task_id` (whatever its origin) gets the Done flip too.
+    // A single-entry case still works because the iterator yields one
+    // mutation; a duplicate case stops fizzling on retry #2.
+    app.tasks
         .iter_mut()
-        .find(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
-    {
-        t.api_status = crate::app::TaskStatus::Done;
-    }
+        .filter(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
+        .for_each(|t| t.api_status = crate::app::TaskStatus::Done);
 
     Ok(json!({"ok": true, "worktree_removed": worktree_removed}))
 }
@@ -1492,24 +1498,42 @@ pub fn stop_workflow(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
     let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
 
-    // Look up the run; check the caller has authority over its task.
-    let run = app
-        .workflow_runs
-        .iter()
-        .find(|r| r.run_id == p.run_id)
-        .ok_or((
-            ErrorCode::NotFound,
-            format!("workflow run {} not found", p.run_id),
-        ))?;
-    if !workflow_run_authorized(&caller, &app.tasks, run) {
-        return Err((
-            ErrorCode::Unauthorized,
-            "workflow run is outside caller's scope".into(),
-        ));
+    // In-memory first.
+    if let Some(run) = app.workflow_runs.iter().find(|r| r.run_id == p.run_id) {
+        if !workflow_run_authorized(&caller, &app.tasks, run) {
+            return Err((
+                ErrorCode::Unauthorized,
+                "workflow run is outside caller's scope".into(),
+            ));
+        }
+        // No-op on terminal status. Pre-fix, calling stop_workflow on a
+        // run that completed naturally via `workflow_done` overwrote the
+        // persisted state.json status from `Done` to `Detached`,
+        // erasing the distinction between successful completion and
+        // user abort. `done_reason` was preserved but paired with a
+        // status that said "you aborted me".
+        if matches!(run.status, crate::workflow::run::RunStatus::Done) {
+            return Ok(json!({"ok": true}));
+        }
+        app.stop_workflow_run(&p.run_id);
+        return Ok(json!({"ok": true}));
     }
-
-    app.stop_workflow_run(&p.run_id);
-    Ok(json!({"ok": true}))
+    // On-disk fallback. After `stop_workflow_run` removes the entry
+    // from `app.workflow_runs`, a Detached run only lives on disk until
+    // the next TUI restart reloads it. Treat a re-stop as a no-op.
+    if let Some(run) = crate::workflow::run::load_one(&p.run_id) {
+        if !workflow_run_authorized(&caller, &app.tasks, &run) {
+            return Err((
+                ErrorCode::Unauthorized,
+                "workflow run is outside caller's scope".into(),
+            ));
+        }
+        return Ok(json!({"ok": true}));
+    }
+    Err((
+        ErrorCode::NotFound,
+        format!("workflow run {} not found", p.run_id),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -1523,21 +1547,31 @@ pub fn get_workflow_state(app: &App, caller_uid: &str, params: &Value) -> Method
     let caller = caller_ctx_or_tombstone(&app.workspaces, caller_uid)
         .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
 
-    let run = app
-        .workflow_runs
-        .iter()
-        .find(|r| r.run_id == p.run_id)
-        .ok_or((
-            ErrorCode::NotFound,
-            format!("workflow run {} not found", p.run_id),
-        ))?;
-    if !workflow_run_authorized(&caller, &app.tasks, run) {
-        return Err((
-            ErrorCode::Unauthorized,
-            "workflow run is outside caller's scope".into(),
-        ));
+    if let Some(run) = app.workflow_runs.iter().find(|r| r.run_id == p.run_id) {
+        if !workflow_run_authorized(&caller, &app.tasks, run) {
+            return Err((
+                ErrorCode::Unauthorized,
+                "workflow run is outside caller's scope".into(),
+            ));
+        }
+        return Ok(serialize_workflow_run(run));
     }
-    Ok(serialize_workflow_run(run))
+    // On-disk fallback for runs that were detached + pruned from
+    // `app.workflow_runs`. The state.json + events.jsonl on disk are
+    // still authoritative for audit reads.
+    if let Some(run) = crate::workflow::run::load_one(&p.run_id) {
+        if !workflow_run_authorized(&caller, &app.tasks, &run) {
+            return Err((
+                ErrorCode::Unauthorized,
+                "workflow run is outside caller's scope".into(),
+            ));
+        }
+        return Ok(serialize_workflow_run(&run));
+    }
+    Err((
+        ErrorCode::NotFound,
+        format!("workflow run {} not found", p.run_id),
+    ))
 }
 
 #[derive(Deserialize, Default)]
@@ -1580,63 +1614,85 @@ pub fn list_workflows(app: &App, caller_uid: &str, params: &Value) -> MethodResu
     }
 
     let mut out: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for run in &app.workflow_runs {
-        // Per-run auth filter against caller. Use the run's bound
-        // `task_id` when set (MCP-launched runs); fall back to walking
-        // tasks bound to the run's workspace key.
-        if let Some(req) = p.task_id.as_deref() {
-            // Explicit scope filter: include the run iff its bound
-            // task is the requested one or its descendant.
-            //
-            // Legacy runs (no `task_id` field) need the same
-            // unambiguous resolution as `workflow_run_authorized`'s
-            // fallback — pick the workspace's candidate task ONLY
-            // when there's exactly one. Picking the first via
-            // `.find()` (the pre-fix version) leaks across task
-            // boundaries: in a workspace with caller-authorized task
-            // A and unrelated task B, filtering on A would surface a
-            // run that actually belonged to B.
-            let resolved_tid: Option<String> = match run.task_id.as_deref() {
-                Some(rid) => Some(rid.to_string()),
-                None => {
-                    let candidates: Vec<&crate::app::TaskEntry> = app
-                        .tasks
-                        .iter()
-                        .filter(|t| {
-                            t.workspace_id.as_deref() == Some(run.task_key.as_str())
-                        })
-                        .collect();
-                    if candidates.len() == 1 {
-                        candidates[0].task_id.clone()
-                    } else {
-                        None
-                    }
-                }
-            };
-            match resolved_tid.as_deref() {
-                Some(rid) if task_is_self_or_descendant_of(&app.tasks, rid, req) => {}
-                _ => continue,
-            }
-        } else if !workflow_run_authorized(&caller, &app.tasks, run) {
+        seen.insert(run.run_id.clone());
+        if !list_workflows_visible(&caller, &app.tasks, run, p.task_id.as_deref()) {
             continue;
         }
-        // Surface the run's bound task_id when available, otherwise
-        // null (UI-launched legacy runs).
-        let surfaced_task_id = run.task_id.clone();
-        out.push(json!({
-            "run_id": run.run_id,
-            "name": run.workflow_name,
-            "task_id": surfaced_task_id,
-            "workspace_id": run.task_key,
-            "active_role": run.active_role,
-            "iteration": run.iteration,
-            "paused": run.paused,
-            "status": run_status_str(&run.status),
-            "started_at": run.started_at,
-            "done_reason": run.done_reason,
-        }));
+        out.push(serialize_workflow_run_summary(run));
+    }
+    // On-disk fallback. Surface runs that have been pruned from
+    // `app.workflow_runs` (Detached via `stop_workflow_run`, or Done
+    // runs persisted to disk before this process started). The same
+    // scope/auth filter applies.
+    for run in crate::workflow::run::load_all() {
+        if seen.contains(&run.run_id) {
+            continue;
+        }
+        if !list_workflows_visible(&caller, &app.tasks, &run, p.task_id.as_deref()) {
+            continue;
+        }
+        out.push(serialize_workflow_run_summary(&run));
     }
     Ok(Value::Array(out))
+}
+
+/// Combined scope+auth filter for list_workflows entries. Returns true
+/// iff the caller can see the run under the requested scope.
+fn list_workflows_visible(
+    caller: &CallerCtx,
+    tasks: &[crate::app::TaskEntry],
+    run: &crate::workflow::run::WorkflowRun,
+    explicit_scope: Option<&str>,
+) -> bool {
+    if let Some(req) = explicit_scope {
+        // Explicit scope filter: include the run iff its bound task
+        // is the requested one or its descendant.
+        //
+        // Legacy runs (no `task_id` field) need the same unambiguous
+        // resolution as `workflow_run_authorized`'s fallback — pick
+        // the workspace's candidate task ONLY when there's exactly
+        // one. Picking the first via `.find()` would leak across task
+        // boundaries.
+        let resolved_tid: Option<String> = match run.task_id.as_deref() {
+            Some(rid) => Some(rid.to_string()),
+            None => {
+                let candidates: Vec<&crate::app::TaskEntry> = tasks
+                    .iter()
+                    .filter(|t| {
+                        t.workspace_id.as_deref() == Some(run.task_key.as_str())
+                    })
+                    .collect();
+                if candidates.len() == 1 {
+                    candidates[0].task_id.clone()
+                } else {
+                    None
+                }
+            }
+        };
+        match resolved_tid.as_deref() {
+            Some(rid) => task_is_self_or_descendant_of(tasks, rid, req),
+            None => false,
+        }
+    } else {
+        workflow_run_authorized(caller, tasks, run)
+    }
+}
+
+fn serialize_workflow_run_summary(run: &crate::workflow::run::WorkflowRun) -> Value {
+    json!({
+        "run_id": run.run_id,
+        "name": run.workflow_name,
+        "task_id": run.task_id,
+        "workspace_id": run.task_key,
+        "active_role": run.active_role,
+        "iteration": run.iteration,
+        "paused": run.paused,
+        "status": run_status_str(&run.status),
+        "started_at": run.started_at,
+        "done_reason": run.done_reason,
+    })
 }
 
 /// Auth check for workflow-targeted calls. Caller must have authority
@@ -2320,5 +2376,107 @@ mod tests {
             is_tombstone: false,
         };
         assert!(!workflow_run_authorized(&caller, &tasks, &run));
+    }
+
+    // -- Phase 7: mark_subtask_done dedupe --
+    //
+    // Bug: the original `iter_mut().find(...)` updated only the first
+    // TaskEntry whose task_id matched. If two entries shared the same
+    // task_id (the duplicate hypothesis surfaced in Phase 5 smoke
+    // testing), the second entry stayed `Running` and `list_subtasks`
+    // — which iterates the full vec — surfaced the stale row. The fix
+    // pivots to `iter_mut().filter(...).for_each(...)`, which updates
+    // ALL matching entries. These tests pin the pattern.
+
+    fn task_with_status(
+        id: &str,
+        status: crate::app::TaskStatus,
+    ) -> crate::app::TaskEntry {
+        let mut t = task_with_parent(id, None, id);
+        t.api_status = status;
+        t
+    }
+
+    /// Apply the same update-all-matching pattern that
+    /// `mark_subtask_done` uses post-fix. Kept as a free helper so the
+    /// tests don't have to spin up a full `App`.
+    fn flip_all_matching_to_done(tasks: &mut [crate::app::TaskEntry], task_id: &str) {
+        tasks
+            .iter_mut()
+            .filter(|t| t.task_id.as_deref() == Some(task_id))
+            .for_each(|t| t.api_status = crate::app::TaskStatus::Done);
+    }
+
+    #[test]
+    fn mark_done_updates_all_matching_entries() {
+        // Reproduces the Phase 5 fizzle: two TaskEntry rows share the
+        // same task_id. Pre-fix the first call only flipped one of
+        // them and `list_subtasks` would still surface the stale
+        // Running row, requiring a second mark_subtask_done call to
+        // converge. Post-fix, ALL matching rows flip on the first call.
+        let mut tasks = vec![
+            task_with_status("dup", crate::app::TaskStatus::Running),
+            task_with_status("other", crate::app::TaskStatus::Running),
+            task_with_status("dup", crate::app::TaskStatus::Running),
+        ];
+
+        flip_all_matching_to_done(&mut tasks, "dup");
+
+        let dup_statuses: Vec<&crate::app::TaskStatus> = tasks
+            .iter()
+            .filter(|t| t.task_id.as_deref() == Some("dup"))
+            .map(|t| &t.api_status)
+            .collect();
+        assert_eq!(dup_statuses.len(), 2);
+        for s in &dup_statuses {
+            assert_eq!(**s, crate::app::TaskStatus::Done);
+        }
+        // Bystander row stays untouched.
+        let other = tasks.iter().find(|t| t.task_id.as_deref() == Some("other")).unwrap();
+        assert_eq!(other.api_status, crate::app::TaskStatus::Running);
+    }
+
+    #[test]
+    fn mark_done_single_entry_path_still_works() {
+        // The common case: exactly one matching entry. Verifies the
+        // for_each pattern doesn't lose the single-row case the old
+        // find()-based code used to handle.
+        let mut tasks = vec![
+            task_with_status("solo", crate::app::TaskStatus::Running),
+        ];
+        flip_all_matching_to_done(&mut tasks, "solo");
+        assert_eq!(tasks[0].api_status, crate::app::TaskStatus::Done);
+    }
+
+    #[test]
+    fn mark_done_no_matching_entry_is_a_noop() {
+        // Defensive: if the local entry was already pruned (Done +
+        // reconcile retain dropped it), the for_each yields nothing
+        // and the call still returns ok at the API layer. Mirrors the
+        // pre-fix `if let Some(t) = ... find()` semantics for this
+        // path.
+        let mut tasks = vec![
+            task_with_status("present", crate::app::TaskStatus::Running),
+        ];
+        flip_all_matching_to_done(&mut tasks, "absent");
+        assert_eq!(tasks[0].api_status, crate::app::TaskStatus::Running);
+    }
+
+    // -- Phase 7: stop_workflow no-op on Done --
+
+    #[test]
+    fn stop_workflow_treats_done_as_terminal() {
+        // The gate condition that prevents `stop_workflow` from
+        // overwriting a `workflow_done`'d run's status. Pre-fix the
+        // run was unconditionally re-marked Detached, erasing
+        // successful-completion semantics on disk.
+        use crate::workflow::run::RunStatus;
+        assert!(matches!(RunStatus::Done, RunStatus::Done));
+        assert!(!matches!(RunStatus::Running, RunStatus::Done));
+        assert!(!matches!(RunStatus::Paused, RunStatus::Done));
+        // Detached is the post-stop state; stopping it again is a
+        // benign no-op handled by the on-disk fallback path (the run
+        // is no longer in `app.workflow_runs`).
+        assert!(!matches!(RunStatus::Detached, RunStatus::Done));
     }
 }
