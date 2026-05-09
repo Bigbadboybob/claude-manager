@@ -48,5 +48,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_project_slug
 CREATE INDEX IF NOT EXISTS idx_tasks_project
     ON tasks (project) WHERE project IS NOT NULL;
 
--- Mark all existing tasks as cloud (they were created by the dispatch system).
-UPDATE tasks SET is_cloud = true WHERE is_cloud = false AND worker_vm IS NOT NULL;
+-- The is_cloud backfill that used to live here moved to
+-- 009_004_backfill_marker.sql, which gates it on the migrations_applied
+-- table from 008 so it runs exactly once instead of on every API restart.
