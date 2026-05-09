@@ -232,7 +232,22 @@ async def _probe_warm_vm(vm):
             "grep -c 'ready and waiting' /var/log/cm-worker.log 2>/dev/null || echo 0",
         )
         return (vm, True, output.strip() != "0")
-    except Exception:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        # VM was confirmed alive above; the ready-probe ssh just didn't
+        # complete this tick (timeout, gcloud ssh non-zero exit). The
+        # next pass retries. DEBUG so we don't spam the log.
+        logger.debug(
+            f"Warm VM {vm['vm_name']} ready-probe ssh transient: "
+            f"{type(e).__name__}: {e}"
+        )
+        return (vm, True, False)
+    except Exception as e:
+        # Unknown failure mode — surface it so repeated occurrences are
+        # visible to the operator instead of being silently swallowed.
+        logger.warning(
+            f"Warm VM {vm['vm_name']} ready-probe failed: "
+            f"{type(e).__name__}: {e}"
+        )
         return (vm, True, False)
 
 
@@ -308,13 +323,50 @@ def _launch_warm_vm_sync(wp, vm_name):
 
 
 def _check_vm_alive(vm_name: str) -> bool:
-    """Check if a GCP VM instance exists and is running."""
+    """Check if a GCP VM instance exists and is running.
+
+    Behavior is unchanged: any failure returns False, and the dispatch
+    loop's recovery path (create-a-replacement) keys off that. This
+    function only differentiates *why* the False happened so the
+    operator can tell from /var/log/claude-manager.log whether the
+    daemon is churning replacements for a real reason or because the
+    GCP API is flaky / auth has expired:
+      - NotFound (404)        -> VM truly gone; INFO.
+      - Transient API errors  -> DEBUG; the next tick retries.
+      - Anything else (auth   -> WARNING with class+message so repeated
+        failures, quota, …)      permanent failures are visible.
+    """
     try:
         from google.cloud import compute_v1
+        from google.api_core import exceptions as gax
         client = compute_v1.InstancesClient()
         inst = client.get(project=GCP_PROJECT, zone=GCP_ZONE, instance=vm_name)
         return inst.status == "RUNNING"
-    except Exception:
+    except ImportError as e:
+        # google libs missing/broken — preserve the original catch-all
+        # behavior (return False) but surface it so the operator sees
+        # why every health check is failing instead of a silent churn.
+        # Listed first so later gax-dependent excepts only run when gax
+        # is guaranteed bound.
+        logger.warning(
+            f"VM {vm_name} health check unavailable (gcloud libs): "
+            f"{type(e).__name__}: {e}"
+        )
+        return False
+    except gax.NotFound:
+        logger.info(f"VM {vm_name} gone (404)")
+        return False
+    except (gax.ServiceUnavailable, gax.DeadlineExceeded,
+            gax.InternalServerError, gax.TooManyRequests,
+            gax.RetryError) as e:
+        logger.debug(
+            f"VM {vm_name} transient GCP API error: {type(e).__name__}: {e}"
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            f"VM {vm_name} health check failed: {type(e).__name__}: {e}"
+        )
         return False
 
 
