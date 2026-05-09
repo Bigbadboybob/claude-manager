@@ -191,6 +191,41 @@ pub struct WorkspaceCandidate {
 /// Reduce a repo URL to a comparable form so SSH and HTTPS pointers to the
 /// same repo match. `git@github.com:org/repo.git` and
 /// `https://github.com/org/repo.git` both collapse to `github.com/org/repo`.
+/// Compose the activation text delivered to a worker agent on planning
+/// launch. The agent only sees ONE string at session-spawn time, but
+/// tasks have two natural fields: `description` (background/motivation
+/// for the user reading the planning queue) and `prompt` (instructions
+/// for the agent). We combine both so the agent always has the WHY plus
+/// the HOW, separated by a clear delimiter so a smart worker can ignore
+/// the background if it's irrelevant.
+///
+/// Precedence:
+///   - Both present: "{description}\n\n---\n\n{prompt}"
+///   - Only prompt: prompt verbatim (most common today; older tasks)
+///   - Only description: description verbatim (description-only tasks
+///     are rare but the agent should still get something useful)
+///   - Neither: title fallback (prevents the empty-prompt class of
+///     bug where the worker spawns with nothing to do)
+///
+/// Whitespace-only fields are treated as empty.
+pub(crate) fn compose_launch_prompt(
+    description: &str,
+    prompt: &str,
+    title: &str,
+) -> String {
+    let description = description.trim();
+    let prompt = prompt.trim();
+    if !description.is_empty() && !prompt.is_empty() {
+        format!("{}\n\n---\n\n{}", description, prompt)
+    } else if !prompt.is_empty() {
+        prompt.to_string()
+    } else if !description.is_empty() {
+        description.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
 /// Used when matching task→workspace at launch time, where the task's URL
 /// often comes from `git remote get-url origin` (SSH) and the workspace's
 /// from `~/.cm/projects/*/repo_url` (HTTPS).
@@ -1742,11 +1777,11 @@ impl PlanningView {
                         self.input_mode = PlanInputMode::Normal;
                         if let Some(pd) = self.project_data.get_mut(project_idx) {
                             if let Some(task) = pd.tasks.get_mut(task_idx) {
-                                let prompt = if task.prompt.is_empty() {
-                                    task.title.clone()
-                                } else {
-                                    task.prompt.clone()
-                                };
+                                let prompt = compose_launch_prompt(
+                                    &task.description,
+                                    &task.prompt,
+                                    &task.title,
+                                );
                                 task.status = PlanStatus::InProgress;
                                 return PlanAction::LaunchTaskIntoWorkspace {
                                     workspace_id: ws.workspace_id,
@@ -1781,11 +1816,11 @@ impl PlanningView {
                     if let Some(pd) = self.project_data.get_mut(project_idx) {
                         if let Some(task) = pd.tasks.get_mut(task_idx) {
                             let project = pd.project.name.clone();
-                            let prompt = if task.prompt.is_empty() {
-                                task.title.clone()
-                            } else {
-                                task.prompt.clone()
-                            };
+                            let prompt = compose_launch_prompt(
+                                &task.description,
+                                &task.prompt,
+                                &task.title,
+                            );
                             let slug = task.slug.clone();
                             let branch = if branch_text.trim().is_empty() {
                                 None
@@ -3636,5 +3671,57 @@ mod tests {
             fields.get("depends"),
             Some(&serde_json::json!([] as [String; 0])),
         );
+    }
+
+    // -- compose_launch_prompt --
+
+    #[test]
+    fn compose_includes_both_when_both_present() {
+        // The agent only sees ONE string at spawn. Description carries
+        // background; prompt carries instructions. Combine with a
+        // delimiter so both are visible and the worker can parse out
+        // which is which.
+        let out = compose_launch_prompt(
+            "Background paragraph explaining motivation.",
+            "Step 1: do this. Step 2: do that.",
+            "Title",
+        );
+        assert!(out.starts_with("Background paragraph"), "{out}");
+        assert!(out.contains("\n\n---\n\n"), "delimiter missing: {out}");
+        assert!(out.ends_with("Step 2: do that."), "{out}");
+    }
+
+    #[test]
+    fn compose_falls_back_to_prompt_only_when_no_description() {
+        let out = compose_launch_prompt("", "Just instructions.", "T");
+        assert_eq!(out, "Just instructions.");
+    }
+
+    #[test]
+    fn compose_falls_back_to_description_when_no_prompt() {
+        // Description-only is unusual but possible. Better to ship
+        // SOMETHING to the worker than nothing.
+        let out = compose_launch_prompt("Just background.", "", "T");
+        assert_eq!(out, "Just background.");
+    }
+
+    #[test]
+    fn compose_falls_back_to_title_when_neither() {
+        // Last-resort safety net so the worker never spawns with an
+        // empty prompt — the empty case used to send the agent in
+        // with nothing to do.
+        let out = compose_launch_prompt("", "", "Untitled task");
+        assert_eq!(out, "Untitled task");
+    }
+
+    #[test]
+    fn compose_treats_whitespace_as_empty() {
+        // A description that's all whitespace shouldn't trigger the
+        // "both present" branch and produce a delimiter with nothing
+        // before it.
+        let out = compose_launch_prompt("   \n  ", "real prompt", "T");
+        assert_eq!(out, "real prompt");
+        let out = compose_launch_prompt("real desc", "  \t", "T");
+        assert_eq!(out, "real desc");
     }
 }
