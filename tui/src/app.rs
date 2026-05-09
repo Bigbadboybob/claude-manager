@@ -1019,6 +1019,577 @@ pub enum WorkflowSlotSource {
     New(Engine),
 }
 
+// ── Input handler extraction ────────────────────────────────────────
+//
+// The per-mode arms of `handle_input_event` are implemented as free
+// functions (`handle_<mode>`) so each modal can be unit-tested without
+// booting an `App`. The functions:
+//   - take a `<Mode>Mut<'_>` bag of refs into the `InputMode` variant
+//     payload (so they can mutate cursor position, type characters, etc.),
+//   - take an `InputCtx<'_>` for the read-only context that's needed
+//     across more than one mode (currently just the repo URL list),
+//   - return an `InputOutcome` describing the post-condition.
+// The dispatcher (`handle_input_event`) translates the outcome into
+// app-level state changes (mode swap, side-effect dispatch).
+
+/// Read-only context handlers may need to make decisions. The whole-App
+/// reference is too coarse — only fields actually needed by some handler
+/// land here. The dispatcher builds this fresh per call.
+pub(crate) struct InputCtx<'a> {
+    /// Repo URLs in the user's config, sorted by repo name. Used by
+    /// `handle_new_session` to cycle the repo picker (←/→).
+    pub repo_urls: &'a [String],
+}
+
+/// Post-condition signal from a per-mode handler back to the dispatcher.
+/// Handlers stay pure-ish: they mutate their own mode payload in place
+/// (typing characters, cycling fields) and surface app-level transitions
+/// through this enum.
+#[derive(Debug, Clone)]
+pub(crate) enum InputOutcome {
+    /// Event handled by the modal; no app-level state change.
+    Consumed,
+    /// Event was not for any modal — fall through to terminal/app keys.
+    /// Only `InputMode::Normal` returns this.
+    Ignored,
+    /// Reset `input_mode` to `Normal`. Used by Esc / explicit cancels.
+    Cancel,
+    /// Reset `input_mode` to `Normal` AND fire a side effect.
+    Submit(SubmitAction),
+}
+
+/// Side effects requested by a `Submit` outcome. The dispatcher matches
+/// on this and invokes the relevant `App` method; the handlers
+/// themselves never see `&mut App`.
+#[derive(Debug, Clone)]
+pub(crate) enum SubmitAction {
+    /// Submit attempted but the inputs produced no work to do (e.g.
+    /// empty workspace name, no workflow selected). Modal still closes.
+    None,
+    CreateLocalSession {
+        repo_url: String,
+        label: String,
+        branch: Option<String>,
+        idle_timeout_secs: u16,
+    },
+    SpawnSessionOnWorkspace {
+        ws_index: usize,
+        session_type: String,
+        task_id: Option<String>,
+    },
+    SaveSessionSettings {
+        ws_index: usize,
+        session_index: usize,
+        name: String,
+        idle_timeout: u16,
+        burst_threshold: u16,
+        hidden: bool,
+        notify_on_idle: bool,
+    },
+    SaveWorkspaceName {
+        ws_index: usize,
+        name: String,
+    },
+    SaveTaskName {
+        task_id: String,
+        name: String,
+    },
+    EnterWorkflowLaunchConfirm {
+        ws_index: usize,
+        focused_si: Option<usize>,
+        workflow_name: String,
+    },
+    LaunchWorkflow {
+        ws_index: usize,
+        workflow_name: String,
+        slots: Vec<WorkflowSlotChoice>,
+        goal: Option<String>,
+    },
+    MarkActiveDone,
+    DeleteActive,
+    StopWorkflow {
+        run_id: String,
+    },
+}
+
+// Per-mode mutable-ref bags. Each handler takes its own bag so the
+// dispatcher can split the borrow on `&mut self.input_mode` and pass
+// only the variant payload through.
+
+pub(crate) struct NewSessionMut<'a> {
+    pub label_text: &'a mut String,
+    pub branch_text: &'a mut String,
+    pub idle_timeout_text: &'a mut String,
+    pub repo_url: &'a mut String,
+    pub active_field: &'a mut u8,
+}
+
+pub(crate) struct NewTerminalSessionMut<'a> {
+    pub ws_index: usize,
+    pub session_type: &'a mut String,
+    pub task_id: &'a Option<String>,
+}
+
+pub(crate) struct SessionSettingsMut<'a> {
+    pub ws_index: usize,
+    pub session_index: usize,
+    pub name: &'a mut String,
+    pub idle_timeout: &'a mut String,
+    pub burst_threshold: &'a mut String,
+    pub hidden: &'a mut bool,
+    pub notify_on_idle: &'a mut bool,
+    pub active_field: &'a mut u8,
+}
+
+pub(crate) struct WorkspaceSettingsMut<'a> {
+    pub ws_index: usize,
+    pub name: &'a mut String,
+}
+
+pub(crate) struct TaskSettingsMut<'a> {
+    pub task_id: &'a str,
+    pub name: &'a mut String,
+}
+
+pub(crate) struct WorkflowLaunchConfirmMut<'a> {
+    pub ws_index: usize,
+    pub workflow_name: &'a str,
+    pub slots: &'a mut Vec<WorkflowSlotChoice>,
+    pub active_slot: &'a mut usize,
+    pub goal: &'a mut String,
+}
+
+pub(crate) struct WorkflowPickerMut<'a> {
+    pub ws_index: usize,
+    pub focused_si: Option<usize>,
+    pub names: &'a [String],
+    pub selected: &'a mut usize,
+}
+
+pub(crate) fn handle_new_session(
+    state: NewSessionMut<'_>,
+    ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Tab => {
+            *state.active_field = (*state.active_field + 1) % 4;
+            InputOutcome::Consumed
+        }
+        KeyCode::BackTab => {
+            *state.active_field = if *state.active_field == 0 {
+                3
+            } else {
+                *state.active_field - 1
+            };
+            InputOutcome::Consumed
+        }
+        KeyCode::Left | KeyCode::Right if *state.active_field == 0 => {
+            if let Some(cur) = ctx.repo_urls.iter().position(|u| u == state.repo_url) {
+                let n = ctx.repo_urls.len();
+                let next = if matches!(key.code, KeyCode::Right) {
+                    (cur + 1) % n
+                } else {
+                    (cur + n - 1) % n
+                };
+                *state.repo_url = ctx.repo_urls[next].clone();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => {
+            if !state.label_text.trim().is_empty() {
+                let branch = if state.branch_text.trim().is_empty() {
+                    None
+                } else {
+                    Some(state.branch_text.clone())
+                };
+                let timeout = state
+                    .idle_timeout_text
+                    .parse::<u16>()
+                    .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+                InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                    repo_url: state.repo_url.clone(),
+                    label: state.label_text.clone(),
+                    branch,
+                    idle_timeout_secs: timeout,
+                })
+            } else {
+                InputOutcome::Consumed
+            }
+        }
+        KeyCode::Backspace => {
+            match *state.active_field {
+                1 => {
+                    state.label_text.pop();
+                }
+                2 => {
+                    state.branch_text.pop();
+                }
+                3 => {
+                    state.idle_timeout_text.pop();
+                }
+                _ => {}
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            match *state.active_field {
+                1 => state.label_text.push(c),
+                2 => state.branch_text.push(c),
+                3 => {
+                    if c.is_ascii_digit() {
+                        state.idle_timeout_text.push(c);
+                    }
+                }
+                _ => {}
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_new_terminal_session(
+    state: NewTerminalSessionMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Char('j') | KeyCode::Tab | KeyCode::Down => {
+            *state.session_type = match state.session_type.as_str() {
+                "claude" => "codex".to_string(),
+                "codex" => "bash".to_string(),
+                _ => "claude".to_string(),
+            };
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Up => {
+            *state.session_type = match state.session_type.as_str() {
+                "claude" => "bash".to_string(),
+                "bash" => "codex".to_string(),
+                _ => "claude".to_string(),
+            };
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
+            ws_index: state.ws_index,
+            session_type: state.session_type.clone(),
+            task_id: state.task_id.clone(),
+        }),
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_session_settings(
+    state: SessionSettingsMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 1) % 5;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') if *state.active_field == 3 => {
+            *state.hidden = !*state.hidden;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') if *state.active_field == 4 => {
+            *state.notify_on_idle = !*state.notify_on_idle;
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => {
+            let new_timeout = state
+                .idle_timeout
+                .parse::<u16>()
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+            let new_burst = state
+                .burst_threshold
+                .parse::<u16>()
+                .unwrap_or(WAKEUP_BURST_THRESHOLD as u16)
+                .max(1);
+            InputOutcome::Submit(SubmitAction::SaveSessionSettings {
+                ws_index: state.ws_index,
+                session_index: state.session_index,
+                name: state.name.clone(),
+                idle_timeout: new_timeout,
+                burst_threshold: new_burst,
+                hidden: *state.hidden,
+                notify_on_idle: *state.notify_on_idle,
+            })
+        }
+        KeyCode::Backspace => {
+            match *state.active_field {
+                0 => {
+                    state.name.pop();
+                }
+                1 => {
+                    state.idle_timeout.pop();
+                }
+                2 => {
+                    state.burst_threshold.pop();
+                }
+                _ => {}
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            match *state.active_field {
+                0 => state.name.push(c),
+                1 => {
+                    if c.is_ascii_digit() {
+                        state.idle_timeout.push(c);
+                    }
+                }
+                2 => {
+                    if c.is_ascii_digit() {
+                        state.burst_threshold.push(c);
+                    }
+                }
+                _ => {}
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_workspace_settings(
+    state: WorkspaceSettingsMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveWorkspaceName {
+            ws_index: state.ws_index,
+            name: state.name.trim().to_string(),
+        }),
+        KeyCode::Backspace => {
+            state.name.pop();
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            state.name.push(c);
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_task_settings(
+    state: TaskSettingsMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
+            task_id: state.task_id.to_string(),
+            name: state.name.trim().to_string(),
+        }),
+        KeyCode::Backspace => {
+            state.name.pop();
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            state.name.push(c);
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_workflow_launch_confirm(
+    state: WorkflowLaunchConfirmMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    // `active_slot == slots.len()` means the goal text field is focused;
+    // typing goes there instead of cycling slots.
+    let goal_focused = *state.active_slot == state.slots.len();
+    let positions = state.slots.len() + 1;
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => {
+            let goal_owned = state.goal.trim().to_string();
+            let goal_opt = if goal_owned.is_empty() {
+                None
+            } else {
+                Some(goal_owned)
+            };
+            InputOutcome::Submit(SubmitAction::LaunchWorkflow {
+                ws_index: state.ws_index,
+                workflow_name: state.workflow_name.to_string(),
+                slots: state.slots.clone(),
+                goal: goal_opt,
+            })
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            *state.active_slot = (*state.active_slot + 1) % positions;
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            *state.active_slot = if *state.active_slot == 0 {
+                positions - 1
+            } else {
+                *state.active_slot - 1
+            };
+            InputOutcome::Consumed
+        }
+        KeyCode::Right => {
+            if !goal_focused {
+                if let Some(slot) = state.slots.get_mut(*state.active_slot) {
+                    slot.cycle(1);
+                }
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Left => {
+            if !goal_focused {
+                if let Some(slot) = state.slots.get_mut(*state.active_slot) {
+                    slot.cycle(-1);
+                }
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Backspace => {
+            if goal_focused {
+                state.goal.pop();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            if goal_focused {
+                state.goal.push(c);
+            } else {
+                // Slot navigation shorthands (only when the goal field
+                // isn't focused, so characters in the goal don't get
+                // consumed as commands).
+                match c {
+                    'j' => *state.active_slot = (*state.active_slot + 1) % positions,
+                    'k' => {
+                        *state.active_slot = if *state.active_slot == 0 {
+                            positions - 1
+                        } else {
+                            *state.active_slot - 1
+                        };
+                    }
+                    'l' | ' ' => {
+                        if let Some(slot) = state.slots.get_mut(*state.active_slot) {
+                            slot.cycle(1);
+                        }
+                    }
+                    'h' => {
+                        if let Some(slot) = state.slots.get_mut(*state.active_slot) {
+                            slot.cycle(-1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_workflow_picker(
+    state: WorkflowPickerMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => match state.names.get(*state.selected).cloned() {
+            Some(wf_name) => {
+                InputOutcome::Submit(SubmitAction::EnterWorkflowLaunchConfirm {
+                    ws_index: state.ws_index,
+                    focused_si: state.focused_si,
+                    workflow_name: wf_name,
+                })
+            }
+            None => InputOutcome::Submit(SubmitAction::None),
+        },
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+            if !state.names.is_empty() {
+                *state.selected = (*state.selected + 1) % state.names.len();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+            if !state.names.is_empty() {
+                *state.selected = if *state.selected == 0 {
+                    state.names.len() - 1
+                } else {
+                    *state.selected - 1
+                };
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_workflow_history(
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => InputOutcome::Cancel,
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_confirm(
+    action: &ConfirmAction,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            let submit = match action.clone() {
+                ConfirmAction::MarkDone => SubmitAction::MarkActiveDone,
+                ConfirmAction::Delete => SubmitAction::DeleteActive,
+                ConfirmAction::StopWorkflow { run_id } => SubmitAction::StopWorkflow { run_id },
+            };
+            InputOutcome::Submit(submit)
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => InputOutcome::Cancel,
+        _ => InputOutcome::Consumed,
+    }
+}
+
 pub struct App {
     pub tasks: Vec<TaskEntry>,
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
@@ -3889,444 +4460,235 @@ impl App {
 
     /// Handle events while in input mode.
     fn handle_input_event(&mut self, event: &CrosstermEvent) -> bool {
-        if let CrosstermEvent::Key(key) = event {
-            match &mut self.input_mode {
-                InputMode::Normal => return false,
-                InputMode::NewSession {
+        // Non-Key events (resize, focus, etc.) match pre-extraction
+        // behavior: while in any non-Normal input mode, the event is
+        // absorbed by the modal.
+        if !matches!(event, CrosstermEvent::Key(_)) {
+            return true;
+        }
+        let urls = sorted_repo_urls(&self.config.repos);
+        let outcome = match &mut self.input_mode {
+            InputMode::Normal => InputOutcome::Ignored,
+            InputMode::NewSession {
+                label_text,
+                branch_text,
+                idle_timeout_text,
+                repo_url,
+                active_field,
+            } => handle_new_session(
+                NewSessionMut {
                     label_text,
                     branch_text,
                     idle_timeout_text,
                     repo_url,
                     active_field,
-                } => match key.code {
-                    KeyCode::Esc => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    KeyCode::Tab => {
-                        *active_field = (*active_field + 1) % 4;
-                        return true;
-                    }
-                    KeyCode::BackTab => {
-                        *active_field = if *active_field == 0 { 3 } else { *active_field - 1 };
-                        return true;
-                    }
-                    KeyCode::Left | KeyCode::Right if *active_field == 0 => {
-                        // Direct field access (`&self.config.repos`) lets the
-                        // borrow checker split the borrow vs `&mut self.input_mode`.
-                        let urls = sorted_repo_urls(&self.config.repos);
-                        if let Some(cur) = urls.iter().position(|u| u == repo_url) {
-                            let n = urls.len();
-                            let next = if matches!(key.code, KeyCode::Right) {
-                                (cur + 1) % n
-                            } else {
-                                (cur + n - 1) % n
-                            };
-                            *repo_url = urls[next].clone();
-                        }
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        if !label_text.trim().is_empty() {
-                            let label = label_text.clone();
-                            let repo = repo_url.clone();
-                            let branch = if branch_text.trim().is_empty() {
-                                None
-                            } else {
-                                Some(branch_text.clone())
-                            };
-                            let timeout = idle_timeout_text.parse::<u16>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-                            self.input_mode = InputMode::Normal;
-                            self.create_local_session(
-                                &repo,
-                                &label,
-                                branch.as_deref(),
-                                timeout,
-                            );
-                        }
-                        return true;
-                    }
-                    KeyCode::Backspace => {
-                        match *active_field {
-                            1 => { label_text.pop(); }
-                            2 => { branch_text.pop(); }
-                            3 => { idle_timeout_text.pop(); }
-                            _ => {}
-                        }
-                        return true;
-                    }
-                    KeyCode::Char(c) => {
-                        match *active_field {
-                            1 => label_text.push(c),
-                            2 => branch_text.push(c),
-                            3 => { if c.is_ascii_digit() { idle_timeout_text.push(c); } }
-                            _ => {}
-                        }
-                        return true;
-                    }
-                    _ => return true,
                 },
-                InputMode::NewTerminalSession {
-                    ws_index,
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::NewTerminalSession {
+                ws_index,
+                session_type,
+                task_id,
+            } => handle_new_terminal_session(
+                NewTerminalSessionMut {
+                    ws_index: *ws_index,
                     session_type,
                     task_id,
-                } => match key.code {
-                    KeyCode::Esc => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    KeyCode::Char('j') | KeyCode::Tab | KeyCode::Down => {
-                        *session_type = match session_type.as_str() {
-                            "claude" => "codex".to_string(),
-                            "codex" => "bash".to_string(),
-                            _ => "claude".to_string(),
-                        };
-                        return true;
-                    }
-                    KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Up => {
-                        *session_type = match session_type.as_str() {
-                            "claude" => "bash".to_string(),
-                            "bash" => "codex".to_string(),
-                            _ => "claude".to_string(),
-                        };
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        let wi = *ws_index;
-                        let st = session_type.clone();
-                        let tid = task_id.clone();
-                        self.input_mode = InputMode::Normal;
-                        self.spawn_session_on_workspace(wi, &st, tid);
-                        return true;
-                    }
-                    _ => return true,
                 },
-                InputMode::SessionSettings {
-                    ws_index,
-                    session_index,
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::SessionSettings {
+                ws_index,
+                session_index,
+                name,
+                idle_timeout,
+                burst_threshold,
+                hidden,
+                notify_on_idle,
+                active_field,
+            } => handle_session_settings(
+                SessionSettingsMut {
+                    ws_index: *ws_index,
+                    session_index: *session_index,
                     name,
                     idle_timeout,
                     burst_threshold,
                     hidden,
                     notify_on_idle,
                     active_field,
-                } => match key.code {
-                    KeyCode::Esc => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    KeyCode::Tab | KeyCode::BackTab => {
-                        *active_field = (*active_field + 1) % 5;
-                        return true;
-                    }
-                    KeyCode::Char(' ') if *active_field == 3 => {
-                        *hidden = !*hidden;
-                        return true;
-                    }
-                    KeyCode::Char(' ') if *active_field == 4 => {
-                        *notify_on_idle = !*notify_on_idle;
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        let wi = *ws_index;
-                        let si = *session_index;
-                        let new_name = name.clone();
-                        let new_timeout = idle_timeout.parse::<u16>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
-                        let new_burst = burst_threshold
-                            .parse::<u16>()
-                            .unwrap_or(WAKEUP_BURST_THRESHOLD as u16)
-                            .max(1);
-                        let new_hidden = *hidden;
-                        let new_notify = *notify_on_idle;
-                        self.input_mode = InputMode::Normal;
-                        if let Some(ws) = self.workspaces.get_mut(wi) {
-                            if let Some(ts) = ws.sessions.get_mut(si) {
-                                if !new_name.trim().is_empty() {
-                                    ts.label = new_name;
-                                }
-                                ts.idle_timeout_secs = new_timeout;
-                                ts.burst_threshold = new_burst;
-                                ts.hidden = new_hidden;
-                                ts.notify_on_idle = new_notify;
-                            }
-                        }
-                        self.save_session_manifest();
-                        self.set_status_msg("Settings saved");
-                        return true;
-                    }
-                    KeyCode::Backspace => {
-                        match *active_field {
-                            0 => { name.pop(); }
-                            1 => { idle_timeout.pop(); }
-                            2 => { burst_threshold.pop(); }
-                            _ => {}
-                        }
-                        return true;
-                    }
-                    KeyCode::Char(c) => {
-                        match *active_field {
-                            0 => name.push(c),
-                            1 => {
-                                if c.is_ascii_digit() { idle_timeout.push(c); }
-                            }
-                            2 => {
-                                if c.is_ascii_digit() { burst_threshold.push(c); }
-                            }
-                            _ => {}
-                        }
-                        return true;
-                    }
-                    _ => return true,
                 },
-                InputMode::WorkspaceSettings { ws_index, name } => match key.code {
-                    KeyCode::Esc => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        let wi = *ws_index;
-                        let new_name = name.trim().to_string();
-                        self.input_mode = InputMode::Normal;
-                        if !new_name.is_empty() {
-                            if let Some(ws) = self.workspaces.get_mut(wi) {
-                                ws.name = new_name;
-                            }
-                            self.save_session_manifest();
-                            self.set_status_msg("Workspace renamed");
-                        }
-                        return true;
-                    }
-                    KeyCode::Backspace => {
-                        name.pop();
-                        return true;
-                    }
-                    KeyCode::Char(c) => {
-                        name.push(c);
-                        return true;
-                    }
-                    _ => return true,
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::WorkspaceSettings { ws_index, name } => handle_workspace_settings(
+                WorkspaceSettingsMut {
+                    ws_index: *ws_index,
+                    name,
                 },
-                InputMode::TaskSettings { task_id, name } => match key.code {
-                    KeyCode::Esc => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        let tid = task_id.clone();
-                        let new_name = name.trim().to_string();
-                        self.input_mode = InputMode::Normal;
-                        if !new_name.is_empty() {
-                            if let Some(task) = self
-                                .tasks
-                                .iter_mut()
-                                .find(|t| t.task_id.as_deref() == Some(tid.as_str()))
-                            {
-                                task.name = new_name.clone();
-                            }
-                            let mut fields = HashMap::new();
-                            fields.insert(
-                                "name".to_string(),
-                                serde_json::Value::String(new_name),
-                            );
-                            self.backend.update_plan_task(tid, fields);
-                            self.set_status_msg("Task renamed");
-                        }
-                        return true;
-                    }
-                    KeyCode::Backspace => {
-                        name.pop();
-                        return true;
-                    }
-                    KeyCode::Char(c) => {
-                        name.push(c);
-                        return true;
-                    }
-                    _ => return true,
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::TaskSettings { task_id, name } => handle_task_settings(
+                TaskSettingsMut {
+                    task_id: task_id.as_str(),
+                    name,
                 },
-                InputMode::WorkflowLaunchConfirm {
-                    ws_index,
-                    workflow_name,
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::WorkflowLaunchConfirm {
+                ws_index,
+                workflow_name,
+                slots,
+                active_slot,
+                goal,
+            } => handle_workflow_launch_confirm(
+                WorkflowLaunchConfirmMut {
+                    ws_index: *ws_index,
+                    workflow_name: workflow_name.as_str(),
                     slots,
                     active_slot,
                     goal,
-                } => {
-                    // `active_slot == slots.len()` means the goal text field
-                    // is focused; typing goes there instead of cycling slots.
-                    let goal_focused = *active_slot == slots.len();
-                    let positions = slots.len() + 1;
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.input_mode = InputMode::Normal;
-                            return true;
-                        }
-                        KeyCode::Enter => {
-                            let wi = *ws_index;
-                            let wf_name = workflow_name.clone();
-                            let slots_owned = slots.clone();
-                            let goal_owned = goal.trim().to_string();
-                            self.input_mode = InputMode::Normal;
-                            let goal_opt = if goal_owned.is_empty() {
-                                None
-                            } else {
-                                Some(goal_owned)
-                            };
-                            self.launch_workflow(wi, &wf_name, slots_owned, goal_opt);
-                            return true;
-                        }
-                        KeyCode::Down | KeyCode::Tab => {
-                            *active_slot = (*active_slot + 1) % positions;
-                            return true;
-                        }
-                        KeyCode::Up | KeyCode::BackTab => {
-                            *active_slot = if *active_slot == 0 {
-                                positions - 1
-                            } else {
-                                *active_slot - 1
-                            };
-                            return true;
-                        }
-                        KeyCode::Right => {
-                            if !goal_focused {
-                                if let Some(slot) = slots.get_mut(*active_slot) {
-                                    slot.cycle(1);
-                                }
-                            }
-                            return true;
-                        }
-                        KeyCode::Left => {
-                            if !goal_focused {
-                                if let Some(slot) = slots.get_mut(*active_slot) {
-                                    slot.cycle(-1);
-                                }
-                            }
-                            return true;
-                        }
-                        KeyCode::Backspace => {
-                            if goal_focused {
-                                goal.pop();
-                            }
-                            return true;
-                        }
-                        KeyCode::Char(c) => {
-                            if goal_focused {
-                                goal.push(c);
-                            } else {
-                                // Slot navigation shorthands (only when the
-                                // goal field isn't focused, so characters
-                                // in the goal don't get consumed as commands).
-                                match c {
-                                    'j' => *active_slot = (*active_slot + 1) % positions,
-                                    'k' => {
-                                        *active_slot = if *active_slot == 0 {
-                                            positions - 1
-                                        } else {
-                                            *active_slot - 1
-                                        };
-                                    }
-                                    'l' | ' ' => {
-                                        if let Some(slot) = slots.get_mut(*active_slot) {
-                                            slot.cycle(1);
-                                        }
-                                    }
-                                    'h' => {
-                                        if let Some(slot) = slots.get_mut(*active_slot) {
-                                            slot.cycle(-1);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            return true;
-                        }
-                        _ => return true,
-                    }
-                }
-                InputMode::WorkflowPicker {
-                    ws_index,
-                    focused_si,
+                },
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::WorkflowPicker {
+                ws_index,
+                focused_si,
+                names,
+                selected,
+            } => handle_workflow_picker(
+                WorkflowPickerMut {
+                    ws_index: *ws_index,
+                    focused_si: *focused_si,
                     names,
                     selected,
-                } => {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.input_mode = InputMode::Normal;
-                            return true;
-                        }
-                        KeyCode::Enter => {
-                            let Some(wf_name) = names.get(*selected).cloned() else {
-                                self.input_mode = InputMode::Normal;
-                                return true;
-                            };
-                            let wi = *ws_index;
-                            let fs = *focused_si;
-                            self.input_mode = InputMode::Normal;
-                            self.enter_workflow_launch_confirm(wi, fs, wf_name);
-                            return true;
-                        }
-                        KeyCode::Down | KeyCode::Tab => {
-                            if !names.is_empty() {
-                                *selected = (*selected + 1) % names.len();
-                            }
-                            return true;
-                        }
-                        KeyCode::Up | KeyCode::BackTab => {
-                            if !names.is_empty() {
-                                *selected = if *selected == 0 {
-                                    names.len() - 1
-                                } else {
-                                    *selected - 1
-                                };
-                            }
-                            return true;
-                        }
-                        KeyCode::Char('j') => {
-                            if !names.is_empty() {
-                                *selected = (*selected + 1) % names.len();
-                            }
-                            return true;
-                        }
-                        KeyCode::Char('k') => {
-                            if !names.is_empty() {
-                                *selected = if *selected == 0 {
-                                    names.len() - 1
-                                } else {
-                                    *selected - 1
-                                };
-                            }
-                            return true;
-                        }
-                        _ => return true,
-                    }
-                }
-                InputMode::WorkflowHistory { run_id: _ } => match key.code {
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    _ => return true,
                 },
-                InputMode::Confirm { action, .. } => match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                        let action = action.clone();
-                        self.input_mode = InputMode::Normal;
-                        match action {
-                            ConfirmAction::MarkDone => self.mark_active_done(),
-                            ConfirmAction::Delete => self.delete_active(),
-                            ConfirmAction::StopWorkflow { run_id } => {
-                                self.stop_workflow_run(&run_id);
-                            }
-                        }
-                        return true;
-                    }
-                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                        self.input_mode = InputMode::Normal;
-                        return true;
-                    }
-                    _ => return true,
-                },
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
+            InputMode::WorkflowHistory { run_id: _ } => {
+                handle_workflow_history(InputCtx { repo_urls: &urls }, event)
+            }
+            InputMode::Confirm { action, .. } => {
+                handle_confirm(action, InputCtx { repo_urls: &urls }, event)
+            }
+        };
+        self.apply_input_outcome(outcome)
+    }
+
+    /// Apply a handler's outcome to App state. Returns whether the event
+    /// was consumed by an input modal (matches the legacy `bool` return
+    /// of `handle_input_event` — `false` means "fall through to terminal/
+    /// app keybindings", which only happens in `InputMode::Normal`).
+    fn apply_input_outcome(&mut self, outcome: InputOutcome) -> bool {
+        match outcome {
+            InputOutcome::Ignored => false,
+            InputOutcome::Consumed => true,
+            InputOutcome::Cancel => {
+                self.input_mode = InputMode::Normal;
+                true
+            }
+            InputOutcome::Submit(action) => {
+                self.input_mode = InputMode::Normal;
+                self.apply_submit_action(action);
+                true
             }
         }
-        true
+    }
+
+    fn apply_submit_action(&mut self, action: SubmitAction) {
+        match action {
+            SubmitAction::None => {}
+            SubmitAction::CreateLocalSession {
+                repo_url,
+                label,
+                branch,
+                idle_timeout_secs,
+            } => {
+                self.create_local_session(
+                    &repo_url,
+                    &label,
+                    branch.as_deref(),
+                    idle_timeout_secs,
+                );
+            }
+            SubmitAction::SpawnSessionOnWorkspace {
+                ws_index,
+                session_type,
+                task_id,
+            } => {
+                self.spawn_session_on_workspace(ws_index, &session_type, task_id);
+            }
+            SubmitAction::SaveSessionSettings {
+                ws_index,
+                session_index,
+                name,
+                idle_timeout,
+                burst_threshold,
+                hidden,
+                notify_on_idle,
+            } => {
+                if let Some(ws) = self.workspaces.get_mut(ws_index) {
+                    if let Some(ts) = ws.sessions.get_mut(session_index) {
+                        if !name.trim().is_empty() {
+                            ts.label = name;
+                        }
+                        ts.idle_timeout_secs = idle_timeout;
+                        ts.burst_threshold = burst_threshold;
+                        ts.hidden = hidden;
+                        ts.notify_on_idle = notify_on_idle;
+                    }
+                }
+                self.save_session_manifest();
+                self.set_status_msg("Settings saved");
+            }
+            SubmitAction::SaveWorkspaceName { ws_index, name } => {
+                if !name.is_empty() {
+                    if let Some(ws) = self.workspaces.get_mut(ws_index) {
+                        ws.name = name;
+                    }
+                    self.save_session_manifest();
+                    self.set_status_msg("Workspace renamed");
+                }
+            }
+            SubmitAction::SaveTaskName { task_id, name } => {
+                if !name.is_empty() {
+                    if let Some(task) = self
+                        .tasks
+                        .iter_mut()
+                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+                    {
+                        task.name = name.clone();
+                    }
+                    let mut fields = HashMap::new();
+                    fields.insert("name".to_string(), serde_json::Value::String(name));
+                    self.backend.update_plan_task(task_id, fields);
+                    self.set_status_msg("Task renamed");
+                }
+            }
+            SubmitAction::EnterWorkflowLaunchConfirm {
+                ws_index,
+                focused_si,
+                workflow_name,
+            } => {
+                self.enter_workflow_launch_confirm(ws_index, focused_si, workflow_name);
+            }
+            SubmitAction::LaunchWorkflow {
+                ws_index,
+                workflow_name,
+                slots,
+                goal,
+            } => {
+                self.launch_workflow(ws_index, &workflow_name, slots, goal);
+            }
+            SubmitAction::MarkActiveDone => self.mark_active_done(),
+            SubmitAction::DeleteActive => self.delete_active(),
+            SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
+        }
     }
 
     // ── Session management ──────────────────────────────────────────
@@ -9065,6 +9427,736 @@ mod entry_matches_delivery_tests {
             session_id,
             paste_content,
         }]
+    }
+}
+
+#[cfg(test)]
+mod input_handler_tests {
+    //! Per-mode handler tests. Each input mode is exercised through its
+    //! free `handle_<mode>` function with synthesized `CrosstermEvent::Key`
+    //! events — no `App`, no PTY, no terminal. Behaviors pinned here:
+    //!   - ESC → InputOutcome::Cancel (closes the modal),
+    //!   - ENTER → InputOutcome::Submit(...) (close + side effect),
+    //!   - BACKSPACE → mode-payload buffer mutated in place.
+    //! These guard the behavior contract that pre-extraction was only
+    //! enforced by the call site of `handle_input_event`.
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> CrosstermEvent {
+        CrosstermEvent::Key(KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    fn ctx_no_repos<'a>() -> InputCtx<'a> {
+        InputCtx { repo_urls: &[] }
+    }
+
+    fn assert_consumed(o: &InputOutcome) {
+        assert!(
+            matches!(o, InputOutcome::Consumed),
+            "expected Consumed, got {:?}",
+            o
+        );
+    }
+
+    fn assert_cancel(o: &InputOutcome) {
+        assert!(
+            matches!(o, InputOutcome::Cancel),
+            "expected Cancel, got {:?}",
+            o
+        );
+    }
+
+    // ── NewSession ────────────────────────────────────────────────
+
+    fn new_session_state(
+        label: &str,
+        branch: &str,
+        timeout: &str,
+        repo: &str,
+        active: u8,
+    ) -> (String, String, String, String, u8) {
+        (
+            label.to_string(),
+            branch.to_string(),
+            timeout.to_string(),
+            repo.to_string(),
+            active,
+        )
+    }
+
+    #[test]
+    fn new_session_esc_cancels() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("hello", "", "2", "", 1);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+        // Buffers preserved — Cancel doesn't clear input.
+        assert_eq!(label, "hello");
+    }
+
+    #[test]
+    fn new_session_backspace_pops_label_buffer() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("foo", "", "2", "", 1);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Backspace),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(label, "fo");
+    }
+
+    #[test]
+    fn new_session_enter_with_label_submits_create_local_session() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("my-task", "feat/x", "10", "https://github.com/a/b", 1);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                repo_url,
+                label,
+                branch,
+                idle_timeout_secs,
+            }) => {
+                assert_eq!(repo_url, "https://github.com/a/b");
+                assert_eq!(label, "my-task");
+                assert_eq!(branch.as_deref(), Some("feat/x"));
+                assert_eq!(idle_timeout_secs, 10);
+            }
+            other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn new_session_enter_with_blank_label_stays_open() {
+        // When the label is empty, Enter is consumed but the modal does
+        // NOT close — pre-extraction behavior was `return true` without
+        // touching `input_mode`.
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("   ", "", "2", "", 1);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        assert_consumed(&outcome);
+    }
+
+    #[test]
+    fn new_session_char_appends_only_to_active_field() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("", "", "2", "", 2);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('x')),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(label, "");
+        assert_eq!(branch, "x");
+    }
+
+    #[test]
+    fn new_session_right_cycles_repo_when_field_zero() {
+        let urls = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("", "", "2", "b", 0);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                active_field: &mut active,
+            },
+            InputCtx { repo_urls: &urls },
+            &key(KeyCode::Right),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(repo, "c");
+    }
+
+    // ── NewTerminalSession ────────────────────────────────────────
+
+    #[test]
+    fn new_terminal_session_j_cycles_type_forward() {
+        let mut session_type = "claude".to_string();
+        let task_id = None;
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                ws_index: 7,
+                session_type: &mut session_type,
+                task_id: &task_id,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('j')),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(session_type, "codex");
+    }
+
+    #[test]
+    fn new_terminal_session_enter_submits_with_payload() {
+        let mut session_type = "bash".to_string();
+        let task_id = Some("t-123".to_string());
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                ws_index: 4,
+                session_type: &mut session_type,
+                task_id: &task_id,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
+                ws_index,
+                session_type,
+                task_id,
+            }) => {
+                assert_eq!(ws_index, 4);
+                assert_eq!(session_type, "bash");
+                assert_eq!(task_id, Some("t-123".to_string()));
+            }
+            other => panic!("expected SpawnSessionOnWorkspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn new_terminal_session_esc_cancels() {
+        let mut session_type = "claude".to_string();
+        let task_id = None;
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                ws_index: 0,
+                session_type: &mut session_type,
+                task_id: &task_id,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+    }
+
+    // ── SessionSettings ───────────────────────────────────────────
+
+    fn session_settings_state(
+        active: u8,
+    ) -> (String, String, String, bool, bool, u8) {
+        (
+            "label".to_string(),
+            "30".to_string(),
+            "5".to_string(),
+            false,
+            false,
+            active,
+        )
+    }
+
+    #[test]
+    fn session_settings_tab_cycles_active_field() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
+            session_settings_state(0);
+        let outcome = handle_session_settings(
+            SessionSettingsMut {
+                ws_index: 1,
+                session_index: 2,
+                name: &mut name,
+                idle_timeout: &mut idle,
+                burst_threshold: &mut burst,
+                hidden: &mut hidden,
+                notify_on_idle: &mut notify,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Tab),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn session_settings_backspace_pops_name_when_field_zero() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
+            session_settings_state(0);
+        let outcome = handle_session_settings(
+            SessionSettingsMut {
+                ws_index: 0,
+                session_index: 0,
+                name: &mut name,
+                idle_timeout: &mut idle,
+                burst_threshold: &mut burst,
+                hidden: &mut hidden,
+                notify_on_idle: &mut notify,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Backspace),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(name, "labe");
+    }
+
+    #[test]
+    fn session_settings_space_toggles_hidden_when_field_three() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
+            session_settings_state(3);
+        hidden = false;
+        let outcome = handle_session_settings(
+            SessionSettingsMut {
+                ws_index: 0,
+                session_index: 0,
+                name: &mut name,
+                idle_timeout: &mut idle,
+                burst_threshold: &mut burst,
+                hidden: &mut hidden,
+                notify_on_idle: &mut notify,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char(' ')),
+        );
+        assert_consumed(&outcome);
+        assert!(hidden);
+    }
+
+    #[test]
+    fn session_settings_enter_submits_save() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
+            session_settings_state(0);
+        let outcome = handle_session_settings(
+            SessionSettingsMut {
+                ws_index: 4,
+                session_index: 9,
+                name: &mut name,
+                idle_timeout: &mut idle,
+                burst_threshold: &mut burst,
+                hidden: &mut hidden,
+                notify_on_idle: &mut notify,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SaveSessionSettings {
+                ws_index,
+                session_index,
+                name,
+                idle_timeout,
+                burst_threshold,
+                hidden,
+                notify_on_idle,
+            }) => {
+                assert_eq!(ws_index, 4);
+                assert_eq!(session_index, 9);
+                assert_eq!(name, "label");
+                assert_eq!(idle_timeout, 30);
+                assert_eq!(burst_threshold, 5);
+                assert!(!hidden);
+                assert!(!notify_on_idle);
+            }
+            other => panic!("expected SaveSessionSettings, got {:?}", other),
+        }
+    }
+
+    // ── WorkspaceSettings ─────────────────────────────────────────
+
+    #[test]
+    fn workspace_settings_char_appends() {
+        let mut name = "foo".to_string();
+        let outcome = handle_workspace_settings(
+            WorkspaceSettingsMut {
+                ws_index: 0,
+                name: &mut name,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('x')),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(name, "foox");
+    }
+
+    #[test]
+    fn workspace_settings_backspace_pops() {
+        let mut name = "abc".to_string();
+        let outcome = handle_workspace_settings(
+            WorkspaceSettingsMut {
+                ws_index: 0,
+                name: &mut name,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Backspace),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(name, "ab");
+    }
+
+    #[test]
+    fn workspace_settings_enter_submits_trimmed_name() {
+        let mut name = "  hello  ".to_string();
+        let outcome = handle_workspace_settings(
+            WorkspaceSettingsMut {
+                ws_index: 3,
+                name: &mut name,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceName { ws_index, name }) => {
+                assert_eq!(ws_index, 3);
+                assert_eq!(name, "hello");
+            }
+            other => panic!("expected SaveWorkspaceName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn workspace_settings_esc_cancels() {
+        let mut name = "n".to_string();
+        let outcome = handle_workspace_settings(
+            WorkspaceSettingsMut {
+                ws_index: 0,
+                name: &mut name,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+    }
+
+    // ── TaskSettings ──────────────────────────────────────────────
+
+    #[test]
+    fn task_settings_backspace_pops_name() {
+        let task_id = "task-id-1".to_string();
+        let mut name = "abc".to_string();
+        let outcome = handle_task_settings(
+            TaskSettingsMut {
+                task_id: task_id.as_str(),
+                name: &mut name,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Backspace),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(name, "ab");
+    }
+
+    #[test]
+    fn task_settings_enter_submits_save_task_name() {
+        let task_id = "task-id-1".to_string();
+        let mut name = " new name ".to_string();
+        let outcome = handle_task_settings(
+            TaskSettingsMut {
+                task_id: task_id.as_str(),
+                name: &mut name,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name }) => {
+                assert_eq!(task_id, "task-id-1");
+                assert_eq!(name, "new name");
+            }
+            other => panic!("expected SaveTaskName, got {:?}", other),
+        }
+    }
+
+    // ── WorkflowLaunchConfirm ─────────────────────────────────────
+
+    fn make_slot() -> WorkflowSlotChoice {
+        WorkflowSlotChoice {
+            role: "worker".to_string(),
+            options: vec![
+                WorkflowSlotSource::New(Engine::ClaudeCode),
+                WorkflowSlotSource::New(Engine::Codex),
+            ],
+            option_index: 0,
+        }
+    }
+
+    #[test]
+    fn workflow_launch_down_advances_active_slot() {
+        let mut slots = vec![make_slot()];
+        let mut active = 0usize;
+        let mut goal = String::new();
+        let outcome = handle_workflow_launch_confirm(
+            WorkflowLaunchConfirmMut {
+                ws_index: 1,
+                workflow_name: "feedback",
+                slots: &mut slots,
+                active_slot: &mut active,
+                goal: &mut goal,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Down),
+        );
+        assert_consumed(&outcome);
+        // positions = slots.len() + 1 = 2; from 0 → 1 (the goal field).
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn workflow_launch_backspace_pops_goal_when_focused() {
+        let mut slots = vec![make_slot()];
+        let mut active = slots.len(); // goal-focused
+        let mut goal = "ab".to_string();
+        let outcome = handle_workflow_launch_confirm(
+            WorkflowLaunchConfirmMut {
+                ws_index: 0,
+                workflow_name: "feedback",
+                slots: &mut slots,
+                active_slot: &mut active,
+                goal: &mut goal,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Backspace),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(goal, "a");
+    }
+
+    #[test]
+    fn workflow_launch_enter_submits_with_optional_goal() {
+        let mut slots = vec![make_slot()];
+        let mut active = slots.len();
+        let mut goal = "  refactor the parser  ".to_string();
+        let outcome = handle_workflow_launch_confirm(
+            WorkflowLaunchConfirmMut {
+                ws_index: 5,
+                workflow_name: "feedback",
+                slots: &mut slots,
+                active_slot: &mut active,
+                goal: &mut goal,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::LaunchWorkflow {
+                ws_index,
+                workflow_name,
+                slots: launched_slots,
+                goal,
+            }) => {
+                assert_eq!(ws_index, 5);
+                assert_eq!(workflow_name, "feedback");
+                assert_eq!(launched_slots.len(), 1);
+                assert_eq!(goal.as_deref(), Some("refactor the parser"));
+            }
+            other => panic!("expected LaunchWorkflow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn workflow_launch_esc_cancels() {
+        let mut slots = vec![make_slot()];
+        let mut active = 0usize;
+        let mut goal = String::new();
+        let outcome = handle_workflow_launch_confirm(
+            WorkflowLaunchConfirmMut {
+                ws_index: 0,
+                workflow_name: "feedback",
+                slots: &mut slots,
+                active_slot: &mut active,
+                goal: &mut goal,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+    }
+
+    // ── WorkflowPicker ────────────────────────────────────────────
+
+    #[test]
+    fn workflow_picker_j_advances_selection_with_wraparound() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let mut selected = 1usize;
+        let outcome = handle_workflow_picker(
+            WorkflowPickerMut {
+                ws_index: 0,
+                focused_si: None,
+                names: &names,
+                selected: &mut selected,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('j')),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn workflow_picker_enter_submits_selected_name() {
+        let names = vec!["alpha".to_string(), "beta".to_string()];
+        let mut selected = 1usize;
+        let outcome = handle_workflow_picker(
+            WorkflowPickerMut {
+                ws_index: 7,
+                focused_si: Some(2),
+                names: &names,
+                selected: &mut selected,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::EnterWorkflowLaunchConfirm {
+                ws_index,
+                focused_si,
+                workflow_name,
+            }) => {
+                assert_eq!(ws_index, 7);
+                assert_eq!(focused_si, Some(2));
+                assert_eq!(workflow_name, "beta");
+            }
+            other => panic!("expected EnterWorkflowLaunchConfirm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn workflow_picker_enter_with_empty_names_submits_none() {
+        let names: Vec<String> = vec![];
+        let mut selected = 0usize;
+        let outcome = handle_workflow_picker(
+            WorkflowPickerMut {
+                ws_index: 0,
+                focused_si: None,
+                names: &names,
+                selected: &mut selected,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        // Pre-extraction behavior: out-of-bounds selection still closes
+        // the modal, just without firing the side effect.
+        assert!(matches!(
+            outcome,
+            InputOutcome::Submit(SubmitAction::None)
+        ));
+    }
+
+    // ── WorkflowHistory ───────────────────────────────────────────
+
+    #[test]
+    fn workflow_history_q_cancels() {
+        let outcome = handle_workflow_history(ctx_no_repos(), &key(KeyCode::Char('q')));
+        assert_cancel(&outcome);
+    }
+
+    #[test]
+    fn workflow_history_other_key_consumes() {
+        let outcome = handle_workflow_history(ctx_no_repos(), &key(KeyCode::Char('x')));
+        assert_consumed(&outcome);
+    }
+
+    // ── Confirm ───────────────────────────────────────────────────
+
+    #[test]
+    fn confirm_y_submits_mark_done() {
+        let outcome = handle_confirm(
+            &ConfirmAction::MarkDone,
+            ctx_no_repos(),
+            &key(KeyCode::Char('y')),
+        );
+        assert!(matches!(
+            outcome,
+            InputOutcome::Submit(SubmitAction::MarkActiveDone)
+        ));
+    }
+
+    #[test]
+    fn confirm_capital_y_submits_delete() {
+        let outcome = handle_confirm(
+            &ConfirmAction::Delete,
+            ctx_no_repos(),
+            &key(KeyCode::Char('Y')),
+        );
+        assert!(matches!(
+            outcome,
+            InputOutcome::Submit(SubmitAction::DeleteActive)
+        ));
+    }
+
+    #[test]
+    fn confirm_n_cancels() {
+        let outcome = handle_confirm(
+            &ConfirmAction::MarkDone,
+            ctx_no_repos(),
+            &key(KeyCode::Char('n')),
+        );
+        assert_cancel(&outcome);
+    }
+
+    #[test]
+    fn confirm_esc_cancels() {
+        let outcome = handle_confirm(
+            &ConfirmAction::MarkDone,
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+    }
+
+    #[test]
+    fn confirm_enter_routes_stop_workflow_run_id() {
+        let outcome = handle_confirm(
+            &ConfirmAction::StopWorkflow {
+                run_id: "run-abc".to_string(),
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::StopWorkflow { run_id }) => {
+                assert_eq!(run_id, "run-abc");
+            }
+            other => panic!("expected StopWorkflow, got {:?}", other),
+        }
     }
 }
 
