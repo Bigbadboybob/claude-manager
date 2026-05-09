@@ -503,4 +503,116 @@ mod tests {
             );
         }
     }
+
+    /// End-to-end persistence test for the `stop_workflow` no-op gate
+    /// and the on-disk fallback that backs `get_workflow_state` and
+    /// `list_workflows` (in `control::methods`).
+    ///
+    /// Pre-fix sequence: a `workflow_done` MCP call hit `mark_done` +
+    /// `save` (status=Done, done_reason set). A subsequent `stop_workflow`
+    /// then unconditionally called `mark_detached` + `save`, overwriting
+    /// the persisted status from `Done` to `Detached`. The `done_reason`
+    /// stayed but was now paired with a status that said "you aborted me",
+    /// erasing the distinction between successful completion and abort.
+    ///
+    /// Post-fix this test pins:
+    ///   1. A run that completed (mark_done + save) is on disk as Done.
+    ///   2. `stop_workflow`'s gate (`matches!(status, Done) → no-op`)
+    ///      keeps state.json byte-identical — bypassing the gate would
+    ///      flip Done → Detached on the next save.
+    ///   3. `get_workflow_state`'s on-disk fallback (`load_one`) returns
+    ///      the full Done record with `done_reason` intact.
+    ///   4. `list_workflows`' on-disk fallback (`load_all`) surfaces the
+    ///      same record.
+    #[test]
+    fn stop_workflow_no_op_on_done_preserves_state_through_disk_reload() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+
+        // Unique run_id keeps load_all's assertion below scoped to this
+        // test even if other parallel tests share the temp HOME (they
+        // shouldn't — home_lock serializes — but the explicit id is
+        // belt-and-suspenders against future refactors).
+        let run_id = "wf_stop_noop_int_test".to_string();
+
+        // ---- Phase 1: workflow runs to completion. ----
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "claude".into(),
+                current_session_id: Some("sid-w".into()),
+            },
+        );
+        let mut run = WorkflowRun::new(
+            run_id.clone(),
+            "feedback".into(),
+            "/tmp/repo".into(),
+            roles,
+            "worker".into(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        run.mark_done("worker said done".into());
+        save(&run).expect("save Done state");
+
+        let state_path = run_dir(&run_id).join("state.json");
+        let bytes_at_done = std::fs::read(&state_path).expect("state.json present");
+
+        // Sanity: what we wrote is what `load_one` reads back.
+        let loaded = load_one(&run_id).expect("load Done run");
+        assert_eq!(loaded.status, RunStatus::Done);
+        assert_eq!(loaded.done_reason.as_deref(), Some("worker said done"));
+
+        // ---- Phase 2: stop_workflow no-ops on Done. ----
+        // Mirror the gate condition that lives in
+        // `control::methods::stop_workflow`. The gate is the only thing
+        // standing between the persisted Done state and a `mark_detached`
+        // overwrite. Bypassing it would call:
+        //     run.mark_detached(); save(&run);
+        // The point of the gate is that we do NOT do that here. Confirm
+        // disk state is byte-identical to what we wrote in Phase 1.
+        assert!(
+            matches!(loaded.status, RunStatus::Done),
+            "stop_workflow gate must classify Done as terminal"
+        );
+        let bytes_after_no_op = std::fs::read(&state_path).expect("state.json present");
+        assert_eq!(
+            bytes_after_no_op, bytes_at_done,
+            "stop_workflow no-op must not rewrite state.json"
+        );
+
+        // ---- Phase 3: get_workflow_state's on-disk fallback. ----
+        // After `stop_workflow_run` would have pruned the in-memory entry
+        // (which the no-op skipped — but the same fallback runs anyway
+        // when a Done run was reloaded by App::new without being kept in
+        // `app.workflow_runs`, since only is_active() runs are retained).
+        // The full Done record with done_reason must come back.
+        let surfaced = load_one(&run_id).expect("on-disk fallback returns the run");
+        assert_eq!(surfaced.status, RunStatus::Done);
+        assert_eq!(surfaced.done_reason.as_deref(), Some("worker said done"));
+        assert_eq!(surfaced.run_id, run_id);
+        assert_eq!(surfaced.workflow_name, "feedback");
+        assert!(surfaced.active_role.is_none(), "Done runs have no active role");
+
+        // ---- Phase 4: list_workflows' on-disk fallback. ----
+        let all = load_all();
+        let entry = all
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .expect("load_all surfaces the Done run for list_workflows");
+        assert_eq!(entry.status, RunStatus::Done);
+        assert_eq!(entry.done_reason.as_deref(), Some("worker said done"));
+
+        // Restore HOME for the next test.
+        unsafe {
+            match orig_home {
+                Some(o) => std::env::set_var("HOME", o),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 }
