@@ -162,18 +162,46 @@ async def delete_warm_vm(pool: asyncpg.Pool, vm_id: str):
         await conn.execute("DELETE FROM warm_vms WHERE id = $1", vm_id)
 
 
-async def find_ready_warm_vm(pool: asyncpg.Pool, repo_url: str) -> dict | None:
-    """Find a ready warm VM for a given repo."""
+async def find_ready_warm_vm(pool: asyncpg.Pool, repo_url: str,
+                              task_id: str) -> dict | None:
+    """Atomically claim a ready warm VM for a given repo.
+
+    Selects a ready VM with FOR UPDATE SKIP LOCKED and flips it to busy in the
+    same statement, so two concurrent dispatchers cannot claim the same VM.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT wv.* FROM warm_vms wv
-               JOIN warm_pools wp ON wv.pool_id = wp.id
-               WHERE wp.repo_url = $1 AND wv.status = 'ready'
-               LIMIT 1
-               FOR UPDATE SKIP LOCKED""",
-            repo_url,
+            """UPDATE warm_vms SET status = 'busy', current_task_id = $1
+               WHERE id = (
+                   SELECT wv.id FROM warm_vms wv
+                   WHERE wv.status = 'ready'
+                     AND wv.pool_id IN (
+                         SELECT id FROM warm_pools WHERE repo_url = $2
+                     )
+                   ORDER BY wv.created_at
+                   LIMIT 1
+                   FOR UPDATE SKIP LOCKED
+               )
+               RETURNING *""",
+            task_id, repo_url,
         )
         return _serialize(dict(row)) if row else None
+
+
+async def count_dispatchable(pool: asyncpg.Pool) -> int:
+    """Count active tasks matching `claim_next_task`'s dispatch predicates.
+
+    Mirrors the WHERE clause of `claim_next_task` so capacity planning only
+    counts work the dispatcher would actually pick up.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT count(*) AS n FROM tasks
+               WHERE status IN ('running', 'blocked')
+                 AND is_cloud = true
+                 AND project IS NULL""",
+        )
+        return row["n"]
 
 
 async def delete_task(pool: asyncpg.Pool, task_id: str):

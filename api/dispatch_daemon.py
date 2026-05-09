@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import shlex
 import subprocess
 from datetime import datetime, timezone
 from dispatch import db
@@ -36,9 +37,7 @@ async def dispatch_loop(pool):
 
 async def _dispatch_tasks(pool):
     """Claim backlog tasks and launch workers (or assign to warm VMs)."""
-    running = await db.list_tasks(pool, status="running")
-    blocked = await db.list_tasks(pool, status="blocked")
-    active_count = len(running) + len(blocked)
+    active_count = await db.count_dispatchable(pool)
 
     if active_count >= MAX_WORKERS:
         return
@@ -49,8 +48,8 @@ async def _dispatch_tasks(pool):
 
     logger.info(f"Dispatching task {task['id']}")
 
-    # Check if there's a warm VM ready for this repo
-    warm_vm = await db.find_ready_warm_vm(pool, task["repo_url"])
+    # Atomically claim a ready warm VM (status flips to busy in same statement)
+    warm_vm = await db.find_ready_warm_vm(pool, task["repo_url"], str(task["id"]))
     if warm_vm:
         await _assign_to_warm_vm(pool, task, warm_vm)
     else:
@@ -58,29 +57,44 @@ async def _dispatch_tasks(pool):
 
 
 async def _assign_to_warm_vm(pool, task, warm_vm):
-    """Assign a task to an existing warm VM."""
+    """Assign a task to a warm VM that has already been claimed (status=busy)."""
     logger.info(f"Assigning task {task['id']} to warm VM {warm_vm['vm_name']}")
 
-    # Mark warm VM as busy
-    await db.update_warm_vm(pool, warm_vm["id"],
-                            status="busy", current_task_id=task["id"])
-
     branch = task.get("wip_branch") or task["repo_branch"]
-
-    # If the task has a different branch, checkout first
-    if branch != "main":
-        await asyncio.to_thread(
-            _ssh_command, warm_vm["vm_name"],
-            f"sudo su - worker -c 'cd /workspace && git fetch origin && git checkout {branch}'"
-        )
-
-    # Send the prompt via tmux (only if prompt exists — otherwise sync mode)
     prompt = task.get("prompt") or ""
-    if prompt:
-        await asyncio.to_thread(
-            _ssh_command, warm_vm["vm_name"],
-            f"sudo su - worker -c \"tmux send-keys -t claude '{prompt}' Enter\""
+
+    try:
+        if branch != "main":
+            inner = (
+                "cd /workspace && git fetch origin && "
+                f"git checkout {shlex.quote(branch)}"
+            )
+            await asyncio.to_thread(
+                _ssh_command, warm_vm["vm_name"],
+                f"sudo -u worker bash -c {shlex.quote(inner)}",
+            )
+
+        # Deliver the prompt via tmux paste-buffer fed from stdin so no
+        # user-controlled bytes ever land in a shell-interpolated string.
+        if prompt:
+            remote_cmd = (
+                "sudo -u worker tmux load-buffer - && "
+                "sudo -u worker tmux paste-buffer -t claude && "
+                "sudo -u worker tmux send-keys -t claude Enter"
+            )
+            await asyncio.to_thread(
+                _ssh_command, warm_vm["vm_name"], remote_cmd, prompt,
+            )
+    except Exception:
+        logger.exception(
+            f"Failed to assign task {task['id']} to warm VM "
+            f"{warm_vm['vm_name']}; rolling back"
         )
+        await db.update_warm_vm(
+            pool, warm_vm["id"], status="ready", current_task_id=None,
+        )
+        await db.update_task(pool, str(task["id"]), status="backlog")
+        return
 
     ttyd_url = f"http://{warm_vm['external_ip']}:8080"
     await db.update_task(pool, str(task["id"]),
@@ -235,12 +249,18 @@ def _check_vm_alive(vm_name: str) -> bool:
         return False
 
 
-def _ssh_command(vm_name: str, command: str) -> str:
-    """Run a command on a VM via SSH."""
+def _ssh_command(vm_name: str, command: str, stdin: str | None = None) -> str:
+    """Run a command on a VM via SSH.
+
+    Raises subprocess.CalledProcessError on non-zero exit and
+    subprocess.TimeoutExpired if the command runs past the timeout — callers
+    that want to ignore failures must wrap the call in try/except.
+    """
     result = subprocess.run(
         ["gcloud", "compute", "ssh", vm_name,
          f"--zone={GCP_ZONE}", f"--project={GCP_PROJECT}",
          "--command", command],
-        capture_output=True, text=True, timeout=15,
+        input=stdin,
+        capture_output=True, text=True, timeout=15, check=True,
     )
     return result.stdout
