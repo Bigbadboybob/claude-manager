@@ -18,12 +18,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Instant, Duration};
 
-use crate::app::{engine_for_session_type, log_tick, prepare_initial_prompt, App, PendingWrite,
-    SessionStatus, Workspace};
-use crate::workflow::{self, run::MessageBaseline, toml_schema::Engine, TriggerKind, Workflow,
-    WorkflowRun};
+use crate::app::{engine_for_session_type, log_tick, new_session_uid, prepare_initial_prompt,
+    respawn_existing_with_workflow_mcp, App, PendingWrite, SessionStatus, TerminalSession,
+    Workspace, WorkflowSlotChoice, WorkflowSlotSource};
+use crate::session::Session;
+use crate::workflow::{self, run::MessageBaseline, toml_schema::Engine, RoleBinding, TriggerKind,
+    Workflow, WorkflowRun};
 
 /// Mutable + immutable references the controller needs from `App`.
 /// Built fresh per call so the controller can't reach into unrelated
@@ -32,6 +34,9 @@ pub struct WorkflowControllerCtx<'a> {
     pub workflow_runs: &'a mut Vec<WorkflowRun>,
     pub workspaces: &'a mut Vec<Workspace>,
     pub workflows: &'a HashMap<String, Workflow>,
+    /// Latest terminal cell dims; used when spawning new participant
+    /// sessions so the PTY child starts sized to the visible area.
+    pub last_term_size: (u16, u16),
 }
 
 /// App-level side effect requested by the controller. The dispatcher
@@ -186,6 +191,348 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
 }
 
 impl<'a> WorkflowControllerCtx<'a> {
+    /// Launch a workflow on a workspace: validate slots, spawn-or-bind a
+    /// session per role, snapshot baselines, build and persist the
+    /// `WorkflowRun`, and emit App-level actions (status bar, manifest
+    /// save). Counterpart to `tick` / `fire_transition` already living
+    /// here. Companion to F7's controller extraction (8c3c152) which
+    /// deferred this method.
+    ///
+    /// All mutation happens against `self.workspaces` / `self.workflow_runs`
+    /// in place — newly-spawned `TerminalSession`s are pushed straight
+    /// onto the target workspace, and the new `WorkflowRun` lands at the
+    /// end of `workflow_runs`. The dispatcher in `App` only needs to
+    /// apply the returned `WorkflowAction`s (status messages and the
+    /// final manifest save).
+    pub fn launch_workflow(
+        &mut self,
+        ws_index: usize,
+        workflow_name: &str,
+        slots: Vec<WorkflowSlotChoice>,
+        goal: Option<String>,
+    ) -> Vec<WorkflowAction> {
+        let mut actions: Vec<WorkflowAction> = Vec::new();
+        let Some(wf) = self.workflows.get(workflow_name).cloned() else {
+            actions.push(WorkflowAction::SetStatusMsg("Workflow not found".to_string()));
+            return actions;
+        };
+        if ws_index >= self.workspaces.len() {
+            return actions;
+        }
+
+        // Validate: `fresh` slots cannot use existing sessions. Also reject
+        // duplicate existing-session assignments across slots.
+        let mut existing_seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for slot in &slots {
+            let role = match wf.roles.get(&slot.role) {
+                Some(r) => r,
+                None => {
+                    actions.push(WorkflowAction::SetStatusMsg(format!(
+                        "Unknown role: {}",
+                        slot.role
+                    )));
+                    return actions;
+                }
+            };
+            if let WorkflowSlotSource::Existing(si) = slot.source() {
+                if matches!(role.context, workflow::toml_schema::Context::Fresh) {
+                    actions.push(WorkflowAction::SetStatusMsg(format!(
+                        "Role '{}' has fresh context; must use a new session",
+                        slot.role
+                    )));
+                    return actions;
+                }
+                if !existing_seen.insert(*si) {
+                    actions.push(WorkflowAction::SetStatusMsg(
+                        "Two roles can't share the same existing session".to_string(),
+                    ));
+                    return actions;
+                }
+            }
+        }
+
+        let task_key = self.workspaces[ws_index].id.clone();
+        let run_id = workflow::run::new_run_id();
+        let worktree_path = self.workspaces[ws_index].worktree_path.clone();
+
+        // Inherit task_id from the first existing session in a slot so new
+        // workflow participants sit under the same task subheader in the
+        // sidebar. If all slots are fresh, participants are workspace-level.
+        let inherit_task_id: Option<String> = slots.iter().find_map(|slot| {
+            if let WorkflowSlotSource::Existing(si) = slot.source() {
+                self.workspaces[ws_index]
+                    .sessions
+                    .get(*si)
+                    .and_then(|ts| ts.task_id.clone())
+            } else {
+                None
+            }
+        });
+
+        // Spawn / bind sessions for each slot and build role_sessions.
+        // For existing sessions we also snapshot the current user/assistant counts
+        // so that templates like `{{ roles.worker.initial_prompt }}` point at the
+        // first message *after* this launch, not the first message ever.
+        let mut role_sessions: BTreeMap<String, RoleBinding> = BTreeMap::new();
+        let mut role_baselines: BTreeMap<String, MessageBaseline> = BTreeMap::new();
+        // Captured at launch from each role's pre-launch transcript tail. Lets
+        // `{{ roles.<role>.plan }}` keep returning the plan the user accepted
+        // even after the worker has produced more turns and the live
+        // transcript's last assistant line is no longer the ExitPlanMode
+        // tool_use.
+        let mut role_plans: BTreeMap<String, String> = BTreeMap::new();
+        // Sids already claimed by some live session in the TUI. Detection
+        // below excludes these so an Existing-bound role with an empty pending
+        // snapshot (e.g. a freshly-created pane that hasn't written its
+        // transcript yet) can't accidentally claim a sid that already belongs
+        // to a sibling session in the same worktree. Updated as the loop
+        // binds new sids so later slots see them too.
+        let mut bound_sids: std::collections::HashSet<String> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .filter_map(|s| s.transcript_id.clone())
+            .collect();
+        for slot in &slots {
+            let role = &wf.roles[&slot.role];
+            let (session_label, session_id, effective_engine) = match slot.source() {
+                WorkflowSlotSource::Existing(si) => {
+                    // Tag with workflow metadata, and if sid isn't known yet,
+                    // try to detect it NOW (newest JSONL heuristic) so the
+                    // baseline below is computed from the actual transcript.
+                    let worktree_for_detect = self.workspaces[ws_index].worktree_path.clone();
+                    let (cols, rows) = self.last_term_size;
+                    let ts = match self.workspaces[ws_index].sessions.get_mut(*si) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    ts.workflow_run_id = Some(run_id.clone());
+                    ts.workflow_role = Some(slot.role.clone());
+                    if ts.transcript_id.is_none() {
+                        if let Some(wt) = worktree_for_detect.as_deref() {
+                            // Augment the per-session pre-launch snapshot with
+                            // sids already bound to other sessions so we don't
+                            // accidentally claim a sibling's sid (e.g. when
+                            // this pane was created before any transcript file
+                            // existed and a sibling pane wrote its transcript
+                            // between then and now).
+                            let mut existing: Vec<String> =
+                                ts.pending_jsonl_files.clone().unwrap_or_default();
+                            existing.extend(bound_sids.iter().cloned());
+                            let detected = match ts.session_type.as_str() {
+                                "claude" => App::detect_session_id(wt, &existing),
+                                "codex" => App::detect_codex_session_id(wt, &existing),
+                                _ => None,
+                            };
+                            if let Some(sid) = detected {
+                                bound_sids.insert(sid.clone());
+                                ts.transcript_id = Some(sid);
+                                ts.pending_jsonl_files = None;
+                            }
+                        }
+                    }
+                    let eng = engine_for_session_type(&ts.session_type);
+                    let sid = ts.transcript_id.clone();
+                    // Respawn-with-`--resume` only happens when the role
+                    // genuinely needs the workflow MCP server wired in.
+                    // Skipping it for `needs_mcp = false` roles (e.g. the
+                    // feedback worker) preserves ephemeral process state
+                    // — most importantly plan-mode UI — across launch.
+                    let respawn_warning = if role.needs_mcp {
+                        respawn_existing_with_workflow_mcp(
+                            ts,
+                            &eng,
+                            &run_id,
+                            &slot.role,
+                            sid.as_deref(),
+                            worktree_for_detect.as_deref(),
+                            cols,
+                            rows,
+                        )
+                    } else {
+                        None
+                    };
+                    let session_label_clone = ts.label.clone();
+                    let session_id_clone = ts.transcript_id.clone();
+                    if let Some(msg) = respawn_warning {
+                        actions.push(WorkflowAction::SetStatusMsg(msg));
+                    }
+                    (session_label_clone, session_id_clone, eng)
+                }
+                WorkflowSlotSource::New(engine) => {
+                    match self.spawn_workflow_session(
+                        ws_index,
+                        &slot.role,
+                        engine,
+                        &run_id,
+                        inherit_task_id.clone(),
+                    ) {
+                        Some((label, sid)) => (label, sid, engine.clone()),
+                        None => {
+                            actions.push(WorkflowAction::SetStatusMsg(format!(
+                                "Failed to spawn {}",
+                                slot.role
+                            )));
+                            return actions;
+                        }
+                    }
+                }
+            };
+            // Compute baseline now, before the session does any new work.
+            // Use count_messages (counts any turn) for assistant_count so the
+            // idle gate sees a consistent picture later — it compares current
+            // count against baseline.assistant_count at start. user_count
+            // still uses list_messages (template slice uses text messages).
+            let baseline = match (worktree_path.as_deref(), session_id.as_deref()) {
+                (Some(wt), Some(sid)) => MessageBaseline {
+                    user_count: workflow::transcript::list_messages(
+                        &effective_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::User,
+                    )
+                    .len(),
+                    assistant_count: workflow::transcript::count_messages(
+                        &effective_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::Assistant,
+                    ),
+                },
+                _ => MessageBaseline::default(),
+            };
+            let _ = role;
+            // Snapshot the role's most-recent pre-launch ExitPlanMode plan, if
+            // any. This must run BEFORE the role produces any new turns —
+            // i.e. right here at launch, before activation prompts fire.
+            if let (Some(wt), Some(sid)) = (worktree_path.as_deref(), session_id.as_deref()) {
+                if let Some(plan) =
+                    workflow::transcript::latest_plan(&effective_engine, wt, sid)
+                {
+                    role_plans.insert(slot.role.clone(), plan);
+                }
+            }
+            role_baselines.insert(slot.role.clone(), baseline);
+            role_sessions.insert(
+                slot.role.clone(),
+                RoleBinding {
+                    session_label,
+                    current_session_id: session_id,
+                },
+            );
+        }
+
+        // Initial active role = first in role_order.
+        let initial_role = wf
+            .role_order
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "worker".into());
+        let run = WorkflowRun::new(
+            run_id.clone(),
+            workflow_name.to_string(),
+            task_key,
+            role_sessions,
+            initial_role.clone(),
+            role_baselines,
+            goal,
+            role_plans,
+        );
+        let _ = workflow::run::save(&run);
+        self.workflow_runs.push(run);
+        actions.push(WorkflowAction::SaveSessionManifest);
+        actions.push(WorkflowAction::SetStatusMsg(format!(
+            "Launched {} ({} roles, initial: {})",
+            workflow_name,
+            wf.role_order.len(),
+            initial_role
+        )));
+        actions
+    }
+
+    /// Spawn a fresh `TerminalSession` for a workflow role, push it onto
+    /// the target workspace, and return `(label, session_id)`. Mirror of
+    /// the old `App::spawn_workflow_session`; lives here now because
+    /// `launch_workflow` is its only caller.
+    fn spawn_workflow_session(
+        &mut self,
+        ws_index: usize,
+        role_name: &str,
+        engine: &Engine,
+        run_id: &str,
+        task_id: Option<String>,
+    ) -> Option<(String, Option<String>)> {
+        let worktree_path = self.workspaces[ws_index].worktree_path.clone()?;
+        let (cols, rows) = self.last_term_size;
+        // Generate the uid first so the MCP config bakes the same value
+        // the TerminalSession ends up holding.
+        let session_uid = new_session_uid();
+        let workflow_meta = crate::mcp_config::WorkflowMeta {
+            run_id,
+            role: role_name,
+        };
+        let (program, args) = match crate::mcp_config::build_args(
+            engine,
+            &session_uid,
+            Some(workflow_meta),
+            None,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // The caller will surface a generic "Failed to spawn"
+                // status; the more specific args-build error is logged
+                // here so it's visible in the workflow log.
+                log_tick(run_id, &format!("spawn args: {}", e));
+                return None;
+            }
+        };
+        let pending = Some(match engine {
+            Engine::ClaudeCode => App::list_jsonl_files(&worktree_path),
+            Engine::Codex => App::list_codex_sessions(&worktree_path),
+        });
+        let sess = Session::new(
+            &program,
+            &args,
+            cols,
+            rows,
+            Some(worktree_path.clone()),
+            Default::default(),
+        )
+        .ok()?;
+        let session_type = engine.as_session_type().to_string();
+        let label = role_name.to_string();
+        let ts = TerminalSession {
+            uid: session_uid,
+            label: label.clone(),
+            session_type,
+            session: sess,
+            // Start Idle — PTY startup noise isn't "work". Wakeup-burst
+            // detection will flip to Running when the agent actually responds.
+            status: SessionStatus::Idle,
+            last_write_at: None,
+            transcript_id: None,
+            generation: 0,
+            pending_jsonl_files: pending,
+            // Participants default hidden — the workflow header carries the
+            // aggregate indicator. Toggle per session with A-h.
+            hidden: true,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: Some(run_id.to_string()),
+            workflow_role: Some(role_name.to_string()),
+            last_delivery: None,
+            task_id,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+        };
+        self.workspaces[ws_index].sessions.push(ts);
+        Some((label, None))
+    }
+
     /// Drive every active workflow run forward by one tick. Steps:
     ///   1. Sync each role's `current_session_id` with whatever the
     ///      live `TerminalSession.transcript_id` is (sids land async).
@@ -991,6 +1338,7 @@ mod tests {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
                 workflows: &workflows,
+                last_term_size: (80, 24),
             };
             let mut actions = Vec::new();
             ctx.finish_run(run_id, "completed by test".into(), &mut actions);
@@ -1059,6 +1407,7 @@ mod tests {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
                 workflows: &workflows,
+                last_term_size: (80, 24),
             };
             let mut actions = Vec::new();
             let did_reset = ctx.reset_fresh_session(run_id, "reviewer", 0, 1, &mut actions);
@@ -1137,6 +1486,7 @@ mod tests {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
                 workflows: &workflows,
+                last_term_size: (80, 24),
             };
             let actions = ctx.tick();
 
@@ -1145,6 +1495,288 @@ mod tests {
             assert!(actions.is_empty(), "tick should be a no-op: {:?}", actions);
             assert_eq!(runs[0].active_role.as_deref(), Some("worker"));
             assert_eq!(runs[0].history.len(), 1);
+        });
+    }
+
+    // ── Launch path tests ───────────────────────────────────────────
+    //
+    // Cover the controller's `launch_workflow` companion to F7's tick /
+    // fire_transition extraction. All three tests use Existing slots
+    // (with `needs_mcp = false` so the `--resume` respawn path is
+    // skipped) — the New-slot path calls `Session::new` against a real
+    // `claude`/`codex` binary, which would make these tests environment-
+    // dependent. The role/binding/baseline plumbing is identical between
+    // the two paths.
+
+    /// Like `stub_session`, but with no workflow tags (so the launch
+    /// path can attach them as it would for a freshly-Existing slot).
+    /// Lets the caller pre-set `task_id` to verify `inherit_task_id`
+    /// behavior.
+    fn bare_session(
+        label: &str,
+        session_type: &str,
+        task_id: Option<&str>,
+    ) -> TerminalSession {
+        let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+            .expect("test PTY session");
+        TerminalSession {
+            uid: format!("uid-{}", label),
+            label: label.to_string(),
+            session_type: session_type.to_string(),
+            session,
+            status: SessionStatus::Idle,
+            last_write_at: None,
+            transcript_id: None,
+            generation: 0,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            last_delivery: None,
+            task_id: task_id.map(str::to_string),
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+        }
+    }
+
+    /// Build a `feedback`-style two-role workflow with persistent
+    /// context everywhere and `needs_mcp = false` so the launch path
+    /// doesn't try to respawn participants with `--resume`.
+    fn launch_test_workflow() -> Workflow {
+        let mut roles = BTreeMap::new();
+        let mut worker = role_with(Engine::ClaudeCode, Context::Persistent);
+        worker.needs_mcp = false;
+        let mut reviewer = role_with(Engine::ClaudeCode, Context::Persistent);
+        reviewer.needs_mcp = false;
+        roles.insert("worker".to_string(), worker);
+        roles.insert("reviewer".to_string(), reviewer);
+        make_workflow(
+            "feedback",
+            roles,
+            vec!["worker".to_string(), "reviewer".to_string()],
+            vec![Transition {
+                from: "worker".to_string(),
+                on: TriggerOn::Idle,
+                to: "reviewer".to_string(),
+            }],
+        )
+    }
+
+    /// Two-role workspace with bare worker + reviewer sessions ready
+    /// to be claimed by Existing slots. `worker_task_id` lets a test
+    /// pre-set the worker's `task_id` to exercise `inherit_task_id`.
+    fn launch_test_workspace(worker_task_id: Option<&str>) -> Vec<Workspace> {
+        let worker = bare_session("worker", "claude", worker_task_id);
+        let reviewer = bare_session("reviewer", "claude", None);
+        vec![workspace_with(vec![worker, reviewer], None)]
+    }
+
+    /// Existing slots for a worker (index 0) + reviewer (index 1).
+    fn launch_test_slots() -> Vec<crate::app::WorkflowSlotChoice> {
+        use crate::app::{WorkflowSlotChoice, WorkflowSlotSource};
+        vec![
+            WorkflowSlotChoice {
+                role: "worker".to_string(),
+                options: vec![WorkflowSlotSource::Existing(0)],
+                option_index: 0,
+            },
+            WorkflowSlotChoice {
+                role: "reviewer".to_string(),
+                options: vec![WorkflowSlotSource::Existing(1)],
+                option_index: 0,
+            },
+        ]
+    }
+
+    /// (a) `prepare_initial_prompt` falls back to `goal` when the role
+    /// has no `activation_prompt`. End-to-end test: call
+    /// `launch_workflow`, then `deliver_initial_workflow_prompt`, and
+    /// pin that the worker's `pending_prompt.text` is the goal verbatim
+    /// (the bypass-rendering branch).
+    #[test]
+    fn launch_then_deliver_uses_goal_when_activation_prompt_empty() {
+        with_temp_home(|| {
+            let mut runs: Vec<WorkflowRun> = Vec::new();
+            let mut workspaces = launch_test_workspace(None);
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), launch_test_workflow());
+
+            let goal = "build feature X — verbatim {{ not_a_template }}";
+
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                };
+                let _ = ctx.launch_workflow(
+                    0,
+                    "feedback",
+                    launch_test_slots(),
+                    Some(goal.to_string()),
+                );
+            }
+            assert_eq!(runs.len(), 1, "launch should push exactly one run");
+            let run_id = runs[0].run_id.clone();
+
+            // Now deliver the initial prompt — same code path the MCP
+            // launch (`start_workflow_run`) uses.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                };
+                let _ = ctx.deliver_initial_workflow_prompt(&run_id, "worker", 0);
+            }
+
+            let worker = &workspaces[0].sessions[0];
+            let pp = worker
+                .pending_prompt
+                .as_ref()
+                .expect("worker should have a queued prompt after deliver");
+            // The goal text bypasses the template renderer — `{{` is
+            // preserved verbatim. submit=true so a trailing Enter
+            // lands.
+            assert_eq!(pp.text, goal);
+            assert!(pp.submit, "initial prompt should be auto-submitted");
+        });
+    }
+
+    /// (b) Every role in the workflow is bound to a participant
+    /// session: launch tags each Existing-slot session with the run id
+    /// + role name, and `WorkflowRun.role_sessions` ends up with one
+    /// `RoleBinding` per role pointing at the right session label /
+    /// engine-derived from the bound session's `session_type`.
+    #[test]
+    fn launch_binds_every_role_to_a_participant_session() {
+        with_temp_home(|| {
+            let mut runs: Vec<WorkflowRun> = Vec::new();
+            let mut workspaces = launch_test_workspace(None);
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), launch_test_workflow());
+
+            let actions = {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                };
+                ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
+            };
+
+            assert_eq!(runs.len(), 1, "exactly one run pushed");
+            let run = &runs[0];
+            let run_id = run.run_id.as_str();
+            assert_eq!(run.workflow_name, "feedback");
+            assert_eq!(run.active_role.as_deref(), Some("worker"));
+            // Bindings present for every declared role.
+            let worker_binding = run.role_sessions.get("worker").expect("worker bound");
+            let reviewer_binding = run
+                .role_sessions
+                .get("reviewer")
+                .expect("reviewer bound");
+            assert_eq!(worker_binding.session_label, "worker");
+            assert_eq!(reviewer_binding.session_label, "reviewer");
+
+            // Each underlying TerminalSession got its workflow tags set.
+            let worker = &workspaces[0].sessions[0];
+            let reviewer = &workspaces[0].sessions[1];
+            assert_eq!(worker.workflow_run_id.as_deref(), Some(run_id));
+            assert_eq!(worker.workflow_role.as_deref(), Some("worker"));
+            assert_eq!(reviewer.workflow_run_id.as_deref(), Some(run_id));
+            assert_eq!(reviewer.workflow_role.as_deref(), Some("reviewer"));
+            // session_type → engine derivation matches both stubs
+            // (which use "claude").
+            assert_eq!(worker.session_type, "claude");
+            assert_eq!(reviewer.session_type, "claude");
+
+            // Action sequence ends with a SaveSessionManifest + a
+            // "Launched ..." status message. The dispatcher in App
+            // applies these in order.
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, WorkflowAction::SaveSessionManifest)),
+                "launch must emit SaveSessionManifest: {:?}",
+                actions
+            );
+            let last_status = actions.iter().rev().find_map(|a| match a {
+                WorkflowAction::SetStatusMsg(s) => Some(s.as_str()),
+                _ => None,
+            });
+            assert_eq!(
+                last_status,
+                Some("Launched feedback (2 roles, initial: worker)")
+            );
+        });
+    }
+
+    /// (c) Every spawned/bound participant session ends up with a
+    /// matching `task_id`. For Existing slots, the launch leaves the
+    /// pre-existing `task_id` intact; the `inherit_task_id` it picks
+    /// up from the first Existing slot is what fresh-spawned New
+    /// slots would inherit (the New-slot path itself isn't exercised
+    /// here because it would shell out to `claude`). Together with
+    /// `MCP-path post-launch stamping in `start_workflow_run`, this
+    /// is the descendant-auth contract: every workflow participant
+    /// is reachable via the launching task's id.
+    #[test]
+    fn launch_preserves_task_id_on_every_participant_session() {
+        with_temp_home(|| {
+            let mut runs: Vec<WorkflowRun> = Vec::new();
+            // Pre-seed both slot sessions with the same task id so the
+            // launch ends up with EVERY participant tagged. (Mimics the
+            // common A-f flow where the user launches from a session
+            // already attached to a task; subsequent slots are picked
+            // from that same task's sessions.)
+            let worker = bare_session("worker", "claude", Some("task-X"));
+            let reviewer = bare_session("reviewer", "claude", Some("task-X"));
+            let mut workspaces = vec![workspace_with(vec![worker, reviewer], None)];
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), launch_test_workflow());
+
+            let _ = {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                };
+                ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
+            };
+
+            // Every slot session got tagged into the new run AND
+            // retained its task_id. start_workflow_run's post-launch
+            // stamp pass relies on this — it walks every session whose
+            // workflow_run_id matches the new run and overwrites
+            // task_id, which only works if launch left them tagged
+            // here.
+            assert_eq!(runs.len(), 1);
+            let run_id = runs[0].run_id.as_str();
+            for ts in &workspaces[0].sessions {
+                assert_eq!(
+                    ts.workflow_run_id.as_deref(),
+                    Some(run_id),
+                    "session '{}' missing run tag",
+                    ts.label
+                );
+                assert_eq!(
+                    ts.task_id.as_deref(),
+                    Some("task-X"),
+                    "session '{}' lost its task id",
+                    ts.label
+                );
+            }
         });
     }
 }
