@@ -76,6 +76,7 @@ Global:
 - `A-j/k` — navigate
 - `A-d` — mark task done
 - `A-x` — delete
+- `A-,` — toggle the activity feed (5-line strip above the status bar showing recent agent-initiated mutations: start_session, send_input, kill_session, start/stop_workflow, create_subtask, mark_subtask_done). Off by default.
 
 Sessions view:
 - `A-n` — new local session (creates a worktree)

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -734,6 +734,122 @@ pub(crate) fn entry_matches_delivery(
         || workflow::history::is_paste_placeholder(&entry.display)
 }
 
+/// Phase 6: format a `SystemTime` as `HH:MM:SS` in UTC. Used by the
+/// activity-feed renderer; UTC keeps the implementation tiny (no chrono /
+/// libc dep) and the absolute ordering of entries is what matters for
+/// the feed, not local-clock alignment.
+fn format_utc_hms(ts: std::time::SystemTime) -> String {
+    let secs = ts
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+/// Phase 6: build a one-line summary for the activity feed from a
+/// completed control-socket method call. Returns `Some(_)` only for
+/// mutating methods; read-only methods (list_*, get_*, ping,
+/// resolve_authorized_session, read_session_output) return `None` so
+/// they don't pollute the feed.
+///
+/// Each summary is at-a-glance and includes the most relevant arg(s) —
+/// session uid prefixes are shortened to 8 chars (uids are ASCII so
+/// byte slicing is safe), text payloads are truncated to ~40 chars
+/// with an ellipsis, and the result's primary id (e.g. new task_id
+/// from create_subtask) is appended where useful.
+fn activity_summary_for(
+    method: &str,
+    params: &serde_json::Value,
+    result_value: &serde_json::Value,
+) -> Option<String> {
+    use serde_json::Value as V;
+    /// Truncate a session uid / task id to the first 8 ASCII chars.
+    fn short(s: &str) -> String {
+        s.chars().take(8).collect()
+    }
+    /// Compact text snippet for send_input: first ~40 chars + ellipsis.
+    fn snippet(s: &str) -> String {
+        let trimmed: String = s.chars().take(40).collect();
+        if s.chars().count() > 40 {
+            format!("{}…", trimmed)
+        } else {
+            trimmed
+        }
+    }
+    match method {
+        "send_input" => {
+            let target = params.get("session_uid").and_then(V::as_str).unwrap_or("?");
+            let text = params.get("text").and_then(V::as_str).unwrap_or("");
+            Some(format!("send_input({}, {:?})", short(target), snippet(text)))
+        }
+        "kill_session" => {
+            let target = params.get("session_uid").and_then(V::as_str).unwrap_or("?");
+            Some(format!("kill_session({})", short(target)))
+        }
+        "start_session" => {
+            let label = params.get("label").and_then(V::as_str).unwrap_or("?");
+            let typ = params.get("type").and_then(V::as_str).unwrap_or("?");
+            Some(format!("start_session({}, {})", label, typ))
+        }
+        "start_workflow" => {
+            let name = params.get("workflow_name").and_then(V::as_str).unwrap_or("?");
+            let task = params.get("task_id").and_then(V::as_str).unwrap_or("?");
+            Some(format!("start_workflow({}, task={})", name, short(task)))
+        }
+        "stop_workflow" => {
+            let run = params.get("run_id").and_then(V::as_str).unwrap_or("?");
+            // Run ids are `wf_<hex>`; show the wf_ prefix + 8 chars of
+            // hex so they're distinguishable from task ids.
+            Some(format!("stop_workflow({})", run.chars().take(15).collect::<String>()))
+        }
+        "create_subtask" => {
+            let name = params.get("name").and_then(V::as_str).unwrap_or("?");
+            let mode = params
+                .get("worktree_mode")
+                .and_then(V::as_str)
+                .unwrap_or("inherit");
+            let new_id = result_value
+                .get("task_id")
+                .and_then(V::as_str)
+                .unwrap_or("?");
+            Some(format!(
+                "create_subtask({}, {}) → {}",
+                name,
+                mode,
+                short(new_id)
+            ))
+        }
+        "mark_subtask_done" => {
+            let task = params.get("task_id").and_then(V::as_str).unwrap_or("?");
+            let close = params
+                .get("close_worktree")
+                .and_then(V::as_bool)
+                .unwrap_or(true);
+            Some(format!(
+                "mark_subtask_done({}, close_worktree={})",
+                short(task),
+                close
+            ))
+        }
+        // Read-only — explicitly NOT logged. List intentional so adding
+        // a new method without thinking about it (the default arm below)
+        // ALSO doesn't get logged accidentally; if you add a mutating
+        // method, add a branch for it here.
+        "ping"
+        | "resolve_authorized_session"
+        | "list_sessions"
+        | "list_workflows"
+        | "list_subtasks"
+        | "get_workflow_state" => None,
+        // Default: don't log unknown methods. New mutating methods must
+        // be explicitly added above to surface in the feed.
+        _ => None,
+    }
+}
+
 fn new_session_uid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -942,7 +1058,41 @@ pub struct App {
     /// main loop and dispatched to method handlers. The server thread
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
     control_queue: crate::control::queue::Queue,
+    /// Phase 6 activity feed: ring buffer of agent-initiated mutations
+    /// surfaced over the MCP control socket. Read-only methods (list_*,
+    /// get_*, ping, read_session_output) are intentionally excluded —
+    /// they're high-frequency and uninteresting in a feed. Capped at
+    /// `ACTIVITY_LOG_CAP` entries (oldest evicted).
+    pub activity_log: VecDeque<ActivityEntry>,
+    /// Toggle for the bottom-of-screen activity strip. Off by default;
+    /// `Alt-,` flips it.
+    pub activity_visible: bool,
 }
+
+/// Phase 6 activity-feed entry. Logged from each mutating control-socket
+/// method handler via `App::log_activity`. Each entry is one observable
+/// mutation (start_session, send_input, kill_session, start/stop_workflow,
+/// create_subtask, mark_subtask_done, propose_task).
+#[derive(Clone, Debug)]
+pub struct ActivityEntry {
+    /// Wall-clock timestamp the mutation landed (used for the leading
+    /// `HH:MM:SS` column in the rendered strip).
+    pub ts: std::time::SystemTime,
+    /// Human-friendly caller label. For workflow participants this is
+    /// the role name (`worker`/`reviewer`/`manager`); otherwise the
+    /// session's sidebar label (e.g. `survey-claude`). Falls back to
+    /// the caller's session_uid prefix if neither is available.
+    pub caller_label: String,
+    /// Compact one-line summary of the mutation, formatted by the
+    /// caller. Example: `start_session(refactor-helpers, codex)` or
+    /// `mark_subtask_done(b4264d86, close_worktree=true)`.
+    pub summary: String,
+}
+
+/// How many activity entries to retain. ~50 covers a few minutes of busy
+/// orchestration while keeping the buffer cheap. The strip itself only
+/// renders the last few; the rest exist for a future scrollable view.
+const ACTIVITY_LOG_CAP: usize = 50;
 
 impl App {
     pub fn new(config: Config) -> Self {
@@ -1004,7 +1154,48 @@ impl App {
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
             control_queue,
+            activity_log: VecDeque::new(),
+            activity_visible: false,
         }
+    }
+
+    /// Append a Phase 6 activity-feed entry. `caller_uid` is resolved to
+    /// a friendly label (workflow role, else session label, else uid
+    /// prefix). Capped at `ACTIVITY_LOG_CAP` — oldest entry evicted on
+    /// overflow. Called by mutating control-socket method handlers.
+    /// Read-only methods MUST NOT call this.
+    pub fn log_activity(&mut self, caller_uid: &str, summary: String) {
+        let caller_label = self.resolve_activity_caller_label(caller_uid);
+        if self.activity_log.len() >= ACTIVITY_LOG_CAP {
+            self.activity_log.pop_front();
+        }
+        self.activity_log.push_back(ActivityEntry {
+            ts: std::time::SystemTime::now(),
+            caller_label,
+            summary,
+        });
+        self.needs_redraw = true;
+    }
+
+    fn resolve_activity_caller_label(&self, caller_uid: &str) -> String {
+        for ws in &self.workspaces {
+            for ts in &ws.sessions {
+                if ts.uid == caller_uid {
+                    if let Some(role) = &ts.workflow_role {
+                        return role.clone();
+                    }
+                    return ts.label.clone();
+                }
+            }
+            for tomb in &ws.tombstones {
+                if tomb.uid == caller_uid {
+                    return tomb.label.clone();
+                }
+            }
+        }
+        // Unknown caller — fall back to a uid prefix so the feed still
+        // renders something searchable rather than the full opaque uid.
+        caller_uid.chars().take(12).collect()
     }
 
     fn spinner_frame(&self) -> &'static str {
@@ -2632,7 +2823,17 @@ impl App {
             )),
         };
         match result {
-            Ok(value) => Response::ok(req.id.clone(), value),
+            Ok(value) => {
+                // Phase 6 activity feed. Only mutating methods land here;
+                // read-only ones (`list_*`, `get_*`, `ping`,
+                // `resolve_authorized_session`) are intentionally skipped.
+                if let Some(summary) =
+                    activity_summary_for(req.method.as_str(), &req.params, &value)
+                {
+                    self.log_activity(caller, summary);
+                }
+                Response::ok(req.id.clone(), value)
+            }
             Err((code, msg)) => Response::err(req.id.clone(), code, msg),
         }
     }
@@ -3157,6 +3358,12 @@ impl App {
         if let CrosstermEvent::Key(key) = event {
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
                 self.toggle_mouse_capture();
+                return true;
+            }
+            // Phase 6: Alt+, toggles the activity feed strip.
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char(',') {
+                self.activity_visible = !self.activity_visible;
+                self.needs_redraw = true;
                 return true;
             }
         }
@@ -5145,12 +5352,32 @@ impl App {
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.area();
 
-        let rows =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
+        // Phase 6: bottom layout — content / [activity strip] / status bar.
+        // Activity strip renders only when toggled on (Alt-,) and we have
+        // entries to show; fixed at 5 lines so it doesn't dominate the
+        // screen but shows enough recent context to be useful.
+        let activity_height: u16 = if self.activity_visible
+            && !self.activity_log.is_empty()
+            && area.height >= 8
+        {
+            5
+        } else {
+            0
+        };
+        let rows = if activity_height > 0 {
+            Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(activity_height),
+                Constraint::Length(1),
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)
+        };
 
         let content_area = rows[0];
-        let bar_area = rows[1];
+        let bar_area = if activity_height > 0 { rows[2] } else { rows[1] };
+        let activity_area = if activity_height > 0 { Some(rows[1]) } else { None };
 
         // Wipe the content area first so stale cells from a previous frame's
         // wider/taller widgets don't bleed through when a new panel renders
@@ -5162,8 +5389,11 @@ impl App {
 
         match self.view_mode {
             ViewMode::Sessions => {
+                // Phase 6: sidebar widened from 30 → 36 cells to fit the
+                // full-name role badges (`[worker]`, `[reviewer]`, `[manager]`)
+                // and a deeper workflow-participant indent.
                 let cols =
-                    Layout::horizontal([Constraint::Min(40), Constraint::Length(30)])
+                    Layout::horizontal([Constraint::Min(40), Constraint::Length(36)])
                         .split(content_area);
 
                 self.draw_terminal(frame, cols[0]);
@@ -5174,6 +5404,9 @@ impl App {
             }
         }
 
+        if let Some(act_area) = activity_area {
+            self.draw_activity_feed(frame, act_area);
+        }
         self.draw_status_bar(frame, bar_area);
 
         // Draw input overlay if active (sessions mode only).
@@ -5678,7 +5911,7 @@ impl App {
             ("A-e    settings", "A-q  quit"),
             ("A-h    hide", "A-y  history"),
             ("A-f    workflow", "A-u  resume"),
-            ("A-o    stop wf", ""),
+            ("A-o    stop wf", "A-,  activity"),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -5752,7 +5985,11 @@ impl App {
                         }
                     };
 
-                    // Role badge for workflow-participant sessions, e.g. "[W]".
+                    // Role badge for workflow-participant sessions, e.g.
+                    // "[worker] " / "[reviewer] " / "[manager] ". Phase 6
+                    // widened the sidebar so the full role name fits;
+                    // single-char tags like "[W]" were too cryptic at a
+                    // glance once feedback workflows became routine.
                     let wf_badge: Option<(String, Style)> =
                         if let (Some(run_id), Some(role)) =
                             (ts.workflow_run_id.as_deref(), ts.workflow_role.as_deref())
@@ -5766,12 +6003,7 @@ impl App {
                             } else {
                                 Style::default().fg(Color::Cyan)
                             };
-                            let ch = role
-                                .chars()
-                                .next()
-                                .map(|c| c.to_ascii_uppercase())
-                                .unwrap_or('?');
-                            Some((format!("[{}] ", ch), style))
+                            Some((format!("[{}] ", role), style))
                         } else {
                             None
                         };
@@ -5791,10 +6023,21 @@ impl App {
                             }
                         }
                         SidebarView::Task => {
-                            // Workspace-level sessions: 2-space indent.
-                            // Task-scoped sessions: 4-space indent so they
-                            // visually nest under their task subheader.
-                            if ts.task_id.is_some() {
+                            // Indent levels (Phase 6 deepened by 2 cells per tier
+                            // so workflow-participant nesting reads cleanly):
+                            //   - Workspace-level (no task): 2 spaces.
+                            //   - Task-scoped, no workflow:  4 spaces.
+                            //   - Workflow participant:      6 spaces, putting
+                            //     them visually inside the task they belong to.
+                            let in_active_wf = ts
+                                .workflow_run_id
+                                .as_deref()
+                                .is_some_and(|id| {
+                                    self.workflow_runs.iter().any(|r| r.run_id == id)
+                                });
+                            if in_active_wf {
+                                format!("      {}", ts.label)
+                            } else if ts.task_id.is_some() {
                                 format!("    {}", ts.label)
                             } else {
                                 format!("  {}", ts.label)
@@ -5941,6 +6184,54 @@ impl App {
             lines.push(line);
         }
         frame.render_widget(Paragraph::new(lines), help_area);
+    }
+
+    /// Phase 6: render the activity-feed strip (Alt-, toggle). Shows the
+    /// last few `ActivityEntry`s from `self.activity_log` formatted as
+    /// `HH:MM:SS  caller → summary`. The strip is bordered so it's
+    /// visually distinct from the main content and the status bar.
+    fn draw_activity_feed(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Activity (Alt-, to hide) ",
+                Style::default().fg(Color::White),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 || inner.width < 8 {
+            return;
+        }
+
+        // Render the most recent N entries (where N is the inner height),
+        // bottom-anchored so the newest entry is closest to the status bar
+        // and older entries scroll upward as new ones arrive.
+        let take = inner.height as usize;
+        let start = self.activity_log.len().saturating_sub(take);
+        let mut lines: Vec<Line> = Vec::with_capacity(take);
+        for entry in self.activity_log.iter().skip(start) {
+            let ts_str = format_utc_hms(entry.ts);
+            // Caller column padded to a stable width so summary text
+            // aligns across entries even when caller names differ.
+            let caller_col_width = 10;
+            let caller_padded = if entry.caller_label.chars().count() >= caller_col_width {
+                entry.caller_label.chars().take(caller_col_width).collect::<String>()
+            } else {
+                let pad = caller_col_width - entry.caller_label.chars().count();
+                format!("{}{}", entry.caller_label, " ".repeat(pad))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", ts_str),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(caller_padded, Style::default().fg(Color::Cyan)),
+                Span::raw(" → "),
+                Span::raw(entry.summary.clone()),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
@@ -8325,6 +8616,120 @@ mod start_workflow_prompt_selection_tests {
             },
         );
         assert_eq!(calls.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod activity_summary_tests {
+    //! Phase 6 activity feed. Pins the read-only/mutating partition (only
+    //! mutating methods get logged) and the formatting of the most-used
+    //! summary lines. The doc on `activity_summary_for` says new mutating
+    //! methods MUST be added explicitly; these tests fail-loud if a
+    //! mutating method is added without surfacing in the feed.
+
+    use super::activity_summary_for;
+    use serde_json::json;
+
+    #[test]
+    fn read_only_methods_are_silent() {
+        // None of these may produce a summary — they're high-frequency
+        // observability calls and would drown out real mutations.
+        for m in [
+            "ping",
+            "resolve_authorized_session",
+            "list_sessions",
+            "list_workflows",
+            "list_subtasks",
+            "get_workflow_state",
+        ] {
+            assert!(
+                activity_summary_for(m, &json!({}), &json!({})).is_none(),
+                "{m} must NOT produce an activity-feed entry"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_method_silent_by_default() {
+        // Defensive: a method that isn't in the explicit list (e.g. a
+        // new control-socket method added without thinking about
+        // observability) defaults to no-log. The author has to come
+        // here and add a branch — surfacing the omission rather than
+        // silently dropping it.
+        assert!(
+            activity_summary_for("totally_made_up_method", &json!({}), &json!({})).is_none()
+        );
+    }
+
+    #[test]
+    fn send_input_summarizes_target_and_text_snippet() {
+        let s = activity_summary_for(
+            "send_input",
+            &json!({"session_uid": "ts-12345678abcdefXX", "text": "hello world"}),
+            &json!({}),
+        )
+        .expect("send_input is mutating");
+        // Truncates uid to 8 chars and quotes the text.
+        assert!(s.contains("ts-12345"), "{s}");
+        assert!(s.contains("\"hello world\""), "{s}");
+    }
+
+    #[test]
+    fn send_input_truncates_long_text_with_ellipsis() {
+        let long = "x".repeat(200);
+        let s = activity_summary_for(
+            "send_input",
+            &json!({"session_uid": "ts-AAAAAAAA", "text": long}),
+            &json!({}),
+        )
+        .expect("send_input is mutating");
+        // Snippet is at most ~40 chars + a "…" suffix.
+        assert!(s.contains("…"), "expected truncation marker in {s}");
+        // Sanity: the full 200-char run isn't in there.
+        assert!(!s.contains(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn create_subtask_appends_new_task_id() {
+        let s = activity_summary_for(
+            "create_subtask",
+            &json!({"name": "demo", "worktree_mode": "branch"}),
+            &json!({"task_id": "abcd1234-deadbeef", "worktree_path": "/tmp/wt"}),
+        )
+        .expect("create_subtask is mutating");
+        // Format is "create_subtask(<name>, <mode>) → <new-id-prefix>".
+        assert!(s.starts_with("create_subtask(demo, branch)"), "{s}");
+        assert!(s.contains("→"), "{s}");
+        assert!(s.contains("abcd1234"), "{s}");
+    }
+
+    #[test]
+    fn mark_subtask_done_includes_close_worktree_flag() {
+        let s = activity_summary_for(
+            "mark_subtask_done",
+            &json!({"task_id": "task-uuid-v1", "close_worktree": true}),
+            &json!({"ok": true, "worktree_removed": true}),
+        )
+        .expect("mark_subtask_done is mutating");
+        assert!(s.contains("close_worktree=true"), "{s}");
+    }
+
+    #[test]
+    fn start_workflow_truncates_task_id() {
+        let s = activity_summary_for(
+            "start_workflow",
+            &json!({
+                "workflow_name": "feedback",
+                "task_id": "1914682b-b633-4d15-9df6-20ba036427bc",
+                "goal": "anything",
+            }),
+            &json!({"run_id": "wf_xxx"}),
+        )
+        .expect("start_workflow is mutating");
+        assert!(s.starts_with("start_workflow(feedback"), "{s}");
+        assert!(s.contains("task=1914682b"), "{s}");
+        // Full UUID must not bleed through — the column would overflow.
+        assert!(!s.contains("20ba036427bc"), "{s}");
     }
 }
 
