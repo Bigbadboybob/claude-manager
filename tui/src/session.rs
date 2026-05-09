@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -116,21 +116,52 @@ impl Session {
     /// Send raw bytes to the PTY (keyboard input).
     /// Writes directly to the PTY fd for minimal latency.
     ///
-    /// The PTY fd is non-blocking (set by alacritty), so we must loop on
-    /// WouldBlock to avoid silently dropping data on large writes (e.g. pastes).
-    pub fn write(&mut self, data: &[u8]) {
+    /// The PTY fd is non-blocking (set by alacritty), so we loop on
+    /// WouldBlock to avoid dropping data on large writes (e.g. pastes).
+    /// The loop is bounded by `WRITE_DEADLINE` so a stalled PTY (child
+    /// process not draining, wedged terminal, etc.) cannot freeze the TUI
+    /// main loop indefinitely. On timeout, returns `TimedOut` with the
+    /// number of bytes successfully delivered embedded in the message so
+    /// callers can surface a useful status note.
+    pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        const WRITE_DEADLINE: Duration = Duration::from_millis(200);
+
+        let total = data.len();
         let mut pos = 0;
-        while pos < data.len() {
+        let start = Instant::now();
+        while pos < total {
             match (&self.pty_writer).write(&data[pos..]) {
+                // Ok(0) on a non-empty slice means the writer accepted no
+                // bytes but didn't signal WouldBlock. Looping on it is a
+                // busy-spin that bypasses the deadline check below, so bail
+                // immediately with the same N/M shape as the timeout error.
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!(
+                            "PTY write made no progress: {}/{} bytes delivered",
+                            pos, total
+                        ),
+                    ));
+                }
                 Ok(n) => pos += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // PTY buffer full — brief yield then retry.
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    if start.elapsed() >= WRITE_DEADLINE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "PTY write timed out: {}/{} bytes delivered",
+                                pos, total
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e) => return Err(e),
             }
         }
+        Ok(())
     }
 
     /// Notify the PTY of a terminal resize.

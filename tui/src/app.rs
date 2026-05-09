@@ -1343,7 +1343,11 @@ impl App {
     /// the \r character — and never submits. The gap is implemented by
     /// queueing the Enter into `ts.pending_enter` and letting the main drain
     /// loop fire it after `fire_at`. We MUST NOT block the UI thread here.
-    fn deliver_pending_write(ts: &mut TerminalSession, pw: &PendingWrite, kind: &str) {
+    fn deliver_pending_write(
+        ts: &mut TerminalSession,
+        pw: &PendingWrite,
+        kind: &str,
+    ) -> std::io::Result<()> {
         let body = pw.text.trim_end_matches(['\r', '\n']);
         let enter = enter_bytes_for(&ts.session);
         let kitty = enter != b"\r";
@@ -1351,8 +1355,10 @@ impl App {
         let term_mode = *ts.session.term.lock().mode();
         let payload = format_body_for_delivery(body, term_mode);
         let bracketed = payload.len() != body.len();
-        ts.session.write(&payload);
-        if pw.submit {
+        let write_result = ts.session.write(&payload);
+        // Only queue the trailing Enter once the body has fully landed —
+        // otherwise we'd submit a half-written prompt to the agent.
+        if write_result.is_ok() && pw.submit {
             ts.pending_enter = Some(PendingEnter {
                 fire_at: Instant::now() + ENTER_GAP,
             });
@@ -1360,8 +1366,14 @@ impl App {
         // Remember the first chunk of the delivered text + delivery time so
         // an unbound workflow session can be correlated to its new sid in
         // ~/.claude/history.jsonl. Only record for workflow sessions that
-        // still need binding.
-        if ts.workflow_run_id.is_some() && ts.transcript_id.is_none() {
+        // still need binding — and only when the body write actually
+        // succeeded in full. A failed/partial body never lands in
+        // history.jsonl, so recording it would just leave the detector
+        // permanently bypassed for this session.
+        if write_result.is_ok()
+            && ts.workflow_run_id.is_some()
+            && ts.transcript_id.is_none()
+        {
             let prefix: String = body.chars().take(120).collect();
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1373,7 +1385,7 @@ impl App {
             log_tick(
                 &run_id,
                 &format!(
-                    "delivered {}: {} body bytes + submit={} to session '{}' role='{}' exited={} kitty_enter={} bracketed={}",
+                    "delivered {}: {} body bytes + submit={} to session '{}' role='{}' exited={} kitty_enter={} bracketed={} write_ok={}",
                     kind,
                     body.len(),
                     pw.submit,
@@ -1382,9 +1394,11 @@ impl App {
                     exited,
                     kitty,
                     bracketed,
+                    write_result.is_ok(),
                 ),
             );
         }
+        write_result
     }
 
     /// Path to the session manifest file.
@@ -2359,6 +2373,10 @@ impl App {
             .flat_map(|w| w.sessions.iter())
             .filter_map(|s| s.transcript_id.clone())
             .collect();
+        // Status-bar notes for write failures encountered during this drain.
+        // Collected here and applied after the loop because we cannot borrow
+        // `&mut self.status_msg` while iterating `&mut self.workspaces`.
+        let mut write_failure_notes: Vec<String> = Vec::new();
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {
                 while let Ok(event) = ts.session.event_rx.try_recv() {
@@ -2393,7 +2411,7 @@ impl App {
                                 if output.status.success() {
                                     let text = String::from_utf8_lossy(&output.stdout);
                                     let response = formatter(&text);
-                                    ts.session.write(response.as_bytes());
+                                    let _ = ts.session.write(response.as_bytes());
                                 }
                             }
                         }
@@ -2449,10 +2467,27 @@ impl App {
                 // Deliver queued `/clear` first once the PTY is quiet (or
                 // the hard deadline hits). Sequenced before pending_prompt so
                 // the prompt always lands AFTER /clear has been processed.
+                //
+                // On write failure, the pending slot has already been taken,
+                // so we don't retry the same payload — preventing an infinite
+                // loop against a wedged PTY. We surface the timeout to the
+                // status bar so the user knows to investigate.
                 if let Some(clear) = &ts.pending_clear {
                     if Self::ready_for_write(&ts.session, clear, now) {
                         let pw = ts.pending_clear.take().unwrap();
-                        Self::deliver_pending_write(ts, &pw, "pending_clear");
+                        if let Err(e) = Self::deliver_pending_write(ts, &pw, "pending_clear") {
+                            // A partial /clear in the PTY buffer can't be
+                            // recovered: any follow-up prompt would land on
+                            // top of the truncated slash-command and produce
+                            // malformed input. Tear down the whole queued
+                            // sequence so the user can re-issue it cleanly.
+                            ts.pending_prompt = None;
+                            ts.pending_enter = None;
+                            write_failure_notes.push(format!(
+                                "write to {}: {}",
+                                ts.label, e
+                            ));
+                        }
                     }
                 }
 
@@ -2466,7 +2501,14 @@ impl App {
                     if let Some(prompt) = &ts.pending_prompt {
                         if Self::ready_for_write(&ts.session, prompt, now) {
                             let pw = ts.pending_prompt.take().unwrap();
-                            Self::deliver_pending_write(ts, &pw, "pending_prompt");
+                            if let Err(e) =
+                                Self::deliver_pending_write(ts, &pw, "pending_prompt")
+                            {
+                                write_failure_notes.push(format!(
+                                    "write to {}: {}",
+                                    ts.label, e
+                                ));
+                            }
                         }
                     }
                 }
@@ -2485,7 +2527,26 @@ impl App {
                         ts.pending_enter = None;
                         let enter = enter_bytes_for(&ts.session);
                         let mode_label = if enter == b"\r" { "raw" } else { "kitty" };
-                        ts.session.write(enter);
+                        if let Err(e) = ts.session.write(enter) {
+                            // Without a successful Enter the agent never
+                            // submits the body, so nothing will land in
+                            // history.jsonl for the correlator to match.
+                            // Clear `last_delivery` so the listing-based
+                            // detector isn't permanently bypassed for this
+                            // session.
+                            ts.last_delivery = None;
+                            // If a `pending_prompt` is still queued at this
+                            // point, this Enter belonged to a `/clear` body
+                            // (the prompt only fires after pending_enter
+                            // clears). The /clear didn't submit, so a prompt
+                            // landing on top would concatenate with the
+                            // half-applied slash-command — drop it.
+                            ts.pending_prompt = None;
+                            write_failure_notes.push(format!(
+                                "enter to {}: {}",
+                                ts.label, e
+                            ));
+                        }
                         if let Some(run_id) = ts.workflow_run_id.clone() {
                             log_tick(
                                 &run_id,
@@ -2589,6 +2650,14 @@ impl App {
         }
         if had_event {
             self.needs_redraw = true;
+        }
+
+        // Surface any write timeouts collected during the per-session loop.
+        // Last note wins (status_msg holds a single string), which is fine —
+        // a stalled PTY tends to fail repeatedly and the user just needs to
+        // see *something*, not every individual failure.
+        if let Some(note) = write_failure_notes.into_iter().next_back() {
+            self.set_status_msg(&note);
         }
 
         // Poll `~/.claude/history.jsonl` for `/clear` and `/compact` events
@@ -3675,6 +3744,8 @@ impl App {
         // Handle bracketed paste — send entire text at once, wrapped in
         // bracket escapes if the inner program has enabled bracketed paste mode.
         if let CrosstermEvent::Paste(text) = event {
+            let mut paste_err: Option<(String, std::io::Error)> = None;
+            let mut handled = false;
             if let Some(ts) = self.active_session_mut() {
                 if !ts.session.exited {
                     use alacritty_terminal::grid::Scroll;
@@ -3686,10 +3757,18 @@ impl App {
                     } else {
                         text.as_bytes().to_vec()
                     };
-                    ts.session.write(&data);
+                    if let Err(e) = ts.session.write(&data) {
+                        paste_err = Some((ts.label.clone(), e));
+                    }
                     ts.last_write_at = Some(Instant::now());
-                    return true;
+                    handled = true;
                 }
+            }
+            if let Some((label, e)) = paste_err {
+                self.set_status_msg(&format!("paste to {}: {}", label, e));
+            }
+            if handled {
+                return true;
             }
         }
 
@@ -3705,6 +3784,8 @@ impl App {
         }
 
         // Forward to active terminal.
+        let mut input_err: Option<(String, std::io::Error)> = None;
+        let mut handled = false;
         if let Some(ts) = self.active_session_mut() {
             if !ts.session.exited {
                 // Auto-scroll to bottom on any input so the cursor stays visible.
@@ -3714,11 +3795,19 @@ impl App {
                 }
                 let term_mode = *ts.session.term.lock().mode();
                 if let Some(bytes) = input::event_to_bytes(event, &term_mode) {
-                    ts.session.write(&bytes);
+                    if let Err(e) = ts.session.write(&bytes) {
+                        input_err = Some((ts.label.clone(), e));
+                    }
                     ts.last_write_at = Some(Instant::now());
                 }
-                return true;
+                handled = true;
             }
+        }
+        if let Some((label, e)) = input_err {
+            self.set_status_msg(&format!("input to {}: {}", label, e));
+        }
+        if handled {
+            return true;
         }
 
         false

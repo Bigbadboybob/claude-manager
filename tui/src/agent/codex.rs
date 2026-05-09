@@ -76,7 +76,7 @@ impl Agent for CodexAgent {
     }
 
     fn interrupt(&self, ctx: AgentCtxMut<'_>) {
-        ctx.ts.session.write(&[0x03]);
+        let _ = ctx.ts.session.write(&[0x03]);
     }
 }
 

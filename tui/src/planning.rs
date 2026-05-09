@@ -1288,12 +1288,12 @@ impl PlanningView {
                     } else {
                         text.as_bytes().to_vec()
                     };
-                    editor.write(&data);
+                    let _ = editor.write(&data);
                     return PlanAction::Consumed;
                 }
                 let term_mode = *editor.term.lock().mode();
                 if let Some(bytes) = crate::input::event_to_bytes(event, &term_mode) {
-                    editor.write(&bytes);
+                    let _ = editor.write(&bytes);
                     return PlanAction::Consumed;
                 }
             }
