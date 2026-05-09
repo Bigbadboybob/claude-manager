@@ -22,10 +22,23 @@ BEGIN
     END IF;
 END $$;
 
--- Expand status to include 'draft' for planning tasks.
-ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
-ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
-    CHECK (status IN ('draft', 'backlog', 'running', 'blocked', 'done'));
+-- Expand status to include 'draft' for planning tasks. Idempotent: only
+-- add the constraint when it's missing entirely. The unconditional
+-- DROP + ADD form here was a latent bomb — once a later migration
+-- (005) widens the constraint to include 'archived' AND any rows get
+-- marked archived, every subsequent restart re-runs 004 and tries to
+-- re-add the narrow constraint, which fails CheckViolationError
+-- because the archived rows violate it. Using the DO/IF NOT EXISTS
+-- pattern here defers to whatever the latest migration left in place.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'tasks_status_check'
+    ) THEN
+        ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
+            CHECK (status IN ('draft', 'backlog', 'running', 'blocked', 'done'));
+    END IF;
+END $$;
 
 -- Unique slug per project (NULLs excluded — legacy cloud-only tasks don't need slugs).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_project_slug
