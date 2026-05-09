@@ -151,7 +151,17 @@ enum PlanInputMode {
     Normal,
     Editing,
     Searching { query: String },
-    NewTask { title: String },
+    /// Top-level task creation (`A-n`) leaves `parent_task_id = None`.
+    /// Subtask creation (`A-S`) sets it to the focused task's id; the
+    /// resulting `CreateTask` action threads it through so the API row
+    /// is persisted with the parent link set. The same input form
+    /// renders both modes; the overlay just adds a "Subtask of: …"
+    /// header when the parent is present.
+    NewTask {
+        title: String,
+        parent_task_id: Option<String>,
+        parent_name: Option<String>,
+    },
     NewHeader { text: String },
     EditingHeader { text: String },
     BulkArchiveConfirm { project_idx: usize, count: usize },
@@ -238,6 +248,14 @@ pub enum PlanAction {
         name: String,
         description: String,
         status: String,
+        /// `Some(parent_id)` → this task is a subtask, persisted with
+        /// `parent_task_id` set on the API row. `None` → top-level
+        /// (the existing `A-n` flow).
+        parent_task_id: Option<String>,
+        /// Worktree mode for subtasks (`inherit` | `branch`). Ignored
+        /// when `parent_task_id` is `None`. Defaults to `inherit` so
+        /// the subtask shares the parent's workspace once launched.
+        worktree_mode: Option<String>,
     },
     UpdateTask {
         id: String,
@@ -1074,6 +1092,24 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
+                    // `A-N` (Alt+Shift+N): create a subtask of the focused
+                    // task. Mirrors `A-n` (top-level new) but the action
+                    // carries `parent_task_id` so the API row is persisted
+                    // with the parent link from creation. `list_subtasks`
+                    // and `mark_subtask_done` then see it as a child of
+                    // the parent.
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.cancel_visual();
+                        if let Some((pi, ti)) = self.selected_task_loc() {
+                            let parent = &self.project_data[pi].tasks[ti];
+                            self.input_mode = PlanInputMode::NewTask {
+                                title: String::new(),
+                                parent_task_id: Some(parent.id.clone()),
+                                parent_name: Some(parent.title.clone()),
+                            };
+                        }
+                        return PlanAction::Consumed;
+                    }
                     KeyCode::Char('u') | KeyCode::Char('U') => { return self.unlaunch_task(); }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         self.cancel_visual();
@@ -1142,7 +1178,11 @@ impl PlanningView {
                         if self.projects.is_empty() {
                             self.input_mode = PlanInputMode::NewProject { name: String::new(), repo_url: String::new(), field: NewProjectField::Name };
                         } else {
-                            self.input_mode = PlanInputMode::NewTask { title: String::new() };
+                            self.input_mode = PlanInputMode::NewTask {
+                                title: String::new(),
+                                parent_task_id: None,
+                                parent_name: None,
+                            };
                         }
                         return PlanAction::Consumed;
                     }
@@ -1280,8 +1320,16 @@ impl PlanningView {
 
     fn handle_new_task_event(&mut self, event: &CrosstermEvent) -> PlanAction {
         if let CrosstermEvent::Key(key) = event {
-            let mut title = match &self.input_mode {
-                PlanInputMode::NewTask { title } => title.clone(),
+            // Snapshot the current state — title accumulates per keystroke,
+            // parent_task_id / parent_name are stable for the lifetime of
+            // the input session and just need to flow through to the
+            // resulting `CreateTask` action.
+            let (mut title, parent_task_id, parent_name) = match &self.input_mode {
+                PlanInputMode::NewTask {
+                    title,
+                    parent_task_id,
+                    parent_name,
+                } => (title.clone(), parent_task_id.clone(), parent_name.clone()),
                 _ => return PlanAction::Consumed,
             };
             match key.code {
@@ -1289,11 +1337,25 @@ impl PlanningView {
                 KeyCode::Enter => {
                     if !title.trim().is_empty() {
                         self.input_mode = PlanInputMode::Normal;
-                        return self.create_task(&title);
+                        return self.create_task(&title, parent_task_id);
                     }
                 }
-                KeyCode::Backspace => { title.pop(); self.input_mode = PlanInputMode::NewTask { title }; }
-                KeyCode::Char(c) => { title.push(c); self.input_mode = PlanInputMode::NewTask { title }; }
+                KeyCode::Backspace => {
+                    title.pop();
+                    self.input_mode = PlanInputMode::NewTask {
+                        title,
+                        parent_task_id,
+                        parent_name,
+                    };
+                }
+                KeyCode::Char(c) => {
+                    title.push(c);
+                    self.input_mode = PlanInputMode::NewTask {
+                        title,
+                        parent_task_id,
+                        parent_name,
+                    };
+                }
                 _ => {}
             }
         }
@@ -1875,11 +1937,24 @@ impl PlanningView {
         }
     }
 
-    fn create_task(&mut self, title: &str) -> PlanAction {
-        // Determine the project for the new task.
-        let pi = self.cursor_project_idx()
-            .or_else(|| self.unified_cols.first().map(|(pi, _)| *pi))
-            .unwrap_or(0);
+    fn create_task(
+        &mut self,
+        title: &str,
+        parent_task_id: Option<String>,
+    ) -> PlanAction {
+        // Determine the project for the new task. For subtasks we honor
+        // the parent's project explicitly so `parent_task_id`-walks line
+        // up; for top-level tasks fall back to the cursor's column.
+        let pi = if let Some(parent_id) = parent_task_id.as_deref() {
+            self.project_data
+                .iter()
+                .position(|pd| pd.tasks.iter().any(|t| t.id == parent_id))
+                .or_else(|| self.cursor_project_idx())
+        } else {
+            self.cursor_project_idx()
+                .or_else(|| self.unified_cols.first().map(|(pi, _)| *pi))
+        }
+        .unwrap_or(0);
 
         if pi >= self.project_data.len() {
             return PlanAction::Consumed;
@@ -1888,12 +1963,23 @@ impl PlanningView {
         let project = self.project_data[pi].project.name.clone();
         let repo_url = repo_url_for_project(&project);
 
+        // Subtasks default to inherit-mode worktree (share parent's). The
+        // user can change this on the API row later if they want a
+        // separate branch worktree before launch.
+        let worktree_mode = if parent_task_id.is_some() {
+            Some("inherit".to_string())
+        } else {
+            None
+        };
+
         PlanAction::CreateTask {
             project,
             repo_url,
             name: title.to_string(),
             description: title.to_string(),
             status: "draft".to_string(),
+            parent_task_id,
+            worktree_mode,
         }
     }
 
@@ -2129,7 +2215,9 @@ impl PlanningView {
 
         match &self.input_mode {
             PlanInputMode::Searching { query } => self.draw_search_overlay(frame, area, query),
-            PlanInputMode::NewTask { title } => self.draw_new_task_overlay(frame, area, title),
+            PlanInputMode::NewTask { title, parent_name, .. } => {
+                self.draw_new_task_overlay(frame, area, title, parent_name.as_deref())
+            }
             PlanInputMode::NewHeader { text } => self.draw_new_header_overlay(frame, area, text, false),
             PlanInputMode::EditingHeader { text } => self.draw_new_header_overlay(frame, area, text, true),
             PlanInputMode::BulkArchiveConfirm { project_idx, count } => self.draw_bulk_archive_confirm(frame, area, *project_idx, *count),
@@ -2369,6 +2457,7 @@ impl PlanningView {
             ("A-J/K  reorder", "A-f    launch"),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
+            ("A-N    subtask", ""),
             ("A-u    unbind", "A-U    unlaunch"),
             ("A-Ent  sep", "A-Spc  empty"),
             ("A-i    header", "A-A    archive done"),
@@ -2655,23 +2744,68 @@ impl PlanningView {
         ]), inner);
     }
 
-    fn draw_new_task_overlay(&self, frame: &mut Frame, area: Rect, title: &str) {
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 5u16);
+    fn draw_new_task_overlay(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        parent_name: Option<&str>,
+    ) {
+        // Subtask overlay is one row taller so we can show the parent
+        // task's name + the worktree-mode default. The fields all stay
+        // read-only here; the only typed input is the title.
+        let h = if parent_name.is_some() { 7u16 } else { 5u16 };
+        let w = 60u16.min(area.width.saturating_sub(4));
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(" New Task ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let title_label = if parent_name.is_some() {
+            " New Subtask "
+        } else {
+            " New Task "
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White))
+            .title(Span::styled(
+                title_label,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
-        frame.render_widget(Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("  Title: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(title, Style::default().fg(Color::White)),
-                Span::styled("\u{2588}", Style::default().fg(Color::White)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("Enter create \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
-        ]), inner);
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(p) = parent_name {
+            // Truncate long parent names so the dialog stays inside its
+            // 60-cell box; we keep ~46 chars of room after "  Parent: ".
+            let max = 46;
+            let shown: String = if p.chars().count() > max {
+                format!("{}…", p.chars().take(max).collect::<String>())
+            } else {
+                p.to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  Parent: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(shown, Style::default().fg(Color::Cyan)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Mode:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("inherit", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "  (subtask shares parent's worktree on launch)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  Title:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(title, Style::default().fg(Color::White)),
+            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Enter create \u{00b7} Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_new_header_overlay(&self, frame: &mut Frame, area: Rect, text: &str, editing: bool) {

@@ -91,7 +91,7 @@ Sessions view:
 - `A-r` — refresh
 
 Planning view:
-- `A-e` edit, `A-n` new, `A-a` accept (claim claude-proposed task), `A-i` insert header (bold-text section label), `A-A` bulk-archive done tasks in current project (with confirm), `A-V` toggle archived task visibility, `A-s/S` cycle status, `A-f` launch (cloud), `A-g` grid/linear toggle
+- `A-e` edit, `A-n` new, `A-N` new subtask of focused task (persists `parent_task_id` on the API row; same input form as `A-n` with the parent name shown for confirmation; worktree mode defaults to `inherit`), `A-a` accept (claim claude-proposed task), `A-i` insert header (bold-text section label), `A-A` bulk-archive done tasks in current project (with confirm), `A-V` toggle archived task visibility, `A-s/S` cycle status, `A-f` launch (cloud), `A-g` grid/linear toggle
 
 ## Cloud mode (optional, secondary)
 

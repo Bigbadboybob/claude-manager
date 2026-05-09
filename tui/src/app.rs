@@ -3424,8 +3424,24 @@ impl App {
                     self.should_quit = true;
                     return true;
                 }
-                PlanAction::CreateTask { project, repo_url, name, description, status } => {
-                    self.backend.create_plan_task(project, repo_url, name, description, status);
+                PlanAction::CreateTask {
+                    project,
+                    repo_url,
+                    name,
+                    description,
+                    status,
+                    parent_task_id,
+                    worktree_mode,
+                } => {
+                    self.backend.create_plan_task(
+                        project,
+                        repo_url,
+                        name,
+                        description,
+                        status,
+                        parent_task_id,
+                        worktree_mode,
+                    );
                     return true;
                 }
                 PlanAction::UpdateTask { id, fields } => {

@@ -39,6 +39,13 @@ pub enum BackendCommand {
         name: String,
         description: String,
         status: String,
+        /// `Some(parent_id)` → posted as a subtask (parent_task_id flows
+        /// to the API row). `None` → top-level task.
+        parent_task_id: Option<String>,
+        /// Worktree mode for subtasks; persisted on the API row so a
+        /// future launch flow can branch correctly. Ignored when
+        /// `parent_task_id` is None.
+        worktree_mode: Option<String>,
     },
     /// Update a planning task in the DB.
     UpdatePlanTask {
@@ -146,6 +153,8 @@ impl BackendHandle {
         name: String,
         description: String,
         status: String,
+        parent_task_id: Option<String>,
+        worktree_mode: Option<String>,
     ) {
         let _ = self.cmd_tx.send(BackendCommand::CreatePlanTask {
             project,
@@ -153,6 +162,8 @@ impl BackendHandle {
             name,
             description,
             status,
+            parent_task_id,
+            worktree_mode,
         });
     }
 
@@ -248,9 +259,19 @@ fn backend_loop(
                 name,
                 description,
                 status,
+                parent_task_id,
+                worktree_mode,
             }) => {
                 do_create_plan_task(
-                    &client, &event_tx, &project, &repo_url, &name, &description, &status,
+                    &client,
+                    &event_tx,
+                    &project,
+                    &repo_url,
+                    &name,
+                    &description,
+                    &status,
+                    parent_task_id.as_deref(),
+                    worktree_mode.as_deref(),
                 );
             }
             Ok(BackendCommand::UpdatePlanTask { id, fields }) => {
@@ -630,7 +651,10 @@ fn do_pull(
     });
 }
 
-/// Create a planning task in the DB.
+/// Create a planning task in the DB. `parent_task_id` and `worktree_mode`
+/// flow through to the API row so subtasks land with their parent link
+/// and worktree intent persisted from creation. Top-level tasks pass
+/// `None` for both and the API treats them as ordinary planning rows.
 fn do_create_plan_task(
     client: &ApiClient,
     event_tx: &mpsc::Sender<BackendEvent>,
@@ -639,6 +663,8 @@ fn do_create_plan_task(
     name: &str,
     description: &str,
     status: &str,
+    parent_task_id: Option<&str>,
+    worktree_mode: Option<&str>,
 ) {
     let body = TaskCreateBody {
         repo_url: repo_url.to_string(),
@@ -654,8 +680,8 @@ fn do_create_plan_task(
         depends: None,
         source: None,
         is_cloud: Some(false),
-        parent_task_id: None,
-        worktree_mode: None,
+        parent_task_id: parent_task_id.map(str::to_string),
+        worktree_mode: worktree_mode.map(str::to_string),
         wip_branch: None,
     };
 
