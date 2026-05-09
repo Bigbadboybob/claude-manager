@@ -345,6 +345,20 @@ fn write_temp_task(task: &PlanTask) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Per-field edit intent, three-valued so the PATCH builder can tell
+/// "user didn't touch this" apart from "user explicitly cleared this".
+/// Without this distinction a cleared field silently reverts to the
+/// stored value on the next refresh.
+#[derive(Debug, Clone, PartialEq)]
+enum FieldUpdate<T> {
+    /// Key absent from the YAML — omit from PATCH.
+    Absent,
+    /// Key present but empty/null/empty-string — PATCH null (or [] for lists).
+    Cleared,
+    /// Key present with a value — PATCH that value.
+    Set(T),
+}
+
 /// Parse a temp task file back into field updates.
 fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -358,6 +372,40 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
     let body = after_first[end_idx + 4..].trim().to_string();
 
     let front: PlanTaskFrontmatter = serde_yaml::from_str(yaml_str).ok()?;
+    // Parse a second time as an untyped mapping so we can detect key
+    // presence — the typed view collapses "absent" and "cleared" into
+    // the same Option::None for nullable scalars.
+    let raw: serde_yaml::Value = serde_yaml::from_str(yaml_str).ok()?;
+    let key_present = |name: &str| -> bool {
+        raw.as_mapping()
+            .map(|m| m.contains_key(serde_yaml::Value::String(name.to_string())))
+            .unwrap_or(false)
+    };
+
+    let difficulty = if !key_present("difficulty") {
+        FieldUpdate::Absent
+    } else {
+        match front.difficulty {
+            Some(d) => FieldUpdate::Set(d),
+            None => FieldUpdate::Cleared,
+        }
+    };
+    let depends = if !key_present("depends") {
+        FieldUpdate::Absent
+    } else {
+        match front.depends {
+            Some(v) if !v.is_empty() => FieldUpdate::Set(v),
+            _ => FieldUpdate::Cleared,
+        }
+    };
+    let branch = if !key_present("branch") {
+        FieldUpdate::Absent
+    } else {
+        match front.branch {
+            Some(s) if !s.is_empty() => FieldUpdate::Set(s),
+            _ => FieldUpdate::Cleared,
+        }
+    };
 
     // Extract prompt section from body.
     let mut in_prompt = false;
@@ -383,9 +431,9 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
     Some(TempTaskParsed {
         title: front.title,
         status: front.status.unwrap_or_else(|| "draft".to_string()),
-        difficulty: front.difficulty,
-        depends: front.depends.unwrap_or_default(),
-        branch: front.branch,
+        difficulty,
+        depends,
+        branch,
         description: desc_lines.join("\n").trim().to_string(),
         prompt: prompt_lines.join("\n").trim().to_string(),
     })
@@ -394,11 +442,55 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
 struct TempTaskParsed {
     title: String,
     status: String,
-    difficulty: Option<u8>,
-    depends: Vec<String>,
-    branch: Option<String>,
+    difficulty: FieldUpdate<u8>,
+    depends: FieldUpdate<Vec<String>>,
+    branch: FieldUpdate<String>,
     description: String,
     prompt: String,
+}
+
+/// Build the PATCH map sent to the API for an editor save. Cleared
+/// nullable fields go out as JSON null; cleared `depends` goes out as
+/// `[]`. Fields the user didn't touch (absent from YAML) are omitted.
+/// The API end of the clear (F17) must accept null/[] for these keys.
+fn build_patch_fields(parsed: &TempTaskParsed) -> HashMap<String, serde_json::Value> {
+    let mut fields = HashMap::new();
+    fields.insert("name".to_string(), serde_json::json!(parsed.title));
+    fields.insert("status".to_string(), serde_json::json!(parsed.status));
+    fields.insert(
+        "description".to_string(),
+        serde_json::json!(parsed.description),
+    );
+    fields.insert("prompt".to_string(), serde_json::json!(parsed.prompt));
+
+    match &parsed.difficulty {
+        FieldUpdate::Absent => {}
+        FieldUpdate::Cleared => {
+            fields.insert("difficulty".to_string(), serde_json::Value::Null);
+        }
+        FieldUpdate::Set(d) => {
+            fields.insert("difficulty".to_string(), serde_json::json!(d));
+        }
+    }
+    match &parsed.depends {
+        FieldUpdate::Absent => {}
+        FieldUpdate::Cleared => {
+            fields.insert("depends".to_string(), serde_json::json!([] as [String; 0]));
+        }
+        FieldUpdate::Set(v) => {
+            fields.insert("depends".to_string(), serde_json::json!(v));
+        }
+    }
+    match &parsed.branch {
+        FieldUpdate::Absent => {}
+        FieldUpdate::Cleared => {
+            fields.insert("repo_branch".to_string(), serde_json::Value::Null);
+        }
+        FieldUpdate::Set(b) => {
+            fields.insert("repo_branch".to_string(), serde_json::json!(b));
+        }
+    }
+    fields
 }
 
 // ── Layout Persistence ──────────────────────────────────────
@@ -2130,30 +2222,32 @@ impl PlanningView {
                 if let Some(task) = self.project_data.get_mut(pi)
                     .and_then(|pd| pd.tasks.iter_mut().find(|t| t.slug == slug))
                 {
-                    // Update local state.
+                    // Update local state. For FieldUpdate-tracked fields,
+                    // Absent leaves the previous value untouched so opening
+                    // the editor on a row where these fields weren't even
+                    // emitted (because they were already empty) doesn't
+                    // accidentally rewrite them.
                     task.title = parsed.title.clone();
                     task.status = PlanStatus::from_str(&parsed.status);
-                    task.difficulty = parsed.difficulty;
-                    task.depends = parsed.depends.clone();
-                    task.branch = parsed.branch.clone();
+                    match &parsed.difficulty {
+                        FieldUpdate::Absent => {}
+                        FieldUpdate::Cleared => task.difficulty = None,
+                        FieldUpdate::Set(d) => task.difficulty = Some(*d),
+                    }
+                    match &parsed.depends {
+                        FieldUpdate::Absent => {}
+                        FieldUpdate::Cleared => task.depends.clear(),
+                        FieldUpdate::Set(v) => task.depends = v.clone(),
+                    }
+                    match &parsed.branch {
+                        FieldUpdate::Absent => {}
+                        FieldUpdate::Cleared => task.branch = None,
+                        FieldUpdate::Set(b) => task.branch = Some(b.clone()),
+                    }
                     task.description = parsed.description.clone();
                     task.prompt = parsed.prompt.clone();
 
-                    // Build fields for API update.
-                    let mut fields = HashMap::new();
-                    fields.insert("name".to_string(), serde_json::json!(parsed.title));
-                    fields.insert("status".to_string(), serde_json::json!(parsed.status));
-                    fields.insert("description".to_string(), serde_json::json!(parsed.description));
-                    fields.insert("prompt".to_string(), serde_json::json!(parsed.prompt));
-                    if let Some(d) = parsed.difficulty {
-                        fields.insert("difficulty".to_string(), serde_json::json!(d));
-                    }
-                    if !parsed.depends.is_empty() {
-                        fields.insert("depends".to_string(), serde_json::json!(parsed.depends));
-                    }
-                    if let Some(ref branch) = parsed.branch {
-                        fields.insert("repo_branch".to_string(), serde_json::json!(branch));
-                    }
+                    let fields = build_patch_fields(&parsed);
 
                     action = PlanAction::UpdateTask {
                         id: task.id.clone(),
@@ -3350,7 +3444,7 @@ mod tests {
         let mut task = make_plan_task("yaml-rt-slash");
         task.branch = Some("user/bar".to_string());
         let parsed = round_trip(&task);
-        assert_eq!(parsed.branch, Some("user/bar".to_string()));
+        assert_eq!(parsed.branch, FieldUpdate::Set("user/bar".to_string()));
     }
 
     #[test]
@@ -3360,7 +3454,7 @@ mod tests {
         let parsed = round_trip(&task);
         assert_eq!(
             parsed.depends,
-            vec!["foo,bar".to_string(), "baz".to_string()]
+            FieldUpdate::Set(vec!["foo,bar".to_string(), "baz".to_string()])
         );
     }
 
@@ -3406,6 +3500,141 @@ mod tests {
 
         assert_eq!(parsed.title, "still here");
         assert_eq!(parsed.status, "backlog");
-        assert!(parsed.depends.is_empty());
+        assert_eq!(parsed.depends, FieldUpdate::Cleared);
+    }
+
+    // ── PATCH-shape tests for the cleared-field fix (F16) ─────
+    //
+    // The temp-file editor used to gate every nullable field behind
+    // `if let Some(...)` / `!is_empty()`, so deleting a field's value in
+    // the editor produced no PATCH key for it — the next refresh
+    // happily reloaded the stale stored value and the user's clear
+    // was silently undone. Each test here pins one corner of the
+    // fix: the PATCH must carry the user's intent, including clears.
+    //
+    // Known dependency: F17 lands the API end (PATCH must accept
+    // `null` / `[]` and propagate the clear down to the DB row).
+    // These tests assert the wire shape only.
+    fn write_temp(name: &str, raw: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("cm-planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
+    #[test]
+    fn cleared_difficulty_in_patch_is_null() {
+        // User opened the editor on a task with difficulty: 3 and
+        // erased the value, leaving `difficulty:` (null).
+        let path = write_temp(
+            "f16-clear-difficulty.md",
+            "---\ntitle: t\nstatus: backlog\ndifficulty:\n---\n\nbody\n",
+        );
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.difficulty, FieldUpdate::Cleared);
+        let fields = build_patch_fields(&parsed);
+        assert_eq!(
+            fields.get("difficulty"),
+            Some(&serde_json::Value::Null),
+            "cleared difficulty must PATCH as JSON null, not be omitted"
+        );
+    }
+
+    #[test]
+    fn cleared_depends_in_patch_is_empty_array() {
+        // User had depends: [a, b] and emptied it to depends: [].
+        let path = write_temp(
+            "f16-clear-depends-empty-list.md",
+            "---\ntitle: t\nstatus: backlog\ndepends: []\n---\n\nbody\n",
+        );
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.depends, FieldUpdate::Cleared);
+        let fields = build_patch_fields(&parsed);
+        assert_eq!(
+            fields.get("depends"),
+            Some(&serde_json::json!([] as [String; 0])),
+            "cleared depends must PATCH as empty array, not be omitted"
+        );
+    }
+
+    #[test]
+    fn cleared_branch_in_patch_is_null() {
+        // User had branch: main and erased the value.
+        let path = write_temp(
+            "f16-clear-branch.md",
+            "---\ntitle: t\nstatus: backlog\nbranch:\n---\n\nbody\n",
+        );
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.branch, FieldUpdate::Cleared);
+        let fields = build_patch_fields(&parsed);
+        assert_eq!(
+            fields.get("repo_branch"),
+            Some(&serde_json::Value::Null),
+            "cleared branch must PATCH repo_branch as JSON null, not be omitted"
+        );
+    }
+
+    #[test]
+    fn untouched_difficulty_omitted_from_patch() {
+        // User saves the editor without touching difficulty: 3 — the
+        // YAML still says `difficulty: 3`, so the PATCH should reassert
+        // the same value and NOT spuriously include null.
+        let path = write_temp(
+            "f16-keep-difficulty.md",
+            "---\ntitle: t\nstatus: backlog\ndifficulty: 3\n---\n\nbody\n",
+        );
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.difficulty, FieldUpdate::Set(3));
+        let fields = build_patch_fields(&parsed);
+        assert_eq!(fields.get("difficulty"), Some(&serde_json::json!(3)));
+
+        // And: if difficulty is genuinely absent from the YAML (was
+        // None to begin with, user didn't add it), it must be omitted
+        // entirely so the API doesn't see a phantom update.
+        let path2 = write_temp(
+            "f16-absent-difficulty.md",
+            "---\ntitle: t\nstatus: backlog\n---\n\nbody\n",
+        );
+        let parsed2 = parse_temp_task(&path2).expect("parse");
+        let _ = std::fs::remove_file(&path2);
+
+        assert_eq!(parsed2.difficulty, FieldUpdate::Absent);
+        let fields2 = build_patch_fields(&parsed2);
+        assert!(
+            !fields2.contains_key("difficulty"),
+            "absent difficulty must be omitted from PATCH (no spurious update)"
+        );
+        assert!(!fields2.contains_key("depends"));
+        assert!(!fields2.contains_key("repo_branch"));
+    }
+
+    #[test]
+    fn cleared_depends_via_null_in_patch_is_empty_array() {
+        // Sibling of cleared_depends_in_patch_is_empty_array: when the
+        // user empties the YAML by leaving `depends:` (null) — same
+        // pre-fix path as the original null-depends regression — the
+        // PATCH must still surface as `[]`.
+        let path = write_temp(
+            "f16-clear-depends-null.md",
+            "---\ntitle: t\nstatus: backlog\ndepends:\n---\n\nbody\n",
+        );
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.depends, FieldUpdate::Cleared);
+        let fields = build_patch_fields(&parsed);
+        assert_eq!(
+            fields.get("depends"),
+            Some(&serde_json::json!([] as [String; 0])),
+        );
     }
 }
