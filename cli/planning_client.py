@@ -21,8 +21,24 @@ class PlanningClient:
     """Client for Claude instances to propose tasks to the backlog."""
 
     def __init__(self, api_url: str | None = None, api_token: str | None = None):
-        url = api_url or os.environ["CM_API_URL"]
-        token = api_token or os.environ["CM_API_TOKEN"]
+        url = api_url or os.environ.get("CM_API_URL")
+        if not url:
+            raise RuntimeError(
+                "CM_API_URL is not set — the MCP planning client needs the "
+                "claude-manager API URL. The TUI normally injects this when "
+                "it spawns MCP servers. To run the MCP server outside the "
+                "TUI, set CM_API_URL=http://localhost:8000 (or the manager "
+                "VM's IP) and CM_API_TOKEN=<your-token>."
+            )
+        token = api_token or os.environ.get("CM_API_TOKEN")
+        if not token:
+            raise RuntimeError(
+                "CM_API_TOKEN is not set — the MCP planning client needs an "
+                "auth token for the claude-manager API. The TUI normally "
+                "injects this when it spawns MCP servers. To run the MCP "
+                "server outside the TUI, set CM_API_TOKEN=<your-token> "
+                "(and CM_API_URL=http://localhost:8000 or the manager VM's IP)."
+            )
         self._client = CMClient(url, token)
 
     def propose_task(
