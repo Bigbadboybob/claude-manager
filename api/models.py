@@ -17,6 +17,13 @@ class TaskCreate(BaseModel):
     depends: list[str] | None = None
     source: str = "user"
     is_cloud: bool = False
+    # Subtask fields (Phase 5 of agent orchestration)
+    parent_task_id: str | None = None
+    worktree_mode: str = "inherit"
+    # Optional initial wip_branch — set by `create_subtask` for both
+    # modes so the API row matches the worktree on disk from the
+    # first save (no UPDATE round-trip needed).
+    wip_branch: str | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -39,6 +46,9 @@ class TaskUpdate(BaseModel):
     depends: list[str] | None = None
     source: str | None = None
     is_cloud: bool | None = None
+    # Subtask fields
+    parent_task_id: str | None = None
+    worktree_mode: str | None = None
 
 
 class TaskResponse(BaseModel):
@@ -66,6 +76,9 @@ class TaskResponse(BaseModel):
     depends: list[str] | None = None
     source: str = "user"
     is_cloud: bool = False
+    # Subtask fields (Phase 5)
+    parent_task_id: str | None = None
+    worktree_mode: str = "inherit"
 
     class Config:
         from_attributes = True

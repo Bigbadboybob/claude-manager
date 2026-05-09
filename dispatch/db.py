@@ -28,17 +28,23 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                    project: str | None = None, slug: str | None = None,
                    name: str | None = None, description: str | None = None,
                    difficulty: int | None = None, depends: list[str] | None = None,
-                   source: str = "user", is_cloud: bool = False) -> dict:
+                   source: str = "user", is_cloud: bool = False,
+                   parent_task_id: str | None = None,
+                   worktree_mode: str = "inherit",
+                   wip_branch: str | None = None) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
                                   status, project, slug, name, description,
-                                  difficulty, depends, source, is_cloud)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                  difficulty, depends, source, is_cloud,
+                                  parent_task_id, worktree_mode, wip_branch)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                       $14, $15, $16)
                RETURNING *""",
             repo_url, repo_branch, prompt, priority,
             status, project, slug, name, description,
             difficulty, depends or [], source, is_cloud,
+            parent_task_id, worktree_mode, wip_branch,
         )
         return _serialize(dict(row))
 

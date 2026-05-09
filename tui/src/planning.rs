@@ -212,6 +212,12 @@ pub enum PlanAction {
         task_id: String,
         task_title: String,
         task_repo_url: String,
+        /// Project name from the planning row. Pinned at action time so
+        /// the launch site can persist it on the local TaskEntry stub
+        /// even when the API row hasn't been reconciled yet — fixes
+        /// the disappearing-subtask race when an agent calls
+        /// `create_subtask` before reconcile backfills `project`.
+        project: String,
         prompt: String,
     },
     /// Clear a task's `workspace_id`. Task status is not affected.
@@ -1525,6 +1531,7 @@ impl PlanningView {
                                     task_id: task.id.clone(),
                                     task_title: task.title.clone(),
                                     task_repo_url: task.repo_url.clone(),
+                                    project: pd.project.name.clone(),
                                     prompt,
                                 };
                             }

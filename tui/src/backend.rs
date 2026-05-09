@@ -464,6 +464,9 @@ fn do_push(
             depends: None,
             source: None,
             is_cloud: Some(true),
+            parent_task_id: None,
+            worktree_mode: None,
+            wip_branch: None,
         };
         match client.create_task(&body) {
             Ok(task) => {
@@ -651,6 +654,9 @@ fn do_create_plan_task(
         depends: None,
         source: None,
         is_cloud: Some(false),
+        parent_task_id: None,
+        worktree_mode: None,
+        wip_branch: None,
     };
 
     match client.create_task(&body) {

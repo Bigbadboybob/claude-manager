@@ -394,6 +394,166 @@ def read_session_output(
 
 
 @mcp.tool()
+def start_workflow(
+    task_id: str,
+    workflow_name: str,
+    goal: str = "",
+) -> dict:
+    """Launch a workflow on a task you have authority over.
+
+    The caller is the orchestrator — NOT a participant. Workflow
+    participants are spawned as fresh sessions with their TOML-declared
+    engine. Use `get_workflow_state` and `read_session_output` to
+    observe progress; the existing `workflow_transition` /
+    `workflow_done` tools are for participants, not orchestrators.
+
+    Args:
+        task_id: Target task. Must be the caller's own task or a
+            descendant in the parent_task_id tree.
+        workflow_name: Workflow definition name (e.g. "feedback").
+        goal: Optional initial goal string passed to the worker's
+            activation prompt template ({{ goal }}).
+
+    Returns: {"run_id": "<id>"}.
+
+    State your intent and ask the user to confirm before calling.
+    """
+    params: dict = {"task_id": task_id, "workflow_name": workflow_name}
+    if goal:
+        params["goal"] = goal
+    return control_client.call("start_workflow", params)
+
+
+@mcp.tool()
+def stop_workflow(run_id: str) -> dict:
+    """Mark a workflow run as detached. Participant sessions stay open
+    but no further transitions fire. Caller must have authority over
+    the workflow's task.
+
+    Ask the user before calling — stopping a workflow is destructive.
+    """
+    return control_client.call("stop_workflow", {"run_id": run_id})
+
+
+@mcp.tool()
+def get_workflow_state(run_id: str) -> dict:
+    """Read full state for a workflow run you have authority over.
+
+    Returns active_role, iteration, paused, status, history (each
+    activation's role/trigger/transcript_id), role_sessions (per-role
+    session_label + current_transcript_id), goal, started_at,
+    done_reason. Use this to monitor a workflow you launched.
+    """
+    return control_client.call("get_workflow_state", {"run_id": run_id})
+
+
+@mcp.tool()
+def list_workflows(task_id: str | None = None) -> list[dict]:
+    """List workflow runs in your scope.
+
+    Args:
+        task_id: Optional task filter. Without it, returns runs across
+            your task and any descendants.
+
+    Returns: list of {run_id, name, task_id, active_role, iteration,
+        paused, status, started_at, done_reason}.
+    """
+    params: dict = {}
+    if task_id:
+        params["task_id"] = task_id
+    return control_client.call("list_workflows", params)
+
+
+@mcp.tool()
+def create_subtask(
+    name: str,
+    prompt: str = "",
+    worktree_mode: str = "inherit",
+    project: str | None = None,
+) -> dict:
+    """Create a subtask under your current task.
+
+    The new task gets `parent_task_id` set to your task. You must have
+    a bound task (workflow- or planning-launched session). Taskless
+    callers (`A-n`) should use `propose_task` for top-level tasks.
+
+    Args:
+        name: Display name for the subtask. Slugified for the branch
+            name (alphanumerics + dash, max 40 chars).
+        prompt: Optional initial prompt for the subtask's worker.
+        worktree_mode: "inherit" (default) — same worktree as parent;
+            sessions spawn in the parent's worktree directory.
+            "branch" — new worktree branched off the parent's
+            wip_branch with name `cm-sub/<slug-chain>-<short_id>`.
+        project: Optional explicit project; defaults to the parent's
+            project.
+
+    Returns: {"task_id": "<uuid>", "worktree_path": "<absolute path>"}.
+
+    State your intent and ask the user before calling. Subtasks are a
+    real fork — branch mode creates real git state.
+    """
+    params: dict = {
+        "name": name,
+        "worktree_mode": worktree_mode,
+    }
+    if prompt:
+        params["prompt"] = prompt
+    if project:
+        params["project"] = project
+    return control_client.call("create_subtask", params)
+
+
+@mcp.tool()
+def list_subtasks(task_id: str | None = None) -> list[dict]:
+    """List direct children of a task.
+
+    Args:
+        task_id: Optional explicit task. Defaults to your own task.
+            Must be your task or a descendant; cross-task scoping
+            is rejected.
+
+    Returns: list of {task_id, name, status, worktree_mode, wip_branch,
+        workspace_id}. Only direct children — to walk a deeper tree,
+        recurse manually with successive list_subtasks calls.
+    """
+    params: dict = {}
+    if task_id:
+        params["task_id"] = task_id
+    return control_client.call("list_subtasks", params)
+
+
+@mcp.tool()
+def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
+    """Mark a subtask done. Optionally tear down its worktree.
+
+    Args:
+        task_id: The subtask. Must be your task or a descendant.
+        close_worktree: When true (default) AND the subtask used
+            branch mode, tombstone its sessions, run `git worktree
+            remove`, and mark its workspace closed. The branch ref
+            stays so merge history is preserved — prune manually with
+            `git branch -d cm-sub/<slug-chain>-<short_id>` once
+            you're confident.
+
+    Returns: {"ok": true, "worktree_removed": bool}.
+
+    For branch-mode subtasks, run your `git merge` (or rebase, or
+    cherry-pick) into the parent worktree BEFORE calling this — once
+    the worktree is removed there's no working copy to merge from.
+    Inherit-mode subtasks have nothing to remove; close_worktree is
+    ignored.
+
+    Ask the user before calling — this is a multi-step destructive
+    operation.
+    """
+    return control_client.call(
+        "mark_subtask_done",
+        {"task_id": task_id, "close_worktree": close_worktree},
+    )
+
+
+@mcp.tool()
 def workflow_transition(to: str, prompt: str) -> str:
     """Hand control to another role in the current workflow.
 

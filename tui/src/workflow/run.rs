@@ -87,6 +87,13 @@ pub struct WorkflowRun {
     /// The `TaskEntry`-identifying key: worktree_path string for local tasks,
     /// `task:<id>` for cloud tasks. Matches the manifest key convention.
     pub task_key: String,
+    /// Bound TaskEntry id, when known. Set by `start_workflow_run` (the
+    /// MCP entry point) so the descendant-aware auth check has a real
+    /// task id to evaluate. UI launches that don't go through the MCP
+    /// path leave this `None`; auth handlers fall back to walking
+    /// `app.tasks` by `workspace_id`.
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub role_sessions: BTreeMap<String, RoleBinding>,
     pub active_role: Option<String>,
     pub iteration: u32,
@@ -152,6 +159,7 @@ impl WorkflowRun {
             run_id,
             workflow_name,
             task_key,
+            task_id: None,
             role_sessions,
             active_role: Some(initial_role),
             iteration: 1,

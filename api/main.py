@@ -65,6 +65,8 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
         status=body.status, project=body.project, slug=slug, name=body.name,
         description=body.description, difficulty=body.difficulty,
         depends=body.depends, source=body.source, is_cloud=body.is_cloud,
+        parent_task_id=body.parent_task_id, worktree_mode=body.worktree_mode,
+        wip_branch=body.wip_branch,
     )
     return task
 

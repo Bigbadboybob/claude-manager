@@ -36,6 +36,17 @@ pub struct Task {
     pub source: String,
     #[serde(default)]
     pub is_cloud: bool,
+    /// FK to another task. Null for top-level tasks. Phase 5 subtask field.
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
+    /// "inherit" (default) or "branch". Only meaningful when
+    /// `parent_task_id` is set. Phase 5 subtask field.
+    #[serde(default = "default_worktree_mode")]
+    pub worktree_mode: String,
+}
+
+fn default_worktree_mode() -> String {
+    "inherit".to_string()
 }
 
 fn default_source() -> String {
@@ -68,6 +79,18 @@ pub struct TaskCreateBody {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_cloud: Option<bool>,
+    // Subtask fields (Phase 5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_mode: Option<String>,
+    /// `wip_branch` at create time. Inherit-mode subtasks need this
+    /// to persist their parent's branch through reconcile (without
+    /// it the API row's `wip_branch` is NULL and the next reconcile
+    /// blanks the local copy, so a branch-mode grandchild would
+    /// fall back to "main" as its start ref).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wip_branch: Option<String>,
 }
 
 /// Blocking HTTP client for the Claude Manager API.

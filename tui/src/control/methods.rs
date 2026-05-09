@@ -143,10 +143,18 @@ pub fn live_caller_ctx(
 }
 
 /// Check whether `caller` may read or mutate the target session/tombstone
-/// in `target_wi`. Tasked callers: same task_id (Phase 5 adds descendants).
-/// Taskless callers: same workspace.
+/// in `target_wi`. Two regimes:
+///   - Tasked caller (workflow- or planning-launched): authorized iff
+///     the target's task_id is the caller's task or a descendant in the
+///     parent_task_id tree. The check is **purely task-tree** with no
+///     workspace constraint, because branch-mode subtasks live in a
+///     freshly-created child workspace different from the caller's.
+///     A tasked caller cannot reach a target without a task_id.
+///   - Taskless caller (`A-n`): authorized iff the target is in the
+///     same workspace as the caller, regardless of its task_id.
 pub fn caller_authorized_for(
     caller: &CallerCtx,
+    tasks: &[crate::app::TaskEntry],
     target_wi: usize,
     target_task_id: Option<&str>,
 ) -> bool {
@@ -154,15 +162,51 @@ pub fn caller_authorized_for(
         return false;
     };
     match &caller.task_id {
-        Some(task_id) => {
-            // Tasked caller — only their own task.
-            target_task_id == Some(task_id.as_str()) && caller_wi == target_wi
-        }
-        None => {
-            // Taskless caller — same workspace, regardless of target's task.
-            caller_wi == target_wi
-        }
+        Some(task_id) => target_task_id
+            .map(|tid| task_is_self_or_descendant_of(tasks, tid, task_id))
+            .unwrap_or(false),
+        None => caller_wi == target_wi,
     }
+}
+
+/// Cap on the parent_task_id walk. Defends against cycles or
+/// pathologically deep trees — neither should occur in practice but
+/// the auth check should not hang or stack-overflow if they do.
+const MAX_TASK_DEPTH: usize = 64;
+
+/// Is `target_id` either equal to `caller_id` or a (transitive) child
+/// of it via the parent_task_id chain? Walks up from target. Stops at
+/// `MAX_TASK_DEPTH` or the first task without a parent (top-level).
+pub fn task_is_self_or_descendant_of(
+    tasks: &[crate::app::TaskEntry],
+    target_id: &str,
+    caller_id: &str,
+) -> bool {
+    if target_id == caller_id {
+        return true;
+    }
+    let mut cur = target_id.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..MAX_TASK_DEPTH {
+        if !visited.insert(cur.clone()) {
+            // Cycle detected — bail.
+            return false;
+        }
+        let Some(task) = tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(cur.as_str()))
+        else {
+            return false;
+        };
+        let Some(parent) = task.parent_task_id.clone() else {
+            return false;
+        };
+        if parent == caller_id {
+            return true;
+        }
+        cur = parent;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +324,7 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
     match target {
         TargetLocation::Live { wi, si } => {
             let ts = &app.workspaces[wi].sessions[si];
-            if !caller_authorized_for(&caller, wi, ts.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, &app.tasks, wi, ts.task_id.as_deref()) {
                 return Err((
                     ErrorCode::Unauthorized,
                     "session is outside caller's scope".into(),
@@ -307,7 +351,7 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
         }
         TargetLocation::Exited { wi, ti } => {
             let tomb = &app.workspaces[wi].tombstones[ti];
-            if !caller_authorized_for(&caller, wi, tomb.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, &app.tasks, wi, tomb.task_id.as_deref()) {
                 return Err((
                     ErrorCode::Unauthorized,
                     "session is outside caller's scope".into(),
@@ -436,40 +480,70 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
     // workspace, including their own tombstone if include_exited).
     let caller = caller_ctx_or_tombstone(&app.workspaces, caller_uid)
         .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
-    let Some(caller_wi) = caller.workspace_index else {
+    // The descendant-only auth model uses task-tree, not
+    // workspace-membership, but we still require the caller's session
+    // to exist in *some* workspace — a 404 here would be ambiguous
+    // otherwise (manifest desync vs. unknown UID). The workspace_index
+    // value itself is unused because `caller_authorized_for` walks
+    // every workspace.
+    if caller.workspace_index.is_none() {
         return Err((
             ErrorCode::NotFound,
             "caller session not found in any workspace".into(),
         ));
-    };
+    }
 
-    // Resolve scope: explicit task_id (must be authorized), else default
-    // (caller's task if any, else caller's workspace).
-    let scope_task: Option<String> = match (p.task_id.as_deref(), caller.task_id.as_deref()) {
-        (Some(req), None) => {
-            // Taskless caller passing a task_id: unauthorized.
-            return Err((
-                ErrorCode::Unauthorized,
-                format!("taskless caller cannot scope to task {}", req),
-            ));
+    // Resolve scope: explicit task_id must be authorized (caller's own
+    // or a descendant). Default = whatever the caller can see by auth.
+    if let Some(req) = p.task_id.as_deref() {
+        match caller.task_id.as_deref() {
+            None => {
+                // Taskless caller passing a task_id: unauthorized.
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!("taskless caller cannot scope to task {}", req),
+                ));
+            }
+            Some(own) => {
+                if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "task {} is not the caller's task or a descendant",
+                            req
+                        ),
+                    ));
+                }
+            }
         }
-        (Some(req), Some(own)) if req != own => {
-            // Phase 5 will extend to descendants. Today: own task only.
-            return Err((
-                ErrorCode::Unauthorized,
-                "scope to a different task is not yet allowed".into(),
-            ));
-        }
-        (Some(_), Some(own)) => Some(own.to_string()),
-        (None, own) => own.map(str::to_string),
-    };
+    }
+    let scope_task: Option<String> = p
+        .task_id
+        .clone()
+        .or_else(|| caller.task_id.clone());
 
+    // Iterate every workspace — branch-mode subtasks live in their own
+    // workspace different from the caller's, but they're still within
+    // scope by the descendant rule. caller_authorized_for makes the
+    // final per-session decision so this stays consistent with reads
+    // from `resolve_authorized_session`.
     let mut out: Vec<Value> = Vec::new();
-    let ws = &app.workspaces[caller_wi];
-    for ts in &ws.sessions {
-        if !session_in_scope(ts.task_id.as_deref(), scope_task.as_deref()) {
-            continue;
-        }
+    for (wi, ws) in app.workspaces.iter().enumerate() {
+        let included_by_explicit_filter = |task: Option<&str>| -> bool {
+            match scope_task.as_deref() {
+                // Explicit scope: only that task's own + descendants.
+                Some(scope) => task
+                    .map(|t| task_is_self_or_descendant_of(&app.tasks, t, scope))
+                    .unwrap_or(false),
+                // Default scope (no explicit task_id): everything the
+                // caller is authorized to see.
+                None => caller_authorized_for(&caller, &app.tasks, wi, task),
+            }
+        };
+        for ts in &ws.sessions {
+            if !included_by_explicit_filter(ts.task_id.as_deref()) {
+                continue;
+            }
         // Both `state` and `idle` flow from the same helper as the
         // resolver — guarantees `list_sessions` and
         // `resolve_authorized_session` agree on every signal. Without
@@ -492,24 +566,33 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             "managed_by_uid": ts.managed_by_uid,
         }));
     }
-    if p.include_exited {
-        for tomb in &ws.tombstones {
-            if !tombstone_in_scope(tomb.task_id.as_deref(), scope_task.as_deref()) {
-                continue;
+        if p.include_exited {
+            for tomb in &ws.tombstones {
+                let task = tomb.task_id.as_deref();
+                let included = match scope_task.as_deref() {
+                    Some(scope) => task
+                        .map(|t| task_is_self_or_descendant_of(&app.tasks, t, scope))
+                        .unwrap_or(false),
+                    None => caller_authorized_for(&caller, &app.tasks, wi, task),
+                };
+                if !included {
+                    continue;
+                }
+                out.push(json!({
+                    "session_uid": tomb.uid,
+                    "label": tomb.label,
+                    "type": public_session_type(&tomb.session_type),
+                    "state": "exited",
+                    "idle": Value::Null,
+                    "managed_by_uid": tomb.managed_by_uid,
+                }));
             }
-            out.push(json!({
-                "session_uid": tomb.uid,
-                "label": tomb.label,
-                "type": public_session_type(&tomb.session_type),
-                "state": "exited",
-                "idle": Value::Null,
-                "managed_by_uid": tomb.managed_by_uid,
-            }));
         }
     }
     Ok(Value::Array(out))
 }
 
+#[allow(dead_code)]
 fn session_in_scope(session_task: Option<&str>, scope_task: Option<&str>) -> bool {
     match scope_task {
         Some(t) => session_task == Some(t),
@@ -545,7 +628,7 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
     let (wi, si) = find_live_session(&app.workspaces, &p.session_uid)
         .ok_or((ErrorCode::NotFound, "session_uid not found".into()))?;
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
         return Err((
             ErrorCode::Unauthorized,
             "session is outside caller's scope".into(),
@@ -607,7 +690,7 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
     let (wi, si) = find_live_session(&app.workspaces, &p.session_uid)
         .ok_or((ErrorCode::NotFound, "session_uid not found".into()))?;
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
         return Err((
             ErrorCode::Unauthorized,
             "session is outside caller's scope".into(),
@@ -658,7 +741,9 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     let Some(caller_wi) = caller.workspace_index else {
         return Err((ErrorCode::NotFound, "caller session not found".into()));
     };
-    // task_id resolution: same rules as list_sessions.
+    // task_id resolution. Allows binding to the caller's own task or
+    // any descendant in the parent_task_id tree. Cross-task binding
+    // outside the descendant tree is unauthorized.
     let task_id_for_new: Option<String> = match (p.task_id.as_deref(), caller.task_id.as_deref()) {
         (Some(req), None) => {
             return Err((
@@ -666,18 +751,38 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
                 format!("taskless caller cannot bind to task {}", req),
             ));
         }
-        (Some(req), Some(own)) if req != own => {
-            return Err((
-                ErrorCode::Unauthorized,
-                "binding to a different task is not yet allowed".into(),
-            ));
+        (Some(req), Some(own)) => {
+            if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "task {} is not the caller's task or a descendant",
+                        req
+                    ),
+                ));
+            }
+            Some(req.to_string())
         }
-        (Some(_), Some(own)) => Some(own.to_string()),
         (None, own) => own.map(str::to_string),
     };
 
+    // Determine which workspace the new session lives in. For the
+    // caller's own task or no task: use caller's workspace. For a
+    // descendant task: that task's workspace (which may differ in
+    // branch-mode subtasks).
+    let target_wi = match task_id_for_new.as_deref() {
+        Some(tid) if Some(tid) != caller.task_id.as_deref() => {
+            // Descendant task — find its workspace.
+            workspace_index_for_task(app, tid).ok_or((
+                ErrorCode::NotFound,
+                format!("task {} has no bound workspace", tid),
+            ))?
+        }
+        _ => caller_wi,
+    };
+
     let new_uid = app.spawn_managed_session(
-        caller_wi,
+        target_wi,
         caller_uid,
         &p.type_,
         &p.label,
@@ -686,6 +791,956 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     )
     .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
     Ok(json!({"session_uid": new_uid}))
+}
+
+/// Look up the workspace index for a task by its FK (`workspace_id`).
+/// Returns None if the task isn't in `app.tasks`, has no workspace_id
+/// set (still in backlog), or its workspace_id doesn't match any
+/// existing workspace.
+pub fn workspace_index_for_task(app: &App, task_id: &str) -> Option<usize> {
+    let task = app.tasks.iter().find(|t| t.task_id.as_deref() == Some(task_id))?;
+    let ws_id = task.workspace_id.as_deref()?;
+    app.workspaces.iter().position(|w| w.id == ws_id)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — subtask MCP tools
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateSubtaskParams {
+    name: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default = "default_subtask_worktree_mode")]
+    worktree_mode: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+fn default_subtask_worktree_mode() -> String {
+    "inherit".to_string()
+}
+
+pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: CreateSubtaskParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    if !matches!(p.worktree_mode.as_str(), "inherit" | "branch") {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "worktree_mode must be 'inherit' or 'branch', got '{}'",
+                p.worktree_mode
+            ),
+        ));
+    }
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+
+    // Subtasks need a parent. Taskless callers should call propose_task
+    // (the existing tool) to add a top-level task instead.
+    let parent_task_id = caller.task_id.clone().ok_or((
+        ErrorCode::Unauthorized,
+        "create_subtask requires a tasked caller; use propose_task for top-level tasks".into(),
+    ))?;
+
+    // Look up the parent — needed for slug chain, repo_url, project,
+    // and (in branch mode) wip_branch as the start ref.
+    let parent = app
+        .tasks
+        .iter()
+        .find(|t| t.task_id.as_deref() == Some(parent_task_id.as_str()))
+        .cloned()
+        .ok_or((
+            ErrorCode::NotFound,
+            format!("parent task {} not found in local task list", parent_task_id),
+        ))?;
+    let parent_workspace_id = parent.workspace_id.clone().ok_or((
+        ErrorCode::Conflict,
+        "parent task has no bound workspace — launch it before creating subtasks".into(),
+    ))?;
+    let parent_wi = app
+        .workspaces
+        .iter()
+        .position(|w| w.id == parent_workspace_id)
+        .ok_or((
+            ErrorCode::NotFound,
+            "parent workspace no longer exists".into(),
+        ))?;
+    let parent_repo_url = parent.repo_url.clone().ok_or((
+        ErrorCode::Conflict,
+        "parent task has no repo_url".into(),
+    ))?;
+    let parent_main_repo = app.workspaces[parent_wi].main_repo_path.clone();
+
+    // Slug for the new task. Same encoding as `worktree::slugify`.
+    let leaf_slug = crate::worktree::slugify(&p.name);
+    if leaf_slug.is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("name '{}' produces an empty slug after normalization", p.name),
+        ));
+    }
+
+    // Project: explicit > inherit from parent. The fallback reads the
+    // parent's `project` field (populated from the API by reconcile).
+    // Without this, subtasks created without an explicit `project`
+    // arg get filtered out of the planning view by
+    // `backend.rs::filter_project_tasks` after the next refresh.
+    let project = p.project.clone().or_else(|| parent.project.clone());
+    // Cloned for the local TaskEntry insert below — `project` itself
+    // gets moved into the API body.
+    let project_for_local = project.clone();
+
+    // Generate a 7-hex-char short id BEFORE the API call. Used for
+    // both the stored slug (`<chain>-<short>`) AND the branch name
+    // (`cm-sub/<chain>-<short>`) so they share a consistent suffix
+    // and we don't depend on the new task's UUID (which we wouldn't
+    // know until after create).
+    //
+    // The DB has a UNIQUE INDEX on (project, slug). Without this
+    // suffix, two subtasks with the same name under the same project
+    // would collide on insert (even under different parents — slugs
+    // would still collide). The suffix is per-call random, so even
+    // same-name siblings under the same parent don't collide.
+    let slug_chain = build_slug_chain(&app.tasks, &parent_task_id, &leaf_slug);
+    let request_short_id = make_request_short_id();
+    let unique_slug = format!("{}-{}", slug_chain, request_short_id);
+
+    // Step 1: validate ALL preconditions BEFORE touching the API.
+    // Earlier this version called `create_task` first and produced
+    // orphan tasks if the worktree precheck failed — the rollback is
+    // a separate API call that may itself fail. Front-loading the
+    // checks reduces the orphan window to "the git command itself
+    // racing or failing on disk", which we then handle with an
+    // explicit DELETE on the failure path below.
+    let inherit_worktree_path: Option<std::path::PathBuf> = if p.worktree_mode == "inherit" {
+        let path = app.workspaces[parent_wi]
+            .worktree_path
+            .clone()
+            .ok_or((
+                ErrorCode::Conflict,
+                "parent workspace has no worktree path (cloud workspace?)".into(),
+            ))?;
+        Some(path)
+    } else {
+        None
+    };
+    let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "branch" {
+        Some(parent_main_repo.clone().ok_or((
+            ErrorCode::Conflict,
+            "parent workspace has no main_repo_path; cannot branch".into(),
+        ))?)
+    } else {
+        None
+    };
+    // Resolve the parent's actual branch UPFRONT. Tasks launched into
+    // existing workspaces commonly have `wip_branch: None` because
+    // the system never had reason to set it; the source of truth in
+    // that case is the parent worktree's actual HEAD. Order of
+    // preference:
+    //   1. parent.wip_branch (canonical when set)
+    //   2. parent worktree's `git rev-parse --abbrev-ref HEAD`
+    //   3. None (handled per-mode below)
+    //
+    // Branch-mode REQUIRES this to be Some — we don't fall back to
+    // "main" because the user may not have a main branch at all, and
+    // silently forking from the wrong base loses the parent's work.
+    // Inherit-mode treats None as soft: the new task's wip_branch
+    // inherits the resolution if available, so future grandchildren
+    // can branch from it.
+    let parent_branch_resolved: Option<String> = parent.wip_branch.clone().or_else(|| {
+        app.workspaces[parent_wi]
+            .worktree_path
+            .as_deref()
+            .and_then(crate::worktree::worktree_current_branch)
+    });
+    if p.worktree_mode == "branch" && parent_branch_resolved.is_none() {
+        return Err((
+            ErrorCode::Conflict,
+            "cannot determine parent's base branch (no wip_branch and worktree HEAD is detached or unreadable)".into(),
+        ));
+    }
+
+    // Compute the new task's `wip_branch` upfront — both modes need
+    // this baked into the API row. Without it, the next reconcile
+    // (which copies API state into the local TaskEntry) would null
+    // out wip_branch for inherit-mode subtasks, and a branch-mode
+    // grandchild would then fall back to "main" as its start ref.
+    //
+    // Inherit mode → same branch as parent (sessions live in the
+    // parent's worktree, which is on the parent's branch).
+    // Branch mode → the freshly-built `cm-sub/<chain>-<short>` name.
+    let branch_name_for_new: Option<String> = match p.worktree_mode.as_str() {
+        // Inherit: subtask's wip_branch IS the parent's resolved branch,
+        // not just its (possibly-None) `wip_branch` field. Without
+        // this fallback through worktree HEAD, an inherit-mode subtask
+        // with parent.wip_branch=None would store None in the API,
+        // and a future branch-mode grandchild would hit the same
+        // base-branch problem.
+        "inherit" => parent_branch_resolved.clone(),
+        "branch" => Some(format!("cm-sub/{}-{}", slug_chain, request_short_id)),
+        _ => None,
+    };
+
+    // Step 2: ask the API to create the task. Server assigns the UUID,
+    // which we need for the short_id in branch-mode names.
+    let api_client = api_client_or_err()?;
+    let body = crate::api::TaskCreateBody {
+        repo_url: parent_repo_url.clone(),
+        repo_branch: "main".to_string(),
+        name: Some(p.name.clone()),
+        prompt: p.prompt.clone(),
+        priority: 0,
+        status: Some("running".to_string()),
+        project,
+        slug: Some(unique_slug.clone()),
+        description: None,
+        difficulty: None,
+        depends: None,
+        source: Some("claude".to_string()),
+        is_cloud: Some(false),
+        parent_task_id: Some(parent_task_id.clone()),
+        worktree_mode: Some(p.worktree_mode.clone()),
+        wip_branch: branch_name_for_new.clone(),
+    };
+    let new_task = api_client
+        .create_task(&body)
+        .map_err(|e| (ErrorCode::Internal, format!("api create_task: {}", e)))?;
+    let new_task_id = new_task.id.clone();
+
+    // Step 3: produce a worktree. Anything that errors after the API
+    // create succeeded triggers a rollback DELETE so we don't leave an
+    // orphan task in `running` state with no usable workspace.
+    let (worktree_path, workspace_id_for_new) = match p.worktree_mode.as_str() {
+        "inherit" => {
+            // Path was validated upfront; safe to unwrap.
+            let path = inherit_worktree_path.expect("validated above");
+            (path, parent_workspace_id.clone())
+        }
+        "branch" => {
+            let main_repo = branch_main_repo.expect("validated above");
+            let parent_branch = parent_branch_resolved
+                .clone()
+                .expect("validated above");
+            // Branch name was computed upfront and sent in the
+            // create_task body — no post-create PATCH needed.
+            let branch_name = branch_name_for_new
+                .clone()
+                .expect("branch_name_for_new is Some in branch mode");
+            let worktree_path = match crate::worktree::create_subtask_worktree(
+                &main_repo,
+                &branch_name,
+                &parent_branch,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Rollback: delete the API task so we don't leak
+                    // a `running` row that points at nothing on disk.
+                    // Best-effort — if the DELETE fails too the user
+                    // has to clean up by hand, but we surface the
+                    // original git error which is what they care about.
+                    let _ = api_client.delete_task(&new_task_id);
+                    return Err((
+                        ErrorCode::Internal,
+                        format!(
+                            "create worktree failed for branch '{}'; api task {} rolled back: {}",
+                            branch_name, new_task_id, e
+                        ),
+                    ));
+                }
+            };
+            crate::worktree::setup_worktree(&main_repo, &worktree_path);
+
+            // Register a fresh workspace for this subtask.
+            let new_ws_id = crate::app::new_workspace_id();
+            let new_ws = Workspace {
+                id: new_ws_id.clone(),
+                name: leaf_slug.clone(),
+                is_closed: false,
+                is_cloud: false,
+                repo_url: Some(parent_repo_url.clone()),
+                worktree_path: Some(worktree_path.clone()),
+                main_repo_path: Some(main_repo.clone()),
+                worker_vm: None,
+                worker_zone: None,
+                sessions: vec![],
+                tombstones: vec![],
+            };
+            app.workspaces.push(new_ws);
+            (worktree_path, new_ws_id)
+        }
+        _ => unreachable!(),
+    };
+
+    // Step 4: insert the TaskEntry locally so it's visible immediately,
+    // pre-empting the next API reconcile (which would also pick it up
+    // a few seconds later).
+    let already_present = app
+        .tasks
+        .iter()
+        .any(|t| t.task_id.as_deref() == Some(new_task_id.as_str()));
+    if !already_present {
+        app.tasks.push(crate::app::TaskEntry {
+            task_id: Some(new_task_id.clone()),
+            name: p.name.clone(),
+            api_status: crate::app::TaskStatus::Running,
+            repo_url: Some(parent_repo_url),
+            prompt: p.prompt.clone(),
+            // Same value we baked into the API row — survives the
+            // next reconcile.
+            wip_branch: branch_name_for_new.clone(),
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: Some(workspace_id_for_new),
+            project: project_for_local.clone(),
+            parent_task_id: Some(parent_task_id),
+            worktree_mode: crate::app::parse_worktree_mode(&p.worktree_mode),
+        });
+    }
+
+    app.save_session_manifest();
+    Ok(json!({
+        "task_id": new_task_id,
+        "worktree_path": worktree_path.to_string_lossy(),
+    }))
+}
+
+/// Generate a 7-hex-char id from nanos + an atomic counter. Mirrors
+/// the shape of `app::new_session_uid` but trimmed to fit a slug
+/// suffix. Used by `create_subtask` to give each subtask a unique
+/// suffix on both its slug (DB unique constraint) and its worktree
+/// branch name.
+fn make_request_short_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:07x}", (nanos.wrapping_add(n)) & 0x0FFF_FFFF)
+}
+
+/// Build the slug chain for a subtask branch name. Walks the parent
+/// chain and joins each ancestor's slug with `-`, ending with the new
+/// (leaf) slug. Caps at `MAX_TASK_DEPTH` to defend against cycles.
+fn build_slug_chain(
+    tasks: &[crate::app::TaskEntry],
+    parent_id: &str,
+    leaf_slug: &str,
+) -> String {
+    let mut chain: Vec<String> = vec![leaf_slug.to_string()];
+    let mut cur: Option<String> = Some(parent_id.to_string());
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..MAX_TASK_DEPTH {
+        let Some(id) = cur.clone() else { break };
+        if !visited.insert(id.clone()) {
+            break;
+        }
+        let Some(task) = tasks.iter().find(|t| t.task_id.as_deref() == Some(id.as_str()))
+        else {
+            break;
+        };
+        chain.push(crate::worktree::slugify(&task.name));
+        cur = task.parent_task_id.clone();
+    }
+    chain.reverse();
+    chain.join("-")
+}
+
+/// Get an `ApiClient` for outbound task ops. Reads config the same way
+/// the rest of the TUI does. Returns `Err(Internal)` if config can't be
+/// loaded — the agent gets a clear failure rather than a panic.
+fn api_client_or_err() -> Result<crate::api::ApiClient, (ErrorCode, String)> {
+    let config = crate::config::Config::load();
+    Ok(crate::api::ApiClient::new(&config))
+}
+
+// ---------------------------------------------------------------------------
+// list_subtasks
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct ListSubtasksParams {
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+pub fn list_subtasks(app: &App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: ListSubtasksParams = if params.is_null() {
+        ListSubtasksParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?
+    };
+    let caller = caller_ctx_or_tombstone(&app.workspaces, caller_uid)
+        .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+
+    let scope = match p.task_id.as_deref() {
+        Some(req) => {
+            let own = caller.task_id.as_deref().ok_or((
+                ErrorCode::Unauthorized,
+                format!("taskless caller cannot scope to task {}", req),
+            ))?;
+            if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!("task {} is not the caller's task or a descendant", req),
+                ));
+            }
+            req.to_string()
+        }
+        None => caller.task_id.clone().ok_or((
+            ErrorCode::Unauthorized,
+            "taskless caller cannot list subtasks (no task scope)".into(),
+        ))?,
+    };
+
+    let mut out: Vec<Value> = Vec::new();
+    for task in &app.tasks {
+        if task.parent_task_id.as_deref() == Some(scope.as_str()) {
+            out.push(json!({
+                "task_id": task.task_id,
+                "name": task.name,
+                "status": task_status_str(&task.api_status),
+                "worktree_mode": task.worktree_mode.as_wire(),
+                "wip_branch": task.wip_branch,
+                "workspace_id": task.workspace_id,
+            }));
+        }
+    }
+    Ok(Value::Array(out))
+}
+
+fn task_status_str(s: &crate::app::TaskStatus) -> &'static str {
+    use crate::app::TaskStatus;
+    match s {
+        TaskStatus::Backlog => "backlog",
+        TaskStatus::Running => "running",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Done => "done",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mark_subtask_done
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MarkSubtaskDoneParams {
+    task_id: String,
+    #[serde(default = "default_close_worktree")]
+    close_worktree: bool,
+}
+
+fn default_close_worktree() -> bool {
+    true
+}
+
+pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: MarkSubtaskDoneParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+    let own = caller.task_id.as_deref().ok_or((
+        ErrorCode::Unauthorized,
+        "taskless caller cannot mark subtasks done".into(),
+    ))?;
+    if !task_is_self_or_descendant_of(&app.tasks, &p.task_id, own) {
+        return Err((
+            ErrorCode::Unauthorized,
+            format!("task {} is not the caller's task or a descendant", p.task_id),
+        ));
+    }
+
+    // Look up the subtask + its workspace.
+    let task = app
+        .tasks
+        .iter()
+        .find(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
+        .cloned()
+        .ok_or((
+            ErrorCode::NotFound,
+            format!("task {} not found", p.task_id),
+        ))?;
+    let was_branch_mode = matches!(task.worktree_mode, crate::app::WorktreeMode::Branch);
+
+    // Phase 1 — locate cleanup targets BEFORE running anything
+    // destructive AND before marking the task done in the API. The
+    // earlier ordering (API mark-done → cleanup) was the same orphan
+    // class as Phase 5's create_subtask bug: a failed `git worktree
+    // remove` returned an error, but the task was already Done in
+    // the API. The next reconcile then drops Done tasks from
+    // `app.tasks` (see app.rs:2930), and the user can never invoke
+    // `mark_subtask_done` again to retry — the worktree is stranded.
+    //
+    // Worktree removal is gated by `close_worktree && was_branch_mode`.
+    // Inherit-mode subtasks share the parent's worktree — there's
+    // nothing of theirs to remove. Branch-mode + close_worktree=false
+    // leaves the worktree on disk so the user can keep working in it
+    // after the agent marks done (e.g. for a manual review pass).
+    // `cleanup_outcome` is the precheck verdict:
+    //   - `Some((wi, main, wt))` → Phase 2 should run `git worktree remove`.
+    //   - `None` with `already_done = false` → no cleanup requested
+    //     (close_worktree=false or inherit-mode).
+    //   - `None` with `already_done = true` → cleanup ALREADY ran on
+    //     a prior invocation (worktree removed, workspace closed),
+    //     and the only thing left to retry is the API mark-done. This
+    //     is the retry path: without it, a successful worktree remove
+    //     followed by an API failure produces a stuck state where
+    //     re-entering with `close_worktree=true` would bail on the
+    //     missing `worktree_path` precheck before reaching Phase 3.
+    let mut already_done = false;
+    let cleanup_target = if p.close_worktree && was_branch_mode {
+        let ws_id = task.workspace_id.clone().ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "task {} has no workspace_id; cannot remove its worktree (likely a manifest desync — try restarting the TUI to recover)",
+                p.task_id
+            ),
+        ))?;
+        let wi = app.workspaces.iter().position(|w| w.id == ws_id).ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "workspace {} for task {} is not present in this session",
+                ws_id, p.task_id
+            ),
+        ))?;
+        // The "already cleaned up" signal: Phase 2 sets
+        // `worktree_path = None` (and `is_closed = true`) only after
+        // a successful `git worktree remove`. So a workspace whose
+        // `worktree_path` is None on entry to this method means the
+        // remove already happened — fall through to Phase 3 to
+        // (re)try the API mark-done. We deliberately don't require
+        // `is_closed` here too; a single signal is enough and easier
+        // to reason about.
+        if app.workspaces[wi].worktree_path.is_none() {
+            already_done = true;
+            None
+        } else {
+            let main = app.workspaces[wi].main_repo_path.clone().ok_or((
+                ErrorCode::Conflict,
+                format!(
+                    "workspace {} has no main_repo_path; cannot run `git worktree remove`",
+                    ws_id
+                ),
+            ))?;
+            // `worktree_path` is Some here (just checked).
+            let wt = app.workspaces[wi].worktree_path.clone().expect("just checked");
+            Some((wi, main, wt))
+        }
+    } else {
+        None
+    };
+
+    // Phase 2 — perform cleanup. Sessions first (always), then the
+    // worktree if applicable. We close sessions before the worktree
+    // because git refuses to remove a worktree that has live
+    // processes inside it; closing sessions also drops the PTY locks
+    // on the directory.
+    //
+    // Filter sessions by task_id (not by workspace), so:
+    //   - inherit-mode subtasks (sharing the parent's workspace):
+    //     only the subtask-tagged sessions close, parent's sessions
+    //     keep running.
+    //   - branch-mode subtasks (own workspace): every session in
+    //     that workspace closes, since they're all subtask-tagged.
+    let target_task = p.task_id.clone();
+    for wi in 0..app.workspaces.len() {
+        let _ = app.tombstone_and_remove(wi, |ts| {
+            ts.task_id.as_deref() == Some(target_task.as_str())
+        });
+    }
+
+    // Observable end-state: `true` means the worktree is gone by the
+    // time this response goes out, regardless of whether THIS call
+    // is the one that removed it (vs. a prior call whose API update
+    // failed and is being retried now).
+    let mut worktree_removed = already_done;
+    if let Some((wi, main, wt)) = cleanup_target {
+        match crate::worktree::remove_worktree(&main, &wt) {
+            Ok(()) => {
+                // Only NOW clear the workspace-side path and mark
+                // closed. If we did this unconditionally, a later
+                // failed remove would leave the manifest unable to
+                // find the path needed to retry.
+                if let Some(ws) = app.workspaces.get_mut(wi) {
+                    ws.is_closed = true;
+                    ws.worktree_path = None;
+                }
+                worktree_removed = true;
+                app.save_session_manifest();
+            }
+            Err(e) => {
+                // Cleanup failure → DO NOT mark the task done.
+                // Sessions are already tombstoned (which the manifest
+                // captured via tombstone_and_remove's mandatory
+                // save), but the API/local task stays in its prior
+                // status so the user can retry this exact call.
+                app.save_session_manifest();
+                return Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "worktree remove failed for task {} (sessions closed, but task NOT marked done — retry once the worktree issue is resolved): {}",
+                        p.task_id, e
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Phase 3 — only NOW commit the Done status. Order matters:
+    // API first so the source of truth flips, then local entry to
+    // pre-empt the next reconcile. If the API call fails after
+    // cleanup succeeded, the worktree is gone but the task is still
+    // running in the API — the user can re-run `mark_subtask_done`,
+    // and Phase 1 will short-circuit (no workspace to clean up,
+    // close_worktree branch skipped) so only the API update fires.
+    let api_client = api_client_or_err()?;
+    let mut fields: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
+    fields.insert("status".into(), Value::String("done".into()));
+    let _ = api_client.update_task(&p.task_id, &fields).map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!(
+                "cleanup succeeded but api update_task failed (worktree gone, task still 'running' in API — retry mark_subtask_done): {}",
+                e
+            ),
+        )
+    })?;
+    if let Some(t) = app
+        .tasks
+        .iter_mut()
+        .find(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
+    {
+        t.api_status = crate::app::TaskStatus::Done;
+    }
+
+    Ok(json!({"ok": true, "worktree_removed": worktree_removed}))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — workflow MCP tools
+//
+// All four (start, stop, get_state, list) honor the same auth model
+// as the session-management surface: the caller can act on workflows
+// in their own task or any descendant in the parent_task_id tree.
+// Workflow state lives in `app.workflow_runs`; persistence happens
+// inside each App method that touches it.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct StartWorkflowParams {
+    task_id: String,
+    workflow_name: String,
+    #[serde(default)]
+    goal: Option<String>,
+}
+
+pub fn start_workflow(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: StartWorkflowParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    // Mutation — caller must be live.
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+
+    // Authorize the target task (caller's own or descendant).
+    match caller.task_id.as_deref() {
+        None => {
+            return Err((
+                ErrorCode::Unauthorized,
+                "taskless caller cannot launch workflows on a specific task".into(),
+            ));
+        }
+        Some(own) => {
+            if !task_is_self_or_descendant_of(&app.tasks, &p.task_id, own) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "task {} is not the caller's task or a descendant",
+                        p.task_id
+                    ),
+                ));
+            }
+        }
+    }
+
+    let target_wi = workspace_index_for_task(app, &p.task_id).ok_or((
+        ErrorCode::NotFound,
+        format!("task {} has no bound workspace", p.task_id),
+    ))?;
+
+    let run_id = app
+        .start_workflow_run(
+            target_wi,
+            &p.workflow_name,
+            p.goal.clone(),
+            Some(p.task_id.clone()),
+        )
+        .map_err(|e| (ErrorCode::Internal, format!("launch_workflow: {}", e)))?;
+    Ok(json!({"run_id": run_id}))
+}
+
+#[derive(Deserialize)]
+struct StopWorkflowParams {
+    run_id: String,
+}
+
+pub fn stop_workflow(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: StopWorkflowParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+
+    // Look up the run; check the caller has authority over its task.
+    let run = app
+        .workflow_runs
+        .iter()
+        .find(|r| r.run_id == p.run_id)
+        .ok_or((
+            ErrorCode::NotFound,
+            format!("workflow run {} not found", p.run_id),
+        ))?;
+    if !workflow_run_authorized(&caller, &app.tasks, run) {
+        return Err((
+            ErrorCode::Unauthorized,
+            "workflow run is outside caller's scope".into(),
+        ));
+    }
+
+    app.stop_workflow_run(&p.run_id);
+    Ok(json!({"ok": true}))
+}
+
+#[derive(Deserialize, Default)]
+struct GetWorkflowStateParams {
+    run_id: String,
+}
+
+pub fn get_workflow_state(app: &App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: GetWorkflowStateParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let caller = caller_ctx_or_tombstone(&app.workspaces, caller_uid)
+        .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+
+    let run = app
+        .workflow_runs
+        .iter()
+        .find(|r| r.run_id == p.run_id)
+        .ok_or((
+            ErrorCode::NotFound,
+            format!("workflow run {} not found", p.run_id),
+        ))?;
+    if !workflow_run_authorized(&caller, &app.tasks, run) {
+        return Err((
+            ErrorCode::Unauthorized,
+            "workflow run is outside caller's scope".into(),
+        ));
+    }
+    Ok(serialize_workflow_run(run))
+}
+
+#[derive(Deserialize, Default)]
+struct ListWorkflowsParams {
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+pub fn list_workflows(app: &App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: ListWorkflowsParams = if params.is_null() {
+        ListWorkflowsParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?
+    };
+    let caller = caller_ctx_or_tombstone(&app.workspaces, caller_uid)
+        .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+
+    // Optional task_id filter — must be authorized.
+    if let Some(req) = p.task_id.as_deref() {
+        match caller.task_id.as_deref() {
+            None => {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!("taskless caller cannot scope to task {}", req),
+                ));
+            }
+            Some(own) => {
+                if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "task {} is not the caller's task or a descendant",
+                            req
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::new();
+    for run in &app.workflow_runs {
+        // Per-run auth filter against caller. Use the run's bound
+        // `task_id` when set (MCP-launched runs); fall back to walking
+        // tasks bound to the run's workspace key.
+        if let Some(req) = p.task_id.as_deref() {
+            // Explicit scope filter: include the run iff its bound
+            // task is the requested one or its descendant.
+            //
+            // Legacy runs (no `task_id` field) need the same
+            // unambiguous resolution as `workflow_run_authorized`'s
+            // fallback — pick the workspace's candidate task ONLY
+            // when there's exactly one. Picking the first via
+            // `.find()` (the pre-fix version) leaks across task
+            // boundaries: in a workspace with caller-authorized task
+            // A and unrelated task B, filtering on A would surface a
+            // run that actually belonged to B.
+            let resolved_tid: Option<String> = match run.task_id.as_deref() {
+                Some(rid) => Some(rid.to_string()),
+                None => {
+                    let candidates: Vec<&crate::app::TaskEntry> = app
+                        .tasks
+                        .iter()
+                        .filter(|t| {
+                            t.workspace_id.as_deref() == Some(run.task_key.as_str())
+                        })
+                        .collect();
+                    if candidates.len() == 1 {
+                        candidates[0].task_id.clone()
+                    } else {
+                        None
+                    }
+                }
+            };
+            match resolved_tid.as_deref() {
+                Some(rid) if task_is_self_or_descendant_of(&app.tasks, rid, req) => {}
+                _ => continue,
+            }
+        } else if !workflow_run_authorized(&caller, &app.tasks, run) {
+            continue;
+        }
+        // Surface the run's bound task_id when available, otherwise
+        // null (UI-launched legacy runs).
+        let surfaced_task_id = run.task_id.clone();
+        out.push(json!({
+            "run_id": run.run_id,
+            "name": run.workflow_name,
+            "task_id": surfaced_task_id,
+            "workspace_id": run.task_key,
+            "active_role": run.active_role,
+            "iteration": run.iteration,
+            "paused": run.paused,
+            "status": run_status_str(&run.status),
+            "started_at": run.started_at,
+            "done_reason": run.done_reason,
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
+/// Auth check for workflow-targeted calls. Caller must have authority
+/// over the run's bound task by the same descendant rule used for
+/// sessions.
+///
+/// Two information sources, in priority order:
+///   1. `WorkflowRun.task_id` — set by `start_workflow_run` (the MCP
+///      launch path). Used directly when present.
+///   2. `WorkflowRun.task_key` — the workspace id (per `workspace_key`).
+///      Set by both UI and MCP launches. Resolve to candidate tasks
+///      via `task.workspace_id` and accept if any candidate descends
+///      from the caller's task.
+fn workflow_run_authorized(
+    caller: &CallerCtx,
+    tasks: &[crate::app::TaskEntry],
+    run: &crate::workflow::run::WorkflowRun,
+) -> bool {
+    let Some(own) = caller.task_id.as_deref() else {
+        return false;
+    };
+    if let Some(rid) = run.task_id.as_deref() {
+        return task_is_self_or_descendant_of(tasks, rid, own);
+    }
+    // Fallback for UI-launched runs (no `task_id` field). task_key is
+    // the workspace id; resolve to the candidate task — but ONLY if
+    // there's exactly one. Authorizing when ANY task in the workspace
+    // is a descendant of the caller is too loose: if workspace W has
+    // task A (caller's) and unrelated task B, an agent on A could
+    // get_workflow_state / stop_workflow a run that was actually
+    // launched on B. Reject ambiguous cases — better to refuse a
+    // legacy MCP call than to leak access across task boundaries.
+    let candidates: Vec<&crate::app::TaskEntry> = tasks
+        .iter()
+        .filter(|t| t.workspace_id.as_deref() == Some(run.task_key.as_str()))
+        .collect();
+    if candidates.len() != 1 {
+        return false;
+    }
+    let Some(candidate_id) = candidates[0].task_id.as_deref() else {
+        return false;
+    };
+    task_is_self_or_descendant_of(tasks, candidate_id, own)
+}
+
+fn run_status_str(status: &crate::workflow::run::RunStatus) -> &'static str {
+    use crate::workflow::run::RunStatus;
+    match status {
+        RunStatus::Running => "running",
+        RunStatus::Paused => "paused",
+        RunStatus::Done => "done",
+        RunStatus::Detached => "detached",
+    }
+}
+
+fn serialize_workflow_run(run: &crate::workflow::run::WorkflowRun) -> Value {
+    let history: Vec<Value> = run
+        .history
+        .iter()
+        .map(|h| {
+            json!({
+                "iteration": h.iteration,
+                "role": h.role,
+                "transcript_id": h.session_id,
+                "last_message": h.last_message,
+                "activated_at": h.activated_at,
+                "deactivated_at": h.deactivated_at,
+                "trigger": format!("{:?}", h.trigger),
+                "assistant_count_at_start": h.assistant_count_at_start,
+            })
+        })
+        .collect();
+    let role_sessions: serde_json::Map<String, Value> = run
+        .role_sessions
+        .iter()
+        .map(|(role, binding)| {
+            (
+                role.clone(),
+                json!({
+                    "session_label": binding.session_label,
+                    "current_transcript_id": binding.current_session_id,
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "run_id": run.run_id,
+        "name": run.workflow_name,
+        // `task_id` is the MCP-bound task; null for UI-launched runs.
+        // `workspace_id` is the run's workspace key (was previously
+        // surfaced as `task_id`, which conflated the two and broke
+        // descendant auth on follow-up calls).
+        "task_id": run.task_id,
+        "workspace_id": run.task_key,
+        "active_role": run.active_role,
+        "iteration": run.iteration,
+        "paused": run.paused,
+        "status": run_status_str(&run.status),
+        "started_at": run.started_at,
+        "done_reason": run.done_reason,
+        "goal": run.goal,
+        "history": history,
+        "role_sessions": Value::Object(role_sessions),
+    })
 }
 
 #[cfg(test)]
@@ -962,5 +2017,308 @@ mod tests {
         let workspaces = vec![ws];
         let err = live_caller_ctx(&workspaces, "dead-caller").expect_err("must reject");
         assert_eq!(err.0, ErrorCode::Unauthorized);
+    }
+
+    // -- Phase 5 --
+
+    fn task_with_parent(id: &str, parent: Option<&str>, name: &str) -> crate::app::TaskEntry {
+        crate::app::TaskEntry {
+            task_id: Some(id.into()),
+            name: name.into(),
+            api_status: crate::app::TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: parent.map(str::to_string),
+            worktree_mode: crate::app::WorktreeMode::Inherit,
+        }
+    }
+
+    #[test]
+    fn descendant_walk_self_is_self() {
+        let tasks = vec![task_with_parent("A", None, "a")];
+        assert!(task_is_self_or_descendant_of(&tasks, "A", "A"));
+    }
+
+    #[test]
+    fn descendant_walk_direct_child() {
+        let tasks = vec![
+            task_with_parent("A", None, "a"),
+            task_with_parent("B", Some("A"), "b"),
+        ];
+        assert!(task_is_self_or_descendant_of(&tasks, "B", "A"));
+        // Reverse direction: A is NOT a descendant of B.
+        assert!(!task_is_self_or_descendant_of(&tasks, "A", "B"));
+    }
+
+    #[test]
+    fn descendant_walk_deep_chain() {
+        let tasks = vec![
+            task_with_parent("A", None, "a"),
+            task_with_parent("B", Some("A"), "b"),
+            task_with_parent("C", Some("B"), "c"),
+            task_with_parent("D", Some("C"), "d"),
+        ];
+        assert!(task_is_self_or_descendant_of(&tasks, "D", "A"));
+        assert!(task_is_self_or_descendant_of(&tasks, "C", "A"));
+        assert!(task_is_self_or_descendant_of(&tasks, "D", "B"));
+    }
+
+    #[test]
+    fn descendant_walk_unrelated_tasks() {
+        let tasks = vec![
+            task_with_parent("A", None, "a"),
+            task_with_parent("X", None, "x"),
+            task_with_parent("Y", Some("X"), "y"),
+        ];
+        // X and Y are an unrelated subtree; not descendants of A.
+        assert!(!task_is_self_or_descendant_of(&tasks, "X", "A"));
+        assert!(!task_is_self_or_descendant_of(&tasks, "Y", "A"));
+    }
+
+    #[test]
+    fn descendant_walk_handles_cycle_without_hanging() {
+        // Pathological: A → B → A. If our walk loops forever, this
+        // test never returns. The cycle guard caps depth and uses a
+        // visited set.
+        let tasks = vec![
+            task_with_parent("A", Some("B"), "a"),
+            task_with_parent("B", Some("A"), "b"),
+        ];
+        // C is not in the tasks list; the walk must terminate cleanly
+        // and report "not a descendant".
+        assert!(!task_is_self_or_descendant_of(&tasks, "A", "C"));
+        assert!(!task_is_self_or_descendant_of(&tasks, "B", "C"));
+    }
+
+    #[test]
+    fn descendant_walk_caps_at_max_depth() {
+        // Build a chain of MAX_TASK_DEPTH + 5 tasks and confirm the
+        // walk doesn't blow up. The reasoning: the walk should at
+        // most walk MAX_TASK_DEPTH steps before bailing.
+        let mut tasks: Vec<crate::app::TaskEntry> = Vec::new();
+        for i in 0..(MAX_TASK_DEPTH + 5) {
+            let id = format!("t{}", i);
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(format!("t{}", i - 1))
+            };
+            tasks.push(task_with_parent(
+                &id,
+                parent.as_deref(),
+                &format!("name-{}", i),
+            ));
+        }
+        // The leaf is way past MAX_TASK_DEPTH from the root. The walk
+        // returns false (depth exceeded), which is conservative — the
+        // alternative (returning true with no real check) would be
+        // wrong.
+        let leaf = format!("t{}", MAX_TASK_DEPTH + 4);
+        let _ = task_is_self_or_descendant_of(&tasks, &leaf, "t0");
+        // No assert about true/false here — what matters is that the
+        // call returned without panicking or hanging.
+    }
+
+    #[test]
+    fn slug_chain_includes_all_ancestors() {
+        let tasks = vec![
+            task_with_parent("A", None, "first task"),
+            task_with_parent("B", Some("A"), "second task"),
+        ];
+        let chain = build_slug_chain(&tasks, "B", "leaf");
+        // Order: root → ... → parent → leaf, joined by "-".
+        // Each task's name is slugified before joining.
+        assert_eq!(chain, "first-task-second-task-leaf");
+    }
+
+    #[test]
+    fn slug_chain_for_top_level_subtask() {
+        let tasks = vec![task_with_parent("A", None, "parent")];
+        let chain = build_slug_chain(&tasks, "A", "kid");
+        assert_eq!(chain, "parent-kid");
+    }
+
+    #[test]
+    fn slug_chain_handles_missing_parent() {
+        // Parent ID doesn't exist in tasks list — chain just contains
+        // the leaf slug. Defensive against a stale reference.
+        let tasks: Vec<crate::app::TaskEntry> = vec![];
+        let chain = build_slug_chain(&tasks, "ghost", "leaf");
+        assert_eq!(chain, "leaf");
+    }
+
+    // -- Phase 4 / 5 workflow auth fix --
+
+    fn task_in_workspace(
+        id: &str,
+        parent: Option<&str>,
+        ws: Option<&str>,
+    ) -> crate::app::TaskEntry {
+        let mut t = task_with_parent(id, parent, id);
+        t.workspace_id = ws.map(str::to_string);
+        t
+    }
+
+    fn make_workflow_run(
+        task_id: Option<&str>,
+        task_key: &str,
+    ) -> crate::workflow::run::WorkflowRun {
+        crate::workflow::run::WorkflowRun {
+            run_id: "run-1".into(),
+            workflow_name: "feedback".into(),
+            task_key: task_key.into(),
+            task_id: task_id.map(str::to_string),
+            role_sessions: Default::default(),
+            active_role: None,
+            iteration: 1,
+            paused: false,
+            status: crate::workflow::run::RunStatus::Running,
+            history: vec![],
+            started_at: 0,
+            done_reason: None,
+            events_offset: 0,
+            role_baselines: Default::default(),
+            goal: None,
+            role_plans: Default::default(),
+        }
+    }
+
+    fn caller_with_task(task: &str) -> CallerCtx {
+        CallerCtx {
+            workspace_index: Some(0),
+            task_id: Some(task.into()),
+            is_tombstone: false,
+        }
+    }
+
+    #[test]
+    fn workflow_auth_accepts_caller_for_own_task_id() {
+        // Caller is on task A. Run is bound to task A via task_id field.
+        // Direct path — task_id present, descendant check trivially passes.
+        let tasks = vec![task_with_parent("A", None, "a")];
+        let run = make_workflow_run(Some("A"), "ws-1");
+        let caller = caller_with_task("A");
+        assert!(workflow_run_authorized(&caller, &tasks, &run));
+    }
+
+    #[test]
+    fn workflow_auth_accepts_caller_for_descendant_task_id() {
+        // Caller on parent A; run is bound to subtask B (parent A).
+        // Descendant — auth allows.
+        let tasks = vec![
+            task_with_parent("A", None, "a"),
+            task_with_parent("B", Some("A"), "b"),
+        ];
+        let run = make_workflow_run(Some("B"), "ws-1");
+        let caller = caller_with_task("A");
+        assert!(workflow_run_authorized(&caller, &tasks, &run));
+    }
+
+    #[test]
+    fn workflow_auth_rejects_caller_for_unrelated_task_id() {
+        let tasks = vec![
+            task_with_parent("A", None, "a"),
+            task_with_parent("B", None, "b"), // unrelated
+        ];
+        let run = make_workflow_run(Some("B"), "ws-1");
+        let caller = caller_with_task("A");
+        assert!(!workflow_run_authorized(&caller, &tasks, &run));
+    }
+
+    #[test]
+    fn workflow_auth_fallback_resolves_workspace_to_task() {
+        // Run has no task_id (UI-launched, pre-Phase-4). task_key
+        // is the workspace id. We resolve to tasks bound to that
+        // workspace and check descendant. Caller is on task A which
+        // is in workspace ws-1 — the run was launched there too.
+        let tasks = vec![task_in_workspace("A", None, Some("ws-1"))];
+        let run = make_workflow_run(None, "ws-1");
+        let caller = caller_with_task("A");
+        assert!(
+            workflow_run_authorized(&caller, &tasks, &run),
+            "fallback must accept when caller's task is bound to the run's workspace"
+        );
+    }
+
+    #[test]
+    fn workflow_auth_fallback_rejects_when_workspace_has_multiple_tasks() {
+        // Critical regression: workspace ws-1 has two tasks — caller's
+        // own task A AND an unrelated task B. The run is in ws-1 but
+        // its task_id wasn't persisted (legacy run). Because we can't
+        // tell whether the run was launched on A or B, we MUST refuse.
+        // Pre-fix this returned true because A descends from itself,
+        // letting an agent on A read/stop a workflow that may have
+        // been launched on B.
+        let tasks = vec![
+            task_in_workspace("A", None, Some("ws-1")),
+            task_in_workspace("B", None, Some("ws-1")), // unrelated
+        ];
+        let run = make_workflow_run(None, "ws-1");
+        let caller = caller_with_task("A");
+        assert!(
+            !workflow_run_authorized(&caller, &tasks, &run),
+            "ambiguous fallback (multiple candidate tasks) must reject"
+        );
+    }
+
+    #[test]
+    fn workflow_auth_fallback_rejects_when_no_task_in_workspace() {
+        // Run's workspace has no tasks bound. Fallback finds nothing.
+        let tasks = vec![task_in_workspace("A", None, Some("ws-other"))];
+        let run = make_workflow_run(None, "ws-1");
+        let caller = caller_with_task("A");
+        assert!(!workflow_run_authorized(&caller, &tasks, &run));
+    }
+
+    // -- Phase 5: slug uniqueness --
+
+    #[test]
+    fn make_request_short_id_produces_seven_hex_chars() {
+        let id = make_request_short_id();
+        assert_eq!(id.len(), 7, "short_id should be exactly 7 chars: {}", id);
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "should be all hex: {}",
+            id
+        );
+    }
+
+    #[test]
+    fn make_request_short_id_is_unique_across_back_to_back_calls() {
+        // Two same-name siblings under the same parent would otherwise
+        // collide on the DB's UNIQUE (project, slug) index. The atomic
+        // counter mixed into the nanos ensures that even calls that
+        // happen within the same nanosecond (or at the exact same
+        // wall-clock reading) produce distinct ids.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = make_request_short_id();
+            assert!(
+                seen.insert(id.clone()),
+                "duplicate short_id within 1000 calls: {}",
+                id
+            );
+        }
+    }
+
+    // -- Phase 5: workflow auth taskless reject --
+
+    #[test]
+    fn workflow_auth_rejects_taskless_caller() {
+        // Taskless callers don't manage workflows.
+        let tasks = vec![task_with_parent("A", None, "a")];
+        let run = make_workflow_run(Some("A"), "ws-1");
+        let caller = CallerCtx {
+            workspace_index: Some(0),
+            task_id: None,
+            is_tombstone: false,
+        };
+        assert!(!workflow_run_authorized(&caller, &tasks, &run));
     }
 }

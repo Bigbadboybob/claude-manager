@@ -371,6 +371,7 @@ pub struct Workspace {
 /// A task tracked in the planning/API layer. Pure metadata — no execution
 /// state. `workspace_id` points at the Workspace this task has been launched
 /// into (None when still in backlog / never launched).
+#[derive(Clone)]
 pub struct TaskEntry {
     pub task_id: Option<String>,
     pub name: String,
@@ -383,6 +384,11 @@ pub struct TaskEntry {
     pub is_cloud: bool,
     /// FK to `App.workspaces`. None = task in backlog, not bound yet.
     pub workspace_id: Option<String>,
+    /// Planning project this task belongs to. Read from the API row;
+    /// `backend.rs::filter_project_tasks` filters tasks with `None` out
+    /// of the planning view, so subtasks need this populated to be
+    /// visible after a planning refresh.
+    pub project: Option<String>,
     /// FK to another `TaskEntry` (by `task_id`). None = top-level task.
     /// Phase 5 uses this for the subtask MCP tools and the planning-view
     /// tree. Set when an agent calls `create_subtask` or when the user
@@ -405,6 +411,26 @@ pub enum WorktreeMode {
     #[default]
     Inherit,
     Branch,
+}
+
+/// Parse the API's `worktree_mode` string into the enum. Unknown values
+/// fall through to `Inherit` — the safer default if the server sends
+/// something we don't recognize (e.g. a future variant we haven't
+/// shipped yet).
+pub fn parse_worktree_mode(s: &str) -> WorktreeMode {
+    match s {
+        "branch" => WorktreeMode::Branch,
+        _ => WorktreeMode::Inherit,
+    }
+}
+
+impl WorktreeMode {
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            WorktreeMode::Inherit => "inherit",
+            WorktreeMode::Branch => "branch",
+        }
+    }
 }
 
 /// Build a TerminalSession wrapping a freshly-spawned PTY with default state.
@@ -470,7 +496,7 @@ fn notify_session_idle(label: &str) {
 
 /// Generate a fresh workspace id. Not cryptographic — just collision-avoidance
 /// across the user's manifest via nanosecond timestamp.
-fn new_workspace_id() -> String {
+pub(crate) fn new_workspace_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -555,6 +581,48 @@ fn engine_for_session_type(session_type: &str) -> workflow::toml_schema::Engine 
     match session_type {
         "codex" => workflow::toml_schema::Engine::Codex,
         _ => workflow::toml_schema::Engine::ClaudeCode,
+    }
+}
+
+/// Decide what prompt to deliver to a workflow's initial role and
+/// produce its final string form. Invoked only by the MCP launch
+/// path (`start_workflow_run`).
+///
+/// Two delivery paths, picked in order:
+///   1. Role's `activation_prompt` template — passed through `render`
+///      so workflow context (`{{ goal }}`, `{{ roles.X.last_message }}`,
+///      etc.) gets resolved.
+///   2. The run's `goal`, used **verbatim**. Critically, this bypasses
+///      `render` — a goal containing literal `{{` (Mustache examples,
+///      JSON template fragments, code samples) would otherwise be
+///      mangled. Both shipped workflows (feedback, review) leave the
+///      initial role's `activation_prompt` unset, so the goal path is
+///      the common case.
+///
+/// `render` is `FnOnce` so callers can build a resolver lazily — the
+/// goal-only path doesn't need one and shouldn't pay for it.
+///
+/// Empty-after-trim inputs are treated as not set; returns `None`
+/// when neither path yields content.
+pub(crate) fn prepare_initial_prompt<F>(
+    activation_prompt: Option<&str>,
+    goal: Option<&str>,
+    render: F,
+) -> Option<String>
+where
+    F: FnOnce(&str) -> String,
+{
+    if let Some(template) = activation_prompt.filter(|s| !s.trim().is_empty()) {
+        let rendered = render(template);
+        if rendered.trim().is_empty() {
+            None
+        } else {
+            Some(rendered)
+        }
+    } else if let Some(goal_text) = goal.filter(|s| !s.trim().is_empty()) {
+        Some(goal_text.to_string())
+    } else {
+        None
     }
 }
 
@@ -2454,6 +2522,13 @@ impl App {
             "send_input" => methods::send_input(self, caller, &req.params),
             "kill_session" => methods::kill_session(self, caller, &req.params),
             "start_session" => methods::start_session(self, caller, &req.params),
+            "start_workflow" => methods::start_workflow(self, caller, &req.params),
+            "stop_workflow" => methods::stop_workflow(self, caller, &req.params),
+            "get_workflow_state" => methods::get_workflow_state(self, caller, &req.params),
+            "list_workflows" => methods::list_workflows(self, caller, &req.params),
+            "create_subtask" => methods::create_subtask(self, caller, &req.params),
+            "list_subtasks" => methods::list_subtasks(self, caller, &req.params),
+            "mark_subtask_done" => methods::mark_subtask_done(self, caller, &req.params),
             other => Err((
                 ErrorCode::UnknownMethod,
                 format!("unknown method: {}", other),
@@ -2709,11 +2784,16 @@ impl App {
                 .collect::<String>();
 
             let is_cloud = task.is_cloud;
+            // Local recovery covers both top-level CM branches (`cm/...`)
+            // AND subtask branches (`cm-sub/...`). Pre-fix, `cm-sub/`
+            // tasks reloaded with `workspace_id = None` after a manifest
+            // loss because reconcile only matched `cm/` — leaving
+            // start_session, workflow launch, and cleanup unable to
+            // find the workspace.
             let is_local = !is_cloud
-                && task
-                    .wip_branch
-                    .as_ref()
-                    .map_or(false, |b| b.starts_with("cm/"));
+                && task.wip_branch.as_ref().map_or(false, |b| {
+                    b.starts_with("cm/") || b.starts_with("cm-sub/")
+                });
 
             // Upsert TaskEntry.
             if let Some(entry) = self
@@ -2729,6 +2809,9 @@ impl App {
                 entry.session_id = task.session_id.clone();
                 entry.blocked_at = task.blocked_at.clone();
                 entry.is_cloud = is_cloud;
+                entry.project = task.project.clone();
+                entry.parent_task_id = task.parent_task_id.clone();
+                entry.worktree_mode = parse_worktree_mode(&task.worktree_mode);
             } else {
                 self.tasks.push(TaskEntry {
                     task_id: Some(task.id.clone()),
@@ -2741,8 +2824,9 @@ impl App {
                     blocked_at: task.blocked_at.clone(),
                     is_cloud,
                     workspace_id: None,
-                    parent_task_id: None,
-                    worktree_mode: WorktreeMode::Inherit,
+                    project: task.project.clone(),
+                    parent_task_id: task.parent_task_id.clone(),
+                    worktree_mode: parse_worktree_mode(&task.worktree_mode),
                 });
             }
 
@@ -2769,23 +2853,13 @@ impl App {
             }
 
             let (worktree_path, main_repo_path) = if is_local {
+                // Single resolver handles both `cm/<slug>` and
+                // `cm-sub/<chain>-<short>` layouts. See
+                // `worktree::recover_worktree_path`.
                 let wt = task
                     .wip_branch
                     .as_ref()
-                    .and_then(|b| {
-                        let slug = b.strip_prefix("cm/").unwrap_or(b);
-                        let repo_name = task
-                            .repo_url
-                            .trim_end_matches('/')
-                            .trim_end_matches(".git")
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("repo");
-                        let path = dirs::home_dir()
-                            .unwrap_or_default()
-                            .join(format!(".cm/worktrees/{}-{}", repo_name, slug));
-                        path.exists().then_some(path)
-                    });
+                    .and_then(|b| worktree::recover_worktree_path(&task.repo_url, b));
                 let main = wt.is_some().then(|| worktree::find_local_repo(&task.repo_url)).flatten();
                 (wt, main)
             } else {
@@ -3014,6 +3088,7 @@ impl App {
                     task_id,
                     task_title,
                     task_repo_url,
+                    project,
                     prompt,
                 } => {
                     self.launch_into_workspace(
@@ -3021,6 +3096,7 @@ impl App {
                         &task_id,
                         &task_title,
                         &task_repo_url,
+                        &project,
                         &prompt,
                     );
                     return true;
@@ -3872,7 +3948,7 @@ impl App {
     /// across TUI crashes. Pushing the save into the helper makes it
     /// impossible to forget. Callers can ignore the return value if
     /// they don't need the count; the persist is unconditional.
-    fn tombstone_and_remove(
+    pub(crate) fn tombstone_and_remove(
         &mut self,
         ws_index: usize,
         mut should_drop: impl FnMut(&TerminalSession) -> bool,
@@ -4376,6 +4452,7 @@ impl App {
                         blocked_at: None,
                         is_cloud: false,
                         workspace_id: Some(ws_id.clone()),
+                        project: None,
                         parent_task_id: None,
                         worktree_mode: WorktreeMode::Inherit,
                     });
@@ -4509,8 +4586,20 @@ impl App {
             .find(|t| t.workspace_id.as_deref() == Some(&ws_id))
             .and_then(|t| t.wip_branch.clone());
 
+        // Worktree removal is the gate to the rest of the destructive
+        // cleanup. If `git worktree remove` fails, branches and API
+        // tasks should NOT get deleted — better to leave the user
+        // with a recoverable state (worktree still on disk, branches
+        // intact, API rows intact) than to half-cleanup. The status
+        // bar shows the git error so the user knows what's wrong.
         if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo_path) {
-            worktree::remove_worktree(repo, wt);
+            if let Err(e) = worktree::remove_worktree(repo, wt) {
+                self.set_status_msg(&format!(
+                    "Workspace delete aborted: git worktree remove failed: {}",
+                    e
+                ));
+                return;
+            }
         }
         if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo_path) {
             let _ = std::process::Command::new("git")
@@ -4741,6 +4830,13 @@ impl App {
                     blocked_at: None,
                     is_cloud: false,
                     workspace_id: Some(ws_id),
+                    // Pin project synchronously so subtask inheritance
+                    // works before the next reconcile pass — without
+                    // this, an agent calling `create_subtask` in the
+                    // first second sees `project: None` on the parent
+                    // and writes `project = NULL` to the API, which
+                    // the planning refresh then filters out.
+                    project: Some(project.to_string()),
                     parent_task_id: None,
                     worktree_mode: WorktreeMode::Inherit,
                 });
@@ -4783,6 +4879,7 @@ impl App {
         task_id: &str,
         task_title: &str,
         task_repo_url: &str,
+        project: &str,
         prompt: &str,
     ) {
         let Some(wi) = self.workspace_index_by_id(workspace_id) else {
@@ -4862,6 +4959,10 @@ impl App {
                         blocked_at: None,
                         is_cloud: false,
                         workspace_id: Some(workspace_id.to_string()),
+                        // Same race fix as `launch_from_plan` — pin the
+                        // project synchronously from the planning row so
+                        // an early `create_subtask` inherits it.
+                        project: Some(project.to_string()),
                         parent_task_id: None,
                         worktree_mode: WorktreeMode::Inherit,
                     });
@@ -6333,6 +6434,208 @@ impl App {
         ));
     }
 
+    /// Programmatic workflow launch used by the `start_workflow` MCP
+    /// tool. Builds default slots (all roles get a freshly-spawned
+    /// session per their TOML-declared engine) and routes through the
+    /// existing `launch_workflow` UI path. Returns the new run's id.
+    ///
+    /// The MCP path differs from the UI path in two important ways:
+    ///   1. The agent provides the target `task_id`; we set it on the
+    ///      new `WorkflowRun` so descendant auth (in `methods.rs`) can
+    ///      evaluate against a real task id rather than the workflow's
+    ///      `task_key` (which is a workspace key, not a task id).
+    ///   2. All slots are fresh-new, so participants would otherwise
+    ///      have `task_id: None`. We override each participant's task
+    ///      binding to match the launching task — without this, every
+    ///      session-management call from the launching agent (list,
+    ///      read_session_output, send_input, kill) would fail the
+    ///      descendant check on participants and return unauthorized.
+    pub fn start_workflow_run(
+        &mut self,
+        ws_index: usize,
+        workflow_name: &str,
+        goal: Option<String>,
+        task_id: Option<String>,
+    ) -> Result<String, String> {
+        let wf = self
+            .workflows
+            .get(workflow_name)
+            .cloned()
+            .ok_or_else(|| format!("workflow not found: {}", workflow_name))?;
+        if ws_index >= self.workspaces.len() {
+            return Err(format!("workspace index {} out of range", ws_index));
+        }
+        let slots: Vec<WorkflowSlotChoice> = wf
+            .role_order
+            .iter()
+            .filter_map(|role_name| {
+                let role = wf.roles.get(role_name)?;
+                Some(WorkflowSlotChoice {
+                    role: role_name.clone(),
+                    options: vec![WorkflowSlotSource::New(role.engine.clone())],
+                    option_index: 0,
+                })
+            })
+            .collect();
+        if slots.is_empty() {
+            return Err("workflow has no roles".into());
+        }
+        let count_before = self.workflow_runs.len();
+        self.launch_workflow(ws_index, workflow_name, slots, goal);
+        if self.workflow_runs.len() == count_before {
+            return Err(self
+                .status_msg
+                .as_ref()
+                .map(|(s, _)| s.clone())
+                .unwrap_or_else(|| "launch failed".into()));
+        }
+        // Pull the run we just pushed and stamp it with the launching
+        // task_id. Same-pass: also bind every participant session in
+        // this run to that task. Both are required for downstream
+        // descendant auth.
+        let run_idx = self.workflow_runs.len() - 1;
+        let run_id = self.workflow_runs[run_idx].run_id.clone();
+        if let Some(tid) = task_id.as_deref() {
+            self.workflow_runs[run_idx].task_id = Some(tid.to_string());
+            // Walk every workspace + session; tag participants of this
+            // run so they descend from the launching task.
+            for ws in &mut self.workspaces {
+                for ts in &mut ws.sessions {
+                    if ts.workflow_run_id.as_deref() == Some(run_id.as_str()) {
+                        ts.task_id = Some(tid.to_string());
+                    }
+                }
+            }
+            let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+            self.save_session_manifest();
+        }
+
+        // Deliver the initial activation prompt. `launch_workflow`
+        // creates the run + spawns participant sessions but never
+        // queues an initial prompt — that's by design for UI launches,
+        // where the user types into the worker themselves. For MCP
+        // launches there's no human typing, so without this the worker
+        // sits idle, the on_idle gate never fires, and the workflow
+        // does nothing.
+        //
+        // Strategy: prefer the initial role's `activation_prompt`
+        // template (rendered with the workflow context, including
+        // `{{ goal }}`) if defined. Otherwise deliver `goal` directly
+        // as the worker's first user turn — both shipped workflows
+        // (feedback, review) leave the initial role's
+        // `activation_prompt` unset because they expect the user to
+        // type the goal in.
+        if let Some(initial_role) = self.workflow_runs[run_idx].active_role.clone() {
+            self.deliver_initial_workflow_prompt(&run_id, &initial_role, ws_index);
+        }
+        Ok(run_id)
+    }
+
+    /// Deliver the very first activation prompt to the initial role's
+    /// session in a freshly-launched workflow. Called only by the MCP
+    /// launch path (`start_workflow_run`); UI launches don't need this
+    /// because the user types directly into the session.
+    ///
+    /// Uses the same `Agent::submit_prompt` queue path as the on_idle
+    /// transition — body + Enter separation, quiet-window timing, all
+    /// inherited automatically.
+    fn deliver_initial_workflow_prompt(
+        &mut self,
+        run_id: &str,
+        role_name: &str,
+        ws_index: usize,
+    ) {
+        let run_idx = match self.workflow_runs.iter().position(|r| r.run_id == run_id) {
+            Some(i) => i,
+            None => return,
+        };
+        let wf_name = self.workflow_runs[run_idx].workflow_name.clone();
+        let wf = match self.workflows.get(&wf_name).cloned() {
+            Some(w) => w,
+            None => return,
+        };
+        let role = match wf.roles.get(role_name) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let goal = self.workflow_runs[run_idx].goal.clone();
+        let rendered = prepare_initial_prompt(
+            role.activation_prompt.as_deref(),
+            goal.as_deref(),
+            // Lazy renderer — only built if `activation_prompt` is
+            // set. Goal-only callers don't pay for the resolver.
+            |template| {
+                let worktree_ref = self.workspaces[ws_index].worktree_path.as_deref();
+                let mut role_engines: std::collections::BTreeMap<
+                    String,
+                    workflow::toml_schema::Engine,
+                > = std::collections::BTreeMap::new();
+                for r in wf.roles.keys() {
+                    let engine = match self.locate_workflow_session(run_id, r) {
+                        Some((wi, sj)) => engine_for_session_type(
+                            &self.workspaces[wi].sessions[sj].session_type,
+                        ),
+                        None => wf.roles[r].engine.clone(),
+                    };
+                    role_engines.insert(r.clone(), engine);
+                }
+                let resolver = WorkflowResolver {
+                    run: &self.workflow_runs[run_idx],
+                    worktree_path: worktree_ref,
+                    role_engines,
+                };
+                workflow::template::render(template, &resolver)
+            },
+        );
+        let rendered = match rendered {
+            Some(s) => s,
+            None => {
+                log_tick(
+                    run_id,
+                    &format!(
+                        "start_workflow: no activation prompt or goal for initial role '{}' — workflow will idle",
+                        role_name
+                    ),
+                );
+                return;
+            }
+        };
+
+        // Locate the initial role's session and queue the prompt via
+        // the same Agent::submit_prompt path the on_idle gate uses.
+        let Some((ti, si)) = self.locate_workflow_session(run_id, role_name) else {
+            return;
+        };
+        let session_type = self.workspaces[ti].sessions[si].session_type.clone();
+        let label = self.workspaces[ti].sessions[si].label.clone();
+        log_tick(
+            run_id,
+            &format!(
+                "start_workflow: queued initial prompt for role='{}' session='{}' ({} bytes)",
+                role_name,
+                label,
+                rendered.trim_end().len(),
+            ),
+        );
+        let ws = &mut self.workspaces[ti];
+        let wt = ws.worktree_path.clone().unwrap_or_default();
+        let ts = &mut ws.sessions[si];
+        let ctx = crate::agent::AgentCtxMut {
+            ts,
+            worktree_path: &wt,
+        };
+        let agent = crate::agent::agent_for(&session_type);
+        if let Err(e) = agent.submit_prompt(ctx, &rendered) {
+            log_tick(
+                run_id,
+                &format!(
+                    "start_workflow: submit_prompt error on initial role '{}': {}",
+                    role_name, e
+                ),
+            );
+        }
+    }
+
     /// Keep role_sessions.current_session_id aligned with the live
     /// TerminalSession.session_id. Nothing else.
     fn sync_role_session_ids(&mut self) {
@@ -6955,7 +7258,7 @@ impl App {
     /// the participating sessions have their workflow tags cleared so they
     /// behave like normal standalone sessions from here on. The sessions
     /// themselves stay open and their transcripts are preserved.
-    fn stop_workflow_run(&mut self, run_id: &str) {
+    pub(crate) fn stop_workflow_run(&mut self, run_id: &str) {
         if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
             run.mark_detached();
             let _ = workflow::run::save(run);
@@ -7809,6 +8112,120 @@ mod rotation_binding_tests {
             Some("new-sid"),
             "must pick the newer transcript (timestamp >= rotation)",
         );
+    }
+}
+
+#[cfg(test)]
+mod start_workflow_prompt_selection_tests {
+    //! Pins down what `deliver_initial_workflow_prompt` will queue for
+    //! the initial role under each combination of inputs. Without this
+    //! coverage, an `start_workflow` call with a workflow whose initial
+    //! role has no activation_prompt and a None goal would silently
+    //! ship-idle (the bug Phase 4 review caught), AND a goal containing
+    //! literal `{{` would be mangled by the renderer.
+
+    use super::prepare_initial_prompt;
+    use std::cell::Cell;
+
+    /// Marker render function — wraps so we can assert the renderer
+    /// was (or wasn't) called.
+    fn marker_render(template: &str) -> String {
+        format!("RENDERED({})", template)
+    }
+
+    fn no_render(_template: &str) -> String {
+        panic!("renderer must not be called on the goal-only path");
+    }
+
+    #[test]
+    fn prefers_activation_prompt_when_set() {
+        let got = prepare_initial_prompt(
+            Some("from-template"),
+            Some("goal-text"),
+            marker_render,
+        );
+        // Renderer was called with the template.
+        assert_eq!(got.as_deref(), Some("RENDERED(from-template)"));
+    }
+
+    #[test]
+    fn falls_back_to_goal_when_no_activation_prompt() {
+        let got = prepare_initial_prompt(None, Some("goal-text"), no_render);
+        assert_eq!(got.as_deref(), Some("goal-text"));
+    }
+
+    #[test]
+    fn goal_with_mustache_braces_is_not_rendered() {
+        // Regression for Phase 4 review: a goal containing literal
+        // `{{` (e.g. user pastes a Mustache example, or a code
+        // fragment with `{{ x }}`, or a JSON template) was being
+        // routed through the renderer in the fallback path and
+        // either mangled or emptied. Now the goal path bypasses
+        // render entirely.
+        let goal = "Implement {{user.name}} substitution in the templating engine.";
+        let got = prepare_initial_prompt(None, Some(goal), no_render);
+        assert_eq!(
+            got.as_deref(),
+            Some(goal),
+            "goal must pass through verbatim — `{{{{` survived intact"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_both_missing() {
+        // Workflow whose initial role has no template AND no goal
+        // provided — caller's choice to ship a no-op launch. We
+        // surface this as None so the caller can log + skip rather
+        // than queueing an empty prompt.
+        let got = prepare_initial_prompt(None, None, no_render);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn empty_or_whitespace_activation_prompt_falls_through_to_goal() {
+        // Treat an empty-after-trim template as "not set" — no point
+        // queueing pure whitespace through the renderer either.
+        let got = prepare_initial_prompt(Some("   "), Some("real-goal"), no_render);
+        assert_eq!(got.as_deref(), Some("real-goal"));
+    }
+
+    #[test]
+    fn empty_goal_with_no_template_returns_none() {
+        let got = prepare_initial_prompt(None, Some("\n\t  "), no_render);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn renderer_is_called_at_most_once() {
+        // The renderer is `FnOnce` — confirm the implementation
+        // doesn't double-invoke it (which would matter if it had
+        // side effects like mutating shared state).
+        let calls = Cell::new(0);
+        let _ = prepare_initial_prompt(
+            Some("template"),
+            Some("goal"),
+            |t| {
+                calls.set(calls.get() + 1);
+                t.to_string()
+            },
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn renderer_is_not_called_when_goal_path_taken() {
+        // Confirms the lazy-build property: the renderer closure is
+        // never invoked when activation_prompt is absent.
+        let calls = Cell::new(0);
+        let _ = prepare_initial_prompt(
+            None,
+            Some("goal"),
+            |t| {
+                calls.set(calls.get() + 1);
+                t.to_string()
+            },
+        );
+        assert_eq!(calls.get(), 0);
     }
 }
 
