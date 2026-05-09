@@ -64,6 +64,7 @@ _FULL_EXTRA_FIELDS = (
     "description", "prompt", "depends", "repo_url", "repo_branch",
     "wip_branch", "session_id", "ttyd_url", "worker_vm",
     "blocked_at", "created_at", "updated_at",
+    "parent_task_id", "worktree_mode",
 )
 
 
