@@ -1616,6 +1616,10 @@ pub struct App {
     last_session_id_check: Instant,
     /// Workflow definitions loaded from `workflows/*.toml` at startup.
     pub workflows: HashMap<String, Workflow>,
+    /// Files in the workflows directory that failed to parse or validate at
+    /// startup. Surfaced in the workflow picker so a typo in a TOML doesn't
+    /// silently make a workflow disappear without a hint.
+    pub workflow_load_errors: Vec<(PathBuf, String)>,
     /// Active + recent workflow runs (persisted per run at ~/.cm/workflow-runs/).
     pub workflow_runs: Vec<WorkflowRun>,
     /// Tails `~/.claude/history.jsonl` for `/clear` and `/compact` events so
@@ -1689,8 +1693,12 @@ impl App {
             .filter(|(_, ws_id)| known_ws_ids.contains(ws_id))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let (workflows, _errs) =
-            workflow::toml_schema::load_all(&workflow::toml_schema::workflows_dir());
+        let workflows_dir = workflow::toml_schema::workflows_dir();
+        let (workflows, load_errs) = workflow::toml_schema::load_all(&workflows_dir);
+        let workflow_load_errors = filter_real_workflow_load_errors(&workflows_dir, load_errs);
+        for (path, err) in &workflow_load_errors {
+            eprintln!("workflow load failed: {}: {}", path.display(), err);
+        }
         let workflow_runs = workflow::run::load_all()
             .into_iter()
             .filter(|r| r.is_active())
@@ -1726,6 +1734,7 @@ impl App {
             manifest_bindings,
             last_session_id_check: Instant::now(),
             workflows,
+            workflow_load_errors,
             workflow_runs,
             history_watcher: workflow::history::HistoryWatcher::new(),
             pending_rotations: Vec::new(),
@@ -7042,18 +7051,18 @@ impl App {
 
         let mut names: Vec<String> = self.workflows.keys().cloned().collect();
         names.sort();
-        match names.len() {
-            0 => {
+        let has_load_errors = !self.workflow_load_errors.is_empty();
+        match route_workflow_launch(names, has_load_errors) {
+            WorkflowLaunchRouting::NoWorkflowsFound => {
                 self.set_status_msg(&format!(
                     "No workflows found in {}",
                     workflow::toml_schema::workflows_dir().display()
                 ));
             }
-            1 => {
-                let only = names.into_iter().next().unwrap();
+            WorkflowLaunchRouting::LaunchOnly(only) => {
                 self.enter_workflow_launch_confirm(wi, focused_si, only);
             }
-            _ => {
+            WorkflowLaunchRouting::OpenPicker(names) => {
                 self.input_mode = InputMode::WorkflowPicker {
                     ws_index: wi,
                     focused_si,
@@ -8247,6 +8256,75 @@ impl App {
 //                         Workflow modal rendering
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Title for the workflow picker dialog. Includes a count when any workflow
+/// files failed to load, so the user has a hint that some entries are missing
+/// from the picker list.
+pub(crate) fn workflow_picker_title(error_count: usize) -> String {
+    if error_count == 0 {
+        " Pick workflow ".to_string()
+    } else {
+        format!(" Pick workflow ({} failed to load) ", error_count)
+    }
+}
+
+/// Strip the directory-level `Io(NotFound)` from `load_all`'s error list and
+/// stringify the rest. A missing `workflows/` directory (e.g. fresh install)
+/// is not a "load failure" — it's an absent surface, already handled by the
+/// existing "No workflows found in …" status. Treating it as a load error
+/// would push the picker into "(1 failed to load)" mode on every bare repo.
+pub(crate) fn filter_real_workflow_load_errors(
+    workflows_dir: &Path,
+    errs: Vec<(PathBuf, workflow::toml_schema::WorkflowError)>,
+) -> Vec<(PathBuf, String)> {
+    errs.into_iter()
+        .filter(|(p, e)| {
+            !(p == workflows_dir
+                && matches!(
+                    e,
+                    workflow::toml_schema::WorkflowError::Io(io)
+                        if io.kind() == std::io::ErrorKind::NotFound
+                ))
+        })
+        .map(|(p, e)| (p, e.to_string()))
+        .collect()
+}
+
+/// Routing decision for the `A-f` launch keybinding. The picker is normally
+/// short-circuited when there are 0 or 1 valid workflows, but when load
+/// errors exist we force-open it so the user sees which TOML files failed
+/// — otherwise a typo silently drops a workflow with no hint.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowLaunchRouting {
+    NoWorkflowsFound,
+    LaunchOnly(String),
+    OpenPicker(Vec<String>),
+}
+
+pub(crate) fn route_workflow_launch(
+    valid_names: Vec<String>,
+    has_load_errors: bool,
+) -> WorkflowLaunchRouting {
+    match (valid_names.len(), has_load_errors) {
+        (0, false) => WorkflowLaunchRouting::NoWorkflowsFound,
+        (1, false) => {
+            WorkflowLaunchRouting::LaunchOnly(valid_names.into_iter().next().unwrap())
+        }
+        _ => WorkflowLaunchRouting::OpenPicker(valid_names),
+    }
+}
+
+/// One-line summary for a single workflow load failure, rendered as a dim row
+/// at the top of the picker dialog. Uses the file's basename to keep the row
+/// short; the full path is logged to stderr at startup.
+pub(crate) fn format_workflow_load_error(path: &Path, err: &str) -> String {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("<unknown>");
+    let one_line = err.lines().next().unwrap_or("").trim();
+    format!("⚠ {}: {}", name, one_line)
+}
+
 impl App {
     pub fn draw_workflow_picker(
         &self,
@@ -8255,8 +8333,11 @@ impl App {
         names: &[String],
         selected: usize,
     ) {
+        let err_rows = self.workflow_load_errors.len() as u16;
+        let err_pad = if err_rows > 0 { 1 } else { 0 };
         let width = area.width.min(60).max(36);
-        let height = (names.len() as u16 + 5).min(area.height.saturating_sub(2));
+        let height = (names.len() as u16 + 5 + err_rows + err_pad)
+            .min(area.height.saturating_sub(2));
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let dialog = Rect { x, y, width, height };
@@ -8264,6 +8345,15 @@ impl App {
         frame.render_widget(Clear, dialog);
 
         let mut lines: Vec<Line> = Vec::new();
+        for (path, err) in &self.workflow_load_errors {
+            lines.push(Line::from(Span::styled(
+                format_workflow_load_error(path, err),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if !self.workflow_load_errors.is_empty() {
+            lines.push(Line::from(""));
+        }
         for (idx, name) in names.iter().enumerate() {
             let is_active = idx == selected;
             let cursor = if is_active { "▸ " } else { "  " };
@@ -8299,7 +8389,7 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Pick workflow ")
+            .title(workflow_picker_title(self.workflow_load_errors.len()))
             .style(Style::default().fg(Color::White));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
@@ -10157,6 +10247,166 @@ mod input_handler_tests {
             }
             other => panic!("expected StopWorkflow, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod workflow_load_errors_tests {
+    //! Pins down that workflow TOML failures captured by `load_all` flow into
+    //! the picker surface. Without this, a typo in `workflows/feedback.toml`
+    //! silently makes that workflow disappear from `A-f` with no hint.
+
+    use super::{
+        filter_real_workflow_load_errors, format_workflow_load_error, route_workflow_launch,
+        workflow_picker_title, WorkflowLaunchRouting,
+    };
+    use crate::workflow;
+
+    const VALID_TOML: &str = r#"
+name = "good"
+description = "Loads cleanly"
+[roles.solo]
+engine = "claude-code"
+context = "persistent"
+"#;
+
+    /// `load_all` walks a workflows dir and partitions entries into
+    /// (parsed, errors). A garbage TOML file lands in the errors bucket
+    /// while siblings keep parsing — that's the contract App::new relies
+    /// on to populate `workflow_load_errors` without losing valid loads.
+    #[test]
+    fn load_all_returns_errors_for_invalid_toml_alongside_valid_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("good.toml"), VALID_TOML).unwrap();
+        std::fs::write(tmp.path().join("bad.toml"), "not = = valid toml").unwrap();
+
+        let (workflows, errors) = workflow::toml_schema::load_all(tmp.path());
+
+        assert_eq!(workflows.len(), 1, "valid workflow should still parse");
+        assert!(workflows.contains_key("good"));
+        assert_eq!(errors.len(), 1, "invalid workflow should be reported");
+        assert!(
+            errors[0].0.file_name().and_then(|s| s.to_str()) == Some("bad.toml"),
+            "error tuple should carry the offending file path",
+        );
+    }
+
+    /// End-to-end: feed real `load_all` output through the same conversion
+    /// `App::new` does, then check both surfaces (picker title + per-row
+    /// summary) include identifying info. This is the surface promise users
+    /// see when they open the picker after a load failure.
+    #[test]
+    fn captured_errors_render_in_picker_title_and_dim_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("typo.toml"), "name = \n").unwrap();
+        let (_workflows, errors) = workflow::toml_schema::load_all(tmp.path());
+        assert_eq!(errors.len(), 1);
+
+        // Mirror what App::new stores.
+        let app_errors: Vec<(std::path::PathBuf, String)> = errors
+            .into_iter()
+            .map(|(p, e)| (p, e.to_string()))
+            .collect();
+
+        let title = workflow_picker_title(app_errors.len());
+        assert_eq!(title, " Pick workflow (1 failed to load) ");
+
+        let row = format_workflow_load_error(&app_errors[0].0, &app_errors[0].1);
+        assert!(row.contains("typo.toml"), "row should name the file: {}", row);
+        assert!(row.starts_with('⚠'), "row should be visually flagged: {}", row);
+    }
+
+    #[test]
+    fn workflow_picker_title_omits_count_when_no_errors() {
+        assert_eq!(workflow_picker_title(0), " Pick workflow ");
+    }
+
+    /// One valid + zero errors: the picker is short-circuited and we go
+    /// straight to launch-confirm. This is the existing fast path.
+    #[test]
+    fn route_one_valid_no_errors_short_circuits_to_launch() {
+        let r = route_workflow_launch(vec!["feedback".into()], false);
+        assert_eq!(r, WorkflowLaunchRouting::LaunchOnly("feedback".into()));
+    }
+
+    /// One valid + one bad TOML: the picker MUST open so the dim error row
+    /// is visible. Without this, the user would jump straight to confirm
+    /// for the lone valid workflow with no hint that another file failed.
+    /// This is the bug the reviewer flagged.
+    #[test]
+    fn route_one_valid_with_load_errors_forces_picker_open() {
+        let r = route_workflow_launch(vec!["feedback".into()], true);
+        match r {
+            WorkflowLaunchRouting::OpenPicker(names) => {
+                assert_eq!(names, vec!["feedback".to_string()]);
+            }
+            other => panic!("expected OpenPicker, got {:?}", other),
+        }
+    }
+
+    /// Zero valid + at least one bad TOML: don't show the misleading
+    /// "No workflows found in <dir>" status — open the picker so the load
+    /// errors are surfaced as the dim rows on top.
+    #[test]
+    fn route_zero_valid_with_load_errors_opens_empty_picker() {
+        let r = route_workflow_launch(Vec::new(), true);
+        match r {
+            WorkflowLaunchRouting::OpenPicker(names) => {
+                assert!(names.is_empty());
+            }
+            other => panic!("expected OpenPicker, got {:?}", other),
+        }
+    }
+
+    /// Zero valid + zero errors: the genuine empty-dir case keeps its
+    /// original status_msg. We don't want to open an empty picker on a
+    /// fresh checkout where no `workflows/` dir exists yet.
+    #[test]
+    fn route_zero_valid_no_errors_reports_not_found() {
+        let r = route_workflow_launch(Vec::new(), false);
+        assert_eq!(r, WorkflowLaunchRouting::NoWorkflowsFound);
+    }
+
+    /// Missing `workflows/` dir: `load_all` returns `(empty, [(dir, Io(NotFound))])`.
+    /// That is NOT a per-file load failure — it's an absent surface — so the
+    /// filter must drop it. Otherwise a fresh install gets the misleading
+    /// "(1 failed to load)" picker title every time.
+    #[test]
+    fn filter_drops_directory_level_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let (workflows, errs) = workflow::toml_schema::load_all(&missing);
+
+        assert!(workflows.is_empty());
+        assert_eq!(errs.len(), 1, "load_all reports the absent dir");
+        let filtered = filter_real_workflow_load_errors(&missing, errs);
+        assert!(
+            filtered.is_empty(),
+            "directory-level NotFound must be filtered: {:?}",
+            filtered
+        );
+
+        // And the routing then falls through to NoWorkflowsFound, matching
+        // the pre-existing "No workflows found in <dir>" UX.
+        let r = route_workflow_launch(Vec::new(), !filtered.is_empty());
+        assert_eq!(r, WorkflowLaunchRouting::NoWorkflowsFound);
+    }
+
+    /// Real per-file failures (parse errors, validation errors) MUST still
+    /// pass through the filter — that's the whole point of the surface.
+    #[test]
+    fn filter_keeps_per_file_parse_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bad.toml"), "not = = valid").unwrap();
+        let (_workflows, errs) = workflow::toml_schema::load_all(tmp.path());
+        assert_eq!(errs.len(), 1);
+
+        let filtered = filter_real_workflow_load_errors(tmp.path(), errs);
+        assert_eq!(filtered.len(), 1, "parse error must survive the filter");
+        assert_eq!(
+            filtered[0].0.file_name().and_then(|s| s.to_str()),
+            Some("bad.toml"),
+        );
     }
 }
 
