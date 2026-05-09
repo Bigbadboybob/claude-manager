@@ -1166,6 +1166,34 @@ impl App {
             .join(".cm/tui-sessions.json")
     }
 
+    /// Crash-safe write: stage to a sibling `.tmp`, fsync, then rename.
+    /// On Linux, rename is atomic across the same filesystem, so a reader
+    /// either sees the old complete file or the new complete file — never
+    /// a truncated/partial one. The fsync before rename ensures the new
+    /// content has hit disk before the directory entry flips.
+    fn atomic_write_manifest(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let tmp = match path.file_name() {
+            Some(name) => {
+                let mut s = name.to_os_string();
+                s.push(".tmp");
+                path.with_file_name(s)
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "manifest path has no file name",
+                ));
+            }
+        };
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
     /// Save session manifest to disk.
     pub(crate) fn save_session_manifest(&self) {
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
@@ -1229,16 +1257,54 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-            let _ = std::fs::write(&path, json);
+            if let Err(e) = Self::atomic_write_manifest(&path, json.as_bytes()) {
+                eprintln!(
+                    "failed to write session manifest at {}: {}",
+                    path.display(),
+                    e
+                );
+            }
         }
     }
 
-    /// Load session manifest from disk.
+    /// Load session manifest from disk. On parse failure, the corrupt file is
+    /// preserved at `<path>.corrupt-<unix_ts>` so the user can recover state.
     fn load_manifest() -> Manifest {
         let path = Self::manifest_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-            Err(_) => Manifest::default(),
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Manifest::default(),
+        };
+        match serde_json::from_str(&contents) {
+            Ok(m) => m,
+            Err(e) => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_extension(format!("json.corrupt-{}", ts));
+                let backup_msg = match std::fs::rename(&path, &backup) {
+                    Ok(()) => format!("backed up to {}", backup.display()),
+                    Err(rename_err) => match std::fs::write(&backup, &contents) {
+                        Ok(()) => format!(
+                            "rename failed ({}); copied to {}",
+                            rename_err,
+                            backup.display()
+                        ),
+                        Err(copy_err) => format!(
+                            "could not preserve corrupt file (rename: {}; copy: {})",
+                            rename_err, copy_err
+                        ),
+                    },
+                };
+                eprintln!(
+                    "session manifest at {} failed to parse ({}); {}. Starting with empty state.",
+                    path.display(),
+                    e,
+                    backup_msg
+                );
+                Manifest::default()
+            }
         }
     }
 
