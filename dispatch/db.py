@@ -135,7 +135,7 @@ async def list_warm_vms(pool: asyncpg.Pool, pool_id: str | None = None) -> list[
 
 
 async def add_warm_vm(pool: asyncpg.Pool, pool_id: str, vm_name: str,
-                      vm_zone: str, external_ip: str) -> dict:
+                      vm_zone: str, external_ip: str | None = None) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO warm_vms (pool_id, vm_name, vm_zone, external_ip)

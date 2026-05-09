@@ -2,11 +2,21 @@ import asyncio
 import logging
 import shlex
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from dispatch import db
 from dispatch.config import (
     GCP_PROJECT, GCP_ZONE, MAX_WORKERS, MANAGER_URL, API_TOKEN,
 )
+
+
+def _warm_vm_name(pool_id) -> str:
+    """Build a unique warm-VM instance name for a pool.
+
+    Pool id alone collides when pool_size > 1 (gcloud rejects duplicate
+    instance names with 409 Conflict), so we mix in a short uuid4 suffix.
+    """
+    return f"cm-warm-{str(pool_id)[:8]}-{uuid.uuid4().hex[:6]}"
 
 logger = logging.getLogger("cm.dispatch")
 
@@ -137,16 +147,32 @@ async def _maintain_warm_pools(pool):
         needed = wp["pool_size"] - len(alive_vms)
         for i in range(needed):
             logger.info(f"Launching warm VM for pool {wp['id']} ({wp['repo_url']})")
+            vm_name = _warm_vm_name(wp["id"])
+            # Persist the row BEFORE gcloud creates the instance so concurrent
+            # dispatchers can't pick the same generated name (the unique
+            # constraint on warm_vms.vm_name will reject the second insert).
             try:
-                vm_name, external_ip = await asyncio.to_thread(
-                    _launch_warm_vm_sync, wp
+                vm_row = await db.add_warm_vm(
+                    pool, wp["id"], vm_name, GCP_ZONE, external_ip=None,
                 )
-                await db.add_warm_vm(
-                    pool, wp["id"], vm_name, GCP_ZONE, external_ip
+            except Exception:
+                logger.exception(f"Failed to reserve warm VM row for pool {wp['id']}")
+                continue
+            try:
+                external_ip = await asyncio.to_thread(
+                    _launch_warm_vm_sync, wp, vm_name,
                 )
+                await db.update_warm_vm(pool, vm_row["id"], external_ip=external_ip)
                 logger.info(f"Warm VM {vm_name} launched ({external_ip})")
             except Exception:
                 logger.exception(f"Failed to launch warm VM for pool {wp['id']}")
+                # Roll back the reserved row so the slot can be retried next tick.
+                try:
+                    await db.delete_warm_vm(pool, vm_row["id"])
+                except Exception:
+                    logger.exception(
+                        f"Failed to clean up reserved warm VM row {vm_row['id']}"
+                    )
 
         # Check health of existing VMs
         for vm in alive_vms:
@@ -183,8 +209,12 @@ def _launch_worker_sync(task, branch):
     )
 
 
-def _launch_warm_vm_sync(wp):
-    """Launch a warm pool VM (no task, just repo setup)."""
+def _launch_warm_vm_sync(wp, vm_name):
+    """Launch a warm pool VM (no task, just repo setup).
+
+    The caller pre-generates ``vm_name`` and persists the warm_vms row so
+    concurrent dispatchers can't race on the same instance name.
+    """
     from dispatch.vm import launch_worker
     from pathlib import Path
 
@@ -193,7 +223,6 @@ def _launch_warm_vm_sync(wp):
     from google.cloud import compute_v1
     from dispatch.config import VM_IMAGE_FAMILY, VM_IMAGE_PROJECT
 
-    vm_name = f"cm-warm-{str(wp['id'])[:8]}"
     client = compute_v1.InstancesClient()
 
     instance = compute_v1.Instance(
@@ -235,7 +264,7 @@ def _launch_warm_vm_sync(wp):
 
     inst = client.get(project=GCP_PROJECT, zone=GCP_ZONE, instance=vm_name)
     external_ip = inst.network_interfaces[0].access_configs[0].nat_i_p
-    return vm_name, external_ip
+    return external_ip
 
 
 def _check_vm_alive(vm_name: str) -> bool:
