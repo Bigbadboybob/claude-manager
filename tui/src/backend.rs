@@ -138,16 +138,25 @@ impl BackendHandle {
         }
     }
 
+    /// Send a command to the backend, logging any SendError to stderr.
+    /// `ctx` identifies the operation in the log line so a dropped
+    /// command surfaces as more than a silent no-op.
+    fn try_send_or_warn(&self, cmd: BackendCommand, ctx: &str) {
+        if let Err(e) = self.cmd_tx.send(cmd) {
+            eprintln!("backend send dropped ({}): {}", ctx, e);
+        }
+    }
+
     pub fn refresh(&self) {
-        let _ = self.cmd_tx.send(BackendCommand::Refresh);
+        self.try_send_or_warn(BackendCommand::Refresh, "refresh");
     }
 
     pub fn update_task(&self, id: String, fields: HashMap<String, serde_json::Value>) {
-        let _ = self.cmd_tx.send(BackendCommand::UpdateTask { id, fields });
+        self.try_send_or_warn(BackendCommand::UpdateTask { id, fields }, "update_task");
     }
 
     pub fn delete_task(&self, id: String) {
-        let _ = self.cmd_tx.send(BackendCommand::DeleteTask { id });
+        self.try_send_or_warn(BackendCommand::DeleteTask { id }, "delete_task");
     }
 
     pub fn push(
@@ -158,17 +167,20 @@ impl BackendHandle {
         task_id: Option<String>,
         workspace_id: String,
     ) {
-        let _ = self.cmd_tx.send(BackendCommand::Push {
-            worktree_path,
-            repo_url,
-            name,
-            task_id,
-            workspace_id,
-        });
+        self.try_send_or_warn(
+            BackendCommand::Push {
+                worktree_path,
+                repo_url,
+                name,
+                task_id,
+                workspace_id,
+            },
+            "push",
+        );
     }
 
     pub fn pull(&self, task_id: String, main_repo: PathBuf) {
-        let _ = self.cmd_tx.send(BackendCommand::Pull { task_id, main_repo });
+        self.try_send_or_warn(BackendCommand::Pull { task_id, main_repo }, "pull");
     }
 
     pub fn create_plan_task(
@@ -181,30 +193,38 @@ impl BackendHandle {
         parent_task_id: Option<String>,
         worktree_mode: Option<String>,
     ) {
-        let _ = self.cmd_tx.send(BackendCommand::CreatePlanTask {
-            project,
-            repo_url,
-            name,
-            description,
-            status,
-            parent_task_id,
-            worktree_mode,
-        });
+        self.try_send_or_warn(
+            BackendCommand::CreatePlanTask {
+                project,
+                repo_url,
+                name,
+                description,
+                status,
+                parent_task_id,
+                worktree_mode,
+            },
+            "create_plan_task",
+        );
     }
 
     pub fn update_plan_task(&self, id: String, fields: HashMap<String, serde_json::Value>) {
-        let _ = self.cmd_tx.send(BackendCommand::UpdatePlanTask { id, fields });
+        self.try_send_or_warn(
+            BackendCommand::UpdatePlanTask { id, fields },
+            "update_plan_task",
+        );
     }
 
     pub fn delete_plan_task(&self, id: String) {
-        let _ = self.cmd_tx.send(BackendCommand::DeletePlanTask { id });
+        self.try_send_or_warn(BackendCommand::DeletePlanTask { id }, "delete_plan_task");
     }
 
     pub fn refresh_plan_tasks(&self) {
-        let _ = self.cmd_tx.send(BackendCommand::RefreshPlanTasks);
+        self.try_send_or_warn(BackendCommand::RefreshPlanTasks, "refresh_plan_tasks");
     }
 
     pub fn shutdown(&mut self) {
+        // SendError here is expected if the receiver thread already
+        // exited (clean shutdown race); skip the warn helper.
         let _ = self.cmd_tx.send(BackendCommand::Shutdown);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
@@ -795,5 +815,25 @@ fn do_refresh_plan_tasks(
         Err(e) => {
             let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_send_or_warn_does_not_panic_when_receiver_dropped() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<BackendCommand>();
+        let (_event_tx, event_rx) = mpsc::channel::<BackendEvent>();
+        drop(cmd_rx);
+        let handle = BackendHandle {
+            cmd_tx,
+            event_rx,
+            thread: None,
+        };
+        handle.refresh();
+        handle.delete_task("nope".to_string());
+        handle.refresh_plan_tasks();
     }
 }
