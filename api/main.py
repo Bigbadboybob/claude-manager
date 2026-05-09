@@ -8,7 +8,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query
 
 from api.auth import verify_token
 from api.models import TaskCreate, TaskUpdate, TaskResponse
-from api.dispatch_daemon import dispatch_loop
+from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from dispatch import db
 from dispatch.config import DB_DSN
 
@@ -21,15 +21,21 @@ async def lifespan(app: FastAPI):
     # Startup
     app.state.pool = await db.get_pool()
     await db.init_db(app.state.pool)
+    # Two independent loops so a slow warm-pool maintenance pass (serial
+    # gcloud probes, gcloud instances create) doesn't drift the dispatch
+    # cadence past its 10s target.
     app.state.dispatch_task = asyncio.create_task(dispatch_loop(app.state.pool))
+    app.state.warm_pool_task = asyncio.create_task(warm_pool_loop(app.state.pool))
     logger.info("API server started")
     yield
     # Shutdown
-    app.state.dispatch_task.cancel()
-    try:
-        await app.state.dispatch_task
-    except asyncio.CancelledError:
-        pass
+    for task in (app.state.dispatch_task, app.state.warm_pool_task):
+        task.cancel()
+    for task in (app.state.dispatch_task, app.state.warm_pool_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await app.state.pool.close()
     logger.info("API server stopped")
 

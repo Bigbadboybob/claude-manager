@@ -20,29 +20,52 @@ def _warm_vm_name(pool_id) -> str:
 
 logger = logging.getLogger("cm.dispatch")
 
+DISPATCH_INTERVAL_SECS = 10
+WARM_POOL_INTERVAL_SECS = 30
 
-async def dispatch_loop(pool):
-    """Background loop: dispatch tasks, maintain warm pools, detect zombies."""
+
+async def dispatch_loop(pool, interval: float = DISPATCH_INTERVAL_SECS):
+    """Background loop: claim backlog tasks and assign workers.
+
+    Runs independently of warm-pool maintenance — see ``warm_pool_loop``.
+    A slow warm-pool pass (serial gcloud ssh probes per VM, gcloud
+    instances create, etc.) must not delay task dispatch, which is why
+    the two cadences live in separate asyncio tasks.
+    """
     logger.info(f"Dispatch daemon started (max_workers={MAX_WORKERS})")
 
-    tick = 0
     while True:
         try:
             await _dispatch_tasks(pool)
-
-            # Warm pool maintenance every 30s
-            if tick % 3 == 0:
-                await _maintain_warm_pools(pool)
-
-
         except asyncio.CancelledError:
             logger.info("Dispatch daemon shutting down")
             raise
         except Exception:
             logger.exception("Dispatch loop error")
 
-        tick += 1
-        await asyncio.sleep(10)
+        await asyncio.sleep(interval)
+
+
+async def warm_pool_loop(pool, interval: float = WARM_POOL_INTERVAL_SECS):
+    """Background loop: maintain warm-pool VM counts and health.
+
+    Lives in its own asyncio task (see ``api.main.lifespan``) so a slow
+    pass doesn't drift the dispatch cadence. Per-VM probes inside
+    ``_maintain_warm_pools`` are themselves parallelized — one slow
+    gcloud ssh shouldn't stall the whole pass either.
+    """
+    logger.info("Warm-pool maintenance loop started")
+
+    while True:
+        try:
+            await _maintain_warm_pools(pool)
+        except asyncio.CancelledError:
+            logger.info("Warm-pool maintenance shutting down")
+            raise
+        except Exception:
+            logger.exception("Warm-pool loop error")
+
+        await asyncio.sleep(interval)
 
 
 async def _dispatch_tasks(pool):
@@ -174,26 +197,43 @@ async def _maintain_warm_pools(pool):
                         f"Failed to clean up reserved warm VM row {vm_row['id']}"
                     )
 
-        # Check health of existing VMs
-        for vm in alive_vms:
-            is_alive = await asyncio.to_thread(_check_vm_alive, vm["vm_name"])
-            if not is_alive:
-                logger.warning(f"Warm VM {vm['vm_name']} is dead, removing")
-                await db.delete_warm_vm(pool, vm["id"])
-                if vm.get("current_task_id"):
-                    await db.update_task(pool, vm["current_task_id"], status="backlog")
-            elif vm["status"] == "booting":
-                # Check if the VM is actually ready (Claude at the prompt)
-                try:
-                    output = await asyncio.to_thread(
-                        _ssh_command, vm["vm_name"],
-                        "grep -c 'ready and waiting' /var/log/cm-worker.log 2>/dev/null || echo 0"
-                    )
-                    if output.strip() != "0":
-                        logger.info(f"Warm VM {vm['vm_name']} is now ready")
-                        await db.update_warm_vm(pool, vm["id"], status="ready")
-                except Exception:
-                    pass
+        # Check health of existing VMs in parallel — a single slow gcloud
+        # ssh would otherwise stall the whole pass behind it.
+        if alive_vms:
+            results = await asyncio.gather(
+                *(_probe_warm_vm(vm) for vm in alive_vms)
+            )
+            for vm, is_alive, became_ready in results:
+                if not is_alive:
+                    logger.warning(f"Warm VM {vm['vm_name']} is dead, removing")
+                    await db.delete_warm_vm(pool, vm["id"])
+                    if vm.get("current_task_id"):
+                        await db.update_task(pool, vm["current_task_id"], status="backlog")
+                elif became_ready:
+                    logger.info(f"Warm VM {vm['vm_name']} is now ready")
+                    await db.update_warm_vm(pool, vm["id"], status="ready")
+
+
+async def _probe_warm_vm(vm):
+    """Probe a single warm VM concurrently with siblings.
+
+    Returns ``(vm, is_alive, became_ready)``. DB writes stay in the caller
+    so we don't fan out asyncpg connection use for what is mostly an
+    IO-bound gcloud roundtrip.
+    """
+    is_alive = await asyncio.to_thread(_check_vm_alive, vm["vm_name"])
+    if not is_alive:
+        return (vm, False, False)
+    if vm["status"] != "booting":
+        return (vm, True, False)
+    try:
+        output = await asyncio.to_thread(
+            _ssh_command, vm["vm_name"],
+            "grep -c 'ready and waiting' /var/log/cm-worker.log 2>/dev/null || echo 0",
+        )
+        return (vm, True, output.strip() != "0")
+    except Exception:
+        return (vm, True, False)
 
 
 
