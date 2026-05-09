@@ -30,6 +30,10 @@ mod dirs {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
+/// Width of the Sessions-view sidebar in cells. The terminal panel takes the
+/// remaining width minus its own border (see `SIDEBAR_WIDTH + 2` in main.rs
+/// when sizing the PTY).
+pub const SIDEBAR_WIDTH: u16 = 36;
 /// Minimum Wakeups within the window to consider a session actively working.
 const WAKEUP_BURST_THRESHOLD: usize = 5;
 
@@ -5932,11 +5936,8 @@ impl App {
 
         match self.view_mode {
             ViewMode::Sessions => {
-                // Phase 6: sidebar widened from 30 → 36 cells to fit the
-                // full-name role badges (`[worker]`, `[reviewer]`, `[manager]`)
-                // and a deeper workflow-participant indent.
                 let cols =
-                    Layout::horizontal([Constraint::Min(40), Constraint::Length(36)])
+                    Layout::horizontal([Constraint::Min(40), Constraint::Length(SIDEBAR_WIDTH)])
                         .split(content_area);
 
                 self.draw_terminal(frame, cols[0]);

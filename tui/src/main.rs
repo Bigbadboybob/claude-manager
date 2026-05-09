@@ -31,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::App;
+use app::{App, SIDEBAR_WIDTH};
 use config::Config;
 
 fn main() -> anyhow::Result<()> {
@@ -118,7 +118,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             let t = Instant::now();
             terminal.draw(|frame| {
                 let area = frame.area();
-                let term_cols = area.width.saturating_sub(32);
+                // Sidebar + the terminal panel's left/right border = SIDEBAR_WIDTH + 2.
+                let term_cols = area.width.saturating_sub(SIDEBAR_WIDTH + 2);
                 let term_rows = area.height.saturating_sub(3);
                 if (term_cols, term_rows) != app.last_term_size {
                     app.resize_terminals(term_cols, term_rows);
