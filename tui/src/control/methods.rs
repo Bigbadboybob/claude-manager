@@ -1065,6 +1065,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
                 worker_zone: None,
                 sessions: vec![],
                 tombstones: vec![],
+                is_pushing: false,
             };
             app.workspaces.push(new_ws);
             (worktree_path, new_ws_id)
@@ -1859,6 +1860,7 @@ mod tests {
             worker_zone: None,
             sessions,
             tombstones,
+            is_pushing: false,
         }
     }
 

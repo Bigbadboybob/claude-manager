@@ -26,6 +26,9 @@ pub enum BackendCommand {
         repo_url: String,
         name: String,
         task_id: Option<String>,
+        /// Echoed back on `PushComplete` / `PushFailed` so the main thread
+        /// can locate the originating workspace without guessing.
+        workspace_id: String,
     },
     /// Pull a cloud session to local.
     Pull {
@@ -77,6 +80,26 @@ pub enum BackendEvent {
         session_id: String,
         repo_url: String,
         prompt: String,
+    },
+    /// Push completed successfully. The main thread gates its
+    /// destructive local cleanup (tombstone sessions, clear
+    /// `worktree_path`, flip `is_cloud`) on this event so a failed push
+    /// doesn't leave the UI claiming a non-existent cloud workspace.
+    /// `task_id` is the cloud task that was updated/created — `None`
+    /// only if the API create failed mid-flow (callers should treat
+    /// that as a partial success and surface a status message rather
+    /// than re-pushing).
+    PushComplete {
+        workspace_id: String,
+        task_id: Option<String>,
+    },
+    /// Push failed at any stage (git push, GCS upload, API call). The
+    /// main thread should clear the workspace's `is_pushing` flag and
+    /// surface `error` to the user; local state stays intact so retry
+    /// is a no-op away.
+    PushFailed {
+        workspace_id: String,
+        error: String,
     },
     /// Planning tasks updated (all tasks with a project field).
     PlanTasksUpdated(Vec<Task>),
@@ -133,12 +156,14 @@ impl BackendHandle {
         repo_url: String,
         name: String,
         task_id: Option<String>,
+        workspace_id: String,
     ) {
         let _ = self.cmd_tx.send(BackendCommand::Push {
             worktree_path,
             repo_url,
             name,
             task_id,
+            workspace_id,
         });
     }
 
@@ -231,6 +256,7 @@ fn backend_loop(
                 repo_url,
                 name,
                 task_id,
+                workspace_id,
             }) => {
                 do_push(
                     &client,
@@ -239,6 +265,7 @@ fn backend_loop(
                     &repo_url,
                     &name,
                     task_id.as_deref(),
+                    &workspace_id,
                 );
                 do_refresh(&client, &event_tx, &mut was_connected);
             }
@@ -370,6 +397,13 @@ fn find_latest_session(cwd: &Path) -> Option<(String, PathBuf)> {
 }
 
 /// Push a local session to the cloud.
+///
+/// Terminates with exactly one of `PushComplete` / `PushFailed` so the
+/// main thread can gate destructive local cleanup on a real success.
+/// `Progress` events are advisory only — they used to be the *only*
+/// signal, which was the bug: a status string saying "Pushed" left the
+/// UI tombstoning sessions even when git/gcloud/API had silently
+/// failed earlier in the flow.
 fn do_push(
     client: &ApiClient,
     event_tx: &mpsc::Sender<BackendEvent>,
@@ -377,16 +411,23 @@ fn do_push(
     repo_url: &str,
     name: &str,
     task_id: Option<&str>,
+    workspace_id: &str,
 ) {
     let progress = |msg: &str| {
         let _ = event_tx.send(BackendEvent::Progress(msg.to_string()));
+    };
+    let fail = |error: String| {
+        let _ = event_tx.send(BackendEvent::PushFailed {
+            workspace_id: workspace_id.to_string(),
+            error,
+        });
     };
 
     // 1. Find session file.
     let (session_id, jsonl_path) = match find_latest_session(worktree_path) {
         Some(s) => s,
         None => {
-            progress("Push failed: no Claude session found");
+            fail("no Claude session found".to_string());
             return;
         }
     };
@@ -421,25 +462,45 @@ fn do_push(
         .args(["push", "-u", "origin", &branch])
         .output();
 
-    if let Ok(r) = &push_result {
-        if !r.status.success() {
+    match &push_result {
+        Ok(r) if !r.status.success() => {
             let stderr = String::from_utf8_lossy(&r.stderr);
-            progress(&format!("Push failed: git push: {}", stderr.trim()));
+            fail(format!("git push: {}", stderr.trim()));
             return;
         }
+        Err(e) => {
+            fail(format!("git push: {}", e));
+            return;
+        }
+        _ => {}
     }
 
     progress("Uploading session...");
 
     // 3. Upload session to GCS.
     let gcs_path = format!("{}/{}/{}.jsonl", GCS_BUCKET, session_id, session_id);
-    let _ = Command::new("gcloud")
+    let gcs_result = Command::new("gcloud")
         .args(["storage", "cp"])
         .arg(&jsonl_path)
         .arg(&gcs_path)
         .output();
 
-    // Upload subagent files if they exist.
+    match &gcs_result {
+        Ok(r) if !r.status.success() => {
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            fail(format!("gcs upload: {}", stderr.trim()));
+            return;
+        }
+        Err(e) => {
+            fail(format!("gcs upload: {}", e));
+            return;
+        }
+        _ => {}
+    }
+
+    // Upload subagent files if they exist. Best-effort: a missing
+    // subdir or a transient gcloud failure here doesn't invalidate
+    // the main session file, so we stay non-fatal.
     let subdir = jsonl_path.parent().unwrap().join(&session_id);
     if subdir.exists() {
         let _ = Command::new("gcloud")
@@ -466,8 +527,14 @@ fn do_push(
     if let Some(id) = task_id {
         progress("Updating cloud task...");
         match client.update_task(id, &fields) {
-            Ok(_) => progress(&format!("Pushed to cloud: {}", &id[..8.min(id.len())])),
-            Err(e) => progress(&format!("Push failed: API update: {}", e)),
+            Ok(_) => {
+                progress(&format!("Pushed to cloud: {}", &id[..8.min(id.len())]));
+                let _ = event_tx.send(BackendEvent::PushComplete {
+                    workspace_id: workspace_id.to_string(),
+                    task_id: Some(id.to_string()),
+                });
+            }
+            Err(e) => fail(format!("API update: {}", e)),
         }
     } else {
         progress("Creating cloud task...");
@@ -491,12 +558,24 @@ fn do_push(
         };
         match client.create_task(&body) {
             Ok(task) => {
-                let _ = client.update_task(&task.id, &fields);
-                progress(&format!("Pushed to cloud: {}", &task.id[..8]));
+                // Second PATCH writes session_id/wip_branch/repo_branch
+                // onto the freshly-created row. If it fails, the cloud
+                // task exists but is missing the fields a `pull` would
+                // need — same "UI lies" failure mode as the other
+                // failure paths, so treat it as PushFailed rather than
+                // tombstoning the local workspace.
+                match client.update_task(&task.id, &fields) {
+                    Ok(_) => {
+                        progress(&format!("Pushed to cloud: {}", &task.id[..8]));
+                        let _ = event_tx.send(BackendEvent::PushComplete {
+                            workspace_id: workspace_id.to_string(),
+                            task_id: Some(task.id),
+                        });
+                    }
+                    Err(e) => fail(format!("API update: {}", e)),
+                }
             }
-            Err(e) => {
-                progress(&format!("Push failed: API: {}", e));
-            }
+            Err(e) => fail(format!("API: {}", e)),
         }
     }
 }

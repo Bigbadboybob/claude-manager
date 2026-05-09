@@ -366,6 +366,12 @@ pub struct Workspace {
     /// already-exited session — its last-known transcript file remains
     /// on disk and the `last_transcript_id` field gives us the path.
     pub tombstones: Vec<SessionTombstone>,
+    /// True between `push_active` and the matching `PushComplete` /
+    /// `PushFailed` event from the backend. Transient — not persisted
+    /// in `ManifestWorkspace`, so a TUI restart mid-push surfaces as
+    /// "not pushing" rather than wedging on a stuck flag (the user can
+    /// retry; the worst case is a duplicate `cm/push-*` branch).
+    pub is_pushing: bool,
 }
 
 /// A task tracked in the planning/API layer. Pure metadata — no execution
@@ -1608,6 +1614,7 @@ impl App {
                 worker_zone: mw.worker_zone.clone(),
                 sessions: vec![],
                 tombstones: restored_tombstones,
+                is_pushing: false,
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
@@ -2747,6 +2754,30 @@ impl App {
                         prompt,
                     );
                 }
+                BackendEvent::PushComplete {
+                    workspace_id,
+                    task_id,
+                } => {
+                    // Local mutation gated on PushComplete: see
+                    // `push_active` for the invariant. Reaching here
+                    // means git push + GCS upload + API write all
+                    // succeeded, so it's now safe to drop the local
+                    // worktree state and flip to cloud.
+                    self.finish_push(&workspace_id, task_id);
+                }
+                BackendEvent::PushFailed {
+                    workspace_id,
+                    error,
+                } => {
+                    if let Some(ws) = self
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.id == workspace_id)
+                    {
+                        ws.is_pushing = false;
+                    }
+                    self.set_status_msg(&format!("Push failed: {}", error));
+                }
                 BackendEvent::PlanTasksUpdated(tasks) => {
                     self.planning.update_from_api(tasks);
                 }
@@ -3199,6 +3230,7 @@ impl App {
                     worker_zone: task.worker_zone.clone(),
                     sessions: vec![],
                     tombstones: Vec::new(),
+                    is_pushing: false,
                 };
                 let id = ws.id.clone();
                 self.workspaces.push(ws);
@@ -4243,6 +4275,14 @@ impl App {
                 return;
             }
         };
+        // A push in flight will tombstone every live session on the
+        // workspace when `PushComplete` lands, so a session added now
+        // would silently disappear seconds later — confusing enough
+        // that we bounce the user with an explicit message instead.
+        if self.workspaces[wi].is_pushing {
+            self.set_status_msg("Workspace is being pushed to cloud, retry after");
+            return;
+        }
         let task_id = self.cursor_task_id();
         self.input_mode = InputMode::NewTerminalSession {
             ws_index: wi,
@@ -4474,6 +4514,7 @@ impl App {
             worker_zone: None,
             sessions: vec![ts],
             tombstones: Vec::new(),
+            is_pushing: false,
         };
         let new_wi = self.workspaces.len();
         self.workspaces.push(ws);
@@ -4750,6 +4791,7 @@ impl App {
                     worker_zone: None,
                     sessions: vec![ts],
                     tombstones: Vec::new(),
+                    is_pushing: false,
                 };
                 let ws_id = local_ws.id.clone();
 
@@ -4950,12 +4992,23 @@ impl App {
     /// Push the active local workspace to the cloud. If a task is bound to
     /// the workspace, its id is included so the cloud side can reuse it;
     /// otherwise a new cloud task is created from the workspace's name.
+    ///
+    /// **Invariant**: this function does NOT mutate local workspace state
+    /// (no tombstones, no clearing `worktree_path`, no flipping
+    /// `is_cloud`). All destructive cleanup is deferred to
+    /// `BackendEvent::PushComplete` in `drain_backend_events`. A failed
+    /// push (`PushFailed`) just clears `is_pushing` and surfaces the
+    /// error — the user can retry without reconstructing the worktree.
     fn push_active(&mut self) {
         let Some(wi) = self.active_workspace_index() else {
             return;
         };
         if self.workspaces[wi].is_cloud {
             self.set_status_msg("Can only push local workspaces");
+            return;
+        }
+        if self.workspaces[wi].is_pushing {
+            self.set_status_msg("Push already in progress");
             return;
         }
         let worktree_path = match &self.workspaces[wi].worktree_path {
@@ -4978,9 +5031,23 @@ impl App {
         let name = first.and_then(|t| t.prompt.clone()).unwrap_or(ws_name);
         let task_id = first.and_then(|t| t.task_id.clone());
 
-        self.backend.push(worktree_path, repo_url, name, task_id);
+        self.workspaces[wi].is_pushing = true;
+        self.backend.push(worktree_path, repo_url, name, task_id, ws_id);
+        self.cursor = Cursor::Workspace(wi);
+        self.set_status_msg("Pushing to cloud...");
+    }
 
-        // Clear local sessions and worktree; mark workspace as cloud.
+    /// Apply the destructive local-cleanup half of a push, gated on a
+    /// `PushComplete` event from the backend. Tombstones live sessions,
+    /// drops `worktree_path`, flips `is_cloud` on the workspace and any
+    /// bound task, and persists the new state. If `cloud_task_id` was
+    /// returned (always set for now, but kept Optional in the event),
+    /// no extra task binding work is done — `do_refresh` will pull the
+    /// authoritative cloud row in the next refresh tick.
+    fn finish_push(&mut self, workspace_id: &str, _cloud_task_id: Option<String>) {
+        let Some(wi) = self.workspaces.iter().position(|w| w.id == workspace_id) else {
+            return;
+        };
         // Tombstone first — the helper saves the manifest with each
         // tombstone's `worktree_path` snapshotted at the current value.
         // We then mutate workspace + task state and save AGAIN so the
@@ -4990,8 +5057,10 @@ impl App {
         // with a stale `worktree_path` — the worst kind of half-state
         // because it looks valid on restart.
         self.tombstone_and_remove(wi, |_| true);
+        let ws_id = self.workspaces[wi].id.clone();
         self.workspaces[wi].worktree_path = None;
         self.workspaces[wi].is_cloud = true;
+        self.workspaces[wi].is_pushing = false;
         if let Some(task) = self
             .tasks
             .iter_mut()
@@ -5000,8 +5069,6 @@ impl App {
             task.is_cloud = true;
         }
         self.save_session_manifest();
-        self.cursor = Cursor::Workspace(wi);
-        self.set_status_msg("Pushing to cloud...");
     }
 
     /// Pull the active cloud workspace to local (uses the first bound task).
@@ -5136,6 +5203,7 @@ impl App {
                     worker_zone: None,
                     sessions: vec![ts],
                     tombstones: Vec::new(),
+                    is_pushing: false,
                 };
                 let ws_id = ws.id.clone();
                 self.workspaces.push(ws);
@@ -6511,6 +6579,13 @@ impl App {
         };
         if wi >= self.workspaces.len() {
             self.set_status_msg("No workspace selected");
+            return;
+        }
+        // Same reason as `start_new_terminal_session`: workflow
+        // participants are sibling sessions on the workspace, and a
+        // push in flight will tombstone them on `PushComplete`.
+        if self.workspaces[wi].is_pushing {
+            self.set_status_msg("Workspace is being pushed to cloud, retry after");
             return;
         }
 
@@ -8408,6 +8483,7 @@ mod rotation_binding_tests {
             worker_zone: None,
             sessions,
             tombstones: vec![],
+            is_pushing: false,
         }
     }
 
