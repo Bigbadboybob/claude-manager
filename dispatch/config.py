@@ -17,12 +17,19 @@ VM_IMAGE_FAMILY = "cm-worker-base"
 VM_IMAGE_PROJECT = GCP_PROJECT
 
 # Database
-DB_DSN = os.getenv("CM_DB_DSN", "postgresql://predictionuser:oracle123@localhost/claude_manager")
+DB_DSN = os.getenv("CM_DB_DSN")
 
 # API
 MANAGER_URL = os.getenv("CM_API_URL", "http://localhost:8000")
-API_TOKEN = os.getenv("CM_API_TOKEN", "dev-token")
+API_TOKEN = os.getenv("CM_API_TOKEN")
 MAX_WORKERS = int(os.getenv("CM_MAX_WORKERS", "3"))
+
+_missing = [name for name, value in (("CM_DB_DSN", DB_DSN), ("CM_API_TOKEN", API_TOKEN)) if not value]
+if _missing:
+    raise RuntimeError(
+        f"Required environment variable(s) not set: {', '.join(_missing)}. "
+        f"Set them in the systemd unit (production) or ~/.config/claude-manager/.env (local)."
+    )
 
 # Repo shortnames -> full clone URLs (discovered from ~/.cm/projects/*/repo_url)
 def _discover_repos():
