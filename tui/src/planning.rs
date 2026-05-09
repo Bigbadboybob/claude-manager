@@ -281,25 +281,46 @@ pub enum PlanAction {
 
 // ── Temp File Editing ──────────────────────────────────────
 
+/// Frontmatter schema for the temp-file editor. `serde_yaml` handles
+/// quoting/escaping, so titles with `:`, branches with `#`, depends
+/// containing `,`, and other YAML-sensitive characters round-trip.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PlanTaskFrontmatter {
+    title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    difficulty: Option<u8>,
+    /// `Option<Vec<_>>` (not bare `Vec<_>`) because the user can clear
+    /// dependencies in the editor by leaving `depends:` with no list
+    /// items — that deserializes as `null`, which would fail to coerce
+    /// into `Vec<String>` and make the whole parse return `None`,
+    /// silently dropping every other edit on the same save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    depends: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+}
+
 /// Write a task to a temp file for editing, returns the temp path.
 fn write_temp_task(task: &PlanTask) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("cm-planning");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{}.md", task.slug));
 
-    let mut yaml_parts = vec![
-        format!("title: {}", task.title),
-        format!("status: {}", task.status.as_str()),
-    ];
-    if let Some(d) = task.difficulty {
-        yaml_parts.push(format!("difficulty: {}", d));
-    }
-    if !task.depends.is_empty() {
-        yaml_parts.push(format!("depends: [{}]", task.depends.join(", ")));
-    }
-    if let Some(ref branch) = task.branch {
-        yaml_parts.push(format!("branch: {}", branch));
-    }
+    let front = PlanTaskFrontmatter {
+        title: task.title.clone(),
+        status: Some(task.status.as_str().to_string()),
+        difficulty: task.difficulty,
+        depends: if task.depends.is_empty() {
+            None
+        } else {
+            Some(task.depends.clone())
+        },
+        branch: task.branch.clone(),
+    };
+    let yaml = serde_yaml::to_string(&front).ok()?;
+    let yaml = yaml.trim_end_matches('\n');
 
     let body = if task.description.is_empty() && task.prompt.is_empty() {
         "## Description\n\n\n\n## Prompt\n".to_string()
@@ -319,7 +340,7 @@ fn write_temp_task(task: &PlanTask) -> Option<PathBuf> {
         body
     };
 
-    let content = format!("---\n{}\n---\n\n{}", yaml_parts.join("\n"), body);
+    let content = format!("---\n{}\n---\n\n{}", yaml, body);
     std::fs::write(&path, content).ok()?;
     Some(path)
 }
@@ -336,20 +357,7 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
     let yaml_str = &after_first[..end_idx];
     let body = after_first[end_idx + 4..].trim().to_string();
 
-    #[derive(serde::Deserialize)]
-    struct Frontmatter {
-        title: String,
-        #[serde(default)]
-        status: Option<String>,
-        #[serde(default)]
-        difficulty: Option<u8>,
-        #[serde(default)]
-        depends: Option<Vec<String>>,
-        #[serde(default)]
-        branch: Option<String>,
-    }
-
-    let front: Frontmatter = serde_yaml::from_str(yaml_str).ok()?;
+    let front: PlanTaskFrontmatter = serde_yaml::from_str(yaml_str).ok()?;
 
     // Extract prompt section from body.
     let mut in_prompt = false;
@@ -3294,5 +3302,110 @@ mod tests {
         assert_eq!(project, "forked-repo");
         assert_eq!(repo_url, stored);
         assert_eq!(parent, Some("parent-id-123".to_string()));
+    }
+
+    // ── Frontmatter round-trip tests ─────────────────────────
+    //
+    // These pin the temp-file editor's YAML pipeline. Pre-fix, the
+    // formatter built frontmatter via `format!("title: {}", ...)` and
+    // any value containing a YAML metacharacter (`:`, `#`, `,`, `[`,
+    // quotes, newlines, …) either silently mangled or made the file
+    // un-parseable. Each test exercises a class of dangerous input.
+
+    fn make_plan_task(slug: &str) -> PlanTask {
+        PlanTask {
+            id: format!("id-{}", slug),
+            slug: slug.to_string(),
+            title: "default title".to_string(),
+            status: PlanStatus::Backlog,
+            difficulty: None,
+            depends: vec![],
+            branch: None,
+            created: None,
+            description: String::new(),
+            prompt: String::new(),
+            source: "user".to_string(),
+            is_cloud: false,
+            repo_url: String::new(),
+        }
+    }
+
+    fn round_trip(task: &PlanTask) -> TempTaskParsed {
+        let path = write_temp_task(task).expect("write_temp_task");
+        let parsed = parse_temp_task(&path).expect("parse_temp_task");
+        let _ = std::fs::remove_file(&path);
+        parsed
+    }
+
+    #[test]
+    fn frontmatter_title_with_colon_round_trips() {
+        let mut task = make_plan_task("yaml-rt-colon");
+        task.title = "feature: refactor X".to_string();
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.title, "feature: refactor X");
+    }
+
+    #[test]
+    fn frontmatter_branch_with_slash_round_trips() {
+        let mut task = make_plan_task("yaml-rt-slash");
+        task.branch = Some("user/bar".to_string());
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.branch, Some("user/bar".to_string()));
+    }
+
+    #[test]
+    fn frontmatter_depends_with_comma_round_trips() {
+        let mut task = make_plan_task("yaml-rt-comma");
+        task.depends = vec!["foo,bar".to_string(), "baz".to_string()];
+        let parsed = round_trip(&task);
+        assert_eq!(
+            parsed.depends,
+            vec!["foo,bar".to_string(), "baz".to_string()]
+        );
+    }
+
+    #[test]
+    fn body_multiline_description_round_trips() {
+        let mut task = make_plan_task("yaml-rt-multiline");
+        task.description = "line one\nline two\nline three".to_string();
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.description, "line one\nline two\nline three");
+    }
+
+    #[test]
+    fn frontmatter_title_with_hash_round_trips() {
+        let mut task = make_plan_task("yaml-rt-hash");
+        task.title = "feature # not a comment".to_string();
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.title, "feature # not a comment");
+    }
+
+    #[test]
+    fn frontmatter_already_quoted_title_round_trips() {
+        let mut task = make_plan_task("yaml-rt-quoted");
+        task.title = "\"already quoted\"".to_string();
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.title, "\"already quoted\"");
+    }
+
+    #[test]
+    fn parse_temp_task_tolerates_null_depends() {
+        // User cleared dependencies in the editor and left `depends:`
+        // behind with no list items — YAML parses that as null. Pre-fix,
+        // a bare `Vec<String>` field would fail to deserialize null and
+        // the whole parse returned None, silently dropping every edit
+        // on the same save. Lock in tolerance.
+        let dir = std::env::temp_dir().join("cm-planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("yaml-rt-null-depends.md");
+        let raw = "---\ntitle: still here\nstatus: backlog\ndepends:\n---\n\nbody\n";
+        std::fs::write(&path, raw).unwrap();
+
+        let parsed = parse_temp_task(&path).expect("parse must succeed with null depends");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.title, "still here");
+        assert_eq!(parsed.status, "backlog");
+        assert!(parsed.depends.is_empty());
     }
 }
