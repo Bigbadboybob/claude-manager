@@ -6,8 +6,11 @@ mod config;
 mod control;
 mod input;
 mod mcp_config;
+mod memory_cap;
 mod planning;
+mod preflight;
 mod session;
+mod session_watch;
 mod terminal_widget;
 #[cfg(test)]
 mod test_support;
@@ -111,6 +114,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_control_events();
         log_slow_phase("drain_control_events", t.elapsed());
+
+        let t = Instant::now();
+        app.drain_memory_kill_events();
+        log_slow_phase("drain_memory_kill_events", t.elapsed());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

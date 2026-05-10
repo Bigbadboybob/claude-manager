@@ -2232,7 +2232,7 @@ impl PlanningView {
         args.push(temp_path.to_string_lossy().to_string());
 
         let (cols, rows) = self.last_editor_size;
-        if let Ok(s) = Session::new(program, &args, cols, rows, None, Default::default()) {
+        if let Ok(s) = Session::new(program, &args, cols, rows, None, Default::default(), None) {
             self.editing_slug = Some(slug);
             self.editing_project_idx = Some(pi);
             self.editing_temp_path = Some(temp_path);

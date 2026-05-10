@@ -20,6 +20,10 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 You have tools that can spawn subtasks, start sessions, send input to other sessions, kill sessions, start workflows, and create subtasks. **Before using any of them, state your intent in plain language and ask the user to confirm.** The tools will not refuse you, but the user expects to stay in the loop. Apply the same convention to anything destructive (killing a session, marking a subtask done, stopping a workflow).
 
 Read-only tools (`ping`, `list_sessions`, `read_session_output`, `get_workflow_state`, `list_workflows`, `list_subtasks`) don't need pre-approval — call them as needed.
+
+## On `signal 9` from a Bash tool
+
+If a Bash tool call dies with `signal 9` (SIGKILL) and you didn't initiate it, the session memory cap may have killed the process. The TUI logs structured kill records to `~/.cm/memory_kills/$CM_TUI_SESSION_ID.jsonl` (one JSON line per kill). Read that file when puzzled by an unexplained SIGKILL — each entry has `comm`, `argc`, `argv_sha256_prefix` (4-byte SHA-256 prefix you can use to correlate against your own argv), `rss_kb`, and the configured `soft_cap_bytes` / `hard_cap_bytes`. The file is per-session; `$CM_TUI_SESSION_ID` is set in your env. Memory caps are user-configured and gated on a startup preflight; an empty file means no kills have happened (or the cap is disabled). See `DESIGN_MEMORY_CAP.md` for the full mechanism.
 - **`api/`** — FastAPI server (cloud mode only). Task CRUD, dispatch daemon for GCP workers, warm pool management. Runs on the `cm-manager` VM.
 - **`dispatch/`** — Cloud-only. DB access (`db.py`), VM lifecycle (`vm.py`), config (`config.py`).
 - **`cli/`** — CLI client + planning client library used by `mcp_server`.

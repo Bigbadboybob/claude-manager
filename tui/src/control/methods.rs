@@ -1816,7 +1816,7 @@ mod tests {
     use std::time::Instant;
 
     fn dummy_session() -> crate::session::Session {
-        crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+        crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
             .expect("dummy session")
     }
 

@@ -37,6 +37,19 @@ pub struct WorkflowControllerCtx<'a> {
     /// Latest terminal cell dims; used when spawning new participant
     /// sessions so the PTY child starts sized to the visible area.
     pub last_term_size: (u16, u16),
+    /// Read-only handle to the App's `Config`. Workflow participant
+    /// spawns route through `session::spawn_agent_session`, which
+    /// reads `Config::memory_cap_for(session_type)` to decide whether
+    /// to wrap the spawn — without this, a runaway workflow agent
+    /// would defeat the per-session memory cap.
+    pub config: &'a crate::config::Config,
+    /// Cached preflight result. Same gate as every other agent spawn:
+    /// a `MemoryCap` is built only when *both* the user configured
+    /// limits and preflight succeeded.
+    pub cap_status: &'a crate::memory_cap::MemoryCapAvailability,
+    /// Sender clone for memory-kill events. Cloned again into each
+    /// per-session watcher thread spawned by `spawn_agent_session`.
+    pub kill_tx: &'a std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
 }
 
 /// App-level side effect requested by the controller. The dispatcher
@@ -348,6 +361,9 @@ impl<'a> WorkflowControllerCtx<'a> {
                             worktree_for_detect.as_deref(),
                             cols,
                             rows,
+                            self.config,
+                            self.cap_status,
+                            self.kill_tx,
                         )
                     } else {
                         None
@@ -490,16 +506,21 @@ impl<'a> WorkflowControllerCtx<'a> {
             Engine::ClaudeCode => App::list_jsonl_files(&worktree_path),
             Engine::Codex => App::list_codex_sessions(&worktree_path),
         });
-        let sess = Session::new(
+        let session_type = engine.as_session_type().to_string();
+        let sess = crate::session::spawn_agent_session(
+            &session_type,
+            &session_uid,
             &program,
             &args,
             cols,
             rows,
             Some(worktree_path.clone()),
             Default::default(),
+            self.config,
+            self.cap_status,
+            self.kill_tx,
         )
         .ok()?;
-        let session_type = engine.as_session_type().to_string();
         let label = role_name.to_string();
         let ts = TerminalSession {
             uid: session_uid,
@@ -1204,7 +1225,7 @@ mod tests {
         role: &str,
         transcript_id: Option<&str>,
     ) -> TerminalSession {
-        let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+        let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
             .expect("test PTY session");
         TerminalSession {
             uid: format!("uid-{}-{}", run_id, role),
@@ -1274,6 +1295,39 @@ mod tests {
         }
     }
 
+    /// Inert cap-state values for tests. Tests don't spawn real agents
+    /// (they use `/bin/true` via `Session::new` directly), so the
+    /// values only need to exist for `WorkflowControllerCtx` field
+    /// init — they're never consulted in test paths. Keep one shared
+    /// channel + an "Unavailable" preflight result so even if a future
+    /// test does land in `spawn_agent_session`, no real cgroup wrap
+    /// happens.
+    struct DummyCapState {
+        config: crate::config::Config,
+        cap_status: crate::memory_cap::MemoryCapAvailability,
+        kill_tx: std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
+        // Held to keep the channel alive for the duration of the test.
+        _kill_rx: std::sync::mpsc::Receiver<crate::session_watch::MemoryKillEvent>,
+    }
+
+    fn dummy_cap_state() -> DummyCapState {
+        let (kill_tx, kill_rx) = std::sync::mpsc::channel();
+        DummyCapState {
+            config: crate::config::Config {
+                api_url: String::new(),
+                api_token: String::new(),
+                gcp_project: String::new(),
+                gcp_zone: String::new(),
+                repos: HashMap::new(),
+            },
+            cap_status: crate::memory_cap::MemoryCapAvailability::Unavailable {
+                reason: "test".into(),
+            },
+            kill_tx,
+            _kill_rx: kill_rx,
+        }
+    }
+
     fn make_run(run_id: &str, wf_name: &str, initial_role: &str) -> WorkflowRun {
         let mut role_sessions = BTreeMap::new();
         role_sessions.insert(
@@ -1334,11 +1388,15 @@ mod tests {
             let mut workspaces: Vec<Workspace> = Vec::new();
             let workflows: HashMap<String, Workflow> = HashMap::new();
 
+            let dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
                 workflows: &workflows,
                 last_term_size: (80, 24),
+                config: &dummy.config,
+                cap_status: &dummy.cap_status,
+                kill_tx: &dummy.kill_tx,
             };
             let mut actions = Vec::new();
             ctx.finish_run(run_id, "completed by test".into(), &mut actions);
@@ -1403,11 +1461,15 @@ mod tests {
             let mut workspaces = vec![workspace];
 
             let workflows: HashMap<String, Workflow> = HashMap::new();
+            let dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
                 workflows: &workflows,
                 last_term_size: (80, 24),
+                config: &dummy.config,
+                cap_status: &dummy.cap_status,
+                kill_tx: &dummy.kill_tx,
             };
             let mut actions = Vec::new();
             let did_reset = ctx.reset_fresh_session(run_id, "reviewer", 0, 1, &mut actions);
@@ -1482,11 +1544,15 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
+            let dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
                 workflows: &workflows,
                 last_term_size: (80, 24),
+                config: &dummy.config,
+                cap_status: &dummy.cap_status,
+                kill_tx: &dummy.kill_tx,
             };
             let actions = ctx.tick();
 
@@ -1517,7 +1583,7 @@ mod tests {
         session_type: &str,
         task_id: Option<&str>,
     ) -> TerminalSession {
-        let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+        let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
             .expect("test PTY session");
         TerminalSession {
             uid: format!("uid-{}", label),
@@ -1610,11 +1676,15 @@ mod tests {
             let goal = "build feature X — verbatim {{ not_a_template }}";
 
             {
+                let dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
                     workflows: &workflows,
                     last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
                 };
                 let _ = ctx.launch_workflow(
                     0,
@@ -1629,11 +1699,15 @@ mod tests {
             // Now deliver the initial prompt — same code path the MCP
             // launch (`start_workflow_run`) uses.
             {
+                let dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
                     workflows: &workflows,
                     last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
                 };
                 let _ = ctx.deliver_initial_workflow_prompt(&run_id, "worker", 0);
             }
@@ -1665,11 +1739,15 @@ mod tests {
             workflows.insert("feedback".to_string(), launch_test_workflow());
 
             let actions = {
+                let dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
                     workflows: &workflows,
                     last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -1746,11 +1824,15 @@ mod tests {
             workflows.insert("feedback".to_string(), launch_test_workflow());
 
             let _ = {
+                let dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
                     workflows: &workflows,
                     last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };

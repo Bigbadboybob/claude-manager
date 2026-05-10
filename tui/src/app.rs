@@ -652,6 +652,9 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     worktree: Option<&Path>,
     cols: u16,
     rows: u16,
+    config: &Config,
+    cap_status: &crate::memory_cap::MemoryCapAvailability,
+    kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
 ) -> Option<String> {
     let (sid, wt) = match (session_id, worktree) {
         (Some(sid), Some(wt)) => (sid, wt),
@@ -677,13 +680,19 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
             ));
         }
     };
-    let new_sess = match Session::new(
+    let session_type = engine.as_session_type();
+    let new_sess = match crate::session::spawn_agent_session(
+        session_type,
+        &ts.uid,
         &program,
         &args,
         cols,
         rows,
         Some(wt.to_path_buf()),
         Default::default(),
+        config,
+        cap_status,
+        kill_tx,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -1651,6 +1660,17 @@ pub struct App {
     /// Toggle for the bottom-of-screen activity strip. Off by default;
     /// `Alt-,` flips it.
     pub activity_visible: bool,
+    /// Result of the startup memory-cap preflight probe. Cached for
+    /// the lifetime of the run; consulted in `spawn_agent_session`
+    /// to decide whether to wrap a spawn. See DESIGN_MEMORY_CAP.md
+    /// § Components / Preflight.
+    pub memory_cap_status: crate::memory_cap::MemoryCapAvailability,
+    /// Channel watcher threads use to push `MemoryKillEvent`s back
+    /// to the main loop. The receiver is drained each tick by
+    /// `drain_memory_kill_events`. The sender is cloned into each
+    /// capped session's watcher thread.
+    pub memory_kill_tx: std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
+    pub memory_kill_rx: std::sync::mpsc::Receiver<crate::session_watch::MemoryKillEvent>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -1717,6 +1737,21 @@ impl App {
                 eprintln!("control socket failed to start: {}", e);
             }
         }
+        // Memory-cap preflight: run once at startup, cache the result.
+        // Subsequent `spawn_agent_session` calls consult this synchronously
+        // — no per-spawn probing.
+        let memory_cap_status = crate::preflight::probe();
+        let mut activity_log: VecDeque<ActivityEntry> = VecDeque::new();
+        if let crate::memory_cap::MemoryCapAvailability::Unavailable { reason } = &memory_cap_status
+        {
+            activity_log.push_back(ActivityEntry {
+                ts: std::time::SystemTime::now(),
+                caller_label: "preflight".into(),
+                summary: format!("memory cap disabled: {}", reason),
+            });
+        }
+        let (memory_kill_tx, memory_kill_rx) = std::sync::mpsc::channel();
+
         App {
             tasks: Vec::new(),
             workspaces: Vec::new(),
@@ -1743,9 +1778,44 @@ impl App {
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
             control_queue,
-            activity_log: VecDeque::new(),
+            activity_log,
             activity_visible: false,
+            memory_cap_status,
+            memory_kill_tx,
+            memory_kill_rx,
         }
+    }
+
+    /// Spawn an agent session through the cap-aware helper. Single
+    /// entry point for every agent (`claude`/`codex`) PTY spawn — owns
+    /// the `CM_TUI_SESSION_ID` env-population, the cap lookup, and
+    /// the watcher thread. See `session::spawn_agent_session` for
+    /// the full contract. Test/infra spawns (`/bin/true`, `gcloud`,
+    /// `/bin/bash`) keep calling `Session::new` directly.
+    pub fn spawn_agent_session(
+        &self,
+        session_type: &str,
+        session_uid: &str,
+        program: &str,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+        working_dir: Option<PathBuf>,
+        env: HashMap<String, String>,
+    ) -> anyhow::Result<Session> {
+        crate::session::spawn_agent_session(
+            session_type,
+            session_uid,
+            program,
+            args,
+            cols,
+            rows,
+            working_dir,
+            env,
+            &self.config,
+            &self.memory_cap_status,
+            &self.memory_kill_tx,
+        )
     }
 
     /// Append a Phase 6 activity-feed entry. `caller_uid` is resolved to
@@ -2220,6 +2290,8 @@ impl App {
                         &ws,
                         (cols, rows),
                         &self.config,
+                        &self.memory_cap_status,
+                        &self.memory_kill_tx,
                     );
                     if let Some(ts) = ts {
                         ws.sessions.push(ts);
@@ -2259,6 +2331,8 @@ impl App {
         ws: &Workspace,
         (cols, rows): (u16, u16),
         config: &Config,
+        cap_status: &crate::memory_cap::MemoryCapAvailability,
+        kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
     ) -> Option<TerminalSession> {
         // Resolve the UID ONCE here so the MCP config and the
         // TerminalSession agree. Earlier this had two separate
@@ -2292,7 +2366,7 @@ impl App {
                     tmux_name
                 ),
             ];
-            Session::new("gcloud", &args, cols, rows, None, Default::default())
+            Session::new("gcloud", &args, cols, rows, None, Default::default(), None)
         } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
             let wt = ws.worktree_path.clone();
             let engine = if entry.session_type == "codex" {
@@ -2318,13 +2392,18 @@ impl App {
                 workflow_meta,
                 entry.transcript_id.as_deref(),
             ) {
-                Ok((program, args)) => Session::new(
+                Ok((program, args)) => crate::session::spawn_agent_session(
+                    &entry.session_type,
+                    &session_uid_for_mcp,
                     &program,
                     &args,
                     cols,
                     rows,
                     wt,
                     Default::default(),
+                    config,
+                    cap_status,
+                    kill_tx,
                 ),
                 Err(_) => {
                     // Fallback: spawn without MCP. Agent loses access to
@@ -2348,12 +2427,24 @@ impl App {
                         }
                         args.push(sid.clone());
                     }
-                    Session::new(program, &args, cols, rows, wt, Default::default())
+                    crate::session::spawn_agent_session(
+                        &entry.session_type,
+                        &session_uid_for_mcp,
+                        program,
+                        &args,
+                        cols,
+                        rows,
+                        wt,
+                        Default::default(),
+                        config,
+                        cap_status,
+                        kill_tx,
+                    )
                 }
             }
         } else {
             let wt = ws.worktree_path.clone();
-            Session::new("/bin/bash", &[], cols, rows, wt, Default::default())
+            Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None)
         };
         let s = result.ok()?;
         let pending = if entry.transcript_id.is_some() {
@@ -3554,16 +3645,19 @@ impl App {
             workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
             workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
         };
-        let session = Session::new(
-            &program,
-            &args,
-            cols,
-            rows,
-            Some(worktree_path),
-            Default::default(),
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let session_type = engine.as_session_type().to_string();
+        let session = self
+            .spawn_agent_session(
+                &session_type,
+                &session_uid,
+                &program,
+                &args,
+                cols,
+                rows,
+                Some(worktree_path),
+                Default::default(),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let mut pending_prompt = None;
         if let Some(text) = prompt {
             if !text.trim().is_empty() {
@@ -3606,6 +3700,51 @@ impl App {
     }
 
     /// Process planning editor events (non-blocking).
+    /// Drain pending `MemoryKillEvent`s pushed by per-session watcher
+    /// threads into the activity feed. Called once per main-loop tick
+    /// alongside the other `drain_*` methods.
+    pub fn drain_memory_kill_events(&mut self) {
+        loop {
+            let evt = match self.memory_kill_rx.try_recv() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let (caller, summary) = match evt {
+                crate::session_watch::MemoryKillEvent::Killed {
+                    session_uid,
+                    pid,
+                    comm,
+                    argc,
+                    argv_sha256_prefix,
+                    rss_kb,
+                    soft_cap_bytes,
+                    ..
+                } => {
+                    // `comm` arrives sanitized, but re-escape at the
+                    // render boundary (defense-in-depth — the writer
+                    // is in another module and could regress).
+                    let safe_comm = crate::session_watch::sanitize(comm.as_bytes(), 16);
+                    let summary = format!(
+                        "killed PID {} comm={} argc={} sha={} — {:.1} GiB RSS, soft cap {:.0} GiB",
+                        pid,
+                        safe_comm,
+                        argc,
+                        argv_sha256_prefix,
+                        rss_kb as f64 / (1024.0 * 1024.0),
+                        soft_cap_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    );
+                    (session_uid, summary)
+                }
+                crate::session_watch::MemoryKillEvent::KillFailed {
+                    session_uid,
+                    reason,
+                    ..
+                } => (session_uid, format!("memory cap kill failed: {}", reason)),
+            };
+            self.log_activity(&caller, summary);
+        }
+    }
+
     pub fn drain_planning_events(&mut self) {
         if let Some(action) = self.planning.drain_editor_events() {
             match action {
@@ -4929,7 +5068,9 @@ impl App {
         });
         let pending = Self::list_jsonl_files(&worktree_path);
 
-        let Ok(s) = Session::new(
+        let Ok(s) = self.spawn_agent_session(
+            "claude",
+            &session_uid,
             &program,
             &args,
             cols,
@@ -5019,7 +5160,7 @@ impl App {
                 "-t".to_string(),
                 "TERM=xterm-256color sudo su - worker -c 'tmux attach -t claude'".to_string(),
             ];
-            Session::new("gcloud", &args, cols, rows, None, Default::default())
+            Session::new("gcloud", &args, cols, rows, None, Default::default(), None)
                 .ok()
                 .map(|s| make_simple_session("ssh", "bash", s, None))
         } else if let Some(wt) = ws.worktree_path.clone() {
@@ -5035,11 +5176,20 @@ impl App {
                 vec!["--dangerously-skip-permissions".to_string()],
             ));
             let pending = Self::list_jsonl_files(&wt);
-            Session::new(&program, &args, cols, rows, Some(wt), Default::default())
-                .ok()
-                .map(|s| make_simple_session_with_uid(session_uid, "claude", "claude", s, Some(pending)))
+            self.spawn_agent_session(
+                "claude",
+                &session_uid,
+                &program,
+                &args,
+                cols,
+                rows,
+                Some(wt),
+                Default::default(),
+            )
+            .ok()
+            .map(|s| make_simple_session_with_uid(session_uid, "claude", "claude", s, Some(pending)))
         } else {
-            Session::new("/bin/bash", &[], cols, rows, None, Default::default())
+            Session::new("/bin/bash", &[], cols, rows, None, Default::default(), None)
                 .ok()
                 .map(|s| make_simple_session("bash", "bash", s, None))
         };
@@ -5092,7 +5242,7 @@ impl App {
                         tmux_name
                     ),
                 ];
-                match Session::new("gcloud", &args, cols, rows, None, Default::default()) {
+                match Session::new("gcloud", &args, cols, rows, None, Default::default(), None) {
                     Ok(s) => {
                         let mut ts = make_simple_session(&tmux_name, "bash", s, None);
                         ts.task_id = task_id.clone();
@@ -5131,7 +5281,16 @@ impl App {
                     "claude".to_string(),
                     vec!["--dangerously-skip-permissions".to_string()],
                 ));
-                Session::new(&program, &args, cols, rows, wt, Default::default())
+                self.spawn_agent_session(
+                    "claude",
+                    &session_uid_pre,
+                    &program,
+                    &args,
+                    cols,
+                    rows,
+                    wt,
+                    Default::default(),
+                )
             }
             "codex" => {
                 let (program, args) = crate::mcp_config::build_args(
@@ -5144,9 +5303,18 @@ impl App {
                     "codex".to_string(),
                     vec!["--yolo".to_string()],
                 ));
-                Session::new(&program, &args, cols, rows, wt, Default::default())
+                self.spawn_agent_session(
+                    "codex",
+                    &session_uid_pre,
+                    &program,
+                    &args,
+                    cols,
+                    rows,
+                    wt,
+                    Default::default(),
+                )
             }
-            _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default()),
+            _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
         };
         match result {
             Ok(s) => {
@@ -5205,7 +5373,9 @@ impl App {
             ),
         };
 
-        match Session::new(
+        match self.spawn_agent_session(
+            "claude",
+            &session_uid,
             &program,
             &args,
             cols,
@@ -5626,7 +5796,9 @@ impl App {
         ));
         let pending = Self::list_jsonl_files(&worktree_path);
 
-        match Session::new(
+        match self.spawn_agent_session(
+            "claude",
+            &session_uid,
             &program,
             &args,
             cols,
@@ -5761,7 +5933,9 @@ impl App {
             vec!["--dangerously-skip-permissions".to_string()],
         ));
         let pending = Self::list_jsonl_files(&worktree_path);
-        match Session::new(
+        match self.spawn_agent_session(
+            "claude",
+            &session_uid,
             &program,
             &args,
             cols,
@@ -7127,6 +7301,9 @@ impl App {
                 workspaces: &mut self.workspaces,
                 workflows: &self.workflows,
                 last_term_size,
+                config: &self.config,
+                cap_status: &self.memory_cap_status,
+                kill_tx: &self.memory_kill_tx,
             };
             f(&mut ctx)
         };
@@ -7926,7 +8103,7 @@ mod transcript_rebind_tests {
         // /bin/true exits immediately; the PTY/Session shell is harmless
         // for a value-only test that never reads the PTY.
         let session =
-            crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+            crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
                 .expect("session for test");
         TerminalSession {
             uid: "uid".into(),
@@ -7996,7 +8173,7 @@ mod rotation_binding_tests {
     use std::time::Instant;
 
     fn dummy_session() -> Session {
-        Session::new("/bin/true", &[], 80, 24, None, HashMap::new())
+        Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
             .expect("dummy session")
     }
 

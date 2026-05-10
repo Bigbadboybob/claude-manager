@@ -31,5 +31,13 @@ base64 = "0.22.1"
 # Desktop notifications (used for per-session idle notifications)
 notify-rust = "4"
 
+# SHA-256 for the argv fingerprint in the per-session memory-cap kill log.
+sha2 = "0.10"
+
+# Low-level Linux syscalls for the per-session memory cap watcher
+# (getuid, kill, pidfd_open / pidfd_send_signal via syscall numbers).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
