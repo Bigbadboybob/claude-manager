@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::Event as TermEvent;
 use alacritty_terminal::term::TermMode;
@@ -154,6 +154,50 @@ impl TerminalSession {
     }
 }
 
+fn note_workflow_transcript_binding(
+    runs: &mut [WorkflowRun],
+    run_id: &str,
+    role: &str,
+    old_sid: Option<&str>,
+    new_sid: &str,
+) -> bool {
+    let Some(run) = runs.iter_mut().find(|run| run.run_id == run_id) else {
+        return false;
+    };
+
+    let mut changed = false;
+    if let Some(binding) = run.role_sessions.get_mut(role) {
+        if binding.current_session_id.as_deref() != Some(new_sid) {
+            binding.current_session_id = Some(new_sid.to_string());
+            changed = true;
+        }
+    }
+
+    let rebound = old_sid.is_some() && old_sid != Some(new_sid);
+    if rebound {
+        run.role_baselines
+            .insert(role.to_string(), workflow::run::MessageBaseline::default());
+        changed = true;
+    }
+
+    if run.active_role.as_deref() == Some(role) {
+        if let Some(entry) = run.history.last_mut() {
+            if entry.role == role {
+                if entry.session_id.as_deref() != Some(new_sid) {
+                    entry.session_id = Some(new_sid.to_string());
+                    changed = true;
+                }
+                if rebound && entry.assistant_count_at_start != 0 {
+                    entry.assistant_count_at_start = 0;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
 /// Marker that an Enter keystroke is queued to fire at or after `fire_at`. The
 /// actual bytes are computed from the current terminal mode at submit time.
 pub struct PendingEnter {
@@ -161,6 +205,7 @@ pub struct PendingEnter {
 }
 
 const DEFAULT_IDLE_TIMEOUT_SECS: u16 = 2;
+const CODEX_RESUME_REBIND_WINDOW: Duration = Duration::from_secs(120);
 
 /// A byte sequence queued to be written to a session's PTY once the session
 /// is "ready" to receive input. Readiness is determined by PTY quietness —
@@ -666,6 +711,11 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         }
     };
     let workflow_meta = crate::mcp_config::WorkflowMeta { run_id, role };
+    let codex_resume_baseline = if matches!(engine, workflow::toml_schema::Engine::Codex) {
+        Some(App::list_codex_sessions(wt))
+    } else {
+        None
+    };
     let (program, args) = match crate::mcp_config::build_args(
         engine,
         &ts.uid,
@@ -703,16 +753,12 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         }
     };
     // Swap the Session: dropping the old one closes its PTY which reaps the
-    // old agent process. We just spawned the new agent with `--resume <sid>`
-    // (or `codex resume <sid>`), which appends to the EXISTING transcript file
-    // — no new file is written, so we keep the sid bound. Clearing it here
-    // and relying on the listing detector to rebind would never resolve,
-    // because `pending_baseline` already contains the only transcript that
-    // exists; nothing would ever look "new" and the workflow idle gate would
-    // stay closed forever.
+    // old agent process. Claude resumes in-place; modern Codex writes a new
+    // rollout id for `codex resume <sid>`, so keep the old sid bound until the
+    // detector sees the post-resume file and rebinds the role.
     ts.session = new_sess;
     ts.transcript_id = Some(sid.to_string());
-    ts.pending_jsonl_files = None;
+    ts.pending_jsonl_files = codex_resume_baseline;
     ts.pending_prompt = None;
     ts.pending_clear = None;
     ts.pending_enter = None;
@@ -1930,6 +1976,13 @@ impl App {
 
     /// List codex session IDs (UUIDs) that were started in the given worktree.
     pub(crate) fn list_codex_sessions(worktree_path: &Path) -> Vec<String> {
+        Self::list_codex_sessions_with_mtime(worktree_path)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect()
+    }
+
+    fn list_codex_sessions_with_mtime(worktree_path: &Path) -> Vec<(SystemTime, String)> {
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => return Vec::new(),
@@ -1947,7 +2000,7 @@ impl App {
         ids
     }
 
-    fn walk_codex_sessions(dir: &Path, wt_str: &str, ids: &mut Vec<String>) {
+    fn walk_codex_sessions(dir: &Path, wt_str: &str, ids: &mut Vec<(SystemTime, String)>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -1965,7 +2018,11 @@ impl App {
                     continue;
                 }
                 if let Some(id) = val.pointer("/payload/id").and_then(|v| v.as_str()) {
-                    ids.push(id.to_string());
+                    let modified = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(UNIX_EPOCH);
+                    ids.push((modified, id.to_string()));
                 }
             }
         }
@@ -1974,8 +2031,11 @@ impl App {
     /// Detect a new codex session_id by comparing against known IDs. Uses the
     /// user's default codex home.
     pub(crate) fn detect_codex_session_id(worktree_path: &Path, existing_ids: &[String]) -> Option<String> {
-        let current = Self::list_codex_sessions(worktree_path);
-        current.into_iter().find(|id| !existing_ids.contains(id))
+        Self::list_codex_sessions_with_mtime(worktree_path)
+            .into_iter()
+            .filter(|(_, id)| !existing_ids.contains(id))
+            .max_by_key(|(modified, _)| *modified)
+            .map(|(_, id)| id)
     }
 
     /// True if the session is ready to receive a queued write. Ready means
@@ -2346,6 +2406,14 @@ impl App {
             entry.uid.clone()
         };
         let cloud_vm = ws.worker_vm.as_deref().filter(|s| !s.is_empty());
+        let codex_resume_baseline =
+            if entry.session_type == "codex" && entry.transcript_id.is_some() {
+                ws.worktree_path
+                    .as_ref()
+                    .map(|p| Self::list_codex_sessions(p))
+            } else {
+                None
+            };
         let result = if cloud_vm.is_some() && entry.session_type == "bash" {
             let vm = cloud_vm.unwrap().to_string();
             let zone = ws
@@ -2448,7 +2516,7 @@ impl App {
         };
         let s = result.ok()?;
         let pending = if entry.transcript_id.is_some() {
-            None
+            codex_resume_baseline
         } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
             Some(Vec::new())
         } else {
@@ -3032,10 +3100,14 @@ impl App {
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 
         let mut had_event = false;
-        // Collected during the loop: (ws_id, session_id) pairs for sessions
-        // whose session_id was freshly detected. Resolved to task_id after
-        // the loop so we don't double-borrow self.
-        let mut ws_sid_updates: Vec<(String, String)> = Vec::new();
+        struct DetectedSid {
+            ws_id: String,
+            sid: String,
+            workflow: Option<(String, String)>,
+            old_sid: Option<String>,
+        }
+        let mut sid_detections: Vec<DetectedSid> = Vec::new();
+        let mut manifest_needs_save = false;
         // Sids already bound to some live session in this TUI. The detector
         // must exclude these so two sessions sharing a worktree (e.g. a
         // workflow reviewer + a regular codex pane) can't both pick the
@@ -3271,7 +3343,13 @@ impl App {
                     if !matches!(ts.session_type.as_str(), "claude" | "codex") {
                         continue;
                     }
-                    if ts.transcript_id.is_some() || ts.pending_jsonl_files.is_none() {
+                    let pending_detection = ts.pending_jsonl_files.is_some();
+                    let initial_bind = ts.transcript_id.is_none() && pending_detection;
+                    let codex_resume_rebind = ts.session_type == "codex"
+                        && ts.transcript_id.is_some()
+                        && pending_detection
+                        && now.duration_since(ts.created_at) <= CODEX_RESUME_REBIND_WINDOW;
+                    if !(initial_bind || codex_resume_rebind) {
                         continue;
                     }
                     detection_order.push((wi, si, ts.created_at));
@@ -3292,19 +3370,34 @@ impl App {
                     Self::detect_session_id(&wt, &existing)
                 };
                 if let Some(sid) = sid {
-                    ts.transcript_id = Some(sid.clone());
+                    let old_sid = ts.transcript_id.clone();
+                    if old_sid.is_some() {
+                        ts.rebind_transcript(Some(sid.clone()));
+                    } else {
+                        ts.transcript_id = Some(sid.clone());
+                    }
                     ts.pending_jsonl_files = None;
+                    let workflow = match (ts.workflow_run_id.clone(), ts.workflow_role.clone()) {
+                        (Some(run_id), Some(role)) => Some((run_id, role)),
+                        _ => None,
+                    };
                     bound_sids.insert(sid.clone());
-                    ws_sid_updates.push((ws_id_here, sid));
+                    sid_detections.push(DetectedSid {
+                        ws_id: ws_id_here,
+                        sid,
+                        workflow,
+                        old_sid,
+                    });
+                    manifest_needs_save = true;
                 }
             }
         }
 
         // Sync any newly detected session_ids to the DB. Resolve each ws_id
         // to bound tasks and push an update per bound task.
-        for (ws_id, sid) in ws_sid_updates {
+        for detected in &sid_detections {
             for task in &self.tasks {
-                if task.workspace_id.as_deref() != Some(&ws_id) {
+                if task.workspace_id.as_deref() != Some(&detected.ws_id) {
                     continue;
                 }
                 let Some(task_id) = task.task_id.clone() else {
@@ -3313,10 +3406,35 @@ impl App {
                 let mut fields = HashMap::new();
                 fields.insert(
                     "session_id".to_string(),
-                    serde_json::Value::String(sid.clone()),
+                    serde_json::Value::String(detected.sid.clone()),
                 );
                 self.backend.update_task(task_id, fields);
             }
+            if let Some((run_id, role)) = &detected.workflow {
+                if note_workflow_transcript_binding(
+                    &mut self.workflow_runs,
+                    run_id,
+                    role,
+                    detected.old_sid.as_deref(),
+                    &detected.sid,
+                ) {
+                    if let Some(run) = self.workflow_runs.iter().find(|r| &r.run_id == run_id) {
+                        let _ = workflow::run::save(run);
+                    }
+                    if let Some(old_sid) = detected.old_sid.as_deref() {
+                        log_tick(
+                            run_id,
+                            &format!(
+                                "codex-resume-rebind: role={} {} -> {}",
+                                role, old_sid, detected.sid
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        if manifest_needs_save {
+            self.save_session_manifest();
         }
 
         if should_check_session_ids {
@@ -8097,7 +8215,7 @@ mod transcript_rebind_tests {
     //! file (cursor offset N applied to a different file).
 
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn make_test_session(transcript_id: Option<&str>, generation: u64) -> TerminalSession {
         // /bin/true exits immediately; the PTY/Session shell is harmless
@@ -8156,6 +8274,57 @@ mod transcript_rebind_tests {
         let mut ts = make_test_session(Some("old"), u64::MAX);
         ts.rebind_transcript(Some("new".into()));
         assert_eq!(ts.generation, u64::MAX, "must not panic on overflow");
+    }
+
+    #[test]
+    fn workflow_rebind_resets_active_role_to_new_sid() {
+        let run_id = "wf_rebind";
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            workflow::run::RoleBinding {
+                session_label: "worker".into(),
+                current_session_id: Some("old-sid".into()),
+            },
+        );
+        let mut role_baselines = BTreeMap::new();
+        role_baselines.insert(
+            "worker".to_string(),
+            workflow::run::MessageBaseline {
+                user_count: 4,
+                assistant_count: 7,
+            },
+        );
+        let mut run = WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".into(),
+            "ws-1".into(),
+            role_sessions,
+            "worker".into(),
+            role_baselines,
+            None,
+            BTreeMap::new(),
+        );
+        run.history[0].assistant_count_at_start = 7;
+        let mut runs = vec![run];
+
+        assert!(note_workflow_transcript_binding(
+            &mut runs,
+            run_id,
+            "worker",
+            Some("old-sid"),
+            "new-sid",
+        ));
+
+        let run = &runs[0];
+        assert_eq!(
+            run.role_sessions["worker"].current_session_id.as_deref(),
+            Some("new-sid")
+        );
+        assert_eq!(run.role_baselines["worker"].assistant_count, 0);
+        assert_eq!(run.role_baselines["worker"].user_count, 0);
+        assert_eq!(run.history[0].session_id.as_deref(), Some("new-sid"));
+        assert_eq!(run.history[0].assistant_count_at_start, 0);
     }
 }
 
@@ -9605,4 +9774,3 @@ context = "persistent"
         );
     }
 }
-

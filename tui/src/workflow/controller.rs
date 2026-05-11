@@ -321,8 +321,8 @@ impl<'a> WorkflowControllerCtx<'a> {
                     };
                     ts.workflow_run_id = Some(run_id.clone());
                     ts.workflow_role = Some(slot.role.clone());
-                    if ts.transcript_id.is_none() {
-                        if let Some(wt) = worktree_for_detect.as_deref() {
+                    if let Some(wt) = worktree_for_detect.as_deref() {
+                        if ts.transcript_id.is_none() {
                             // Augment the per-session pre-launch snapshot with
                             // sids already bound to other sessions so we don't
                             // accidentally claim a sibling's sid (e.g. when
@@ -341,6 +341,30 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 bound_sids.insert(sid.clone());
                                 ts.transcript_id = Some(sid);
                                 ts.pending_jsonl_files = None;
+                            }
+                        } else if ts.session_type == "codex" {
+                            let current_sid = ts.transcript_id.clone();
+                            let existing: Vec<String> = bound_sids
+                                .iter()
+                                .filter(|sid| Some(sid.as_str()) != current_sid.as_deref())
+                                .cloned()
+                                .collect();
+                            if let Some(sid) = App::detect_codex_session_id(wt, &existing) {
+                                if current_sid.as_deref() != Some(sid.as_str()) {
+                                    if let Some(old) = current_sid.as_ref() {
+                                        bound_sids.remove(old);
+                                    }
+                                    bound_sids.insert(sid.clone());
+                                    ts.rebind_transcript(Some(sid.clone()));
+                                    ts.pending_jsonl_files = None;
+                                    log_tick(
+                                        &run_id,
+                                        &format!(
+                                            "launch-codex-rebind: role={} {:?} -> {}",
+                                            slot.role, current_sid, sid
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1374,6 +1398,24 @@ mod tests {
         }
     }
 
+    fn write_codex_meta(sid: &str, worktree: &std::path::Path) {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME set"));
+        let dir = home.join(".codex/sessions/2026/05/11");
+        std::fs::create_dir_all(&dir).expect("codex session dir");
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": sid,
+                "cwd": worktree.to_string_lossy(),
+            }
+        });
+        std::fs::write(
+            dir.join(format!("rollout-2026-05-11T00-00-00-{}.jsonl", sid)),
+            format!("{}\n", line),
+        )
+        .expect("codex transcript");
+    }
+
     /// `finish_run` flips status to Done, clears the active role,
     /// persists state.json, and emits a status-bar action.
     #[test]
@@ -1796,6 +1838,50 @@ mod tests {
                 last_status,
                 Some("Launched feedback (2 roles, initial: worker)")
             );
+        });
+    }
+
+    #[test]
+    fn launch_existing_codex_rebinds_stale_sid_to_newest_rollout() {
+        with_temp_home(|| {
+            let worktree = PathBuf::from("/tmp/cm-codex-launch-rebind");
+            write_codex_meta("old-sid", &worktree);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            write_codex_meta("new-sid", &worktree);
+
+            let mut worker = bare_session("worker", "codex", Some("task-1"));
+            worker.transcript_id = Some("old-sid".into());
+            worker.generation = 3;
+            let reviewer = bare_session("reviewer", "claude", None);
+            let mut workspaces = vec![workspace_with(vec![worker, reviewer], Some(worktree))];
+
+            let mut runs: Vec<WorkflowRun> = Vec::new();
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), launch_test_workflow());
+
+            {
+                let dummy = dummy_cap_state();
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.launch_workflow(0, "feedback", launch_test_slots(), None);
+            }
+
+            let worker = &workspaces[0].sessions[0];
+            assert_eq!(worker.transcript_id.as_deref(), Some("new-sid"));
+            assert_eq!(worker.generation, 4, "stale sid rebind must bump generation");
+            let run = &runs[0];
+            assert_eq!(
+                run.role_sessions["worker"].current_session_id.as_deref(),
+                Some("new-sid")
+            );
+            assert_eq!(run.history[0].session_id.as_deref(), Some("new-sid"));
         });
     }
 
