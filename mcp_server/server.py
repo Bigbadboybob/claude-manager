@@ -458,14 +458,18 @@ def start_workflow(
     task_id: str,
     workflow_name: str,
     goal: str = "",
+    role_sessions: dict[str, str] | None = None,
 ) -> dict:
     """Launch a workflow on a task you have authority over.
 
-    The caller is the orchestrator — NOT a participant. Workflow
-    participants are spawned as fresh sessions with their TOML-declared
-    engine. Use `get_workflow_state` and `read_session_output` to
-    observe progress; the existing `workflow_transition` /
-    `workflow_done` tools are for participants, not orchestrators.
+    The caller is the orchestrator — NOT a participant. By default,
+    workflow participants are spawned as fresh sessions with their
+    TOML-declared engine. Pass `role_sessions` to bind specific roles
+    to existing sessions instead (only valid for `persistent`-context
+    roles; `fresh` roles must always spawn anew). Use
+    `get_workflow_state` and `read_session_output` to observe progress;
+    the existing `workflow_transition` / `workflow_done` tools are for
+    participants, not orchestrators.
 
     Args:
         task_id: Target task. Must be the caller's own task or a
@@ -473,6 +477,12 @@ def start_workflow(
         workflow_name: Workflow definition name (e.g. "feedback").
         goal: Optional initial goal string passed to the worker's
             activation prompt template ({{ goal }}).
+        role_sessions: Optional map of role name → existing
+            `session_uid`. Each referenced session must live in the
+            target task's workspace and be in the caller's auth scope.
+            The role must be `persistent`-context and its declared
+            engine must match the session's engine. Roles not in this
+            map are spawned fresh as usual.
 
     Returns: {"run_id": "<id>"}.
 
@@ -481,6 +491,8 @@ def start_workflow(
     params: dict = {"task_id": task_id, "workflow_name": workflow_name}
     if goal:
         params["goal"] = goal
+    if role_sessions:
+        params["role_sessions"] = role_sessions
     return control_client.call("start_workflow", params)
 
 

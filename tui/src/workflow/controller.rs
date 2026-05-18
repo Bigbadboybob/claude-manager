@@ -261,6 +261,25 @@ impl<'a> WorkflowControllerCtx<'a> {
                     ));
                     return actions;
                 }
+                // Engine match: an Existing slot's session type must agree
+                // with the role's TOML-declared engine. The bound session
+                // is the source of truth for the engine actually used at
+                // runtime (templating, respawn paths), so a mismatch
+                // silently overrides the TOML — almost certainly a bug.
+                // Fail loudly instead.
+                if let Some(ts) = self.workspaces[ws_index].sessions.get(*si) {
+                    let session_engine = engine_for_session_type(&ts.session_type);
+                    if session_engine != role.engine {
+                        actions.push(WorkflowAction::SetStatusMsg(format!(
+                            "Role '{}' declares engine '{}' but session '{}' is '{}'",
+                            slot.role,
+                            role.engine.as_session_type(),
+                            ts.label,
+                            ts.session_type,
+                        )));
+                        return actions;
+                    }
+                }
             }
         }
 
@@ -1857,7 +1876,29 @@ mod tests {
 
             let mut runs: Vec<WorkflowRun> = Vec::new();
             let mut workflows = HashMap::new();
-            workflows.insert("feedback".to_string(), launch_test_workflow());
+            // Worker role must declare Codex engine to match the
+            // codex worker session bound below — launch validation
+            // rejects engine mismatches on Existing slots.
+            let mut codex_worker = role_with(Engine::Codex, Context::Persistent);
+            codex_worker.needs_mcp = false;
+            let mut reviewer_role = role_with(Engine::ClaudeCode, Context::Persistent);
+            reviewer_role.needs_mcp = false;
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), codex_worker);
+            roles.insert("reviewer".to_string(), reviewer_role);
+            workflows.insert(
+                "feedback".to_string(),
+                make_workflow(
+                    "feedback",
+                    roles,
+                    vec!["worker".to_string(), "reviewer".to_string()],
+                    vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                ),
+            );
 
             {
                 let dummy = dummy_cap_state();

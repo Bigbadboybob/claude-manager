@@ -7327,6 +7327,7 @@ impl App {
         workflow_name: &str,
         goal: Option<String>,
         task_id: Option<String>,
+        existing_role_sessions: std::collections::BTreeMap<String, usize>,
     ) -> Result<String, String> {
         let wf = self
             .workflows
@@ -7336,14 +7337,29 @@ impl App {
         if ws_index >= self.workspaces.len() {
             return Err(format!("workspace index {} out of range", ws_index));
         }
+        // Reject any role name in existing_role_sessions that isn't a
+        // role of this workflow — surfaces typos at the MCP boundary
+        // instead of silently falling back to a fresh spawn.
+        for role in existing_role_sessions.keys() {
+            if !wf.roles.contains_key(role) {
+                return Err(format!(
+                    "role '{}' is not declared in workflow '{}'",
+                    role, workflow_name
+                ));
+            }
+        }
         let slots: Vec<WorkflowSlotChoice> = wf
             .role_order
             .iter()
             .filter_map(|role_name| {
                 let role = wf.roles.get(role_name)?;
+                let source = match existing_role_sessions.get(role_name) {
+                    Some(si) => WorkflowSlotSource::Existing(*si),
+                    None => WorkflowSlotSource::New(role.engine.clone()),
+                };
                 Some(WorkflowSlotChoice {
                     role: role_name.clone(),
-                    options: vec![WorkflowSlotSource::New(role.engine.clone())],
+                    options: vec![source],
                     option_index: 0,
                 })
             })
