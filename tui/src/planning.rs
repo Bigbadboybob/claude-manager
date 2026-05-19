@@ -2585,9 +2585,15 @@ impl PlanningView {
     ) -> Vec<ListItem<'a>> {
         let mut items = Vec::new();
         let start = self.grid_col_scroll.get(col_idx).copied().unwrap_or(0).min(column.len());
-        let end = (start + max_rows).min(column.len());
 
-        for ri in start..end {
+        // Iterate to the end of the column, but stop once we've collected
+        // max_rows real ListItems. Bounding by `start + max_rows` would
+        // count `continue`-skipped (archived) items against the visible
+        // budget, making columns with archived rows in their window render
+        // shorter than their data — items at the bottom stay invisible
+        // until the user scrolls.
+        for ri in start..column.len() {
+            if items.len() >= max_rows { break; }
             let is_selected = self.cursor.col == col_idx && self.cursor.row == ri;
             let in_visual = self.is_in_visual_range(col_idx, ri);
             // Skip archived task rows when show_archived is off.
