@@ -663,7 +663,13 @@ pub struct PlanningView {
     /// Maps global column index → (project_data_idx, col_within_project).
     unified_cols: Vec<(usize, usize)>,
     cursor: GridCursor,
-    scroll_offset: usize,
+    /// Per-column vertical scroll for grid mode, indexed by `unified_cols`
+    /// position. Kept in sync with `unified_cols` by `rebuild_unified_cols`.
+    /// A single shared offset doesn't work: scrolling a tall column past a
+    /// shorter column's end would make the shorter column render empty.
+    grid_col_scroll: Vec<usize>,
+    /// Flat-list scroll for linear mode.
+    linear_scroll: usize,
     grid_rows_visible: usize,
     linear_mode: bool,
     /// Qualified conflict slugs: "project_name/slug".
@@ -696,7 +702,8 @@ impl PlanningView {
             project_filter: None,
             unified_cols: vec![],
             cursor: GridCursor { col: 0, row: 0 },
-            scroll_offset: 0,
+            grid_col_scroll: vec![],
+            linear_scroll: 0,
             grid_rows_visible: 20,
             linear_mode: false,
             conflict_slugs: HashSet::new(),
@@ -979,6 +986,10 @@ impl PlanningView {
                 self.unified_cols.push((pi, ci));
             }
         }
+        // Per-column scroll offsets shadow `unified_cols`. We don't try to
+        // remap by (pi, ci) on rebuild — resetting new entries to 0 is fine;
+        // entries below the new length keep their existing scroll.
+        self.grid_col_scroll.resize(self.unified_cols.len(), 0);
     }
 
     fn recompute_conflicts(&mut self) {
@@ -1238,11 +1249,43 @@ impl PlanningView {
     fn ensure_cursor_visible(&mut self) {
         let h = self.grid_rows_visible;
         if h == 0 { return; }
-        if self.cursor.row < self.scroll_offset {
-            self.scroll_offset = self.cursor.row;
-        } else if self.cursor.row >= self.scroll_offset + h {
-            self.scroll_offset = self.cursor.row.saturating_sub(h - 1);
+        if self.linear_mode {
+            let flat = self.cursor_flat_index_linear();
+            if flat < self.linear_scroll {
+                self.linear_scroll = flat;
+            } else if flat >= self.linear_scroll + h {
+                self.linear_scroll = flat.saturating_sub(h - 1);
+            }
+        } else {
+            if self.cursor.col >= self.grid_col_scroll.len() { return; }
+            let off = self.grid_col_scroll[self.cursor.col];
+            if self.cursor.row < off {
+                self.grid_col_scroll[self.cursor.col] = self.cursor.row;
+            } else if self.cursor.row >= off + h {
+                self.grid_col_scroll[self.cursor.col] = self.cursor.row.saturating_sub(h - 1);
+            }
         }
+    }
+
+    /// Flat-list index of the cursor in linear mode, matching the order the
+    /// linear renderer walks: project header + separator rows are counted.
+    fn cursor_flat_index_linear(&self) -> usize {
+        let mut flat = 0usize;
+        for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
+            let pd = match self.project_data.get(pi) { Some(p) => p, None => continue };
+            let column = match pd.layout.columns.get(ci) { Some(c) => c, None => continue };
+            if gi > 0 && self.is_first_col_of_project(gi) && !column.is_empty() {
+                flat += 1;
+            }
+            if self.is_first_col_of_project(gi) && self.project_filter.is_none() {
+                flat += 1;
+            }
+            if gi == self.cursor.col {
+                return flat + self.cursor.row;
+            }
+            flat += column.len();
+        }
+        flat
     }
 
     // ── Event Handling ──────────────────────────────────────
@@ -2541,7 +2584,7 @@ impl PlanningView {
         &'a self, col_idx: usize, project_name: &str, column: &[GridItem], width: usize, max_rows: usize,
     ) -> Vec<ListItem<'a>> {
         let mut items = Vec::new();
-        let start = self.scroll_offset;
+        let start = self.grid_col_scroll.get(col_idx).copied().unwrap_or(0).min(column.len());
         let end = (start + max_rows).min(column.len());
 
         for ri in start..end {
@@ -2689,7 +2732,7 @@ impl PlanningView {
             let column = &pd.layout.columns[ci];
 
             if gi > 0 && self.is_first_col_of_project(gi) && !column.is_empty() {
-                if flat_idx >= self.scroll_offset && items.len() < list_height {
+                if flat_idx >= self.linear_scroll && items.len() < list_height {
                     let sep = "\u{2550}".repeat(inner.width.saturating_sub(2) as usize);
                     items.push(ListItem::new(Line::from(vec![
                         Span::styled(" ", dim),
@@ -2700,7 +2743,7 @@ impl PlanningView {
             }
 
             if self.is_first_col_of_project(gi) && self.project_filter.is_none() {
-                if flat_idx >= self.scroll_offset && items.len() < list_height {
+                if flat_idx >= self.linear_scroll && items.len() < list_height {
                     items.push(ListItem::new(Line::from(Span::styled(
                         format!(" {}", pd.project.name),
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -2710,7 +2753,7 @@ impl PlanningView {
             }
 
             for (ri, grid_item) in column.iter().enumerate() {
-                if flat_idx < self.scroll_offset { flat_idx += 1; continue; }
+                if flat_idx < self.linear_scroll { flat_idx += 1; continue; }
                 if items.len() >= list_height { break; }
                 let is_selected = self.cursor.col == gi && self.cursor.row == ri;
 
