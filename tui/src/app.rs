@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
+use crate::agent;
+use crate::agent_memory;
 use crate::api::Task;
 use crate::backend::{BackendEvent, BackendHandle};
 use crate::config::Config;
@@ -1016,6 +1018,25 @@ enum InputMode {
         ws_index: usize,
         name: String,
     },
+    /// Save the focused session as a named agent-memory snapshot. Opened
+    /// via A-b in Sessions view; see `DESIGN_AGENT_MEMORIES.md` (chunk 3).
+    ///
+    /// Target identified by stable IDs (workspace id + session uid) — NOT
+    /// by indices. Backend events can reorder `App.workspaces` while the
+    /// modal is open, so indices would silently point at the wrong session
+    /// (or fall out of bounds) by submit time.
+    ///
+    /// `error` is set when a submit fails so the modal can stay open and
+    /// surface the reason inline (e.g. name conflict, no transcript yet).
+    SaveSnapshot {
+        workspace_id: String,
+        session_uid: String,
+        name_text: String,
+        description_text: String,
+        /// 0 = name, 1 = description.
+        active_field: u8,
+        error: Option<String>,
+    },
     /// Renaming a task (updates the `name` field via the planning API and
     /// updates the local TaskEntry so the sidebar subheader refreshes).
     TaskSettings {
@@ -1163,6 +1184,12 @@ pub(crate) enum SubmitAction {
         ws_index: usize,
         name: String,
     },
+    SaveSnapshot {
+        workspace_id: String,
+        session_uid: String,
+        name: String,
+        description: String,
+    },
     SaveTaskName {
         task_id: String,
         name: String,
@@ -1217,6 +1244,17 @@ pub(crate) struct SessionSettingsMut<'a> {
 pub(crate) struct WorkspaceSettingsMut<'a> {
     pub ws_index: usize,
     pub name: &'a mut String,
+}
+
+pub(crate) struct SaveSnapshotMut<'a> {
+    pub workspace_id: &'a str,
+    pub session_uid: &'a str,
+    pub name_text: &'a mut String,
+    pub description_text: &'a mut String,
+    pub active_field: &'a mut u8,
+    /// Cleared on the next user input so the previous error doesn't
+    /// linger after the user starts correcting the form.
+    pub error: &'a mut Option<String>,
 }
 
 pub(crate) struct TaskSettingsMut<'a> {
@@ -1459,6 +1497,51 @@ pub(crate) fn handle_workspace_settings(
         }
         KeyCode::Char(c) => {
             state.name.push(c);
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_save_snapshot(
+    state: SaveSnapshotMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 1) % 2;
+            *state.error = None;
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveSnapshot {
+            workspace_id: state.workspace_id.to_string(),
+            session_uid: state.session_uid.to_string(),
+            name: state.name_text.trim().to_string(),
+            description: state.description_text.trim().to_string(),
+        }),
+        KeyCode::Backspace => {
+            let buf = if *state.active_field == 0 {
+                &mut *state.name_text
+            } else {
+                &mut *state.description_text
+            };
+            buf.pop();
+            *state.error = None;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            let buf = if *state.active_field == 0 {
+                &mut *state.name_text
+            } else {
+                &mut *state.description_text
+            };
+            buf.push(c);
+            *state.error = None;
             InputOutcome::Consumed
         }
         _ => InputOutcome::Consumed,
@@ -2568,6 +2651,163 @@ impl App {
         })
     }
 
+    /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
+    /// transcript path via the agent strategy, builds a `SaveSpec`, and
+    /// either toasts on success or re-opens the modal with the error
+    /// surfaced inline.
+    fn handle_save_snapshot_submit(
+        &mut self,
+        workspace_id: String,
+        session_uid: String,
+        name: String,
+        description: String,
+    ) {
+        // Reopen the modal carrying `name` / `description` so the user
+        // doesn't lose what they typed. Called via the early-return closure
+        // pattern below — used for any failure that's recoverable in-form
+        // (validation, name conflict, missing transcript). Stable IDs are
+        // re-stored so a subsequent reorder still resolves correctly.
+        let reopen = |this: &mut Self, err: String| {
+            this.input_mode = InputMode::SaveSnapshot {
+                workspace_id: workspace_id.clone(),
+                session_uid: session_uid.clone(),
+                name_text: name.clone(),
+                description_text: description.clone(),
+                active_field: 0,
+                error: Some(err),
+            };
+        };
+
+        // Resolve stable IDs → current indices. Backend events can reorder
+        // workspaces while the modal is open, so the IDs are the source of
+        // truth, not the indices that were captured at open time.
+        let Some((_wi, _si)) = resolve_session_by_ids(
+            &self.workspaces,
+            &workspace_id,
+            &session_uid,
+        ) else {
+            self.set_status_msg(
+                "Snapshot cancelled — the target session is no longer available",
+            );
+            return;
+        };
+
+        // Pull immutable refs anew now that we have current indices.
+        let ws = &self.workspaces[_wi];
+        let ts = &ws.sessions[_si];
+
+        let engine = match ts.session_type.as_str() {
+            "claude" => Engine::ClaudeCode,
+            "codex" => Engine::Codex,
+            _ => {
+                reopen(
+                    self,
+                    "Snapshots only supported for Claude Code / Codex sessions"
+                        .into(),
+                );
+                return;
+            }
+        };
+
+        let Some(source_cwd) = ws.worktree_path.clone() else {
+            reopen(self, "Session has no worktree path".into());
+            return;
+        };
+
+        let source_session_uid = ts.uid.clone();
+        let Some(source_transcript_id) = ts.transcript_id.clone() else {
+            reopen(
+                self,
+                "No transcript yet — let the session produce at least one message first"
+                    .into(),
+            );
+            return;
+        };
+
+        // Resolve the transcript on disk via the agent strategy (walks
+        // ~/.codex/sessions for codex; encoded-cwd join for claude).
+        let agent = agent::agent_for(&ts.session_type);
+        let ctx = agent::AgentCtx {
+            ts,
+            worktree_path: &source_cwd,
+        };
+        let Some(source_transcript_path) = agent.transcript_path(ctx) else {
+            reopen(
+                self,
+                "Could not resolve transcript path for this session".into(),
+            );
+            return;
+        };
+
+        // Claude has a per-cwd memory dir; codex does not.
+        let memory_dir = match engine {
+            Engine::ClaudeCode => agent_memory::claude_memory_dir(&source_cwd),
+            Engine::Codex => None,
+        };
+
+        let spec = agent_memory::SaveSpec {
+            name: name.as_str(),
+            description: description.as_str(),
+            engine: engine.clone(),
+            source_session_uid: source_session_uid.as_str(),
+            source_transcript_id: source_transcript_id.as_str(),
+            source_cwd: &source_cwd,
+            source_transcript_path: &source_transcript_path,
+            source_memory_dir: memory_dir.as_deref(),
+        };
+
+        match agent_memory::save(spec) {
+            Ok(snap) => {
+                self.set_status_msg(&format!("Snapshot saved: {}", snap.name));
+            }
+            Err(e) => {
+                reopen(self, e.to_string());
+            }
+        }
+    }
+
+    /// Open the save-snapshot modal for the focused session. Surface the
+    /// design's two upfront error toasts (engine not supported, no
+    /// transcript yet) so the modal only opens when a save can plausibly
+    /// succeed. See `DESIGN_AGENT_MEMORIES.md` save flow.
+    fn open_save_snapshot(&mut self) {
+        let (wi, si) = match self.cursor {
+            Cursor::Session(wi, si) => (wi, si),
+            _ => {
+                self.set_status_msg("Snapshot: focus a session first");
+                return;
+            }
+        };
+        let Some(ws) = self.workspaces.get(wi) else {
+            return;
+        };
+        let Some(ts) = ws.sessions.get(si) else {
+            return;
+        };
+        if !matches!(ts.session_type.as_str(), "claude" | "codex") {
+            self.set_status_msg(
+                "Snapshots only supported for Claude Code / Codex sessions",
+            );
+            return;
+        }
+        if ts.transcript_id.is_none() {
+            self.set_status_msg(
+                "No transcript yet — let the session produce at least one message first",
+            );
+            return;
+        }
+        // Capture stable IDs so a backend-driven workspace reorder while
+        // the modal is open doesn't make the indices stale.
+        self.input_mode = InputMode::SaveSnapshot {
+            workspace_id: ws.id.clone(),
+            session_uid: ts.uid.clone(),
+            name_text: String::new(),
+            description_text: String::new(),
+            active_field: 0,
+            error: None,
+        };
+    }
+
     /// Open settings for whatever the cursor is focused on — a workspace
     /// (rename) when on a header, a session (label / idle / hidden) when on
     /// a specific session.
@@ -2805,6 +3045,26 @@ impl App {
     fn workspace_index_by_id(&self, id: &str) -> Option<usize> {
         self.workspaces.iter().position(|w| w.id == id)
     }
+}
+
+/// Resolve a `(workspace_id, session_uid)` pair to current `(ws_index,
+/// session_index)`. Returns `None` if either has been removed since the
+/// IDs were captured. Free function so it can be unit-tested against a
+/// hand-rolled `&[Workspace]` without building a full `App`.
+fn resolve_session_by_ids(
+    workspaces: &[Workspace],
+    workspace_id: &str,
+    session_uid: &str,
+) -> Option<(usize, usize)> {
+    let wi = workspaces.iter().position(|w| w.id == workspace_id)?;
+    let si = workspaces[wi]
+        .sessions
+        .iter()
+        .position(|s| s.uid == session_uid)?;
+    Some((wi, si))
+}
+
+impl App {
 
     /// First task bound to the given workspace, if any. Used by push/pull
     /// (which need *a* representative task) and the detail panel (shows one
@@ -4531,6 +4791,10 @@ impl App {
                         self.toggle_session_hidden();
                         return true;
                     }
+                    KeyCode::Char('b') => {
+                        self.open_save_snapshot();
+                        return true;
+                    }
                     KeyCode::Char('n') => {
                         self.start_new_session();
                         return true;
@@ -4839,6 +5103,25 @@ impl App {
                 InputCtx { repo_urls: &urls },
                 event,
             ),
+            InputMode::SaveSnapshot {
+                workspace_id,
+                session_uid,
+                name_text,
+                description_text,
+                active_field,
+                error,
+            } => handle_save_snapshot(
+                SaveSnapshotMut {
+                    workspace_id: workspace_id.as_str(),
+                    session_uid: session_uid.as_str(),
+                    name_text,
+                    description_text,
+                    active_field,
+                    error,
+                },
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
             InputMode::TaskSettings { task_id, name } => handle_task_settings(
                 TaskSettingsMut {
                     task_id: task_id.as_str(),
@@ -4963,6 +5246,19 @@ impl App {
                     self.save_session_manifest();
                     self.set_status_msg("Workspace renamed");
                 }
+            }
+            SubmitAction::SaveSnapshot {
+                workspace_id,
+                session_uid,
+                name,
+                description,
+            } => {
+                self.handle_save_snapshot_submit(
+                    workspace_id,
+                    session_uid,
+                    name,
+                    description,
+                );
             }
             SubmitAction::SaveTaskName { task_id, name } => {
                 if !name.is_empty() {
@@ -6334,6 +6630,22 @@ impl App {
                 InputMode::WorkspaceSettings { name, .. } => {
                     self.draw_workspace_settings(frame, area, name);
                 }
+                InputMode::SaveSnapshot {
+                    name_text,
+                    description_text,
+                    active_field,
+                    error,
+                    ..
+                } => {
+                    self.draw_save_snapshot(
+                        frame,
+                        area,
+                        name_text,
+                        description_text,
+                        *active_field,
+                        error.as_deref(),
+                    );
+                }
                 InputMode::WorkflowPicker { names, selected, .. } => {
                     self.draw_workflow_picker(frame, area, names, *selected);
                 }
@@ -6664,6 +6976,73 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn draw_save_snapshot(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        name_text: &str,
+        description_text: &str,
+        active_field: u8,
+        error: Option<&str>,
+    ) {
+        let width = 60u16.min(area.width.saturating_sub(4));
+        // Base = 11 rows (title, name, blank, description, blank, blank,
+        // hint). +2 when an error is being shown.
+        let height = if error.is_some() { 13u16 } else { 11u16 };
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let dialog_area = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White))
+            .title(Span::styled(
+                " Save Snapshot ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let cursor = "\u{2588}";
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+        let red = Style::default().fg(Color::Red);
+
+        let name_cursor = if active_field == 0 { cursor } else { "" };
+        let desc_cursor = if active_field == 1 { cursor } else { "" };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("        Name: ", dim),
+                Span::styled(name_text, white),
+                Span::styled(name_cursor, white),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Description: ", dim),
+                Span::styled(description_text, white),
+                Span::styled(desc_cursor, white),
+            ]),
+            Line::from(""),
+        ];
+
+        if let Some(msg) = error {
+            lines.push(Line::from(Span::styled(msg.to_string(), red)));
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(Span::styled(
+            "Tab switch field \u{00b7} Enter save \u{00b7} Esc cancel",
+            dim,
+        )));
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_workspace_settings(&self, frame: &mut Frame, area: Rect, name: &str) {
         let width = 55u16.min(area.width.saturating_sub(4));
         let height = 7u16;
@@ -6812,6 +7191,7 @@ impl App {
             ("A-h    hide", "A-y  history"),
             ("A-f    workflow", "A-u  resume"),
             ("A-o    stop wf", "A-,  activity"),
+            ("A-b    snapshot", ""),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -9471,6 +9851,230 @@ mod input_handler_tests {
                 ws_index: 0,
                 name: &mut name,
             },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+    }
+
+    // ── SaveSnapshot ──────────────────────────────────────────────
+
+    fn save_snapshot_state<'a>(
+        name: &'a mut String,
+        desc: &'a mut String,
+        active: &'a mut u8,
+        error: &'a mut Option<String>,
+    ) -> SaveSnapshotMut<'a> {
+        SaveSnapshotMut {
+            workspace_id: "ws-1",
+            session_uid: "uid-1",
+            name_text: name,
+            description_text: desc,
+            active_field: active,
+            error,
+        }
+    }
+
+    #[test]
+    fn save_snapshot_char_routes_to_active_field() {
+        let mut name = "fo".to_string();
+        let mut desc = "ba".to_string();
+        let mut active = 0u8;
+        let mut error = None;
+
+        let outcome = handle_save_snapshot(
+            save_snapshot_state(&mut name, &mut desc, &mut active, &mut error),
+            ctx_no_repos(),
+            &key(KeyCode::Char('o')),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(name, "foo");
+        assert_eq!(desc, "ba");
+
+        active = 1;
+        let outcome = handle_save_snapshot(
+            save_snapshot_state(&mut name, &mut desc, &mut active, &mut error),
+            ctx_no_repos(),
+            &key(KeyCode::Char('r')),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(name, "foo");
+        assert_eq!(desc, "bar");
+    }
+
+    #[test]
+    fn save_snapshot_tab_cycles_field_and_clears_error() {
+        let mut name = "x".to_string();
+        let mut desc = String::new();
+        let mut active = 0u8;
+        let mut error = Some("prior".to_string());
+
+        let outcome = handle_save_snapshot(
+            save_snapshot_state(&mut name, &mut desc, &mut active, &mut error),
+            ctx_no_repos(),
+            &key(KeyCode::Tab),
+        );
+        assert_consumed(&outcome);
+        assert_eq!(active, 1);
+        assert!(error.is_none(), "tab should clear stale error");
+    }
+
+    #[test]
+    fn save_snapshot_typing_clears_error() {
+        let mut name = String::new();
+        let mut desc = String::new();
+        let mut active = 0u8;
+        let mut error = Some("prior".to_string());
+
+        let outcome = handle_save_snapshot(
+            save_snapshot_state(&mut name, &mut desc, &mut active, &mut error),
+            ctx_no_repos(),
+            &key(KeyCode::Char('a')),
+        );
+        assert_consumed(&outcome);
+        assert!(error.is_none(), "typing should clear stale error");
+    }
+
+    #[test]
+    fn save_snapshot_enter_submits_trimmed() {
+        let mut name = "  reviewer-strict  ".to_string();
+        let mut desc = "  hello  ".to_string();
+        let mut active = 0u8;
+        let mut error = None;
+
+        let outcome = handle_save_snapshot(
+            SaveSnapshotMut {
+                workspace_id: "ws-target",
+                session_uid: "uid-target",
+                name_text: &mut name,
+                description_text: &mut desc,
+                active_field: &mut active,
+                error: &mut error,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SaveSnapshot {
+                workspace_id,
+                session_uid,
+                name,
+                description,
+            }) => {
+                assert_eq!(workspace_id, "ws-target");
+                assert_eq!(session_uid, "uid-target");
+                assert_eq!(name, "reviewer-strict");
+                assert_eq!(description, "hello");
+            }
+            other => panic!("expected SaveSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_session_by_ids_follows_reordered_workspaces() {
+        // Regression for stale-index bug: the modal stores (workspace_id,
+        // session_uid). Even after the backend reorders self.workspaces,
+        // submit-time resolution must still point at the originally-
+        // targeted session — not whatever happens to be at the old index.
+
+        // Initial order: [A, B]. Target = ws-A, uid-A2 → (0, 1).
+        let mut workspaces = vec![
+            ws_fixture("ws-A", &[("uid-A1", "claude"), ("uid-A2", "claude")]),
+            ws_fixture("ws-B", &[("uid-B1", "codex")]),
+        ];
+        assert_eq!(
+            super::resolve_session_by_ids(&workspaces, "ws-A", "uid-A2"),
+            Some((0, 1)),
+        );
+
+        // Backend swaps order in place: [B, A]. Same IDs → (1, 1).
+        workspaces.swap(0, 1);
+        assert_eq!(
+            super::resolve_session_by_ids(&workspaces, "ws-A", "uid-A2"),
+            Some((1, 1)),
+        );
+
+        // Target session removed → None (caller toasts and bails).
+        let wi_a = workspaces.iter().position(|w| w.id == "ws-A").unwrap();
+        workspaces[wi_a].sessions.retain(|s| s.uid != "uid-A2");
+        assert!(
+            super::resolve_session_by_ids(&workspaces, "ws-A", "uid-A2").is_none()
+        );
+
+        // Workspace removed → None.
+        workspaces.retain(|w| w.id != "ws-A");
+        assert!(
+            super::resolve_session_by_ids(&workspaces, "ws-A", "uid-A1").is_none()
+        );
+    }
+
+    /// Build a `Workspace` with the requested `(uid, session_type)` sessions.
+    /// Bash sessions are used (no transcript, no PTY work) so the helper
+    /// can synthesize them cheaply for resolver-only tests.
+    fn ws_fixture(id: &str, sessions: &[(&str, &str)]) -> Workspace {
+        use std::collections::HashMap;
+        let mut out = Workspace {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: Vec::new(),
+            tombstones: Vec::new(),
+            is_pushing: false,
+        };
+        for (uid, ty) in sessions {
+            let session = crate::session::Session::new(
+                "/bin/true",
+                &[],
+                80,
+                24,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .expect("dummy session for fixture");
+            out.sessions.push(TerminalSession {
+                uid: (*uid).into(),
+                label: (*uid).into(),
+                session_type: (*ty).into(),
+                session,
+                status: SessionStatus::Idle,
+                last_write_at: None,
+                transcript_id: None,
+                generation: 0,
+                pending_jsonl_files: None,
+                hidden: false,
+                idle_timeout_secs: 0,
+                burst_threshold: 0,
+                pending_prompt: None,
+                pending_clear: None,
+                workflow_run_id: None,
+                workflow_role: None,
+                task_id: None,
+                last_delivery: None,
+                notify_on_idle: false,
+                pending_enter: None,
+                created_at: Instant::now(),
+                managed_by_uid: None,
+                seeded_from_snapshot: None,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn save_snapshot_esc_cancels() {
+        let mut name = "x".to_string();
+        let mut desc = String::new();
+        let mut active = 0u8;
+        let mut error = None;
+        let outcome = handle_save_snapshot(
+            save_snapshot_state(&mut name, &mut desc, &mut active, &mut error),
             ctx_no_repos(),
             &key(KeyCode::Esc),
         );
