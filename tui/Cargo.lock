@@ -348,6 +348,7 @@ dependencies = [
  "terminput-crossterm",
  "toml",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

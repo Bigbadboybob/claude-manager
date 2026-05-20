@@ -34,6 +34,9 @@ notify-rust = "4"
 # SHA-256 for the argv fingerprint in the per-session memory-cap kill log.
 sha2 = "0.10"
 
+# UUID v4 for cloned-Codex transcript ids (agent_memory clone flow).
+uuid = { version = "1", features = ["v4"] }
+
 # Low-level Linux syscalls for the per-session memory cap watcher
 # (getuid, kill, pidfd_open / pidfd_send_signal via syscall numbers).
 [target.'cfg(target_os = "linux")'.dependencies]
