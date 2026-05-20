@@ -138,6 +138,11 @@ pub struct TerminalSession {
     /// session is spawned via the agent-orchestration MCP tools; None
     /// for user-created sessions. Persisted across TUI restart.
     pub managed_by_uid: Option<String>,
+    /// Name of the agent-memory snapshot this session was cloned from, if
+    /// any. Informational provenance only — surfaces in session info as
+    /// "Seeded from: <name>". Persisted via `ManifestEntry`. See
+    /// DESIGN_AGENT_MEMORIES.md.
+    pub seeded_from_snapshot: Option<String>,
 }
 
 impl TerminalSession {
@@ -303,6 +308,11 @@ struct ManifestEntry {
     task_id: Option<String>,
     #[serde(default)]
     notify_on_idle: bool,
+    /// Name of the agent-memory snapshot this session was cloned from, if
+    /// any. Informational provenance only — used to surface "Seeded from:
+    /// <name>" in session info. See DESIGN_AGENT_MEMORIES.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seeded_from_snapshot: Option<String>,
 }
 
 /// Persisted workspace metadata. Lives in `Manifest::workspaces` keyed by the
@@ -531,6 +541,7 @@ fn make_simple_session_with_uid(
         pending_enter: None,
         created_at: Instant::now(),
         managed_by_uid: None,
+        seeded_from_snapshot: None,
     }
 }
 
@@ -992,6 +1003,10 @@ enum InputMode {
         burst_threshold: String,
         hidden: bool,
         notify_on_idle: bool,
+        /// Read-only provenance: name of the agent-memory snapshot this
+        /// session was cloned from, if any. Surfaced at the bottom of the
+        /// dialog when `Some`. Not editable from settings.
+        seeded_from_snapshot: Option<String>,
         /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden, 4 = notify on idle
         active_field: u8,
     },
@@ -2170,6 +2185,7 @@ impl App {
                     workflow_role: ts.workflow_role.clone(),
                     task_id: ts.task_id.clone(),
                     notify_on_idle: ts.notify_on_idle,
+                    seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
                 })
                 .collect();
             workspaces.insert(
@@ -2548,6 +2564,7 @@ impl App {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: entry.managed_by_uid.clone(),
+            seeded_from_snapshot: entry.seeded_from_snapshot.clone(),
         })
     }
 
@@ -2577,6 +2594,7 @@ impl App {
                             },
                             hidden: ts.hidden,
                             notify_on_idle: ts.notify_on_idle,
+                            seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
                             active_field: 0,
                         };
                     }
@@ -3831,6 +3849,7 @@ impl App {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: Some(caller_uid.to_string()),
+            seeded_from_snapshot: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         self.save_session_manifest();
@@ -4796,6 +4815,7 @@ impl App {
                 burst_threshold,
                 hidden,
                 notify_on_idle,
+                seeded_from_snapshot: _,
                 active_field,
             } => handle_session_settings(
                 SessionSettingsMut {
@@ -5243,6 +5263,7 @@ impl App {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         };
         let ws = Workspace {
             id: new_workspace_id(),
@@ -6297,8 +6318,18 @@ impl App {
                         session_type,
                     );
                 }
-                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, active_field, .. } => {
-                    self.draw_session_settings(frame, area, name, idle_timeout, burst_threshold, *hidden, *notify_on_idle, *active_field);
+                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, seeded_from_snapshot, active_field, .. } => {
+                    self.draw_session_settings(
+                        frame,
+                        area,
+                        name,
+                        idle_timeout,
+                        burst_threshold,
+                        *hidden,
+                        *notify_on_idle,
+                        seeded_from_snapshot.as_deref(),
+                        *active_field,
+                    );
                 }
                 InputMode::WorkspaceSettings { name, .. } => {
                     self.draw_workspace_settings(frame, area, name);
@@ -6545,10 +6576,14 @@ impl App {
         burst_threshold: &str,
         hidden: bool,
         notify_on_idle: bool,
+        seeded_from_snapshot: Option<&str>,
         active_field: u8,
     ) {
         let width = 55u16.min(area.width.saturating_sub(4));
-        let height = 15u16;
+        // Seeded-from line is a 2-line block (blank + "Seeded from: <name>")
+        // only when the field is set; otherwise the dialog keeps its old
+        // size so the unrelated common case doesn't grow.
+        let height = if seeded_from_snapshot.is_some() { 17u16 } else { 15u16 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -6580,7 +6615,7 @@ impl App {
         let notify_marker = if notify_on_idle { "[x]" } else { "[ ]" };
         let notify_style = if active_field == 4 { white } else { dim };
 
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("           Name: ", dim),
                 Span::styled(name, white),
@@ -6610,12 +6645,21 @@ impl App {
                 Span::styled(notify_marker, notify_style),
                 Span::styled(if active_field == 4 { "  Space to toggle" } else { "" }, dim),
             ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Tab next field \u{00b7} Enter save \u{00b7} Esc cancel",
-                dim,
-            )),
         ];
+
+        if let Some(snap) = seeded_from_snapshot {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("   Seeded from: ", dim),
+                Span::styled(snap, white),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Tab next field \u{00b7} Enter save \u{00b7} Esc cancel",
+            dim,
+        )));
 
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -8077,6 +8121,80 @@ fn copy_to_clipboard(text: &str) {
 }
 
 #[cfg(test)]
+mod manifest_entry_seeded_from_tests {
+    //! Lock in the persistence semantics of `ManifestEntry.seeded_from_snapshot`:
+    //! the serde-default lets pre-existing manifests load cleanly, and the
+    //! skip-if-none keeps the on-disk format quiet when the field is absent.
+    use super::*;
+
+    #[test]
+    fn seeded_from_snapshot_round_trips() {
+        let entry = ManifestEntry {
+            uid: "ts-abc".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "x".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: Some("reviewer-strict".into()),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.seeded_from_snapshot.as_deref(), Some("reviewer-strict"));
+    }
+
+    #[test]
+    fn missing_seeded_from_deserializes_as_none() {
+        // Pre-existing manifests written before this field existed must
+        // continue to load. `#[serde(default)]` guarantees that.
+        let json = r#"{
+            "uid": "ts-abc",
+            "generation": 0,
+            "label": "x",
+            "session_type": "claude",
+            "hidden": false,
+            "idle_timeout_secs": 0,
+            "burst_threshold": 0,
+            "notify_on_idle": false
+        }"#;
+        let entry: ManifestEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.seeded_from_snapshot.is_none());
+    }
+
+    #[test]
+    fn none_does_not_serialize() {
+        let entry = ManifestEntry {
+            uid: "ts-abc".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "x".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+        };
+        let s = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !s.contains("seeded_from_snapshot"),
+            "None should be skipped, got: {s}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ready_tests {
     use super::*;
 
@@ -8282,6 +8400,7 @@ mod transcript_rebind_tests {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         }
     }
 
@@ -8409,6 +8528,7 @@ mod rotation_binding_tests {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         }
     }
 

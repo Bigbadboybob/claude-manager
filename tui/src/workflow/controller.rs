@@ -592,6 +592,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -1293,6 +1294,7 @@ mod tests {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         }
     }
 
@@ -1669,6 +1671,7 @@ mod tests {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         }
     }
 

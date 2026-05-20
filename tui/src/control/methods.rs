@@ -1885,6 +1885,7 @@ mod tests {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
+            seeded_from_snapshot: None,
         }
     }
 

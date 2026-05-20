@@ -535,6 +535,7 @@ fn with_stub_ctx<T>(f: impl FnOnce(AgentCtx<'_>) -> T) -> T {
         pending_enter: None,
         created_at: std::time::Instant::now(),
         managed_by_uid: None,
+        seeded_from_snapshot: None,
     };
     let wt = PathBuf::from("/tmp");
     let ctx = AgentCtx {
@@ -717,6 +718,7 @@ fn make_codex_test_session(transcript_id: &str) -> crate::app::TerminalSession {
         pending_enter: None,
         created_at: std::time::Instant::now(),
         managed_by_uid: None,
+        seeded_from_snapshot: None,
     }
 }
 
