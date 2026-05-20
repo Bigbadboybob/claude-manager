@@ -1037,6 +1037,28 @@ enum InputMode {
         active_field: u8,
         error: Option<String>,
     },
+    /// Browse / detail / rename / delete the agent-memory snapshot catalog.
+    /// Opened via A-z in Sessions view. `mode` tracks the active sub-view
+    /// (the catalog modal stays one InputMode variant rather than a family
+    /// of variants, so the snapshots list is loaded once on open and shared
+    /// across all sub-modes — list re-reads only happen after a rename or
+    /// delete commits).
+    ///
+    /// `is_picker` toggles select-and-return semantics for chunk 5's
+    /// seed-from-snapshot field: when true, Enter on a row would return
+    /// the snapshot name to the caller instead of opening Detail, and
+    /// rename / delete are disabled. Currently unused — chunk 4 only opens
+    /// the catalog in browse mode (`is_picker = false`).
+    SnapshotCatalog {
+        snapshots: Vec<agent_memory::Snapshot>,
+        selected: usize,
+        mode: CatalogMode,
+        is_picker: bool,
+        /// Transient error/status string surfaced at the bottom of the
+        /// catalog (e.g. "Delete failed: …"). Cleared on the next user
+        /// input so it doesn't linger across mode transitions.
+        status_msg: Option<String>,
+    },
     /// Renaming a task (updates the `name` field via the planning API and
     /// updates the local TaskEntry so the sidebar subheader refreshes).
     TaskSettings {
@@ -1190,6 +1212,14 @@ pub(crate) enum SubmitAction {
         name: String,
         description: String,
     },
+    /// Emitted when the catalog is opened in picker mode and the user
+    /// presses Enter on a row. Chunk 4 doesn't open the catalog in picker
+    /// mode anywhere — chunk 5's seed-from-snapshot field will. The arm
+    /// in `apply_submit_action` is a no-op today so the variant exists
+    /// to be wired up later.
+    SnapshotPicked {
+        name: String,
+    },
     SaveTaskName {
         task_id: String,
         name: String,
@@ -1255,6 +1285,39 @@ pub(crate) struct SaveSnapshotMut<'a> {
     /// Cleared on the next user input so the previous error doesn't
     /// linger after the user starts correcting the form.
     pub error: &'a mut Option<String>,
+}
+
+/// Snapshot-catalog sub-mode. Tracks what the user is currently doing
+/// inside the catalog modal — all sub-modes share the same list of
+/// snapshots and selection cursor.
+#[derive(Debug, Clone)]
+pub enum CatalogMode {
+    /// Default list view. j/k navigate, Enter→Detail, r→Rename, d→ConfirmDelete.
+    Browse,
+    /// Read-only manifest + transcript head/tail preview. Esc/Enter→Browse.
+    /// `head` and `tail` are loaded once on transition and cached so
+    /// rendering doesn't hit disk every frame.
+    Detail {
+        head: Vec<String>,
+        tail: Vec<String>,
+    },
+    /// In-line rename of the selected snapshot. Enter commits via
+    /// `agent_memory::rename`; Esc returns to Browse without changes.
+    Rename {
+        text: String,
+        error: Option<String>,
+    },
+    /// "Delete snapshot `<name>`? (y/n)" confirm prompt. y/Enter commits
+    /// via `agent_memory::delete`; n/Esc returns to Browse.
+    ConfirmDelete,
+}
+
+pub(crate) struct SnapshotCatalogMut<'a> {
+    pub snapshots: &'a mut Vec<agent_memory::Snapshot>,
+    pub selected: &'a mut usize,
+    pub mode: &'a mut CatalogMode,
+    pub is_picker: bool,
+    pub status_msg: &'a mut Option<String>,
 }
 
 pub(crate) struct TaskSettingsMut<'a> {
@@ -1501,6 +1564,390 @@ pub(crate) fn handle_workspace_settings(
         }
         _ => InputOutcome::Consumed,
     }
+}
+
+pub(crate) fn handle_snapshot_catalog(
+    state: SnapshotCatalogMut<'_>,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+
+    // Alt+z anywhere closes the catalog (matches the open binding so it
+    // toggles). Esc behaves contextually inside each sub-mode below.
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('z') {
+        return InputOutcome::Cancel;
+    }
+
+    // Clear any transient status message ("Delete failed: …" etc.) on the
+    // next keystroke so it doesn't linger across unrelated interactions.
+    // Sub-handlers can re-set it for the current event if needed.
+    *state.status_msg = None;
+
+    match state.mode.clone() {
+        CatalogMode::Browse => handle_catalog_browse(state, key),
+        CatalogMode::Detail { .. } => handle_catalog_detail(state, key),
+        CatalogMode::Rename { text, error } => {
+            handle_catalog_rename(state, key, text, error)
+        }
+        CatalogMode::ConfirmDelete => handle_catalog_delete(state, key),
+    }
+}
+
+fn handle_catalog_browse(
+    state: SnapshotCatalogMut<'_>,
+    key: &crossterm::event::KeyEvent,
+) -> InputOutcome {
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !state.snapshots.is_empty() {
+                *state.selected = (*state.selected + 1) % state.snapshots.len();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if !state.snapshots.is_empty() {
+                *state.selected = if *state.selected == 0 {
+                    state.snapshots.len() - 1
+                } else {
+                    *state.selected - 1
+                };
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => {
+            let Some(snap) = state.snapshots.get(*state.selected) else {
+                return InputOutcome::Consumed;
+            };
+            if state.is_picker {
+                return InputOutcome::Submit(SubmitAction::SnapshotPicked {
+                    name: snap.name.clone(),
+                });
+            }
+            let (head, tail) = read_transcript_head_tail(&snap.dir, 5);
+            *state.mode = CatalogMode::Detail { head, tail };
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('r') if !state.is_picker => {
+            let Some(snap) = state.snapshots.get(*state.selected) else {
+                return InputOutcome::Consumed;
+            };
+            *state.mode = CatalogMode::Rename {
+                text: snap.name.clone(),
+                error: None,
+            };
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('d') if !state.is_picker => {
+            if state.snapshots.get(*state.selected).is_some() {
+                *state.mode = CatalogMode::ConfirmDelete;
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+fn handle_catalog_detail(
+    state: SnapshotCatalogMut<'_>,
+    key: &crossterm::event::KeyEvent,
+) -> InputOutcome {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            *state.mode = CatalogMode::Browse;
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+fn handle_catalog_rename(
+    state: SnapshotCatalogMut<'_>,
+    key: &crossterm::event::KeyEvent,
+    mut text: String,
+    error: Option<String>,
+) -> InputOutcome {
+    match key.code {
+        KeyCode::Esc => {
+            *state.mode = CatalogMode::Browse;
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => {
+            let Some(snap) = state.snapshots.get(*state.selected) else {
+                *state.mode = CatalogMode::Browse;
+                return InputOutcome::Consumed;
+            };
+            let old = snap.name.clone();
+            let new = text.trim().to_string();
+            if new == old {
+                *state.mode = CatalogMode::Browse;
+                return InputOutcome::Consumed;
+            }
+            match agent_memory::rename(&old, &new) {
+                Ok(()) => match agent_memory::list() {
+                    Ok(fresh) => {
+                        // Move selection to the renamed entry so the
+                        // cursor doesn't appear to jump arbitrarily.
+                        let new_idx = fresh
+                            .iter()
+                            .position(|s| s.name == new)
+                            .unwrap_or(0);
+                        *state.snapshots = fresh;
+                        *state.selected = new_idx;
+                        *state.mode = CatalogMode::Browse;
+                        InputOutcome::Consumed
+                    }
+                    Err(e) => {
+                        *state.mode = CatalogMode::Rename {
+                            text: new,
+                            error: Some(format!("rename succeeded but reload failed: {e}")),
+                        };
+                        InputOutcome::Consumed
+                    }
+                },
+                Err(e) => {
+                    *state.mode = CatalogMode::Rename {
+                        text: new,
+                        error: Some(e.to_string()),
+                    };
+                    InputOutcome::Consumed
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            text.pop();
+            *state.mode = CatalogMode::Rename { text, error: None };
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) => {
+            // Drop the prior error so the user sees their typing land
+            // before any new validation runs at submit.
+            let _ = error;
+            text.push(c);
+            *state.mode = CatalogMode::Rename { text, error: None };
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+fn handle_catalog_delete(
+    state: SnapshotCatalogMut<'_>,
+    key: &crossterm::event::KeyEvent,
+) -> InputOutcome {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            let Some(snap) = state.snapshots.get(*state.selected) else {
+                *state.mode = CatalogMode::Browse;
+                return InputOutcome::Consumed;
+            };
+            let name = snap.name.clone();
+            match agent_memory::delete(&name) {
+                Err(e) => {
+                    // Keep list + selection as-is and surface the error.
+                    // The previous code discarded the result and then
+                    // potentially blanked the list via list().unwrap_or_default(),
+                    // which silently dropped state on failures like a
+                    // permission-denied rmdir.
+                    *state.status_msg = Some(format!("Delete failed: {e}"));
+                    *state.mode = CatalogMode::Browse;
+                }
+                Ok(()) => match agent_memory::list() {
+                    Ok(fresh) => {
+                        let len = fresh.len();
+                        *state.snapshots = fresh;
+                        *state.selected = if len == 0 {
+                            0
+                        } else {
+                            (*state.selected).min(len - 1)
+                        };
+                        *state.mode = CatalogMode::Browse;
+                    }
+                    Err(e) => {
+                        // Disk delete succeeded but we can't refresh the
+                        // list. Keep the in-memory list intact (slightly
+                        // stale) — better than blanking it. The user can
+                        // close + reopen the catalog to retry the list.
+                        *state.status_msg = Some(format!(
+                            "Deleted, but reload failed: {e}"
+                        ));
+                        *state.mode = CatalogMode::Browse;
+                    }
+                },
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            *state.mode = CatalogMode::Browse;
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+/// Read up to `n` lines from the start and the end of `transcript.jsonl`
+/// inside a snapshot dir. Cached in `CatalogMode::Detail` so the read
+/// happens once per transition, not every frame.
+///
+/// Memory is O(n) regardless of file size: head is a `Vec<String>` capped at
+/// `n`, tail is a `VecDeque<String>` ring buffer of capacity `n` that the
+/// rest of the iterator drains into. Earlier implementation slurped the
+/// whole transcript into memory just to take 5 lines from each end —
+/// for multi-MB transcripts that stalled the UI on Detail open.
+fn read_transcript_head_tail(
+    snapshot_dir: &Path,
+    n: usize,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader};
+
+    let path = snapshot_dir.join("transcript.jsonl");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let reader = BufReader::new(file);
+
+    let mut head: Vec<String> = Vec::with_capacity(n);
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(n.saturating_add(1));
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            // Skip unreadable lines (e.g. invalid UTF-8 in the middle) but
+            // keep the loop going so we still get a usable head/tail.
+            Err(_) => continue,
+        };
+        if head.len() < n {
+            head.push(line);
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        if tail.len() == n {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+
+    (head, tail.into_iter().collect())
+}
+
+/// Build the body lines of the catalog Rename overlay. Pure function so
+/// unit tests can drive it without spinning up a Terminal/TestBackend.
+/// Both `text` and `error` (validation messages can quote control bytes)
+/// are sanitized before being placed into spans.
+fn rename_overlay_lines(text: &str, error: Option<&str>) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let white = Style::default().fg(Color::White);
+    let red = Style::default().fg(Color::Red);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("New name: ", dim),
+            // Defensive: paste into the buffer could carry control
+            // bytes — sanitize on render so the rename modal can't be
+            // weaponized via clipboard injection.
+            Span::styled(sanitize_for_display(text), white),
+            Span::styled("\u{2588}", white),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(msg) = error {
+        // Validation errors (`validate_name`) quote the offending
+        // character — including potentially an ESC. Sanitize on render
+        // so the error message can't drive the terminal.
+        lines.push(Line::from(Span::styled(sanitize_for_display(msg), red)));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "Enter rename \u{00b7} Esc cancel",
+        dim,
+    )));
+    lines
+}
+
+/// Compute the visible row range for a scrollable list given the current
+/// selection. Keeps `selected` on-screen by centering it within the window
+/// when possible and clamping to the top/bottom edges otherwise. Returns
+/// `(start, end)` such that `start <= selected < end` and `end - start <=
+/// visible` and `end <= total`. Both bounds are 0 when there's nothing to
+/// show.
+fn visible_range(selected: usize, total: usize, visible: usize) -> (usize, usize) {
+    if total == 0 || visible == 0 {
+        return (0, 0);
+    }
+    let visible = visible.min(total);
+    let half = visible / 2;
+    // Center the selection, clamping at the top.
+    let mut start = selected.saturating_sub(half);
+    // Pull start in so end never overshoots `total`.
+    if start + visible > total {
+        start = total - visible;
+    }
+    let end = start + visible;
+    (start, end)
+}
+
+/// Strip bytes that would let an untrusted string drive the user's terminal
+/// — ESC (0x1B), DEL (0x7F), and other C0 control characters except `\t`.
+/// Snapshot manifests and transcript lines are user-authored or
+/// agent-authored content; if one contains a stray `\x1b[2J` it would clear
+/// the screen the moment the catalog opens. Apply this to every string
+/// that came from a snapshot before handing it to ratatui.
+///
+/// `\n` is also stripped here because the catalog/detail renderers handle
+/// line breaks themselves via separate `Line`s — letting a raw newline
+/// through would visually merge a field with the following one.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            if *c == '\t' {
+                return true;
+            }
+            !c.is_control()
+        })
+        .collect()
+}
+
+/// Truncate `s` to at most `max` characters (counting chars, not bytes).
+/// Used for one-line previews of transcript text in the detail pane.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('\u{2026}');
+        out
+    }
+}
+
+/// Format a unix-seconds timestamp relative to `now_secs` as "just now",
+/// "5m ago", "2h ago", "3d ago", etc. Saturates at "1y+ ago" so very old
+/// timestamps don't render an awkwardly large number.
+fn format_relative_time(then_secs: u64, now_secs: u64) -> String {
+    let delta = now_secs.saturating_sub(then_secs);
+    if delta < 60 {
+        return "just now".to_string();
+    }
+    let minutes = delta / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    if days < 365 {
+        return format!("{days}d ago");
+    }
+    "1y+ ago".to_string()
 }
 
 pub(crate) fn handle_save_snapshot(
@@ -2770,6 +3217,30 @@ impl App {
     /// design's two upfront error toasts (engine not supported, no
     /// transcript yet) so the modal only opens when a save can plausibly
     /// succeed. See `DESIGN_AGENT_MEMORIES.md` save flow.
+    /// Load all saved snapshots and open the catalog modal in browse
+    /// mode. Toasts if the on-disk list can't be read; otherwise opens
+    /// even when there are zero snapshots (the empty-state render tells
+    /// the user how to create one).
+    ///
+    /// `is_picker` is plumbed through for chunk 5's seed-from-snapshot
+    /// field; chunk 4 only ever calls this with `false`.
+    fn open_snapshot_catalog(&mut self, is_picker: bool) {
+        let snapshots = match agent_memory::list() {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_status_msg(&format!("Could not list snapshots: {e}"));
+                return;
+            }
+        };
+        self.input_mode = InputMode::SnapshotCatalog {
+            snapshots,
+            selected: 0,
+            mode: CatalogMode::Browse,
+            is_picker,
+            status_msg: None,
+        };
+    }
+
     fn open_save_snapshot(&mut self) {
         let (wi, si) = match self.cursor {
             Cursor::Session(wi, si) => (wi, si),
@@ -4795,6 +5266,10 @@ impl App {
                         self.open_save_snapshot();
                         return true;
                     }
+                    KeyCode::Char('z') => {
+                        self.open_snapshot_catalog(false);
+                        return true;
+                    }
                     KeyCode::Char('n') => {
                         self.start_new_session();
                         return true;
@@ -5122,6 +5597,23 @@ impl App {
                 InputCtx { repo_urls: &urls },
                 event,
             ),
+            InputMode::SnapshotCatalog {
+                snapshots,
+                selected,
+                mode,
+                is_picker,
+                status_msg,
+            } => handle_snapshot_catalog(
+                SnapshotCatalogMut {
+                    snapshots,
+                    selected,
+                    mode,
+                    is_picker: *is_picker,
+                    status_msg,
+                },
+                InputCtx { repo_urls: &urls },
+                event,
+            ),
             InputMode::TaskSettings { task_id, name } => handle_task_settings(
                 TaskSettingsMut {
                     task_id: task_id.as_str(),
@@ -5259,6 +5751,14 @@ impl App {
                     name,
                     description,
                 );
+            }
+            SubmitAction::SnapshotPicked { name } => {
+                // Picker-mode result. Chunk 4 never opens the catalog in
+                // picker mode; chunk 5 will wire this to the seed-from
+                // field on the new-session form. For now we just toast so
+                // the variant has somewhere to land if a misbehaving caller
+                // emits it.
+                let _ = name;
             }
             SubmitAction::SaveTaskName { task_id, name } => {
                 if !name.is_empty() {
@@ -6646,6 +7146,23 @@ impl App {
                         error.as_deref(),
                     );
                 }
+                InputMode::SnapshotCatalog {
+                    snapshots,
+                    selected,
+                    mode,
+                    is_picker,
+                    status_msg,
+                } => {
+                    self.draw_snapshot_catalog(
+                        frame,
+                        area,
+                        snapshots,
+                        *selected,
+                        mode,
+                        *is_picker,
+                        status_msg.as_deref(),
+                    );
+                }
                 InputMode::WorkflowPicker { names, selected, .. } => {
                     self.draw_workflow_picker(frame, area, names, *selected);
                 }
@@ -7031,7 +7548,10 @@ impl App {
         ];
 
         if let Some(msg) = error {
-            lines.push(Line::from(Span::styled(msg.to_string(), red)));
+            // Validation errors that quote an offending character can
+            // include ESC / control bytes — sanitize on render so they
+            // don't drive the terminal.
+            lines.push(Line::from(Span::styled(sanitize_for_display(msg), red)));
             lines.push(Line::from(""));
         }
 
@@ -7191,7 +7711,7 @@ impl App {
             ("A-h    hide", "A-y  history"),
             ("A-f    workflow", "A-u  resume"),
             ("A-o    stop wf", "A-,  activity"),
-            ("A-b    snapshot", ""),
+            ("A-b    snapshot", "A-z  catalog"),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -8167,6 +8687,345 @@ impl App {
             .style(Style::default().fg(Color::White));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
+    }
+
+    pub fn draw_snapshot_catalog(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshots: &[agent_memory::Snapshot],
+        selected: usize,
+        mode: &CatalogMode,
+        is_picker: bool,
+        status_msg: Option<&str>,
+    ) {
+        // Each sub-mode reuses the same outer dialog so transitions feel
+        // in-place. Browse renders the list; Detail overlays the manifest
+        // and head/tail; Rename overlays an inline editor; ConfirmDelete
+        // overlays a y/n prompt.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let width = area.width.min(78).max(40);
+        let height = area.height.min(28).max(8);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let title = match (is_picker, mode) {
+            (true, _) => " Pick Snapshot ",
+            (false, CatalogMode::Detail { .. }) => " Snapshot Detail ",
+            (false, CatalogMode::Rename { .. }) => " Rename Snapshot ",
+            (false, CatalogMode::ConfirmDelete) => " Delete Snapshot ",
+            _ => " Snapshots ",
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().fg(Color::White)));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+        let cyan = Style::default().fg(Color::Cyan);
+        let yellow = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let red = Style::default().fg(Color::Red);
+
+        if snapshots.is_empty() {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "No snapshots saved yet.",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Focus a claude / codex session and press A-b to save one.",
+                    dim,
+                )),
+                Line::from(""),
+            ];
+            if let Some(msg) = status_msg {
+                lines.push(Line::from(Span::styled(
+                    sanitize_for_display(msg),
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled("Esc / A-z close", dim)));
+            frame.render_widget(Paragraph::new(lines), inner);
+            return;
+        }
+
+        // Reserve rows for the footer (blank + optional status + hint).
+        // Cap the visible row count by the inner area so the selection
+        // never scrolls off-screen and the footer is always visible —
+        // a long list without windowing would silently let the user
+        // rename / delete an invisible row.
+        let footer_rows: u16 = 1 // blank separator
+            + if status_msg.is_some() { 1 } else { 0 }
+            + 1; // hint
+        let visible_rows = inner
+            .height
+            .saturating_sub(footer_rows) as usize;
+        let (row_start, row_end) =
+            visible_range(selected, snapshots.len(), visible_rows);
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (idx, snap) in snapshots[row_start..row_end].iter().enumerate() {
+            let global_idx = row_start + idx;
+            let is_active = global_idx == selected;
+            let cursor = if is_active { "▸ " } else { "  " };
+            let engine = match snap.manifest.engine {
+                Engine::ClaudeCode => "claude-code",
+                Engine::Codex => "codex",
+            };
+            let when =
+                format_relative_time(snap.manifest.created_at_unix, now_secs);
+            // Sanitize every snapshot-sourced string — manifests come from
+            // disk and could include ANSI/OSC bytes that would otherwise
+            // execute against the user's terminal on render.
+            let safe_name = sanitize_for_display(&snap.name);
+            let desc_first = sanitize_for_display(
+                snap.manifest.description.lines().next().unwrap_or(""),
+            );
+
+            let name_style = if is_active { yellow } else { cyan };
+            let meta_style = if is_active { white } else { dim };
+            let mut spans = vec![
+                Span::raw(cursor),
+                Span::styled(format!("{safe_name:<24}"), name_style),
+                Span::styled(format!("{engine:<13}"), meta_style),
+                Span::styled(format!("{when:<10}"), meta_style),
+            ];
+            if !desc_first.is_empty() {
+                spans.push(Span::styled(desc_first, meta_style));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+        if let Some(msg) = status_msg {
+            lines.push(Line::from(Span::styled(
+                sanitize_for_display(msg),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        let total = snapshots.len();
+        let hint = if is_picker {
+            "j/k select \u{00b7} Enter pick \u{00b7} Esc / A-z cancel"
+        } else {
+            "j/k select \u{00b7} Enter detail \u{00b7} r rename \u{00b7} d delete \u{00b7} Esc / A-z close"
+        };
+        // Indicator like " 41/53 " when only a window is visible, so the
+        // user can tell their selection is part of a longer list.
+        let footer = if row_end - row_start < total {
+            format!(
+                "{hint}    [{}/{}]",
+                selected.saturating_add(1),
+                total,
+            )
+        } else {
+            hint.to_string()
+        };
+        lines.push(Line::from(Span::styled(footer, dim)));
+
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        // Sub-mode overlays.
+        match mode {
+            CatalogMode::Browse => {}
+            CatalogMode::Detail { head, tail } => {
+                if let Some(snap) = snapshots.get(selected) {
+                    self.draw_snapshot_detail(frame, inner, snap, head, tail);
+                }
+            }
+            CatalogMode::Rename { text, error } => {
+                self.draw_snapshot_rename_overlay(
+                    frame,
+                    inner,
+                    text,
+                    error.as_deref(),
+                );
+            }
+            CatalogMode::ConfirmDelete => {
+                if let Some(snap) = snapshots.get(selected) {
+                    self.draw_snapshot_delete_overlay(frame, inner, &snap.name);
+                }
+            }
+        }
+        let _ = (white, red);
+    }
+
+    fn draw_snapshot_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snap: &agent_memory::Snapshot,
+        head: &[String],
+        tail: &[String],
+    ) {
+        let width = area.width.saturating_sub(2).min(74).max(30);
+        let height = area.height.saturating_sub(2).min(22).max(6);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+        frame.render_widget(Clear, dialog);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                format!(" {} ", sanitize_for_display(&snap.name)),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let engine = match snap.manifest.engine {
+            Engine::ClaudeCode => "claude-code",
+            Engine::Codex => "codex",
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        // Every snapshot-sourced string is sanitized — manifests live on
+        // disk and could carry ANSI/OSC byte sequences that would
+        // otherwise be replayed into the user's terminal here.
+        let kv = |k: &str, v: &str| {
+            Line::from(vec![
+                Span::styled(format!("{k:<16}"), dim),
+                Span::styled(sanitize_for_display(v), white),
+            ])
+        };
+        lines.push(kv("Engine:", engine));
+        lines.push(kv(
+            "Created:",
+            &format_relative_time(snap.manifest.created_at_unix, now_secs),
+        ));
+        lines.push(kv(
+            "Transcript:",
+            &format!("{} bytes", snap.manifest.transcript_bytes),
+        ));
+        lines.push(kv(
+            "Memory files:",
+            &snap.manifest.memory_files.to_string(),
+        ));
+        lines.push(kv("Source UID:", &snap.manifest.source_session_uid));
+        lines.push(kv(
+            "Source transcript:",
+            &snap.manifest.source_transcript_id,
+        ));
+        lines.push(kv(
+            "Source cwd:",
+            &snap.manifest.source_cwd.display().to_string(),
+        ));
+        if !snap.manifest.description.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Description", dim)));
+            for ln in snap.manifest.description.lines() {
+                lines.push(Line::from(Span::styled(
+                    sanitize_for_display(ln),
+                    white,
+                )));
+            }
+        }
+        if !head.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Transcript head", dim)));
+            for ln in head {
+                lines.push(Line::from(Span::styled(
+                    truncate(&sanitize_for_display(ln), 72),
+                    white,
+                )));
+            }
+        }
+        if !tail.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Transcript tail", dim)));
+            for ln in tail {
+                lines.push(Line::from(Span::styled(
+                    truncate(&sanitize_for_display(ln), 72),
+                    white,
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Esc / Enter back", dim)));
+
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+    }
+
+    fn draw_snapshot_rename_overlay(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        text: &str,
+        error: Option<&str>,
+    ) {
+        let width = area.width.min(60).max(30);
+        let height = if error.is_some() { 9u16 } else { 7u16 };
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+        frame.render_widget(Clear, dialog);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" Rename ", Style::default().fg(Color::White)));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+
+        let lines = rename_overlay_lines(text, error);
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_snapshot_delete_overlay(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        name: &str,
+    ) {
+        let width = area.width.min(60).max(30);
+        let height = 5u16;
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+        frame.render_widget(Clear, dialog);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(" Confirm ", Style::default().fg(Color::White)));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("Delete snapshot `{}`?", sanitize_for_display(name)),
+                white,
+            )),
+            Line::from(""),
+            Line::from(Span::styled("y / Enter confirm \u{00b7} n / Esc cancel", dim)),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     pub fn draw_workflow_launch(
@@ -10079,6 +10938,550 @@ mod input_handler_tests {
             &key(KeyCode::Esc),
         );
         assert_cancel(&outcome);
+    }
+
+    // ── SnapshotCatalog ───────────────────────────────────────────
+
+    fn fake_snapshot(name: &str) -> agent_memory::Snapshot {
+        use agent_memory::{Manifest, Snapshot, MANIFEST_VERSION};
+        Snapshot {
+            name: name.to_string(),
+            dir: std::path::PathBuf::from("/dev/null"),
+            manifest: Manifest {
+                version: MANIFEST_VERSION,
+                description: String::new(),
+                engine: Engine::ClaudeCode,
+                source_session_uid: "uid".into(),
+                source_transcript_id: "tid".into(),
+                source_cwd: std::path::PathBuf::from("/tmp"),
+                created_at_unix: 0,
+                transcript_bytes: 0,
+                memory_files: 0,
+            },
+        }
+    }
+
+    fn alt(code: KeyCode) -> CrosstermEvent {
+        CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            code,
+            KeyModifiers::ALT,
+        ))
+    }
+
+    #[test]
+    fn catalog_jk_wraps_around_list() {
+        let mut snaps = vec![fake_snapshot("a"), fake_snapshot("b"), fake_snapshot("c")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Browse;
+
+        // j j j → wrap back to 0
+        for _ in 0..3 {
+            handle_snapshot_catalog(
+                SnapshotCatalogMut {
+                    snapshots: &mut snaps,
+                    selected: &mut selected,
+                    mode: &mut mode,
+                    is_picker: false,
+                    status_msg: &mut None,
+                },
+                ctx_no_repos(),
+                &key(KeyCode::Char('j')),
+            );
+        }
+        assert_eq!(selected, 0);
+
+        // k → wraps to last
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('k')),
+        );
+        assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn catalog_browse_enter_opens_detail() {
+        let mut snaps = vec![fake_snapshot("a")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Browse;
+        let outcome = handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        assert_consumed(&outcome);
+        assert!(matches!(mode, CatalogMode::Detail { .. }));
+    }
+
+    #[test]
+    fn catalog_picker_enter_submits_snapshot_name() {
+        let mut snaps = vec![fake_snapshot("alpha"), fake_snapshot("beta")];
+        let mut selected = 1usize;
+        let mut mode = CatalogMode::Browse;
+        let outcome = handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: true,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SnapshotPicked { name }) => {
+                assert_eq!(name, "beta");
+            }
+            other => panic!("expected SnapshotPicked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_browse_r_opens_rename_with_current_name() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Browse;
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('r')),
+        );
+        match mode {
+            CatalogMode::Rename { text, error } => {
+                assert_eq!(text, "alpha");
+                assert!(error.is_none());
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_browse_d_opens_confirm_delete() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Browse;
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('d')),
+        );
+        assert!(matches!(mode, CatalogMode::ConfirmDelete));
+    }
+
+    #[test]
+    fn catalog_picker_disables_rename_and_delete() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+
+        for ch in ['r', 'd'] {
+            let mut mode = CatalogMode::Browse;
+            handle_snapshot_catalog(
+                SnapshotCatalogMut {
+                    snapshots: &mut snaps,
+                    selected: &mut selected,
+                    mode: &mut mode,
+                    is_picker: true,
+                    status_msg: &mut None,
+                },
+                ctx_no_repos(),
+                &key(KeyCode::Char(ch)),
+            );
+            assert!(
+                matches!(mode, CatalogMode::Browse),
+                "picker mode should ignore `{ch}`, stayed in: {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_alt_z_cancels_from_any_sub_mode() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+
+        for start in [
+            CatalogMode::Browse,
+            CatalogMode::Detail {
+                head: Vec::new(),
+                tail: Vec::new(),
+            },
+            CatalogMode::Rename {
+                text: "x".into(),
+                error: None,
+            },
+            CatalogMode::ConfirmDelete,
+        ] {
+            let mut mode = start;
+            let outcome = handle_snapshot_catalog(
+                SnapshotCatalogMut {
+                    snapshots: &mut snaps,
+                    selected: &mut selected,
+                    mode: &mut mode,
+                    is_picker: false,
+                    status_msg: &mut None,
+                },
+                ctx_no_repos(),
+                &alt(KeyCode::Char('z')),
+            );
+            assert_cancel(&outcome);
+        }
+    }
+
+    #[test]
+    fn catalog_detail_esc_returns_to_browse() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Detail {
+            head: Vec::new(),
+            tail: Vec::new(),
+        };
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert!(matches!(mode, CatalogMode::Browse));
+    }
+
+    #[test]
+    fn catalog_rename_typing_and_backspace() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Rename {
+            text: "alp".into(),
+            error: Some("prior".into()),
+        };
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('x')),
+        );
+        match &mode {
+            CatalogMode::Rename { text, error } => {
+                assert_eq!(text, "alpx");
+                assert!(error.is_none(), "typing should clear prior error");
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Backspace),
+        );
+        match &mode {
+            CatalogMode::Rename { text, .. } => assert_eq!(text, "alp"),
+            other => panic!("expected Rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_rename_esc_returns_to_browse() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::Rename {
+            text: "alpha-v2".into(),
+            error: None,
+        };
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert!(matches!(mode, CatalogMode::Browse));
+    }
+
+    #[test]
+    fn catalog_confirm_delete_n_returns_to_browse() {
+        let mut snaps = vec![fake_snapshot("alpha")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::ConfirmDelete;
+        handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('n')),
+        );
+        assert!(matches!(mode, CatalogMode::Browse));
+        // List untouched on cancel.
+        assert_eq!(snaps.len(), 1);
+    }
+
+    #[test]
+    fn format_relative_time_buckets() {
+        // Pick `now` well above one year so the 1y+ case can subtract
+        // cleanly without overflow in the literal computation.
+        let one_year_secs: u64 = 60 * 60 * 24 * 365;
+        let now: u64 = one_year_secs + 10;
+        assert_eq!(super::format_relative_time(now, now), "just now");
+        assert_eq!(super::format_relative_time(now - 59, now), "just now");
+        assert_eq!(super::format_relative_time(now - 60, now), "1m ago");
+        assert_eq!(super::format_relative_time(now - 60 * 59, now), "59m ago");
+        assert_eq!(super::format_relative_time(now - 60 * 60, now), "1h ago");
+        assert_eq!(super::format_relative_time(now - 60 * 60 * 24, now), "1d ago");
+        assert_eq!(
+            super::format_relative_time(now - one_year_secs, now),
+            "1y+ ago"
+        );
+        // Saturating subtraction so future timestamps don't panic.
+        assert_eq!(super::format_relative_time(now + 5, now), "just now");
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings_intact() {
+        assert_eq!(super::truncate("hello", 10), "hello");
+        assert_eq!(super::truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_inserts_ellipsis_when_too_long() {
+        let out = super::truncate("hello world", 6);
+        assert_eq!(out.chars().count(), 6);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn sanitize_for_display_strips_ansi_and_control_bytes() {
+        // ESC + CSI red, then "red", then ESC + CSI reset. All ESCs and
+        // control bytes must be stripped — otherwise opening the catalog
+        // replays the sequence into the user's terminal.
+        let out = super::sanitize_for_display("\x1b[31mred\x1b[0m");
+        assert!(!out.contains('\x1b'), "ESC must be stripped: {out:?}");
+        assert_eq!(out, "[31mred[0m");
+
+        // C0 controls (other than tab) and DEL are stripped.
+        let out = super::sanitize_for_display(
+            "a\x00b\x07c\x08d\x0ae\x0df\x7fg",
+        );
+        assert_eq!(out, "abcdefg");
+
+        // Tab is preserved (it's the one C0 control we let through).
+        let out = super::sanitize_for_display("a\tb");
+        assert_eq!(out, "a\tb");
+
+        // OSC (ESC ] ... BEL) — ESC and BEL both go, content between
+        // remains as inert text. Acceptable: the dangerous part is the
+        // ESC that begins the sequence; without it the terminal sees
+        // only literal characters.
+        let out = super::sanitize_for_display("\x1b]0;title\x07rest");
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
+        assert_eq!(out, "]0;titlerest");
+    }
+
+    #[test]
+    fn read_transcript_head_tail_streams_large_file() {
+        // 1000-line transcript. Head should be the first N, tail should
+        // be the last N. Function must work without slurping the whole
+        // file (covered by code review; the assertion here verifies
+        // correctness of the windowing).
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().to_path_buf();
+        let path = snap_dir.join("transcript.jsonl");
+        let mut buf = String::new();
+        for i in 0..1000 {
+            buf.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&path, buf).unwrap();
+
+        let (head, tail) = super::read_transcript_head_tail(&snap_dir, 5);
+        assert_eq!(head.len(), 5);
+        assert_eq!(head[0], "line 0");
+        assert_eq!(head[4], "line 4");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail[0], "line 995");
+        assert_eq!(tail[4], "line 999");
+    }
+
+    #[test]
+    fn read_transcript_head_tail_no_overlap_for_small_files() {
+        // 8 lines, n=5 → head = 0..4, tail = 5..7. (Tail must not
+        // include lines already in head.)
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir.path().to_path_buf();
+        let path = snap_dir.join("transcript.jsonl");
+        let buf: String = (0..8).map(|i| format!("L{i}\n")).collect();
+        std::fs::write(&path, buf).unwrap();
+
+        let (head, tail) = super::read_transcript_head_tail(&snap_dir, 5);
+        assert_eq!(head, vec!["L0", "L1", "L2", "L3", "L4"]);
+        assert_eq!(tail, vec!["L5", "L6", "L7"]);
+    }
+
+    #[test]
+    fn read_transcript_head_tail_empty_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (head, tail) =
+            super::read_transcript_head_tail(dir.path(), 5);
+        assert!(head.is_empty());
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn snapshot_rename_error_is_sanitized_on_render() {
+        // Render the rename overlay with an ANSI-laced validation error
+        // into a TestBackend and inspect the buffer. No ESC byte should
+        // appear anywhere on screen — otherwise a paste-injected name
+        // that fails `validate_name` would echo its bytes back through
+        // the terminal when the error renders.
+        //
+        // Render methods on `App` for this overlay don't dereference
+        // `self`, so we can avoid building a full App by using ratatui's
+        // pure widget API directly to construct the same lines the
+        // method does and asserting on that. (Tested via the line-build
+        // helper below — extracted from the render method so the test
+        // can drive it without a Terminal.)
+        let lines = rename_overlay_lines("newname", Some("invalid character: '\x1b[31m'"));
+        // Flatten all spans into a single text dump.
+        let dump: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            !dump.contains('\x1b'),
+            "ESC byte present in rendered text: {dump:?}"
+        );
+        // Sanitized text is still visible.
+        assert!(
+            dump.contains("invalid character"),
+            "expected the (sanitized) error text on screen, got: {dump:?}"
+        );
+    }
+
+    #[test]
+    fn visible_range_centers_selection_when_possible() {
+        // selected=40, total=50, visible=10 → window around 40 with 5
+        // items above the selection (half = 10/2 = 5) and 4 after.
+        let (start, end) = super::visible_range(40, 50, 10);
+        assert_eq!(end - start, 10, "window must be exactly visible-sized");
+        assert!(
+            start <= 40 && 40 < end,
+            "selected 40 must be within window [{start}, {end})"
+        );
+        assert_eq!(start, 35);
+        assert_eq!(end, 45);
+    }
+
+    #[test]
+    fn visible_range_clamps_at_top() {
+        let (start, end) = super::visible_range(0, 50, 10);
+        assert_eq!((start, end), (0, 10));
+    }
+
+    #[test]
+    fn visible_range_clamps_at_bottom() {
+        let (start, end) = super::visible_range(49, 50, 10);
+        assert_eq!((start, end), (40, 50));
+    }
+
+    #[test]
+    fn visible_range_fits_whole_list_when_room_allows() {
+        let (start, end) = super::visible_range(2, 5, 10);
+        assert_eq!((start, end), (0, 5));
+    }
+
+    #[test]
+    fn visible_range_handles_empty_or_zero_height() {
+        assert_eq!(super::visible_range(0, 0, 10), (0, 0));
+        assert_eq!(super::visible_range(3, 10, 0), (0, 0));
+    }
+
+    #[test]
+    fn catalog_delete_failure_preserves_list_and_surfaces_error() {
+        // Construct an in-memory snapshot list whose entries don't exist
+        // on disk under HOME. `agent_memory::delete` returns NotFound;
+        // the handler must keep the list intact and set status_msg
+        // instead of silently blanking the list via list().unwrap_or_default().
+        use crate::test_support::home_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path();
+
+        let mut snaps = vec![fake_snapshot("ghost"), fake_snapshot("other")];
+        let mut selected = 0usize;
+        let mut mode = CatalogMode::ConfirmDelete;
+        let mut status: Option<String> = None;
+
+        let _guard = home_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", fake_home) };
+        let outcome = handle_snapshot_catalog(
+            SnapshotCatalogMut {
+                snapshots: &mut snaps,
+                selected: &mut selected,
+                mode: &mut mode,
+                is_picker: false,
+                status_msg: &mut status,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('y')),
+        );
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_consumed(&outcome);
+        assert_eq!(snaps.len(), 2, "list must be preserved on delete failure");
+        assert_eq!(snaps[0].name, "ghost");
+        assert!(matches!(mode, CatalogMode::Browse));
+        let msg = status.expect("status_msg should be set on delete failure");
+        assert!(
+            msg.starts_with("Delete failed: "),
+            "expected delete-failure status, got: {msg:?}"
+        );
     }
 
     // ── TaskSettings ──────────────────────────────────────────────
