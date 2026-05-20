@@ -409,6 +409,46 @@ impl Drop for TmpDirGuard<'_> {
 pub struct ClonedSession {
     pub transcript_id: String,
     pub transcript_path: PathBuf,
+    /// Per-file pre-clone state so callers can fully roll the clone back
+    /// if a downstream step (e.g. agent spawn) fails. Without this, a
+    /// failed Claude launch would leave snapshot memory files merged
+    /// into the worktree — a subsequent unseeded session would silently
+    /// inherit them. See `cleanup_clone`.
+    pub rollback: ClonedRollback,
+}
+
+/// Captured state for unwinding a `clone_into_session` after a downstream
+/// failure. Always populated by `clone_into_session`; for Codex the
+/// memory-related fields are empty since Codex has no per-cwd memory dir.
+#[derive(Clone, Debug, Default)]
+pub struct ClonedRollback {
+    /// `Some(path)` when the clone created the destination memory dir
+    /// from scratch (claude only). On cleanup, removed if empty.
+    pub created_memory_dir: Option<PathBuf>,
+    /// One entry per memory file the clone wrote at the destination. On
+    /// cleanup, each is reverted to its pre-clone state — newly-created
+    /// files are removed, pre-existing files have their captured
+    /// original bytes restored.
+    pub memory_files: Vec<MemoryFileRollback>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryFileRollback {
+    pub path: PathBuf,
+    /// `None`: the destination file did not exist before the clone —
+    /// cleanup removes it.
+    /// `Some(snapshot)`: the destination existed and we overwrote it —
+    /// cleanup writes the bytes back AND restores the captured
+    /// permissions. Without permission restoration a private file
+    /// (e.g. `0600`) could be silently relaxed to whatever mode the
+    /// snapshot tmp ended up with (typically `0644`).
+    pub original: Option<MemoryFileSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryFileSnapshot {
+    pub bytes: Vec<u8>,
+    pub permissions: std::fs::Permissions,
 }
 
 /// Materialize a snapshot into the on-disk locations a freshly-spawned
@@ -449,7 +489,7 @@ fn clone_claude(snapshot: &Snapshot, new_cwd: &Path) -> Result<ClonedSession> {
         None
     };
 
-    clone_claude_inner(
+    let rollback = clone_claude_inner(
         &src_transcript,
         src_memory_dir.as_deref(),
         &dst_transcript,
@@ -459,6 +499,7 @@ fn clone_claude(snapshot: &Snapshot, new_cwd: &Path) -> Result<ClonedSession> {
     Ok(ClonedSession {
         transcript_id,
         transcript_path: dst_transcript,
+        rollback,
     })
 }
 
@@ -476,7 +517,7 @@ fn clone_claude_inner(
     src_memory_dir: Option<&Path>,
     dst_transcript: &Path,
     dst_memory_dir: &Path,
-) -> Result<()> {
+) -> Result<ClonedRollback> {
     if dst_transcript.exists() {
         return Err(SnapshotError::AlreadyExists);
     }
@@ -538,29 +579,124 @@ fn clone_claude_inner(
     // within the same dir are atomic on POSIX and effectively never fail
     // once staging succeeds, but ENOSPC and a pre-existing non-file at a
     // destination path are both real possibilities.)
+    //
+    // For each successful commit we capture the destination's pre-clone
+    // bytes into `committed_files` so a downstream caller can call
+    // `cleanup_clone` to fully unwind the merge — without that, a failed
+    // spawn would leave snapshot memory files contaminating the worktree.
+    let mut committed_files: Vec<MemoryFileRollback> = Vec::new();
     for (i, sm) in staged_memory.iter().enumerate() {
+        // Capture pre-clone bytes AND permissions before the rename
+        // commits. fs::rename swaps the inode for the snapshot tmp's,
+        // taking its mode with it — without capturing permissions, a
+        // private `0600` file would be silently restored as `0644`.
+        let original: Option<MemoryFileSnapshot> = match fs::read(&sm.dst) {
+            Ok(bytes) => match fs::metadata(&sm.dst) {
+                Ok(meta) => Some(MemoryFileSnapshot {
+                    bytes,
+                    permissions: meta.permissions(),
+                }),
+                Err(e) => {
+                    for done in &committed_files {
+                        restore_memory_file(done);
+                    }
+                    for other in &staged_memory[i..] {
+                        let _ = fs::remove_file(&other.tmp);
+                    }
+                    let _ = fs::remove_file(&tmp_transcript);
+                    if created_memory_dir {
+                        let _ = fs::remove_dir(dst_memory_dir);
+                    }
+                    return Err(e.into());
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                // Pre-clone read failed for some other reason
+                // (permission, etc.). Bail and roll back partial commits.
+                for done in &committed_files {
+                    restore_memory_file(done);
+                }
+                for other in &staged_memory[i..] {
+                    let _ = fs::remove_file(&other.tmp);
+                }
+                let _ = fs::remove_file(&tmp_transcript);
+                if created_memory_dir {
+                    let _ = fs::remove_dir(dst_memory_dir);
+                }
+                return Err(e.into());
+            }
+        };
         if let Err(e) = fs::rename(&sm.tmp, &sm.dst) {
-            // Best-effort cleanup: any memory tmps that haven't been
-            // renamed yet, plus the staged transcript (never committed).
-            // Memory files committed earlier in the loop stay at the
-            // destination — we can't reverse them, but they don't block
-            // a retry because the transcript wasn't committed.
+            // Rename failed: roll back any commits we've made so far,
+            // remove remaining staged tmps + the staged transcript.
+            for done in &committed_files {
+                restore_memory_file(done);
+            }
             for other in &staged_memory[i..] {
                 let _ = fs::remove_file(&other.tmp);
             }
             let _ = fs::remove_file(&tmp_transcript);
+            if created_memory_dir {
+                let _ = fs::remove_dir(dst_memory_dir);
+            }
             return Err(e.into());
         }
+        committed_files.push(MemoryFileRollback {
+            path: sm.dst.clone(),
+            original,
+        });
     }
 
     if let Err(e) = fs::rename(&tmp_transcript, dst_transcript) {
-        // Memory was fully committed; the transcript never landed. Clean up
-        // the staged transcript so it doesn't linger as `.tmp-*` cruft.
+        // Memory was fully committed; the transcript never landed.
+        // Restore each committed memory file to its pre-clone state and
+        // clean up the staged transcript so retries aren't blocked.
+        for done in &committed_files {
+            restore_memory_file(done);
+        }
         let _ = fs::remove_file(&tmp_transcript);
+        if created_memory_dir {
+            let _ = fs::remove_dir(dst_memory_dir);
+        }
         return Err(e.into());
     }
 
-    Ok(())
+    Ok(ClonedRollback {
+        created_memory_dir: if created_memory_dir {
+            Some(dst_memory_dir.to_path_buf())
+        } else {
+            None
+        },
+        memory_files: committed_files,
+    })
+}
+
+fn restore_memory_file(item: &MemoryFileRollback) {
+    match &item.original {
+        Some(snap) => {
+            // The file at `item.path` is the snapshot tmp's inode after
+            // the clone's rename; it carries the snapshot file's mode,
+            // which can be read-only (`0444`). `fs::write` on a
+            // read-only file fails with PermissionDenied — and silently
+            // leaving the user's worktree with snapshot contents at
+            // snapshot permissions is exactly the leak this rollback
+            // exists to prevent.
+            //
+            // Remove-then-create sidesteps the issue: removing a file
+            // only requires write on the *directory*, which the user
+            // must have had pre-clone for the original file to exist.
+            // The fresh `fs::write` creates the inode with default
+            // mode; `set_permissions` then installs the captured one.
+            let _ = fs::remove_file(&item.path);
+            if fs::write(&item.path, &snap.bytes).is_ok() {
+                let _ = fs::set_permissions(&item.path, snap.permissions.clone());
+            }
+        }
+        None => {
+            let _ = fs::remove_file(&item.path);
+        }
+    }
 }
 
 struct StagedMemoryFile {
@@ -632,7 +768,31 @@ fn clone_codex(snapshot: &Snapshot, new_cwd: &Path) -> Result<ClonedSession> {
     Ok(ClonedSession {
         transcript_id: new_id,
         transcript_path: dst,
+        // Codex has no per-cwd memory dir to merge into — rollback is
+        // just the transcript file, handled by `cleanup_clone` directly.
+        rollback: ClonedRollback::default(),
     })
+}
+
+/// Undo a `clone_into_session` after a downstream failure (e.g. agent
+/// spawn errored). Removes the transcript and restores every merged
+/// memory file to its pre-clone bytes (or deletes newly-created ones).
+/// Best-effort: errors are swallowed so the caller can keep surfacing
+/// the original failure without nested error reporting.
+///
+/// Safe to call multiple times; safe to call when the transcript or
+/// memory files are already gone (the rollback simply no-ops on each
+/// missing file).
+pub fn cleanup_clone(cloned: &ClonedSession) {
+    let _ = fs::remove_file(&cloned.transcript_path);
+    for item in &cloned.rollback.memory_files {
+        restore_memory_file(item);
+    }
+    if let Some(dir) = &cloned.rollback.created_memory_dir {
+        // remove_dir succeeds only if the dir is empty. If a concurrent
+        // writer dropped files in there we leave them alone.
+        let _ = fs::remove_dir(dir);
+    }
 }
 
 /// Rewrite line 1 of a Codex JSONL transcript: replace `payload.id` and
@@ -1117,6 +1277,158 @@ mod tests {
         assert!(
             !dst_memory_dir.exists(),
             "freshly-created memory dir should be removed on rollback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_clone_restores_file_mode_not_just_bytes() {
+        // Regression: previous rollback wrote original bytes back but
+        // left the file with the snapshot tmp's mode (typically 0644).
+        // If the user's memory file was 0600 (private), a failed seeded
+        // launch would silently relax it world-readable. The fix
+        // captures fs::Permissions alongside bytes and restores both.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_transcript = dir.path().join("src.jsonl");
+        fs::write(&src_transcript, b"line\n").unwrap();
+
+        let src_mem = dir.path().join("src_mem");
+        fs::create_dir(&src_mem).unwrap();
+        fs::write(src_mem.join("MEMORY.md"), b"SNAPSHOT").unwrap();
+
+        // Pre-existing user file with restrictive 0600 perms.
+        let dst_mem = dir.path().join("dst/memory");
+        fs::create_dir_all(&dst_mem).unwrap();
+        let user_file = dst_mem.join("MEMORY.md");
+        fs::write(&user_file, b"USER ORIGINAL").unwrap();
+        let mut user_perms = fs::metadata(&user_file).unwrap().permissions();
+        user_perms.set_mode(0o600);
+        fs::set_permissions(&user_file, user_perms).unwrap();
+        // Sanity: the user file is 0600 before clone.
+        assert_eq!(
+            fs::metadata(&user_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let dst_transcript = dir.path().join("dst/t.jsonl");
+
+        let rollback = clone_claude_inner(
+            &src_transcript,
+            Some(&src_mem),
+            &dst_transcript,
+            &dst_mem,
+        )
+        .unwrap();
+        let cloned = ClonedSession {
+            transcript_id: "tid".into(),
+            transcript_path: dst_transcript,
+            rollback,
+        };
+
+        // After clone, the file was overwritten — both content and
+        // (because rename swapped the inode) mode now reflect the
+        // snapshot tmp. Sanity-check the rename happened.
+        assert_eq!(fs::read(&user_file).unwrap(), b"SNAPSHOT");
+
+        // Trigger rollback.
+        cleanup_clone(&cloned);
+
+        // Bytes AND mode must be restored.
+        assert_eq!(
+            fs::read(&user_file).unwrap(),
+            b"USER ORIGINAL",
+            "bytes must be restored"
+        );
+        assert_eq!(
+            fs::metadata(&user_file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "0600 mode must be restored after rollback — silent loosening to 0644 is a security regression"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_clone_restores_over_readonly_snapshot_replacement() {
+        // Inverse of the previous mode-preservation test. The snapshot's
+        // memory file is 0444; the clone's `fs::copy` preserves that
+        // mode into the tmp file, and the subsequent rename leaves the
+        // user's destination path bound to that read-only inode. The
+        // first rollback iteration's `fs::write` would then fail with
+        // PermissionDenied — silently leaving the user's worktree with
+        // snapshot contents at snapshot permissions, which is exactly
+        // the leak the rollback was supposed to prevent.
+        //
+        // The fix is remove-then-create inside `restore_memory_file`,
+        // which works because directory write perms are presumed (the
+        // original file existed in the dir pre-clone, so the user has
+        // write on the dir).
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_transcript = dir.path().join("src.jsonl");
+        fs::write(&src_transcript, b"line\n").unwrap();
+
+        // Source memory file is read-only (0444). fs::copy preserves
+        // mode, so after the clone's rename the destination is also
+        // read-only.
+        let src_mem = dir.path().join("src_mem");
+        fs::create_dir(&src_mem).unwrap();
+        let src_file = src_mem.join("MEMORY.md");
+        fs::write(&src_file, b"SNAPSHOT").unwrap();
+        let mut src_perms = fs::metadata(&src_file).unwrap().permissions();
+        src_perms.set_mode(0o444);
+        fs::set_permissions(&src_file, src_perms).unwrap();
+
+        // User's pre-existing file is 0600.
+        let dst_mem = dir.path().join("dst/memory");
+        fs::create_dir_all(&dst_mem).unwrap();
+        let user_file = dst_mem.join("MEMORY.md");
+        fs::write(&user_file, b"USER ORIGINAL").unwrap();
+        let mut user_perms = fs::metadata(&user_file).unwrap().permissions();
+        user_perms.set_mode(0o600);
+        fs::set_permissions(&user_file, user_perms).unwrap();
+
+        let dst_transcript = dir.path().join("dst/t.jsonl");
+
+        let rollback = clone_claude_inner(
+            &src_transcript,
+            Some(&src_mem),
+            &dst_transcript,
+            &dst_mem,
+        )
+        .unwrap();
+        let cloned = ClonedSession {
+            transcript_id: "tid".into(),
+            transcript_path: dst_transcript,
+            rollback,
+        };
+
+        // After the clone, the destination has snapshot bytes and the
+        // snapshot's read-only mode — this is the state the rollback
+        // has to recover from.
+        assert_eq!(fs::read(&user_file).unwrap(), b"SNAPSHOT");
+        assert_eq!(
+            fs::metadata(&user_file).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "clone should have moved the read-only snapshot inode into place"
+        );
+
+        cleanup_clone(&cloned);
+
+        // After rollback: bytes restored AND mode back to 0600.
+        // Critically the prior implementation would have failed the
+        // fs::write here and left snapshot bytes + 0444 perms on disk.
+        assert_eq!(
+            fs::read(&user_file).unwrap(),
+            b"USER ORIGINAL",
+            "bytes must be restored even when the snapshot replacement was read-only"
+        );
+        assert_eq!(
+            fs::metadata(&user_file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "0600 mode must be restored after rollback"
         );
     }
 

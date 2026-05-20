@@ -985,16 +985,35 @@ enum InputMode {
         branch_text: String,
         idle_timeout_text: String,
         repo_url: String,
-        /// 0 = repo (←/→ to cycle), 1 = name, 2 = branch, 3 = idle timeout
+        /// `Some(snapshot_name)` when the session should be cloned from
+        /// that agent-memory snapshot. Filled in via the picker invoked
+        /// from field 4. See chunk 5 in DESIGN_AGENT_MEMORIES.md.
+        seed_from: Option<String>,
+        /// 0 = repo (←/→ to cycle), 1 = name, 2 = branch, 3 = idle timeout,
+        /// 4 = seed-from (Enter opens snapshot picker, Esc clears)
         active_field: u8,
     },
     /// Picking a session type to add to a workspace.
+    ///
+    /// Target identified by stable `workspace_id` (NOT positional index).
+    /// Backend events can fire `reconcile_tasks` while the form is open,
+    /// which sorts `self.workspaces`. A stored index would silently point
+    /// at the wrong workspace by submit time — the seeded clone could
+    /// land in the wrong worktree. See chunk-3's SaveSnapshot fix for
+    /// the same pattern.
     NewTerminalSession {
-        ws_index: usize,
+        workspace_id: String,
         session_type: String,
         /// Task scope inherited from the cursor when A-s was pressed. None =
         /// workspace-level session (no task subheader).
         task_id: Option<String>,
+        /// `Some(snapshot_name)` when the session should be cloned from
+        /// that agent-memory snapshot. Cleared whenever `session_type`
+        /// changes — the picker filtered to a specific engine, and we
+        /// can't carry a Codex snapshot across to a Claude session.
+        seed_from: Option<String>,
+        /// 0 = session type (j/k cycles), 1 = seed-from (Enter picks).
+        active_field: u8,
     },
     /// Editing session settings.
     SessionSettings {
@@ -1053,7 +1072,11 @@ enum InputMode {
         snapshots: Vec<agent_memory::Snapshot>,
         selected: usize,
         mode: CatalogMode,
-        is_picker: bool,
+        /// `Some` when the catalog was opened in picker mode from a parent
+        /// form — Enter on a row submits `SnapshotPicked` and the dispatch
+        /// returns to that form with `seed_from` set. `None` for the
+        /// stand-alone catalog opened via A-z.
+        picker_target: Option<PickerTarget>,
         /// Transient error/status string surfaced at the bottom of the
         /// catalog (e.g. "Delete failed: …"). Cleared on the next user
         /// input so it doesn't linger across mode transitions.
@@ -1187,11 +1210,30 @@ pub(crate) enum SubmitAction {
         label: String,
         branch: Option<String>,
         idle_timeout_secs: u16,
+        seed_from: Option<String>,
     },
     SpawnSessionOnWorkspace {
-        ws_index: usize,
+        workspace_id: String,
         session_type: String,
         task_id: Option<String>,
+        seed_from: Option<String>,
+    },
+    /// Open the snapshot catalog in picker mode from the A-n form. Carries
+    /// the form state so the catalog can re-open the form (with seed_from
+    /// set on pick or unchanged on cancel) on submit / cancel.
+    OpenSnapshotPickerForNewSession {
+        label_text: String,
+        branch_text: String,
+        idle_timeout_text: String,
+        repo_url: String,
+        existing_seed_from: Option<String>,
+    },
+    /// Open the snapshot catalog in picker mode from the A-s form.
+    OpenSnapshotPickerForNewTerminalSession {
+        workspace_id: String,
+        session_type: String,
+        task_id: Option<String>,
+        existing_seed_from: Option<String>,
     },
     SaveSessionSettings {
         ws_index: usize,
@@ -1251,13 +1293,16 @@ pub(crate) struct NewSessionMut<'a> {
     pub branch_text: &'a mut String,
     pub idle_timeout_text: &'a mut String,
     pub repo_url: &'a mut String,
+    pub seed_from: &'a mut Option<String>,
     pub active_field: &'a mut u8,
 }
 
 pub(crate) struct NewTerminalSessionMut<'a> {
-    pub ws_index: usize,
+    pub workspace_id: &'a str,
     pub session_type: &'a mut String,
     pub task_id: &'a Option<String>,
+    pub seed_from: &'a mut Option<String>,
+    pub active_field: &'a mut u8,
 }
 
 pub(crate) struct SessionSettingsMut<'a> {
@@ -1285,6 +1330,167 @@ pub(crate) struct SaveSnapshotMut<'a> {
     /// Cleared on the next user input so the previous error doesn't
     /// linger after the user starts correcting the form.
     pub error: &'a mut Option<String>,
+}
+
+/// What to return to after the catalog is opened in picker mode. Carries
+/// the form state captured at picker-open time so that Esc (cancel) and
+/// Enter (select) can both re-open the parent form with the user's typed
+/// input intact. See chunk 5 in DESIGN_AGENT_MEMORIES.md.
+///
+/// `existing_seed_from` is the form's `seed_from` value at the moment the
+/// picker was opened. Picker-cancel restores it (don't silently wipe a
+/// previously-picked snapshot just because the user opened the picker to
+/// look); picker-select overwrites it with the chosen name.
+#[derive(Debug, Clone)]
+pub enum PickerTarget {
+    NewSession {
+        label_text: String,
+        branch_text: String,
+        idle_timeout_text: String,
+        repo_url: String,
+        existing_seed_from: Option<String>,
+    },
+    NewTerminalSession {
+        workspace_id: String,
+        session_type: String,
+        task_id: Option<String>,
+        existing_seed_from: Option<String>,
+    },
+}
+
+/// Compute the next `InputMode` and optional status toast for an
+/// `open_snapshot_catalog` call given the result of
+/// `agent_memory::list()`. Pure function so the failure path —
+/// especially the recovery that re-opens the parent form when called
+/// from a picker — is unit-testable without standing up an `App`.
+///
+/// - `Ok(snapshots)`: filter by the picker target's engine (if any),
+///   build the `SnapshotCatalog` input mode. No status message.
+/// - `Err(e)` with `picker_target = Some(t)`: re-open the parent form
+///   via `rebuild_form_from_picker` so the user's typed input survives
+///   the list failure. Status message describes the error.
+/// - `Err(e)` with `picker_target = None`: drop back to `Normal` and
+///   surface the error.
+fn catalog_open_outcome(
+    list_result: Result<Vec<agent_memory::Snapshot>, agent_memory::SnapshotError>,
+    picker_target: Option<PickerTarget>,
+) -> (InputMode, Option<String>) {
+    match list_result {
+        Ok(snapshots) => {
+            let filtered = match &picker_target {
+                Some(t) => {
+                    let want = picker_target_engine(t);
+                    snapshots
+                        .into_iter()
+                        .filter(|s| Some(&s.manifest.engine) == want.as_ref())
+                        .collect()
+                }
+                None => snapshots,
+            };
+            (
+                InputMode::SnapshotCatalog {
+                    snapshots: filtered,
+                    selected: 0,
+                    mode: CatalogMode::Browse,
+                    picker_target,
+                    status_msg: None,
+                },
+                None,
+            )
+        }
+        Err(e) => {
+            let msg = format!("Could not list snapshots: {e}");
+            let mode = match picker_target {
+                Some(t) => rebuild_form_from_picker(t, None),
+                None => InputMode::Normal,
+            };
+            (mode, Some(msg))
+        }
+    }
+}
+
+/// Rebuild the parent input form after a snapshot picker round-trip.
+///
+/// - `name = Some(picked)`: overwrite `seed_from` with the picked
+///   snapshot (used by `SubmitAction::SnapshotPicked`).
+/// - `name = None`: preserve `existing_seed_from` from the target so
+///   picker-cancel doesn't silently wipe a previously-picked snapshot
+///   (the user opening the picker to look at options should be a no-op
+///   if they bail).
+///
+/// Extracted as a free function so the round-trip is unit-testable
+/// without constructing an `App`.
+fn rebuild_form_from_picker(target: PickerTarget, name: Option<String>) -> InputMode {
+    match target {
+        PickerTarget::NewSession {
+            label_text,
+            branch_text,
+            idle_timeout_text,
+            repo_url,
+            existing_seed_from,
+        } => InputMode::NewSession {
+            label_text,
+            branch_text,
+            idle_timeout_text,
+            repo_url,
+            seed_from: name.or(existing_seed_from),
+            // Keep the picker field selected so the user sees the
+            // result of their pick (or non-pick) land in context.
+            active_field: 4,
+        },
+        PickerTarget::NewTerminalSession {
+            workspace_id,
+            session_type,
+            task_id,
+            existing_seed_from,
+        } => InputMode::NewTerminalSession {
+            workspace_id,
+            session_type,
+            task_id,
+            seed_from: name.or(existing_seed_from),
+            active_field: 1,
+        },
+    }
+}
+
+/// Engine constraint the catalog enforces when opened in picker mode.
+/// `NewSession` always spawns a Claude Code session, so the filter is
+/// always `ClaudeCode`. `NewTerminalSession` filters to whichever engine
+/// the user selected on the form (no filter for bash — that path
+/// doesn't reach the picker).
+fn picker_target_engine(t: &PickerTarget) -> Option<Engine> {
+    match t {
+        PickerTarget::NewSession { .. } => Some(Engine::ClaudeCode),
+        PickerTarget::NewTerminalSession { session_type, .. } => {
+            match session_type.as_str() {
+                "claude" => Some(Engine::ClaudeCode),
+                "codex" => Some(Engine::Codex),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Cheap pre-flight check that the named snapshot loads cleanly. Used
+/// by `create_local_session` to fail-fast BEFORE creating a git worktree
+/// — otherwise a seeded A-n with a bad snapshot name would leave an
+/// orphan worktree + branch on disk and block retries on the same label.
+///
+/// The later `clone_snapshot_for_spawn` re-loads the snapshot to do the
+/// actual materialization; this just rejects names that would never
+/// succeed. Free function so tests can drive it against an isolated
+/// HOME without standing up an `App`.
+fn validate_seed_loadable(name: &str) -> std::result::Result<(), String> {
+    agent_memory::load(name).map(|_| ()).map_err(|e| format!("Snapshot load failed: {e}"))
+}
+
+/// Resolve a stable `workspace_id` to its current position in
+/// `App.workspaces`. Returns `None` if the workspace has been removed
+/// since the id was captured (e.g. user deleted it, or reconcile_tasks
+/// dropped a cloud workspace). Free function so it's unit-testable
+/// against a hand-rolled `&[Workspace]`.
+fn resolve_workspace_by_id(workspaces: &[Workspace], workspace_id: &str) -> Option<usize> {
+    workspaces.iter().position(|w| w.id == workspace_id)
 }
 
 /// Snapshot-catalog sub-mode. Tracks what the user is currently doing
@@ -1316,8 +1522,14 @@ pub(crate) struct SnapshotCatalogMut<'a> {
     pub snapshots: &'a mut Vec<agent_memory::Snapshot>,
     pub selected: &'a mut usize,
     pub mode: &'a mut CatalogMode,
-    pub is_picker: bool,
+    pub picker_target: Option<&'a PickerTarget>,
     pub status_msg: &'a mut Option<String>,
+}
+
+impl SnapshotCatalogMut<'_> {
+    fn is_picker(&self) -> bool {
+        self.picker_target.is_some()
+    }
 }
 
 pub(crate) struct TaskSettingsMut<'a> {
@@ -1348,15 +1560,26 @@ pub(crate) fn handle_new_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    const FIELD_COUNT: u8 = 5; // repo, label, branch, idle, seed-from
     match key.code {
-        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Esc => {
+            // Esc on the seed-from field with a value clears the
+            // selection instead of cancelling the whole form — matches
+            // the design: "Esc clears the selection back to [none]".
+            if *state.active_field == 4 && state.seed_from.is_some() {
+                *state.seed_from = None;
+                InputOutcome::Consumed
+            } else {
+                InputOutcome::Cancel
+            }
+        }
         KeyCode::Tab => {
-            *state.active_field = (*state.active_field + 1) % 4;
+            *state.active_field = (*state.active_field + 1) % FIELD_COUNT;
             InputOutcome::Consumed
         }
         KeyCode::BackTab => {
             *state.active_field = if *state.active_field == 0 {
-                3
+                FIELD_COUNT - 1
             } else {
                 *state.active_field - 1
             };
@@ -1374,6 +1597,20 @@ pub(crate) fn handle_new_session(
             }
             InputOutcome::Consumed
         }
+        KeyCode::Enter if *state.active_field == 4 => {
+            // Open the snapshot catalog in picker mode. The dispatcher
+            // stashes the form state on the submit action so it can
+            // re-open this exact form after the user picks (or cancels).
+            // existing_seed_from is captured so picker-cancel doesn't
+            // wipe a previously-picked snapshot.
+            InputOutcome::Submit(SubmitAction::OpenSnapshotPickerForNewSession {
+                label_text: state.label_text.clone(),
+                branch_text: state.branch_text.clone(),
+                idle_timeout_text: state.idle_timeout_text.clone(),
+                repo_url: state.repo_url.clone(),
+                existing_seed_from: state.seed_from.clone(),
+            })
+        }
         KeyCode::Enter => {
             if !state.label_text.trim().is_empty() {
                 let branch = if state.branch_text.trim().is_empty() {
@@ -1390,6 +1627,7 @@ pub(crate) fn handle_new_session(
                     label: state.label_text.clone(),
                     branch,
                     idle_timeout_secs: timeout,
+                    seed_from: state.seed_from.clone(),
                 })
             } else {
                 InputOutcome::Consumed
@@ -1435,29 +1673,64 @@ pub(crate) fn handle_new_terminal_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    match key.code {
-        KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Char('j') | KeyCode::Tab | KeyCode::Down => {
+    // Two fields: 0 = session type, 1 = seed-from. Tab/BackTab cycle
+    // between them; j/k cycle the session type when field 0 is active
+    // (within-field). j/k on the seed-from field are no-ops (would
+    // conflict with the picker selection later).
+    match (key.code, *state.active_field) {
+        (KeyCode::Esc, 1) if state.seed_from.is_some() => {
+            *state.seed_from = None;
+            InputOutcome::Consumed
+        }
+        (KeyCode::Esc, _) => InputOutcome::Cancel,
+        (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
+            *state.active_field = (*state.active_field + 1) % 2;
+            InputOutcome::Consumed
+        }
+        (KeyCode::Char('j') | KeyCode::Down, 0) => {
             *state.session_type = match state.session_type.as_str() {
                 "claude" => "codex".to_string(),
                 "codex" => "bash".to_string(),
                 _ => "claude".to_string(),
             };
+            // Engine changed — any previously-picked snapshot was
+            // engine-filtered for the OLD value and no longer applies.
+            *state.seed_from = None;
             InputOutcome::Consumed
         }
-        KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Up => {
+        (KeyCode::Char('k') | KeyCode::Up, 0) => {
             *state.session_type = match state.session_type.as_str() {
                 "claude" => "bash".to_string(),
                 "bash" => "codex".to_string(),
                 _ => "claude".to_string(),
             };
+            *state.seed_from = None;
             InputOutcome::Consumed
         }
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
-            ws_index: state.ws_index,
-            session_type: state.session_type.clone(),
-            task_id: state.task_id.clone(),
-        }),
+        (KeyCode::Enter, 1) => {
+            // Bash doesn't have transcripts and so isn't pickable; bounce
+            // the user back to field 0 with a no-op rather than opening
+            // an empty picker.
+            if state.session_type == "bash" {
+                return InputOutcome::Consumed;
+            }
+            InputOutcome::Submit(
+                SubmitAction::OpenSnapshotPickerForNewTerminalSession {
+                    workspace_id: state.workspace_id.to_string(),
+                    session_type: state.session_type.clone(),
+                    task_id: state.task_id.clone(),
+                    existing_seed_from: state.seed_from.clone(),
+                },
+            )
+        }
+        (KeyCode::Enter, _) => {
+            InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
+                workspace_id: state.workspace_id.to_string(),
+                session_type: state.session_type.clone(),
+                task_id: state.task_id.clone(),
+                seed_from: state.seed_from.clone(),
+            })
+        }
         _ => InputOutcome::Consumed,
     }
 }
@@ -1622,7 +1895,7 @@ fn handle_catalog_browse(
             let Some(snap) = state.snapshots.get(*state.selected) else {
                 return InputOutcome::Consumed;
             };
-            if state.is_picker {
+            if state.is_picker() {
                 return InputOutcome::Submit(SubmitAction::SnapshotPicked {
                     name: snap.name.clone(),
                 });
@@ -1631,7 +1904,7 @@ fn handle_catalog_browse(
             *state.mode = CatalogMode::Detail { head, tail };
             InputOutcome::Consumed
         }
-        KeyCode::Char('r') if !state.is_picker => {
+        KeyCode::Char('r') if !state.is_picker() => {
             let Some(snap) = state.snapshots.get(*state.selected) else {
                 return InputOutcome::Consumed;
             };
@@ -1641,7 +1914,7 @@ fn handle_catalog_browse(
             };
             InputOutcome::Consumed
         }
-        KeyCode::Char('d') if !state.is_picker => {
+        KeyCode::Char('d') if !state.is_picker() => {
             if state.snapshots.get(*state.selected).is_some() {
                 *state.mode = CatalogMode::ConfirmDelete;
             }
@@ -3222,23 +3495,19 @@ impl App {
     /// even when there are zero snapshots (the empty-state render tells
     /// the user how to create one).
     ///
-    /// `is_picker` is plumbed through for chunk 5's seed-from-snapshot
-    /// field; chunk 4 only ever calls this with `false`.
-    fn open_snapshot_catalog(&mut self, is_picker: bool) {
-        let snapshots = match agent_memory::list() {
-            Ok(s) => s,
-            Err(e) => {
-                self.set_status_msg(&format!("Could not list snapshots: {e}"));
-                return;
-            }
-        };
-        self.input_mode = InputMode::SnapshotCatalog {
-            snapshots,
-            selected: 0,
-            mode: CatalogMode::Browse,
-            is_picker,
-            status_msg: None,
-        };
+    /// `picker_target` is `None` for the stand-alone A-z catalog. Pass
+    /// `Some(target)` when invoking from a parent form so the catalog
+    /// can re-open it (with seed_from set or unchanged) on submit /
+    /// cancel — including when `list()` fails before the catalog can
+    /// even render. Without that restoration, a list() error would
+    /// silently drop the user's typed form state.
+    fn open_snapshot_catalog(&mut self, picker_target: Option<PickerTarget>) {
+        let (mode, status) =
+            catalog_open_outcome(agent_memory::list(), picker_target);
+        self.input_mode = mode;
+        if let Some(msg) = status {
+            self.set_status_msg(&msg);
+        }
     }
 
     fn open_save_snapshot(&mut self) {
@@ -5267,7 +5536,7 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('z') => {
-                        self.open_snapshot_catalog(false);
+                        self.open_snapshot_catalog(None);
                         return true;
                     }
                     KeyCode::Char('n') => {
@@ -5521,6 +5790,7 @@ impl App {
                 branch_text,
                 idle_timeout_text,
                 repo_url,
+                seed_from,
                 active_field,
             } => handle_new_session(
                 NewSessionMut {
@@ -5528,20 +5798,25 @@ impl App {
                     branch_text,
                     idle_timeout_text,
                     repo_url,
+                    seed_from,
                     active_field,
                 },
                 InputCtx { repo_urls: &urls },
                 event,
             ),
             InputMode::NewTerminalSession {
-                ws_index,
+                workspace_id,
                 session_type,
                 task_id,
+                seed_from,
+                active_field,
             } => handle_new_terminal_session(
                 NewTerminalSessionMut {
-                    ws_index: *ws_index,
+                    workspace_id: workspace_id.as_str(),
                     session_type,
                     task_id,
+                    seed_from,
+                    active_field,
                 },
                 InputCtx { repo_urls: &urls },
                 event,
@@ -5601,14 +5876,14 @@ impl App {
                 snapshots,
                 selected,
                 mode,
-                is_picker,
+                picker_target,
                 status_msg,
             } => handle_snapshot_catalog(
                 SnapshotCatalogMut {
                     snapshots,
                     selected,
                     mode,
-                    is_picker: *is_picker,
+                    picker_target: picker_target.as_ref(),
                     status_msg,
                 },
                 InputCtx { repo_urls: &urls },
@@ -5673,15 +5948,54 @@ impl App {
             InputOutcome::Ignored => false,
             InputOutcome::Consumed => true,
             InputOutcome::Cancel => {
-                self.input_mode = InputMode::Normal;
+                // If the cancelled modal was a snapshot picker invoked
+                // from a parent form, re-open the form with seed_from
+                // unchanged (None on first open). Otherwise the user's
+                // form input would be silently lost on a picker Esc.
+                let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                if let InputMode::SnapshotCatalog {
+                    picker_target: Some(target),
+                    ..
+                } = old
+                {
+                    self.reopen_form_from_picker(target, None);
+                }
                 true
             }
             InputOutcome::Submit(action) => {
-                self.input_mode = InputMode::Normal;
+                // Special case: picker-mode SnapshotPicked submission
+                // returns to the parent form with seed_from set to the
+                // chosen name. Other submits (and a no-target catalog)
+                // go through the normal path.
+                let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                if let InputMode::SnapshotCatalog {
+                    picker_target: Some(target),
+                    ..
+                } = old
+                {
+                    if let SubmitAction::SnapshotPicked { name } = action {
+                        self.reopen_form_from_picker(target, Some(name));
+                        return true;
+                    }
+                    // Some other submit emerged from picker mode
+                    // (shouldn't happen given the catalog handler, but
+                    // safe-fall back to reopening the form unchanged).
+                    self.reopen_form_from_picker(target, None);
+                    return true;
+                }
                 self.apply_submit_action(action);
                 true
             }
         }
+    }
+
+    /// Restore the parent form that opened the snapshot picker.
+    fn reopen_form_from_picker(
+        &mut self,
+        target: PickerTarget,
+        name: Option<String>,
+    ) {
+        self.input_mode = rebuild_form_from_picker(target, name);
     }
 
     fn apply_submit_action(&mut self, action: SubmitAction) {
@@ -5692,20 +6006,58 @@ impl App {
                 label,
                 branch,
                 idle_timeout_secs,
+                seed_from,
             } => {
                 self.create_local_session(
                     &repo_url,
                     &label,
                     branch.as_deref(),
                     idle_timeout_secs,
+                    seed_from.as_deref(),
                 );
             }
             SubmitAction::SpawnSessionOnWorkspace {
-                ws_index,
+                workspace_id,
                 session_type,
                 task_id,
+                seed_from,
             } => {
-                self.spawn_session_on_workspace(ws_index, &session_type, task_id);
+                self.spawn_session_on_workspace(
+                    &workspace_id,
+                    &session_type,
+                    task_id,
+                    seed_from.as_deref(),
+                );
+            }
+            SubmitAction::OpenSnapshotPickerForNewSession {
+                label_text,
+                branch_text,
+                idle_timeout_text,
+                repo_url,
+                existing_seed_from,
+            } => {
+                self.open_snapshot_catalog(Some(PickerTarget::NewSession {
+                    label_text,
+                    branch_text,
+                    idle_timeout_text,
+                    repo_url,
+                    existing_seed_from,
+                }));
+            }
+            SubmitAction::OpenSnapshotPickerForNewTerminalSession {
+                workspace_id,
+                session_type,
+                task_id,
+                existing_seed_from,
+            } => {
+                self.open_snapshot_catalog(Some(
+                    PickerTarget::NewTerminalSession {
+                        workspace_id,
+                        session_type,
+                        task_id,
+                        existing_seed_from,
+                    },
+                ));
             }
             SubmitAction::SaveSessionSettings {
                 ws_index,
@@ -5815,6 +6167,7 @@ impl App {
             branch_text: String::new(),
             idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
             repo_url,
+            seed_from: None,
             active_field: 0,
         };
     }
@@ -5840,10 +6193,17 @@ impl App {
             return;
         }
         let task_id = self.cursor_task_id();
+        // Capture workspace_id (stable) instead of the index — backend
+        // events fired while the form is open can reorder workspaces,
+        // and a stored index would silently target the wrong workspace
+        // by submit time.
+        let workspace_id = self.workspaces[wi].id.clone();
         self.input_mode = InputMode::NewTerminalSession {
-            ws_index: wi,
+            workspace_id,
             session_type: "claude".to_string(),
             task_id,
+            seed_from: None,
+            active_field: 0,
         };
     }
 
@@ -5973,12 +6333,69 @@ impl App {
     }
 
     /// Create a fresh standalone workspace — A-n flow. No task binding.
+    /// Load the named snapshot and materialize it into `worktree_path`'s
+    /// expected on-disk locations. Returns the full `ClonedSession` so
+    /// the caller can pass `transcript_id` as `resume_session_id` to
+    /// `build_args` / `codex_args` AND, if a later step (build_args,
+    /// spawn) fails, remove the cloned `transcript_path` to keep retries
+    /// unblocked. On clone/load error, toasts and returns `None`.
+    ///
+    /// **Engine-asymmetric integration** (see ClonedSession rustdoc):
+    /// - Claude Code: returned id IS the live transcript id; caller sets
+    ///   `ts.transcript_id = Some(id)`, `pending_jsonl_files = None`.
+    /// - Codex: returned id is a *resume-source* id only — `codex resume`
+    ///   reads our seed file once, then mints a fresh rollout. Caller
+    ///   leaves `ts.transcript_id = None` and primes
+    ///   `pending_jsonl_files` AFTER this call so the detector picks up
+    ///   the new rollout (not the seed file).
+    fn clone_snapshot_for_spawn(
+        &mut self,
+        name: &str,
+        engine: Engine,
+        worktree_path: &Path,
+    ) -> Option<agent_memory::ClonedSession> {
+        let snap = match agent_memory::load(name) {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_status_msg(&format!("Snapshot load failed: {e}"));
+                return None;
+            }
+        };
+        if snap.manifest.engine != engine {
+            // Picker filters by engine but a hand-crafted manifest or a
+            // stale form could still reach this branch — refuse rather
+            // than producing an incoherent clone.
+            self.set_status_msg(
+                "Snapshot engine doesn't match this session type",
+            );
+            return None;
+        }
+        match agent_memory::clone_into_session(&snap, worktree_path) {
+            Ok(cloned) => Some(cloned),
+            Err(e) => {
+                self.set_status_msg(&format!("Snapshot clone failed: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Undo a snapshot clone when a later step (build_args, PTY spawn)
+    /// fails. Removes the transcript AND restores every merged memory
+    /// file to its pre-clone state — otherwise a subsequent unseeded
+    /// Claude session in the same worktree would silently inherit the
+    /// snapshot's memory entries (the merge wrote them to disk and only
+    /// the transcript would have been removed by a partial cleanup).
+    fn cleanup_failed_clone(cloned: &agent_memory::ClonedSession) {
+        agent_memory::cleanup_clone(cloned);
+    }
+
     fn create_local_session(
         &mut self,
         repo_url: &str,
         label: &str,
         start_branch: Option<&str>,
         idle_timeout_secs: u16,
+        seed_from: Option<&str>,
     ) {
         let main_repo = match worktree::find_local_repo(repo_url) {
             Some(p) => p,
@@ -5994,6 +6411,20 @@ impl App {
             return;
         }
 
+        // Fail-fast on snapshot load BEFORE touching git. Without this,
+        // a non-existent / corrupt snapshot would leave a freshly-created
+        // worktree + branch orphaned on disk, and a retry would fail
+        // because the worktree path is taken. The later
+        // `clone_snapshot_for_spawn` re-validates (load is idempotent
+        // and cheap) — this early check just keeps git off the failure
+        // path.
+        if let Some(name) = seed_from {
+            if let Err(e) = validate_seed_loadable(name) {
+                self.set_status_msg(&e);
+                return;
+            }
+        }
+
         let worktree_path = match worktree::create_worktree(&main_repo, &slug, start_branch) {
             Ok(p) => p,
             Err(e) => {
@@ -6003,26 +6434,67 @@ impl App {
         };
         worktree::setup_worktree(&main_repo, &worktree_path);
 
+        // If the user picked a snapshot, materialize it into the new
+        // worktree's expected paths before we spawn. The returned id is
+        // what `claude --resume <id>` reads — for Claude this is also
+        // the live transcript id (post-resume Claude keeps writing to
+        // the same file), so we set it directly on `ts` below.
+        let cloned: Option<agent_memory::ClonedSession> = match seed_from {
+            Some(name) => match self.clone_snapshot_for_spawn(
+                name,
+                Engine::ClaudeCode,
+                &worktree_path,
+            ) {
+                Some(c) => Some(c),
+                None => return, // clone failure already toasted
+            },
+            None => None,
+        };
+
         let (cols, rows) = self.last_term_size;
         // Generate uid first so the MCP config carries the matching
         // CM_TUI_SESSION_ID. A-n sessions are taskless — pass None for
         // workflow meta.
         let session_uid = new_session_uid();
-        let (program, args) = crate::mcp_config::build_args(
+        let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
+        let (program, args) = match crate::mcp_config::build_args(
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
-            None,
-        )
-        .unwrap_or_else(|_| {
-            (
-                "claude".to_string(),
-                vec!["--dangerously-skip-permissions".to_string()],
-            )
-        });
-        let pending = Self::list_jsonl_files(&worktree_path);
+            cloned_transcript_id.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(c) = cloned.as_ref() {
+                    // A seeded launch CANNOT fall back to plain `claude`
+                    // (no `--resume`) — that would leave the TUI bound
+                    // to the seed transcript while the live agent runs
+                    // with none of the seeded context. Cleanup + fail.
+                    Self::cleanup_failed_clone(c);
+                    self.set_status_msg(&format!(
+                        "Seeded launch aborted (could not configure agent): {e}"
+                    ));
+                    return;
+                }
+                // Unseeded fallback preserved — original behavior when
+                // MCP config writing fails (agent runs without MCP).
+                (
+                    "claude".to_string(),
+                    vec!["--dangerously-skip-permissions".to_string()],
+                )
+            }
+        };
+        // For a seeded Claude session, the JSONL is already on disk and
+        // `--resume` keeps writing to it — there's no "new file" for the
+        // detector to find, so leave `pending_jsonl_files = None`
+        // (matches the resumed-Claude pattern at app.rs:5512).
+        let pending = if cloned.is_some() {
+            None
+        } else {
+            Some(Self::list_jsonl_files(&worktree_path))
+        };
 
-        let Ok(s) = self.spawn_agent_session(
+        let s = match self.spawn_agent_session(
             "claude",
             &session_uid,
             &program,
@@ -6031,9 +6503,15 @@ impl App {
             rows,
             Some(worktree_path.clone()),
             Default::default(),
-        ) else {
-            self.set_status_msg("Spawn failed");
-            return;
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                if let Some(c) = cloned.as_ref() {
+                    Self::cleanup_failed_clone(c);
+                }
+                self.set_status_msg("Spawn failed");
+                return;
+            }
         };
 
         let ts = TerminalSession {
@@ -6043,9 +6521,9 @@ impl App {
             session: s,
             status: SessionStatus::Running,
             last_write_at: None,
-            transcript_id: None,
+            transcript_id: cloned_transcript_id.clone(),
             generation: 0,
-            pending_jsonl_files: Some(pending),
+            pending_jsonl_files: pending,
             hidden: false,
             idle_timeout_secs,
             burst_threshold: 0,
@@ -6059,7 +6537,7 @@ impl App {
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
-            seeded_from_snapshot: None,
+            seeded_from_snapshot: seed_from.map(str::to_string),
         };
         let ws = Workspace {
             id: new_workspace_id(),
@@ -6161,13 +6639,24 @@ impl App {
     /// appears under the corresponding task subheader.
     fn spawn_session_on_workspace(
         &mut self,
-        ws_index: usize,
+        workspace_id: &str,
         session_type: &str,
         task_id: Option<String>,
+        seed_from: Option<&str>,
     ) {
-        if ws_index >= self.workspaces.len() {
-            return;
-        }
+        // Resolve workspace_id → current index. If the workspace
+        // disappeared while the form was open (delete, reconcile drop,
+        // etc.), bail cleanly rather than spawning into an unrelated
+        // workspace at whatever happens to sit at the stale index now.
+        let ws_index = match resolve_workspace_by_id(&self.workspaces, workspace_id) {
+            Some(i) => i,
+            None => {
+                self.set_status_msg(
+                    "Workspace no longer exists — session not started",
+                );
+                return;
+            }
+        };
         if self.workspaces[ws_index].is_cloud && self.workspaces[ws_index].worker_vm.is_none() {
             self.set_status_msg("Waiting for cloud VM assignment...");
             return;
@@ -6214,9 +6703,46 @@ impl App {
         }
 
         let wt = self.workspaces[ws_index].worktree_path.clone();
-        let pending = match session_type {
-            "claude" => wt.as_ref().map(|p| Self::list_jsonl_files(p)),
-            "codex" => wt.as_ref().map(|p| Self::list_codex_sessions(p)),
+
+        // Clone the seed snapshot BEFORE computing the baseline (Codex)
+        // or building args (both engines). For Codex, the cloned seed
+        // file must be in the baseline so the post-spawn detector picks
+        // the new rollout id rather than rebinding to the seed file.
+        let cloned: Option<agent_memory::ClonedSession> =
+            match (seed_from, session_type, wt.as_ref()) {
+                (Some(name), "claude", Some(p)) => {
+                    match self.clone_snapshot_for_spawn(name, Engine::ClaudeCode, p) {
+                        Some(c) => Some(c),
+                        None => return,
+                    }
+                }
+                (Some(name), "codex", Some(p)) => {
+                    match self.clone_snapshot_for_spawn(name, Engine::Codex, p) {
+                        Some(c) => Some(c),
+                        None => return,
+                    }
+                }
+                (Some(_), _, _) => {
+                    // Bash or no worktree — seed_from is meaningless.
+                    // The form prevents this combination but defend
+                    // against it.
+                    self.set_status_msg(
+                        "Snapshots only apply to claude / codex sessions",
+                    );
+                    return;
+                }
+                (None, _, _) => None,
+            };
+
+        // For Claude with a clone, the JSONL is already on disk and
+        // --resume keeps writing to it, so pending_jsonl_files = None
+        // (detector path isn't used). For Codex, baseline is taken AFTER
+        // the clone so the seed file is excluded and the detector picks
+        // the freshly-minted rollout id post-resume.
+        let pending = match (session_type, cloned.is_some()) {
+            ("claude", true) => None,
+            ("claude", false) => wt.as_ref().map(|p| Self::list_jsonl_files(p)),
+            ("codex", _) => wt.as_ref().map(|p| Self::list_codex_sessions(p)),
             _ => None,
         };
         // Pre-generate uid so MCP env carries the same CM_TUI_SESSION_ID
@@ -6224,19 +6750,35 @@ impl App {
         // are taskless from MCP's POV (they inherit a task_id below for
         // sidebar grouping but no workflow context).
         let session_uid_pre = new_session_uid();
+        let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
+
+        // Build args, refusing to fall back to plain claude/codex
+        // (without `--resume`/`resume`) for seeded launches — the
+        // resume flag IS the wiring that connects the seed transcript
+        // to the live agent. Without it the TUI binds to the seed file
+        // while the agent has none of the context.
+        let build = |engine: Engine, fallback_prog: &str, fallback_args: Vec<String>| {
+            crate::mcp_config::build_args(
+                &engine,
+                &session_uid_pre,
+                None,
+                cloned_transcript_id.as_deref(),
+            )
+            .or_else(|e| {
+                if cloned.is_some() {
+                    Err(e)
+                } else {
+                    Ok((fallback_prog.to_string(), fallback_args))
+                }
+            })
+        };
         let result = match session_type {
-            "claude" => {
-                let (program, args) = crate::mcp_config::build_args(
-                    &workflow::toml_schema::Engine::ClaudeCode,
-                    &session_uid_pre,
-                    None,
-                    None,
-                )
-                .unwrap_or_else(|_| (
-                    "claude".to_string(),
-                    vec!["--dangerously-skip-permissions".to_string()],
-                ));
-                self.spawn_agent_session(
+            "claude" => match build(
+                Engine::ClaudeCode,
+                "claude",
+                vec!["--dangerously-skip-permissions".to_string()],
+            ) {
+                Ok((program, args)) => self.spawn_agent_session(
                     "claude",
                     &session_uid_pre,
                     &program,
@@ -6245,20 +6787,23 @@ impl App {
                     rows,
                     wt,
                     Default::default(),
-                )
-            }
-            "codex" => {
-                let (program, args) = crate::mcp_config::build_args(
-                    &workflow::toml_schema::Engine::Codex,
-                    &session_uid_pre,
-                    None,
-                    None,
-                )
-                .unwrap_or_else(|_| (
-                    "codex".to_string(),
-                    vec!["--yolo".to_string()],
-                ));
-                self.spawn_agent_session(
+                ),
+                Err(e) => {
+                    if let Some(c) = cloned.as_ref() {
+                        Self::cleanup_failed_clone(c);
+                    }
+                    self.set_status_msg(&format!(
+                        "Seeded launch aborted (could not configure agent): {e}"
+                    ));
+                    return;
+                }
+            },
+            "codex" => match build(
+                Engine::Codex,
+                "codex",
+                vec!["--yolo".to_string()],
+            ) {
+                Ok((program, args)) => self.spawn_agent_session(
                     "codex",
                     &session_uid_pre,
                     &program,
@@ -6267,8 +6812,17 @@ impl App {
                     rows,
                     wt,
                     Default::default(),
-                )
-            }
+                ),
+                Err(e) => {
+                    if let Some(c) = cloned.as_ref() {
+                        Self::cleanup_failed_clone(c);
+                    }
+                    self.set_status_msg(&format!(
+                        "Seeded launch aborted (could not configure agent): {e}"
+                    ));
+                    return;
+                }
+            },
             _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
         };
         match result {
@@ -6285,13 +6839,26 @@ impl App {
                     pending,
                 );
                 ts.task_id = task_id;
+                ts.seeded_from_snapshot = seed_from.map(str::to_string);
+                // Engine-asymmetric transcript_id wiring — see
+                // `ClonedSession` rustdoc. For Claude the cloned id IS
+                // the live transcript id; for Codex it's a seed-file id
+                // and the live id is filled in by detection.
+                if session_type == "claude" {
+                    ts.transcript_id = cloned_transcript_id;
+                }
                 let si = self.workspaces[ws_index].sessions.len();
                 self.workspaces[ws_index].sessions.push(ts);
                 self.cursor = Cursor::Session(ws_index, si);
                 self.save_session_manifest();
                 self.set_status_msg(&format!("Started {} session", session_type));
             }
-            Err(e) => self.set_status_msg(&format!("Spawn: {}", e)),
+            Err(e) => {
+                if let Some(c) = cloned.as_ref() {
+                    Self::cleanup_failed_clone(c);
+                }
+                self.set_status_msg(&format!("Spawn: {}", e));
+            }
         }
     }
 
@@ -7090,6 +7657,7 @@ impl App {
                     branch_text,
                     idle_timeout_text,
                     repo_url,
+                    seed_from,
                     active_field,
                 } => {
                     self.draw_input_dialog(
@@ -7099,19 +7667,24 @@ impl App {
                         branch_text,
                         idle_timeout_text,
                         repo_url,
+                        seed_from.as_deref(),
                         *active_field,
                     );
                 }
                 InputMode::NewTerminalSession {
-                    ws_index,
+                    workspace_id,
                     session_type,
+                    seed_from,
+                    active_field,
                     ..
                 } => {
                     self.draw_new_terminal_dialog(
                         frame,
                         area,
-                        *ws_index,
+                        workspace_id,
                         session_type,
+                        seed_from.as_deref(),
+                        *active_field,
                     );
                 }
                 InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, seeded_from_snapshot, active_field, .. } => {
@@ -7150,7 +7723,7 @@ impl App {
                     snapshots,
                     selected,
                     mode,
-                    is_picker,
+                    picker_target,
                     status_msg,
                 } => {
                     self.draw_snapshot_catalog(
@@ -7159,7 +7732,7 @@ impl App {
                         snapshots,
                         *selected,
                         mode,
-                        *is_picker,
+                        picker_target.is_some(),
                         status_msg.as_deref(),
                     );
                 }
@@ -7247,10 +7820,12 @@ impl App {
         branch_text: &str,
         idle_timeout_text: &str,
         repo_url: &str,
+        seed_from: Option<&str>,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 11u16;
+        // +2 rows for the seed-from line (one separator + the field).
+        let height = 13u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -7300,6 +7875,14 @@ impl App {
             ""
         };
 
+        let seed_label = sanitize_for_display(seed_from.unwrap_or("[none]"));
+        let seed_style = if active_field == 4 { highlight } else { white };
+        let seed_hint = match (active_field == 4, seed_from.is_some()) {
+            (true, true) => "  Esc clear",
+            (true, false) => "  Enter pick",
+            _ => "",
+        };
+
         let lines = vec![
             Line::from(vec![
                 Span::styled("    Repo: ", dim),
@@ -7323,6 +7906,11 @@ impl App {
                 Span::styled(idle_timeout_text, white),
                 Span::styled(timeout_cursor, white),
             ]),
+            Line::from(vec![
+                Span::styled("    Seed: ", dim),
+                Span::styled(seed_label, seed_style),
+                Span::styled(seed_hint, dim),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab switch field \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -7337,20 +7925,26 @@ impl App {
         &self,
         frame: &mut Frame,
         area: Rect,
-        ws_index: usize,
+        workspace_id: &str,
         session_type: &str,
+        seed_from: Option<&str>,
+        active_field: u8,
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
-        let height = 9u16;
+        // +2 rows for the seed-from line.
+        let height = 11u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
 
         frame.render_widget(Clear, dialog_area);
 
+        // Resolve workspace name from the stable id at render time —
+        // tolerates a reorder while the form is open.
         let ws_name = self
             .workspaces
-            .get(ws_index)
+            .iter()
+            .find(|w| w.id == workspace_id)
             .map(|w| w.name.as_str())
             .unwrap_or("?");
 
@@ -7371,26 +7965,55 @@ impl App {
         let max_name = (width as usize).saturating_sub(8);
         let display_name: String = ws_name.chars().take(max_name).collect();
 
+        let dim = Style::default().fg(Color::DarkGray);
+        let white = Style::default().fg(Color::White);
+        let highlight = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("  Task: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(display_name, Style::default().fg(Color::White)),
+                Span::styled("  Task: ", dim),
+                Span::styled(display_name, white),
             ]),
             Line::from(""),
         ];
+        // The session-type rows are field 0 and j/k cycle them in place.
+        // A `▸` marker on the active row group makes it easy to see which
+        // field has focus once the seed-from line is in play below.
+        let type_marker = if active_field == 0 { "▸ " } else { "  " };
         for opt in &options {
             let ind = if session_type == *opt { ">" } else { " " };
             let st = if session_type == *opt {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                if active_field == 0 { highlight } else { white }
             } else {
                 Style::default().fg(Color::Gray)
             };
-            lines.push(Line::from(Span::styled(format!("  {} {}", ind, opt), st)));
+            lines.push(Line::from(Span::styled(
+                format!("{}{} {}", type_marker, ind, opt),
+                st,
+            )));
         }
         lines.push(Line::from(""));
+        let seed_label = sanitize_for_display(seed_from.unwrap_or(
+            if session_type == "bash" { "[N/A]" } else { "[none]" },
+        ));
+        let seed_style = if active_field == 1 { highlight } else { white };
+        let seed_hint = match (active_field == 1, seed_from.is_some(), session_type) {
+            (true, _, "bash") => "  not pickable",
+            (true, true, _) => "  Esc clear",
+            (true, false, _) => "  Enter pick",
+            _ => "",
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Seed: ", dim),
+            Span::styled(seed_label, seed_style),
+            Span::styled(seed_hint, dim),
+        ]));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "j/k select \u{00b7} Enter start \u{00b7} Esc cancel",
-            Style::default().fg(Color::DarkGray),
+            "Tab field \u{00b7} j/k type \u{00b7} Enter start \u{00b7} Esc cancel",
+            dim,
         )));
 
         frame.render_widget(Paragraph::new(lines), inner);
@@ -10345,6 +10968,7 @@ mod input_handler_tests {
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
+                seed_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -10365,6 +10989,7 @@ mod input_handler_tests {
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
+                seed_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -10384,6 +11009,7 @@ mod input_handler_tests {
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
+                seed_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -10395,11 +11021,13 @@ mod input_handler_tests {
                 label,
                 branch,
                 idle_timeout_secs,
+                seed_from,
             }) => {
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
                 assert_eq!(branch.as_deref(), Some("feat/x"));
                 assert_eq!(idle_timeout_secs, 10);
+                assert!(seed_from.is_none());
             }
             other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
         }
@@ -10418,6 +11046,7 @@ mod input_handler_tests {
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
+                seed_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -10436,6 +11065,7 @@ mod input_handler_tests {
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
+                seed_from: &mut None,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -10457,6 +11087,7 @@ mod input_handler_tests {
                 branch_text: &mut branch,
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
+                seed_from: &mut None,
                 active_field: &mut active,
             },
             InputCtx { repo_urls: &urls },
@@ -10466,17 +11097,152 @@ mod input_handler_tests {
         assert_eq!(repo, "c");
     }
 
+    // ── NewSession seed-from (chunk 5) ────────────────────────────
+
+    #[test]
+    fn new_session_tab_cycles_through_five_fields() {
+        // 0 → 1 → 2 → 3 → 4 → 0
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("", "", "", "", 0);
+        let mut seed: Option<String> = None;
+        for expected in [1, 2, 3, 4, 0] {
+            handle_new_session(
+                NewSessionMut {
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: &mut seed,
+                    active_field: &mut active,
+                },
+                ctx_no_repos(),
+                &key(KeyCode::Tab),
+            );
+            assert_eq!(active, expected);
+        }
+    }
+
+    #[test]
+    fn new_session_enter_on_seed_field_opens_picker_with_form_state() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("my-task", "feat/x", "12", "https://github.com/o/r", 4);
+        let mut seed: Option<String> = None;
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(
+                SubmitAction::OpenSnapshotPickerForNewSession {
+                    label_text,
+                    branch_text,
+                    idle_timeout_text,
+                    repo_url,
+                    existing_seed_from,
+                },
+            ) => {
+                assert_eq!(label_text, "my-task");
+                assert_eq!(branch_text, "feat/x");
+                assert_eq!(idle_timeout_text, "12");
+                assert_eq!(repo_url, "https://github.com/o/r");
+                assert!(existing_seed_from.is_none());
+            }
+            other => panic!(
+                "expected OpenSnapshotPickerForNewSession, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_session_esc_on_seed_field_with_value_clears_seed_only() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("x", "", "2", "", 4);
+        let mut seed: Option<String> = Some("reviewer".into());
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_consumed(&outcome);
+        assert!(seed.is_none(), "seed_from should have been cleared");
+        assert_eq!(label, "x", "other form fields untouched");
+    }
+
+    #[test]
+    fn new_session_esc_on_other_fields_still_cancels() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("x", "", "2", "", 1);
+        let mut seed: Option<String> = None;
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_cancel(&outcome);
+    }
+
+    #[test]
+    fn new_session_submit_carries_seed_from_when_set() {
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("task", "", "2", "https://github.com/a/b", 1);
+        let mut seed: Option<String> = Some("reviewer-strict".into());
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                seed_from, ..
+            }) => assert_eq!(seed_from.as_deref(), Some("reviewer-strict")),
+            other => panic!("expected CreateLocalSession, got {other:?}"),
+        }
+    }
+
     // ── NewTerminalSession ────────────────────────────────────────
 
     #[test]
     fn new_terminal_session_j_cycles_type_forward() {
         let mut session_type = "claude".to_string();
         let task_id = None;
+        let mut seed = None;
+        let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
-                ws_index: 7,
+                workspace_id: "ws-7",
                 session_type: &mut session_type,
                 task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Char('j')),
@@ -10489,24 +11255,30 @@ mod input_handler_tests {
     fn new_terminal_session_enter_submits_with_payload() {
         let mut session_type = "bash".to_string();
         let task_id = Some("t-123".to_string());
+        let mut seed = None;
+        let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
-                ws_index: 4,
+                workspace_id: "ws-4",
                 session_type: &mut session_type,
                 task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
         );
         match outcome {
             InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
-                ws_index,
+                workspace_id,
                 session_type,
                 task_id,
+                seed_from,
             }) => {
-                assert_eq!(ws_index, 4);
+                assert_eq!(workspace_id, "ws-4");
                 assert_eq!(session_type, "bash");
                 assert_eq!(task_id, Some("t-123".to_string()));
+                assert!(seed_from.is_none());
             }
             other => panic!("expected SpawnSessionOnWorkspace, got {:?}", other),
         }
@@ -10516,16 +11288,704 @@ mod input_handler_tests {
     fn new_terminal_session_esc_cancels() {
         let mut session_type = "claude".to_string();
         let task_id = None;
+        let mut seed = None;
+        let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
-                ws_index: 0,
+                workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
         );
         assert_cancel(&outcome);
+    }
+
+    // ── NewTerminalSession seed-from (chunk 5) ────────────────────
+
+    #[test]
+    fn new_terminal_session_j_on_field_0_clears_seed_from() {
+        // Engine change invalidates a previously picked snapshot (picker
+        // filters by engine). Must clear seed_from to avoid carrying a
+        // claude-code snapshot across to a codex session.
+        let mut session_type = "claude".to_string();
+        let task_id = None;
+        let mut seed: Option<String> = Some("reviewer".into());
+        let mut active = 0u8;
+        handle_new_terminal_session(
+            NewTerminalSessionMut {
+                workspace_id: "ws-0",
+                session_type: &mut session_type,
+                task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char('j')),
+        );
+        assert_eq!(session_type, "codex");
+        assert!(seed.is_none(), "engine change should clear seed_from");
+    }
+
+    #[test]
+    fn new_terminal_session_tab_cycles_field_0_and_1() {
+        let mut session_type = "claude".to_string();
+        let task_id = None;
+        let mut seed: Option<String> = None;
+        let mut active = 0u8;
+        for expected in [1u8, 0] {
+            handle_new_terminal_session(
+                NewTerminalSessionMut {
+                    workspace_id: "ws-0",
+                    session_type: &mut session_type,
+                    task_id: &task_id,
+                    seed_from: &mut seed,
+                    active_field: &mut active,
+                },
+                ctx_no_repos(),
+                &key(KeyCode::Tab),
+            );
+            assert_eq!(active, expected);
+        }
+    }
+
+    #[test]
+    fn new_terminal_session_enter_on_seed_field_with_bash_is_noop() {
+        let mut session_type = "bash".to_string();
+        let task_id = None;
+        let mut seed: Option<String> = None;
+        let mut active = 1u8;
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                workspace_id: "ws-0",
+                session_type: &mut session_type,
+                task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        assert_consumed(&outcome);
+    }
+
+    #[test]
+    fn new_terminal_session_enter_on_seed_field_with_claude_opens_picker() {
+        let mut session_type = "claude".to_string();
+        let task_id = Some("t-42".to_string());
+        let mut seed: Option<String> = None;
+        let mut active = 1u8;
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                workspace_id: "ws-9",
+                session_type: &mut session_type,
+                task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(
+                SubmitAction::OpenSnapshotPickerForNewTerminalSession {
+                    workspace_id,
+                    session_type,
+                    task_id,
+                    existing_seed_from,
+                },
+            ) => {
+                assert_eq!(workspace_id, "ws-9");
+                assert_eq!(session_type, "claude");
+                assert_eq!(task_id.as_deref(), Some("t-42"));
+                assert!(existing_seed_from.is_none());
+            }
+            other => panic!(
+                "expected OpenSnapshotPickerForNewTerminalSession, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_terminal_session_esc_on_seed_field_with_value_clears_seed_only() {
+        let mut session_type = "claude".to_string();
+        let task_id = None;
+        let mut seed: Option<String> = Some("reviewer".into());
+        let mut active = 1u8;
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                workspace_id: "ws-0",
+                session_type: &mut session_type,
+                task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Esc),
+        );
+        assert_consumed(&outcome);
+        assert!(seed.is_none());
+    }
+
+    #[test]
+    fn new_terminal_session_submit_carries_seed_from() {
+        let mut session_type = "claude".to_string();
+        let task_id = None;
+        let mut seed: Option<String> = Some("reviewer".into());
+        let mut active = 0u8;
+        let outcome = handle_new_terminal_session(
+            NewTerminalSessionMut {
+                workspace_id: "ws-1",
+                session_type: &mut session_type,
+                task_id: &task_id,
+                seed_from: &mut seed,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
+                seed_from, ..
+            }) => assert_eq!(seed_from.as_deref(), Some("reviewer")),
+            other => panic!("expected SpawnSessionOnWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_cancel_preserves_existing_seed_from() {
+        // Regression for "Picker cancel clears an existing seed_from".
+        // The form had seed_from = Some("A"); the user opens the picker
+        // to maybe change it, then Escs out. rebuild_form_from_picker
+        // with name=None must restore the captured existing value.
+        let target = PickerTarget::NewSession {
+            label_text: "task".into(),
+            branch_text: "br".into(),
+            idle_timeout_text: "30".into(),
+            repo_url: "u".into(),
+            existing_seed_from: Some("snap-A".into()),
+        };
+        let mode = super::rebuild_form_from_picker(target, None);
+        match mode {
+            InputMode::NewSession { seed_from, .. } => {
+                assert_eq!(seed_from.as_deref(), Some("snap-A"));
+            }
+            _ => panic!("expected NewSession"),
+        }
+    }
+
+    #[test]
+    fn picker_select_overwrites_existing_seed_from() {
+        let target = PickerTarget::NewTerminalSession {
+            workspace_id: "ws-3".into(),
+            session_type: "claude".into(),
+            task_id: None,
+            existing_seed_from: Some("snap-A".into()),
+        };
+        let mode = super::rebuild_form_from_picker(
+            target,
+            Some("snap-B".into()),
+        );
+        match mode {
+            InputMode::NewTerminalSession {
+                seed_from,
+                workspace_id,
+                ..
+            } => {
+                assert_eq!(seed_from.as_deref(), Some("snap-B"));
+                assert_eq!(workspace_id, "ws-3");
+            }
+            _ => panic!("expected NewTerminalSession"),
+        }
+    }
+
+    #[test]
+    fn picker_cancel_with_no_prior_seed_remains_none() {
+        // No prior pick → cancel leaves seed_from None (i.e. the new
+        // existing-seed_from preservation logic doesn't accidentally
+        // inject something).
+        let target = PickerTarget::NewSession {
+            label_text: String::new(),
+            branch_text: String::new(),
+            idle_timeout_text: String::new(),
+            repo_url: String::new(),
+            existing_seed_from: None,
+        };
+        let mode = super::rebuild_form_from_picker(target, None);
+        match mode {
+            InputMode::NewSession { seed_from, .. } => {
+                assert!(seed_from.is_none())
+            }
+            _ => panic!("expected NewSession"),
+        }
+    }
+
+    #[test]
+    fn cleanup_failed_clone_removes_transcript_file() {
+        // Regression for "Seeded A-s leaves clone artifacts when spawn
+        // fails". If a later step (build_args or spawn) errors after
+        // clone_into_session has written the seed transcript, the file
+        // must be removed so the next retry isn't blocked by
+        // `AlreadyExists` from clone_into_session.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, b"seed\n").unwrap();
+        let cloned = agent_memory::ClonedSession {
+            transcript_id: "tid".into(),
+            transcript_path: path.clone(),
+            rollback: agent_memory::ClonedRollback::default(),
+        };
+        assert!(path.exists());
+        App::cleanup_failed_clone(&cloned);
+        assert!(!path.exists(), "transcript should have been removed");
+    }
+
+    #[test]
+    fn cleanup_failed_clone_is_idempotent_on_missing_file() {
+        // Called twice or against a never-written path: must not panic
+        // or surface an error to the user. We're a best-effort cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-existed.jsonl");
+        let cloned = agent_memory::ClonedSession {
+            transcript_id: "tid".into(),
+            transcript_path: path,
+            rollback: agent_memory::ClonedRollback::default(),
+        };
+        App::cleanup_failed_clone(&cloned); // no panic
+    }
+
+    #[test]
+    fn cleanup_failed_clone_restores_overwritten_memory_files() {
+        // End-to-end rollback for the Claude memory-merge case. Build a
+        // fake worktree with a user's MEMORY.md, clone a snapshot whose
+        // memory dir contains a same-named file (the merge overwrites),
+        // then call cleanup_failed_clone and assert the user's original
+        // bytes are restored.
+        use crate::test_support::home_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path();
+        let worktree = fake_home.join("workspace");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let projects_dir = fake_home.join(".claude/projects").join(
+            worktree
+                .to_string_lossy()
+                .replace('/', "-")
+                .replace('.', "-"),
+        );
+        let memory_dir = projects_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let user_memory = memory_dir.join("MEMORY.md");
+        std::fs::write(&user_memory, b"USER ORIGINAL CONTENT").unwrap();
+
+        // Build a snapshot on disk with a competing MEMORY.md.
+        let snap_root = fake_home.join(".cm/agent-memories");
+        let snap_dir = snap_root.join("reviewer");
+        std::fs::create_dir_all(snap_dir.join("memory")).unwrap();
+        std::fs::write(
+            snap_dir.join("memory/MEMORY.md"),
+            b"SNAPSHOT MEMORY",
+        )
+        .unwrap();
+        std::fs::write(snap_dir.join("transcript.jsonl"), b"line\n").unwrap();
+        let manifest = serde_json::json!({
+            "version": agent_memory::MANIFEST_VERSION,
+            "description": "",
+            "engine": "claude-code",
+            "source_session_uid": "ts-x",
+            "source_transcript_id": "tid-1",
+            "source_cwd": "/tmp",
+            "created_at_unix": 0,
+            "transcript_bytes": 5,
+            "memory_files": 1,
+        });
+        std::fs::write(
+            snap_dir.join("manifest.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+
+        let _guard = home_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let snap = agent_memory::load("reviewer").unwrap();
+        let cloned =
+            agent_memory::clone_into_session(&snap, &worktree).unwrap();
+
+        // Sanity: after clone the user's file was overwritten and the
+        // transcript exists.
+        assert_eq!(
+            std::fs::read(&user_memory).unwrap(),
+            b"SNAPSHOT MEMORY",
+            "clone should have merged snapshot memory over user's file"
+        );
+        assert!(cloned.transcript_path.exists());
+
+        // Simulate the post-clone failure path.
+        App::cleanup_failed_clone(&cloned);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(!cloned.transcript_path.exists(), "transcript removed");
+        assert_eq!(
+            std::fs::read(&user_memory).unwrap(),
+            b"USER ORIGINAL CONTENT",
+            "user's MEMORY.md must be byte-restored after cleanup",
+        );
+    }
+
+    #[test]
+    fn cleanup_failed_clone_removes_newly_created_memory_artifacts() {
+        // When the worktree had no MEMORY.md before the clone, the file
+        // is "newly created" and rollback should remove it (and the
+        // memory dir if we created that too). A subsequent unseeded
+        // session would then see no snapshot memory at all.
+        use crate::test_support::home_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path();
+        let worktree = fake_home.join("workspace");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let projects_dir = fake_home.join(".claude/projects").join(
+            worktree
+                .to_string_lossy()
+                .replace('/', "-")
+                .replace('.', "-"),
+        );
+        // No memory dir/files yet — fresh worktree.
+
+        let snap_root = fake_home.join(".cm/agent-memories");
+        let snap_dir = snap_root.join("primed");
+        std::fs::create_dir_all(snap_dir.join("memory")).unwrap();
+        std::fs::write(
+            snap_dir.join("memory/MEMORY.md"),
+            b"SNAPSHOT MEMORY",
+        )
+        .unwrap();
+        std::fs::write(snap_dir.join("transcript.jsonl"), b"line\n").unwrap();
+        let manifest = serde_json::json!({
+            "version": agent_memory::MANIFEST_VERSION,
+            "description": "",
+            "engine": "claude-code",
+            "source_session_uid": "ts-y",
+            "source_transcript_id": "tid-2",
+            "source_cwd": "/tmp",
+            "created_at_unix": 0,
+            "transcript_bytes": 5,
+            "memory_files": 1,
+        });
+        std::fs::write(
+            snap_dir.join("manifest.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+
+        let _guard = home_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let snap = agent_memory::load("primed").unwrap();
+        let cloned =
+            agent_memory::clone_into_session(&snap, &worktree).unwrap();
+        let dst_memory = projects_dir.join("memory/MEMORY.md");
+        assert_eq!(std::fs::read(&dst_memory).unwrap(), b"SNAPSHOT MEMORY");
+
+        App::cleanup_failed_clone(&cloned);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            !dst_memory.exists(),
+            "newly-created memory file should be removed"
+        );
+        assert!(
+            !projects_dir.join("memory").exists(),
+            "newly-created memory dir should be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn catalog_open_list_failure_with_picker_restores_form() {
+        // Regression: list() failure inside open_snapshot_catalog used
+        // to set a toast and return — silently dropping the captured
+        // PickerTarget form state. The fix routes through
+        // rebuild_form_from_picker, preserving every typed field plus
+        // any existing seed_from.
+        let target = PickerTarget::NewSession {
+            label_text: "task".into(),
+            branch_text: "feat/x".into(),
+            idle_timeout_text: "30".into(),
+            repo_url: "https://github.com/o/r".into(),
+            existing_seed_from: Some("prior-snap".into()),
+        };
+        let err = agent_memory::SnapshotError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        let (mode, status) =
+            super::catalog_open_outcome(Err(err), Some(target));
+        match mode {
+            InputMode::NewSession {
+                label_text,
+                branch_text,
+                idle_timeout_text,
+                repo_url,
+                seed_from,
+                ..
+            } => {
+                assert_eq!(label_text, "task");
+                assert_eq!(branch_text, "feat/x");
+                assert_eq!(idle_timeout_text, "30");
+                assert_eq!(repo_url, "https://github.com/o/r");
+                assert_eq!(seed_from.as_deref(), Some("prior-snap"));
+            }
+            _ => panic!("expected restored NewSession form"),
+        }
+        let msg = status.expect("error should surface as status_msg");
+        assert!(
+            msg.contains("Could not list snapshots"),
+            "unexpected status: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_open_list_failure_without_picker_drops_to_normal() {
+        let err = agent_memory::SnapshotError::NotFound;
+        let (mode, status) = super::catalog_open_outcome(Err(err), None);
+        assert!(matches!(mode, InputMode::Normal));
+        assert!(status.is_some());
+    }
+
+    #[test]
+    fn catalog_open_success_filters_by_picker_engine() {
+        // Picker for a codex form must only show codex snapshots.
+        let snaps = vec![
+            agent_memory::Snapshot {
+                name: "claude-one".into(),
+                dir: std::path::PathBuf::from("/dev/null"),
+                manifest: agent_memory::Manifest {
+                    version: agent_memory::MANIFEST_VERSION,
+                    description: String::new(),
+                    engine: Engine::ClaudeCode,
+                    source_session_uid: "u".into(),
+                    source_transcript_id: "tid".into(),
+                    source_cwd: std::path::PathBuf::from("/tmp"),
+                    created_at_unix: 0,
+                    transcript_bytes: 0,
+                    memory_files: 0,
+                },
+            },
+            agent_memory::Snapshot {
+                name: "codex-one".into(),
+                dir: std::path::PathBuf::from("/dev/null"),
+                manifest: agent_memory::Manifest {
+                    version: agent_memory::MANIFEST_VERSION,
+                    description: String::new(),
+                    engine: Engine::Codex,
+                    source_session_uid: "u".into(),
+                    source_transcript_id: "tid".into(),
+                    source_cwd: std::path::PathBuf::from("/tmp"),
+                    created_at_unix: 0,
+                    transcript_bytes: 0,
+                    memory_files: 0,
+                },
+            },
+        ];
+        let target = PickerTarget::NewTerminalSession {
+            workspace_id: "ws-0".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            existing_seed_from: None,
+        };
+        let (mode, _) = super::catalog_open_outcome(Ok(snaps), Some(target));
+        match mode {
+            InputMode::SnapshotCatalog { snapshots, .. } => {
+                assert_eq!(snapshots.len(), 1);
+                assert_eq!(snapshots[0].name, "codex-one");
+            }
+            _ => panic!("expected SnapshotCatalog"),
+        }
+    }
+
+    #[test]
+    fn validate_seed_loadable_rejects_nonexistent_snapshot() {
+        // Pointed at a fresh HOME with no snapshots; `load` returns
+        // NotFound, the helper surfaces it as a user-facing error
+        // string. `create_local_session` consults this BEFORE
+        // `worktree::create_worktree`, so a bad seed name no longer
+        // leaves an orphan worktree + branch on disk.
+        use crate::test_support::home_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = home_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        let result = super::validate_seed_loadable("ghost-snapshot");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let msg = result.expect_err("missing snapshot should fail validation");
+        assert!(
+            msg.starts_with("Snapshot load failed: "),
+            "unexpected error message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn validate_seed_loadable_accepts_real_snapshot() {
+        // Counterpart: a real on-disk snapshot returns Ok so the
+        // worktree creation proceeds.
+        use crate::test_support::home_lock;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_home = dir.path();
+        let snap_root = fake_home.join(".cm/agent-memories");
+        let snap_dir = snap_root.join("real");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let manifest = serde_json::json!({
+            "version": agent_memory::MANIFEST_VERSION,
+            "description": "",
+            "engine": "claude-code",
+            "source_session_uid": "ts-x",
+            "source_transcript_id": "tid-1",
+            "source_cwd": "/tmp",
+            "created_at_unix": 0,
+            "transcript_bytes": 0,
+            "memory_files": 0,
+        });
+        std::fs::write(snap_dir.join("manifest.json"), manifest.to_string())
+            .unwrap();
+        std::fs::write(snap_dir.join("transcript.jsonl"), b"line\n").unwrap();
+
+        let _guard = home_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let result = super::validate_seed_loadable("real");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(result.is_ok(), "real snapshot should pass validation: {result:?}");
+    }
+
+    #[test]
+    fn picker_round_trip_targets_workspace_by_stable_id() {
+        // Regression: PickerTarget::NewTerminalSession used to store a
+        // positional ws_index. While the picker was open, backend events
+        // (reconcile_tasks) could reorder workspaces and the form would
+        // reopen pointing at the wrong slot. After the fix the target
+        // carries workspace_id, so the form always reopens on the
+        // workspace the user actually invoked the picker from.
+        let target = PickerTarget::NewTerminalSession {
+            workspace_id: "ws-B".into(),
+            session_type: "claude".into(),
+            task_id: Some("t-1".into()),
+            existing_seed_from: None,
+        };
+
+        // Simulate: workspaces were [A, B, C] when picker opened; while
+        // the picker was open a reconcile reordered them to [C, B, A].
+        // The form's workspace_id must still be ws-B (not whatever sits
+        // at index 1 now, which happens to be B in this case but would
+        // diverge in other orderings).
+        let workspaces = vec![
+            ws_fixture("ws-C", &[]),
+            ws_fixture("ws-B", &[]),
+            ws_fixture("ws-A", &[]),
+        ];
+        let mode = super::rebuild_form_from_picker(target, Some("snap-X".into()));
+        let workspace_id = match mode {
+            InputMode::NewTerminalSession {
+                workspace_id,
+                seed_from,
+                ..
+            } => {
+                assert_eq!(seed_from.as_deref(), Some("snap-X"));
+                workspace_id
+            }
+            _ => panic!("expected NewTerminalSession"),
+        };
+        // The reopened form still references workspace B by id.
+        assert_eq!(workspace_id, "ws-B");
+        // And resolving against the reordered vec lands on B's current
+        // position — index 1 now (because of the swap), but the lookup
+        // would still work even if it had moved further.
+        let resolved =
+            super::resolve_workspace_by_id(&workspaces, &workspace_id);
+        assert_eq!(resolved, Some(1));
+        assert_eq!(workspaces[resolved.unwrap()].id, "ws-B");
+    }
+
+    #[test]
+    fn resolve_workspace_by_id_returns_none_when_workspace_removed() {
+        // The "workspace vanished between open and submit" path —
+        // spawn_session_on_workspace bails on None rather than spawning
+        // into whatever (unrelated) workspace happens to share the
+        // old index.
+        let workspaces = vec![
+            ws_fixture("ws-A", &[]),
+            ws_fixture("ws-C", &[]),
+        ];
+        assert!(
+            super::resolve_workspace_by_id(&workspaces, "ws-B").is_none(),
+            "lookup must return None for a removed workspace"
+        );
+    }
+
+    #[test]
+    fn picker_target_engine_resolves_per_target() {
+        assert_eq!(
+            super::picker_target_engine(&PickerTarget::NewSession {
+                label_text: String::new(),
+                branch_text: String::new(),
+                idle_timeout_text: String::new(),
+                repo_url: String::new(),
+                existing_seed_from: None,
+            }),
+            Some(Engine::ClaudeCode)
+        );
+        assert_eq!(
+            super::picker_target_engine(&PickerTarget::NewTerminalSession {
+                workspace_id: "ws-0".into(),
+                session_type: "claude".into(),
+                task_id: None,
+                existing_seed_from: None,
+            }),
+            Some(Engine::ClaudeCode)
+        );
+        assert_eq!(
+            super::picker_target_engine(&PickerTarget::NewTerminalSession {
+                workspace_id: "ws-0".into(),
+                session_type: "codex".into(),
+                task_id: None,
+                existing_seed_from: None,
+            }),
+            Some(Engine::Codex)
+        );
+        assert_eq!(
+            super::picker_target_engine(&PickerTarget::NewTerminalSession {
+                workspace_id: "ws-0".into(),
+                session_type: "bash".into(),
+                task_id: None,
+                existing_seed_from: None,
+            }),
+            None
+        );
     }
 
     // ── SessionSettings ───────────────────────────────────────────
@@ -10981,7 +12441,7 @@ mod input_handler_tests {
                     snapshots: &mut snaps,
                     selected: &mut selected,
                     mode: &mut mode,
-                    is_picker: false,
+                    picker_target: None,
                     status_msg: &mut None,
                 },
                 ctx_no_repos(),
@@ -10996,7 +12456,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11015,7 +12475,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11035,7 +12495,13 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: true,
+                picker_target: Some(&PickerTarget::NewSession {
+                    label_text: String::new(),
+                    branch_text: String::new(),
+                    idle_timeout_text: String::new(),
+                    repo_url: String::new(),
+                    existing_seed_from: None,
+                }),
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11059,7 +12525,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11084,7 +12550,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11105,7 +12571,13 @@ mod input_handler_tests {
                     snapshots: &mut snaps,
                     selected: &mut selected,
                     mode: &mut mode,
-                    is_picker: true,
+                    picker_target: Some(&PickerTarget::NewSession {
+                        label_text: String::new(),
+                        branch_text: String::new(),
+                        idle_timeout_text: String::new(),
+                        repo_url: String::new(),
+                        existing_seed_from: None,
+                    }),
                     status_msg: &mut None,
                 },
                 ctx_no_repos(),
@@ -11141,7 +12613,7 @@ mod input_handler_tests {
                     snapshots: &mut snaps,
                     selected: &mut selected,
                     mode: &mut mode,
-                    is_picker: false,
+                    picker_target: None,
                     status_msg: &mut None,
                 },
                 ctx_no_repos(),
@@ -11164,7 +12636,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11186,7 +12658,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11205,7 +12677,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11230,7 +12702,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11249,7 +12721,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut None,
             },
             ctx_no_repos(),
@@ -11462,7 +12934,7 @@ mod input_handler_tests {
                 snapshots: &mut snaps,
                 selected: &mut selected,
                 mode: &mut mode,
-                is_picker: false,
+                picker_target: None,
                 status_msg: &mut status,
             },
             ctx_no_repos(),
