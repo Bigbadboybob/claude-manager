@@ -730,10 +730,10 @@ struct StartSessionParams {
 pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
-    if !matches!(p.type_.as_str(), "claude-code" | "codex") {
+    if !matches!(p.type_.as_str(), "claude-code" | "codex" | "bash") {
         return Err((
             ErrorCode::InvalidParams,
-            format!("type must be claude-code or codex, got {}", p.type_),
+            format!("type must be claude-code, codex, or bash, got {}", p.type_),
         ));
     }
     // Mutation — caller must be live.

@@ -3753,29 +3753,49 @@ impl App {
             })?;
         let (cols, rows) = self.last_term_size;
         let session_uid = new_session_uid();
-        let engine = match type_ {
-            "codex" => workflow::toml_schema::Engine::Codex,
-            _ => workflow::toml_schema::Engine::ClaudeCode,
-        };
-        let (program, args) =
-            crate::mcp_config::build_args(&engine, &session_uid, None, None)?;
-        let pending = match engine {
-            workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
-            workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
-        };
-        let session_type = engine.as_session_type().to_string();
-        let session = self
-            .spawn_agent_session(
-                &session_type,
-                &session_uid,
-                &program,
-                &args,
+        // Bash gets a raw PTY shell — no MCP injection, no transcript
+        // tracking. `idle` still flips correctly via the burst detector
+        // (PTY-activity-based), and `send_input` works because it queues
+        // raw bytes + Enter at the PTY layer. Useful when the caller
+        // wants a shell the user can also drive interactively.
+        let (session, session_type, pending) = if type_ == "bash" {
+            let s = Session::new(
+                "/bin/bash",
+                &[],
                 cols,
                 rows,
-                Some(worktree_path),
+                Some(worktree_path.clone()),
                 Default::default(),
+                None,
             )
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            (s, "bash".to_string(), None)
+        } else {
+            let engine = match type_ {
+                "codex" => workflow::toml_schema::Engine::Codex,
+                _ => workflow::toml_schema::Engine::ClaudeCode,
+            };
+            let (program, args) =
+                crate::mcp_config::build_args(&engine, &session_uid, None, None)?;
+            let pending = match engine {
+                workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
+                workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
+            };
+            let session_type = engine.as_session_type().to_string();
+            let s = self
+                .spawn_agent_session(
+                    &session_type,
+                    &session_uid,
+                    &program,
+                    &args,
+                    cols,
+                    rows,
+                    Some(worktree_path),
+                    Default::default(),
+                )
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            (s, session_type, Some(pending))
+        };
         let mut pending_prompt = None;
         if let Some(text) = prompt {
             if !text.trim().is_empty() {
@@ -3797,7 +3817,7 @@ impl App {
             last_write_at: None,
             transcript_id: None,
             generation: 0,
-            pending_jsonl_files: Some(pending),
+            pending_jsonl_files: pending,
             hidden: false,
             idle_timeout_secs: 0,
             burst_threshold: 0,

@@ -331,14 +331,21 @@ def start_session(
     prompt: str = "",
     task_id: str | None = None,
 ) -> dict:
-    """Spawn a new agent session in your workspace.
+    """Spawn a new agent or shell session in your workspace.
 
     Args:
-        type: "claude-code" or "codex". Bash sessions are user-only.
+        type: "claude-code", "codex", or "bash". A bash session is a raw
+            shell in the workspace's worktree — useful when you want to
+            drive a terminal and have the user share it. No MCP
+            injection, no transcript, but `send_input` and
+            `wait_for_session_idle` still work (writes raw bytes + Enter
+            to the PTY; idle flips via the same burst detector as
+            agents).
         label: Sidebar label for the new session.
-        prompt: Optional initial prompt to deliver once the agent is
+        prompt: Optional initial prompt to deliver once the session is
             ready (queued via the same PendingWrite drainer the workflow
-            activation flow uses).
+            activation flow uses). For a bash session this is just a
+            command line.
         task_id: Optional task to bind to. Omitted = your own task (if
             any) or no task. Cross-task binding is rejected.
 
@@ -534,6 +541,188 @@ def list_workflows(task_id: str | None = None) -> list[dict]:
     if task_id:
         params["task_id"] = task_id
     return control_client.call("list_workflows", params)
+
+
+@mcp.tool()
+def wait_for_workflow_done(
+    run_id: str,
+    timeout_s: float = 1800.0,
+    poll_interval_s: float = 5.0,
+) -> dict:
+    """Block until a workflow run finishes, then return its final state.
+
+    Finished means `status` is `Done` or `Detached`, or `done_reason` is
+    set (a `Paused` run is NOT done — this keeps waiting). Internally
+    polls `get_workflow_state` on `poll_interval_s` (clamped to
+    [1.0, 60.0]) until done or `timeout_s` elapses (clamped to
+    [1.0, 86400.0]).
+
+    Use this to orchestrate multi-step work: launch a workflow, wait,
+    inspect, repeat. No need to poll yourself.
+
+    Args:
+        run_id: Workflow run id returned by `start_workflow`.
+        timeout_s: Max seconds to wait. Default 1800 (30 min).
+        poll_interval_s: Seconds between polls. Default 5.
+
+    Returns: {"done": bool, "timed_out": bool, "state": <state dict>}.
+        - done=True: workflow finished; inspect `state["status"]` and
+          `state["done_reason"]`.
+        - done=False, timed_out=True: deadline reached; `state` is the
+          last snapshot read.
+
+    Raises ControlError on auth failure or unknown run_id — does not
+    retry past those.
+    """
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(1.0, min(poll_interval_s, 60.0))
+    while True:
+        state = control_client.call("get_workflow_state", {"run_id": run_id})
+        status = state.get("status")
+        if status in ("Done", "Detached") or state.get("done_reason") is not None:
+            return {"done": True, "timed_out": False, "state": state}
+        if time.monotonic() >= deadline:
+            return {"done": False, "timed_out": True, "state": state}
+        time.sleep(interval)
+
+
+@mcp.tool()
+def wait_for_workflow_stop(
+    run_id: str,
+    timeout_s: float = 3600.0,
+    poll_interval_s: float = 5.0,
+    stuck_after_s: float = 60.0,
+) -> dict:
+    """Block until a workflow finishes OR gets stuck, then return.
+
+    Stuck = the active role's session has been idle for `stuck_after_s`
+    seconds with no transition (iteration counter unchanged). Use this
+    when a workflow can dead-end without anyone calling
+    `workflow_done` — e.g. an agent that just stops without a final
+    handoff. The orchestrator can then inspect, prod, or stop the run.
+
+    Done = `status` is `Done`/`Detached` or `done_reason` is set
+    (same predicate as `wait_for_workflow_done`).
+
+    Internally polls `get_workflow_state` + `list_sessions` on
+    `poll_interval_s` (clamped to [1.0, 60.0]) until done/stuck or
+    `timeout_s` elapses. The stuck timer resets every time `iteration`
+    changes.
+
+    Args:
+        run_id: Workflow run id returned by `start_workflow`.
+        timeout_s: Max seconds to wait. Default 3600 (1 hour).
+        poll_interval_s: Seconds between polls. Default 5.
+        stuck_after_s: Seconds the active session must stay idle (with
+            no transition) before the run is declared stuck. Default 60.
+
+    Returns: {"done": bool, "stuck": bool, "timed_out": bool,
+        "state": <state dict>}. Exactly one of done/stuck/timed_out is
+        true on return.
+    """
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(1.0, min(poll_interval_s, 60.0))
+    stuck_window = max(5.0, min(stuck_after_s, 3600.0))
+
+    last_iteration: int | None = None
+    idle_since: float | None = None
+
+    while True:
+        state = control_client.call("get_workflow_state", {"run_id": run_id})
+        status = state.get("status")
+        if status in ("Done", "Detached") or state.get("done_reason") is not None:
+            return {
+                "done": True, "stuck": False, "timed_out": False, "state": state,
+            }
+
+        iteration = state.get("iteration", 0)
+        active_role = state.get("active_role")
+        role_sessions = state.get("role_sessions") or {}
+
+        if iteration != last_iteration:
+            last_iteration = iteration
+            idle_since = None
+
+        active_label = None
+        if active_role and active_role in role_sessions:
+            active_label = (role_sessions[active_role] or {}).get("session_label")
+
+        active_idle = False
+        if active_label:
+            # Omit task_id — defaults to the caller's scope, which
+            # includes the workflow's participant sessions for any
+            # orchestrator authorized to launch the run.
+            sessions = control_client.call("list_sessions", {"include_exited": False})
+            for s in sessions:
+                if s.get("label") == active_label:
+                    active_idle = bool(s.get("idle", False))
+                    break
+
+        now = time.monotonic()
+        if active_idle:
+            if idle_since is None:
+                idle_since = now
+            elif now - idle_since >= stuck_window:
+                return {
+                    "done": False, "stuck": True, "timed_out": False, "state": state,
+                }
+        else:
+            idle_since = None
+
+        if time.monotonic() >= deadline:
+            return {
+                "done": False, "stuck": False, "timed_out": True, "state": state,
+            }
+        time.sleep(interval)
+
+
+@mcp.tool()
+def wait_for_session_idle(
+    session_uid: str,
+    timeout_s: float = 600.0,
+    poll_interval_s: float = 2.0,
+) -> dict:
+    """Block until a session becomes idle (agent at the prompt), then
+    return.
+
+    "Idle" mirrors the same signal surfaced by `read_session_output`
+    and `list_sessions`. An `exited` session is reported as idle (no
+    PTY left to be busy on). Internally polls
+    `resolve_authorized_session` on `poll_interval_s` (clamped to
+    [0.5, 30.0]) until idle or `timeout_s` elapses (clamped to
+    [1.0, 86400.0]).
+
+    Use this after `send_input` or `start_session` instead of looping
+    on `read_session_output` yourself.
+
+    Args:
+        session_uid: Target session's stable UID.
+        timeout_s: Max seconds to wait. Default 600 (10 min).
+        poll_interval_s: Seconds between polls. Default 2.
+
+    Returns: {"idle": bool, "timed_out": bool, "state":
+        "ready"|"pending"|"exited"}.
+        - idle=True, state="ready": agent finished its turn.
+        - idle=True, state="exited": session terminated.
+        - idle=False, timed_out=True: deadline reached while still busy.
+
+    Raises ControlError on auth failure or unknown session_uid.
+    """
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(0.5, min(poll_interval_s, 30.0))
+    while True:
+        resolved = control_client.call(
+            "resolve_authorized_session",
+            {"session_uid": session_uid},
+        )
+        state = resolved.get("state", "pending")
+        if state == "exited":
+            return {"idle": True, "timed_out": False, "state": state}
+        if bool(resolved.get("idle", False)):
+            return {"idle": True, "timed_out": False, "state": state}
+        if time.monotonic() >= deadline:
+            return {"idle": False, "timed_out": True, "state": state}
+        time.sleep(interval)
 
 
 @mcp.tool()
