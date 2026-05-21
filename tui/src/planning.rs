@@ -282,6 +282,12 @@ pub enum PlanAction {
     UnlaunchTask {
         task_id: String,
     },
+    /// Reopen a done task: validate the worktree is still on disk, PATCH the
+    /// task back to `running`, un-archive the workspace, and switch to the
+    /// Sessions view. Gracefully fails when the worktree has been removed.
+    ReopenTask {
+        task_id: String,
+    },
     SwitchToSessions,
     Quit,
     CreateTask {
@@ -984,6 +990,17 @@ impl PlanningView {
         }
     }
 
+    /// Optimistically flip a task back to `InProgress` in the in-memory plan.
+    /// The grid reconciles on the next `refresh_plan_tasks` tick.
+    pub fn mark_task_running_by_id(&mut self, task_id: &str) {
+        for pd in &mut self.project_data {
+            if let Some(task) = pd.tasks.iter_mut().find(|t| t.id == task_id) {
+                task.status = PlanStatus::InProgress;
+                return;
+            }
+        }
+    }
+
     fn rebuild_unified_cols(&mut self) {
         self.unified_cols.clear();
         for (pi, pd) in self.project_data.iter().enumerate() {
@@ -1411,6 +1428,19 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
+                    // `A-O` (Alt+Shift+O): reopen a done task's worktree.
+                    // Only fires on a focused task whose status is Done.
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        self.cancel_visual();
+                        if let Some((pi, ti)) = self.selected_task_loc() {
+                            if let Some(task) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)) {
+                                if task.status == PlanStatus::Done {
+                                    return PlanAction::ReopenTask { task_id: task.id.clone() };
+                                }
+                            }
+                        }
+                        return PlanAction::Consumed;
+                    }
                     // `A-N` (Alt+Shift+N): create a subtask of the focused
                     // task. Mirrors `A-n` (top-level new) but the action
                     // carries `parent_task_id` so the API row is persisted
@@ -2878,7 +2908,7 @@ impl PlanningView {
             ("A-J/K  reorder", "A-f    launch"),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
-            ("A-N    subtask", ""),
+            ("A-N    subtask", "A-O    reopen done"),
             ("A-u    unbind", "A-U    unlaunch"),
             ("A-Ent  sep", "A-Spc  empty"),
             ("A-i    header", "A-A    archive done"),

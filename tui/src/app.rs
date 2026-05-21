@@ -973,6 +973,8 @@ enum VisualItem {
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
     WorkflowHeader { ws_idx: usize, run_id: String },
+    /// Dim label that introduces the "Past workspaces" section. Not selectable.
+    SectionHeader(&'static str),
 }
 
 /// Modal input state.
@@ -3603,6 +3605,73 @@ impl App {
         }
     }
 
+    /// Reopen the past workspace under the cursor: flip `is_closed` back to
+    /// false and bring any bound done tasks back to `running` so the
+    /// workspace re-enters the active sidebar. Refuses gracefully when the
+    /// worktree directory is gone (manually deleted or `git worktree
+    /// remove`'d) — the user can press A-x to drop the workspace entry
+    /// instead.
+    fn reopen_active_workspace(&mut self) {
+        let Some(wi) = self.active_workspace_index() else {
+            return;
+        };
+        if !self.is_past_workspace(wi) {
+            self.set_status_msg("Not a past workspace");
+            return;
+        }
+        let ws_id = self.workspaces[wi].id.clone();
+        let worktree_path = self.workspaces[wi].worktree_path.clone();
+        match worktree_path.as_deref() {
+            Some(p) if p.exists() => {}
+            Some(p) => {
+                self.set_status_msg(&format!(
+                    "Worktree gone: {} — A-x to remove",
+                    p.display()
+                ));
+                return;
+            }
+            None => {
+                self.set_status_msg("Workspace has no worktree to reopen");
+                return;
+            }
+        }
+
+        self.workspaces[wi].is_closed = false;
+
+        // PATCH any bound done tasks back to running so they re-enter the
+        // active sidebar (reconcile only surfaces running/blocked).
+        let bound_done: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
+            .filter(|t| matches!(t.api_status, TaskStatus::Done))
+            .filter_map(|t| t.task_id.clone())
+            .collect();
+        for tid in &bound_done {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "status".to_string(),
+                serde_json::Value::String("running".to_string()),
+            );
+            self.backend.update_task(tid.clone(), fields);
+        }
+        for tid in &bound_done {
+            if let Some(entry) = self
+                .tasks
+                .iter_mut()
+                .find(|t| t.task_id.as_deref() == Some(tid.as_str()))
+            {
+                entry.api_status = TaskStatus::Running;
+            }
+            self.planning.mark_task_running_by_id(tid);
+        }
+
+        self.save_session_manifest();
+        self.cursor = Cursor::Workspace(wi);
+        self.clamp_cursor();
+        self.set_status_msg("Workspace reopened — A-s to add session");
+    }
+
     /// Soft-close the workspace under the cursor: kill its session PTYs
     /// and hide from the sidebar. Worktree stays on disk; bindings persist.
     /// Each closed session leaves behind a `SessionTombstone` so the
@@ -3816,6 +3885,37 @@ impl App {
             .find(|t| t.workspace_id.as_deref() == Some(ws_id))
     }
 
+    /// A workspace is "past" if it's been put away but its worktree may still
+    /// be on disk. Cloud workspaces never qualify — there's no worktree to
+    /// reopen and the VM may be gone. Local workspaces qualify when either:
+    ///   - `is_closed = true` (explicit A-W close), or
+    ///   - they have no live sessions AND every bound task is done.
+    /// An unbound, sessionless, open workspace is NOT past — it's a fresh
+    /// workspace waiting for sessions.
+    fn is_past_workspace(&self, wi: usize) -> bool {
+        let Some(ws) = self.workspaces.get(wi) else {
+            return false;
+        };
+        if ws.is_cloud {
+            return false;
+        }
+        if ws.is_closed {
+            return true;
+        }
+        if !ws.sessions.is_empty() {
+            return false;
+        }
+        let bound: Vec<&TaskEntry> = self
+            .tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(&ws.id))
+            .collect();
+        !bound.is_empty()
+            && bound
+                .iter()
+                .all(|t| matches!(t.api_status, TaskStatus::Done))
+    }
+
     /// Compute effective task status: derived from the workspace's sessions
     /// if bound, otherwise falls back to api_status.
     fn task_status(&self, task: &TaskEntry) -> TaskStatus {
@@ -3888,13 +3988,19 @@ impl App {
     }
 
     /// Status view: flat list of sessions grouped by status.
-    /// Running sessions first, then idle, then workspaces with no sessions.
+    /// Running sessions first, then idle, then workspaces with no sessions,
+    /// then a "Past workspaces" section for closed / done-task workspaces.
     fn visual_items_status(&self) -> Vec<VisualItem> {
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
+        let mut past: Vec<VisualItem> = Vec::new();
 
         for (wi, ws) in self.workspaces.iter().enumerate() {
+            if self.is_past_workspace(wi) {
+                past.push(VisualItem::WorkspaceHeader(wi));
+                continue;
+            }
             if ws.is_closed {
                 continue;
             }
@@ -3923,16 +4029,29 @@ impl App {
             }
         }
         items.extend(no_session);
+        if !past.is_empty() {
+            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
+                items.push(VisualItem::Separator);
+            }
+            items.push(VisualItem::SectionHeader("Past workspaces"));
+            items.extend(past);
+        }
         items
     }
 
     /// Task view: workspace headers with sessions indented underneath.
     /// Sessions grouped by workflow run appear contiguously under a workflow
     /// subheader. Standalone sessions render first; each workflow group follows.
+    /// Past workspaces are gathered into a trailing "Past workspaces" section.
     fn visual_items_task(&self) -> Vec<VisualItem> {
         let mut items = Vec::new();
         let mut first = true;
+        let mut past: Vec<usize> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
+            if self.is_past_workspace(wi) {
+                past.push(wi);
+                continue;
+            }
             if ws.is_closed {
                 continue;
             }
@@ -4042,6 +4161,15 @@ impl App {
                 }
             }
         }
+        if !past.is_empty() {
+            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
+                items.push(VisualItem::Separator);
+            }
+            items.push(VisualItem::SectionHeader("Past workspaces"));
+            for wi in past {
+                items.push(VisualItem::WorkspaceHeader(wi));
+            }
+        }
         items
     }
 
@@ -4066,6 +4194,7 @@ impl App {
             VisualItem::TaskHeader { .. } => true,
             VisualItem::Separator => false,
             VisualItem::WorkflowHeader { .. } => false,
+            VisualItem::SectionHeader(_) => false,
         };
 
         if !items.iter().any(is_selectable) {
@@ -5395,6 +5524,10 @@ impl App {
                     self.unlaunch_task(&task_id);
                     return true;
                 }
+                PlanAction::ReopenTask { task_id } => {
+                    self.reopen_task_from_planning(&task_id);
+                    return true;
+                }
                 PlanAction::SwitchToSessions => {
                     self.view_mode = ViewMode::Sessions;
                     return true;
@@ -5557,6 +5690,21 @@ impl App {
                     }
                     KeyCode::Char('u') => {
                         self.resume_workflow_for_cursor();
+                        return true;
+                    }
+                    // A-O (Alt+Shift+O): reopen the focused past workspace.
+                    // Mirrors A-W (close workspace) but in the other direction —
+                    // un-archive + flip any bound done tasks back to running.
+                    // Terminals differ on whether Shift is folded into the
+                    // case of the char or reported as a modifier — accept both.
+                    KeyCode::Char('O') => {
+                        self.reopen_active_workspace();
+                        return true;
+                    }
+                    KeyCode::Char('o')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.reopen_active_workspace();
                         return true;
                     }
                     KeyCode::Char('o') => {
@@ -7550,6 +7698,132 @@ impl App {
         }
     }
 
+    /// Planning-view counterpart to `reopen_active_workspace`. Resolves the
+    /// task's worktree via either its existing workspace binding, an in-memory
+    /// workspace matching by recovered path, or a filesystem scan. Refuses
+    /// when the worktree directory is gone. Otherwise PATCHes the task back
+    /// to `running`, un-archives (or provisions) the workspace, switches to
+    /// the Sessions view, and leaves the cursor on the reopened workspace.
+    fn reopen_task_from_planning(&mut self, task_id: &str) {
+        let entry = self
+            .tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(task_id));
+        let (repo_url, wip_branch, workspace_id, is_cloud, name) = match entry {
+            Some(t) => (
+                t.repo_url.clone(),
+                t.wip_branch.clone(),
+                t.workspace_id.clone(),
+                t.is_cloud,
+                t.name.clone(),
+            ),
+            None => {
+                self.set_status_msg("Task not found locally");
+                return;
+            }
+        };
+        if is_cloud {
+            self.set_status_msg("Cloud tasks aren't reopenable from past");
+            return;
+        }
+
+        // Locate an existing workspace: by id, else by recovered worktree_path.
+        let recovered_path = wip_branch
+            .as_deref()
+            .zip(repo_url.as_deref())
+            .and_then(|(b, r)| worktree::recover_worktree_path(r, b));
+        let mut wi: Option<usize> = workspace_id
+            .as_deref()
+            .and_then(|id| self.workspaces.iter().position(|w| w.id == id));
+        if wi.is_none() {
+            if let Some(ref wt) = recovered_path {
+                wi = self
+                    .workspaces
+                    .iter()
+                    .position(|w| w.worktree_path.as_deref() == Some(wt.as_path()));
+            }
+        }
+
+        // Resolve the worktree path we'll validate. Prefer the existing
+        // workspace's path (might differ from recovered if branch was renamed),
+        // fall back to filesystem recovery.
+        let worktree_path = wi
+            .and_then(|i| self.workspaces[i].worktree_path.clone())
+            .or(recovered_path);
+        let worktree_path = match worktree_path {
+            Some(p) if p.exists() => p,
+            Some(p) => {
+                self.set_status_msg(&format!(
+                    "Worktree gone: {} — task can't be reopened",
+                    p.display()
+                ));
+                return;
+            }
+            None => {
+                self.set_status_msg("Worktree not found on disk — task can't be reopened");
+                return;
+            }
+        };
+
+        // PATCH task → running and update optimistic in-memory state.
+        let mut fields = HashMap::new();
+        fields.insert(
+            "status".to_string(),
+            serde_json::Value::String("running".to_string()),
+        );
+        self.backend.update_task(task_id.to_string(), fields);
+        if let Some(entry) = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+        {
+            entry.api_status = TaskStatus::Running;
+        }
+        self.planning.mark_task_running_by_id(task_id);
+
+        // Provision a workspace if none exists yet — the manifest may have
+        // dropped the binding when the task last reconciled as done (the
+        // reconcile loop skips non-running/blocked tasks).
+        let final_wi = match wi {
+            Some(i) => i,
+            None => {
+                let main_repo = repo_url.as_deref().and_then(worktree::find_local_repo);
+                let ws = Workspace {
+                    id: new_workspace_id(),
+                    name,
+                    is_closed: false,
+                    is_cloud: false,
+                    repo_url: repo_url.clone(),
+                    worktree_path: Some(worktree_path),
+                    main_repo_path: main_repo,
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: vec![],
+                    tombstones: Vec::new(),
+                    is_pushing: false,
+                };
+                let new_ws_id = ws.id.clone();
+                self.workspaces.push(ws);
+                let idx = self.workspaces.len() - 1;
+                if let Some(entry) = self
+                    .tasks
+                    .iter_mut()
+                    .find(|t| t.task_id.as_deref() == Some(task_id))
+                {
+                    entry.workspace_id = Some(new_ws_id);
+                }
+                idx
+            }
+        };
+
+        self.workspaces[final_wi].is_closed = false;
+        self.cursor = Cursor::Workspace(final_wi);
+        self.save_session_manifest();
+        self.view_mode = ViewMode::Sessions;
+        self.clamp_cursor();
+        self.set_status_msg("Reopened — A-s to add session");
+    }
+
     fn unlaunch_task(&mut self, task_id: &str) {
         let mut fields = std::collections::HashMap::new();
         fields.insert("status".to_string(), serde_json::Value::String("backlog".to_string()));
@@ -8335,6 +8609,7 @@ impl App {
             ("A-f    workflow", "A-u  resume"),
             ("A-o    stop wf", "A-,  activity"),
             ("A-b    snapshot", "A-z  catalog"),
+            ("A-O    reopen ws", ""),
             ("PgUp   scroll up", ""),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
@@ -8357,6 +8632,7 @@ impl App {
                         Cursor::Workspace(cwi) => cwi == wi,
                         _ => false,
                     };
+                    let is_past = self.is_past_workspace(*wi);
 
                     let max_name = (inner.width as usize).saturating_sub(2);
                     let name = if ws.name.len() > max_name {
@@ -8374,6 +8650,8 @@ impl App {
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
+                    } else if is_past {
+                        Style::default().fg(Color::DarkGray)
                     } else {
                         Style::default().fg(Color::Gray)
                     };
@@ -8568,6 +8846,10 @@ impl App {
                         Span::raw(name),
                     ]);
                     items.push(ListItem::new(line).style(base_style));
+                }
+                VisualItem::SectionHeader(label) => {
+                    let line = Line::from(Span::styled(format!(" {}", label), dim));
+                    items.push(ListItem::new(line));
                 }
             }
         }
