@@ -5106,8 +5106,11 @@ impl App {
     pub fn drain_planning_events(&mut self) {
         if let Some(action) = self.planning.drain_editor_events() {
             match action {
-                PlanAction::UpdateTask { id, fields } => {
+                PlanAction::UpdateTask { id, fields, status_msg } => {
                     self.backend.update_plan_task(id, fields);
+                    if let Some(msg) = status_msg {
+                        self.set_status_msg(&msg);
+                    }
                 }
                 _ => {}
             }
@@ -5629,8 +5632,11 @@ impl App {
                     );
                     return true;
                 }
-                PlanAction::UpdateTask { id, fields } => {
+                PlanAction::UpdateTask { id, fields, status_msg } => {
                     self.backend.update_plan_task(id, fields);
+                    if let Some(msg) = status_msg {
+                        self.set_status_msg(&msg);
+                    }
                     return true;
                 }
                 PlanAction::BulkUpdateTasks { ids, fields } => {

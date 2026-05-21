@@ -90,6 +90,7 @@ pub struct PlanTask {
     pub source: String,
     pub is_cloud: bool,
     pub repo_url: String,
+    pub parent_task_id: Option<String>,
 }
 
 impl PlanTask {
@@ -110,6 +111,7 @@ impl PlanTask {
             source: task.source.clone(),
             is_cloud: task.is_cloud,
             repo_url: task.repo_url.clone(),
+            parent_task_id: task.parent_task_id.clone(),
         }
     }
 }
@@ -308,6 +310,10 @@ pub enum PlanAction {
     UpdateTask {
         id: String,
         fields: HashMap<String, serde_json::Value>,
+        /// Optional toast to surface alongside the PATCH dispatch — used
+        /// when editor save partially succeeded (e.g. parent slug
+        /// resolution failed; other fields still go out).
+        status_msg: Option<String>,
     },
     /// Apply the same field update to a list of tasks. Used by bulk-archive.
     /// The app loop iterates and PATCHes each id with `fields.clone()`.
@@ -342,10 +348,21 @@ struct PlanTaskFrontmatter {
     depends: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// Parent task by slug (same project only). Same three-valued
+    /// presence semantics as `depends`/`branch`: absent means no
+    /// change, empty/null means clear, set means reparent. Slug → id
+    /// resolution and cycle/cross-project validation happen at save
+    /// time in `stop_editor`, since `build_patch_fields` doesn't have
+    /// access to the task list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
 }
 
 /// Write a task to a temp file for editing, returns the temp path.
-fn write_temp_task(task: &PlanTask) -> Option<PathBuf> {
+///
+/// `parent_slug` should be the slug of the task's current parent (if any),
+/// pre-resolved from the project's task list by the caller.
+fn write_temp_task(task: &PlanTask, parent_slug: Option<&str>) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("cm-planning");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{}.md", task.slug));
@@ -360,6 +377,7 @@ fn write_temp_task(task: &PlanTask) -> Option<PathBuf> {
             Some(task.depends.clone())
         },
         branch: task.branch.clone(),
+        parent: parent_slug.map(|s| s.to_string()),
     };
     let yaml = serde_yaml::to_string(&front).ok()?;
     let yaml = yaml.trim_end_matches('\n');
@@ -448,6 +466,14 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
             _ => FieldUpdate::Cleared,
         }
     };
+    let parent = if !key_present("parent") {
+        FieldUpdate::Absent
+    } else {
+        match front.parent {
+            Some(s) if !s.is_empty() => FieldUpdate::Set(s),
+            _ => FieldUpdate::Cleared,
+        }
+    };
 
     // Extract prompt section from body.
     let mut in_prompt = false;
@@ -476,6 +502,7 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
         difficulty,
         depends,
         branch,
+        parent,
         description: desc_lines.join("\n").trim().to_string(),
         prompt: prompt_lines.join("\n").trim().to_string(),
     })
@@ -487,6 +514,10 @@ struct TempTaskParsed {
     difficulty: FieldUpdate<u8>,
     depends: FieldUpdate<Vec<String>>,
     branch: FieldUpdate<String>,
+    /// Parent slug. Resolved to `parent_task_id` in `stop_editor`, which
+    /// has access to the project's task list for slug→id lookup and
+    /// cycle/scope validation.
+    parent: FieldUpdate<String>,
     description: String,
     prompt: String,
 }
@@ -533,6 +564,63 @@ fn build_patch_fields(parsed: &TempTaskParsed) -> HashMap<String, serde_json::Va
         }
     }
     fields
+}
+
+/// Walk cap shared by `task_is_self_or_descendant_of` — the same value
+/// is reused here so behaviour stays consistent across the auth check
+/// and the planning editor's cycle-detection walk.
+const MAX_PARENT_WALK: usize = 64;
+
+/// Resolve a parsed `parent` slug to a `parent_task_id` PATCH entry,
+/// applying same-project + cycle validation.
+///
+/// Returns:
+/// - `Ok(None)` — caller should not include `parent_task_id` in the PATCH.
+///   Used for `FieldUpdate::Absent` (user didn't touch the field).
+/// - `Ok(Some(Value::Null))` — caller should PATCH `parent_task_id: null`.
+///   Used for `FieldUpdate::Cleared`.
+/// - `Ok(Some(Value::String(id)))` — caller should PATCH with the resolved id.
+/// - `Err(msg)` — validation failed; caller should surface `msg` and
+///   omit the parent change. Other PATCH fields can still be sent.
+///
+/// `tasks` must be the *current project's* task list. Slugs are resolved
+/// within that list only; a cross-project parent is reported as
+/// "unknown slug" since it isn't visible here.
+fn resolve_parent_patch(
+    tasks: &[PlanTask],
+    current_task_id: &str,
+    field: &FieldUpdate<String>,
+) -> Result<Option<serde_json::Value>, String> {
+    match field {
+        FieldUpdate::Absent => Ok(None),
+        FieldUpdate::Cleared => Ok(Some(serde_json::Value::Null)),
+        FieldUpdate::Set(slug) => {
+            let parent = tasks.iter().find(|t| t.slug == *slug).ok_or_else(|| {
+                format!("parent: no task with slug '{}' in this project", slug)
+            })?;
+            if parent.id == current_task_id {
+                return Err("parent: a task cannot be its own parent".to_string());
+            }
+            // Walk up from the candidate parent. If we ever hit the
+            // current task, the candidate is a descendant of us and
+            // accepting the edit would form a cycle.
+            let mut cur = parent.parent_task_id.clone();
+            for _ in 0..MAX_PARENT_WALK {
+                let Some(id) = cur else { break };
+                if id == current_task_id {
+                    return Err(format!(
+                        "parent: '{}' is a descendant of this task (would form a cycle)",
+                        slug
+                    ));
+                }
+                cur = tasks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.parent_task_id.clone());
+            }
+            Ok(Some(serde_json::json!(parent.id)))
+        }
+    }
 }
 
 // ── Layout Persistence ──────────────────────────────────────
@@ -2061,7 +2149,7 @@ impl PlanningView {
                 let status_str = task.status.as_str().to_string();
                 let mut fields = HashMap::new();
                 fields.insert("status".to_string(), serde_json::json!(status_str));
-                return PlanAction::UpdateTask { id, fields };
+                return PlanAction::UpdateTask { id, fields, status_msg: None };
             }
         }
         PlanAction::Consumed
@@ -2088,7 +2176,7 @@ impl PlanningView {
                 let id = task.id.clone();
                 let mut fields = HashMap::new();
                 fields.insert("status".to_string(), serde_json::json!("done"));
-                return PlanAction::UpdateTask { id, fields };
+                return PlanAction::UpdateTask { id, fields, status_msg: None };
             }
         }
         PlanAction::Consumed
@@ -2102,7 +2190,7 @@ impl PlanningView {
                 let id = task.id.clone();
                 let mut fields = HashMap::new();
                 fields.insert("source".to_string(), serde_json::json!("user"));
-                return PlanAction::UpdateTask { id, fields };
+                return PlanAction::UpdateTask { id, fields, status_msg: None };
             }
         }
         PlanAction::Consumed
@@ -2401,8 +2489,20 @@ impl PlanningView {
         let task = &self.project_data[pi].tasks[ti];
         let slug = task.slug.clone();
 
+        // Resolve current parent's slug for pre-fill. Look up within the
+        // same project — cross-project parents aren't allowed and we
+        // ignore any orphan link (parent_task_id pointing outside the
+        // current project's task list) here.
+        let parent_slug = task.parent_task_id.as_ref().and_then(|pid| {
+            self.project_data[pi]
+                .tasks
+                .iter()
+                .find(|t| t.id == *pid)
+                .map(|t| t.slug.clone())
+        });
+
         // Write task to temp file for editing.
-        let temp_path = match write_temp_task(task) {
+        let temp_path = match write_temp_task(task, parent_slug.as_deref()) {
             Some(p) => p,
             None => return PlanAction::Consumed,
         };
@@ -2436,6 +2536,40 @@ impl PlanningView {
             &self.editing_temp_path.clone(),
         ) {
             if let Some(parsed) = parse_temp_task(temp_path) {
+                // Resolve the parent reference first (immutable borrow on
+                // the project's task list) before taking the mutable
+                // borrow on the focused task to update local state.
+                let current_id = self.project_data.get(pi)
+                    .and_then(|pd| pd.tasks.iter().find(|t| t.slug == slug))
+                    .map(|t| t.id.clone());
+
+                let parent_patch = current_id.as_deref().and_then(|id| {
+                    self.project_data.get(pi).map(|pd| {
+                        resolve_parent_patch(&pd.tasks, id, &parsed.parent)
+                    })
+                });
+
+                let (parent_field, status_msg): (Option<serde_json::Value>, Option<String>) =
+                    match parent_patch {
+                        Some(Ok(v)) => (v, None),
+                        Some(Err(msg)) => (None, Some(msg)),
+                        None => (None, None),
+                    };
+
+                // Resolve the new parent_task_id for local state. We need
+                // the actual `Option<String>` to write back onto the
+                // PlanTask — Cleared → None, Set → Some(id), Absent →
+                // leave untouched.
+                let local_parent_update: Option<Option<String>> = match (&parsed.parent, &parent_field) {
+                    (FieldUpdate::Absent, _) => None,
+                    (_, None) => None, // validation error: don't touch local state
+                    (FieldUpdate::Cleared, Some(_)) => Some(None),
+                    (FieldUpdate::Set(_), Some(serde_json::Value::String(id))) => {
+                        Some(Some(id.clone()))
+                    }
+                    (FieldUpdate::Set(_), Some(_)) => None,
+                };
+
                 if let Some(task) = self.project_data.get_mut(pi)
                     .and_then(|pd| pd.tasks.iter_mut().find(|t| t.slug == slug))
                 {
@@ -2461,14 +2595,21 @@ impl PlanningView {
                         FieldUpdate::Cleared => task.branch = None,
                         FieldUpdate::Set(b) => task.branch = Some(b.clone()),
                     }
+                    if let Some(p) = local_parent_update {
+                        task.parent_task_id = p;
+                    }
                     task.description = parsed.description.clone();
                     task.prompt = parsed.prompt.clone();
 
-                    let fields = build_patch_fields(&parsed);
+                    let mut fields = build_patch_fields(&parsed);
+                    if let Some(v) = parent_field {
+                        fields.insert("parent_task_id".to_string(), v);
+                    }
 
                     action = PlanAction::UpdateTask {
                         id: task.id.clone(),
                         fields,
+                        status_msg,
                     };
                 }
             }
@@ -3661,6 +3802,7 @@ mod tests {
             source: "user".to_string(),
             is_cloud: false,
             repo_url: stored.to_string(),
+            parent_task_id: None,
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -3696,11 +3838,12 @@ mod tests {
             source: "user".to_string(),
             is_cloud: false,
             repo_url: String::new(),
+            parent_task_id: None,
         }
     }
 
     fn round_trip(task: &PlanTask) -> TempTaskParsed {
-        let path = write_temp_task(task).expect("write_temp_task");
+        let path = write_temp_task(task, None).expect("write_temp_task");
         let parsed = parse_temp_task(&path).expect("parse_temp_task");
         let _ = std::fs::remove_file(&path);
         parsed
@@ -3911,6 +4054,125 @@ mod tests {
             fields.get("depends"),
             Some(&serde_json::json!([] as [String; 0])),
         );
+    }
+
+    // ── parent field round-trip + resolver tests ─────────────
+    //
+    // The `parent` field lives in the editor's YAML frontmatter, follows
+    // the same Absent/Cleared/Set semantics as depends/branch, and gets
+    // resolved from a slug to a `parent_task_id` PATCH key by
+    // `resolve_parent_patch` (which also enforces same-project scope and
+    // no-cycle).
+
+    fn task_with_parent(slug: &str, id: &str, parent_id: Option<&str>) -> PlanTask {
+        let mut t = make_plan_task(slug);
+        t.id = id.to_string();
+        t.parent_task_id = parent_id.map(|s| s.to_string());
+        t
+    }
+
+    #[test]
+    fn frontmatter_parent_round_trips() {
+        let mut task = make_plan_task("child");
+        task.parent_task_id = Some("id-parent".to_string());
+        let path = write_temp_task(&task, Some("parent")).expect("write");
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(parsed.parent, FieldUpdate::Set("parent".to_string()));
+    }
+
+    #[test]
+    fn frontmatter_no_parent_emits_no_key() {
+        let task = make_plan_task("orphan");
+        let path = write_temp_task(&task, None).expect("write");
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+        // Without `parent:` in the YAML, parse must surface Absent so
+        // the PATCH builder skips the key.
+        assert_eq!(parsed.parent, FieldUpdate::Absent);
+    }
+
+    #[test]
+    fn parent_cleared_via_empty_value_resolves_to_null() {
+        let path = write_temp(
+            "parent-clear.md",
+            "---\ntitle: t\nstatus: backlog\nparent:\n---\n\nbody\n",
+        );
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(parsed.parent, FieldUpdate::Cleared);
+
+        let tasks = vec![task_with_parent("me", "id-me", Some("id-old"))];
+        let out = resolve_parent_patch(&tasks, "id-me", &parsed.parent)
+            .expect("clear must succeed");
+        assert_eq!(out, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn parent_set_to_known_slug_resolves_to_id() {
+        let tasks = vec![
+            task_with_parent("me", "id-me", None),
+            task_with_parent("other", "id-other", None),
+        ];
+        let field = FieldUpdate::Set("other".to_string());
+        let out = resolve_parent_patch(&tasks, "id-me", &field).expect("ok");
+        assert_eq!(out, Some(serde_json::json!("id-other")));
+    }
+
+    #[test]
+    fn parent_unknown_slug_is_error() {
+        let tasks = vec![task_with_parent("me", "id-me", None)];
+        let field = FieldUpdate::Set("nope".to_string());
+        let err = resolve_parent_patch(&tasks, "id-me", &field).unwrap_err();
+        assert!(err.contains("nope"), "msg names the missing slug: {}", err);
+    }
+
+    #[test]
+    fn parent_self_is_error() {
+        let tasks = vec![task_with_parent("me", "id-me", None)];
+        let field = FieldUpdate::Set("me".to_string());
+        let err = resolve_parent_patch(&tasks, "id-me", &field).unwrap_err();
+        assert!(err.contains("own parent"), "msg names self-cycle: {}", err);
+    }
+
+    #[test]
+    fn parent_descendant_is_cycle_error() {
+        // Tree: me → child → grandchild. Setting parent=grandchild on me
+        // would form a cycle.
+        let tasks = vec![
+            task_with_parent("me", "id-me", None),
+            task_with_parent("child", "id-child", Some("id-me")),
+            task_with_parent("grand", "id-grand", Some("id-child")),
+        ];
+        let field = FieldUpdate::Set("grand".to_string());
+        let err = resolve_parent_patch(&tasks, "id-me", &field).unwrap_err();
+        assert!(err.contains("cycle"), "msg names cycle: {}", err);
+    }
+
+    #[test]
+    fn parent_sibling_subtree_is_allowed() {
+        // Tree:
+        //   root-a (root)
+        //   root-b (root)
+        //   child-a (parent = root-a)
+        // Reparenting child-a → root-b is allowed: root-b isn't a
+        // descendant of child-a.
+        let tasks = vec![
+            task_with_parent("root-a", "id-a", None),
+            task_with_parent("root-b", "id-b", None),
+            task_with_parent("child-a", "id-ca", Some("id-a")),
+        ];
+        let field = FieldUpdate::Set("root-b".to_string());
+        let out = resolve_parent_patch(&tasks, "id-ca", &field).expect("ok");
+        assert_eq!(out, Some(serde_json::json!("id-b")));
+    }
+
+    #[test]
+    fn parent_absent_yields_no_patch_entry() {
+        let tasks = vec![task_with_parent("me", "id-me", None)];
+        let out = resolve_parent_patch(&tasks, "id-me", &FieldUpdate::Absent)
+            .expect("absent is ok");
+        assert_eq!(out, None);
     }
 
     // -- compose_launch_prompt --
