@@ -158,6 +158,11 @@ pub fn codex_args(
         args.push("resume".into());
     }
     args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    // Disable codex's startup update check: when a new version is published,
+    // accepting the popup tears down the TUI and exits with "Please restart
+    // Codex", which inside our PTY looks like a blank/dead session.
+    args.push("-c".into());
+    args.push("check_for_update_on_startup=false".into());
     args.extend(codex_overrides(session_uid, workflow.as_ref()));
     if let Some(sid) = resume_session_id {
         args.push(sid.to_string());
@@ -262,6 +267,14 @@ mod tests {
         assert!(args
             .iter()
             .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_args_disable_update_check() {
+        let args = codex_args("uid-x", None, None);
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-c" && w[1] == "check_for_update_on_startup=false"));
     }
 
     #[test]
