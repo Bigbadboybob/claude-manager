@@ -239,6 +239,7 @@ def update_task(
     difficulty: int | None = None,
     project: str | None = None,
     depends: list[str] | None = None,
+    parent_task_id: str | None = None,
 ) -> dict:
     """Edit a task's planning fields.
 
@@ -251,7 +252,9 @@ def update_task(
     The returned object includes the `source` field so you can confirm
     what you just modified.
 
-    Only the fields you pass (non-None) will be updated.
+    Only the fields you pass (non-None) will be updated. To clear
+    `parent_task_id` (promote a subtask back to top-level), pass the
+    literal string "null".
 
     Args:
         task_id: Task UUID.
@@ -263,8 +266,10 @@ def update_task(
         difficulty: 1-10.
         project: Reassign to a different project.
         depends: Replace the dependency list (task slugs).
+        parent_task_id: Reparent this task under another task's UUID,
+            or "null" to detach (make it top-level).
     """
-    fields = {
+    fields: dict = {
         k: v for k, v in {
             "name": name,
             "description": description,
@@ -276,6 +281,8 @@ def update_task(
             "depends": depends,
         }.items() if v is not None
     }
+    if parent_task_id is not None:
+        fields["parent_task_id"] = None if parent_task_id == "null" else parent_task_id
     if not fields:
         raise ValueError("No fields to update — pass at least one field.")
     client = PlanningClient()
