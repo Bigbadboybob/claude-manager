@@ -1146,6 +1146,10 @@ pub enum ConfirmAction {
     MarkDone,
     Delete,
     StopWorkflow { run_id: String },
+    /// Y/n prompt that follows A-O reopen when the workspace had any
+    /// tombstoned sessions. Y respawns one session per tombstone (claude
+    /// /codex resume via `--resume`, bash starts fresh in the worktree).
+    RestoreTombstones { ws_id: String },
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -1305,6 +1309,10 @@ pub(crate) enum SubmitAction {
     },
     /// Picker chose a past workspace to reopen.
     ReopenPastWorkspace {
+        ws_id: String,
+    },
+    /// Confirmed Y on the "Restore N closed sessions?" prompt.
+    RestoreTombstones {
         ws_id: String,
     },
 }
@@ -2520,6 +2528,9 @@ pub(crate) fn handle_confirm(
                 ConfirmAction::MarkDone => SubmitAction::MarkActiveDone,
                 ConfirmAction::Delete => SubmitAction::DeleteActive,
                 ConfirmAction::StopWorkflow { run_id } => SubmitAction::StopWorkflow { run_id },
+                ConfirmAction::RestoreTombstones { ws_id } => {
+                    SubmitAction::RestoreTombstones { ws_id }
+                }
             };
             InputOutcome::Submit(submit)
         }
@@ -3766,8 +3777,167 @@ impl App {
         self.save_session_manifest();
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
-        self.set_status_msg("Workspace reopened — A-s to add session");
+
+        // If the workspace has any tombstones, offer to resurrect them.
+        // Pure session-state restore — task status / workspace_id are
+        // already wired up by this point.
+        let tombstone_count = self.workspaces[wi].tombstones.len();
+        if tombstone_count > 0 {
+            self.input_mode = InputMode::Confirm {
+                prompt: format!(
+                    "Restore {} closed session{} in this workspace?",
+                    tombstone_count,
+                    if tombstone_count == 1 { "" } else { "s" },
+                ),
+                action: ConfirmAction::RestoreTombstones {
+                    ws_id: ws_id.to_string(),
+                },
+            };
+        } else {
+            self.set_status_msg("Workspace reopened — A-s to add session");
+        }
         true
+    }
+
+    /// Respawn one PTY per tombstone in the named workspace. Claude/Codex
+    /// sessions are revived via `--resume <transcript_id>`; bash starts
+    /// fresh in the worktree (no transcript to resume). Tombstones that
+    /// successfully spawn are consumed from the workspace; failures stay
+    /// in the list and surface in the status bar so the user can retry.
+    fn restore_tombstones_for_workspace(&mut self, ws_id: &str) {
+        let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            self.set_status_msg("Workspace no longer exists");
+            return;
+        };
+        if self.workspaces[wi].tombstones.is_empty() {
+            return;
+        }
+        let (cols, rows) = self.last_term_size;
+        let worktree = self.workspaces[wi].worktree_path.clone();
+
+        // Move tombstones out so the spawn loop can call &mut self helpers
+        // without aliasing through `self.workspaces[wi]`.
+        let tombstones: Vec<SessionTombstone> =
+            std::mem::take(&mut self.workspaces[wi].tombstones);
+        let total = tombstones.len();
+        let mut restored = 0;
+        let mut failed: Vec<SessionTombstone> = Vec::new();
+
+        for tomb in tombstones {
+            let session_uid = new_session_uid();
+            let result = match tomb.session_type.as_str() {
+                "claude" => {
+                    let resume = tomb.last_transcript_id.as_deref();
+                    let (program, args) = match crate::mcp_config::build_args(
+                        &workflow::toml_schema::Engine::ClaudeCode,
+                        &session_uid,
+                        None,
+                        resume,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.set_status_msg(&format!(
+                                "Restore failed to configure claude: {}",
+                                e
+                            ));
+                            failed.push(tomb);
+                            continue;
+                        }
+                    };
+                    self.spawn_agent_session(
+                        "claude",
+                        &session_uid,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        worktree.clone(),
+                        Default::default(),
+                    )
+                }
+                "codex" => {
+                    let resume = tomb.last_transcript_id.as_deref();
+                    let (program, args) = match crate::mcp_config::build_args(
+                        &workflow::toml_schema::Engine::Codex,
+                        &session_uid,
+                        None,
+                        resume,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.set_status_msg(&format!(
+                                "Restore failed to configure codex: {}",
+                                e
+                            ));
+                            failed.push(tomb);
+                            continue;
+                        }
+                    };
+                    self.spawn_agent_session(
+                        "codex",
+                        &session_uid,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        worktree.clone(),
+                        Default::default(),
+                    )
+                }
+                _ => Session::new(
+                    "/bin/bash",
+                    &[],
+                    cols,
+                    rows,
+                    worktree.clone(),
+                    Default::default(),
+                    None,
+                ),
+            };
+
+            match result {
+                Ok(s) => {
+                    let pending = match tomb.session_type.as_str() {
+                        "claude" => worktree.as_ref().map(|p| Self::list_jsonl_files(p)),
+                        "codex" => worktree.as_ref().map(|p| Self::list_codex_sessions(p)),
+                        _ => None,
+                    };
+                    let mut ts = make_simple_session_with_uid(
+                        session_uid,
+                        &tomb.label,
+                        &tomb.session_type,
+                        s,
+                        pending,
+                    );
+                    ts.task_id = tomb.task_id.clone();
+                    // For Claude `--resume` keeps writing to the same JSONL,
+                    // so the transcript id IS the live id immediately. For
+                    // Codex the live id is rebound by the detector when the
+                    // post-resume rollout appears in `pending_jsonl_files`.
+                    if tomb.session_type == "claude" {
+                        ts.transcript_id = tomb.last_transcript_id.clone();
+                    }
+                    self.workspaces[wi].sessions.push(ts);
+                    restored += 1;
+                }
+                Err(e) => {
+                    self.set_status_msg(&format!("Restore failed: {}", e));
+                    failed.push(tomb);
+                }
+            }
+        }
+
+        // Put any failures back so the user can A-O again later.
+        self.workspaces[wi].tombstones.extend(failed);
+        self.save_session_manifest();
+        self.cursor = Cursor::Workspace(wi);
+        self.clamp_cursor();
+        self.set_status_msg(&format!(
+            "Restored {}/{} session{}",
+            restored,
+            total,
+            if total == 1 { "" } else { "s" },
+        ));
     }
 
     /// Soft-close the workspace under the cursor: kill its session PTYs
@@ -6381,6 +6551,9 @@ impl App {
             SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
             SubmitAction::ReopenPastWorkspace { ws_id } => {
                 self.reopen_workspace_by_id(&ws_id);
+            }
+            SubmitAction::RestoreTombstones { ws_id } => {
+                self.restore_tombstones_for_workspace(&ws_id);
             }
         }
     }
@@ -9686,23 +9859,63 @@ impl App {
         candidates: &[PastCandidate],
         selected: usize,
     ) {
-        let rows = candidates.len() as u16;
+        let total = candidates.len();
         let width = area.width.min(80).max(40);
-        let height = (rows + 5).min(area.height.saturating_sub(2));
+        // Dialog chrome: 2 border rows + 1 blank + 1 footer line.
+        // Below that, each candidate (or scroll-indicator) takes one row.
+        let max_dialog_height = area.height.saturating_sub(2).max(7);
+        let desired_height = (total as u16).saturating_add(4).max(7);
+        let height = desired_height.min(max_dialog_height);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let dialog = Rect { x, y, width, height };
 
         frame.render_widget(Clear, dialog);
 
-        let mut lines: Vec<Line> = Vec::new();
-        if candidates.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No past workspaces.",
-                Style::default().fg(Color::DarkGray),
-            )));
+        let inner_height = height.saturating_sub(2) as usize;
+        let footer_rows = 2; // blank + key-hint line
+        let list_budget = inner_height.saturating_sub(footer_rows).max(1);
+        let needs_scroll = total > list_budget;
+        // Reserve one line each for "↑ N more" / "↓ N more" when scrolling.
+        let body_rows = if needs_scroll {
+            list_budget.saturating_sub(2).max(1)
         } else {
-            for (idx, cand) in candidates.iter().enumerate() {
+            list_budget
+        };
+
+        // Stable scroll: keep selected at the bottom edge when it would
+        // otherwise scroll off, capped by the final page so we don't show
+        // empty rows below the last candidate.
+        let offset = if !needs_scroll || selected < body_rows {
+            0
+        } else {
+            selected
+                .saturating_sub(body_rows)
+                .saturating_add(1)
+                .min(total.saturating_sub(body_rows))
+        };
+        let above = offset;
+        let end = (offset + body_rows).min(total);
+        let below = total.saturating_sub(end);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines: Vec<Line> = Vec::new();
+
+        if candidates.is_empty() {
+            lines.push(Line::from(Span::styled("No past workspaces.", dim)));
+        } else {
+            if needs_scroll {
+                if above > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  \u{2191} {} more", above),
+                        dim,
+                    )));
+                } else {
+                    lines.push(Line::from(""));
+                }
+            }
+            for idx in offset..end {
+                let cand = &candidates[idx];
                 let is_active = idx == selected;
                 let cursor = if is_active { "\u{25b8} " } else { "  " };
                 let path_repr = cand
@@ -9752,11 +9965,21 @@ impl App {
                 }
                 lines.push(Line::from(spans));
             }
+            if needs_scroll {
+                if below > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  \u{2193} {} more", below),
+                        dim,
+                    )));
+                } else {
+                    lines.push(Line::from(""));
+                }
+            }
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "\u{2191}\u{2193} select   Enter: reopen   Esc: cancel",
-            Style::default().fg(Color::DarkGray),
+            dim,
         )));
 
         let block = Block::default()
