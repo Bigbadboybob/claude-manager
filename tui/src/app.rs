@@ -973,8 +973,6 @@ enum VisualItem {
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
     WorkflowHeader { ws_idx: usize, run_id: String },
-    /// Dim label that introduces the "Past workspaces" section. Not selectable.
-    SectionHeader(&'static str),
 }
 
 /// Modal input state.
@@ -1114,12 +1112,33 @@ enum InputMode {
     WorkflowHistory {
         run_id: String,
     },
+    /// Picker over past workspaces (closed or all-tasks-done) so the user
+    /// can reopen one without cluttering the sidebar. Opened via A-O from
+    /// Sessions view. Carries the candidate list up-front instead of
+    /// recomputing on every input event.
+    PastWorkspacePicker {
+        candidates: Vec<PastCandidate>,
+        selected: usize,
+    },
     /// Generic y/N confirmation overlay. The action runs only on `y`/`Y`/Enter;
     /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-d, A-x).
     Confirm {
         prompt: String,
         action: ConfirmAction,
     },
+}
+
+/// Snapshot of a past workspace surfaced in the A-O picker. `worktree_exists`
+/// is checked at modal-open time so the row can be greyed/disabled when the
+/// directory has been removed since close.
+#[derive(Clone, Debug)]
+pub struct PastCandidate {
+    pub ws_id: String,
+    pub display: String,
+    pub worktree_path: Option<std::path::PathBuf>,
+    pub worktree_exists: bool,
+    /// Latest tombstone `exited_at` if any — used to sort most-recent first.
+    pub last_exited_at: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -1283,6 +1302,10 @@ pub(crate) enum SubmitAction {
     DeleteActive,
     StopWorkflow {
         run_id: String,
+    },
+    /// Picker chose a past workspace to reopen.
+    ReopenPastWorkspace {
+        ws_id: String,
     },
 }
 
@@ -2425,6 +2448,43 @@ pub(crate) fn handle_workflow_picker(
                     state.names.len() - 1
                 } else {
                     *state.selected - 1
+                };
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+pub(crate) fn handle_past_workspace_picker(
+    candidates: &[PastCandidate],
+    selected: &mut usize,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => InputOutcome::Cancel,
+        KeyCode::Enter => match candidates.get(*selected) {
+            Some(c) => InputOutcome::Submit(SubmitAction::ReopenPastWorkspace {
+                ws_id: c.ws_id.clone(),
+            }),
+            None => InputOutcome::Cancel,
+        },
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+            if !candidates.is_empty() {
+                *selected = (*selected + 1) % candidates.len();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+            if !candidates.is_empty() {
+                *selected = if *selected == 0 {
+                    candidates.len() - 1
+                } else {
+                    *selected - 1
                 };
             }
             InputOutcome::Consumed
@@ -3605,45 +3665,82 @@ impl App {
         }
     }
 
-    /// Reopen the past workspace under the cursor: flip `is_closed` back to
-    /// false and bring any bound done tasks back to `running` so the
-    /// workspace re-enters the active sidebar. Refuses gracefully when the
-    /// worktree directory is gone (manually deleted or `git worktree
-    /// remove`'d) — the user can press A-x to drop the workspace entry
-    /// instead.
-    fn reopen_active_workspace(&mut self) {
-        let Some(wi) = self.active_workspace_index() else {
-            return;
-        };
-        if !self.is_past_workspace(wi) {
-            self.set_status_msg("Not a past workspace");
+    /// Build the candidate list for the A-O picker and open it. Shows a
+    /// status message when no past workspaces exist instead of an empty
+    /// modal. Most-recent (latest tombstone) first.
+    fn open_past_workspace_picker(&mut self) {
+        let mut candidates: Vec<PastCandidate> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(wi, _)| self.is_past_workspace(*wi))
+            .map(|(_, ws)| {
+                let last_exited_at = ws
+                    .tombstones
+                    .iter()
+                    .map(|t| t.exited_at)
+                    .fold(0.0f64, f64::max);
+                let worktree_exists = ws
+                    .worktree_path
+                    .as_ref()
+                    .map_or(false, |p| p.exists());
+                PastCandidate {
+                    ws_id: ws.id.clone(),
+                    display: ws.name.clone(),
+                    worktree_path: ws.worktree_path.clone(),
+                    worktree_exists,
+                    last_exited_at,
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            self.set_status_msg("No past workspaces");
             return;
         }
-        let ws_id = self.workspaces[wi].id.clone();
+        candidates.sort_by(|a, b| {
+            b.last_exited_at
+                .partial_cmp(&a.last_exited_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.input_mode = InputMode::PastWorkspacePicker {
+            candidates,
+            selected: 0,
+        };
+    }
+
+    /// Reopen a past workspace by id: flip `is_closed` back to false and
+    /// PATCH any bound done tasks back to `running` so the workspace
+    /// re-enters the active sidebar. Refuses gracefully when the worktree
+    /// directory is gone (manually deleted or `git worktree remove`'d).
+    /// Returns true on success — callers in modal mode use it to close
+    /// the picker only when the reopen actually went through.
+    fn reopen_workspace_by_id(&mut self, ws_id: &str) -> bool {
+        let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            self.set_status_msg("Workspace no longer in manifest");
+            return false;
+        };
         let worktree_path = self.workspaces[wi].worktree_path.clone();
         match worktree_path.as_deref() {
             Some(p) if p.exists() => {}
             Some(p) => {
                 self.set_status_msg(&format!(
-                    "Worktree gone: {} — A-x to remove",
+                    "Worktree gone: {} — can't reopen",
                     p.display()
                 ));
-                return;
+                return false;
             }
             None => {
                 self.set_status_msg("Workspace has no worktree to reopen");
-                return;
+                return false;
             }
         }
 
         self.workspaces[wi].is_closed = false;
 
-        // PATCH any bound done tasks back to running so they re-enter the
-        // active sidebar (reconcile only surfaces running/blocked).
         let bound_done: Vec<String> = self
             .tasks
             .iter()
-            .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
+            .filter(|t| t.workspace_id.as_deref() == Some(ws_id))
             .filter(|t| matches!(t.api_status, TaskStatus::Done))
             .filter_map(|t| t.task_id.clone())
             .collect();
@@ -3670,6 +3767,7 @@ impl App {
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
         self.set_status_msg("Workspace reopened — A-s to add session");
+        true
     }
 
     /// Soft-close the workspace under the cursor: kill its session PTYs
@@ -3988,20 +4086,16 @@ impl App {
     }
 
     /// Status view: flat list of sessions grouped by status.
-    /// Running sessions first, then idle, then workspaces with no sessions,
-    /// then a "Past workspaces" section for closed / done-task workspaces.
+    /// Running sessions first, then idle, then workspaces with no sessions.
+    /// Past workspaces (closed / all-tasks-done) are hidden — open the
+    /// A-O picker to reach them.
     fn visual_items_status(&self) -> Vec<VisualItem> {
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
-        let mut past: Vec<VisualItem> = Vec::new();
 
         for (wi, ws) in self.workspaces.iter().enumerate() {
-            if self.is_past_workspace(wi) {
-                past.push(VisualItem::WorkspaceHeader(wi));
-                continue;
-            }
-            if ws.is_closed {
+            if ws.is_closed || self.is_past_workspace(wi) {
                 continue;
             }
             if ws.sessions.is_empty() {
@@ -4029,30 +4123,18 @@ impl App {
             }
         }
         items.extend(no_session);
-        if !past.is_empty() {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
-                items.push(VisualItem::Separator);
-            }
-            items.push(VisualItem::SectionHeader("Past workspaces"));
-            items.extend(past);
-        }
         items
     }
 
     /// Task view: workspace headers with sessions indented underneath.
     /// Sessions grouped by workflow run appear contiguously under a workflow
-    /// subheader. Standalone sessions render first; each workflow group follows.
-    /// Past workspaces are gathered into a trailing "Past workspaces" section.
+    /// subheader. Standalone sessions render first; each workflow group
+    /// follows. Past workspaces are hidden — reachable via the A-O picker.
     fn visual_items_task(&self) -> Vec<VisualItem> {
         let mut items = Vec::new();
         let mut first = true;
-        let mut past: Vec<usize> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
-            if self.is_past_workspace(wi) {
-                past.push(wi);
-                continue;
-            }
-            if ws.is_closed {
+            if ws.is_closed || self.is_past_workspace(wi) {
                 continue;
             }
             if !first {
@@ -4161,15 +4243,6 @@ impl App {
                 }
             }
         }
-        if !past.is_empty() {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
-                items.push(VisualItem::Separator);
-            }
-            items.push(VisualItem::SectionHeader("Past workspaces"));
-            for wi in past {
-                items.push(VisualItem::WorkspaceHeader(wi));
-            }
-        }
         items
     }
 
@@ -4194,7 +4267,6 @@ impl App {
             VisualItem::TaskHeader { .. } => true,
             VisualItem::Separator => false,
             VisualItem::WorkflowHeader { .. } => false,
-            VisualItem::SectionHeader(_) => false,
         };
 
         if !items.iter().any(is_selectable) {
@@ -5692,19 +5764,19 @@ impl App {
                         self.resume_workflow_for_cursor();
                         return true;
                     }
-                    // A-O (Alt+Shift+O): reopen the focused past workspace.
-                    // Mirrors A-W (close workspace) but in the other direction —
-                    // un-archive + flip any bound done tasks back to running.
-                    // Terminals differ on whether Shift is folded into the
-                    // case of the char or reported as a modifier — accept both.
+                    // A-O (Alt+Shift+O): open the past-workspaces picker.
+                    // Past workspaces never appear in the sidebar — this is
+                    // the only path to find and reopen them. Terminals
+                    // differ on whether Shift is folded into the case of
+                    // the char or reported as a modifier — accept both.
                     KeyCode::Char('O') => {
-                        self.reopen_active_workspace();
+                        self.open_past_workspace_picker();
                         return true;
                     }
                     KeyCode::Char('o')
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        self.reopen_active_workspace();
+                        self.open_past_workspace_picker();
                         return true;
                     }
                     KeyCode::Char('o') => {
@@ -6080,6 +6152,14 @@ impl App {
             InputMode::WorkflowHistory { run_id: _ } => {
                 handle_workflow_history(InputCtx { repo_urls: &urls }, event)
             }
+            InputMode::PastWorkspacePicker { candidates, selected } => {
+                handle_past_workspace_picker(
+                    candidates,
+                    selected,
+                    InputCtx { repo_urls: &urls },
+                    event,
+                )
+            }
             InputMode::Confirm { action, .. } => {
                 handle_confirm(action, InputCtx { repo_urls: &urls }, event)
             }
@@ -6293,6 +6373,9 @@ impl App {
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
+            SubmitAction::ReopenPastWorkspace { ws_id } => {
+                self.reopen_workspace_by_id(&ws_id);
+            }
         }
     }
 
@@ -8030,6 +8113,9 @@ impl App {
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
                 }
+                InputMode::PastWorkspacePicker { candidates, selected } => {
+                    self.draw_past_workspace_picker(frame, area, candidates, *selected);
+                }
                 InputMode::Confirm { prompt, .. } => {
                     self.draw_confirm(frame, area, prompt);
                 }
@@ -8632,7 +8718,6 @@ impl App {
                         Cursor::Workspace(cwi) => cwi == wi,
                         _ => false,
                     };
-                    let is_past = self.is_past_workspace(*wi);
 
                     let max_name = (inner.width as usize).saturating_sub(2);
                     let name = if ws.name.len() > max_name {
@@ -8650,8 +8735,6 @@ impl App {
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
-                    } else if is_past {
-                        Style::default().fg(Color::DarkGray)
                     } else {
                         Style::default().fg(Color::Gray)
                     };
@@ -8846,10 +8929,6 @@ impl App {
                         Span::raw(name),
                     ]);
                     items.push(ListItem::new(line).style(base_style));
-                }
-                VisualItem::SectionHeader(label) => {
-                    let line = Line::from(Span::styled(format!(" {}", label), dim));
-                    items.push(ListItem::new(line));
                 }
             }
         }
@@ -9589,6 +9668,94 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(workflow_picker_title(self.workflow_load_errors.len()))
+            .style(Style::default().fg(Color::White));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, dialog);
+    }
+
+    pub fn draw_past_workspace_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        candidates: &[PastCandidate],
+        selected: usize,
+    ) {
+        let rows = candidates.len() as u16;
+        let width = area.width.min(80).max(40);
+        let height = (rows + 5).min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let mut lines: Vec<Line> = Vec::new();
+        if candidates.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No past workspaces.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (idx, cand) in candidates.iter().enumerate() {
+                let is_active = idx == selected;
+                let cursor = if is_active { "\u{25b8} " } else { "  " };
+                let path_repr = cand
+                    .worktree_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                let name_style = if !cand.worktree_exists {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::CROSSED_OUT)
+                } else if is_active {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let path_style = if !cand.worktree_exists {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT)
+                } else if is_active {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let suffix = if cand.worktree_exists {
+                    String::new()
+                } else {
+                    "  (worktree gone)".to_string()
+                };
+                let mut spans = vec![
+                    Span::raw(cursor),
+                    Span::styled(cand.display.clone(), name_style),
+                ];
+                if !path_repr.is_empty() {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(path_repr.to_string(), path_style));
+                }
+                if !suffix.is_empty() {
+                    spans.push(Span::styled(
+                        suffix,
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "\u{2191}\u{2193} select   Enter: reopen   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Reopen past workspace ")
             .style(Style::default().fg(Color::White));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
