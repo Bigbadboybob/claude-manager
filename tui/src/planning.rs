@@ -141,9 +141,54 @@ struct GridLayout {
     columns: Vec<Vec<GridItem>>,
 }
 
+/// A row in a column's tree-aware visible projection. Both cursor
+/// (`cursor.row` indexes a `Vec<VisibleRow>`) and rendering work in
+/// this space, not in raw `GridLayout`. Synthetic `Subtask` rows are
+/// rebuilt each frame from `parent_task_id` + `expanded_tasks`.
+#[derive(Clone, Debug)]
+struct VisibleRow {
+    kind: VisibleRowKind,
+    /// 0 = top-level row from raw column (or a task whose parent
+    /// isn't in this project). 1+ = a subtask under an expanded parent.
+    depth: u8,
+    /// True when the underlying task has at least one in-project
+    /// child. Drives the ▶/▼ fold glyph.
+    has_children: bool,
+    /// `expanded_tasks` membership at compute time.
+    expanded: bool,
+    /// Transitive descendant count, for the "(N)" badge on collapsed
+    /// parents. 0 when `has_children` is false.
+    descendant_count: u32,
+}
+
+#[derive(Clone, Debug)]
+enum VisibleRowKind {
+    /// An entry that exists in the persisted raw `GridLayout`.
+    /// `raw_idx` allows raw-layout mutations (reorder, move, insert)
+    /// to look up the original position.
+    Layout { raw_idx: usize, item: GridItem },
+    /// A synthetic row for a parented subtask. Doesn't exist in
+    /// `pd.layout.columns[ci]` — its persistence is the
+    /// `parent_task_id` field on the API row.
+    Subtask { slug: String },
+}
+
+/// Slug at a visible row, regardless of layout vs. synthetic origin.
+/// Returns `None` for non-task layout items (Separator/Empty/Header).
+fn visible_row_slug(row: &VisibleRow) -> Option<&str> {
+    match &row.kind {
+        VisibleRowKind::Layout { item: GridItem::Task(slug), .. } => Some(slug.as_str()),
+        VisibleRowKind::Subtask { slug } => Some(slug.as_str()),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GridCursor {
     col: usize,
+    /// Index into the column's `Vec<VisibleRow>` (NOT raw layout).
+    /// When no in-project parenting exists, visible rows ≈ raw items
+    /// and this is identity with the old semantics.
     row: usize,
 }
 
@@ -794,6 +839,11 @@ pub struct PlanningView {
     /// When false, archived tasks are skipped from rendering and cursor
     /// navigation. Toggled with alt+shift+v.
     show_archived: bool,
+    /// Task IDs whose direct children are unfolded in the planning
+    /// tree. Anything not in this set renders as collapsed. In-memory
+    /// only; resets across TUI restarts. Default empty so the user
+    /// always opens to a tidy top-level view.
+    expanded_tasks: HashSet<String>,
 }
 
 impl PlanningView {
@@ -821,6 +871,7 @@ impl PlanningView {
             initialized: false,
             workspace_candidates: vec![],
             show_archived: false,
+            expanded_tasks: HashSet::new(),
         }
     }
 
@@ -1006,19 +1057,29 @@ impl PlanningView {
                     0
                 });
             let insert_at = if self.cursor_project_idx() == Some(pi) {
-                (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len())
+                let raw = self.anchor_raw_idx().unwrap_or_else(|| {
+                    self.project_data[pi].layout.columns[ci].len().saturating_sub(1)
+                });
+                (raw + 1).min(self.project_data[pi].layout.columns[ci].len())
             } else {
                 self.project_data[pi].layout.columns[ci].len()
             };
-            self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Task(slug));
+            self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Task(slug.clone()));
             save_layout(&self.project_data[pi].layout, &self.project_data[pi].project.path);
             self.rebuild_unified_cols();
             self.recompute_conflicts();
 
             // Move cursor to the newly created task and open editor.
+            // After rebuild_unified_cols, the visible-rows projection
+            // includes the new task at some visible-row index; find it
+            // by slug so cursor.row lands on it (not on the raw idx).
             if let Some(uc) = self.unified_cols.iter().position(|(p, c)| *p == pi && *c == ci) {
                 self.cursor.col = uc;
-                self.cursor.row = insert_at;
+                if let Some(rows) = self.cursor_visible_column() {
+                    if let Some(idx) = rows.iter().position(|r| visible_row_slug(r) == Some(slug.as_str())) {
+                        self.cursor.row = idx;
+                    }
+                }
             }
             self.start_editor();
 
@@ -1149,23 +1210,46 @@ impl PlanningView {
         self.unified_cols.get(self.cursor.col).map(|(pi, _)| *pi)
     }
 
-    fn cursor_column(&self) -> Option<&Vec<GridItem>> {
+    /// Raw layout column for the cursor's project/col. Used by raw-layout
+    /// mutations (reorder, move, insert, delete) which need to operate
+    /// on the persisted `Vec<GridItem>`. Read-only callers should prefer
+    /// `cursor_visible_column` so subtasks line up with their parent.
+    fn cursor_raw_column(&self) -> Option<&Vec<GridItem>> {
         let (pi, ci) = *self.unified_cols.get(self.cursor.col)?;
         self.project_data.get(pi)?.layout.columns.get(ci)
     }
 
-    fn selected_slug(&self) -> Option<&str> {
-        let col = self.cursor_column()?;
-        match col.get(self.cursor.row)? {
-            GridItem::Task(slug) => Some(slug),
-            GridItem::Separator | GridItem::Empty | GridItem::Header(_) => None,
+    /// Tree-aware visible projection of the cursor's column. Each
+    /// frame, this is what cursor.row indexes.
+    fn cursor_visible_column(&self) -> Option<Vec<VisibleRow>> {
+        let (pi, ci) = *self.unified_cols.get(self.cursor.col)?;
+        Some(self.visible_rows_for_column(pi, ci))
+    }
+
+    fn cursor_visible_row(&self) -> Option<VisibleRow> {
+        let col = self.cursor_visible_column()?;
+        col.into_iter().nth(self.cursor.row)
+    }
+
+    /// Resolve cursor.row (visible) to the raw `Vec<GridItem>` index
+    /// for the cursor's column. `None` when the cursor is on a
+    /// synthetic subtask row (which has no raw-layout slot).
+    fn cursor_raw_idx(&self) -> Option<usize> {
+        match self.cursor_visible_row()?.kind {
+            VisibleRowKind::Layout { raw_idx, .. } => Some(raw_idx),
+            VisibleRowKind::Subtask { .. } => None,
         }
     }
 
+    fn selected_slug(&self) -> Option<String> {
+        let row = self.cursor_visible_row()?;
+        visible_row_slug(&row).map(str::to_string)
+    }
+
     fn selected_header_text(&self) -> Option<String> {
-        let col = self.cursor_column()?;
-        match col.get(self.cursor.row)? {
-            GridItem::Header(text) => Some(text.clone()),
+        let row = self.cursor_visible_row()?;
+        match row.kind {
+            VisibleRowKind::Layout { item: GridItem::Header(text), .. } => Some(text),
             _ => None,
         }
     }
@@ -1200,7 +1284,7 @@ impl PlanningView {
         if self.cursor.col >= self.unified_cols.len() {
             self.cursor.col = self.unified_cols.len() - 1;
         }
-        if let Some(col) = self.cursor_column() {
+        if let Some(col) = self.cursor_visible_column() {
             if col.is_empty() {
                 self.cursor.row = 0;
             } else if self.cursor.row >= col.len() {
@@ -1209,51 +1293,30 @@ impl PlanningView {
         }
     }
 
-    /// Whether the cursor is allowed to land on an item.
-    /// Skips Empty rows always; skips archived task rows when show_archived is false.
-    fn is_item_selectable(&self, pi: usize, item: &GridItem) -> bool {
-        match item {
-            GridItem::Empty => false,
-            GridItem::Task(slug) => {
-                if self.show_archived {
-                    return true;
-                }
-                let pd = match self.project_data.get(pi) {
-                    Some(pd) => pd,
-                    None => return true,
-                };
-                match pd.tasks.iter().find(|t| t.slug == *slug) {
-                    Some(t) => t.status != PlanStatus::Archived,
-                    None => true,
-                }
-            }
-            GridItem::Separator | GridItem::Header(_) => true,
+    /// Whether the cursor is allowed to land on a visible row.
+    /// Skips Empty layout rows always; archived tasks are filtered at
+    /// `visible_rows_for_column` build time so any row that reaches
+    /// here is non-archived (or `show_archived` is on).
+    fn is_visible_row_selectable(&self, row: &VisibleRow) -> bool {
+        match &row.kind {
+            VisibleRowKind::Layout { item: GridItem::Empty, .. } => false,
+            _ => true,
         }
     }
 
     fn snap_cursor_to_selectable(&mut self, direction: i32) {
-        let pi = match self.cursor_project_idx() {
-            Some(p) => p,
-            None => return,
-        };
-        let ci = match self.unified_cols.get(self.cursor.col) {
-            Some((_, ci)) => *ci,
-            None => return,
-        };
-        let col_len = match self.project_data.get(pi).and_then(|pd| pd.layout.columns.get(ci)) {
-            Some(c) if !c.is_empty() => c.len(),
+        let rows = match self.cursor_visible_column() {
+            Some(r) if !r.is_empty() => r,
             _ => return,
         };
-        let len = col_len as i32;
+        let len = rows.len() as i32;
         let start = (self.cursor.row as i32).min(len - 1);
         let mut pos = start;
-        for _ in 0..col_len {
-            let selectable = self.project_data[pi].layout.columns[ci]
-                .get(pos as usize)
-                .cloned()
-                .map(|item| self.is_item_selectable(pi, &item))
-                .unwrap_or(false);
-            if selectable {
+        for _ in 0..rows.len() {
+            if rows.get(pos as usize)
+                .map(|r| self.is_visible_row_selectable(r))
+                .unwrap_or(false)
+            {
                 self.cursor.row = pos as usize;
                 return;
             }
@@ -1285,19 +1348,47 @@ impl PlanningView {
         self.visual_anchor = None;
     }
 
+    /// Toggle the fold state of the task under the cursor. Only acts
+    /// when the cursor is on a task row that has at least one child;
+    /// otherwise a no-op. Repositions cursor.row to keep the same task
+    /// focused after the visible-row list re-shuffles.
+    fn toggle_fold_at_cursor(&mut self) {
+        let row = match self.cursor_visible_row() { Some(r) => r, None => return };
+        if !row.has_children { return; }
+        let slug = match visible_row_slug(&row) { Some(s) => s.to_string(), None => return };
+        let pi = match self.cursor_project_idx() { Some(p) => p, None => return };
+        let task_id = match self.project_data.get(pi).and_then(|pd| pd.tasks.iter().find(|t| t.slug == slug)) {
+            Some(t) => t.id.clone(),
+            None => return,
+        };
+        if self.expanded_tasks.contains(&task_id) {
+            self.expanded_tasks.remove(&task_id);
+        } else {
+            self.expanded_tasks.insert(task_id);
+        }
+        // After fold flip, the visible-row list changes length. Walk it
+        // to find the same task again so the cursor stays put visually.
+        if let Some(rows) = self.cursor_visible_column() {
+            if let Some(idx) = rows.iter().position(|r| visible_row_slug(r) == Some(slug.as_str())) {
+                self.cursor.row = idx;
+            }
+        }
+        self.ensure_cursor_visible();
+    }
+
     // ── Navigation ──────────────────────────────────────────
 
     fn navigate_vertical(&mut self, direction: i32) {
         if self.unified_cols.is_empty() { return; }
-        let prev_slug = self.selected_slug().map(|s| s.to_string());
+        let prev_slug = self.selected_slug();
         let in_visual = self.visual_anchor.is_some();
 
         if self.linear_mode && !in_visual {
             let mut selectable_positions: Vec<(usize, usize)> = Vec::new();
             for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
-                let col = &self.project_data[pi].layout.columns[ci];
-                for (ri, item) in col.iter().enumerate() {
-                    if self.is_item_selectable(pi, item) {
+                let rows = self.visible_rows_for_column(pi, ci);
+                for (ri, row) in rows.iter().enumerate() {
+                    if self.is_visible_row_selectable(row) {
                         selectable_positions.push((gi, ri));
                     }
                 }
@@ -1310,29 +1401,23 @@ impl PlanningView {
             self.cursor.col = selectable_positions[next].0;
             self.cursor.row = selectable_positions[next].1;
         } else {
-            let pi = match self.cursor_project_idx() {
-                Some(p) => p,
-                None => return,
-            };
-            let ci = match self.unified_cols.get(self.cursor.col) {
-                Some((_, ci)) => *ci,
-                None => return,
-            };
-            let col_len = match self.project_data.get(pi).and_then(|pd| pd.layout.columns.get(ci)) {
-                Some(c) if !c.is_empty() => c.len(),
+            let rows = match self.cursor_visible_column() {
+                Some(r) if !r.is_empty() => r,
                 _ => return,
             };
-            let len = col_len as i32;
+            let len = rows.len() as i32;
             if in_visual {
                 let next = self.cursor.row as i32 + direction;
                 if next < 0 || next >= len { return; }
                 self.cursor.row = next as usize;
             } else {
                 let mut next = self.cursor.row as i32;
-                for _ in 0..col_len {
+                for _ in 0..rows.len() {
                     next = (next + direction).rem_euclid(len);
-                    let item = self.project_data[pi].layout.columns[ci][next as usize].clone();
-                    if self.is_item_selectable(pi, &item) {
+                    if rows.get(next as usize)
+                        .map(|r| self.is_visible_row_selectable(r))
+                        .unwrap_or(false)
+                    {
                         break;
                     }
                 }
@@ -1340,7 +1425,7 @@ impl PlanningView {
             }
         }
         self.ensure_cursor_visible();
-        if self.selected_slug().map(|s| s.to_string()) != prev_slug {
+        if self.selected_slug() != prev_slug {
             self.detail_scroll = 0;
         }
     }
@@ -1351,7 +1436,7 @@ impl PlanningView {
         let len = self.unified_cols.len() as i32;
         let next = (self.cursor.col as i32 + direction).rem_euclid(len) as usize;
         self.cursor.col = next;
-        if let Some(col) = self.cursor_column() {
+        if let Some(col) = self.cursor_visible_column() {
             if col.is_empty() { self.cursor.row = 0; }
             else if self.cursor.row >= col.len() { self.cursor.row = col.len() - 1; }
         }
@@ -1377,80 +1462,166 @@ impl PlanningView {
             self.grid_col_scroll[self.cursor.col] = self.cursor.row;
             return;
         }
-        // Count *visible* rows between off and cursor.row inclusive. Archived
-        // rows are skipped by build_column_items, so the cursor can be at a
-        // column index far below `off` while occupying only a few visible
-        // rows. Comparing raw `cursor.row` against `off + h` (the old
-        // behavior) made one keystroke that hopped past archived items
-        // trigger a big scroll even when the cursor was still on-screen.
-        let visible = self.visible_row_count(self.cursor.col, off, self.cursor.row.saturating_add(1));
+        // cursor.row already indexes the visible-row projection, so
+        // the count "off..=cursor.row" is cursor.row - off + 1.
+        let visible = self.cursor.row.saturating_sub(off).saturating_add(1);
         if visible <= h { return; }
         self.grid_col_scroll[self.cursor.col] =
-            self.visible_window_top(self.cursor.col, self.cursor.row, h);
+            self.cursor.row.saturating_sub(h - 1);
     }
 
-    /// Number of items in column `col_idx` over `start..end` that are NOT
-    /// skipped by `build_column_items` (i.e. not archived when archived rows
-    /// are hidden). Mirrors the skip logic in `build_column_items`.
-    fn visible_row_count(&self, col_idx: usize, start: usize, end: usize) -> usize {
-        let (pi, ci) = match self.unified_cols.get(col_idx) {
-            Some(v) => *v,
-            None => return 0,
-        };
+    /// Build the tree-aware visible-row list for one column. Top-level
+    /// entries come from raw layout; expanded parents' children get
+    /// emitted as synthetic `Subtask` rows immediately after their
+    /// parent. Parented tasks that already appear in their own raw
+    /// column are filtered out from there (they only show under the
+    /// parent).
+    ///
+    /// Archived filtering still happens at this layer — archived tasks
+    /// and their subtrees are skipped when `show_archived` is off.
+    fn visible_rows_for_column(&self, pi: usize, ci: usize) -> Vec<VisibleRow> {
         let pd = match self.project_data.get(pi) {
             Some(p) => p,
-            None => return 0,
+            None => return Vec::new(),
         };
         let column = match pd.layout.columns.get(ci) {
             Some(c) => c,
-            None => return 0,
+            None => return Vec::new(),
         };
-        let end = end.min(column.len());
-        let mut count = 0usize;
-        for ri in start..end {
-            if self.is_row_visible(pd, &column[ri]) {
-                count += 1;
+
+        let task_by_id: HashMap<&str, &PlanTask> = pd.tasks.iter()
+            .map(|t| (t.id.as_str(), t))
+            .collect();
+        let task_by_slug: HashMap<&str, &PlanTask> = pd.tasks.iter()
+            .map(|t| (t.slug.as_str(), t))
+            .collect();
+
+        // children_of[parent_id] = child slugs in column-walk order
+        // (left-to-right across raw columns, top-to-bottom within each).
+        // Only includes children whose parent is in this project.
+        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        for col in &pd.layout.columns {
+            for item in col {
+                if let GridItem::Task(slug) = item {
+                    let t = match task_by_slug.get(slug.as_str()) { Some(t) => *t, None => continue };
+                    let pid = match &t.parent_task_id { Some(p) => p, None => continue };
+                    if !task_by_id.contains_key(pid.as_str()) { continue; }
+                    // Archived subtasks invisible when show_archived is off.
+                    if !self.show_archived && t.status == PlanStatus::Archived { continue; }
+                    children_of.entry(pid.clone()).or_default().push(slug.clone());
+                }
             }
         }
-        count
-    }
 
-    /// Largest scroll offset `<= end_row` such that the visible rows in
-    /// `offset..=end_row` total exactly `h` (or hits the top of the column
-    /// first). Walks backward from `end_row` counting visible items.
-    fn visible_window_top(&self, col_idx: usize, end_row: usize, h: usize) -> usize {
-        let (pi, ci) = match self.unified_cols.get(col_idx) {
-            Some(v) => *v,
-            None => return 0,
-        };
-        let pd = match self.project_data.get(pi) {
-            Some(p) => p,
-            None => return 0,
-        };
-        let column = match pd.layout.columns.get(ci) {
-            Some(c) => c,
-            None => return 0,
-        };
-        if h == 0 || column.is_empty() { return 0; }
-        let mut ri = end_row.min(column.len() - 1);
-        let mut count = 0usize;
-        loop {
-            if self.is_row_visible(pd, &column[ri]) {
-                count += 1;
+        // Transitive descendant count per task id, memoized DFS.
+        fn count_desc(
+            task_id: &str,
+            children_of: &HashMap<String, Vec<String>>,
+            task_by_slug: &HashMap<&str, &PlanTask>,
+            memo: &mut HashMap<String, u32>,
+        ) -> u32 {
+            if let Some(c) = memo.get(task_id) { return *c; }
+            // Insert a placeholder to short-circuit cycles defensively.
+            memo.insert(task_id.to_string(), 0);
+            let kids = match children_of.get(task_id) {
+                Some(v) => v.clone(),
+                None => { return 0; }
+            };
+            let mut total: u32 = kids.len() as u32;
+            for child_slug in &kids {
+                if let Some(child) = task_by_slug.get(child_slug.as_str()) {
+                    total += count_desc(&child.id, children_of, task_by_slug, memo);
+                }
             }
-            if count >= h { return ri; }
-            if ri == 0 { return 0; }
-            ri -= 1;
+            memo.insert(task_id.to_string(), total);
+            total
         }
-    }
+        let mut desc_memo: HashMap<String, u32> = HashMap::new();
+        for t in &pd.tasks {
+            count_desc(&t.id, &children_of, &task_by_slug, &mut desc_memo);
+        }
 
-    fn is_row_visible(&self, pd: &ProjectData, item: &GridItem) -> bool {
-        if self.show_archived { return true; }
-        match item {
-            GridItem::Task(slug) => pd.tasks.iter().find(|t| t.slug == *slug)
-                .map(|t| t.status != PlanStatus::Archived).unwrap_or(true),
-            _ => true,
+        // DFS subtree emitter for synthetic child rows. Iterative to
+        // sidestep borrow gymnastics with self.expanded_tasks.
+        let emit_subtree = |
+            root_slug: &str,
+            start_depth: u8,
+            out: &mut Vec<VisibleRow>,
+        | {
+            let mut stack: Vec<(String, u8)> = vec![(root_slug.to_string(), start_depth)];
+            while let Some((slug, depth)) = stack.pop() {
+                let task = match task_by_slug.get(slug.as_str()) { Some(t) => *t, None => continue };
+                let kids = children_of.get(&task.id);
+                let has_children = kids.map_or(false, |v| !v.is_empty());
+                let expanded = self.expanded_tasks.contains(&task.id);
+                let dcount = desc_memo.get(&task.id).copied().unwrap_or(0);
+                out.push(VisibleRow {
+                    kind: VisibleRowKind::Subtask { slug: slug.clone() },
+                    depth,
+                    has_children,
+                    expanded,
+                    descendant_count: dcount,
+                });
+                if expanded {
+                    if let Some(kids) = kids {
+                        for child_slug in kids.iter().rev() {
+                            stack.push((child_slug.clone(), depth + 1));
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut out: Vec<VisibleRow> = Vec::new();
+        for (raw_idx, item) in column.iter().enumerate() {
+            match item {
+                GridItem::Task(slug) => {
+                    // Skip rendering parented tasks here — they appear
+                    // under their parent's row instead.
+                    if let Some(t) = task_by_slug.get(slug.as_str()) {
+                        if let Some(pid) = &t.parent_task_id {
+                            if task_by_id.contains_key(pid.as_str()) {
+                                continue;
+                            }
+                        }
+                    }
+                    let task = task_by_slug.get(slug.as_str()).copied();
+                    let (has_children, expanded, dcount) = match task {
+                        Some(t) => (
+                            children_of.get(&t.id).map_or(false, |v| !v.is_empty()),
+                            self.expanded_tasks.contains(&t.id),
+                            desc_memo.get(&t.id).copied().unwrap_or(0),
+                        ),
+                        None => (false, false, 0),
+                    };
+                    out.push(VisibleRow {
+                        kind: VisibleRowKind::Layout { raw_idx, item: item.clone() },
+                        depth: 0,
+                        has_children,
+                        expanded,
+                        descendant_count: dcount,
+                    });
+                    if expanded {
+                        if let Some(t) = task {
+                            let kids = children_of.get(&t.id).cloned().unwrap_or_default();
+                            for child_slug in kids {
+                                emit_subtree(&child_slug, 1, &mut out);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    out.push(VisibleRow {
+                        kind: VisibleRowKind::Layout { raw_idx, item: item.clone() },
+                        depth: 0,
+                        has_children: false,
+                        expanded: false,
+                        descendant_count: 0,
+                    });
+                }
+            }
         }
+        out
     }
 
     /// Flat-list index of the cursor in linear mode, matching the order the
@@ -1458,9 +1629,8 @@ impl PlanningView {
     fn cursor_flat_index_linear(&self) -> usize {
         let mut flat = 0usize;
         for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
-            let pd = match self.project_data.get(pi) { Some(p) => p, None => continue };
-            let column = match pd.layout.columns.get(ci) { Some(c) => c, None => continue };
-            if gi > 0 && self.is_first_col_of_project(gi) && !column.is_empty() {
+            let rows = self.visible_rows_for_column(pi, ci);
+            if gi > 0 && self.is_first_col_of_project(gi) && !rows.is_empty() {
                 flat += 1;
             }
             if self.is_first_col_of_project(gi) && self.project_filter.is_none() {
@@ -1469,7 +1639,7 @@ impl PlanningView {
             if gi == self.cursor.col {
                 return flat + self.cursor.row;
             }
-            flat += column.len();
+            flat += rows.len();
         }
         flat
     }
@@ -1667,6 +1837,10 @@ impl PlanningView {
             }
 
             match key.code {
+                KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                    self.toggle_fold_at_cursor();
+                    return PlanAction::Consumed;
+                }
                 KeyCode::PageDown => {
                     self.detail_scroll = self.detail_scroll.saturating_add(
                         (self.grid_rows_visible.get() as u16 / 3).max(1)
@@ -1686,7 +1860,7 @@ impl PlanningView {
                     return PlanAction::Consumed;
                 }
                 KeyCode::End => {
-                    if let Some(col) = self.cursor_column() {
+                    if let Some(col) = self.cursor_visible_column() {
                         self.cursor.row = col.len().saturating_sub(1);
                     }
                     self.snap_cursor_to_selectable(-1);
@@ -2207,7 +2381,9 @@ impl PlanningView {
         if let Some((range_start, range_end)) = self.visual_range() {
             self.move_visual_block(pi, ci, range_start, range_end, direction);
         } else {
-            let ri = self.cursor.row;
+            // Synthetic subtask rows have no raw position — reordering
+            // them in their own column is meaningless. Skip.
+            let ri = match self.cursor_raw_idx() { Some(r) => r, None => return };
             let target = match self.next_visible_row(pi, ci, ri, direction) {
                 Some(t) => t,
                 None => {
@@ -2218,7 +2394,13 @@ impl PlanningView {
                 }
             };
             self.project_data[pi].layout.columns[ci].swap(ri, target);
-            self.cursor.row = target;
+            // Recompute cursor row in visible-row space — find the
+            // swapped item's new raw_idx in the new visible list.
+            if let Some(rows) = self.cursor_visible_column() {
+                if let Some(idx) = rows.iter().position(|r| matches!(&r.kind, VisibleRowKind::Layout { raw_idx, .. } if *raw_idx == target)) {
+                    self.cursor.row = idx;
+                }
+            }
         }
         self.save_project_layout(pi);
         self.recompute_conflicts();
@@ -2227,16 +2409,28 @@ impl PlanningView {
 
     /// Walk `direction` from `from_row` and return the first row whose item
     /// would actually render — i.e. skip archived task rows when
-    /// `show_archived` is off. Returns `None` if there is no such row in that
-    /// direction.
+    /// `show_archived` is off, and skip subtasks that render under a
+    /// parent. Returns `None` if there is no such row in that direction.
     fn next_visible_row(&self, pi: usize, ci: usize, from_row: usize, direction: i32) -> Option<usize> {
         if direction == 0 { return None; }
         let pd = self.project_data.get(pi)?;
         let col = pd.layout.columns.get(ci)?;
         let len = col.len() as i32;
         let mut t = from_row as i32 + direction;
+        let task_by_id: std::collections::HashSet<&str> = pd.tasks.iter().map(|t| t.id.as_str()).collect();
         while t >= 0 && t < len {
-            if self.is_row_visible(pd, &col[t as usize]) {
+            let item = &col[t as usize];
+            let visible = match item {
+                GridItem::Task(slug) => {
+                    let task = pd.tasks.iter().find(|tt| tt.slug == *slug);
+                    let archived = task.map_or(false, |tt| tt.status == PlanStatus::Archived);
+                    let parented = task.and_then(|tt| tt.parent_task_id.as_deref())
+                        .map_or(false, |pid| task_by_id.contains(pid));
+                    (self.show_archived || !archived) && !parented
+                }
+                _ => true,
+            };
+            if visible {
                 return Some(t as usize);
             }
             t += direction;
@@ -2245,8 +2439,23 @@ impl PlanningView {
     }
 
     fn move_visual_block(&mut self, pi: usize, ci: usize, start: usize, end: usize, direction: i32) {
+        // Visual block move operates on a contiguous run of raw layout
+        // items. If any row in [start..=end] is a synthetic subtask
+        // (or a parented task hidden from raw view), the run isn't
+        // contiguous in raw space and the operation can't be defined
+        // unambiguously — bail. Translate visible bounds to raw.
+        let rows = self.visible_rows_for_column(pi, ci);
+        let raw_start = match rows.get(start).map(|r| &r.kind) {
+            Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
+            _ => return,
+        };
+        let raw_end = match rows.get(end).map(|r| &r.kind) {
+            Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
+            _ => return,
+        };
+        if raw_end - raw_start != end - start { return; }
         if direction > 0 {
-            let below = match self.next_visible_row(pi, ci, end, 1) {
+            let below = match self.next_visible_row(pi, ci, raw_end, 1) {
                 Some(b) => b,
                 None => {
                     let col = &mut self.project_data[pi].layout.columns[ci];
@@ -2256,19 +2465,19 @@ impl PlanningView {
             };
             let col = &mut self.project_data[pi].layout.columns[ci];
             let item = col.remove(below);
-            col.insert(start, item);
+            col.insert(raw_start, item);
             self.cursor.row += 1;
             if let Some(ref mut anchor) = self.visual_anchor {
                 *anchor += 1;
             }
         } else {
-            let above = match self.next_visible_row(pi, ci, start, -1) {
+            let above = match self.next_visible_row(pi, ci, raw_start, -1) {
                 Some(a) => a,
                 None => return,
             };
             let col = &mut self.project_data[pi].layout.columns[ci];
             let item = col.remove(above);
-            col.insert(end, item);
+            col.insert(raw_end, item);
             self.cursor.row -= 1;
             if let Some(ref mut anchor) = self.visual_anchor {
                 *anchor -= 1;
@@ -2289,33 +2498,54 @@ impl PlanningView {
         if src_pi != dst_pi { return; }
 
         if let Some((range_start, range_end)) = self.visual_range() {
+            // Translate visible-row visual range to raw indices. Bail
+            // if any row is a synthetic subtask or the raw indices
+            // aren't contiguous.
+            let rows = self.visible_rows_for_column(src_pi, src_ci);
+            let raw_start = match rows.get(range_start).map(|r| &r.kind) {
+                Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
+                _ => return,
+            };
+            let raw_end = match rows.get(range_end).map(|r| &r.kind) {
+                Some(VisibleRowKind::Layout { raw_idx, .. }) => *raw_idx,
+                _ => return,
+            };
+            if raw_end - raw_start != range_end - range_start { return; }
             let src_len = self.project_data[src_pi].layout.columns[src_ci].len();
-            if range_end >= src_len { return; }
+            if raw_end >= src_len { return; }
             let items: Vec<GridItem> = self.project_data[src_pi].layout.columns[src_ci]
-                .drain(range_start..=range_end)
+                .drain(raw_start..=raw_end)
                 .collect();
             let dst_len = self.project_data[dst_pi].layout.columns[dst_ci].len();
-            let insert_at = range_start.min(dst_len);
+            let insert_at = raw_start.min(dst_len);
             for (offset, item) in items.into_iter().enumerate() {
                 self.project_data[dst_pi].layout.columns[dst_ci].insert(insert_at + offset, item);
             }
-            let cursor_offset = self.cursor.row.saturating_sub(range_start);
+            // Reposition cursor/anchor in the new visible-rows projection.
             self.cursor.col = target_gcol;
-            self.cursor.row = insert_at + cursor_offset;
+            self.cursor.row = range_start;
             if let Some(ref mut anchor) = self.visual_anchor {
                 let anchor_offset = anchor.saturating_sub(range_start);
-                *anchor = insert_at + anchor_offset;
+                *anchor = range_start + anchor_offset;
             }
         } else {
-            match self.project_data[src_pi].layout.columns[src_ci].get(self.cursor.row) {
+            // Single-row move: only valid on a raw Layout row of
+            // kind Task or Header. Subtasks (synthetic) bail.
+            let raw_idx = match self.cursor_raw_idx() { Some(r) => r, None => return };
+            match self.project_data[src_pi].layout.columns[src_ci].get(raw_idx) {
                 Some(GridItem::Task(_)) | Some(GridItem::Header(_)) => {}
                 _ => return,
             }
-            let item = self.project_data[src_pi].layout.columns[src_ci].remove(self.cursor.row);
-            let insert_at = self.cursor.row.min(self.project_data[dst_pi].layout.columns[dst_ci].len());
+            let item = self.project_data[src_pi].layout.columns[src_ci].remove(raw_idx);
+            let insert_at = raw_idx.min(self.project_data[dst_pi].layout.columns[dst_ci].len());
             self.project_data[dst_pi].layout.columns[dst_ci].insert(insert_at, item);
             self.cursor.col = target_gcol;
-            self.cursor.row = insert_at;
+            // After insertion, recompute cursor.row in the new column.
+            if let Some(rows) = self.cursor_visible_column() {
+                if let Some(idx) = rows.iter().position(|r| matches!(&r.kind, VisibleRowKind::Layout { raw_idx, .. } if *raw_idx == insert_at)) {
+                    self.cursor.row = idx;
+                }
+            }
         }
 
         self.save_project_layout(src_pi);
@@ -2323,12 +2553,25 @@ impl PlanningView {
         self.clamp_cursor();
     }
 
+    /// Anchor for inserts/removes. Resolves cursor.row (visible) to a
+    /// raw layout index. When cursor is on a synthetic subtask row,
+    /// returns the raw index of the parent's row in this column so
+    /// inserts land just after the parent's subtree.
+    fn anchor_raw_idx(&self) -> Option<usize> {
+        let row = self.cursor_visible_row()?;
+        match row.kind {
+            VisibleRowKind::Layout { raw_idx, .. } => Some(raw_idx),
+            VisibleRowKind::Subtask { .. } => None,
+        }
+    }
+
     fn insert_separator(&mut self) {
         let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
             Some(v) => *v,
             None => return,
         };
-        let insert_at = (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len());
+        let raw = match self.anchor_raw_idx() { Some(r) => r, None => return };
+        let insert_at = (raw + 1).min(self.project_data[pi].layout.columns[ci].len());
         self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Separator);
         self.save_project_layout(pi);
     }
@@ -2338,7 +2581,8 @@ impl PlanningView {
             Some(v) => *v,
             None => return,
         };
-        let insert_at = (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len());
+        let raw = match self.anchor_raw_idx() { Some(r) => r, None => return };
+        let insert_at = (raw + 1).min(self.project_data[pi].layout.columns[ci].len());
         self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Empty);
         self.save_project_layout(pi);
     }
@@ -2348,7 +2592,8 @@ impl PlanningView {
             Some(v) => *v,
             None => return,
         };
-        let insert_at = (self.cursor.row + 1).min(self.project_data[pi].layout.columns[ci].len());
+        let raw = match self.anchor_raw_idx() { Some(r) => r, None => return };
+        let insert_at = (raw + 1).min(self.project_data[pi].layout.columns[ci].len());
         self.project_data[pi].layout.columns[ci].insert(insert_at, GridItem::Header(text));
         self.save_project_layout(pi);
     }
@@ -2358,7 +2603,8 @@ impl PlanningView {
             Some(v) => *v,
             None => return,
         };
-        if let Some(item) = self.project_data[pi].layout.columns[ci].get_mut(self.cursor.row) {
+        let raw = match self.anchor_raw_idx() { Some(r) => r, None => return };
+        if let Some(item) = self.project_data[pi].layout.columns[ci].get_mut(raw) {
             if matches!(item, GridItem::Header(_)) {
                 *item = GridItem::Header(text);
                 self.save_project_layout(pi);
@@ -2371,8 +2617,9 @@ impl PlanningView {
             Some(v) => *v,
             None => return,
         };
-        if matches!(self.project_data[pi].layout.columns[ci].get(self.cursor.row), Some(GridItem::Separator | GridItem::Empty | GridItem::Header(_))) {
-            self.project_data[pi].layout.columns[ci].remove(self.cursor.row);
+        let raw = match self.anchor_raw_idx() { Some(r) => r, None => return };
+        if matches!(self.project_data[pi].layout.columns[ci].get(raw), Some(GridItem::Separator | GridItem::Empty | GridItem::Header(_))) {
+            self.project_data[pi].layout.columns[ci].remove(raw);
             self.save_project_layout(pi);
             self.clamp_cursor();
         }
@@ -2665,16 +2912,15 @@ impl PlanningView {
         if query.is_empty() { return; }
         let q = query.to_lowercase();
         for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
-            let col = &self.project_data[pi].layout.columns[ci];
-            for (ri, item) in col.iter().enumerate() {
-                if let GridItem::Task(slug) = item {
-                    if let Some(task) = self.project_data[pi].tasks.iter().find(|t| t.slug == *slug) {
-                        if task.title.to_lowercase().contains(&q) || task.description.to_lowercase().contains(&q) {
-                            self.cursor.col = gi;
-                            self.cursor.row = ri;
-                            self.ensure_cursor_visible();
-                            return;
-                        }
+            let rows = self.visible_rows_for_column(pi, ci);
+            for (ri, row) in rows.iter().enumerate() {
+                let slug = match visible_row_slug(row) { Some(s) => s, None => continue };
+                if let Some(task) = self.project_data[pi].tasks.iter().find(|t| t.slug == slug) {
+                    if task.title.to_lowercase().contains(&q) || task.description.to_lowercase().contains(&q) {
+                        self.cursor.col = gi;
+                        self.cursor.row = ri;
+                        self.ensure_cursor_visible();
+                        return;
                     }
                 }
             }
@@ -2810,7 +3056,8 @@ impl PlanningView {
 
             let header_h: u16 = if show_headers { 1 } else { 0 };
             let col_area = Rect::new(x, inner.y + header_h, w, (grid_height as u16).saturating_sub(header_h));
-            let items = self.build_column_items(gi, &pd.project.name, column, w as usize, col_area.height as usize);
+            let _ = column;
+            let items = self.build_column_items(gi, &pd.project.name, pi, ci, w as usize, col_area.height as usize);
             frame.render_widget(List::new(items), col_area);
         }
 
@@ -2858,7 +3105,7 @@ impl PlanningView {
                 dim,
             )),
             Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+                " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
                 dim,
             )),
         ]), help_area);
@@ -2873,77 +3120,62 @@ impl PlanningView {
             Some(p) => p,
             None => return " [debug] no project".to_string(),
         };
-        let col = match pd.layout.columns.get(ci) {
-            Some(c) => c,
-            None => return " [debug] no column data".to_string(),
-        };
+        let rows = self.visible_rows_for_column(pi, ci);
         let off = self.grid_col_scroll.get(self.cursor.col).copied().unwrap_or(0);
         let h = self.grid_rows_visible.get();
-        let len = col.len();
+        let len = rows.len();
         let row = self.cursor.row;
-        let item_str = match col.get(row) {
-            Some(GridItem::Task(slug)) => {
+        let item_str = match rows.get(row).map(|r| (&r.kind, r.depth)) {
+            Some((VisibleRowKind::Layout { item: GridItem::Task(slug), .. }, d)) => {
                 let archived = pd.tasks.iter().find(|t| t.slug == *slug)
                     .map(|t| t.status == PlanStatus::Archived).unwrap_or(false);
-                if archived { format!("Task({}) ARCHIVED", slug) } else { format!("Task({})", slug) }
+                if archived { format!("Task({}) d{} ARCHIVED", slug, d) } else { format!("Task({}) d{}", slug, d) }
             }
-            Some(GridItem::Empty) => "Empty".to_string(),
-            Some(GridItem::Separator) => "Separator".to_string(),
-            Some(GridItem::Header(t)) => format!("Header({})", t),
+            Some((VisibleRowKind::Subtask { slug }, d)) => format!("Subtask({}) d{}", slug, d),
+            Some((VisibleRowKind::Layout { item: GridItem::Empty, .. }, _)) => "Empty".to_string(),
+            Some((VisibleRowKind::Layout { item: GridItem::Separator, .. }, _)) => "Separator".to_string(),
+            Some((VisibleRowKind::Layout { item: GridItem::Header(t), .. }, _)) => format!("Header({})", t),
             None => "<oob>".to_string(),
         };
-        let visible_here = col.get(row).map(|it| self.is_row_visible(pd, it)).unwrap_or(false);
-        let hidden_below = col[row.saturating_add(1).min(len)..].iter()
-            .take_while(|it| !self.is_row_visible(pd, it))
-            .count();
-        let hidden_above = if row > 0 {
-            col[..row].iter().rev()
-                .take_while(|it| !self.is_row_visible(pd, it))
-                .count()
-        } else { 0 };
         let visual = match self.visual_anchor {
             Some(a) => format!(" visual={}", a),
             None => String::new(),
         };
         format!(
-            " [debug] col={} row={} off={} h={} len={} item={} visible={} hidden_above={} hidden_below={} show_arch={}{}",
-            self.cursor.col, row, off, h, len, item_str, visible_here, hidden_above, hidden_below, self.show_archived, visual,
+            " [debug] col={} row={} off={} h={} len={} item={} show_arch={}{}",
+            self.cursor.col, row, off, h, len, item_str, self.show_archived, visual,
         )
     }
 
     fn build_column_items<'a>(
-        &'a self, col_idx: usize, project_name: &str, column: &[GridItem], width: usize, max_rows: usize,
+        &'a self, col_idx: usize, project_name: &str, pi: usize, ci: usize, width: usize, max_rows: usize,
     ) -> Vec<ListItem<'a>> {
+        let rows = self.visible_rows_for_column(pi, ci);
         let mut items = Vec::new();
-        let start = self.grid_col_scroll.get(col_idx).copied().unwrap_or(0).min(column.len());
+        let start = self.grid_col_scroll.get(col_idx).copied().unwrap_or(0).min(rows.len());
 
-        // Iterate to the end of the column, but stop once we've collected
-        // max_rows real ListItems. Bounding by `start + max_rows` would
-        // count `continue`-skipped (archived) items against the visible
-        // budget, making columns with archived rows in their window render
-        // shorter than their data — items at the bottom stay invisible
-        // until the user scrolls.
-        for ri in start..column.len() {
+        for ri in start..rows.len() {
             if items.len() >= max_rows { break; }
             let is_selected = self.cursor.col == col_idx && self.cursor.row == ri;
             let in_visual = self.is_in_visual_range(col_idx, ri);
-            // Skip archived task rows when show_archived is off.
-            if !self.show_archived {
-                if let GridItem::Task(slug) = &column[ri] {
-                    let archived = self.project_data.iter().find_map(|pd| {
-                        if pd.project.name == project_name { pd.tasks.iter().find(|t| t.slug == *slug) } else { None }
-                    }).map(|t| t.status == PlanStatus::Archived).unwrap_or(false);
-                    if archived { continue; }
-                }
-            }
-            match &column[ri] {
-                GridItem::Task(slug) => {
+            let row = &rows[ri];
+            // Slug for this row, if any (task layout or subtask).
+            let slug_opt: Option<&str> = visible_row_slug(row);
+
+            // Non-task rows render verbatim from the raw layout side.
+            let raw_item_opt: Option<&GridItem> = match &row.kind {
+                VisibleRowKind::Layout { item, .. } => Some(item),
+                VisibleRowKind::Subtask { .. } => None,
+            };
+
+            match (raw_item_opt, slug_opt) {
+                (_, Some(slug)) => {
                     let task = self.project_data.iter().find_map(|pd| {
                         if pd.project.name == project_name { pd.tasks.iter().find(|t| t.slug == *slug) } else { None }
                     });
                     let (title_str, status, is_claude) = match task {
                         Some(t) => (t.title.as_str(), Some(&t.status), t.source == "claude"),
-                        None => (slug.as_str(), None, false),
+                        None => (slug, None, false),
                     };
                     let indicator = match status {
                         Some(PlanStatus::Done) => "\u{2713}",
@@ -2965,19 +3197,42 @@ impl PlanningView {
                             None => Style::default(),
                         }
                     };
+                    // Tree prefix: indent (2 cells per depth level) + fold
+                    // glyph or 2-cell pad. `▼ ` expanded, `▶ ` collapsed,
+                    // `  ` leaf. Children-count badge appears as a "(N)"
+                    // suffix when collapsed.
+                    let indent: String = "  ".repeat(row.depth as usize);
+                    let fold_glyph = if row.has_children {
+                        if row.expanded { "\u{25bc} " } else { "\u{25b6} " }
+                    } else {
+                        "  "
+                    };
+                    let count_suffix = if row.has_children && !row.expanded {
+                        format!(" ({})", row.descendant_count)
+                    } else {
+                        String::new()
+                    };
+
                     let claude_prefix = if is_claude { "[C] " } else { "" };
-                    let max_title = width.saturating_sub(4 + claude_prefix.len());
+                    let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/ + claude_prefix.len();
+                    let max_title = width.saturating_sub(prefix_len + count_suffix.len());
                     let title_display = if title_str.len() > max_title {
                         format!("{}...", &title_str[..max_title.saturating_sub(3)])
                     } else { title_str.to_string() };
 
-                    let mut spans = vec![
-                        Span::styled(format!("{} ", indicator), indicator_style),
-                    ];
+                    let mut spans = Vec::new();
+                    if !indent.is_empty() {
+                        spans.push(Span::raw(indent.clone()));
+                    }
+                    spans.push(Span::styled(fold_glyph.to_string(), Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(format!("{} ", indicator), indicator_style));
                     if is_claude {
                         spans.push(Span::styled(claude_prefix, Style::default().fg(Color::Magenta)));
                     }
                     spans.push(Span::raw(title_display));
+                    if !count_suffix.is_empty() {
+                        spans.push(Span::styled(count_suffix, Style::default().fg(Color::DarkGray)));
+                    }
                     let line = Line::from(spans);
                     let conflict = self.is_conflict(project_name, slug);
                     let base_fg = if is_claude { Color::Magenta } else { Color::Gray };
@@ -2997,15 +3252,15 @@ impl PlanningView {
                     } else { style };
                     items.push(ListItem::new(line).style(style));
                 }
-                GridItem::Separator => {
+                (Some(GridItem::Separator), None) => {
                     let ch = if is_selected { "\u{2501}" } else { "\u{2500}" };
                     let st = if is_selected { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray) };
                     items.push(ListItem::new(Line::from(Span::styled(ch.repeat(width.saturating_sub(1)), st))));
                 }
-                GridItem::Empty => {
+                (Some(GridItem::Empty), None) => {
                     items.push(ListItem::new(Line::from("")));
                 }
-                GridItem::Header(text) => {
+                (Some(GridItem::Header(text)), None) => {
                     let base_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
                     let style = if is_selected && in_visual {
                         base_style.bg(Color::Rgb(50, 50, 80))
@@ -3024,6 +3279,7 @@ impl PlanningView {
                     };
                     items.push(ListItem::new(Line::from(Span::styled(display, style))));
                 }
+                _ => {}
             }
         }
         items
@@ -3640,6 +3896,94 @@ mod tests {
             } => (project, repo_url, parent_task_id),
             other => panic!("expected CreateTask, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    fn make_task(id: &str, slug: &str, parent: Option<&str>) -> PlanTask {
+        PlanTask {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            title: slug.to_string(),
+            status: PlanStatus::Backlog,
+            difficulty: None,
+            depends: vec![],
+            branch: None,
+            created: None,
+            description: String::new(),
+            prompt: String::new(),
+            source: "user".to_string(),
+            is_cloud: false,
+            repo_url: String::new(),
+            parent_task_id: parent.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn visible_rows_skip_parented_tasks_from_own_column_when_collapsed() {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("a", "root", None),
+            make_task("b", "child", Some("a")),
+        ];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("root".to_string()),
+            GridItem::Task("child".to_string()),
+        ]];
+        view.project_data.push(pd);
+
+        let rows = view.visible_rows_for_column(0, 0);
+        assert_eq!(rows.len(), 1, "child should be hidden under collapsed parent");
+        assert!(rows[0].has_children, "parent should advertise children");
+        assert_eq!(rows[0].descendant_count, 1);
+        assert!(matches!(rows[0].kind, VisibleRowKind::Layout { .. }));
+    }
+
+    #[test]
+    fn visible_rows_inject_children_when_expanded() {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("a", "root", None),
+            make_task("b", "child", Some("a")),
+            make_task("c", "grand", Some("b")),
+        ];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("root".to_string()),
+            GridItem::Task("child".to_string()),
+            GridItem::Task("grand".to_string()),
+        ]];
+        view.project_data.push(pd);
+        view.expanded_tasks.insert("a".to_string());
+
+        let rows = view.visible_rows_for_column(0, 0);
+        assert_eq!(rows.len(), 2, "only parent + direct child (grand still folded)");
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1);
+        match &rows[1].kind {
+            VisibleRowKind::Subtask { slug } => assert_eq!(slug, "child"),
+            other => panic!("expected synthetic Subtask, got {:?}", other),
+        }
+        // Now expand the child too.
+        view.expanded_tasks.insert("b".to_string());
+        let rows = view.visible_rows_for_column(0, 0);
+        assert_eq!(rows.len(), 3, "grand should now be visible");
+        assert_eq!(rows[2].depth, 2);
+    }
+
+    #[test]
+    fn visible_rows_treat_orphan_parent_as_top_level() {
+        // parent_task_id pointing outside the project shouldn't hide
+        // the row — there's no parent to render it under.
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![make_task("a", "stray", Some("missing"))];
+        pd.layout.columns = vec![vec![GridItem::Task("stray".to_string())]];
+        view.project_data.push(pd);
+
+        let rows = view.visible_rows_for_column(0, 0);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].has_children);
+        assert_eq!(rows[0].depth, 0);
     }
 
     #[test]
