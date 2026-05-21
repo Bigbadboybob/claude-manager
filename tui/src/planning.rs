@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -670,7 +671,14 @@ pub struct PlanningView {
     grid_col_scroll: Vec<usize>,
     /// Flat-list scroll for linear mode.
     linear_scroll: usize,
-    grid_rows_visible: usize,
+    /// Visible row count of each grid column's list area. Updated from
+    /// `draw_grid` (which has `&self`) via interior mutability, and read by
+    /// `ensure_cursor_visible` / detail scroll keybindings to decide when
+    /// to scroll. Previously this was a plain `usize` mutated only by an
+    /// `update_layout()` method that no caller invoked — so it stayed at
+    /// the `new()` default of 20, making columns "feel" 20 rows tall even
+    /// in tall terminals.
+    grid_rows_visible: Cell<usize>,
     linear_mode: bool,
     /// Qualified conflict slugs: "project_name/slug".
     conflict_slugs: HashSet<String>,
@@ -704,7 +712,7 @@ impl PlanningView {
             cursor: GridCursor { col: 0, row: 0 },
             grid_col_scroll: vec![],
             linear_scroll: 0,
-            grid_rows_visible: 20,
+            grid_rows_visible: Cell::new(20),
             linear_mode: false,
             conflict_slugs: HashSet::new(),
             detail_scroll: 0,
@@ -1247,7 +1255,7 @@ impl PlanningView {
     }
 
     fn ensure_cursor_visible(&mut self) {
-        let h = self.grid_rows_visible;
+        let h = self.grid_rows_visible.get();
         if h == 0 { return; }
         if self.linear_mode {
             let flat = self.cursor_flat_index_linear();
@@ -1470,13 +1478,13 @@ impl PlanningView {
             match key.code {
                 KeyCode::PageDown => {
                     self.detail_scroll = self.detail_scroll.saturating_add(
-                        (self.grid_rows_visible as u16 / 3).max(1)
+                        (self.grid_rows_visible.get() as u16 / 3).max(1)
                     );
                     return PlanAction::Consumed;
                 }
                 KeyCode::PageUp => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(
-                        (self.grid_rows_visible as u16 / 3).max(1)
+                        (self.grid_rows_visible.get() as u16 / 3).max(1)
                     );
                     return PlanAction::Consumed;
                 }
@@ -2442,9 +2450,6 @@ impl PlanningView {
 
     pub fn update_layout(&mut self, area_width: u16, area_height: u16) {
         let left_width = if self.linear_mode { 30 } else { area_width / 2 };
-        let help_h: u16 = if self.linear_mode { 7 } else { 3 };
-        let inner_h = area_height.saturating_sub(2);
-        self.grid_rows_visible = inner_h.saturating_sub(help_h + 1) as usize;
 
         let editor_cols = area_width.saturating_sub(left_width + 2);
         let editor_rows = area_height.saturating_sub(2);
@@ -2506,6 +2511,11 @@ impl PlanningView {
         let num_cols = self.unified_cols.len().max(1);
         let col_width = inner.width / num_cols as u16;
         let dim = Style::default().fg(Color::DarkGray);
+
+        // Publish the actual list area height so ensure_cursor_visible
+        // scrolls based on the real terminal size, not the stale default.
+        let header_h: u16 = if self.project_filter.is_none() { 1 } else { 0 };
+        self.grid_rows_visible.set((grid_height as u16).saturating_sub(header_h) as usize);
 
         for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
             let pd = &self.project_data[pi];
@@ -2729,6 +2739,7 @@ impl PlanningView {
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 2) as usize;
         let dim = Style::default().fg(Color::DarkGray);
+        self.grid_rows_visible.set(list_height);
 
         let mut items: Vec<ListItem> = Vec::new();
         let mut flat_idx = 0usize;
