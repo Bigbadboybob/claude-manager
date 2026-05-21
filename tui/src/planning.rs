@@ -2090,12 +2090,15 @@ impl PlanningView {
             self.move_visual_block(pi, ci, range_start, range_end, direction);
         } else {
             let ri = self.cursor.row;
-            let target = ri as i32 + direction;
-            if target < 0 { return; }
-            let target = target as usize;
-            while target >= self.project_data[pi].layout.columns[ci].len() {
-                self.project_data[pi].layout.columns[ci].push(GridItem::Empty);
-            }
+            let target = match self.next_visible_row(pi, ci, ri, direction) {
+                Some(t) => t,
+                None => {
+                    if direction <= 0 { return; }
+                    let col = &mut self.project_data[pi].layout.columns[ci];
+                    col.push(GridItem::Empty);
+                    col.len() - 1
+                }
+            };
             self.project_data[pi].layout.columns[ci].swap(ri, target);
             self.cursor.row = target;
         }
@@ -2104,14 +2107,36 @@ impl PlanningView {
         self.ensure_cursor_visible();
     }
 
-    fn move_visual_block(&mut self, pi: usize, ci: usize, start: usize, end: usize, direction: i32) {
-        let col = &mut self.project_data[pi].layout.columns[ci];
-
-        if direction > 0 {
-            let below = end + 1;
-            while below >= col.len() {
-                col.push(GridItem::Empty);
+    /// Walk `direction` from `from_row` and return the first row whose item
+    /// would actually render — i.e. skip archived task rows when
+    /// `show_archived` is off. Returns `None` if there is no such row in that
+    /// direction.
+    fn next_visible_row(&self, pi: usize, ci: usize, from_row: usize, direction: i32) -> Option<usize> {
+        if direction == 0 { return None; }
+        let pd = self.project_data.get(pi)?;
+        let col = pd.layout.columns.get(ci)?;
+        let len = col.len() as i32;
+        let mut t = from_row as i32 + direction;
+        while t >= 0 && t < len {
+            if self.is_row_visible(pd, &col[t as usize]) {
+                return Some(t as usize);
             }
+            t += direction;
+        }
+        None
+    }
+
+    fn move_visual_block(&mut self, pi: usize, ci: usize, start: usize, end: usize, direction: i32) {
+        if direction > 0 {
+            let below = match self.next_visible_row(pi, ci, end, 1) {
+                Some(b) => b,
+                None => {
+                    let col = &mut self.project_data[pi].layout.columns[ci];
+                    col.push(GridItem::Empty);
+                    col.len() - 1
+                }
+            };
+            let col = &mut self.project_data[pi].layout.columns[ci];
             let item = col.remove(below);
             col.insert(start, item);
             self.cursor.row += 1;
@@ -2119,8 +2144,11 @@ impl PlanningView {
                 *anchor += 1;
             }
         } else {
-            if start == 0 { return; }
-            let above = start - 1;
+            let above = match self.next_visible_row(pi, ci, start, -1) {
+                Some(a) => a,
+                None => return,
+            };
+            let col = &mut self.project_data[pi].layout.columns[ci];
             let item = col.remove(above);
             col.insert(end, item);
             self.cursor.row -= 1;
@@ -2579,7 +2607,7 @@ impl PlanningView {
 
         if inner.height < 4 || inner.width < 8 { return; }
 
-        let help_h = 3u16;
+        let help_h = 4u16;
         let grid_height = inner.height.saturating_sub(help_h) as usize;
         let num_cols = self.unified_cols.len().max(1);
         let col_width = inner.width / num_cols as u16;
@@ -2650,8 +2678,10 @@ impl PlanningView {
         let help_y = inner.y + inner.height.saturating_sub(help_h);
         let help_area = Rect::new(inner.x, help_y, inner.width, help_h);
         let sep = Line::from(Span::styled("\u{2500}".repeat(inner.width as usize), dim));
+        let debug_line = Line::from(Span::styled(self.grid_debug_line(), Style::default().fg(Color::Yellow)));
         frame.render_widget(Paragraph::new(vec![
             sep,
+            debug_line,
             Line::from(Span::styled(
                 " A-j/k nav \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear",
                 dim,
@@ -2661,6 +2691,53 @@ impl PlanningView {
                 dim,
             )),
         ]), help_area);
+    }
+
+    fn grid_debug_line(&self) -> String {
+        let (pi, ci) = match self.unified_cols.get(self.cursor.col) {
+            Some(v) => *v,
+            None => return " [debug] no column".to_string(),
+        };
+        let pd = match self.project_data.get(pi) {
+            Some(p) => p,
+            None => return " [debug] no project".to_string(),
+        };
+        let col = match pd.layout.columns.get(ci) {
+            Some(c) => c,
+            None => return " [debug] no column data".to_string(),
+        };
+        let off = self.grid_col_scroll.get(self.cursor.col).copied().unwrap_or(0);
+        let h = self.grid_rows_visible.get();
+        let len = col.len();
+        let row = self.cursor.row;
+        let item_str = match col.get(row) {
+            Some(GridItem::Task(slug)) => {
+                let archived = pd.tasks.iter().find(|t| t.slug == *slug)
+                    .map(|t| t.status == PlanStatus::Archived).unwrap_or(false);
+                if archived { format!("Task({}) ARCHIVED", slug) } else { format!("Task({})", slug) }
+            }
+            Some(GridItem::Empty) => "Empty".to_string(),
+            Some(GridItem::Separator) => "Separator".to_string(),
+            Some(GridItem::Header(t)) => format!("Header({})", t),
+            None => "<oob>".to_string(),
+        };
+        let visible_here = col.get(row).map(|it| self.is_row_visible(pd, it)).unwrap_or(false);
+        let hidden_below = col[row.saturating_add(1).min(len)..].iter()
+            .take_while(|it| !self.is_row_visible(pd, it))
+            .count();
+        let hidden_above = if row > 0 {
+            col[..row].iter().rev()
+                .take_while(|it| !self.is_row_visible(pd, it))
+                .count()
+        } else { 0 };
+        let visual = match self.visual_anchor {
+            Some(a) => format!(" visual={}", a),
+            None => String::new(),
+        };
+        format!(
+            " [debug] col={} row={} off={} h={} len={} item={} visible={} hidden_above={} hidden_below={} show_arch={}{}",
+            self.cursor.col, row, off, h, len, item_str, visible_here, hidden_above, hidden_below, self.show_archived, visual,
+        )
     }
 
     fn build_column_items<'a>(
