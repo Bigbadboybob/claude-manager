@@ -1264,14 +1264,87 @@ impl PlanningView {
             } else if flat >= self.linear_scroll + h {
                 self.linear_scroll = flat.saturating_sub(h - 1);
             }
-        } else {
-            if self.cursor.col >= self.grid_col_scroll.len() { return; }
-            let off = self.grid_col_scroll[self.cursor.col];
-            if self.cursor.row < off {
-                self.grid_col_scroll[self.cursor.col] = self.cursor.row;
-            } else if self.cursor.row >= off + h {
-                self.grid_col_scroll[self.cursor.col] = self.cursor.row.saturating_sub(h - 1);
+            return;
+        }
+        if self.cursor.col >= self.grid_col_scroll.len() { return; }
+        let off = self.grid_col_scroll[self.cursor.col];
+        if self.cursor.row < off {
+            self.grid_col_scroll[self.cursor.col] = self.cursor.row;
+            return;
+        }
+        // Count *visible* rows between off and cursor.row inclusive. Archived
+        // rows are skipped by build_column_items, so the cursor can be at a
+        // column index far below `off` while occupying only a few visible
+        // rows. Comparing raw `cursor.row` against `off + h` (the old
+        // behavior) made one keystroke that hopped past archived items
+        // trigger a big scroll even when the cursor was still on-screen.
+        let visible = self.visible_row_count(self.cursor.col, off, self.cursor.row.saturating_add(1));
+        if visible <= h { return; }
+        self.grid_col_scroll[self.cursor.col] =
+            self.visible_window_top(self.cursor.col, self.cursor.row, h);
+    }
+
+    /// Number of items in column `col_idx` over `start..end` that are NOT
+    /// skipped by `build_column_items` (i.e. not archived when archived rows
+    /// are hidden). Mirrors the skip logic in `build_column_items`.
+    fn visible_row_count(&self, col_idx: usize, start: usize, end: usize) -> usize {
+        let (pi, ci) = match self.unified_cols.get(col_idx) {
+            Some(v) => *v,
+            None => return 0,
+        };
+        let pd = match self.project_data.get(pi) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let column = match pd.layout.columns.get(ci) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let end = end.min(column.len());
+        let mut count = 0usize;
+        for ri in start..end {
+            if self.is_row_visible(pd, &column[ri]) {
+                count += 1;
             }
+        }
+        count
+    }
+
+    /// Largest scroll offset `<= end_row` such that the visible rows in
+    /// `offset..=end_row` total exactly `h` (or hits the top of the column
+    /// first). Walks backward from `end_row` counting visible items.
+    fn visible_window_top(&self, col_idx: usize, end_row: usize, h: usize) -> usize {
+        let (pi, ci) = match self.unified_cols.get(col_idx) {
+            Some(v) => *v,
+            None => return 0,
+        };
+        let pd = match self.project_data.get(pi) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let column = match pd.layout.columns.get(ci) {
+            Some(c) => c,
+            None => return 0,
+        };
+        if h == 0 || column.is_empty() { return 0; }
+        let mut ri = end_row.min(column.len() - 1);
+        let mut count = 0usize;
+        loop {
+            if self.is_row_visible(pd, &column[ri]) {
+                count += 1;
+            }
+            if count >= h { return ri; }
+            if ri == 0 { return 0; }
+            ri -= 1;
+        }
+    }
+
+    fn is_row_visible(&self, pd: &ProjectData, item: &GridItem) -> bool {
+        if self.show_archived { return true; }
+        match item {
+            GridItem::Task(slug) => pd.tasks.iter().find(|t| t.slug == *slug)
+                .map(|t| t.status != PlanStatus::Archived).unwrap_or(true),
+            _ => true,
         }
     }
 
