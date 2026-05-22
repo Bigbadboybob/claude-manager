@@ -1584,6 +1584,11 @@ impl PlanningView {
                                 continue;
                             }
                         }
+                        // Hide archived top-level tasks when the
+                        // show_archived toggle (A-V) is off.
+                        if !self.show_archived && t.status == PlanStatus::Archived {
+                            continue;
+                        }
                     }
                     let task = task_by_slug.get(slug.as_str()).copied();
                     let (has_children, expanded, dcount) = match task {
@@ -3968,6 +3973,30 @@ mod tests {
         let rows = view.visible_rows_for_column(0, 0);
         assert_eq!(rows.len(), 3, "grand should now be visible");
         assert_eq!(rows[2].depth, 2);
+    }
+
+    #[test]
+    fn visible_rows_hide_archived_top_level_unless_show_archived() {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        let mut t = make_task("a", "live", None);
+        t.status = PlanStatus::Backlog;
+        let mut t2 = make_task("b", "old", None);
+        t2.status = PlanStatus::Archived;
+        pd.tasks = vec![t, t2];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("live".to_string()),
+            GridItem::Task("old".to_string()),
+        ]];
+        view.project_data.push(pd);
+
+        let rows = view.visible_rows_for_column(0, 0);
+        assert_eq!(rows.len(), 1, "archived row should be hidden by default");
+        assert!(matches!(&rows[0].kind, VisibleRowKind::Layout { item: GridItem::Task(s), .. } if s == "live"));
+
+        view.show_archived = true;
+        let rows = view.visible_rows_for_column(0, 0);
+        assert_eq!(rows.len(), 2, "archived row should appear when toggle is on");
     }
 
     #[test]
