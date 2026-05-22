@@ -1,0 +1,89 @@
+name = "design-doc"
+description = "Designer writes a design doc; reviewer audits it; manager decides iterate or finalize. On finalize, the doc is bundled with the task so launching it later resurrects the designer session."
+
+role_order = ["designer", "reviewer", "manager"]
+
+[roles.designer]
+engine = "claude-code"
+context = "persistent"
+# Designer calls `update_task` at the end of /design-doc to attach the bundle
+# metadata (design_doc_path, designer_session_uid). MCP must be wired.
+needs_mcp = true
+activation_prompt = """Run the `/design-doc` skill to produce a design doc for the goal below. Follow the skill's required process — restate, clarify if needed, explore the codebase, write the doc with numbered phases.
+
+GOAL:
+{{ goal }}
+
+Once the doc is written, the `/design-doc` skill will call `update_task` to attach the doc path and your session uid to this task's `metadata.resume`. After that, just stop — the workflow will hand off to a reviewer automatically. Do not start implementing.
+"""
+subsequent_activation_prompt = """The reviewer found things to address. Revise the doc accordingly.
+
+Reviewer's feedback:
+{{ roles.reviewer.last_message }}
+
+Manager's direction (what to actually change vs. ignore):
+{{ roles.manager.last_message }}
+
+Edit the doc in place — same path you wrote it to last time. When you're done, just stop; the workflow routes to the reviewer again.
+"""
+
+[roles.reviewer]
+engine = "codex"
+context = "fresh"
+activation_prompt = """A design doc was just written. Read it and audit.
+
+Find the doc — the designer attached its path to the task. Look for the line in the designer's most recent message that names the doc path, or read it from the task bundle if you have MCP access. If you absolutely can't find the path, say so plainly and stop.
+
+Audit for:
+  - Correctness — does the design actually solve the stated problem?
+  - Completeness — are phases shaped per the design-doc skill (numbered, with checkable acceptance criteria)?
+  - Real risks not surfaced in the doc's "Risks and open questions" section.
+
+Only report findings you're at least 80% confident are real issues. Skip nitpicks (formatting, prose, naming preferences). Consolidate similar findings.
+"""
+
+[roles.manager]
+engine = "claude-code"
+context = "persistent"
+activation_prompt = """You are the manager of a design-doc workflow. Your job is to decide whether the doc needs another round with the designer, or whether it's good to hand back to the user.
+
+GOAL (the launch prompt — what the designer was asked to design):
+{{ goal }}
+
+Designer's most recent message:
+{{ roles.designer.last_message }}
+
+Reviewer's review:
+{{ roles.reviewer.last_message }}
+
+Important: the reviewer lacks the goal context. Don't relay nitpicks. Only direct the designer to address findings that actually serve the original goal or surface real correctness / completeness risks.
+
+Decide:
+  - If the reviewer surfaced real issues that matter for the goal: call `workflow_transition` with `to = "designer"` and a concise `prompt` distilling EXACTLY what to fix. Be directive — paraphrase the review, don't quote it wholesale.
+  - If the doc is good and the goal has been met: call `workflow_done` with a short `reason`. The bundle metadata is already attached to the task (the designer called `update_task` at the end of `/design-doc`). When the user launches this task later, the designer session will resurrect and the user can keep iterating or run `/design-doc-impl-loop` to implement.
+
+Call exactly one tool. Do not write code or edit the doc yourself.
+"""
+subsequent_activation_prompt = """Designer revised the doc. Reviewer took another look.
+
+Designer's most recent message:
+{{ roles.designer.last_message }}
+
+Reviewer's review:
+{{ roles.reviewer.last_message }}
+
+Same decision rules as before. Call exactly one tool (`workflow_transition` to "designer", or `workflow_done`).
+"""
+
+[[transitions]]
+from = "designer"
+on = "idle"
+to = "reviewer"
+
+[[transitions]]
+from = "reviewer"
+on = "idle"
+to = "manager"
+
+# Note: `manager` has no static transition. It must call workflow_transition or
+# workflow_done via the claude-manager MCP tools to advance the workflow.

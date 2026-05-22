@@ -302,6 +302,27 @@ pub struct RuntimeState {
     pub idle: bool,
 }
 
+/// Return the caller's bound task_id (and workspace_id), letting MCP
+/// tools answer "what task am I in?" without the caller having to track
+/// it themselves. Used by `get_current_task` so skills can pull doc paths
+/// and other bundle metadata off the task row without arguments.
+///
+/// Tombstoned callers (Phase 2b retention) are served too — a recently
+/// closed session's bundle is still readable. Returns null fields when
+/// the caller has no task or no workspace (e.g. `A-n` taskless sessions).
+pub fn get_caller_task(app: &App, caller_uid: &str, _params: &Value) -> MethodResult {
+    let caller = caller_ctx_or_tombstone(&app.workspaces, caller_uid)
+        .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+    let workspace_id = caller
+        .workspace_index
+        .map(|wi| app.workspaces[wi].id.clone());
+    Ok(json!({
+        "task_id": caller.task_id,
+        "workspace_id": workspace_id,
+        "is_tombstone": caller.is_tombstone,
+    }))
+}
+
 /// Resolve a session's transcript path for direct file IO by the MCP
 /// server. Returns:
 ///   - `state="ready"` + path when the session is live with a bound
@@ -1097,6 +1118,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             project: project_for_local.clone(),
             parent_task_id: Some(parent_task_id),
             worktree_mode: crate::app::parse_worktree_mode(&p.worktree_mode),
+            metadata: None,
         });
     }
 
@@ -2137,6 +2159,7 @@ mod tests {
             project: None,
             parent_task_id: parent.map(str::to_string),
             worktree_mode: crate::app::WorktreeMode::Inherit,
+            metadata: None,
         }
     }
 

@@ -4126,6 +4126,7 @@ mod tests {
             is_cloud: false,
             parent_task_id: None,
             worktree_mode: "inherit".to_string(),
+            metadata: None,
         }
     }
 

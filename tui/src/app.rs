@@ -466,6 +466,11 @@ pub struct TaskEntry {
     ///   - "branch": a new worktree is created off the parent's branch
     ///     with name `cm-sub/<slug-chain>-<short_id>`.
     pub worktree_mode: WorktreeMode,
+    /// Free-form JSONB bag mirrored from the API row. Skills attach
+    /// structured context here — currently `metadata.resume.*` for the
+    /// design-doc bundle (`design_doc_path` + `designer_session_uid`).
+    /// `None` = no bag set.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// How a subtask's worktree relates to its parent. Default = `Inherit`
@@ -3774,12 +3779,16 @@ impl App {
             self.planning.mark_task_running_by_id(tid);
         }
 
+        let respawned = self.resurrect_designer_sessions_for_workspace(wi);
+
         self.save_session_manifest();
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
 
-        // If the workspace has any tombstones, offer to resurrect them.
-        // Pure session-state restore — task status / workspace_id are
+        // Designer sessions tagged by `metadata.resume.designer_session_uid`
+        // were already auto-resurrected above. If any tombstones remain
+        // (workflow participants, ad-hoc sessions, etc.), offer to restore
+        // them via the confirm dialog. Task status / workspace_id are
         // already wired up by this point.
         let tombstone_count = self.workspaces[wi].tombstones.len();
         if tombstone_count > 0 {
@@ -3793,6 +3802,12 @@ impl App {
                     ws_id: ws_id.to_string(),
                 },
             };
+        } else if respawned > 0 {
+            self.set_status_msg(&format!(
+                "Workspace reopened — resurrected {} designer session{}",
+                respawned,
+                if respawned == 1 { "" } else { "s" },
+            ));
         } else {
             self.set_status_msg("Workspace reopened — A-s to add session");
         }
@@ -3968,6 +3983,126 @@ impl App {
         }
         self.clamp_cursor();
         self.set_status_msg("Workspace closed");
+    }
+
+    /// Resurrect tombstoned sessions referenced by a bound task's
+    /// `metadata.resume.designer_session_uid`. Generic by design — any
+    /// skill that stashes a session uid under that key gets the same
+    /// behavior on workspace reopen. First and currently only caller is
+    /// the design-doc bundle (skill writes the uid; reopen brings the
+    /// session back as a live `claude --resume <transcript_id>`).
+    ///
+    /// Returns the number of tombstones successfully respawned so
+    /// callers can include it in status messages. Failures (missing
+    /// transcript id, spawn error, unsupported session type) leave the
+    /// tombstone in place so a subsequent reopen can retry.
+    fn resurrect_designer_sessions_for_workspace(&mut self, wi: usize) -> usize {
+        if wi >= self.workspaces.len() {
+            return 0;
+        }
+        let ws_id = self.workspaces[wi].id.clone();
+        let target_uids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(ws_id.as_str()))
+            .filter_map(|t| {
+                t.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("resume"))
+                    .and_then(|r| r.get("designer_session_uid"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        if target_uids.is_empty() {
+            return 0;
+        }
+
+        let (cols, rows) = self.last_term_size;
+        let mut respawned = 0usize;
+        for uid in target_uids {
+            // Skip if the uid is already live (e.g. a previous resurrect
+            // hop already brought it back) — never spawn a duplicate.
+            if self.workspaces[wi]
+                .sessions
+                .iter()
+                .any(|s| s.uid == uid)
+            {
+                continue;
+            }
+            let Some(ti) = self.workspaces[wi]
+                .tombstones
+                .iter()
+                .position(|t| t.uid == uid)
+            else {
+                continue;
+            };
+            let tomb = &self.workspaces[wi].tombstones[ti];
+            if tomb.session_type != "claude" {
+                continue;
+            }
+            let Some(transcript_id) = tomb.last_transcript_id.clone() else {
+                continue;
+            };
+            let worktree_path = tomb
+                .worktree_path
+                .clone()
+                .or_else(|| self.workspaces[wi].worktree_path.clone());
+            let label = tomb.label.clone();
+            let task_id = tomb.task_id.clone();
+
+            let (program, args) = match crate::mcp_config::build_args(
+                &workflow::toml_schema::Engine::ClaudeCode,
+                &uid,
+                None,
+                Some(transcript_id.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(_) => (
+                    "claude".to_string(),
+                    vec![
+                        "--dangerously-skip-permissions".to_string(),
+                        "--resume".to_string(),
+                        transcript_id.clone(),
+                    ],
+                ),
+            };
+
+            match self.spawn_agent_session(
+                "claude",
+                &uid,
+                &program,
+                &args,
+                cols,
+                rows,
+                worktree_path,
+                Default::default(),
+            ) {
+                Ok(s) => {
+                    let mut ts = make_simple_session_with_uid(
+                        uid.clone(),
+                        &label,
+                        "claude",
+                        s,
+                        None,
+                    );
+                    ts.transcript_id = Some(transcript_id);
+                    ts.task_id = task_id;
+                    self.workspaces[wi].sessions.push(ts);
+                    self.workspaces[wi].tombstones.remove(ti);
+                    respawned += 1;
+                }
+                Err(_) => {
+                    // Spawn failed — leave the tombstone alone so the
+                    // user can retry by closing and reopening again
+                    // (or by adding a session manually with A-s).
+                }
+            }
+        }
+        if respawned > 0 {
+            self.save_session_manifest();
+        }
+        respawned
     }
 
     fn toggle_session_hidden(&mut self) {
@@ -5087,6 +5222,7 @@ impl App {
             "resolve_authorized_session" => {
                 methods::resolve_authorized_session(self, caller, &req.params)
             }
+            "get_caller_task" => methods::get_caller_task(self, caller, &req.params),
             "list_sessions" => methods::list_sessions(self, caller, &req.params),
             "send_input" => methods::send_input(self, caller, &req.params),
             "kill_session" => methods::kill_session(self, caller, &req.params),
@@ -5465,6 +5601,7 @@ impl App {
                 entry.project = task.project.clone();
                 entry.parent_task_id = task.parent_task_id.clone();
                 entry.worktree_mode = parse_worktree_mode(&task.worktree_mode);
+                entry.metadata = task.metadata.clone();
             } else {
                 self.tasks.push(TaskEntry {
                     task_id: Some(task.id.clone()),
@@ -5480,6 +5617,7 @@ impl App {
                     project: task.project.clone(),
                     parent_task_id: task.parent_task_id.clone(),
                     worktree_mode: parse_worktree_mode(&task.worktree_mode),
+                    metadata: task.metadata.clone(),
                 });
             }
 
@@ -7384,6 +7522,7 @@ impl App {
                         project: None,
                         parent_task_id: None,
                         worktree_mode: WorktreeMode::Inherit,
+                        metadata: None,
                     });
                 }
                 self.workspaces.push(local_ws);
@@ -7796,6 +7935,7 @@ impl App {
                     project: Some(project.to_string()),
                     parent_task_id: None,
                     worktree_mode: WorktreeMode::Inherit,
+                    metadata: None,
                 });
 
                 self.cursor = Cursor::Session(new_wi, 0);
@@ -7924,6 +8064,7 @@ impl App {
                         project: Some(project.to_string()),
                         parent_task_id: None,
                         worktree_mode: WorktreeMode::Inherit,
+                        metadata: None,
                     });
                 }
                 self.cursor = Cursor::Session(wi, si);
@@ -8079,11 +8220,33 @@ impl App {
         };
 
         self.workspaces[final_wi].is_closed = false;
+        let respawned = self.resurrect_designer_sessions_for_workspace(final_wi);
+        let final_ws_id = self.workspaces[final_wi].id.clone();
         self.cursor = Cursor::Workspace(final_wi);
         self.save_session_manifest();
         self.view_mode = ViewMode::Sessions;
         self.clamp_cursor();
-        self.set_status_msg("Reopened — A-s to add session");
+        let tombstone_count = self.workspaces[final_wi].tombstones.len();
+        if tombstone_count > 0 {
+            self.input_mode = InputMode::Confirm {
+                prompt: format!(
+                    "Restore {} closed session{} in this workspace?",
+                    tombstone_count,
+                    if tombstone_count == 1 { "" } else { "s" },
+                ),
+                action: ConfirmAction::RestoreTombstones {
+                    ws_id: final_ws_id,
+                },
+            };
+        } else if respawned > 0 {
+            self.set_status_msg(&format!(
+                "Reopened — resurrected {} designer session{}",
+                respawned,
+                if respawned == 1 { "" } else { "s" },
+            ));
+        } else {
+            self.set_status_msg("Reopened — A-s to add session");
+        }
     }
 
     fn unlaunch_task(&mut self, task_id: &str) {
