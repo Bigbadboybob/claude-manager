@@ -1803,10 +1803,18 @@ impl PlanningView {
                     KeyCode::Char('a') => { return self.accept_proposal(); }
                     KeyCode::Char('x') => {
                         self.cancel_visual();
-                        if let Some((pi, ci)) = self.unified_cols.get(self.cursor.col).copied() {
+                        // `cursor.row` indexes the visible-row projection, not
+                        // the raw layout — match on the visible row's kind so
+                        // a focused subtask (synthetic) still routes through
+                        // `delete_task` instead of being mis-detected as
+                        // whatever sits at the same raw index.
+                        if let Some(row) = self.cursor_visible_row() {
                             if matches!(
-                                self.project_data[pi].layout.columns[ci].get(self.cursor.row),
-                                Some(GridItem::Separator | GridItem::Empty | GridItem::Header(_))
+                                row.kind,
+                                VisibleRowKind::Layout {
+                                    item: GridItem::Separator | GridItem::Empty | GridItem::Header(_),
+                                    ..
+                                }
                             ) {
                                 self.remove_separator();
                                 return PlanAction::Consumed;
@@ -4013,6 +4021,54 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].has_children);
         assert_eq!(rows[0].depth, 0);
+    }
+
+    #[test]
+    fn alt_x_on_synthetic_subtask_routes_to_delete_not_remove_separator() {
+        // Regression: A-x checked `layout.columns[ci].get(self.cursor.row)`,
+        // but cursor.row now indexes the visible-row projection. With a
+        // synthetic Subtask row whose visible index lines up with a raw
+        // Separator (or Empty/Header) further down the column, the handler
+        // mis-routed to `remove_separator` and the focused subtask never
+        // got deleted.
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("a", "parent", None),
+            make_task("b", "child", Some("a")),
+        ];
+        // raw column: [Task(parent), Separator, Task(child)]
+        // visible (parent expanded): [Layout(parent, raw=0),
+        //                             Subtask(child),
+        //                             Layout(Separator, raw=1)]
+        pd.layout.columns = vec![vec![
+            GridItem::Task("parent".to_string()),
+            GridItem::Separator,
+            GridItem::Task("child".to_string()),
+        ]];
+        view.project_data.push(pd);
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+        view.expanded_tasks.insert("a".to_string());
+        view.rebuild_unified_cols();
+        view.cursor = GridCursor { col: 0, row: 1 };
+
+        // Sanity: cursor is actually on the synthetic Subtask row.
+        match view.cursor_visible_row().expect("visible row").kind {
+            VisibleRowKind::Subtask { ref slug } => assert_eq!(slug, "child"),
+            other => panic!("expected Subtask row at cursor, got {:?}", other),
+        }
+
+        let event = CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::ALT,
+        ));
+        match view.handle_event(&event) {
+            PlanAction::DeleteTask { id } => assert_eq!(id, "b"),
+            other => panic!(
+                "expected DeleteTask for child, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
     }
 
     #[test]
