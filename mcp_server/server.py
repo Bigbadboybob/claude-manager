@@ -1,5 +1,6 @@
 """MCP server for Claude instances to propose tasks to the backlog."""
 
+import asyncio
 import json
 import os
 import sys
@@ -604,7 +605,7 @@ def list_workflows(task_id: str | None = None) -> list[dict]:
 
 
 @mcp.tool()
-def wait_for_workflow_done(
+async def wait_for_workflow_done(
     run_id: str,
     timeout_s: float = 1800.0,
     poll_interval_s: float = 5.0,
@@ -637,17 +638,19 @@ def wait_for_workflow_done(
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(1.0, min(poll_interval_s, 60.0))
     while True:
-        state = control_client.call("get_workflow_state", {"run_id": run_id})
+        state = await asyncio.to_thread(
+            control_client.call, "get_workflow_state", {"run_id": run_id}
+        )
         status = state.get("status")
         if status in ("done", "detached") or state.get("done_reason") is not None:
             return {"done": True, "timed_out": False, "state": state}
         if time.monotonic() >= deadline:
             return {"done": False, "timed_out": True, "state": state}
-        time.sleep(interval)
+        await asyncio.sleep(interval)
 
 
 @mcp.tool()
-def wait_for_workflow_stop(
+async def wait_for_workflow_stop(
     run_id: str,
     timeout_s: float = 3600.0,
     poll_interval_s: float = 5.0,
@@ -688,7 +691,9 @@ def wait_for_workflow_stop(
     idle_since: float | None = None
 
     while True:
-        state = control_client.call("get_workflow_state", {"run_id": run_id})
+        state = await asyncio.to_thread(
+            control_client.call, "get_workflow_state", {"run_id": run_id}
+        )
         status = state.get("status")
         if status in ("done", "detached") or state.get("done_reason") is not None:
             return {
@@ -712,7 +717,9 @@ def wait_for_workflow_stop(
             # Omit task_id — defaults to the caller's scope, which
             # includes the workflow's participant sessions for any
             # orchestrator authorized to launch the run.
-            sessions = control_client.call("list_sessions", {"include_exited": False})
+            sessions = await asyncio.to_thread(
+                control_client.call, "list_sessions", {"include_exited": False}
+            )
             for s in sessions:
                 if s.get("label") == active_label:
                     active_idle = bool(s.get("idle", False))
@@ -733,11 +740,11 @@ def wait_for_workflow_stop(
             return {
                 "done": False, "stuck": False, "timed_out": True, "state": state,
             }
-        time.sleep(interval)
+        await asyncio.sleep(interval)
 
 
 @mcp.tool()
-def wait_for_session_idle(
+async def wait_for_session_idle(
     session_uid: str,
     timeout_s: float = 600.0,
     poll_interval_s: float = 2.0,
@@ -771,7 +778,8 @@ def wait_for_session_idle(
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
     while True:
-        resolved = control_client.call(
+        resolved = await asyncio.to_thread(
+            control_client.call,
             "resolve_authorized_session",
             {"session_uid": session_uid},
         )
@@ -782,7 +790,7 @@ def wait_for_session_idle(
             return {"idle": True, "timed_out": False, "state": state}
         if time.monotonic() >= deadline:
             return {"idle": False, "timed_out": True, "state": state}
-        time.sleep(interval)
+        await asyncio.sleep(interval)
 
 
 @mcp.tool()
