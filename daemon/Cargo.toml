@@ -1,0 +1,49 @@
+[package]
+name = "cm-daemon"
+version = "0.1.0"
+edition = "2021"
+
+# Daemon binary that owns session PTYs, worktrees, workflow runs, and the
+# MCP / TUI control socket. See doc/persistent-host-daemon.md.
+#
+# Phase 1: bind ~/.cm/daemon.sock with stale-socket probe and run a
+# placeholder accept loop. Subsequent slices relocate modules into this
+# crate (worktree, mcp_config, control, workflow) and wire the dispatch
+# table.
+
+[lib]
+name = "cm_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cm-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Workflow TOMLs are parsed daemon-side after slice 6 of
+# doc/persistent-host-daemon.md.
+toml = "0.8"
+# `umask(2)` is called by the socket-bind path so the inode lands at
+# 0o600 atomically — without this scope the bind/chmod sequence has a
+# microsecond TOCTOU window where another local process can connect
+# to a too-permissive socket. Slice 4 of doc/persistent-host-daemon.md.
+libc = "0.2"
+# v4 UUIDs back AttachTicket identifiers — slice 5 of the design doc.
+uuid = { version = "1", features = ["v4"] }
+# PTY spawn primitive used by `DaemonSession::spawn` (slice 10c-a).
+# Used directly rather than via `alacritty_terminal` because the
+# daemon only needs the raw master/slave + child handles, not the
+# Term grid or EventLoop machinery that alacritty wraps around them.
+portable-pty = "0.9"
+# StreamFrame bytes are base64-encoded per the protocol-doc contract
+# (see `daemon/src/control/protocol.rs::StreamFrame` and the
+# decoder in `tui/src/term_shim.rs`). Slice 10c-c needs this on
+# the daemon side to write attach-stream data frames the TUI can
+# read. Same version as the TUI uses for symmetry.
+base64 = "0.22.1"
+
+[dev-dependencies]
+tempfile = "3"

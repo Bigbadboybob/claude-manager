@@ -529,24 +529,35 @@ fn extract_codex_line(v: &serde_json::Value, kind: MessageKind) -> Option<String
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the process-global HOME env var.
-    /// Routes through the shared crate-wide lock so tests in this module
-    /// serialize against HOME-mutating tests in other modules too.
-    fn home_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_support::home_lock()
-    }
-
+    /// Test guard that takes the crate-wide `env_lock` *before* doing
+    /// anything fs-related, then creates a tempdir and points HOME at
+    /// it. The lock-first ordering matters: `bind_with_tight_umask`
+    /// elsewhere in the crate transiently sets the process umask to
+    /// `0o177`, and `tempfile::tempdir()` running under that umask
+    /// yields a directory with mode `0o600` (no execute) that
+    /// `create_dir_all` on subdirectories then fails on.
+    ///
+    /// Holding the env lock *across* tempdir creation, fs writes, and
+    /// every transcript read in the test body keeps the umask stable
+    /// at the process default for the duration.
     struct HomeOverride {
         _guard: std::sync::MutexGuard<'static, ()>,
-        _tmp: tempfile::TempDir,
+        tmp: tempfile::TempDir,
         old: Option<std::ffi::OsString>,
     }
     impl HomeOverride {
-        fn new(tmp: tempfile::TempDir) -> Self {
-            let guard = home_lock();
+        fn new() -> Self {
+            let guard = crate::test_support::env_lock();
+            // Tempdir creation runs inside the lock so no parallel test
+            // can be in the middle of `bind_with_tight_umask` when we
+            // mkdtemp(). The default process umask applies.
+            let tmp = tempfile::tempdir().expect("tempdir");
             let old = std::env::var_os("HOME");
             unsafe { std::env::set_var("HOME", tmp.path()); }
-            HomeOverride { _guard: guard, _tmp: tmp, old }
+            HomeOverride { _guard: guard, tmp, old }
+        }
+        fn path(&self) -> &std::path::Path {
+            self.tmp.path()
         }
     }
     impl Drop for HomeOverride {
@@ -559,8 +570,11 @@ mod tests {
         }
     }
 
-    fn write_transcript(tmp: &tempfile::TempDir, encoded: &str, session_id: &str, content: &str) {
-        let proj_dir = tmp.path().join(format!(".claude/projects/{}", encoded));
+    /// Write a transcript under `home/.claude/projects/<encoded>/<session_id>.jsonl`.
+    /// `home` is typically the path returned by `HomeOverride::path()`,
+    /// so calls go inside the env-lock-protected scope (no umask race).
+    fn write_transcript(home: &std::path::Path, encoded: &str, session_id: &str, content: &str) {
+        let proj_dir = home.join(format!(".claude/projects/{}", encoded));
         std::fs::create_dir_all(&proj_dir).unwrap();
         std::fs::write(proj_dir.join(format!("{}.jsonl", session_id)), content).unwrap();
     }
@@ -569,10 +583,9 @@ mod tests {
     /// confirmed by inspecting Claude Code's JSONL output.
     #[test]
     fn extract_plan_from_tool_use() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_x","name":"ExitPlanMode","input":{"plan":"# Plan\n\n1. step one\n2. step two","planFilePath":"/tmp/p.md"}}]}}"##;
-        write_transcript(&tmp, "-tmp-repo", "sid-test", line);
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-test", line);
         let plan = latest_plan(
             &Engine::ClaudeCode,
             &std::path::PathBuf::from("/tmp/repo"),
@@ -586,13 +599,12 @@ mod tests {
 
     #[test]
     fn extract_plan_returns_latest_when_multiple() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         let lines = vec![
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"first plan"}}]}}"##,
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"second plan"}}]}}"##,
         ];
-        write_transcript(&tmp, "-tmp-repo", "sid-test", &lines.join("\n"));
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-test", &lines.join("\n"));
         let plan = latest_plan(
             &Engine::ClaudeCode,
             &std::path::PathBuf::from("/tmp/repo"),
@@ -606,14 +618,13 @@ mod tests {
     /// already moved past.
     #[test]
     fn stale_plan_is_not_returned() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         let lines = vec![
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"old plan"}}]}}"##,
             r##"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"great, now do something else"}]}}"##,
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"started working on the new thing"}]}}"##,
         ];
-        write_transcript(&tmp, "-tmp-repo", "sid-test", &lines.join("\n"));
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-test", &lines.join("\n"));
         let plan = latest_plan(
             &Engine::ClaudeCode,
             &std::path::PathBuf::from("/tmp/repo"),
@@ -634,15 +645,14 @@ mod tests {
     /// `count_messages` returns 2 — the correct turn count for the gate.
     #[test]
     fn gate_undercounts_when_thinking_only() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         let lines = [
             // Thinking-only assistant turn (real shape from Claude JSONL).
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"planning..."}]}}"##,
             // Text-only assistant turn.
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"here you go"}]}}"##,
         ];
-        write_transcript(&tmp, "-tmp-repo", "sid-x", &lines.join("\n"));
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-x", &lines.join("\n"));
         let wt = std::path::PathBuf::from("/tmp/repo");
 
         let text_count = list_messages(
@@ -664,10 +674,9 @@ mod tests {
     /// TUI uses actually fires.
     #[test]
     fn gate_fires_after_new_assistant_turn() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         let pre = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"pre-launch response"}]}}"##;
-        write_transcript(&tmp, "-tmp-repo", "sid-x", pre);
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-x", pre);
         let wt = std::path::PathBuf::from("/tmp/repo");
 
         // At launch: baseline = current count.
@@ -711,7 +720,7 @@ mod tests {
 
     #[test]
     fn claude_turn_complete_only_when_end_turn() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         // Two session files under the same HomeOverride — can't hold two
         // overrides at once (the guard mutex serializes them).
         let lines_busy = [
@@ -725,9 +734,8 @@ mod tests {
             r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}"##,
         ]
         .join("\n");
-        write_transcript(&tmp, "-tmp-repo", "sid-busy", &lines_busy);
-        write_transcript(&tmp, "-tmp-repo", "sid-done", &lines_done);
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-busy", &lines_busy);
+        write_transcript(_h.path(), "-tmp-repo", "sid-done", &lines_done);
         let wt = std::path::PathBuf::from("/tmp/repo");
         assert!(!role_turn_complete(&Engine::ClaudeCode, &wt, "sid-busy"));
         assert!(role_turn_complete(&Engine::ClaudeCode, &wt, "sid-done"));
@@ -741,15 +749,14 @@ mod tests {
     /// returns the user's first *real* prompt, not `/clear`.
     #[test]
     fn user_list_skips_meta_and_slash_command_records() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         let lines = [
             r##"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ..."}}"##,
             r##"{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-message>clear</command-message>"}}"##,
             r##"{"type":"user","message":{"role":"user","content":"real prompt from user"}}"##,
         ]
         .join("\n");
-        write_transcript(&tmp, "-tmp-repo", "sid-c", &lines);
-        let _h = HomeOverride::new(tmp);
+        write_transcript(_h.path(), "-tmp-repo", "sid-c", &lines);
         let msgs = list_messages(
             &Engine::ClaudeCode,
             &std::path::PathBuf::from("/tmp/repo"),
@@ -787,9 +794,10 @@ mod tests {
 
     /// Write a Codex JSONL rollout under the temp HOME for tests. First
     /// line is a session_meta carrying the requested `id`; subsequent
-    /// lines are appended verbatim (each on its own line).
-    fn write_codex_transcript(tmp: &tempfile::TempDir, sid: &str, body_lines: &[&str]) {
-        let dir = tmp.path().join(".codex/sessions/2026/01/15");
+    /// lines are appended verbatim (each on its own line). `home` is
+    /// the path returned by `HomeOverride::path()`.
+    fn write_codex_transcript(home: &std::path::Path, sid: &str, body_lines: &[&str]) {
+        let dir = home.join(".codex/sessions/2026/01/15");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{}.jsonl", sid));
         let mut content = format!(
@@ -812,16 +820,15 @@ mod tests {
     /// even if hypothetical orderings reverse.
     #[test]
     fn codex_last_message_returns_canonical_response_item() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         write_codex_transcript(
-            &tmp,
+            _h.path(),
             "sid-canon",
             &[
                 r##"{"type":"event_msg","payload":{"type":"agent_message","message":"the answer"}}"##,
                 r##"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"the answer"}]}}"##,
             ],
         );
-        let _h = HomeOverride::new(tmp);
         assert_eq!(
             codex_last_message("sid-canon").as_deref(),
             Some("the answer")
@@ -834,9 +841,9 @@ mod tests {
     /// return exactly 1 — counting both would be the off-by-one bug.
     #[test]
     fn count_messages_assistant_dedupes_mirrored_pair() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         write_codex_transcript(
-            &tmp,
+            _h.path(),
             "sid-dedupe",
             &[
                 r##"{"type":"event_msg","payload":{"type":"agent_message","message":"same text"}}"##,
@@ -844,7 +851,6 @@ mod tests {
                 r##"{"type":"event_msg","payload":{"type":"task_complete"}}"##,
             ],
         );
-        let _h = HomeOverride::new(tmp);
         let n = count_messages(
             &Engine::Codex,
             std::path::Path::new("/ignored-by-codex"),
@@ -859,9 +865,9 @@ mod tests {
     /// the canonical `response_item`.
     #[test]
     fn list_messages_assistant_dedupes_mirrored_pair() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         write_codex_transcript(
-            &tmp,
+            _h.path(),
             "sid-list-dedupe",
             &[
                 r##"{"type":"event_msg","payload":{"type":"agent_message","message":"reply one"}}"##,
@@ -870,7 +876,6 @@ mod tests {
                 r##"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"reply two"}]}}"##,
             ],
         );
-        let _h = HomeOverride::new(tmp);
         let msgs = list_messages(
             &Engine::Codex,
             std::path::Path::new("/ignored-by-codex"),
@@ -886,16 +891,15 @@ mod tests {
     /// User-kind extraction is unaffected by the change.
     #[test]
     fn list_messages_user_does_not_pick_up_agent_message() {
-        let tmp = tempfile::tempdir().unwrap();
+        let _h = HomeOverride::new();
         write_codex_transcript(
-            &tmp,
+            _h.path(),
             "sid-user",
             &[
                 r##"{"type":"event_msg","payload":{"type":"agent_message","message":"shouldnt-appear"}}"##,
                 r##"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"real user"}]}}"##,
             ],
         );
-        let _h = HomeOverride::new(tmp);
         let msgs = list_messages(
             &Engine::Codex,
             std::path::Path::new("/ignored-by-codex"),

@@ -16,8 +16,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use cm_daemon::manifest::SessionTombstone;
+
 use crate::agent;
-use crate::app::{App, SessionStatus, SessionTombstone, TerminalSession, Workspace};
+use crate::app::{App, SessionStatus, TerminalSession, Workspace};
 use crate::control::protocol::ErrorCode;
 
 /// Result of a method handler. `Err(ErrorCode, message)` produces an
@@ -697,8 +699,17 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
         ));
     }
     // Tombstone-then-drop. Mark the PTY exited so the drainer cleans up.
+    //
+    // Slice 10c-e-3b-fix6: daemon-attached sessions need an
+    // explicit `kill_session` RPC against the daemon BEFORE the
+    // local handle drops — `Session::Drop` for daemon-attached
+    // sessions is detach-only by design (slice 10c-e-3b-fix2),
+    // so without this MCP `kill_session` succeeds locally but
+    // leaves the daemon's PTY child running. The same helper
+    // the operator-driven `A-w` path uses.
     {
         let ws = &mut app.workspaces[wi];
+        crate::app::App::kill_daemon_session_if_attached(&ws.sessions[si]);
         App::tombstone_session_pub(ws, si);
         if let Some(ts) = ws.sessions.get_mut(si) {
             ts.session.exited = true;
@@ -873,7 +884,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     let parent_main_repo = app.workspaces[parent_wi].main_repo_path.clone();
 
     // Slug for the new task. Same encoding as `worktree::slugify`.
-    let leaf_slug = crate::worktree::slugify(&p.name);
+    let leaf_slug = cm_daemon::worktree::slugify(&p.name);
     if leaf_slug.is_empty() {
         return Err((
             ErrorCode::InvalidParams,
@@ -952,7 +963,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
         app.workspaces[parent_wi]
             .worktree_path
             .as_deref()
-            .and_then(crate::worktree::worktree_current_branch)
+            .and_then(cm_daemon::worktree::worktree_current_branch)
     });
     if p.worktree_mode == "branch" && parent_branch_resolved.is_none() {
         return Err((
@@ -1027,7 +1038,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             let branch_name = branch_name_for_new
                 .clone()
                 .expect("branch_name_for_new is Some in branch mode");
-            let worktree_path = match crate::worktree::create_subtask_worktree(
+            let worktree_path = match cm_daemon::worktree::create_subtask_worktree(
                 &main_repo,
                 &branch_name,
                 &parent_branch,
@@ -1049,7 +1060,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
                     ));
                 }
             };
-            crate::worktree::setup_worktree(&main_repo, &worktree_path);
+            cm_daemon::worktree::setup_worktree(&main_repo, &worktree_path);
 
             // Register a fresh workspace for this subtask.
             let new_ws_id = crate::app::new_workspace_id();
@@ -1144,7 +1155,7 @@ fn build_slug_chain(
         else {
             break;
         };
-        chain.push(crate::worktree::slugify(&task.name));
+        chain.push(cm_daemon::worktree::slugify(&task.name));
         cur = task.parent_task_id.clone();
     }
     chain.reverse();
@@ -1360,7 +1371,7 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     // failed and is being retried now).
     let mut worktree_removed = already_done;
     if let Some((wi, main, wt)) = cleanup_target {
-        match crate::worktree::remove_worktree(&main, &wt) {
+        match cm_daemon::worktree::remove_worktree(&main, &wt) {
             Ok(()) => {
                 // Only NOW clear the workspace-side path and mark
                 // closed. If we did this unconditionally, a later
@@ -1886,6 +1897,7 @@ mod tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 

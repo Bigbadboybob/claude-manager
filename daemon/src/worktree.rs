@@ -394,15 +394,15 @@ mod tests {
     use super::*;
 
     /// `recover_worktree_path` reads `$HOME` via the in-module `dirs`
-    /// helper. We MUST share the crate-wide HOME mutex
-    /// (`test_support::home_lock`) — a module-local mutex doesn't
-    /// serialize against other modules' HOME mutators (events,
-    /// agent, transcript, app, control), and Cargo runs them in
-    /// parallel. The reviewer caught a flaky
-    /// `workflow::events::tests::reads_new_events_incrementally`
-    /// failure caused by exactly that race.
+    /// helper. We MUST share the crate-wide env mutex
+    /// (`test_support::env_lock`) so HOME-mutating tests in this
+    /// module don't race against the env-var / umask tests in
+    /// `lib.rs`. A module-local mutex would only serialize
+    /// within-file. Reviewer caught the cross-module gap when this
+    /// crate first split out of the TUI; one mutex covers everything
+    /// that touches process-global state.
     fn with_home<F: FnOnce(&Path)>(f: F) {
-        let _g = crate::test_support::home_lock();
+        let _g = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

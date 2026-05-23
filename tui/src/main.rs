@@ -2,9 +2,12 @@ mod agent;
 mod agent_memory;
 mod api;
 mod app;
+mod attached_pty;
 mod backend;
+mod client_session;
 mod config;
 mod control;
+mod daemon_launch;
 mod input;
 mod mcp_config;
 mod memory_cap;
@@ -12,11 +15,13 @@ mod planning;
 mod preflight;
 mod session;
 mod session_watch;
+mod term_shim;
 mod terminal_widget;
 #[cfg(test)]
 mod test_support;
 mod workflow;
-mod worktree;
+// `worktree` relocated to the `cm-daemon` crate (slice 3 of
+// doc/persistent-host-daemon.md). Callers use `cm_daemon::worktree::*`.
 
 use std::io;
 use std::io::Write;
@@ -40,6 +45,29 @@ use config::Config;
 
 fn main() -> anyhow::Result<()> {
     let config = Config::load();
+
+    // Daemon auto-launch is gated on `CM_USE_DAEMON_SOCKET=1` (slice 11
+    // + slice 13 of doc/persistent-host-daemon.md). With the opt-in
+    // off (the current default), this is a no-op and the clean-home
+    // path is byte-identical to today. With the opt-in on, the daemon
+    // MUST come up — `mcp_config::build_env` also branches off the
+    // same flag and injects `CM_DAEMON_SOCKET` into spawned MCP
+    // agents, so a soft fallback would pin every agent to a dead
+    // socket. Loud opt-in, loud failure: log and exit non-zero so the
+    // user can see the problem and fix it instead of debugging
+    // confusing MCP errors downstream.
+    let daemon_socket = cm_daemon::default_socket_path();
+    if let Err(e) = daemon_launch::ensure_daemon_at_startup(&daemon_socket) {
+        eprintln!(
+            "cm-tui: CM_USE_DAEMON_SOCKET=1 set but cm-daemon could not be launched at {}: {}",
+            daemon_socket.display(),
+            e,
+        );
+        eprintln!(
+            "cm-tui: refusing to start with a broken daemon path. Either unset CM_USE_DAEMON_SOCKET or fix the daemon (build with `cargo build -p cm-daemon`, set CM_DAEMON_BINARY, check ~/.cm permissions)."
+        );
+        std::process::exit(1);
+    }
 
     // Setup terminal.
     enable_raw_mode()?;

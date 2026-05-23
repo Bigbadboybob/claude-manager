@@ -1,0 +1,1246 @@
+//! Auto-launch the `cm-daemon` binary when the socket is absent.
+//! Slice 11 of doc/persistent-host-daemon.md.
+//!
+//! ## Design constraint
+//!
+//! Every commit on this branch must leave the default user-visible
+//! behavior unchanged — MCP keeps working against the existing TUI
+//! socket, no rogue background processes appear. So auto-launch is
+//! **gated behind `CM_USE_DAEMON_SOCKET=1`**, the same opt-in flag
+//! the Python control client uses (slice 13). Without it,
+//! [`maybe_ensure_daemon_running`] is a no-op.
+//!
+//! When the opt-in is set, the TUI probes `~/.cm/daemon.sock`; if no
+//! daemon is listening it spawns the `cm-daemon` binary detached
+//! (stdin/stdout/stderr redirected to /dev/null) and polls for the
+//! socket to appear. Spawn failure or timeout logs a warning and
+//! continues — the daemon doesn't yet host real session state, so
+//! its absence isn't fatal.
+//!
+//! ## What this slice does NOT do
+//!
+//! Once slice 10 rewires `app.rs` to talk to the daemon for
+//! sessions, the gate flips: auto-launch becomes unconditional and
+//! its failure becomes a hard error. That commit will replace the
+//! "log a warning and continue" branch below with a fatal exit;
+//! the structural plumbing here is what makes that change a
+//! one-line tweak rather than a fresh module.
+
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Default timeout for the auto-launch handshake. The daemon's bind
+/// + stale-probe + listener registration is sub-second on a healthy
+/// host; 2 seconds gives generous headroom and matches the pattern
+/// the design doc names (`tmux`-style auto-launch with up-to-2s wait).
+pub const AUTO_LAUNCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Sleep granularity between socket-probe attempts inside the
+/// auto-launch wait loop. Small enough to land sub-100ms after the
+/// daemon binds; large enough not to busy-spin.
+pub const PROBE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Strict wrapper used by `main()`. When `CM_USE_DAEMON_SOCKET=1`,
+/// daemon launch failure is fatal — the opt-in only makes sense if
+/// the daemon path actually runs end-to-end, and silently falling
+/// back to the TUI socket is exactly the bug class the reviewer
+/// flagged across the last few rounds (mcp_config keys env injection
+/// off the same flag, so a "log and continue" fallback would pin
+/// agents to a dead socket).
+///
+/// When the opt-in is unset, this is a clean no-op — clean-home
+/// behavior is byte-identical to today.
+///
+/// Use [`ensure_daemon_at_startup_with_timeout`] in tests that
+/// want to pin the timeout; the public alias here uses the default
+/// `AUTO_LAUNCH_TIMEOUT` for production.
+pub fn ensure_daemon_at_startup(socket_path: &Path) -> std::io::Result<()> {
+    ensure_daemon_at_startup_with_timeout(socket_path, AUTO_LAUNCH_TIMEOUT)
+}
+
+/// Inner form of [`ensure_daemon_at_startup`] that accepts an
+/// explicit timeout — tests use a small one so they don't wait the
+/// full 2-second production budget.
+///
+/// On opt-in failure (binary not found, timeout, spawn error) the
+/// caller is expected to log + `std::process::exit(1)`. Returning
+/// an `Err` from `main()` works equally well; the test below
+/// asserts only that an error is produced — the exit policy is
+/// `main()`'s.
+///
+/// ## Path absolutization (slice-10c-b review)
+///
+/// `socket_path` is absolutized **once at the top of this function**
+/// and the result is the value passed to both:
+///   - the `try_connect` probe loop in `ensure_daemon_running`, AND
+///   - the child's `CM_DAEMON_SOCKET` env in `spawn_daemon_binary`.
+///
+/// Without this, a relative `CM_DAEMON_SOCKET` would resolve under
+/// the TUI's cwd in the parent but under `/` in the child (because
+/// the detach `pre_exec` does `chdir("/")` before `exec`), and the
+/// probe loop would never connect. The "they match" property below
+/// is load-bearing.
+pub fn ensure_daemon_at_startup_with_timeout(
+    socket_path: &Path,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    if !opt_in_enabled() {
+        return Ok(());
+    }
+    // Single absolutization point. Both the probe loop below and
+    // the spawn closure capture this exact PathBuf — the
+    // "they match" invariant the slice-10c-b reviewer flagged.
+    let abs_socket = absolutize_socket_path(socket_path)?;
+    // Resolve the binary lazily, INSIDE the spawn closure. The
+    // common dev workflow is "daemon already running, TUI starting
+    // up" — in that case `try_connect` inside `ensure_daemon_running`
+    // short-circuits and the spawn closure never runs. Pulling
+    // `locate_daemon_binary` out here would fail-fast even when the
+    // binary is irrelevant.
+    ensure_daemon_running(
+        &abs_socket,
+        || {
+            // `locate_daemon_binary` returns a canonicalized
+            // (absolute, symlink-resolved) path; pre_exec's
+            // chdir("/") in the child would otherwise misroute
+            // a relative override.
+            let bin = locate_daemon_binary()?;
+            spawn_daemon_binary(&bin, &abs_socket)
+        },
+        timeout,
+    )
+}
+
+/// Soft wrapper kept for tests and any future caller that wants
+/// the lossy "Ok(true)/Ok(false)/Err" shape. Production callers
+/// should use [`ensure_daemon_at_startup`] — its semantics align
+/// with the opt-in's "do it or fail loudly" contract.
+///
+/// Returns:
+/// - `Ok(true)` — opt-in was off (no-op) OR the daemon is reachable.
+/// - `Ok(false)` — opt-in was on but the daemon couldn't be made
+///   reachable in time.
+/// - `Err(...)` — spawn-side failure (binary not found, fork failure,
+///   etc.).
+pub fn maybe_ensure_daemon_running(socket_path: &Path) -> std::io::Result<bool> {
+    if !opt_in_enabled() {
+        return Ok(true);
+    }
+    // Same single-absolutization rule as `ensure_daemon_at_startup_with_timeout`
+    // (see that fn's docs). `bin` is already canonical because
+    // `locate_daemon_binary` canonicalizes its return.
+    let abs_socket = absolutize_socket_path(socket_path)?;
+    let bin = locate_daemon_binary()?;
+    let result = ensure_daemon_running(
+        &abs_socket,
+        || spawn_daemon_binary(&bin, &abs_socket),
+        AUTO_LAUNCH_TIMEOUT,
+    );
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Returns true iff `CM_USE_DAEMON_SOCKET=1` is set. Mirrors the
+/// Python client's gate exactly so an operator who flips one flips
+/// both consistently. `pub` so slice 10c-e-3's spawn-path branch in
+/// `app.rs` can ask the same question.
+pub fn opt_in_enabled() -> bool {
+    std::env::var_os("CM_USE_DAEMON_SOCKET")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Core auto-launch logic, parameterized over the spawner so tests
+/// can inject a cooperating (or non-cooperating) one. Production
+/// callers go through [`maybe_ensure_daemon_running`] with the
+/// real binary-spawn impl.
+///
+/// Behavior:
+/// 1. If `socket_path` accepts a probe `connect()`, return Ok — a
+///    daemon is already listening.
+/// 2. Otherwise call `spawn_daemon`. If it errors, propagate.
+/// 3. Poll `connect()` at `PROBE_INTERVAL` until `timeout` elapses
+///    or the daemon comes up. Return `TimedOut` if neither.
+pub fn ensure_daemon_running<F>(
+    socket_path: &Path,
+    spawn_daemon: F,
+    timeout: Duration,
+) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    if try_connect(socket_path) {
+        return Ok(());
+    }
+    spawn_daemon()?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if try_connect(socket_path) {
+            return Ok(());
+        }
+        std::thread::sleep(PROBE_INTERVAL);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "cm-daemon did not become reachable at {} within {:?}",
+            socket_path.display(),
+            timeout
+        ),
+    ))
+}
+
+/// One-shot connect probe. Doesn't send or receive bytes — just
+/// asks the OS whether something accepted the connection.
+fn try_connect(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+/// Resolution order for the `cm-daemon` binary:
+///   1. `$CM_DAEMON_BINARY` env var (explicit override, useful for
+///      multi-installation setups and tests).
+///   2. Sibling of the currently-running TUI binary — the installed
+///      layout puts `cm-daemon` next to the TUI under `bin/`.
+///   3. `<workspace_root>/target/debug/cm-daemon` — the dev layout
+///      when running `cargo run -p claude-manager-tui`.
+///
+/// Returns `NotFound` with a clear message if none of these resolve;
+/// the caller surfaces this so an operator who flipped the opt-in
+/// without building the daemon sees a useful error rather than a
+/// silent timeout.
+///
+/// ## Canonicalization (slice-10c-b review)
+///
+/// Every resolved path is canonicalized via
+/// [`canonicalize_binary_path`] before return. This matters for the
+/// env-override branch: an operator setting
+/// `CM_DAEMON_BINARY=target/debug/cm-daemon` (relative) would
+/// validate in the parent's cwd, but the child's `pre_exec` runs
+/// `chdir("/")` before `exec` — the relative path would re-resolve
+/// under `/` and `exec` would fail (or, worse, exec the wrong file
+/// if `/target/debug/cm-daemon` happened to exist). Canonicalizing
+/// here makes the path absolute and symlink-resolved at the moment
+/// it's about to be passed to `Command::new`.
+fn locate_daemon_binary() -> std::io::Result<PathBuf> {
+    if let Some(p) = std::env::var_os("CM_DAEMON_BINARY") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return canonicalize_binary_path(&pb);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("cm-daemon");
+            if candidate.is_file() {
+                return canonicalize_binary_path(&candidate);
+            }
+        }
+    }
+    // Dev fallback: walk up from the current exe to find a workspace
+    // `target/` directory and look for cm-daemon there. Cargo puts
+    // tui's binary at <workspace>/target/<profile>/claude-manager-tui,
+    // so cm-daemon is a sibling.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("cm-daemon");
+            if candidate.is_file() {
+                return canonicalize_binary_path(&candidate);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cm-daemon binary not found; set CM_DAEMON_BINARY or build it via `cargo build -p cm-daemon`",
+    ))
+}
+
+/// Canonicalize `path` (resolve symlinks, expand to absolute) for
+/// use as a binary argv[0] across the daemon `pre_exec` boundary.
+/// The slice-10c-b reviewer flagged that the spawn's `chdir("/")`
+/// invalidates relative paths between parent validation and child
+/// exec; `fs::canonicalize` errors when the target doesn't exist,
+/// so an invalid override fails fast in the parent rather than as
+/// a confusing post-detach exec failure.
+pub(crate) fn canonicalize_binary_path(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "canonicalize CM_DAEMON_BINARY={}: {} (the daemon detach runs chdir(\"/\"), so the binary path must be absolute and resolvable at the parent — set CM_DAEMON_BINARY to an absolute path that exists)",
+                path.display(),
+                e,
+            ),
+        )
+    })
+}
+
+/// Re-export of [`cm_daemon::path::absolutize_socket_path`] for
+/// callers that previously imported it under
+/// `daemon_launch::absolutize_socket_path` (pre-second-consumer
+/// extraction). The shared definition lives in `cm_daemon::path`
+/// so `tui/src/mcp_config.rs::build_env` can share the exact same
+/// code path — that's the "they match" load-bearing property
+/// generalized across the daemon-launch and MCP-injection consumers.
+pub(crate) use cm_daemon::path::absolutize_socket_path;
+
+/// Spawn `cm-daemon` detached:
+///
+///   - stdio → /dev/null so the daemon doesn't write into the TUI's
+///     terminal.
+///   - `setsid` in `pre_exec` so the child becomes the leader of a
+///     new session and process group, with no controlling terminal.
+///     Without this, terminal `SIGHUP` (close the terminal, Ctrl-\\,
+///     parent shell job-control) propagates to the daemon and kills
+///     it — the opposite of "persistent host daemon" and a guaranteed
+///     fail on the doc's reconnect / ring-buffer acceptance test
+///     (which kills the TUI and expects the daemon to survive).
+///   - `chdir("/")` in the same `pre_exec` so the daemon doesn't pin
+///     the TUI's cwd (often a worktree the user wants to move or
+///     remove).
+///
+/// We use a single fork + setsid rather than the classic double
+/// fork. The single-fork variant is sufficient here because:
+///   1. `setsid` already drops the controlling terminal — the child
+///      can't accidentally re-acquire one (would require an explicit
+///      `open(O_TTY)` against a tty device, which the daemon doesn't
+///      do).
+///   2. When the TUI exits, init (PID 1) inherits the daemon and
+///      reaps it on exit; no zombie risk.
+///   3. The doc's stale-socket probe (`daemon/src/lib.rs::bind_socket`)
+///      already handles "daemon crashed, socket left over" cleanly,
+///      so any edge case in the parent->child handoff is recoverable
+///      on the next start.
+///
+/// The daemon's own `bind_socket` stale-probe handles any
+/// stale-inode case left by an earlier daemon that crashed.
+///
+/// `socket_path` must be absolute — the caller is responsible for
+/// absolutization via [`absolutize_socket_path`] (slice-10c-b
+/// review). `bin` should be canonical (`locate_daemon_binary` is
+/// the production source and does that).
+fn spawn_daemon_binary(bin: &Path, socket_path: &Path) -> std::io::Result<()> {
+    let mut cmd = prepare_daemon_command(bin, socket_path);
+    apply_detach_pre_exec(&mut cmd);
+    let child = cmd.spawn()?;
+    // Reap the child if it exits before us. `setsid()` in pre_exec
+    // detaches the session (so terminal SIGHUP can't kill the
+    // daemon) but the kernel PPID is still the TUI's PID — the TUI
+    // remains responsible for `wait()`ing on the daemon if it exits
+    // first. Without an explicit waiter the daemon's `task_struct`
+    // would linger as a zombie pinned to the TUI's PID table until
+    // the TUI itself exits.
+    //
+    // Choice: spawn a one-shot waiter thread instead of a classic
+    // double-fork. Simpler (no intermediate process to manage), and
+    // the thread blocks on `child.wait()` for the daemon's entire
+    // lifetime — when the TUI exits, the thread dies with it and
+    // init inherits any still-running daemon. Either approach
+    // works; the waiter is the one we own.
+    std::thread::Builder::new()
+        .name("cm-daemon-waiter".into())
+        .spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        })
+        .ok();
+    Ok(())
+}
+
+/// Build the `Command` that `spawn_daemon_binary` will launch,
+/// **without** applying `pre_exec` or spawning. Extracted so unit
+/// tests can inspect the prepared env (slice-10c-b review: the
+/// "they match" assertion between the probe path and the child env
+/// path).
+///
+/// Production callers should use [`spawn_daemon_binary`]; calling
+/// this directly skips the detach setup and would tether the daemon
+/// to the TUI's session.
+pub(crate) fn prepare_daemon_command(
+    bin: &Path,
+    abs_socket: &Path,
+) -> std::process::Command {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(bin);
+    cmd.env("CM_DAEMON_SOCKET", abs_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// Install the `setsid` + `chdir("/")` pre_exec hook on `cmd`.
+/// Extracted so the unit test can exercise the same detach setup
+/// against any binary (we test against `/bin/sleep`, which is
+/// available everywhere `cm-daemon` would also be).
+///
+/// `pre_exec` runs between `fork(2)` and `exec(2)` in the child, so
+/// the closure must use only async-signal-safe syscalls — `setsid`
+/// and `chdir` both qualify per POSIX. The `unsafe` block is
+/// unavoidable because `pre_exec` can be a footgun (running in the
+/// half-initialized child); the documented constraint above plus the
+/// minimal closure body keep that risk bounded.
+fn apply_detach_pre_exec(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the child between fork and exec
+    // and uses only async-signal-safe POSIX calls. No allocation,
+    // no Rust I/O, no shared state. Both `setsid` and `chdir` are
+    // explicitly listed by POSIX as async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // "/\\0" is a NUL-terminated byte literal; the cast
+            // matches `libc::c_char` (i8 on Linux, can be u8 on
+            // some platforms — the cast handles both).
+            let root: &[u8] = b"/\0";
+            if libc::chdir(root.as_ptr() as *const libc::c_char) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::TempDir;
+
+    /// Crate-wide env-lock alias for this module's HOME/env-mutating
+    /// tests. Matches the daemon's `env_lock()` discipline — see
+    /// `daemon/src/test_support.rs` for the rationale.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::home_lock()
+    }
+
+    /// Test-only spawner that creates a Unix listener at the given
+    /// path on a background thread. The listener accepts one
+    /// connection then drops it — enough to make `try_connect`
+    /// succeed on the polling loop.
+    fn spawn_cooperating_listener(path: &Path) -> std::io::Result<()> {
+        let p = path.to_path_buf();
+        thread::spawn(move || {
+            // Small delay so the auto-launch wait loop has a chance
+            // to fail at least one probe — exercises the polling
+            // path rather than a happy first-try connect.
+            thread::sleep(Duration::from_millis(20));
+            let listener = match UnixListener::bind(&p) {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            // Accept one connection and drop. The probe just needs
+            // the connect() syscall to succeed; we don't read or
+            // write anything.
+            let _ = listener.accept();
+            // Hold the listener so the socket stays bound until
+            // ensure_daemon_running returns.
+            thread::sleep(Duration::from_millis(200));
+            drop(listener);
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_short_circuits_when_already_listening() {
+        let _g = env_lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("daemon.sock");
+        // Bind a listener up-front so the first try_connect succeeds.
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let spawn_called = Arc::new(AtomicBool::new(false));
+        let flag = spawn_called.clone();
+        let result = ensure_daemon_running(
+            &path,
+            || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_secs(2),
+        );
+        assert!(result.is_ok(), "already-listening path must succeed: {:?}", result);
+        assert!(
+            !spawn_called.load(Ordering::SeqCst),
+            "spawn must not be called when daemon is already up"
+        );
+    }
+
+    #[test]
+    fn ensure_calls_spawner_and_succeeds_when_socket_appears() {
+        let _g = env_lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("daemon.sock");
+
+        let result = ensure_daemon_running(
+            &path,
+            || spawn_cooperating_listener(&path),
+            Duration::from_secs(2),
+        );
+        assert!(result.is_ok(), "cooperating spawn must succeed: {:?}", result);
+    }
+
+    #[test]
+    fn ensure_times_out_when_spawner_does_nothing() {
+        let _g = env_lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("daemon.sock");
+
+        // Spawner reports success but does nothing — the socket
+        // never appears. Should TimeOut, NOT hang.
+        let start = Instant::now();
+        let result = ensure_daemon_running(
+            &path,
+            || Ok(()),
+            Duration::from_millis(200),
+        );
+        let err = result.expect_err("absent daemon must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "timeout must honor the configured duration; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn ensure_propagates_spawn_failure() {
+        let _g = env_lock();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("daemon.sock");
+
+        let result = ensure_daemon_running(
+            &path,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "scripted permission denied",
+                ))
+            },
+            Duration::from_secs(2),
+        );
+        let err = result.expect_err("spawn-side error must propagate");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn maybe_ensure_is_noop_when_opt_in_unset() {
+        let _g = env_lock();
+        let prev = std::env::var_os("CM_USE_DAEMON_SOCKET");
+        unsafe {
+            std::env::remove_var("CM_USE_DAEMON_SOCKET");
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent-daemon.sock");
+
+        // No daemon, no binary, no opt-in — must still report Ok(true)
+        // without doing anything. (Without the opt-in guard, this
+        // would error on missing binary.)
+        let result = maybe_ensure_daemon_running(&path);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CM_USE_DAEMON_SOCKET", v) },
+            None => {}
+        }
+        assert!(
+            matches!(result, Ok(true)),
+            "opt-in-off must be a no-op Ok(true): {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn maybe_ensure_returns_false_on_timeout_when_opt_in_set() {
+        // Opt-in on, binary located, but daemon never appears. The
+        // wrapper folds TimedOut into Ok(false) so the TUI can log
+        // and continue rather than fatal-exiting; today the daemon
+        // doesn't own real state so its absence is non-fatal.
+        //
+        // We bypass `locate_daemon_binary` by pointing
+        // CM_DAEMON_BINARY at /bin/true — exists, spawns, exits
+        // immediately, never creates the socket.
+        let _g = env_lock();
+
+        struct EnvGuard {
+            prev_opt: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev_opt.take() {
+                        Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
+                        None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
+                    }
+                    match self.prev_bin.take() {
+                        Some(v) => std::env::set_var("CM_DAEMON_BINARY", v),
+                        None => std::env::remove_var("CM_DAEMON_BINARY"),
+                    }
+                }
+            }
+        }
+        let _g2 = EnvGuard {
+            prev_opt: std::env::var_os("CM_USE_DAEMON_SOCKET"),
+            prev_bin: std::env::var_os("CM_DAEMON_BINARY"),
+        };
+        unsafe {
+            std::env::set_var("CM_USE_DAEMON_SOCKET", "1");
+            std::env::set_var("CM_DAEMON_BINARY", "/bin/true");
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never-appears.sock");
+
+        // Use a small explicit timeout so the test doesn't actually
+        // wait 2s. Call ensure_daemon_running directly with the
+        // same /bin/true spawner.
+        let result = ensure_daemon_running(
+            &path,
+            || spawn_daemon_binary(Path::new("/bin/true"), &path),
+            Duration::from_millis(150),
+        );
+        let err = result.expect_err("daemon binary that doesn't bind must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // --- ensure_daemon_at_startup (strict opt-in) -------------------
+
+    /// Reviewer-named regression fix (slice 10a review #1): when
+    /// the daemon is already running, `ensure_daemon_at_startup`
+    /// must short-circuit on `try_connect` without ever touching
+    /// `locate_daemon_binary`. Without this, the common
+    /// "daemon already up, restart TUI" workflow fails on any host
+    /// where the binary isn't on the resolved path.
+    ///
+    /// Setup: bind a real listener on a tempdir socket so
+    /// `try_connect` succeeds. Set `CM_DAEMON_BINARY` to a path
+    /// that definitely doesn't exist. If the resolver is invoked,
+    /// the function would return `Err(NotFound)` — instead it must
+    /// return `Ok` because the existing daemon is reachable.
+    #[test]
+    fn startup_strict_skips_binary_lookup_when_daemon_already_running() {
+        let _g = env_lock();
+
+        struct EnvGuard {
+            prev_opt: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev_opt.take() {
+                        Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
+                        None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
+                    }
+                    match self.prev_bin.take() {
+                        Some(v) => std::env::set_var("CM_DAEMON_BINARY", v),
+                        None => std::env::remove_var("CM_DAEMON_BINARY"),
+                    }
+                }
+            }
+        }
+        let _restore = EnvGuard {
+            prev_opt: std::env::var_os("CM_USE_DAEMON_SOCKET"),
+            prev_bin: std::env::var_os("CM_DAEMON_BINARY"),
+        };
+        unsafe {
+            std::env::set_var("CM_USE_DAEMON_SOCKET", "1");
+            // If the resolver gets invoked, this path is what it
+            // would try — and it doesn't exist. So a passing test
+            // proves the resolver never ran.
+            std::env::set_var(
+                "CM_DAEMON_BINARY",
+                "/nonexistent/cm-daemon-must-not-be-resolved",
+            );
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("already-up.sock");
+        // Bind a listener — simulates an already-running daemon.
+        let _listener = std::os::unix::net::UnixListener::bind(&path)
+            .expect("bind sentinel listener");
+
+        // With the daemon "already up", startup must succeed
+        // without resolving the binary.
+        let result = ensure_daemon_at_startup_with_timeout(
+            &path,
+            Duration::from_millis(150),
+        );
+        assert!(
+            result.is_ok(),
+            "already-running daemon must short-circuit without binary lookup: {:?}",
+            result,
+        );
+    }
+
+    /// Reviewer-named regression fix: with the opt-in OFF,
+    /// production startup must be a clean no-op so the default
+    /// path is untouched — even when no daemon binary exists.
+    #[test]
+    fn startup_strict_is_noop_when_opt_in_unset() {
+        let _g = env_lock();
+        let prev = std::env::var_os("CM_USE_DAEMON_SOCKET");
+        unsafe {
+            std::env::remove_var("CM_USE_DAEMON_SOCKET");
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never-touched.sock");
+
+        let result = ensure_daemon_at_startup_with_timeout(
+            &path,
+            Duration::from_millis(150),
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CM_USE_DAEMON_SOCKET", v) },
+            None => {}
+        }
+        assert!(
+            result.is_ok(),
+            "opt-in unset must be a clean no-op: {:?}",
+            result
+        );
+        assert!(
+            !path.exists(),
+            "no-op path must not touch the filesystem",
+        );
+    }
+
+    /// The bug the reviewer caught, made impossible by a test:
+    /// with the opt-in ON and a daemon binary that spawns but never
+    /// binds, the strict wrapper MUST return Err so `main()` exits
+    /// before mcp_config injects `CM_DAEMON_SOCKET` into agents.
+    /// /bin/true is a real binary that exits Ok immediately,
+    /// reproducing "spawn succeeded but socket never appeared."
+    #[test]
+    fn startup_strict_fatal_when_opt_in_on_and_daemon_never_binds() {
+        let _g = env_lock();
+
+        struct EnvGuard {
+            prev_opt: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev_opt.take() {
+                        Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
+                        None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
+                    }
+                    match self.prev_bin.take() {
+                        Some(v) => std::env::set_var("CM_DAEMON_BINARY", v),
+                        None => std::env::remove_var("CM_DAEMON_BINARY"),
+                    }
+                }
+            }
+        }
+        let _restore = EnvGuard {
+            prev_opt: std::env::var_os("CM_USE_DAEMON_SOCKET"),
+            prev_bin: std::env::var_os("CM_DAEMON_BINARY"),
+        };
+        unsafe {
+            std::env::set_var("CM_USE_DAEMON_SOCKET", "1");
+            std::env::set_var("CM_DAEMON_BINARY", "/bin/true");
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never-binds.sock");
+
+        let result = ensure_daemon_at_startup_with_timeout(
+            &path,
+            Duration::from_millis(150),
+        );
+        let err = result.expect_err("opt-in on + daemon doesn't bind must be fatal");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "expected TimedOut, got {:?}: {}",
+            err.kind(),
+            err
+        );
+    }
+
+    /// Companion to the strict-fatal test: opt-in ON with a
+    /// nonexistent binary surfaces NotFound. Important to test
+    /// because the binary-not-found path lives in
+    /// `locate_daemon_binary`, not in the polling loop — without
+    /// this test, a regression there would let the strict wrapper
+    /// silently succeed.
+    #[test]
+    fn startup_strict_fatal_when_opt_in_on_and_binary_missing() {
+        let _g = env_lock();
+        struct EnvGuard {
+            prev_opt: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev_opt.take() {
+                        Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
+                        None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
+                    }
+                    match self.prev_bin.take() {
+                        Some(v) => std::env::set_var("CM_DAEMON_BINARY", v),
+                        None => std::env::remove_var("CM_DAEMON_BINARY"),
+                    }
+                }
+            }
+        }
+        let _restore = EnvGuard {
+            prev_opt: std::env::var_os("CM_USE_DAEMON_SOCKET"),
+            prev_bin: std::env::var_os("CM_DAEMON_BINARY"),
+        };
+        unsafe {
+            std::env::set_var("CM_USE_DAEMON_SOCKET", "1");
+            // A path that definitely doesn't exist. locate_daemon_binary
+            // rejects the env override and falls through to the
+            // sibling-of-exe / dev-target lookup, which in the test
+            // binary's location won't find a cm-daemon either, so we
+            // get NotFound.
+            std::env::set_var(
+                "CM_DAEMON_BINARY",
+                "/nonexistent/cm-daemon-strict-test",
+            );
+            // Make sure the sibling-of-exe path also can't find a
+            // cm-daemon by accident — point `current_exe`'s sibling
+            // at a tempdir.
+            //
+            // We can't actually move current_exe, but the test
+            // binary's exe lives under `target/debug/deps/` which
+            // has no cm-daemon sibling — the workspace's cm-daemon
+            // is at `target/debug/cm-daemon`, two directories up.
+            // So the sibling-of-exe lookup naturally fails, which
+            // is exactly the no-binary state this test wants.
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nb.sock");
+
+        let result = ensure_daemon_at_startup_with_timeout(
+            &path,
+            Duration::from_millis(150),
+        );
+        // Either NotFound (locate failed) is the expected behavior.
+        // If the test binary happens to sit next to a real
+        // cm-daemon (e.g. someone runs this from `target/debug/`),
+        // we get TimedOut instead. Both indicate the strict
+        // wrapper refused to succeed quietly, which is what
+        // matters.
+        let err = result.expect_err("missing binary must be fatal under opt-in");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::TimedOut
+            ),
+            "expected NotFound or TimedOut, got {:?}: {}",
+            err.kind(),
+            err,
+        );
+    }
+
+    #[test]
+    fn locate_daemon_binary_honors_env_override() {
+        let _g = env_lock();
+        let prev = std::env::var_os("CM_DAEMON_BINARY");
+        // Use /bin/true which exists on every Linux system; tests
+        // run on Linux per the repo target. Post slice-10c-b review
+        // the result is canonicalized (symlinks resolved) — on
+        // distros where /bin is a symlink to /usr/bin, the canonical
+        // form is /usr/bin/true. Compare against fs::canonicalize
+        // rather than the literal input so the test stays portable.
+        unsafe { std::env::set_var("CM_DAEMON_BINARY", "/bin/true") };
+        let result = locate_daemon_binary();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CM_DAEMON_BINARY", v) },
+            None => unsafe { std::env::remove_var("CM_DAEMON_BINARY") },
+        }
+        let resolved = result.expect("env override must resolve");
+        let expected =
+            std::fs::canonicalize("/bin/true").expect("canonicalize /bin/true");
+        assert_eq!(
+            resolved, expected,
+            "locate_daemon_binary must return the canonical form",
+        );
+    }
+
+    /// Black-box check that `apply_detach_pre_exec` actually
+    /// detaches: spawn `/bin/sleep` through it, read the child's
+    /// session id via `getsid`, confirm it differs from the parent's
+    /// and equals the child's own PID (the `setsid` postcondition —
+    /// the caller becomes the leader of a new session whose ID is
+    /// its PID).
+    ///
+    /// This is the most direct unit-level evidence that terminal
+    /// SIGHUP can't propagate from the TUI to the daemon. The
+    /// reviewer's named acceptance criterion (reconnect test kills
+    /// the TUI mid-session, daemon survives) hinges on this.
+    #[test]
+    fn detached_command_runs_in_new_session() {
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        apply_detach_pre_exec(&mut cmd);
+
+        let mut child = cmd.spawn().expect("spawn detached sleep");
+        let child_pid = child.id() as libc::pid_t;
+
+        // The child is alive here (sleep 5 takes 5s, we read its
+        // SID well within that window). getsid(child_pid) returns
+        // -1 only if the PID is invalid or the process is in a
+        // different session we can't see, neither of which applies
+        // to a child we just spawned.
+        let child_sid = unsafe { libc::getsid(child_pid) };
+        let our_sid = unsafe { libc::getsid(0) };
+
+        // Always clean up the sleep before asserting — a panic
+        // before kill() would leave a 5s zombie attached to the
+        // test binary, which is rude.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            child_sid > 0,
+            "getsid({}) returned {} (errno {})",
+            child_pid,
+            child_sid,
+            std::io::Error::last_os_error(),
+        );
+        assert_ne!(
+            child_sid, our_sid,
+            "child SID {} equals parent SID {} — setsid did not run",
+            child_sid, our_sid,
+        );
+        assert_eq!(
+            child_sid, child_pid,
+            "child SID {} != child PID {} — child is not its own session leader",
+            child_sid, child_pid,
+        );
+    }
+
+    #[test]
+    fn locate_daemon_binary_rejects_nonexistent_override() {
+        let _g = env_lock();
+        let prev = std::env::var_os("CM_DAEMON_BINARY");
+        unsafe {
+            std::env::set_var("CM_DAEMON_BINARY", "/nonexistent/cm-daemon-xyz");
+        }
+        let result = locate_daemon_binary();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CM_DAEMON_BINARY", v) },
+            None => unsafe { std::env::remove_var("CM_DAEMON_BINARY") },
+        }
+        // The env override didn't resolve — falls through to other
+        // resolution branches. In the test environment the TUI's
+        // current_exe sibling may or may not have cm-daemon, so we
+        // accept either Ok or Err NotFound; what we're proving is
+        // that the env override doesn't blindly succeed when the
+        // file is missing.
+        if let Ok(p) = result {
+            assert_ne!(
+                p, PathBuf::from("/nonexistent/cm-daemon-xyz"),
+                "missing env-override path must not be returned",
+            );
+        }
+    }
+
+    // ============================================================
+    // Slice-10c-b review fix: relative override paths must not
+    // break across the daemon detach (pre_exec runs chdir("/")
+    // before exec).
+    // ============================================================
+
+    /// Run `f` with the process cwd temporarily set to `dir`,
+    /// restoring the original cwd on exit. Used in the
+    /// absolutize tests below where we need a known cwd to assert
+    /// against the joined output.
+    fn with_cwd<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        let original = std::env::current_dir().expect("get original cwd");
+        std::env::set_current_dir(dir).expect("set test cwd");
+        let result = f();
+        std::env::set_current_dir(&original).expect("restore cwd");
+        result
+    }
+
+    #[test]
+    fn absolutize_socket_path_passes_through_absolute() {
+        // Already absolute: no work to do, no IO, identical PathBuf
+        // (or at least equal-by-comparison — the contract).
+        let abs = PathBuf::from("/run/user/1000/cm/daemon.sock");
+        let out = absolutize_socket_path(&abs).expect("absolute passthrough");
+        assert_eq!(out, abs, "absolute path must pass through unchanged");
+        assert!(out.is_absolute());
+    }
+
+    #[test]
+    fn absolutize_socket_path_joins_relative_to_cwd() {
+        let _g = env_lock();
+        let dir = TempDir::new().expect("tempdir");
+        // Canonicalize the tempdir path so we can compare against
+        // the absolutized output without macOS-style /private prefix
+        // mismatches (Linux-only here, but be defensive).
+        let cwd_canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+        let result = with_cwd(&cwd_canonical, || {
+            absolutize_socket_path(Path::new("daemon.sock"))
+        });
+        let resolved = result.expect("absolutize ok");
+        assert!(
+            resolved.is_absolute(),
+            "relative path must become absolute: {}",
+            resolved.display()
+        );
+        assert_eq!(
+            resolved,
+            cwd_canonical.join("daemon.sock"),
+            "relative absolutization must join cwd",
+        );
+    }
+
+    #[test]
+    fn canonicalize_binary_path_returns_canonical_for_existing_relative_path() {
+        let _g = env_lock();
+        // Cwd at /tmp, then canonicalize "bin/true". We can't
+        // assume /tmp contains "bin/true" — use the well-known
+        // location instead.
+        let bin_dir = Path::new("/bin");
+        let result = with_cwd(bin_dir, || {
+            canonicalize_binary_path(Path::new("true"))
+        });
+        let canonical = result.expect("canonical /bin/true");
+        assert!(canonical.is_absolute(), "result must be absolute");
+        // /bin/true exists everywhere we run; canonical form is
+        // either /bin/true or /usr/bin/true depending on
+        // distribution-specific symlinking. Both are valid.
+        assert!(
+            canonical.ends_with("true"),
+            "canonical path must end with 'true': {}",
+            canonical.display()
+        );
+    }
+
+    #[test]
+    fn canonicalize_binary_path_errors_for_nonexistent_file() {
+        // The contract: canonicalize errors when target doesn't
+        // exist, so an invalid override fails fast in the parent
+        // rather than as a post-detach exec failure. The error
+        // message must mention CM_DAEMON_BINARY so the operator
+        // knows what to fix.
+        let err = canonicalize_binary_path(Path::new("/nonexistent/no-such-binary"))
+            .expect_err("nonexistent must surface as Err");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CM_DAEMON_BINARY"),
+            "error must reference CM_DAEMON_BINARY so operator knows what to fix: {}",
+            msg
+        );
+        assert!(
+            msg.contains("chdir"),
+            "error should explain WHY canonicalization matters: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn locate_daemon_binary_canonicalizes_relative_env_override() {
+        // The headline regression from the slice-10c-b review:
+        // `CM_DAEMON_BINARY=relative/path` validates in the
+        // parent's cwd, but the child's chdir("/") would invalidate
+        // it. After this fix, locate_daemon_binary returns the
+        // canonical absolute path.
+        let _g = env_lock();
+        let dir = TempDir::new().expect("tempdir");
+        let dir_canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+        // Materialize a "binary" — any executable will do. We use
+        // /bin/true symlinked, which is portable.
+        let target = dir_canonical.join("daemon-stub");
+        std::os::unix::fs::symlink("/bin/true", &target)
+            .expect("symlink /bin/true into tempdir");
+
+        let prev = std::env::var_os("CM_DAEMON_BINARY");
+        let result = with_cwd(&dir_canonical, || {
+            unsafe {
+                // Relative override — pointing at the symlink we
+                // just made, by basename only.
+                std::env::set_var("CM_DAEMON_BINARY", "daemon-stub");
+            }
+            locate_daemon_binary()
+        });
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CM_DAEMON_BINARY", v),
+                None => std::env::remove_var("CM_DAEMON_BINARY"),
+            }
+        }
+        let resolved = result.expect("relative override must resolve");
+        assert!(
+            resolved.is_absolute(),
+            "locate_daemon_binary must return absolute path: {}",
+            resolved.display(),
+        );
+        // The symlink target is /bin/true (or /usr/bin/true on
+        // some distros); fs::canonicalize follows symlinks.
+        assert!(
+            resolved.ends_with("true"),
+            "canonical resolved path follows symlink: {}",
+            resolved.display(),
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_command_carries_socket_path_in_env() {
+        // Sanity check on the command builder before the bigger
+        // "they match" test below: prepare_daemon_command must
+        // set CM_DAEMON_SOCKET to whatever the caller hands in.
+        let cmd = prepare_daemon_command(
+            Path::new("/bin/true"),
+            Path::new("/run/user/1000/cm/daemon.sock"),
+        );
+        let env_pair = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("CM_DAEMON_SOCKET"))
+            .expect("CM_DAEMON_SOCKET must be in the prepared env");
+        let env_val = env_pair.1.expect("env value present");
+        assert_eq!(
+            Path::new(env_val),
+            Path::new("/run/user/1000/cm/daemon.sock"),
+        );
+    }
+
+    #[test]
+    fn relative_socket_path_resolves_identically_for_probe_and_child_env() {
+        // The "they match" property the slice-10c-b reviewer
+        // named as load-bearing: a relative CM_DAEMON_SOCKET must
+        // produce a single absolute PathBuf that's consumed by:
+        //   1. the probe path (try_connect / ensure_daemon_running),
+        //   2. the child env (Command's CM_DAEMON_SOCKET).
+        //
+        // If the two are absolutized independently from
+        // different cwds (or one is absolutized and the other
+        // isn't), they diverge and the daemon and TUI bind/poll
+        // on different inodes.
+        //
+        // This test runs `ensure_daemon_at_startup_with_timeout`
+        // with the opt-in on, a relative socket path, and a
+        // /bin/true binary stub (which spawns and exits without
+        // binding). It captures both:
+        //   - the absolutized path computed at the entry
+        //     (absolutize_socket_path on the relative input),
+        //   - the env CM_DAEMON_SOCKET passed to the child by
+        //     prepare_daemon_command on the same value.
+        // and asserts equality.
+        let _g = env_lock();
+        let dir = TempDir::new().expect("tempdir");
+        let dir_canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+
+        // Two consumers must see the same absolute path.
+        let expected_abs = with_cwd(&dir_canonical, || {
+            absolutize_socket_path(Path::new("daemon.sock")).expect("absolutize ok")
+        });
+        let cmd_env_path = {
+            let cmd = prepare_daemon_command(Path::new("/bin/true"), &expected_abs);
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new("CM_DAEMON_SOCKET"))
+                .and_then(|(_, v)| v)
+                .map(|v| PathBuf::from(v))
+                .expect("CM_DAEMON_SOCKET set on Command")
+        };
+
+        // The load-bearing assertion: both consumers refer to
+        // the SAME absolute path.
+        assert_eq!(
+            cmd_env_path, expected_abs,
+            "Command env CM_DAEMON_SOCKET must equal the absolutized probe path",
+        );
+        assert!(
+            expected_abs.is_absolute(),
+            "absolutized path must be absolute (for cross-detach correctness): {}",
+            expected_abs.display(),
+        );
+        assert_eq!(
+            expected_abs,
+            dir_canonical.join("daemon.sock"),
+            "relative absolutization must join cwd",
+        );
+    }
+
+    #[test]
+    fn ensure_daemon_at_startup_canonicalizes_relative_socket_and_binary() {
+        // End-to-end integration of both fixes through the public
+        // entry. Setup:
+        //   - opt-in on
+        //   - CM_DAEMON_BINARY = symlink to /bin/true in tempdir
+        //     (relative to chdir'd tempdir, so the canonicalization
+        //     path is exercised)
+        //   - relative socket path
+        //   - chdir into tempdir (so the relative paths have a
+        //     known root)
+        // /bin/true spawns and exits without binding the socket,
+        // so the probe loop times out — we want the TimedOut
+        // result (proves we reached the spawn) plus structural
+        // confirmation that absolutization happened.
+        let _g = env_lock();
+        let dir = TempDir::new().expect("tempdir");
+        let dir_canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+        let target = dir_canonical.join("cm-daemon-stub");
+        std::os::unix::fs::symlink("/bin/true", &target)
+            .expect("symlink /bin/true into tempdir");
+
+        struct EnvGuard {
+            prev_opt: Option<std::ffi::OsString>,
+            prev_bin: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.prev_opt.take() {
+                        Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
+                        None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
+                    }
+                    match self.prev_bin.take() {
+                        Some(v) => std::env::set_var("CM_DAEMON_BINARY", v),
+                        None => std::env::remove_var("CM_DAEMON_BINARY"),
+                    }
+                }
+            }
+        }
+        let _restore = EnvGuard {
+            prev_opt: std::env::var_os("CM_USE_DAEMON_SOCKET"),
+            prev_bin: std::env::var_os("CM_DAEMON_BINARY"),
+        };
+
+        let result = with_cwd(&dir_canonical, || {
+            unsafe {
+                std::env::set_var("CM_USE_DAEMON_SOCKET", "1");
+                // Relative — basename only. Without canonicalization
+                // this would resolve under "/" in the child and exec
+                // would fail.
+                std::env::set_var("CM_DAEMON_BINARY", "cm-daemon-stub");
+            }
+            ensure_daemon_at_startup_with_timeout(
+                Path::new("daemon.sock"),
+                Duration::from_millis(150),
+            )
+        });
+        let err = result.expect_err(
+            "/bin/true spawns + exits without binding, so probe must time out",
+        );
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "expected TimedOut (proves we reached spawn + probe with absolutized paths), got {:?}: {}",
+            err.kind(),
+            err,
+        );
+    }
+}

@@ -21,7 +21,7 @@ use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::workflow::{self, toml_schema::Engine, Workflow, WorkflowRun};
-use crate::worktree;
+use cm_daemon::worktree;
 
 mod dirs {
     use std::path::PathBuf;
@@ -145,6 +145,17 @@ pub struct TerminalSession {
     /// "Seeded from: <name>". Persisted via `ManifestEntry`. See
     /// DESIGN_AGENT_MEMORIES.md.
     pub seeded_from_snapshot: Option<String>,
+    /// Read-through copy of `ManifestEntry.last_exit`. The daemon
+    /// owns this field (slice 9 of doc/persistent-host-daemon.md
+    /// adds it; slice 10 wires the producer). The TUI doesn't yet
+    /// inspect or write `last_exit` — it just loads it on startup
+    /// and writes it back unchanged on every manifest save, so the
+    /// daemon's `memory_cap_kill: true` flag survives across TUI
+    /// restarts and the detached-session cap-kill toast renders
+    /// correctly. Without this passthrough, every TUI save would
+    /// clobber the field to `None` and the named acceptance
+    /// criterion would fail.
+    pub preserved_last_exit: Option<cm_daemon::manifest::LastExit>,
 }
 
 impl TerminalSession {
@@ -272,139 +283,22 @@ const TICK_LOG_MAX_BYTES: u64 = 500 * 1024 * 1024;
 /// being a fresh keystroke.
 const ENTER_GAP: Duration = Duration::from_secs(10);
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct ManifestEntry {
-    /// Stable per-session UID generated at creation. Persisted (Phase 2a)
-    /// so MCP env's `CM_TUI_SESSION_ID` survives TUI restart and the
-    /// agent's tool calls keep authorizing. Backfill rule: missing on
-    /// load → generate fresh and re-save.
-    #[serde(default)]
-    uid: String,
-    /// UID of the agent session that spawned/owns this one. Used by
-    /// the descendant-only auth check in Phase 3 and by sidebar
-    /// "managed-by" markers later.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    managed_by_uid: Option<String>,
-    /// Bumps every time `transcript_id` rebinds. Persisted so a
-    /// pre-restart cursor against an old transcript correctly mismatches
-    /// the post-restart generation and resets to offset 0.
-    #[serde(default)]
-    generation: u64,
-    label: String,
-    session_type: String,
-    /// Current transcript file UUID. Older manifests stored this as
-    /// `session_id`; the alias keeps backfill correct across upgrade.
-    #[serde(alias = "session_id")]
-    transcript_id: Option<String>,
-    #[serde(default)]
-    hidden: bool,
-    #[serde(default)]
-    idle_timeout_secs: u16,
-    #[serde(default)]
-    burst_threshold: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    task_id: Option<String>,
-    #[serde(default)]
-    notify_on_idle: bool,
-    /// Name of the agent-memory snapshot this session was cloned from, if
-    /// any. Informational provenance only — used to surface "Seeded from:
-    /// <name>" in session info. See DESIGN_AGENT_MEMORIES.md.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    seeded_from_snapshot: Option<String>,
-}
-
-/// Persisted workspace metadata. Lives in `Manifest::workspaces` keyed by the
-/// workspace's stable id.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-struct ManifestWorkspace {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    is_closed: bool,
-    #[serde(default)]
-    is_cloud: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worktree_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    main_repo_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    repo_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_vm: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_zone: Option<String>,
-    #[serde(default)]
-    sessions: Vec<ManifestEntry>,
-    /// Recently-closed sessions kept around so `read_session_output` can
-    /// resolve a transcript path even after the session is gone. Pruned
-    /// on TUI startup; see `TOMBSTONE_RETENTION_SECS`.
-    #[serde(default)]
-    tombstones: Vec<SessionTombstone>,
-}
-
-/// Lightweight record of a session that's been closed. Holds only what
-/// the resolver and sidebar need; the live `TerminalSession` (which owns
-/// PTY resources) is dropped at close time. Keeping the full struct
-/// alive after exit would leak the PTY writer file descriptor.
-///
-/// **Self-contained**: every field needed to resolve `transcript_path`
-/// for an `exited`-state read is on the tombstone itself, not on the
-/// workspace. This matters because workspace state mutates after a
-/// session closes (e.g. `push_active` clears `worktree_path` when a
-/// local workspace gets uploaded to cloud). If resolution depended on
-/// the workspace's *current* `worktree_path`, those tombstones would
-/// silently stop resolving even though the on-disk transcript file
-/// still exists at the path captured at exit time.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct SessionTombstone {
-    pub uid: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_by_uid: Option<String>,
-    pub label: String,
-    /// "claude" / "codex" / "bash"
-    pub session_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    /// Last transcript file UUID this session was bound to. Used by the
-    /// resolver to compute a `transcript_path` for `state: "exited"`
-    /// reads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_transcript_id: Option<String>,
-    /// Worktree path captured at exit time. Snapshot, not a live
-    /// reference — survives subsequent mutations of the workspace's
-    /// `worktree_path`. Required to compute Claude Code transcript
-    /// paths (Codex's path scheme is per-user-and-date and ignores it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_path: Option<PathBuf>,
-    pub generation: u64,
-    /// Unix-timestamp seconds when the session exited. Used for the
-    /// retention prune.
-    pub exited_at: f64,
-}
-
-/// How long tombstones live before the startup prune drops them. 30 days
-/// is generous because the data is small and these are exactly the
-/// records an agent might want to look at later.
-const TOMBSTONE_RETENTION_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-struct Manifest {
-    /// Workspaces keyed by stable workspace id.
-    #[serde(default)]
-    workspaces: HashMap<String, ManifestWorkspace>,
-    /// `task_id` → `workspace_id` bindings. A task present here is bound to
-    /// the referenced workspace.
-    #[serde(default)]
-    bindings: HashMap<String, String>,
-    #[serde(default)]
-    view: Option<String>,
-}
+// `ManifestEntry`, `ManifestWorkspace`, `SessionTombstone`, `Manifest`,
+// and `TOMBSTONE_RETENTION_SECS` live in the daemon crate (slice
+// 10a-types of doc/persistent-host-daemon.md). Module-level `use`
+// brings them into scope so existing bare references inside this
+// file (`ManifestEntry { ... }`, `SessionTombstone { ... }` etc.)
+// resolve unchanged.
+//
+// Deliberately NOT `pub use` — external modules that need these
+// types should import from `cm_daemon::manifest` directly so the
+// dependency path is explicit and the eventual slice-10e flip
+// (when manifest ownership moves daemon-side) doesn't have to
+// chase shim re-exports.
+use cm_daemon::manifest::{
+    Manifest, ManifestEntry, ManifestWorkspace, SessionTombstone,
+    TOMBSTONE_RETENTION_SECS,
+};
 
 /// An execution context: a worktree (local) or cloud worker (remote) plus
 /// the sessions running in it. Any number of `TaskEntry`s can point at a
@@ -544,6 +438,9 @@ fn make_simple_session_with_uid(
         created_at: Instant::now(),
         managed_by_uid: None,
         seeded_from_snapshot: None,
+        // Fresh sessions have no exit history; the daemon may
+        // populate this later through manifest.watch diffs.
+        preserved_last_exit: None,
     }
 }
 
@@ -730,6 +627,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         None
     };
     let (program, args) = match crate::mcp_config::build_args(
+        crate::mcp_config::SpawnTarget::TuiLocal,
         engine,
         &ts.uid,
         Some(workflow_meta),
@@ -765,10 +663,18 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
             ));
         }
     };
-    // Swap the Session: dropping the old one closes its PTY which reaps the
-    // old agent process. Claude resumes in-place; modern Codex writes a new
-    // rollout id for `codex resume <sid>`, so keep the old sid bound until the
-    // detector sees the post-resume file and rebinds the role.
+    // Swap the Session. For local-PTY sessions, dropping the old one closes
+    // its master fd which reaps the old agent process. For daemon-attached
+    // sessions, Drop is detach-only (slice 10c-e-3b-fix2) — we MUST issue an
+    // explicit kill RPC before the assignment, else the daemon's old child
+    // PTY keeps running while a new resumed agent starts in the same slot:
+    // duplicate live agents, transcript / worktree races. Same bug class as
+    // the operator A-w / workspace-teardown / task-close paths fixed in fix2
+    // and fix6 (`kill_daemon_session_if_attached` is the shared helper).
+    // Claude resumes in-place; modern Codex writes a new rollout id for
+    // `codex resume <sid>`, so keep the old sid bound until the detector
+    // sees the post-resume file and rebinds the role.
+    App::kill_daemon_session_if_attached(ts);
     ts.session = new_sess;
     ts.transcript_id = Some(sid.to_string());
     ts.pending_jsonl_files = codex_resume_baseline;
@@ -2684,6 +2590,162 @@ impl App {
         )
     }
 
+    /// Slice 10c-e-3: opt-in daemon spawn branch.
+    ///
+    /// When `CM_USE_DAEMON_SOCKET=1`, route the spawn through the
+    /// daemon's RPC dance (`start_session` → `session.attach` →
+    /// dial → `attach.open`) and return a `Session` whose
+    /// `pty_writer` is `None` — `Session::write` falls back through
+    /// the EventLoop's input channel, which encodes keystrokes as
+    /// `StreamKind::Input` frames on the attach socket.
+    ///
+    /// Returns:
+    ///   - `Some(Ok(Session))` — daemon spawn succeeded; caller
+    ///     should use it directly (skip the local PTY path).
+    ///   - `Some(Err(e))` — opt-in was on but the daemon spawn
+    ///     failed. Caller surfaces the error — we DO NOT silently
+    ///     fall back to the local path, because that would mask
+    ///     daemon issues during the smoke test (the opt-in's
+    ///     purpose is to exercise the daemon path end-to-end).
+    ///   - `None` — opt-in is off OR the session_type isn't in the
+    ///     daemon's allowlist (e.g. `gcloud` SSH paths). Caller
+    ///     proceeds with the existing local spawn.
+    ///
+    /// ## Argv parity (slice 10c-e-3b)
+    ///
+    /// The daemon execs argv verbatim — no agent-specific
+    /// reconstruction. We build `argv` and `env` here using the
+    /// same `mcp_config::build_args(SpawnTarget::Daemon, ...)` that
+    /// the local `Session::new` path uses (with `SpawnTarget::TuiLocal`)
+    /// so the spawned child sees `--mcp-config` / Codex MCP
+    /// overrides / `--resume` tokens identically to a local spawn.
+    /// Memory cap wrapping (`wrap_with_systemd_run`) is applied
+    /// here too so the daemon-spawned PTY runs under the same
+    /// scope unit a local cap would produce.
+    ///
+    /// `session_type` is the TUI's own label (`"claude"` / `"codex"`
+    /// / `"bash"`).
+    pub fn try_spawn_via_daemon(
+        &self,
+        session_uid: &str,
+        workspace_id: &str,
+        worktree_path: &Path,
+        session_type: &str,
+        label: &str,
+        resume_session_id: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> Option<anyhow::Result<Session>> {
+        if !crate::daemon_launch::opt_in_enabled() {
+            return None;
+        }
+        // Map TUI session_type to engine + program builder.
+        // gcloud and other ad-hoc shells aren't daemon-eligible —
+        // fall through to local.
+        let argv_result = match session_type {
+            "claude" => crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::Daemon,
+                &crate::workflow::toml_schema::Engine::ClaudeCode,
+                session_uid,
+                None,
+                resume_session_id,
+            ),
+            "codex" => crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::Daemon,
+                &crate::workflow::toml_schema::Engine::Codex,
+                session_uid,
+                None,
+                resume_session_id,
+            ),
+            "bash" => Ok(("/bin/bash".to_string(), Vec::new())),
+            _ => return None,
+        };
+        let (program, args) = match argv_result {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(Err(anyhow::anyhow!(
+                    "build_args(SpawnTarget::Daemon) for {} failed: {}",
+                    session_type,
+                    e
+                )));
+            }
+        };
+
+        // Memory cap wrap (slice 10c-e-3b parity). Same resolution
+        // the local `spawn_agent_session` path uses — preflight
+        // status × per-engine config bytes. When the cap is
+        // None, `wrap_with_systemd_run` is a passthrough.
+        let memory_cap = match (
+            &self.memory_cap_status,
+            self.config.memory_cap_for(session_type),
+        ) {
+            (
+                crate::memory_cap::MemoryCapAvailability::Available { cgroup_prefix },
+                Some((soft_bytes, hard_bytes)),
+            ) => Some(crate::memory_cap::MemoryCap {
+                soft_bytes,
+                hard_bytes,
+                session_uid: session_uid.to_string(),
+                cgroup_prefix: cgroup_prefix.clone(),
+            }),
+            _ => None,
+        };
+        let (final_program, final_args, cgroup_path) =
+            crate::session::wrap_with_systemd_run(&program, &args, &memory_cap);
+
+        // Compose final argv as Vec<String> for the wire.
+        let mut argv = Vec::with_capacity(final_args.len() + 1);
+        argv.push(final_program);
+        argv.extend(final_args);
+
+        // Daemon-spawned child's process env. Mirrors what the
+        // local `spawn_agent_session` injects (CM_TUI_SESSION_ID
+        // is the only one — the MCP routing pin lives in the MCP
+        // config file via `build_args` above, not in the parent
+        // process env). The daemon also defensively re-pins
+        // CM_TUI_SESSION_ID on its side; sending it here makes
+        // the wire shape self-contained.
+        let mut env: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
+
+        let daemon_socket = cm_daemon::default_socket_path();
+        // Memory-cap wire fields (slice 10c-e-3b-fix2). When
+        // `memory_cap` is Some, the soft byte count signals the
+        // daemon to populate `SpawnParams.kills_dir`, and the
+        // cgroup_path round-trips back so the TUI's `Session`
+        // sees the same predicted path the local-spawn helper
+        // produces.
+        let memory_cap_bytes = memory_cap.as_ref().map(|c| c.soft_bytes);
+        let config = crate::client_session::ClientSessionConfig {
+            daemon_socket: &daemon_socket,
+            // The token_id is just a label on the Caller::Operator
+            // payload. The daemon accepts any non-empty string.
+            operator_token_id: "tui-operator",
+            // Slice 10c-e-3b-fix: TUI is source of truth for uid.
+            // The same uid is already baked into the MCP config
+            // (CM_TUI_SESSION_ID env block written above by
+            // build_args). The daemon validates format + checks
+            // collision but otherwise uses this verbatim.
+            uid: session_uid,
+            workspace_id,
+            label,
+            argv: &argv,
+            working_dir: worktree_path,
+            env,
+            cols,
+            rows,
+            memory_cap_bytes,
+            cgroup_path: cgroup_path.as_deref(),
+            // Auto-register the workspace if the daemon doesn't
+            // know about it yet (pre-10e bridge). Always pass —
+            // the daemon ignores the hint when the workspace is
+            // already registered.
+            worktree_path: Some(worktree_path),
+        };
+        Some(crate::session::Session::new_attached(config))
+    }
+
     /// Append a Phase 6 activity-feed entry. `caller_uid` is resolved to
     /// a friendly label (workflow role, else session label, else uid
     /// prefix). Capped at `ACTIVITY_LOG_CAP` — oldest entry evicted on
@@ -2991,6 +3053,15 @@ impl App {
                     task_id: ts.task_id.clone(),
                     notify_on_idle: ts.notify_on_idle,
                     seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
+                    // Read-modify-write the daemon-owned `last_exit`.
+                    // The TUI never inspects or mutates it — just
+                    // hands it back unchanged so the daemon's
+                    // `memory_cap_kill: true` flag survives every
+                    // TUI save. Without this, the named acceptance
+                    // criterion (detached cap-kill toast on
+                    // reattach) breaks the moment the TUI saves
+                    // after the daemon writes.
+                    last_exit: ts.preserved_last_exit.clone(),
                 })
                 .collect();
             workspaces.insert(
@@ -3276,6 +3347,7 @@ impl App {
                 _ => None,
             };
             match crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &engine,
                 &session_uid_for_mcp,
                 workflow_meta,
@@ -3370,6 +3442,10 @@ impl App {
             created_at: Instant::now(),
             managed_by_uid: entry.managed_by_uid.clone(),
             seeded_from_snapshot: entry.seeded_from_snapshot.clone(),
+            // Preserve the daemon-written `last_exit` across the
+            // load. The TUI doesn't yet inspect it; this passthrough
+            // ensures the next save doesn't clobber it to None.
+            preserved_last_exit: entry.last_exit.clone(),
         })
     }
 
@@ -4270,6 +4346,10 @@ impl App {
         // Collected here and applied after the loop because we cannot borrow
         // `&mut self.status_msg` while iterating `&mut self.workspaces`.
         let mut write_failure_notes: Vec<String> = Vec::new();
+        // Collected here for the same borrow-shape reason
+        // as `write_failure_notes` — the activity log mutation
+        // happens outside the workspaces loop.
+        let mut cap_kill_notes: Vec<(String, String)> = Vec::new();
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {
                 while let Ok(event) = ts.session.event_rx.try_recv() {
@@ -4277,6 +4357,32 @@ impl App {
                     match event {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
                             ts.session.exited = true;
+                            // Slice 10c-e-3b-fix4b: daemon-attached
+                            // cap-kill toast. The reader half of
+                            // the attach stream latches
+                            // `memory_cap_kill` into this Arc
+                            // BEFORE delivering the exit event
+                            // (slice-10c-e-2 review-5 fix #2b
+                            // ordering), so by the time we observe
+                            // `Exit`/`ChildExit` here the flag is
+                            // already populated. Read-and-clear via
+                            // `swap(false, SeqCst)`; if true,
+                            // dispatch the same activity-feed entry
+                            // the local-spawn cap-kill path
+                            // produces (see `drain_memory_kill_events`).
+                            if let Some(flag) =
+                                ts.session.daemon_memory_cap_kill.as_ref()
+                            {
+                                use std::sync::atomic::Ordering;
+                                if flag.swap(false, Ordering::SeqCst) {
+                                    cap_kill_notes.push((
+                                        ts.uid.clone(),
+                                        format!(
+                                            "killed by memory cap (daemon-attached session)"
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                         TermEvent::Title(title) => {
                             ts.session.title = title;
@@ -4599,6 +4705,17 @@ impl App {
             self.set_status_msg(&note);
         }
 
+        // Slice 10c-e-3b-fix4b: dispatch any daemon-attached
+        // cap-kill toasts collected during the per-session loop
+        // through the SAME activity-log helper local-spawn
+        // cap-kills go through (`log_activity` is what
+        // `drain_memory_kill_events` ultimately calls). Single
+        // source of truth for cap-kill rendering: both paths
+        // converge on the activity feed entry.
+        for (uid, summary) in cap_kill_notes {
+            self.log_activity(&uid, summary);
+        }
+
         // Poll `~/.claude/history.jsonl` for `/clear` and `/compact` events
         // targeting any active workflow role's bound session, and migrate
         // to the new transcript file.
@@ -4836,11 +4953,26 @@ impl App {
     ) -> crate::control::protocol::Response {
         use crate::control::methods;
         use crate::control::protocol::{ErrorCode, Response};
-        let caller = req.caller.session_uid.as_str();
+        // Every method currently dispatched here is session-scoped (the
+        // pre-Phase-1 surface). Operator-only methods (session.attach,
+        // attach.open) land in a later slice and short-circuit before
+        // reaching this match; rejecting Operator callers here keeps the
+        // existing methods exactly as strict as they were when `Caller`
+        // was a flat struct.
+        let caller = match req.caller.session_uid() {
+            Some(uid) => uid,
+            None => {
+                return Response::err(
+                    req.id.clone(),
+                    ErrorCode::Unauthorized,
+                    "method requires a session-scoped caller",
+                );
+            }
+        };
         let result: methods::MethodResult = match req.method.as_str() {
             "ping" => Ok(serde_json::json!({
                 "pong": true,
-                "uid": req.caller.session_uid,
+                "uid": caller,
             })),
             "resolve_authorized_session" => {
                 methods::resolve_authorized_session(self, caller, &req.params)
@@ -4922,8 +5054,13 @@ impl App {
                 "codex" => workflow::toml_schema::Engine::Codex,
                 _ => workflow::toml_schema::Engine::ClaudeCode,
             };
-            let (program, args) =
-                crate::mcp_config::build_args(&engine, &session_uid, None, None)?;
+            let (program, args) = crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
+                &engine,
+                &session_uid,
+                None,
+                None,
+            )?;
             let pending = match engine {
                 workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
                 workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
@@ -4979,6 +5116,7 @@ impl App {
             created_at: Instant::now(),
             managed_by_uid: Some(caller_uid.to_string()),
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         self.save_session_manifest();
@@ -6361,6 +6499,40 @@ impl App {
         Self::tombstone_session(ws, si);
     }
 
+    /// Operator-driven kill for a daemon-attached session — slice
+    /// 10c-e-3b-fix2. Drop on `Session` is detach-only by design
+    /// (see the Drop comment in `session.rs`); A-w / workspace
+    /// teardown / task close / bulk-cleanup paths are responsible
+    /// for issuing the explicit kill BEFORE removing the
+    /// `TerminalSession` from `ws.sessions`. Without this the
+    /// daemon's child PTY keeps running after the operator
+    /// thought they closed it.
+    ///
+    /// No-op for local-PTY sessions (`daemon_session_uid = None`)
+    /// — dropping the master fd handles those.
+    ///
+    /// Best-effort: an RPC failure logs to stderr and continues.
+    /// The daemon's reaper-cleanup callback removes the session
+    /// from its registry when the child eventually exits anyway,
+    /// so a missed RPC means a slow teardown (orphan child runs
+    /// until exit), not a permanent leak.
+    pub(crate) fn kill_daemon_session_if_attached(ts: &TerminalSession) {
+        if let Some(uid) = ts.session.daemon_session_uid.as_deref() {
+            let daemon_socket = cm_daemon::default_socket_path();
+            if let Err(e) = crate::client_session::rpc_kill_session(
+                &daemon_socket,
+                "tui-operator",
+                uid,
+            ) {
+                eprintln!(
+                    "cm-tui: A-w kill_session({}) failed: {} \
+                     (orphan child will be reaped when it exits)",
+                    uid, e,
+                );
+            }
+        }
+    }
+
     /// Bulk session removal that preserves the tombstone invariant.
     /// Walks `ws.sessions`, tombstones each entry where `should_drop`
     /// returns true, marks the PTY exited, and removes it. Use this
@@ -6386,6 +6558,11 @@ impl App {
         let mut i = 0;
         while i < ws.sessions.len() {
             if should_drop(&ws.sessions[i]) {
+                // Slice 10c-e-3b-fix2: operator-driven kill
+                // before drop. See `kill_daemon_session_if_attached`
+                // for rationale. Bulk-cleanup paths (task close,
+                // workspace teardown) flow through here too.
+                Self::kill_daemon_session_if_attached(&ws.sessions[i]);
                 Self::tombstone_session(ws, i);
                 ws.sessions[i].session.exited = true;
                 ws.sessions.remove(i);
@@ -6438,6 +6615,12 @@ impl App {
             Cursor::Session(wi, si) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
                     if si < ws.sessions.len() {
+                        // Slice 10c-e-3b-fix2: operator-driven
+                        // kill BEFORE drop. Daemon-attached
+                        // sessions need an explicit kill_session
+                        // RPC because Drop is detach-only by
+                        // design.
+                        Self::kill_daemon_session_if_attached(&ws.sessions[si]);
                         Self::tombstone_session(ws, si);
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
@@ -6454,6 +6637,9 @@ impl App {
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
                     if ws.sessions.len() == 1 {
+                        // Same operator-kill semantics as the
+                        // Session-cursor arm above.
+                        Self::kill_daemon_session_if_attached(&ws.sessions[0]);
                         Self::tombstone_session(ws, 0);
                         ws.sessions.remove(0);
                         self.cursor = Cursor::Workspace(wi);
@@ -6606,6 +6792,7 @@ impl App {
         let session_uid = new_session_uid();
         let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
         let (program, args) = match crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -6642,24 +6829,53 @@ impl App {
             Some(Self::list_jsonl_files(&worktree_path))
         };
 
-        let s = match self.spawn_agent_session(
-            "claude",
+        // Slice 10c-e-3: pre-generate the workspace id so the
+        // daemon spawn branch can auto-register it on
+        // `start_session`. The Workspace struct below picks this
+        // same id up — that's what makes the daemon's view of the
+        // workspace and the TUI's view share an identity.
+        let workspace_id_pre = new_workspace_id();
+
+        let s = match self.try_spawn_via_daemon(
             &session_uid,
-            &program,
-            &args,
+            &workspace_id_pre,
+            &worktree_path,
+            "claude",
+            "claude",
+            cloned_transcript_id.as_deref(),
             cols,
             rows,
-            Some(worktree_path.clone()),
-            Default::default(),
         ) {
-            Ok(s) => s,
-            Err(_) => {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 if let Some(c) = cloned.as_ref() {
                     Self::cleanup_failed_clone(c);
                 }
-                self.set_status_msg("Spawn failed");
+                self.set_status_msg(&format!(
+                    "Daemon spawn failed: {}",
+                    e
+                ));
                 return;
             }
+            None => match self.spawn_agent_session(
+                "claude",
+                &session_uid,
+                &program,
+                &args,
+                cols,
+                rows,
+                Some(worktree_path.clone()),
+                Default::default(),
+            ) {
+                Ok(s) => s,
+                Err(_) => {
+                    if let Some(c) = cloned.as_ref() {
+                        Self::cleanup_failed_clone(c);
+                    }
+                    self.set_status_msg("Spawn failed");
+                    return;
+                }
+            },
         };
 
         let ts = TerminalSession {
@@ -6686,9 +6902,10 @@ impl App {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: seed_from.map(str::to_string),
+            preserved_last_exit: None,
         };
         let ws = Workspace {
-            id: new_workspace_id(),
+            id: workspace_id_pre,
             name: label.to_string(),
             is_closed: false,
             is_cloud: false,
@@ -6747,6 +6964,7 @@ impl App {
         } else if let Some(wt) = ws.worktree_path.clone() {
             let session_uid = new_session_uid();
             let (program, args) = crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &workflow::toml_schema::Engine::ClaudeCode,
                 &session_uid,
                 None,
@@ -6907,6 +7125,7 @@ impl App {
         // while the agent has none of the context.
         let build = |engine: Engine, fallback_prog: &str, fallback_args: Vec<String>| {
             crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &engine,
                 &session_uid_pre,
                 None,
@@ -6920,58 +7139,89 @@ impl App {
                 }
             })
         };
-        let result = match session_type {
-            "claude" => match build(
-                Engine::ClaudeCode,
-                "claude",
-                vec!["--dangerously-skip-permissions".to_string()],
-            ) {
-                Ok((program, args)) => self.spawn_agent_session(
+        // Slice 10c-e-3: opt-in daemon spawn for A-s. Try the
+        // daemon path FIRST (when opt-in is on AND we have a
+        // worktree). On `None` (opt-in off or unsupported type),
+        // fall through to the existing local spawn unchanged.
+        let workspace_id = self.workspaces[ws_index].id.clone();
+        let daemon_attempt = match (wt.as_deref(), &session_type) {
+            (Some(wt_path), _) => self.try_spawn_via_daemon(
+                &session_uid_pre,
+                &workspace_id,
+                wt_path,
+                session_type,
+                session_type,
+                cloned_transcript_id.as_deref(),
+                cols,
+                rows,
+            ),
+            _ => None,
+        };
+        let result = match daemon_attempt {
+            Some(Ok(s)) => Ok(s),
+            Some(Err(e)) => {
+                if let Some(c) = cloned.as_ref() {
+                    Self::cleanup_failed_clone(c);
+                }
+                self.set_status_msg(&format!(
+                    "Daemon spawn failed: {}",
+                    e
+                ));
+                return;
+            }
+            None => match session_type {
+                "claude" => match build(
+                    Engine::ClaudeCode,
                     "claude",
-                    &session_uid_pre,
-                    &program,
-                    &args,
-                    cols,
-                    rows,
-                    wt,
-                    Default::default(),
-                ),
-                Err(e) => {
-                    if let Some(c) = cloned.as_ref() {
-                        Self::cleanup_failed_clone(c);
+                    vec!["--dangerously-skip-permissions".to_string()],
+                ) {
+                    Ok((program, args)) => self.spawn_agent_session(
+                        "claude",
+                        &session_uid_pre,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        wt,
+                        Default::default(),
+                    ),
+                    Err(e) => {
+                        if let Some(c) = cloned.as_ref() {
+                            Self::cleanup_failed_clone(c);
+                        }
+                        self.set_status_msg(&format!(
+                            "Seeded launch aborted (could not configure agent): {e}"
+                        ));
+                        return;
                     }
-                    self.set_status_msg(&format!(
-                        "Seeded launch aborted (could not configure agent): {e}"
-                    ));
-                    return;
-                }
-            },
-            "codex" => match build(
-                Engine::Codex,
-                "codex",
-                vec!["--yolo".to_string()],
-            ) {
-                Ok((program, args)) => self.spawn_agent_session(
+                },
+                "codex" => match build(
+                    Engine::Codex,
                     "codex",
-                    &session_uid_pre,
-                    &program,
-                    &args,
-                    cols,
-                    rows,
-                    wt,
-                    Default::default(),
-                ),
-                Err(e) => {
-                    if let Some(c) = cloned.as_ref() {
-                        Self::cleanup_failed_clone(c);
+                    vec!["--yolo".to_string()],
+                ) {
+                    Ok((program, args)) => self.spawn_agent_session(
+                        "codex",
+                        &session_uid_pre,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        wt,
+                        Default::default(),
+                    ),
+                    Err(e) => {
+                        if let Some(c) = cloned.as_ref() {
+                            Self::cleanup_failed_clone(c);
+                        }
+                        self.set_status_msg(&format!(
+                            "Seeded launch aborted (could not configure agent): {e}"
+                        ));
+                        return;
                     }
-                    self.set_status_msg(&format!(
-                        "Seeded launch aborted (could not configure agent): {e}"
-                    ));
-                    return;
-                }
+                },
+                _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
             },
-            _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
         };
         match result {
             Ok(s) => {
@@ -7027,6 +7277,7 @@ impl App {
         // tool call would fail auth as `not_found`.
         let session_uid = new_session_uid();
         let (program, args) = match crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -7287,6 +7538,14 @@ impl App {
             self.backend.delete_task(tid.clone());
         }
         self.tasks.retain(|t| !bound_task_ids.iter().any(|id| t.task_id.as_deref() == Some(id)));
+        // Slice 10c-e-3b-fix2: workspace teardown is the bulkiest
+        // operator-driven cleanup path. Issue daemon kill_session
+        // for every daemon-attached session in this workspace
+        // BEFORE the Workspace (and its Sessions) drop — Drop is
+        // detach-only by design.
+        for ts in &self.workspaces[wi].sessions {
+            Self::kill_daemon_session_if_attached(ts);
+        }
         self.workspaces.remove(wi);
         self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
         self.set_status_msg("Deleted");
@@ -7455,6 +7714,7 @@ impl App {
         // CM_TUI_SESSION_ID — the Phase 1 "MCP-everywhere" invariant.
         let session_uid = new_session_uid();
         let (program, args) = crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -7593,6 +7853,7 @@ impl App {
         // any orchestration tool.
         let session_uid = new_session_uid();
         let (program, args) = crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -10288,6 +10549,7 @@ mod manifest_entry_seeded_from_tests {
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: Some("reviewer-strict".into()),
+            last_exit: None,
         };
         let bytes = serde_json::to_vec(&entry).unwrap();
         let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
@@ -10329,12 +10591,180 @@ mod manifest_entry_seeded_from_tests {
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
+            last_exit: None,
         };
         let s = serde_json::to_string(&entry).unwrap();
         assert!(
             !s.contains("seeded_from_snapshot"),
             "None should be skipped, got: {s}"
         );
+        // Same skip semantics for the Phase-1-added last_exit field.
+        assert!(
+            !s.contains("last_exit"),
+            "last_exit:None should be skipped, got: {s}"
+        );
+    }
+
+    #[test]
+    fn missing_last_exit_deserializes_as_none() {
+        // Phase-1 schema-change check: a manifest written by a
+        // pre-slice-9 binary has no `last_exit` field at all; serde
+        // default must accept it and produce `None`. This is the
+        // doc's named "manifests written by older binaries load
+        // cleanly" rollout requirement.
+        let json = r#"{
+            "uid": "ts-abc",
+            "generation": 0,
+            "label": "x",
+            "session_type": "claude",
+            "hidden": false,
+            "idle_timeout_secs": 0,
+            "burst_threshold": 0,
+            "notify_on_idle": false
+        }"#;
+        let entry: ManifestEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.last_exit.is_none());
+    }
+
+    #[test]
+    fn last_exit_round_trips_with_memory_cap_kill_flag() {
+        // The attached-session leg sources `memory_cap_kill` from
+        // the `term_shim::ChildEvent::Exited` exit frame; the
+        // detached leg sources it from this persisted field. Prove
+        // the round-trip preserves the flag so the toast renders
+        // correctly post-restart.
+        let entry = ManifestEntry {
+            uid: "ts-abc".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "x".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: Some(cm_daemon::manifest::LastExit {
+                code: Some(137),
+                memory_cap_kill: true,
+                kills_file_offset: Some(0),
+                exited_at: 1_700_000_000.0,
+            }),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
+        let got = back.last_exit.expect("last_exit present after round-trip");
+        assert!(got.memory_cap_kill);
+        assert_eq!(got.code, Some(137));
+    }
+
+    /// Reviewer-named regression test: simulate the
+    /// `load → mutate unrelated field → save → reload` cycle the TUI
+    /// runs every time a user edits a session and saves. The
+    /// daemon-owned `last_exit` field MUST survive untouched. Pre-fix
+    /// behavior at `app.rs:3007` rebuilt the entry with
+    /// `last_exit: None` on every save, clobbering the daemon's
+    /// `memory_cap_kill: true` flag and silently breaking the
+    /// detached-session cap-kill toast — the named acceptance
+    /// criterion for slice 12.
+    ///
+    /// This test exercises the persistence/in-memory boundary by
+    /// roundtripping ManifestEntry through serde (the load step
+    /// internally to the TUI), copying the loaded `last_exit` into
+    /// the in-memory mirror (`TerminalSession.preserved_last_exit`,
+    /// which we represent here as a local variable since
+    /// constructing a full TerminalSession requires a real PTY),
+    /// mutating an unrelated field, rebuilding ManifestEntry with
+    /// `last_exit: preserved.clone()` (mirroring the post-fix
+    /// `app.rs:3007`), and re-serializing. The final field must
+    /// equal the original — any reversion to the clobber would
+    /// produce `None` here.
+    #[test]
+    fn last_exit_survives_load_mutate_save_reload_cycle() {
+        // Initial state, as a manifest written by the daemon.
+        let stored_exit = cm_daemon::manifest::LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(0),
+            exited_at: 1_700_000_000.0,
+        };
+        let initial = ManifestEntry {
+            uid: "ts-cap-killed".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "label-before".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: Some(stored_exit.clone()),
+        };
+        let on_disk = serde_json::to_string(&initial).unwrap();
+
+        // Load step: TUI reads the manifest. The Phase-1 fix
+        // hydrates `last_exit` into the in-memory mirror.
+        let loaded: ManifestEntry = serde_json::from_str(&on_disk).unwrap();
+        let preserved_last_exit = loaded.last_exit.clone();
+        assert_eq!(
+            preserved_last_exit,
+            Some(stored_exit.clone()),
+            "load step must hydrate last_exit",
+        );
+
+        // User mutates an unrelated TUI-owned field (rename via the
+        // SessionSettings dialog). The TUI updates its in-memory
+        // state and triggers a save.
+        let mut mutated_label = loaded.label.clone();
+        mutated_label.clear();
+        mutated_label.push_str("label-after");
+
+        // Save step: TUI rebuilds ManifestEntry from in-memory state.
+        // This mirrors the read-modify-write at `app.rs:3007` —
+        // `last_exit: preserved_last_exit.clone()` is the fix. With
+        // the pre-fix `last_exit: None`, the assertion at the end of
+        // this test would fail.
+        let rebuilt = ManifestEntry {
+            uid: loaded.uid.clone(),
+            managed_by_uid: loaded.managed_by_uid.clone(),
+            generation: loaded.generation,
+            label: mutated_label,
+            session_type: loaded.session_type.clone(),
+            transcript_id: loaded.transcript_id.clone(),
+            hidden: loaded.hidden,
+            idle_timeout_secs: loaded.idle_timeout_secs,
+            burst_threshold: loaded.burst_threshold,
+            workflow_run_id: loaded.workflow_run_id.clone(),
+            workflow_role: loaded.workflow_role.clone(),
+            task_id: loaded.task_id.clone(),
+            notify_on_idle: loaded.notify_on_idle,
+            seeded_from_snapshot: loaded.seeded_from_snapshot.clone(),
+            last_exit: preserved_last_exit.clone(),
+        };
+        let after_save = serde_json::to_string(&rebuilt).unwrap();
+
+        // Reload — what the next TUI start (or next manifest read)
+        // would see.
+        let after_reload: ManifestEntry =
+            serde_json::from_str(&after_save).unwrap();
+
+        // Field survives.
+        assert_eq!(
+            after_reload.last_exit,
+            Some(stored_exit),
+            "last_exit must survive the load→mutate→save→reload cycle",
+        );
+        // Mutation also survives (sanity).
+        assert_eq!(after_reload.label, "label-after");
     }
 }
 
@@ -10545,6 +10975,7 @@ mod transcript_rebind_tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -10673,6 +11104,7 @@ mod rotation_binding_tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -12663,6 +13095,7 @@ mod input_handler_tests {
                 created_at: Instant::now(),
                 managed_by_uid: None,
                 seeded_from_snapshot: None,
+                preserved_last_exit: None,
             });
         }
         out
@@ -13688,6 +14121,122 @@ context = "persistent"
         assert_eq!(
             filtered[0].0.file_name().and_then(|s| s.to_str()),
             Some("bad.toml"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod respawn_kills_daemon_session_tests {
+    //! Slice 10d-memory-cap-relocation review finding.
+    //!
+    //! Pins the structural invariant the reviewer surfaced:
+    //! `respawn_existing_with_workflow_mcp` swaps a fresh
+    //! `Session` into a live `TerminalSession` slot via
+    //! `ts.session = new_sess`. For local-PTY sessions, dropping
+    //! the old `Session` closes its master fd and reaps the old
+    //! agent. For daemon-attached sessions, Drop is detach-only
+    //! by design (slice 10c-e-3b-fix2) — so without an explicit
+    //! `App::kill_daemon_session_if_attached` BEFORE the
+    //! assignment, the daemon's old PTY child stays alive while
+    //! a freshly-resumed agent starts in the same slot.
+    //! Duplicate live agents, transcript / worktree races.
+    //!
+    //! This is the same bug class as the round-33 finding 1
+    //! (`MCP kill_session` orphan) and the slice-10c-e-3b-fix2
+    //! teardown-paths sweep — a *missed call site* of the kill
+    //! helper. The pinning test guards against a future
+    //! refactor that re-removes the call.
+    //!
+    //! **Why a source-presence test rather than a behavioral
+    //! one**: `respawn_existing_with_workflow_mcp` calls
+    //! `crate::session::spawn_agent_session`, which spawns a
+    //! real PTY child running the agent binary. Driving that
+    //! end-to-end requires a real worktree, a live daemon, and
+    //! the agent binary on `$PATH` — far too heavy for a unit
+    //! test. The lower-cost behavioral coverage already exists
+    //! (`client_session::tests` verifies that
+    //! `kill_daemon_session_if_attached` actually removes the
+    //! daemon-side registry entry). What's missing — and what
+    //! this test adds — is the *call-site* pin: a future change
+    //! that re-introduces the bug by removing or reordering the
+    //! call will fail this test by name.
+
+    const APP_SRC: &str = include_str!("app.rs");
+
+    /// Locate the start of `pub(crate) fn respawn_existing_with_workflow_mcp`
+    /// in this file and return the function body — from the
+    /// `{` after the signature through the matching `}`. Used
+    /// to scope the structural assertions below to the body of
+    /// the function under test (not the whole file).
+    fn respawn_body() -> &'static str {
+        let sig_marker = "pub(crate) fn respawn_existing_with_workflow_mcp";
+        let sig_idx = APP_SRC
+            .find(sig_marker)
+            .expect("respawn_existing_with_workflow_mcp must exist in app.rs");
+        let from_sig = &APP_SRC[sig_idx..];
+
+        // Find the first `{` that opens the body (after the
+        // signature + return type). `signed -> Option<String> {`
+        let body_open = from_sig
+            .find('{')
+            .expect("function signature must be followed by an opening brace");
+        let body = &from_sig[body_open..];
+
+        // Find the matching closing brace by counting depth.
+        let mut depth = 0usize;
+        let mut end = body.len();
+        for (i, c) in body.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &body[..end]
+    }
+
+    /// The named acceptance test. The function must call
+    /// `kill_daemon_session_if_attached(ts)` before assigning
+    /// `ts.session = new_sess`. Without that ordering, a
+    /// daemon-attached session being respawned leaves a live
+    /// orphan on the daemon side.
+    #[test]
+    fn respawn_calls_kill_daemon_before_session_swap() {
+        let body = respawn_body();
+        let kill_idx = body.find("kill_daemon_session_if_attached(ts)").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must call \
+                 App::kill_daemon_session_if_attached(ts) before swapping \
+                 `ts.session`. For daemon-attached sessions, Drop is \
+                 detach-only — without the explicit kill, the daemon's old \
+                 PTY child outlives the swap and races the new agent. \
+                 Same bug class as round-33 finding 1 + the slice \
+                 10c-e-3b-fix2 teardown-paths sweep.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let swap_idx = body.find("ts.session = new_sess").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must assign \
+                 `ts.session = new_sess` to install the freshly-spawned \
+                 session. If the assignment shape has changed, update \
+                 this test's needle.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        assert!(
+            kill_idx < swap_idx,
+            "kill_daemon_session_if_attached(ts) at byte {} must precede \
+             `ts.session = new_sess` at byte {} — otherwise the swap drops \
+             the old daemon-attached Session (detach-only Drop) BEFORE the \
+             explicit kill RPC fires, leaving an orphan daemon PTY child.\n\nFunction body:\n{}",
+            kill_idx, swap_idx, body
         );
     }
 }

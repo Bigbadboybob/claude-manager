@@ -526,7 +526,7 @@ mod tests {
     ///      same record.
     #[test]
     fn stop_workflow_no_op_on_done_preserves_state_through_disk_reload() {
-        let _guard = crate::test_support::home_lock();
+        let _guard = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let orig_home = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", tmp.path()); }

@@ -4,12 +4,27 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Workspace sibling. Transitional Phase-1 dep that lets the TUI call into
+# modules already relocated into the daemon (worktree, eventually
+# mcp_config / workflow / etc.) without breaking the build during the
+# multi-slice refactor. Slice 10 of doc/persistent-host-daemon.md
+# replaces these direct calls with RPC to a running daemon and the dep
+# can be dropped at that point.
+cm-daemon = { path = "../daemon" }
+
 # Terminal UI framework
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = "0.29"
 
 # Terminal emulation
 alacritty_terminal = "0.25"
+# Match alacritty_terminal 0.25's polling dep exactly. Slice 10c-e-1's
+# AttachedPty implements alacritty's `EventedReadWrite` trait, which
+# registers fds with a `polling::Poller`. The Poller instances must
+# come from the same crate version alacritty's `EventLoop` uses, or
+# the trait impl can't share the poller. 3.8 is what alacritty 0.25
+# pins (`alacritty_terminal/Cargo.toml::dependencies.polling`).
+polling = "3.8"
 
 # Key event -> ANSI byte encoding
 terminput = "0.5"
@@ -37,9 +52,12 @@ sha2 = "0.10"
 # UUID v4 for cloned-Codex transcript ids (agent_memory clone flow).
 uuid = { version = "1", features = ["v4"] }
 
-# Low-level Linux syscalls for the per-session memory cap watcher
-# (getuid, kill, pidfd_open / pidfd_send_signal via syscall numbers).
-[target.'cfg(target_os = "linux")'.dependencies]
+# Low-level Unix syscalls. Used by the per-session memory cap
+# watcher (Linux: getuid, kill, pidfd_open / pidfd_send_signal) and
+# by the daemon-launch setsid+chdir pre_exec (any Unix). libc
+# compiles on every Unix target; the Linux-only call sites are
+# already cfg-gated at their use sites.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

@@ -19,8 +19,15 @@ use super::protocol::{ErrorCode, Request, Response};
 use super::queue::{Queue, REPLY_TIMEOUT};
 
 /// Default path. Override via `CM_TUI_SOCKET` for tests / multi-TUI setups.
+///
+/// `CM_TUI_SOCKET=""` (literal empty / whitespace-only) counts as
+/// "unset" — slice-10c-b review fix, parity with the Python
+/// resolver and with `cm_daemon::default_socket_path`. Without this,
+/// `mcp_config::build_env`'s authoritative-empty entry would be
+/// re-read by this fn as a present-but-empty pin, leading
+/// downstream code to absolutize `""` to cwd.
 pub fn default_socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("CM_TUI_SOCKET") {
+    if let Some(p) = cm_daemon::path::env_socket_override("CM_TUI_SOCKET") {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME")

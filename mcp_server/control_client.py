@@ -11,6 +11,15 @@ Caller identity (`CM_TUI_SESSION_ID`) and the socket path
 (`CM_TUI_SOCKET`, defaulting to `~/.cm/tui.sock`) are read from the
 process environment — these are injected by the TUI when it spawns the
 agent that hosts this MCP server.
+
+**Phase-1 transitional note** (doc/persistent-host-daemon.md): the
+default is *still* `~/.cm/tui.sock` because the daemon scaffold
+currently closes incoming connections — it doesn't yet dispatch MCP
+RPCs. The default flips to `~/.cm/daemon.sock` once daemon-side
+dispatch lands (the deferred half of slice 4). Set
+`CM_USE_DAEMON_SOCKET=1` to opt into the daemon-socket-preferred
+resolution during integration work; this lets developers exercise the
+new path without breaking everyone else's MCP calls.
 """
 
 from __future__ import annotations
@@ -42,13 +51,50 @@ class TransportError(Exception):
 
 
 def default_socket_path() -> Path:
-    """Resolve the socket path. Prefer `CM_TUI_SOCKET`; fall back to the
-    `~/.cm/tui.sock` default the TUI uses."""
-    env = os.environ.get("CM_TUI_SOCKET", "").strip()
-    if env:
-        return Path(env)
-    home = os.environ.get("HOME", "/tmp")
-    return Path(home) / ".cm" / "tui.sock"
+    """Resolve the control socket path.
+
+    Resolution order:
+      1. `$CM_DAEMON_SOCKET` env var. Injected by the TUI when it
+         spawned this agent with `CM_USE_DAEMON_SOCKET=1`. When
+         present, this is the authoritative pin — the agent talks
+         to the daemon socket, not the TUI's.
+      2. `$CM_TUI_SOCKET` env var. The current default injection by
+         the TUI's MCP-config builder. Daemon-spawned agents always
+         get exactly one of these two pins, so the resolver never
+         sees both.
+      3. `~/.cm/tui.sock` — fallback for ad-hoc callers running
+         outside any env injection. The daemon binds
+         `~/.cm/daemon.sock` but doesn't yet dispatch MCP RPCs (it
+         closes incoming connections), so defaulting to it would
+         break every MCP call.
+
+    Opt-in development override (for ad-hoc callers without env
+    injection):
+      `CM_USE_DAEMON_SOCKET=1` prefers `~/.cm/daemon.sock` when it
+      exists, falling back to `tui.sock` if absent. Used to exercise
+      the daemon path during integration work. Once daemon-side
+      dispatch is wired (deferred half of slice 4 of
+      doc/persistent-host-daemon.md), the default flips and this
+      opt-in becomes a no-op.
+
+    Returns the resolved path unconditionally — connectivity is the
+    caller's problem; this function just resolves where to dial.
+    """
+    # An explicit daemon-socket pin trumps everything: the TUI
+    # already decided this agent talks to the daemon, no
+    # filesystem probes needed.
+    daemon_env = os.environ.get("CM_DAEMON_SOCKET", "").strip()
+    if daemon_env:
+        return Path(daemon_env)
+    tui_env = os.environ.get("CM_TUI_SOCKET", "").strip()
+    if tui_env:
+        return Path(tui_env)
+    home = Path(os.environ.get("HOME", "/tmp"))
+    if os.environ.get("CM_USE_DAEMON_SOCKET", "").strip() == "1":
+        daemon_sock = home / ".cm" / "daemon.sock"
+        if daemon_sock.exists():
+            return daemon_sock
+    return home / ".cm" / "tui.sock"
 
 
 def caller_session_uid() -> str:

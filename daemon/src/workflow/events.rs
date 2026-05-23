@@ -109,7 +109,7 @@ mod tests {
         // Serialize HOME env mutation across the whole crate — cargo
         // runs tests from different modules in parallel, so a local
         // `static LOCK` would only protect this module's tests.
-        let _guard = crate::test_support::home_lock();
+        let _guard = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let orig = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", tmp.path()); }

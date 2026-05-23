@@ -1,0 +1,219 @@
+# `app.rs` rewire — slicing plan
+
+Phase-1 work to date has landed every daemon-side primitive the design doc names: protocol types, scaffold, worktree relocation, attach-ticket allocator, workflow-submodule relocation, PtyByteFanout, term_shim FSM, LastExit schema, ManifestWatcher, reaper with per-spawn baseline, detached daemon spawn, opt-in env + auto-launch, and now the pure-function `session.attach` / `attach.open` handlers. What remains is the load-bearing slice: rewiring `tui/src/app.rs` to drive sessions through RPC. This doc sketches which fields move where and a committable slice sequence.
+
+## Field-level inventory
+
+### App fields that move to the daemon
+
+| Field on `App` | Daemon-side owner | Notes |
+|---|---|---|
+| `workspaces: Vec<Workspace>` | Daemon `SessionsRegistry` + `WorkspacesRegistry` | Per-workspace session list + tombstones. Daemon owns the persistent state; TUI keeps an in-memory mirror updated via `manifest.watch`. |
+| `Workspace.sessions: Vec<TerminalSession>` | Daemon `DaemonSession` map keyed by uid | TUI hydrates a `ClientSession` (Term + EventLoop + shim) per attached uid. Detached sessions exist only daemon-side. |
+| `Workspace.tombstones: Vec<SessionTombstone>` | Daemon manifest | 30-day retention stays in `~/.cm/tui-sessions.json`. |
+| Session PTY (`Session.term`, `Session.sender`, `Session.pty_writer`, memory cap, cgroup) | Daemon `DaemonSession` | The split per the doc's "Session struct split" section: daemon owns OS PTY + cap + cgroup + exited flag + wakeup tracker. |
+| Workflow runs (currently in `controller.rs`, the one workflow module still TUI-side) | Daemon workflow controller | Already-relocated submodules become the consumers; controller follows once Session moves daemon-side. |
+| Manifest persistence (`tui-sessions.json` reads/writes) | Daemon `ManifestPersister` | Daemon does the file I/O; TUI subscribes via `manifest.watch` for diffs. Slice-9 `last_exit` schema add already in place. |
+| Memory-cap kill detection (currently `session_watch.rs`) | Daemon reaper | Slice-12 producer already lands; full path wires when sessions live daemon-side. |
+| MCP control socket dispatch (`control/server.rs` + `queue.rs` + `methods.rs`) | Daemon dispatch table | Task #17. Methods take `&App` today; they take `&DaemonState` post-rewire. |
+
+### App fields that stay TUI-side
+
+| Field | Rationale |
+|---|---|
+| Cursor / focus state | Pure UI — no persistent meaning across daemon restart. |
+| `InputMode` (modal dialogs, pickers) | Local input state; never written to disk. |
+| Viewport / scroll position | Render-time state. |
+| Activity feed (`A-,`) | Display-only event log; subscribes to daemon events. |
+| `Config` (theme, layout knobs) | TUI rendering config; unrelated to daemon. |
+| Planning view's `PlanningClient` (talks to FastAPI) | Already host-independent per the design doc. |
+| Toast / notification state | Display layer. |
+
+### Bridge layer (TUI-side wrappers that proxy to daemon)
+
+- **`ClientSession`** — `Term<EventProxy>` + `EventLoop` + `StreamReader`/`StreamWriter` shim (slice 8). Constructed in the TUI; reads PTY bytes off the daemon's `attach.open`-bootstrapped dedicated connection.
+- **`SessionsView` mirror** — local `BTreeMap<uid, ManifestEntry>` populated by `manifest.watch` subscribe + diffs. The TUI reads this for rendering; never writes directly.
+- **`WorkflowView` mirror** — local `Vec<WorkflowRun>` populated by `events.subscribe` (slice 2 of the doc — that's the *next* RPC after Phase 1) or, for the Phase-1 staging, by file-tailing `~/.cm/workflow-runs/*/events.jsonl` on the daemon's filesystem.
+- **Operator RPC client** — a thin `cm_daemon_client` wrapper around the existing `control::protocol` types (already daemon-relocated). One control connection per TUI process, plus one dedicated connection per attached session.
+
+## Slice sequence
+
+Each slice leaves the tree compiling and the default user-visible path (TUI bound to `tui.sock`, daemon optional) working. The opt-in gate `CM_USE_DAEMON_SOCKET=1` graduates from "exercise the daemon scaffold" through each slice until the final flip makes it the default.
+
+### Slice 10a — Daemon-side App-state shell
+
+Subdivided into two commits when it turned out (a) ManifestEntry/Workspace/SessionTombstone relocation touches ~50 sites across `app.rs`, `control/methods.rs`, `agent/`, and `workflow/controller.rs`, and (b) the placeholder-dispatcher work is independently testable. Same overall goal.
+
+**10a-shell:**
+
+- New `daemon::state::DaemonState` carrying the daemon's mutable session/manifest state. Skeletal in this commit — just `sessions: HashMap<String, DaemonSession>` from slice 7. Full `workspaces` / `tombstones` arrive with 10a-types.
+- Daemon's accept loop wires from `drop(stream)` (slice 2 placeholder) to a real read-dispatch-write loop. Each connection: read 4-byte length prefix + JSON body, deserialize into `Request`, call `dispatch_request(state, req)`, serialize the `Response` with length prefix, close.
+- `dispatch_request` returns `UnknownMethod` for every method as a placeholder. The point is to prove the wire path works end-to-end before slice 10b relocates `methods.rs` and starts routing to real handlers. `session_attach` / `attach_open` (the pure functions from slice 5's review) wire in at 10b too.
+
+**10a-types** (next commit):
+
+- Relocate `ManifestEntry`, `Workspace`, `SessionTombstone` from `tui/src/app.rs` to `daemon/src/manifest.rs` alongside the existing `LastExit` and `ManifestDiff`. TUI gains transitional re-export shims so call sites keep compiling.
+- `DaemonState` grows `workspaces` and `tombstones` fields.
+- Daemon's startup loads the existing `~/.cm/tui-sessions.json` into `DaemonState` (read-only — TUI still writes the file until slice 10e flips manifest ownership).
+
+**Working-set check:** TUI ignores the daemon. Default path unchanged. `cargo test --workspace` green after each sub-slice.
+
+### Slice 10b — Move `control/methods.rs` to daemon
+
+- Relocate `methods.rs` from `tui/src/control/` to `daemon/src/control/methods.rs`. Methods take `&mut DaemonState` instead of `&mut App`.
+- TUI keeps `control/server.rs` + `control/queue.rs` for now — its socket still services MCP agents.
+- Daemon's dispatcher wires the relocated methods to its own accept loop. With opt-in on, MCP agents (which got `CM_DAEMON_SOCKET` injected by slice 11's env branch) actually reach handlers.
+- Pure-function `session_attach` / `attach_open` wire into the dispatcher as one-liners (the `TODO(slice-17)` comments in `daemon/src/attach.rs`).
+- TUI's own `dispatch_control` is a thin shim that re-routes to RPC against the daemon if opt-in is on, else falls back to the legacy local dispatch.
+
+**Working-set check:** with opt-in off, default MCP path unchanged. With opt-in on, MCP works against the daemon. Either way the tree is green.
+
+### Slice 10c — Session-spawn split
+
+The slice the reviewer flagged as the hardest one to keep working-set-green. Sub-divided aggressively below; each sub-slice leaves the tree compiling and the default `A-n`/`A-s` flow unchanged. The opt-in (`CM_USE_DAEMON_SOCKET=1`) gradually unlocks daemon-side session handling.
+
+The end goal: `tui/src/session.rs::Session` (which couples alacritty `Term`, `EventLoop`, PTY fd, memory cap, cgroup, and exit tracking) splits into:
+- **`DaemonSession`** (already a skeletal struct in `daemon/src/session.rs` from slice 7) — owns the OS PTY child, memory cap, cgroup, exit watcher, and the `PtyByteFanout` that broadcasts bytes to attached clients. Lives in `DaemonState.sessions: HashMap<uid, DaemonSession>`.
+- **`ClientSession`** (new in 10c-e) — owns alacritty `Term` + `EventLoop` + `EventProxy`, fed by `term_shim::StreamReader`/`StreamWriter` (already built and tested in slice 8). The TUI's `Workspace.sessions` becomes `Vec<ClientSession>` (or similar).
+
+#### Sub-slices
+
+**10c-a — `DaemonSession::spawn` primitive.** Move PTY-child creation (the `alacritty_terminal::tty::new` call from `tui/src/session.rs:106`) into a `DaemonSession::spawn(uid, shell, args, working_dir, env, memory_cap)` method. Tests use the existing `PtyByteFanout` to confirm bytes flow from the child into the fanout. The TUI is *not* yet calling this — `tui/src/session.rs::Session::new` keeps doing what it does today.
+
+**10c-b — daemon `start_session` method handler.** Wire a real `start_session` JSON-RPC handler (replacing the slice-10b `UnknownMethod` placeholder for this method only). Handler takes `params: { workspace_id, label, session_type, ... }` and calls `DaemonSession::spawn` from 10c-a, inserts into `DaemonState.sessions`, returns the new uid. Tested with the dispatcher unit-test pattern from 10b. Other session-mutation methods (`send_input`, `kill_session`, `read_session_output`) stay deferred until 10c-d.
+
+**10c-c — wire `session.attach` / `attach.open` with live registry.** Now that `DaemonState.sessions` is populated, the dispatcher arm for `session.attach` can validate the requested uid against the live registry before minting a ticket (the slice-10b-review fix that punted these). `attach.open` consumes the ticket and looks up the session's `PtyByteFanout`. The stream-transition (where the dedicated connection becomes a `StreamFrame` stream attached to the fanout) is the new piece — `handle_connection` grows a branch for "this is an attach.open consumer; switch to streaming mode."
+
+**10c-d — daemon `send_input` / `kill_session` / `read_session_output`.** Each method's body relocates from `tui/src/control/methods.rs` to `daemon/src/control/methods.rs` (taking `&mut DaemonState` instead of `&mut App`). These all need the live `DaemonState.sessions` registry from 10c-b; the relocation is mechanical once the registry exists.
+
+**10c-e — TUI `ClientSession` + opt-in spawn rewire.** TUI's `Session::new` becomes `ClientSession::new(stream_reader, stream_writer, …)`. Behind the opt-in, the TUI's `A-n` / `A-s` flow:
+1. Calls `start_session` RPC against the daemon → gets new uid.
+2. Calls `session.attach { uid }` → gets a ticket.
+3. Dials a fresh connection to `attach_addr`, sends `attach.open { ticket }`.
+4. Constructs `ClientSession` over the resulting stream.
+
+Opt-in off: TUI keeps the existing direct-`tty::new` path. Both paths coexist through 10e.
+
+**10c-e was further subdivided in practice:**
+- **10c-e-1** — alacritty trait impls on the `StreamReader`/`StreamWriter` wrapper (`AttachedPty`).
+- **10c-e-2** — `ClientSession::new` itself, full RPC dance, returning a working `Term` + `EventLoop`. Several review rounds landed bidirectional input, TOCTOU fixes, cols/rows plumbing, backpressure, lazy memory_cap classification, Shape-B opportunistic drain.
+- **10c-e-3a** — per-spawn `SpawnTarget::Daemon | TuiLocal` routing in `mcp_config::build_env`. Decouples "the daemon exists" from "this particular spawn is daemon-side." Required because workflow respawns and attach-active are still TUI-local; pre-3a a global `CM_USE_DAEMON_SOCKET` would mis-route their MCP callbacks.
+- **10c-e-3b** — argv/env/cwd wire shape for `start_session`. Daemon no longer interprets a session_type tag; TUI builds full argv (with `--mcp-config`, Codex `-c` overrides, resume tokens, systemd-run wrap) via the same code path the local `Session::new` uses, with `SpawnTarget::Daemon`. Daemon execs verbatim. Element-wise argv parity tests pin the contract.
+- **10c-e-3b-fix** — uid passthrough. TUI is source of truth for the uid (because MCP config bakes it at config-write time, before the daemon sees the spawn). `StartSessionParams.uid` is required and used verbatim with format-validation + collision guard.
+- **10c-e-3c** — actual wire of `try_spawn_via_daemon` into `A-n`/`A-s` + interactive smoke (PTY mechanics only — see slice-ordering note below).
+
+### Rejected findings (10c-e-3)
+
+Standing rejections from the review cycle. Grep this section before
+reopening any of these — the reasoning is recorded; rejecting in
+place beats round-by-round re-litigation.
+
+- **`Ok(buf.len())` in `term_shim::StreamWriter::write` without
+  guaranteed full drain** — rounds 26, 30, 31, 33. The tail is
+  drained opportunistically on inbound EventLoop calls via
+  `attached_pty.rs::drain_pending` (Shape B). Quiescent-session
+  caveat is the documented tradeoff. Escalate to Shape A (per-attach
+  writer thread) only on smoke evidence of stuck input in practice.
+  Deflection comments live at `term_shim.rs::tests`-adjacent
+  `impl Write for StreamWriter` and the `Ok(buf.len())` return
+  site itself.
+
+- **Daemon-spawned MCP callers see `UnknownMethod`/`Unauthorized`
+  for TUI-served methods** — rounds 19, 27, 28, 29. Intentional
+  during Phase 1's migration. Daemon-side MCP surface lands in
+  `10d-mcp-surface`. Adding TUI-socket fallback proxying would
+  re-introduce the silent-fallback bug class we've fixed three
+  times during this phase (slices 11/13/17). Deflection comment in
+  `daemon/src/control/dispatch.rs` module-level doc.
+
+**Working-set check (revised through 10c-e-3):**
+- After **10c-a**: TUI behavior unchanged (`DaemonSession::spawn` exists but isn't called from production).
+- After **10c-b**: TUI behavior unchanged (`start_session` daemon-side, but TUI's opt-in path doesn't call it yet).
+- After **10c-c**: TUI behavior unchanged (attach methods serve real responses, but no caller exercises the stream transition yet — only integration tests).
+- After **10c-d**: TUI behavior unchanged (more methods are daemon-routable but the TUI's opt-in path still spawns locally).
+- After **10c-e-{1,2,3a,3b,3b-fix}**: Opt-in OFF byte-identical to today. Opt-in ON is structurally complete but `try_spawn_via_daemon` not yet called from the user-facing handlers.
+- After **10c-e-3c**: Opt-in ON does the full RPC dance from a user keystroke. Smoke (PTY mechanics) is viable.
+
+### Slice 10d-memory-cap-relocation — Cgroup-OOM watcher relocation
+
+> **Note**: Promoted to its own slice during 10c-e-3b-fix2 review. The plumbing for memory-cap End-frame attribution (`SpawnParams.kills_dir` populated when `memory_cap_bytes` is set, daemon-side cgroup_path round-trip on the `start_session` response) lands in 10c-e-3b-fix2. The *producer* of kill-log records — the cgroup-OOM watcher — relocates here. Sequenced before mcp-surface because the memory_cap_kill named acceptance criterion is foundational.
+
+- Relocate `tui/src/session_watch.rs::spawn_watcher` to the daemon side, consuming the daemon's `DaemonSession.cgroup_path` (received from `start_session.cgroup_path`) and writing JSONL records into `~/.cm/memory_kills/<uid>.jsonl` using the existing `daemon/src/path.rs` perms helpers.
+- Daemon-side reaper's `LastExitProbe::snapshot` already scans this directory on End-frame emission (slice 10c-e-2 review-6) — no changes needed there once the watcher writes records.
+- TUI's `tui/src/session_watch.rs` keeps writing for local-spawn sessions (the daemon path doesn't exercise that for daemon-attached sessions because there's no local cgroup ownership).
+- Named acceptance: a daemon-spawned session that's killed by cgroup OOM surfaces `memory_cap_kill: true` on the End frame and the cap-kill toast renders. The TODO(10d-memory-cap-relocation) markers in `Session::new_attached` and `try_spawn_via_daemon` come out.
+
+**Working-set check:** opt-in off, local watcher writes records (unchanged). Opt-in on with cap, daemon-side watcher writes records; cap-kill attribution works end-to-end.
+
+### Slice 10d-mcp-surface — Daemon-side MCP tool surface
+
+> **Note**: Originally folded into 10c-e. Separated during 10c-e-3 review when it became clear the surface is large (Session-caller descendant-task-tree validation, `propose_task`, workflow tools, subtask tools, kill/list/start_session-for-agents, …) and the smoke can validate PTY mechanics without it.
+
+- Daemon-side dispatch for `Session`-caller MCP requests (the agent-orchestration tools): `propose_task`, `workflow_transition`, `workflow_done`, `create_subtask`, `list_subtasks`, `mark_subtask_done`, `list_sessions`, `start_session` (Session-caller), `send_input`, `read_session_output`, `kill_session`, `wait_for_session_idle`, `wait_for_workflow_done` / `wait_for_workflow_stop`.
+- Descendant-task-tree authorization: a Session caller can only act on sessions in its own task tree (the TUI's existing rule).
+- This unblocks A-n daemon-spawned Claude actually invoking MCP tools (the "MCP from inside the session" bullet that was dropped from the 10c-e-3c smoke).
+
+**Working-set check:** opt-in off, MCP routes to `tui.sock` as today. Opt-in on, MCP routes to `daemon.sock` and Session-caller validation kicks in.
+
+### Slice 10d-workflow-controller — Workflow controller relocation
+
+- Move `tui/src/workflow/controller.rs` to `daemon/src/workflow/controller.rs` now that `Session` is daemon-owned (the only remaining blocker on this module per slice 6).
+- TUI's `app.rs` workflow handling becomes RPC calls + manifest/events subscriptions.
+
+**Working-set check:** opt-in off, workflows work locally. Opt-in on, workflows run daemon-side; the TUI is a thin observer.
+
+### Slice 10e — Manifest ownership flip
+
+- Daemon becomes the only writer of `~/.cm/tui-sessions.json`. TUI's `save_session_manifest` becomes a no-op (or a debug-assert) when opt-in is on.
+- TUI populates its in-memory mirror exclusively via `manifest.watch`. The slice-9 `ManifestWatcher` broadcaster wires to actual diffs.
+- `last_exit` flows end-to-end: daemon reaper detects cap kill → updates manifest → broadcasts `ManifestDiff::Exited` → TUI mirror reflects → toast renders. Named acceptance criterion green for the detached path.
+- Subsumes the 10c-e-3 `worktree_path` auto-register fallback in `start_session` — the daemon learns about new workspaces via `manifest.watch` instead.
+
+**Working-set check:** opt-in off, TUI owns manifest as today. Opt-in on, daemon owns it; TUI follows.
+
+### Slice 14 — Reconnect / ring-buffer replay integration test
+
+> **Note on test flake-class** (carried forward from 10c-e-3b-fix2 review). The daemon's real-PTY-spawn tests
+> (`cm_tui_session_id_env_is_injected_for_child`, `exited_session_is_removed_from_registry_within_bound`,
+> `registry_remove_races_safely_against_insert`, `start_session_default_cols_rows_used_when_not_provided`,
+> `start_session_with_explicit_cols_rows_sizes_pty_accordingly`,
+> `end_frame_for_signal_kill_with_baseline_relative_record_carries_cap_kill_true`) and the TUI's
+> `client_session_new_with_explicit_size_spawns_pty_at_that_size` all flake under workspace concurrency
+> when build artifacts are cold. Per-package sequential runs (daemon-only, TUI-only) pass cleanly; the
+> failures only appear under `cargo test --workspace` + concurrent rustc work. The reconnect test will
+> exercise more of the same shape (spawn real bash, kill TUI, reattach, observe replay) — so:
+>
+> - Use generous bounded deadlines for the spawn / kill / probe windows. The slice-10c-e tests use 2-3s;
+>   the reconnect test should use 5s+ for the same operations.
+> - Run with `--test-threads=1` in CI specifically for the reconnect-test target, or quarantine it to
+>   a non-`--workspace` invocation. The serial run avoids the PTY-resource-contention flake.
+> - The reconnect test's "TUI restart picks up the existing daemon session" assertion is the load-bearing
+>   one. Bound it on `state.sessions.contains_key(&uid)` polling rather than wall-clock sleeps.
+
+### Slice 10f — Default flip + cleanup
+
+- Default socket flips to `~/.cm/daemon.sock` in both `mcp_config.rs::build_env` and `control_client.py::default_socket_path`. The legacy `tui.sock` resolution becomes the fallback for one release. Regression test added at slice 13 catches any premature flip.
+- Remove `tui/src/control/server.rs` + `queue.rs`. The TUI no longer hosts a socket.
+- Remove `CM_USE_DAEMON_SOCKET` (now unconditional behavior). Mark the env var as no-op-with-warning for one release.
+- Reconnect/ring-buffer integration test (slice 14) runs end-to-end: kill TUI mid-session, restart, observe replay through the daemon. Named acceptance criterion green.
+
+**Working-set check:** new default is the daemon path. Old MCP clients that hardcode `tui.sock` still work via the legacy fallback. Tests cover both.
+
+## Estimated commit count
+
+- Slice 10a: 2–3 commits (state struct + cm-core crate split + workspace plumbing).
+- Slice 10b: 3–4 commits (methods relocation is mechanical but `App`→`DaemonState` is a lot of references; split by method group).
+- Slice 10c: 5–8 commits, actual count higher (10c-{a,b,c,d,e-1,e-2,e-3a,e-3b,e-3b-fix,e-3b-fix2,e-3c} plus review-fix commits per slice).
+- Slice 10d-memory-cap-relocation: 2–3 commits (watcher relocation + cap-kill end-to-end test).
+- Slice 10d-mcp-surface: 3–5 commits (Session-caller dispatch + per-tool relocations + auth check).
+- Slice 10d-workflow-controller: 1–2 commits.
+- Slice 10e: 1–2 commits.
+- Slice 10f: 1 commit (the actual flip) + 1 commit (cleanup).
+
+Total: roughly 15–20 commits with the 10c subdivision + 10d split. Each leaves the tree green. The opt-in stays the integration safety net through 10a–10e; 10f removes it.
+
+## What this doc is NOT
+
+- An implementation. The point is to make the slicing committable; each slice gets its own design pass when it's the next-up.
+- A schedule. Slices land when they're ready; no ETAs.
+- A defense of the current scope. If a reviewer reading this catches a missing field or a wrong boundary, that's the right place to push back — better here than mid-rewire.

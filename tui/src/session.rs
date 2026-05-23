@@ -22,6 +22,16 @@ pub struct EventProxy {
     tx: mpsc::Sender<TermEvent>,
 }
 
+impl EventProxy {
+    /// Constructor used by both `Session::new` (local PTY) and
+    /// `ClientSession::new` (daemon-attached PTY) so they build
+    /// equivalent EventProxies without exposing the private `tx`
+    /// field across modules.
+    pub fn new(tx: mpsc::Sender<TermEvent>) -> Self {
+        Self { tx }
+    }
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
         let _ = self.tx.send(event);
@@ -32,8 +42,14 @@ impl EventListener for EventProxy {
 pub struct Session {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub sender: EventLoopSender,
-    /// Direct fd to PTY master for low-latency input writes.
-    pty_writer: File,
+    /// Direct fd to PTY master for low-latency input writes. `Some`
+    /// for local-PTY sessions (built via [`Session::new`]); `None`
+    /// for daemon-attached sessions (built via
+    /// [`Session::new_attached`], slice 10c-e-3) where there is no
+    /// local PTY fd — writes go through `sender` instead. The
+    /// fallback path in [`Session::write`] is what makes the daemon
+    /// branch a drop-in at every call site.
+    pty_writer: Option<File>,
     pub event_rx: mpsc::Receiver<TermEvent>,
     pub title: String,
     pub exited: bool,
@@ -45,6 +61,29 @@ pub struct Session {
     /// preflight-failed environments).
     pub memory_cap: Option<MemoryCap>,
     pub cgroup_path: Option<PathBuf>,
+    /// Daemon-side session uid for daemon-attached sessions (slice
+    /// 10c-e-3). `None` for local-PTY sessions. Used by the
+    /// close path (A-w) to issue `kill_session` against the daemon
+    /// — without this, dropping the session would just close the
+    /// attach socket while the daemon's session keeps running.
+    pub daemon_session_uid: Option<String>,
+    /// Latched `memory_cap_kill` flag for daemon-attached
+    /// sessions (slice 10c-e-3b-fix4b). The attach-stream reader
+    /// half stores `true` here when the daemon's `End` frame
+    /// carried `memory_cap_kill: true`. The exit handler at
+    /// `app.rs::drain_pty_events` reads-and-clears it via
+    /// `swap(false, SeqCst)` after observing
+    /// `TermEvent::Exit`/`ChildExit` and dispatches the cap-kill
+    /// toast — the same toast the local-spawn watcher fires when
+    /// its `MemoryKillEvent::Killed` arrives. Single source of
+    /// truth: `memory_cap_kill` (daemon path) and
+    /// `MemoryKillEvent::Killed` (local path) both end at the
+    /// same cap-kill rendering.
+    ///
+    /// `None` for local-PTY sessions — those get their cap-kill
+    /// signal via the watcher's `MemoryKillEvent` channel
+    /// instead.
+    pub daemon_memory_cap_kill: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Session {
@@ -64,7 +103,7 @@ impl Session {
         memory_cap: Option<MemoryCap>,
     ) -> anyhow::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
-        let event_proxy = EventProxy { tx: event_tx };
+        let event_proxy = EventProxy::new(event_tx);
 
         // Enable Kitty keyboard protocol tracking so alacritty actually
         // records `\x1b[>Nu` push/pop sequences from agents like codex —
@@ -152,13 +191,75 @@ impl Session {
         Ok(Session {
             term,
             sender,
-            pty_writer,
+            pty_writer: Some(pty_writer),
             event_rx,
             title: format!("{} {}", shell, args.join(" ")),
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap,
             cgroup_path,
+            daemon_session_uid: None,
+            // Local-spawn sessions get cap-kill signals via the
+            // watcher's `MemoryKillEvent` channel, not this Arc.
+            daemon_memory_cap_kill: None,
+        })
+    }
+
+    /// Build a `Session` backed by a daemon-attached PTY (slice
+    /// 10c-e-3 opt-in path, gated on `CM_USE_DAEMON_SOCKET=1`).
+    /// Runs the RPC dance via [`crate::client_session::ClientSession::new`]
+    /// and wraps the result in a `Session` whose `pty_writer` is
+    /// `None` (writes route through `sender`) and whose
+    /// `daemon_session_uid` carries the daemon-minted uid so the
+    /// close path can issue `kill_session` on teardown.
+    ///
+    /// `memory_cap` / `cgroup_path` are always `None` — the daemon
+    /// owns memory-cap enforcement for daemon-attached sessions (a
+    /// 10c-d concern); the TUI's `spawn_agent_session` watcher
+    /// path is not exercised here.
+    pub fn new_attached(
+        config: crate::client_session::ClientSessionConfig,
+    ) -> anyhow::Result<Self> {
+        let title_label = config.label.to_string();
+        let cs = crate::client_session::ClientSession::new(config)?;
+        // Mirror the daemon-echoed cgroup_path so the local
+        // Session has parity with what `Session::new` would
+        // produce for a memory-capped local spawn (slice
+        // 10c-e-3b-fix2). The cgroup-OOM watcher relocation in
+        // slice 10d-memory-cap-relocation will pick this up.
+        // Mirror the daemon-echoed cgroup_path so the local
+        // Session has parity with what `Session::new` would
+        // produce for a memory-capped local spawn (slice
+        // 10c-e-3b-fix2). The cgroup-OOM watcher relocation in
+        // slice 10d-memory-cap-relocation will pick this up.
+        let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
+        Ok(Session {
+            term: cs.term,
+            sender: cs.sender,
+            pty_writer: None,
+            event_rx: cs.event_rx,
+            title: format!("{} (daemon:{})", title_label, cs.session_uid),
+            exited: false,
+            wakeup_times: Vec::new(),
+            // TODO(10d-memory-cap-relocation): a daemon-spawned
+            // session has its memory-cap watcher on the daemon
+            // side, not here. The TUI's `MemoryCap` struct is the
+            // local-spawn shape; leaving None until the watcher
+            // moves over. The End-frame's `memory_cap_kill` flag
+            // path is wired up below (`daemon_memory_cap_kill`)
+            // so cap kills DO surface the toast — but the
+            // *producer* of those kill records (the watcher
+            // writing into `~/.cm/memory_kills/`) doesn't run on
+            // the daemon side yet, so in practice the flag stays
+            // false until 10d-memory-cap-relocation ships the
+            // producer.
+            memory_cap: None,
+            cgroup_path,
+            daemon_session_uid: Some(cs.session_uid),
+            // Slice 10c-e-3b-fix4b: route the latched cap-kill
+            // flag from the AttachedPty's reader half up to the
+            // exit handler.
+            daemon_memory_cap_kill: Some(cs.memory_cap_kill),
         })
     }
 
@@ -175,11 +276,32 @@ impl Session {
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         const WRITE_DEADLINE: Duration = Duration::from_millis(200);
 
+        // Daemon-attached path (slice 10c-e-3): no local PTY fd.
+        // Route through the EventLoop's input channel, which
+        // serializes writes onto `StreamWriter` as `StreamKind::Input`
+        // frames. The EventLoop's writable-readiness drain (Shape B
+        // hooks in `AttachedPty`) handles backpressure.
+        if self.pty_writer.is_none() {
+            use std::borrow::Cow;
+            return self
+                .sender
+                .send(Msg::Input(Cow::Owned(data.to_vec())))
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "daemon-attached Session::write: channel send failed: {}",
+                        e
+                    ))
+                });
+        }
+        let pty_writer = self.pty_writer.as_ref().expect("checked is_some above");
+
         let total = data.len();
         let mut pos = 0;
         let start = Instant::now();
         while pos < total {
-            match (&self.pty_writer).write(&data[pos..]) {
+            // &File implements Write, so write through the shared ref —
+            // matches the prior `&self.pty_writer` shape.
+            match (&*pty_writer).write(&data[pos..]) {
                 // Ok(0) on a non-empty slice means the writer accepted no
                 // bytes but didn't signal WouldBlock. Looping on it is a
                 // busy-spin that bypasses the deadline check below, so bail
@@ -228,6 +350,40 @@ impl Session {
         });
     }
 }
+
+// Drop semantics (slice 10c-e-3b-fix2): no daemon-side kill.
+//
+// Pre-fix2, this Drop arm issued a `kill_session` RPC for every
+// daemon-attached session. That defeats the whole point of the
+// "persistent host daemon" design — every TUI exit (A-q, crash,
+// `cargo run` shutdown) would tear down every daemon session, and
+// the reconnect-on-restart acceptance criterion the design names
+// would be unreachable.
+//
+// Drop is now detach-only for both flavors:
+//   - **Local-PTY sessions** (`pty_writer = Some(File)`): dropping
+//     the master fd sends SIGHUP to the child, which exits and
+//     reaps via the kernel — the existing behavior, unchanged.
+//   - **Daemon-attached sessions** (`daemon_session_uid = Some(...)`,
+//     `pty_writer = None`): dropping the `sender` and the
+//     EventLoop closes the attach socket. The daemon's reader
+//     half sees EOF, the attach handler thread winds down. The
+//     daemon's PTY child KEEPS RUNNING. This is the property
+//     that makes reconnect possible.
+//
+// Operator-driven teardown (A-w) explicitly calls
+// `kill_session` BEFORE removing the Session from the workspace.
+// See `App::close_active_session` and
+// `App::tombstone_and_remove`. The same kill is owed by any
+// destructive-cleanup path (workspace delete, task close, etc.).
+//
+// TODO(reconnect-slice): on TUI restart, `spawn_restored_session`
+// should probe the daemon for a matching uid and attach instead
+// of respawning. Until then a daemon session whose TUI is
+// restarted is functionally orphaned (the bookkeeping is gone
+// from `~/.cm/tui-sessions.json`'s next read but the daemon's
+// `state.sessions` still has it). Acceptable for the 10c-e-3c
+// smoke since the operator won't restart mid-smoke.
 
 /// Simple dimensions struct implementing alacritty's Dimensions trait.
 pub struct TermSize {
@@ -359,7 +515,13 @@ fn run_nonce() -> &'static str {
 /// -- shell args...` when a `MemoryCap` is provided, and compute the
 /// predicted cgroup path. When `memory_cap` is `None`, returns inputs
 /// unchanged with `cgroup_path = None`.
-fn wrap_with_systemd_run(
+///
+/// `pub(crate)` so slice 10c-e-3b can reuse this for the daemon
+/// spawn path: the TUI side pre-wraps argv before sending it across
+/// the wire so the daemon-spawned child runs under the same
+/// systemd-run scope the local Session::new path produces. Element-
+/// wise parity is the contract.
+pub(crate) fn wrap_with_systemd_run(
     shell: &str,
     args: &[String],
     memory_cap: &Option<MemoryCap>,

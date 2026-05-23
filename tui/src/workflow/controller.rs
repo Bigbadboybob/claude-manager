@@ -530,7 +530,14 @@ impl<'a> WorkflowControllerCtx<'a> {
             run_id,
             role: role_name,
         };
+        // Workflow respawns are TUI-local (slice 10c-e-3a per-spawn
+        // routing). They have no daemon-side equivalent in Phase 1;
+        // the workflow control plane lives in `~/.cm/workflow-runs/`
+        // which the daemon doesn't manage. MCP calls from a
+        // workflow participant (e.g. `workflow_transition`) must
+        // reach the TUI socket, not the daemon — pinning explicitly.
         let (program, args) = match crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             engine,
             &session_uid,
             Some(workflow_meta),
@@ -593,6 +600,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -1295,6 +1303,7 @@ mod tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -1672,6 +1681,7 @@ mod tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
