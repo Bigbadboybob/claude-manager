@@ -44,6 +44,13 @@ portable-pty = "0.9"
 # the daemon side to write attach-stream data frames the TUI can
 # read. Same version as the TUI uses for symmetry.
 base64 = "0.22.1"
+# Per-session cgroup-OOM watcher (slice 10d-memory-cap-relocation)
+# hashes argv so the JSONL kill-log records a 4-byte SHA-256
+# prefix the operator can correlate against. The TUI uses the
+# same dep for `tui/src/session_watch.rs`; daemon adds it here
+# so the producer relocation doesn't introduce cross-crate
+# dependency drift.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

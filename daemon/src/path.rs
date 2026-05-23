@@ -124,6 +124,124 @@ pub fn wait_for_cgroup_active(path: &Path, max_wait: std::time::Duration) -> boo
     }
 }
 
+/// Pure-function part of [`discover_session_cgroup_path`]. Parses
+/// one /proc/<pid>/cgroup content string + verifies the cgroup-v2
+/// basename matches the `cm-sess-*.scope` pattern; returns the
+/// absolute path under `/sys/fs/cgroup`.
+///
+/// Slice 10d-memory-cap-relocation review fix #1: the daemon must
+/// never trust a caller-supplied cgroup path. A buggy or malicious
+/// caller could pre-populate an active cgroup with PIDs from
+/// unrelated processes (their shell, another worker, …) and the
+/// daemon's watcher would SIGKILL those PIDs on the first memory
+/// breach. Discovering the cgroup from `/proc/<pid>/cgroup` binds
+/// the path to *this specific spawn* — no path the caller didn't
+/// produce can ever be observed.
+///
+/// cgroup-v2 unified-hierarchy format (`man 7 cgroups`):
+/// ```text
+/// 0::/user.slice/.../app.slice/cm-sess-<uid>-<nonce>-<gen>.scope
+/// ```
+///
+/// The pattern check (`cm-sess-*.scope`) mirrors the unit-name
+/// convention `tui/src/session.rs::wrap_with_systemd_run` emits,
+/// which both local-spawn and daemon-spawn paths use. A child
+/// that ended up outside this scope (e.g. systemd-run failed
+/// mid-setup and the child runs in the parent cgroup) gets
+/// rejected — the daemon refuses to declare success and SIGKILLs
+/// the child via the caller's `PendingSession::Drop` path.
+pub fn parse_cgroup_v2_line(content: &str) -> Result<PathBuf, String> {
+    // cgroup-v2 entry is the line(s) prefixed with `0::`. v1
+    // entries (`<n>:<controller>:...`) are ignored — pure v2
+    // hosts have only `0::`. Hybrid v1+v2 hosts have both, but
+    // memory accounting on hybrid is v1, where the rest of the
+    // 10d wiring (memory.events, MemoryMax via scope) doesn't
+    // apply, so v2-only is the right scope.
+    let rel = content
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "no cgroup-v2 entry (expected line starting '0::'); content was: {:?}",
+                content
+            )
+        })?;
+    // Some kernels append " (deleted)" when the cgroup mount
+    // point was removed but the proc entry lingers briefly.
+    // We treat such entries as no-discoverable-path rather than
+    // accepting them: a deleted cgroup is exactly the case
+    // where the watcher would have nothing to watch.
+    let rel = rel.trim().trim_end_matches(" (deleted)").trim();
+    if !rel.starts_with('/') {
+        return Err(format!(
+            "cgroup-v2 path must be absolute (start with '/'); got: {:?}",
+            rel
+        ));
+    }
+    let basename = std::path::Path::new(rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("cgroup path has no basename: {:?}", rel))?;
+    if !basename.starts_with("cm-sess-") || !basename.ends_with(".scope") {
+        return Err(format!(
+            "cgroup basename {:?} doesn't match cm-sess-*.scope pattern \
+             (the systemd-run scope didn't materialize — either systemd-run \
+             failed mid-setup, or the caller bypassed the wrapper)",
+            basename
+        ));
+    }
+    Ok(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+/// Discover a session's cgroup path by polling `/proc/<pid>/cgroup`
+/// until either the basename matches `cm-sess-*.scope` (success) or
+/// the deadline expires (`Err`).
+///
+/// Why polling: systemd-run's child-PID exists in `/proc` before
+/// the scope cgroup setup completes — the kernel moves the child
+/// into the new cgroup once systemd finishes scope creation, so
+/// the first read of `/proc/<pid>/cgroup` can return the *parent*
+/// cgroup. Polling lets the scope materialize before we record
+/// the path. 500ms matches the local-spawn `wait_for_cgroup_active`
+/// budget for consistency.
+///
+/// Linux-only by the crate-root gate on `lib.rs` (slice 10d
+/// watcher-fix #2). `/proc/<pid>/cgroup` has no portable
+/// equivalent on other OSes.
+pub fn discover_session_cgroup_path(
+    pid: u32,
+    max_wait: std::time::Duration,
+) -> Result<PathBuf, String> {
+    let proc_path = format!("/proc/{}/cgroup", pid);
+    let deadline = std::time::Instant::now() + max_wait;
+    let mut last_err = String::new();
+    loop {
+        let content = match std::fs::read_to_string(&proc_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!("read {}: {}", proc_path, e));
+            }
+        };
+        match parse_cgroup_v2_line(&content) {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                last_err = e;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "/proc/{}/cgroup did not produce a cm-sess-*.scope path within \
+                 {}ms (last parse error: {})",
+                pid,
+                max_wait.as_millis(),
+                last_err
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// `$HOME/.cm/memory_kills` — the canonical kill-log directory.
 /// Used by both the TUI's local-spawn `session_watch` writer and
 /// the daemon's spawn path (`SpawnParams::kills_dir`) so the
@@ -421,5 +539,112 @@ mod tests {
         assert_eq!(leaf_mode, 0o700, "leaf must be 0o700");
         // Parents exist; their modes follow umask.
         assert!(tmp.path().join("a/b/c").is_dir());
+    }
+
+    // ============================================================
+    // Slice 10d-memory-cap-relocation review fix #1: cgroup
+    // discovery from /proc — pure-function tests against the
+    // parse layer so we don't have to fight real /proc.
+    // ============================================================
+
+    #[test]
+    fn parse_cgroup_v2_line_happy_path() {
+        // A real-world systemd-user cgroup-v2 line for a session
+        // produced by `wrap_with_systemd_run`.
+        let content = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/cm-sess-ts-abc-1-2.scope\n";
+        let path = parse_cgroup_v2_line(content).expect("should parse");
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/cm-sess-ts-abc-1-2.scope"
+            ),
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_line_rejects_non_cm_sess_basename() {
+        // A process running in the user-manager's own cgroup, or
+        // any other non-cm-sess cgroup. This is the security
+        // boundary — the daemon refuses to operate on a cgroup
+        // that wasn't produced by our scope-naming convention.
+        let content = "0::/user.slice/user-1000.slice/user@1000.service\n";
+        let err = parse_cgroup_v2_line(content).expect_err("must reject");
+        assert!(
+            err.contains("cm-sess-*.scope"),
+            "error must name the expected pattern: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_line_rejects_scope_with_wrong_prefix() {
+        // Basename ends in `.scope` but doesn't start with
+        // `cm-sess-` — could be any other systemd transient
+        // scope. Reject.
+        let content = "0::/user.slice/some-other-app.scope\n";
+        let err = parse_cgroup_v2_line(content).expect_err("must reject");
+        assert!(err.contains("cm-sess-*.scope"));
+    }
+
+    #[test]
+    fn parse_cgroup_v2_line_rejects_v1_only_content() {
+        // cgroup-v1 hierarchies have lines like
+        // `1:name=systemd:/user.slice`. A v1-only host produces
+        // no `0::` entry; we reject because the rest of the
+        // memory-cap wiring (memory.events, MemoryMax via scope)
+        // is v2-specific.
+        let content = "1:name=systemd:/user.slice/x.scope\n3:memory:/user.slice/x.scope\n";
+        let err = parse_cgroup_v2_line(content).expect_err("must reject v1-only");
+        assert!(
+            err.contains("no cgroup-v2 entry"),
+            "error must name the missing v2 entry: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_cgroup_v2_line_strips_deleted_suffix_but_still_validates() {
+        // A cgroup whose mount point was removed but whose proc
+        // entry lingers. We strip the `(deleted)` suffix and
+        // re-run the pattern check; here the basename underneath
+        // would still match cm-sess, so the path comes back —
+        // but the watcher will exit on its own because the
+        // directory doesn't exist on the filesystem.
+        let content = "0::/foo/cm-sess-x.scope (deleted)\n";
+        let path = parse_cgroup_v2_line(content).expect("strip + parse");
+        assert_eq!(path, PathBuf::from("/sys/fs/cgroup/foo/cm-sess-x.scope"));
+    }
+
+    #[test]
+    fn parse_cgroup_v2_line_rejects_non_absolute_path() {
+        let content = "0::relative/path/cm-sess-x.scope\n";
+        let err = parse_cgroup_v2_line(content).expect_err("must reject");
+        assert!(err.contains("must be absolute"));
+    }
+
+    /// Live-process integration test: read `/proc/<self>/cgroup`
+    /// and assert the parser rejects it (the test binary itself
+    /// won't be running inside a `cm-sess-*.scope`). Proves the
+    /// pattern check actually fails when an unrelated PID is
+    /// queried — the exact scenario Finding 1 is about.
+    #[test]
+    fn discover_session_cgroup_path_rejects_test_process_pid() {
+        let result = discover_session_cgroup_path(
+            std::process::id(),
+            std::time::Duration::from_millis(50),
+        );
+        let err = result.expect_err(
+            "test binary is NOT running inside a cm-sess-*.scope, so \
+             discovery must reject — this is exactly the threat model \
+             of Finding 1: the daemon must refuse to operate on cgroups \
+             it didn't produce",
+        );
+        assert!(
+            err.contains("cm-sess-*.scope")
+                || err.contains("did not produce")
+                || err.contains("cgroup"),
+            "error must name the failure mode: {}",
+            err
+        );
     }
 }

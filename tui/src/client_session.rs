@@ -476,9 +476,18 @@ pub(crate) fn rpc_start_session_full(
     if let Some(bytes) = config.memory_cap_bytes {
         params["memory_cap_bytes"] = serde_json::Value::Number(bytes.into());
     }
-    if let Some(cg) = config.cgroup_path {
-        params["cgroup_path"] = serde_json::Value::String(cg.display().to_string());
-    }
+    // Slice 10d watcher-fix #1: `cgroup_path` is NO LONGER
+    // sent on the wire. The daemon discovers the actual cgroup
+    // from `/proc/<spawn-pid>/cgroup` post-spawn (see
+    // `daemon/src/path.rs::discover_session_cgroup_path`).
+    // Sending a caller-supplied path would let a buggy or
+    // malicious caller direct the daemon's watcher at a cgroup
+    // pre-populated with PIDs from unrelated processes — same
+    // bug class as the kill_session orphan / writer-deadlock /
+    // silent-paste-drop fixes earlier in this chain. The
+    // `config.cgroup_path` field is kept for build-time
+    // compatibility but its value is discarded here.
+    let _ = config.cgroup_path; // intentionally unused
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(config.operator_token_id),
@@ -1206,13 +1215,22 @@ mod tests {
         );
     }
 
+    /// Slice 10d watcher-fix #1: `memory_cap_bytes` still
+    /// travels on the wire, but `cgroup_path` is NO LONGER sent
+    /// by the TUI. The daemon discovers the actual cgroup from
+    /// `/proc/<spawn-pid>/cgroup` post-spawn — a buggy or
+    /// malicious caller cannot direct the daemon's watcher at a
+    /// cgroup containing PIDs from unrelated processes anymore.
+    ///
+    /// This test pins the new wire contract: even when the
+    /// caller's `ClientSessionConfig.cgroup_path` is `Some(...)`
+    /// (legacy code path or accidental), `rpc_start_session_full`
+    /// must drop it before the wire. The response's
+    /// `cgroup_path` field is now informational (daemon-
+    /// authoritative) — we test the round-trip by having the
+    /// fake daemon echo a fabricated discovered path.
     #[test]
-    fn memory_cap_bytes_and_cgroup_path_round_trip_in_wire() {
-        // Wire-shape acceptance for the memory-cap plumbing
-        // (slice 10c-e-3b-fix2). The TUI sends
-        // `memory_cap_bytes` + `cgroup_path` in the
-        // start_session request; the daemon echoes
-        // `cgroup_path` back in the response.
+    fn memory_cap_bytes_travels_on_wire_but_caller_cgroup_path_is_dropped() {
         use cm_daemon::control::wire as wire_local;
         use std::os::unix::net::UnixListener;
 
@@ -1225,23 +1243,23 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).expect("bind");
 
+        // Fabricated discovered path the spy returns — proves
+        // the response-side `cgroup_path` is the daemon's word,
+        // not echoed from a request field.
+        let daemon_authoritative_path =
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cm-sess-discovered.scope";
+
         let socket_for_spy = socket_path.clone();
         let spy = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let req = wire_local::read_request(&mut stream)
                 .expect("read req")
                 .expect("frame");
-            // Echo the cgroup_path from the request into the
-            // response — same shape the real daemon produces.
-            let cg_from_req = req.params["cgroup_path"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
             let resp = cm_daemon::control::protocol::Response::ok(
                 req.id.clone(),
                 serde_json::json!({
                     "session_uid": req.params["uid"].as_str().unwrap(),
-                    "cgroup_path": cg_from_req,
+                    "cgroup_path": daemon_authoritative_path,
                 }),
             );
             wire_local::write_response(&mut stream, &resp).expect("write");
@@ -1251,8 +1269,12 @@ mod tests {
 
         let argv = vec!["/bin/bash".to_string()];
         let uid = test_uid();
-        let cgroup_path = std::path::Path::new(
-            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cm-sess-test.scope",
+        // The HOSTILE caller-supplied path — the test verifies
+        // this never reaches the wire. Pre-fix this would have
+        // ridden the request to the daemon and (in production)
+        // been trusted as the watcher's cgroup.
+        let hostile_cgroup = std::path::Path::new(
+            "/sys/fs/cgroup/user.slice/HOSTILE-CALLER-SUPPLIED.scope",
         );
         let config = ClientSessionConfig {
             daemon_socket: &socket_path,
@@ -1266,31 +1288,44 @@ mod tests {
             cols: 80,
             rows: 24,
             memory_cap_bytes: Some(64 * 1024 * 1024),
-            cgroup_path: Some(cgroup_path),
+            cgroup_path: Some(hostile_cgroup),
             worktree_path: None,
         };
         let result = rpc_start_session_full(&config).expect("rpc ok");
 
         let req = spy.join().expect("spy joined");
-        // Wire-out: TUI must serialize both new fields.
+        // Wire-out: memory_cap_bytes still travels.
         assert_eq!(
             req.params["memory_cap_bytes"].as_u64(),
             Some(64 * 1024 * 1024),
-            "memory_cap_bytes must travel on the wire"
+            "memory_cap_bytes must still travel on the wire"
         );
-        assert_eq!(
-            req.params["cgroup_path"].as_str(),
-            Some(cgroup_path.to_str().unwrap()),
-            "cgroup_path must travel on the wire"
+        // Wire-out: `cgroup_path` must NOT travel — this is
+        // the security fix. The field is absent from the JSON
+        // (serde_json `Value` returns Null for missing keys;
+        // we assert the as_str() option is None).
+        assert!(
+            req.params["cgroup_path"].is_null()
+                || req.params.get("cgroup_path").is_none(),
+            "cgroup_path must NOT be sent on the wire (slice 10d watcher-fix #1) — \
+             observed: {:?}",
+            req.params["cgroup_path"]
         );
 
-        // Wire-in: daemon's cgroup_path echo must round-trip
-        // back to the TUI's StartSessionResult.
+        // Wire-in: daemon's response carries the
+        // daemon-discovered path, not the caller's hostile
+        // one. (The fake daemon here echoes whatever it
+        // claims; in production it's the /proc-discovered
+        // path.)
         assert_eq!(
             result.cgroup_path.as_deref(),
-            Some(cgroup_path.to_str().unwrap()),
-            "cgroup_path must round-trip from response into the StartSessionResult \
-             so Session::new_attached can populate Session.cgroup_path"
+            Some(daemon_authoritative_path),
+            "response cgroup_path must be the daemon-authoritative path"
+        );
+        assert_ne!(
+            result.cgroup_path.as_deref(),
+            Some(hostile_cgroup.to_str().unwrap()),
+            "result must NOT contain the hostile caller-supplied path"
         );
 
         let _ = std::fs::remove_file(&socket_path);

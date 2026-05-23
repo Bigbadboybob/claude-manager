@@ -530,13 +530,47 @@ pub struct LastExitProbe {
     kills_baseline: u64,
     /// Session uid — needed for `<uid>.jsonl` path resolution.
     uid: String,
+    /// Set to `true` by the `kill_session` RPC handler BEFORE it
+    /// issues the SIGKILL via pidfd (slice 10d watcher-fix #4).
+    /// Joins with `kill_status` + signal in
+    /// `crate::reaper::is_cap_kill` so an operator-driven kill on
+    /// a session that ALSO happens to have a transient
+    /// `protected`/`no_pids` record past baseline doesn't get
+    /// misattributed as a cap kill.
+    ///
+    /// Lives on `LastExitProbe` (not on `DaemonSession`) so the
+    /// attach-stream End-frame consumer can read it after the
+    /// reaper has removed the session from the registry — the
+    /// `SharedLastExit` Arc outlives `DaemonSession`.
+    operator_kill_requested: std::sync::atomic::AtomicBool,
 }
 
 /// Kernel-observable exit. What the reaper can know
 /// synchronously from `waitpid`.
+///
+/// Slice 10d watcher-fix #1.5 (refine consumer): `signal` was
+/// added so `LastExitProbe::snapshot` can distinguish "clean
+/// exit but a transient soft-limit breach was recorded" from
+/// "kernel-killed". The watcher fires on `memory.events high`,
+/// which can be a *recoverable* soft-limit hit — a process that
+/// touched the high watermark, the kernel reclaimed pages, and
+/// the process kept running to a clean exit. Pre-fix-#1.5 such
+/// a record past baseline incorrectly flipped
+/// `memory_cap_kill: true`, surfacing a phantom toast for an
+/// exit today wouldn't have shown one. Now the consumer joins
+/// `kill_status` from the record with `signal` here: only
+/// `kill_status == "killed_by_us"` is unconditional;
+/// `protected`/`no_pids`/`already_dead` require a signal exit
+/// to flip the flag. See `crate::reaper::is_cap_kill`.
 #[derive(Debug, Clone)]
 pub struct KernelExitStatus {
+    /// `WEXITSTATUS` — set when the child exited via `_exit(N)`.
+    /// `None` when the child was signal-killed (`WIFSIGNALED`).
     pub code: Option<i32>,
+    /// `WTERMSIG` — set when the child was killed by a signal.
+    /// `None` for clean exits. The "kernel killed me" indicator
+    /// the cap-kill consumer needs.
+    pub signal: Option<i32>,
 }
 
 impl LastExitProbe {
@@ -552,6 +586,7 @@ impl LastExitProbe {
             kills_dir,
             kills_baseline,
             uid,
+            operator_kill_requested: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -559,6 +594,28 @@ impl LastExitProbe {
     pub fn set_kernel(&self, status: KernelExitStatus) {
         let mut slot = self.kernel.lock().unwrap_or_else(|p| p.into_inner());
         *slot = Some(status);
+    }
+
+    /// Mark that an operator-initiated kill (the `kill_session`
+    /// RPC) is about to fire, BEFORE the pidfd-SIGKILL goes out.
+    /// Slice 10d watcher-fix #4: prevents the signal exit that
+    /// follows from being misattributed as a cap kill when a
+    /// transient `protected`/`no_pids`/`already_dead` record
+    /// happens to exist past baseline.
+    ///
+    /// Idempotent — setting twice has no effect, and a kill
+    /// initiated by the cap-watcher path (which writes a
+    /// `killed_by_us` record) supersedes via the priority order
+    /// inside `is_cap_kill`.
+    pub fn mark_operator_kill_requested(&self) {
+        self.operator_kill_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Read the operator-kill flag for the `is_cap_kill` join.
+    pub fn operator_kill_requested(&self) -> bool {
+        self.operator_kill_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// True once the reaper has populated kernel exit. Used by
@@ -572,16 +629,27 @@ impl LastExitProbe {
 
     /// Snapshot the End-frame payload's `(exit_code, memory_cap_kill)`.
     /// Reads kernel exit from the cached slot; scans the kill log
-    /// AT THIS MOMENT for memory_cap_kill — that's the lazy
+    /// AT THIS MOMENT for `memory_cap_kill` — that's the lazy
     /// classification that closes the slice-10c-e-2 review-6
     /// race.
+    ///
+    /// Slice 10d watcher-fix #1.5: `memory_cap_kill` is now the
+    /// join of `kill_status` (most-decisive record past baseline)
+    /// with the kernel's `WTERMSIG` via [`crate::reaper::is_cap_kill`].
+    /// A clean exit with a `protected`/`no_pids`/`already_dead`
+    /// record no longer fires the toast — that's the transient
+    /// soft-limit breach case the watcher records but the kernel
+    /// never had to escalate. Only `killed_by_us` (the watcher's
+    /// own kill) is unconditionally cap-kill.
     pub fn snapshot(&self) -> (Option<i32>, bool) {
-        let code = self
+        let kernel_snapshot: Option<KernelExitStatus> = self
             .kernel
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .and_then(|k| k.code);
+            .clone();
+        let code = kernel_snapshot.as_ref().and_then(|k| k.code);
+        let signal = kernel_snapshot.as_ref().and_then(|k| k.signal);
+        let operator_kill = self.operator_kill_requested();
         let memory_cap_kill = match &self.kills_dir {
             Some(dir) => {
                 let probe = crate::reaper::probe_kill_log_since(
@@ -589,7 +657,11 @@ impl LastExitProbe {
                     &self.uid,
                     self.kills_baseline,
                 );
-                probe.memory_cap_kill
+                crate::reaper::is_cap_kill(
+                    probe.kill_status.as_deref(),
+                    signal,
+                    operator_kill,
+                )
             }
             None => false,
         };
@@ -698,6 +770,21 @@ pub struct DaemonSession {
     /// unconditionally — breaking the "memory-cap kill on
     /// attached sessions surfaces via End frame" criterion.
     pub last_exit: SharedLastExit,
+    /// Optional cgroup-OOM watcher thread handle (slice
+    /// 10d-memory-cap-relocation review fix). `Some` for sessions
+    /// spawned with a memory cap; `None` otherwise. The handle is
+    /// detached on session removal — the watcher's main loop
+    /// self-terminates when the cgroup vanishes (which happens
+    /// after the session's child exits and systemd cleans up
+    /// the scope), so a synchronous join would only block the
+    /// reaper-cleanup path without adding safety.
+    ///
+    /// The field exists primarily so `start_session` can attach
+    /// the handle to the registry-resident session at the same
+    /// instant the session is inserted — if `Drop` of
+    /// `DaemonSession` ever needs to do bounded join in the
+    /// future, the handle is here. For now, drop = detach.
+    pub watcher_handle: Option<JoinHandle<()>>,
 }
 
 /// Phase-1 result of [`DaemonSession::spawn`]. Holds a live child
@@ -761,6 +848,23 @@ struct PendingSessionInner {
 }
 
 impl PendingSession {
+    /// Spawned child's OS PID. Used by `start_session` for
+    /// /proc-based cgroup discovery (slice 10d watcher-fix #1
+    /// "never trust a path that wasn't read from /proc"). The
+    /// PID is valid from spawn through either `arm_reaper`
+    /// (which consumes the inner state) or `Drop` (which uses
+    /// it to issue the cleanup pidfd-SIGKILL via `inner`).
+    ///
+    /// Panics if called after `arm_reaper` has taken `inner` —
+    /// a programmer error, since the PID becomes meaningless
+    /// once it's owned by the live `DaemonSession`.
+    pub fn pid(&self) -> libc::pid_t {
+        self.inner
+            .as_ref()
+            .map(|i| i.pid)
+            .expect("pid() called on already-armed PendingSession")
+    }
+
     /// **Phase 1** of session spawn. Opens a PTY pair, execs the
     /// requested command against the slave, opens a pidfd bound to
     /// the child, spawns the reader thread that drains the master
@@ -1012,6 +1116,12 @@ impl PendingSession {
                 // cgroup-OOM writer and `waitpid`.
                 last_exit_for_reaper.set_kernel(KernelExitStatus {
                     code: status.code,
+                    // Slice 10d watcher-fix #1.5: signal is what
+                    // distinguishes a kernel kill (signal-exit) from
+                    // a clean exit-with-transient-soft-breach. The
+                    // lazy `LastExitProbe::snapshot` reads both and
+                    // joins with kill_status via `is_cap_kill`.
+                    signal: status.signal,
                 });
 
                 if let Some(cb) = on_exit {
@@ -1044,6 +1154,14 @@ impl PendingSession {
             _reaper_handle: reaper_handle,
             _master: master,
             last_exit,
+            // Filled in by `start_session` after arm_reaper returns
+            // when a memory cap was applied (slice 10d-memory-cap-
+            // relocation review fix). The two-step assignment is
+            // structurally important: arm_reaper is on the spawn
+            // hot path and shouldn't care about the watcher's
+            // existence, while `start_session` is where the
+            // watcher's lifetime decisions are made.
+            watcher_handle: None,
         })
     }
 }

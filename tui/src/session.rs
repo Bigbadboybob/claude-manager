@@ -123,7 +123,18 @@ impl Session {
         // `systemd-run --user --scope` transient unit. The caller has
         // already verified preflight; `Some(MemoryCap)` here is an
         // unconditional "wrap me".
-        let (final_shell, final_args, cgroup_path) = wrap_with_systemd_run(shell, args, &memory_cap);
+        //
+        // Slice 10d watcher-fix #1: the predicted path returned by
+        // `wrap_with_systemd_run` is no longer authoritative —
+        // post-spawn we discover the actual cgroup from
+        // `/proc/<pid>/cgroup`. The prediction stays useful as
+        // the `--unit=` flag and for unit-testing the wrapper, but
+        // the path that gets stashed on `Session.cgroup_path` (and
+        // handed to the watcher) is read from /proc. "Never trust
+        // a path that wasn't read from /proc" applies to local-spawn
+        // and daemon-spawn equally.
+        let (final_shell, final_args, _predicted_cgroup_path) =
+            wrap_with_systemd_run(shell, args, &memory_cap);
 
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(final_shell, final_args)),
@@ -148,29 +159,54 @@ impl Session {
         // bypassing the event loop channel for lower latency.
         let pty_writer = pty.file().try_clone()?;
 
-        // When wrapped, verify the systemd-run scope actually
-        // materialized AND has a process inside — `cgroup.procs`
-        // becomes non-empty as soon as systemd has set up the scope
-        // and the wrapper has exec'd into the agent. `tty::new` only
-        // knows that the systemd-run *binary* spawned; it can't see
-        // whether systemd-run then failed to create the scope
-        // (unit-name collision, cgroup-v2 quirk, user-manager refusal),
-        // and bare path existence is satisfied by stale scopes left
-        // over from previous TUI runs that didn't clean up. Without
-        // this check, the caller would swap a dead handle in over the
-        // previous live agent. See DESIGN_MEMORY_CAP.md § Failure modes.
+        // Slice 10d watcher-fix #1: discover the cgroup path by
+        // reading `/proc/<pid>/cgroup` rather than trusting the
+        // path `wrap_with_systemd_run` predicted. The kernel writes
+        // the cgroup of the live child PID; systemd-run will have
+        // moved the child into a `cm-sess-*.scope` cgroup if the
+        // scope setup completed, and the discovery helper verifies
+        // the basename matches that pattern. If it doesn't
+        // (systemd-run failed mid-setup, scope ended up elsewhere),
+        // bail before constructing the session — same recovery
+        // shape as the slice 10c-e-3b-fix4a verification arm.
         //
-        // Bail before `EventLoop::new`/`spawn` so we don't leak the
-        // event loop on a dead PTY; dropping `pty` and `pty_writer`
-        // here closes both fds.
-        if let Some(ref expected_cgroup) = cgroup_path {
-            if !wait_for_cgroup_active(expected_cgroup, Duration::from_millis(500)) {
+        // Dropping `pty` here closes the master fd, which SIGHUPs
+        // the child; alacritty's Pty Drop also `wait()`s the child.
+        // No process leak.
+        let cgroup_path: Option<PathBuf> = if memory_cap.is_some() {
+            let child_pid = pty.child().id();
+            match cm_daemon::path::discover_session_cgroup_path(
+                child_pid,
+                Duration::from_millis(500),
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "cgroup discovery from /proc/{}/cgroup failed: {} \
+                         (systemd-run did not produce the expected \
+                         cm-sess-*.scope hierarchy — likely a transient \
+                         systemd error or unit-name collision)",
+                        child_pid,
+                        e
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Belt-and-suspenders verification: cgroup is active
+        // (cgroup.procs non-empty). discover already verified the
+        // pattern and path existence; the active check confirms
+        // the kernel has actually moved the child into this cgroup.
+        // Same semantics as the daemon side for parity.
+        if let Some(ref discovered) = cgroup_path {
+            if !wait_for_cgroup_active(discovered, Duration::from_millis(500)) {
                 return Err(anyhow::anyhow!(
-                    "memory-cap scope did not materialize as active at {} within 500ms — \
-                     systemd-run likely failed (unit-name collision, scope refusal, \
-                     or stale lingering cgroup with no processes). Refusing to return a \
-                     Session over a dead PTY child.",
-                    expected_cgroup.display()
+                    "discovered cgroup {} has no procs within 500ms — \
+                     systemd-run scope is half-created. Refusing to return \
+                     a Session over a dead PTY child.",
+                    discovered.display()
                 ));
             }
         }
@@ -227,11 +263,13 @@ impl Session {
         // produce for a memory-capped local spawn (slice
         // 10c-e-3b-fix2). The cgroup-OOM watcher relocation in
         // slice 10d-memory-cap-relocation will pick this up.
-        // Mirror the daemon-echoed cgroup_path so the local
-        // Session has parity with what `Session::new` would
-        // produce for a memory-capped local spawn (slice
-        // 10c-e-3b-fix2). The cgroup-OOM watcher relocation in
-        // slice 10d-memory-cap-relocation will pick this up.
+        // The daemon-echoed cgroup_path mirrors what `Session::new`
+        // would produce for a memory-capped local spawn (slice
+        // 10c-e-3b-fix2). Slice 10d-memory-cap-relocation moved
+        // the cgroup-OOM watcher to the daemon side, so the TUI
+        // doesn't spawn its own watcher for this path — the
+        // daemon writes the kill-log records and the End frame
+        // surfaces them via `daemon_memory_cap_kill`.
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
             term: cs.term,
@@ -241,18 +279,17 @@ impl Session {
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
             exited: false,
             wakeup_times: Vec::new(),
-            // TODO(10d-memory-cap-relocation): a daemon-spawned
-            // session has its memory-cap watcher on the daemon
-            // side, not here. The TUI's `MemoryCap` struct is the
-            // local-spawn shape; leaving None until the watcher
-            // moves over. The End-frame's `memory_cap_kill` flag
-            // path is wired up below (`daemon_memory_cap_kill`)
-            // so cap kills DO surface the toast — but the
-            // *producer* of those kill records (the watcher
-            // writing into `~/.cm/memory_kills/`) doesn't run on
-            // the daemon side yet, so in practice the flag stays
-            // false until 10d-memory-cap-relocation ships the
-            // producer.
+            // Daemon-spawned sessions: the memory-cap watcher
+            // runs on the daemon side (slice 10d-memory-cap-
+            // relocation), writing into the SAME kill-log
+            // (`~/.cm/memory_kills/<uid>.jsonl`) that local-spawn
+            // sessions use. The End frame's `memory_cap_kill`
+            // flag carries the daemon's attribution decision up
+            // through `daemon_memory_cap_kill` to the exit
+            // handler (fix4b consumer chain). The TUI's
+            // `MemoryCap` struct is the local-spawn shape and
+            // stays `None` here — there's no local watcher to
+            // describe.
             memory_cap: None,
             cgroup_path,
             daemon_session_uid: Some(cs.session_uid),

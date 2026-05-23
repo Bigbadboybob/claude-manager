@@ -1332,7 +1332,14 @@ mod tests {
         ));
 
         // Step 1: set kernel exit. This is what the reaper does.
-        probe.set_kernel(KernelExitStatus { code: None });
+        // Signal-killed exit (no WEXITSTATUS); we use signal=9
+        // to model a SIGKILL — what slice 10d watcher-fix #1.5
+        // requires for the kill-record + signal join to flag
+        // memory_cap_kill once a fresh kill record exists.
+        probe.set_kernel(KernelExitStatus {
+            code: None,
+            signal: Some(9),
+        });
 
         // Step 2: snapshot now — no kill record present, so
         // memory_cap_kill must be false.

@@ -1,5 +1,25 @@
 //! `cm-daemon` library entry points and shared modules.
 //!
+//! ## Linux-only
+//!
+//! Slice 10d watcher-fix #2 (build portability): the daemon is **Linux-
+//! only by construction** — it owns pidfd (`libc::SYS_pidfd_open` /
+//! `pidfd_send_signal`), cgroup-v2 (`/sys/fs/cgroup` reads, `memory.events`
+//! polling, `cgroup.procs` enumeration), `/proc/<pid>/cgroup` discovery,
+//! and `systemd-run --user --scope` integration. The pre-fix-#2
+//! per-module `#[cfg(any(target_os = "linux", test))]` gates and
+//! `#[cfg(not(target_os = "linux"))]` stubs were misleading: they
+//! suggested portability the daemon doesn't actually have, while
+//! breaking the build on non-Linux because unconditional refs (the
+//! `methods.rs` watcher-spawn arm, the `path.rs` cgroup helpers)
+//! would fail to resolve.
+//!
+//! Declaring the whole crate Linux-only at the root matches actual
+//! capability. Non-Linux developers can still build the TUI's
+//! non-daemon paths against a Linux-host daemon socket (or via the
+//! Python `mcp_server` shim) — they just can't run the daemon
+//! binary locally.
+//!
 //! The binary in `src/main.rs` is a thin shim that calls [`run`]; everything
 //! testable lives here so unit tests can drive the bind path against
 //! temp directories without spawning a subprocess.
@@ -28,12 +48,18 @@
 //!     handlers wire these into the dispatch table when control/
 //!     completes its relocation.
 
+// Slice 10d watcher-fix #2: declare the whole crate Linux-only.
+// Per-module gates inside the source files are removed so the
+// portability story is honest and single-source-of-truth.
+#![cfg(target_os = "linux")]
+
 pub mod attach;
 pub mod control;
 pub mod manifest;
 pub mod path;
 pub mod reaper;
 pub mod session;
+pub mod session_watch;
 pub mod state;
 pub mod workflow;
 pub mod worktree;

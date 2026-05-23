@@ -30,13 +30,139 @@ use crate::manifest::LastExit;
 /// the per-spawn baseline.
 #[derive(Debug, PartialEq, Eq)]
 pub struct KillProbe {
-    /// `true` iff there's at least one well-formed record past the
-    /// baseline offset.
-    pub memory_cap_kill: bool,
+    /// **Has** at least one well-formed record past the baseline
+    /// offset. NOT directly `memory_cap_kill` — see
+    /// [`is_cap_kill`] for the join with the kernel exit signal.
+    /// Slice 10d watcher-fix #1.5: pre-fix this was the answer;
+    /// post-fix we need the kill_status + exit_signal combination
+    /// to distinguish transient soft-limit breaches (clean exit)
+    /// from real cap kills.
+    pub has_record: bool,
+    /// Most-decisive `kill_status` from records past baseline.
+    /// `Some("killed_by_us")` if any record carries that status;
+    /// otherwise `Some("protected" | "no_pids" | "already_dead")`
+    /// from the latest such record; `Some("killed_by_us")` for
+    /// pre-fix-#2 records that lacked the field (forward-compat
+    /// — the pre-#2 TUI watcher only wrote records when it
+    /// actually killed). `None` when no records past baseline.
+    pub kill_status: Option<String>,
     /// Byte offset of the latest kill record's first byte within
     /// the file (absolute, not baseline-relative). `None` when no
     /// post-baseline records exist.
     pub kills_file_offset: Option<u64>,
+}
+
+/// Join the watcher's `kill_status` from the most-decisive
+/// post-baseline record with the kernel's `WTERMSIG` and the
+/// operator-kill flag to classify whether this exit was a
+/// memory-cap kill.
+///
+/// Slice 10d watcher-fix history:
+///   - **#1.5**: added the `kill_status × signal` join so
+///     transient soft-limit breaches don't fire a toast on
+///     clean exit.
+///   - **#4**: added the `operator_kill_requested` dimension
+///     for `protected`/`no_pids`/`already_dead` rows so a
+///     transient breach record + operator A-w doesn't
+///     misattribute as cap-kill.
+///   - **#5** (this round): extended the operator override to
+///     `killed_by_us` rows too. The `killed_by_us` record
+///     proves the watcher *attempted* a SIGKILL, not that the
+///     watcher's SIGKILL actually delivered the killing
+///     signal. In a rare concurrent race — watcher writes
+///     `killed_by_us` and the operator's `kill_session` RPC
+///     fires before the watcher's signal lands — the
+///     operator's pidfd-SIGKILL wins and was the proximate
+///     cause. The conservative rule "operator override always
+///     wins when set" accepts the rare cap-and-operator-
+///     concurrent-race case at the cost of clean attribution
+///     elsewhere, in exchange for never claiming cap-kill on
+///     an exit the operator initiated.
+///
+/// Decision table (post-#5):
+///   - `killed_by_us` + any exit + `!operator` → `true`
+///     (cap-driven kill, no operator involvement).
+///   - `killed_by_us` + any exit + `operator` → **`false`**
+///     (operator override; rare race accepted — see #5 above).
+///   - `protected` / `no_pids` / `already_dead`
+///       + signal exit + `!operator` → `true`
+///       (kernel `MemoryMax`-driven kill).
+///   - `protected` / `no_pids` / `already_dead`
+///       + signal exit + `operator` → `false`
+///       (operator-driven kill; the breach record is
+///       coincidental — don't surface a cap toast on a user-
+///       initiated A-w).
+///   - `protected` / `no_pids` / `already_dead` + clean exit
+///     → `false` (transient soft-limit recovery).
+///   - no record → `false` (no breach observed for this spawn).
+///
+/// Trade-off (#5): if the watcher genuinely SIGKILLed the
+/// agent AND an operator A-w fired concurrently (e.g., the
+/// user pressed A-w around the same instant the cgroup
+/// breached), the toast won't show "cap kill" — it'll show as
+/// an ordinary operator kill. We treat that as the safer
+/// failure mode: an operator who pressed A-w knows they did,
+/// and a missing cap-kill toast is less confusing than a
+/// "cap kill" toast on an exit they just initiated.
+///
+/// Slice 10d watcher-fix #7 (signal tightening): only
+/// `signal == Some(SIGKILL)` flips the `protected`/`no_pids`/
+/// `already_dead` rows. Pre-fix any signal exit did — a
+/// SIGTERM/SIGINT/SIGHUP/SIGABRT from the user (Ctrl-C in a
+/// detached agent, daemonized cleanup signal, etc.) would
+/// falsely render as cap-kill when a transient soft-limit
+/// record happened to sit past baseline. The kernel's
+/// `MemoryMax` enforcement sends SIGKILL specifically; other
+/// signals are user-driven and not cap-attributable. Constant
+/// is read from `libc::SIGKILL` so the comparison stays
+/// platform-correct.
+pub fn is_cap_kill(
+    kill_status: Option<&str>,
+    exit_signal: Option<i32>,
+    operator_kill_requested: bool,
+) -> bool {
+    // Operator override (slice 10d watcher-fix #5): when an
+    // operator-initiated kill is in flight, attribute the exit
+    // to the operator regardless of what record the watcher
+    // wrote. The `killed_by_us` race with `kill_session` is
+    // real (watcher wrote record but operator's pidfd-SIGKILL
+    // actually delivered the signal); the conservative rule
+    // accepts that case as non-cap-kill.
+    if operator_kill_requested {
+        return false;
+    }
+    match kill_status {
+        Some("killed_by_us") => true,
+        Some("protected") | Some("no_pids") | Some("already_dead") => {
+            // Slice 10d watcher-fix #7: only SIGKILL flips
+            // these rows. The kernel's MemoryMax enforcement
+            // sends SIGKILL specifically; SIGTERM/SIGINT/etc.
+            // are user-driven (Ctrl-C in a detached agent,
+            // explicit cleanup signal, …) and must NOT render
+            // as cap-kill on a transient breach record.
+            exit_signal == Some(libc::SIGKILL)
+        }
+        // Unknown status string → conservatively treat as
+        // non-kill (false-negative preferred over false-positive
+        // toast).
+        Some(_) => false,
+        // No post-baseline record → no breach observed.
+        None => false,
+    }
+}
+
+/// Priority order for picking the "most decisive" kill_status
+/// when multiple records exist past baseline. Higher = more
+/// decisive (the watcher actually killing trumps anything else
+/// — once we KillByUs'd a PID, the exit was caused by us).
+fn kill_status_priority(s: &str) -> u8 {
+    match s {
+        "killed_by_us" => 3,
+        "already_dead" => 2,
+        "protected" => 1,
+        "no_pids" => 1,
+        _ => 0,
+    }
 }
 
 /// Capture the current size of `<kills_dir>/<uid>.jsonl` so reap
@@ -102,7 +228,8 @@ pub fn probe_kill_log_since(kills_dir: &Path, uid: &str, baseline: u64) -> KillP
         Ok(b) => b,
         Err(_) => {
             return KillProbe {
-                memory_cap_kill: false,
+                has_record: false,
+                kill_status: None,
                 kills_file_offset: None,
             };
         }
@@ -111,37 +238,88 @@ pub fn probe_kill_log_since(kills_dir: &Path, uid: &str, baseline: u64) -> KillP
         // No growth since baseline — nothing was killed during
         // this spawn's lifetime, even if older records exist.
         return KillProbe {
-            memory_cap_kill: false,
+            has_record: false,
+            kill_status: None,
             kills_file_offset: None,
         };
     }
-    // The new content lives at `bytes[baseline..]`. Find the
-    // offset of the LAST record start within that slice and add
-    // `baseline` to get the absolute offset for the surfaced
-    // `kills_file_offset`.
+    // The new content lives at `bytes[baseline..]`. Walk it
+    // line by line, parse each record as JSON, pull out the
+    // `kill_status` field (slice 10d watcher-fix #2). Pick
+    // the most-decisive status per `kill_status_priority`.
+    //
+    // Forward-compat: pre-fix-#2 records (TUI local-spawn, or
+    // pre-relocation daemon paths) lack the field — default to
+    // `"killed_by_us"` because those producers only wrote
+    // records when they actually killed.
     let baseline_usize = baseline as usize;
     let new_content = &bytes[baseline_usize..];
     let last_start_in_new = last_record_offset(new_content) as usize;
+
+    let mut best_status: Option<String> = None;
+    let mut best_priority: u8 = 0;
+    for line in new_content.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        // Best-effort UTF-8 + JSON parse; malformed lines are
+        // skipped (a parser bug or partial write shouldn't
+        // poison the probe). The default-killed_by_us fallback
+        // also kicks in on parse failure, mirroring the forward-
+        // compat reasoning above — any well-formed-looking
+        // record past baseline is at minimum evidence the
+        // producer thought it was a kill.
+        let s = match std::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let status_str = match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => v.get("kill_status")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "killed_by_us".to_string()),
+            Err(_) => continue,
+        };
+        let prio = kill_status_priority(&status_str);
+        if prio > best_priority {
+            best_priority = prio;
+            best_status = Some(status_str);
+        } else if best_status.is_none() {
+            best_status = Some(status_str);
+        }
+    }
     KillProbe {
-        memory_cap_kill: true,
+        has_record: true,
+        kill_status: best_status,
         kills_file_offset: Some(baseline + last_start_in_new as u64),
     }
 }
 
 /// Construct a [`LastExit`] for a session that just exited.
 /// `baseline` is the file-size snapshot captured at spawn time;
-/// `code` and `exited_at` come from the daemon's session reaper.
+/// `code`, `signal`, `operator_kill_requested`, and `exited_at`
+/// come from the daemon's session reaper / kill_session RPC.
+///
+/// Slice 10d watcher-fix #1.5 added the `signal` join; #4 added
+/// `operator_kill_requested` so an operator-driven A-w (the
+/// `kill_session` RPC's pidfd-SIGKILL) doesn't get
+/// misattributed when a transient `protected`/`no_pids`/`already_dead`
+/// record happens to sit past baseline.
 pub fn build_last_exit_since(
     kills_dir: &Path,
     uid: &str,
     baseline: u64,
     code: Option<i32>,
+    signal: Option<i32>,
+    operator_kill_requested: bool,
     exited_at: f64,
 ) -> LastExit {
     let probe = probe_kill_log_since(kills_dir, uid, baseline);
+    let memory_cap_kill =
+        is_cap_kill(probe.kill_status.as_deref(), signal, operator_kill_requested);
     LastExit {
         code,
-        memory_cap_kill: probe.memory_cap_kill,
+        memory_cap_kill,
         kills_file_offset: probe.kills_file_offset,
         exited_at,
     }
@@ -206,9 +384,19 @@ mod tests {
 
     fn sample_record(rec_id: u32) -> String {
         // Shape mirrors session_watch::write_kill_log_to.
+        // Pre-fix-#2 records lacked `kill_status` — the
+        // probe's forward-compat default treats them as
+        // `killed_by_us`, which is what these tests assume.
         format!(
             r#"{{"ts":1700000000,"session_uid":"ts-x","pid":{},"comm":"claude","argc":2,"argv_sha256_prefix":"deadbeef","rss_kb":1024,"soft_cap_bytes":104857600,"hard_cap_bytes":209715200}}"#,
             rec_id
+        )
+    }
+
+    fn sample_record_with_status(rec_id: u32, status: &str) -> String {
+        format!(
+            r#"{{"ts":1700000000,"session_uid":"ts-x","pid":{},"comm":"claude","argc":2,"argv_sha256_prefix":"deadbeef","rss_kb":1024,"soft_cap_bytes":104857600,"hard_cap_bytes":209715200,"kill_status":"{}"}}"#,
+            rec_id, status
         )
     }
 
@@ -259,8 +447,8 @@ mod tests {
     #[test]
     fn probe_with_no_growth_returns_no_kill_even_if_file_is_nonempty() {
         // The regression the reviewer caught: a UID with stale
-        // historical kills must NOT report `memory_cap_kill: true`
-        // on subsequent clean exits.
+        // historical kills must NOT report a post-baseline
+        // record on subsequent clean exits.
         let _g = lock();
         let tmp = TempDir::new().unwrap();
         let stale = format!("{}\n", sample_record(1));
@@ -272,10 +460,11 @@ mod tests {
         assert_eq!(
             probe,
             KillProbe {
-                memory_cap_kill: false,
+                has_record: false,
+                kill_status: None,
                 kills_file_offset: None,
             },
-            "stale kills under a reused UID must not flag this exit",
+            "stale kills under a reused UID must not surface this exit",
         );
     }
 
@@ -291,7 +480,10 @@ mod tests {
         append_log(&tmp, "ts-fresh", &fresh);
 
         let probe = probe_kill_log_since(tmp.path(), "ts-fresh", baseline);
-        assert!(probe.memory_cap_kill);
+        assert!(probe.has_record);
+        // Pre-#2 record without kill_status → forward-compat
+        // default of "killed_by_us".
+        assert_eq!(probe.kill_status.as_deref(), Some("killed_by_us"));
         assert_eq!(
             probe.kills_file_offset,
             Some(baseline),
@@ -317,7 +509,7 @@ mod tests {
         append_log(&tmp, "ts-mixed", &fresh);
 
         let probe = probe_kill_log_since(tmp.path(), "ts-mixed", baseline);
-        assert!(probe.memory_cap_kill);
+        assert!(probe.has_record);
         assert_eq!(
             probe.kills_file_offset,
             Some(baseline),
@@ -349,7 +541,7 @@ mod tests {
         append_log(&tmp, "ts-multi", &format!("{}\n{}\n{}\n", r1, r2, r3));
 
         let probe = probe_kill_log_since(tmp.path(), "ts-multi", baseline);
-        assert!(probe.memory_cap_kill);
+        assert!(probe.has_record);
         let expected = baseline + (r1.len() + 1 + r2.len() + 1) as u64;
         assert_eq!(probe.kills_file_offset, Some(expected));
     }
@@ -365,7 +557,8 @@ mod tests {
         assert_eq!(
             probe,
             KillProbe {
-                memory_cap_kill: false,
+                has_record: false,
+                kill_status: None,
                 kills_file_offset: None,
             }
         );
@@ -382,7 +575,7 @@ mod tests {
         append_log(&tmp, "ts-no-nl", &sample_record(1));
 
         let probe = probe_kill_log_since(tmp.path(), "ts-no-nl", baseline);
-        assert!(probe.memory_cap_kill);
+        assert!(probe.has_record);
         assert_eq!(probe.kills_file_offset, Some(baseline));
     }
 
@@ -402,6 +595,8 @@ mod tests {
             "ts-respawn",
             baseline,
             Some(0),
+            None, // no signal — clean exit
+            false, // no operator kill
             1_700_000_002.0,
         );
         assert_eq!(exit.code, Some(0));
@@ -418,17 +613,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let baseline = capture_baseline_for_spawn(tmp.path(), "ts-killed").unwrap();
 
-        // Cgroup fires during this spawn.
+        // Cgroup fires during this spawn. Pre-#2 format (no
+        // kill_status field) → forward-compat as killed_by_us.
         append_log(&tmp, "ts-killed", &format!("{}\n", sample_record(1)));
 
         let exit = build_last_exit_since(
             tmp.path(),
             "ts-killed",
             baseline,
-            Some(137),
+            None,
+            Some(9), // SIGKILL — kernel signal
+            false,   // no operator kill — this was kernel-driven
             1_700_000_003.0,
         );
-        assert_eq!(exit.code, Some(137));
+        assert_eq!(exit.code, None);
         assert!(exit.memory_cap_kill);
         assert_eq!(exit.kills_file_offset, Some(baseline));
         assert_eq!(exit.exited_at, 1_700_000_003.0);
@@ -439,9 +637,426 @@ mod tests {
         let _g = lock();
         let tmp = TempDir::new().unwrap();
         let baseline = capture_baseline_for_spawn(tmp.path(), "ts-signal").unwrap();
-        let exit = build_last_exit_since(tmp.path(), "ts-signal", baseline, None, 0.0);
+        let exit = build_last_exit_since(
+            tmp.path(),
+            "ts-signal",
+            baseline,
+            None,
+            None,
+            false,
+            0.0,
+        );
         assert_eq!(exit.code, None);
         assert!(!exit.memory_cap_kill);
+    }
+
+    // ============================================================
+    // Slice 10d watcher-fix #1.5: `is_cap_kill` table — pin each
+    // row of the kill_status × exit_signal decision matrix.
+    // ============================================================
+
+    #[test]
+    fn is_cap_kill_killed_by_us_always_true_regardless_of_signal() {
+        // The watcher killed the target itself. Whether the
+        // resulting waitpid surface was a code (very rare —
+        // would require the process catching SIGTERM and
+        // doing exit(N)) or a signal (the SIGKILL we sent),
+        // the cap-kill flag must be true: WE caused the exit.
+        assert!(is_cap_kill(Some("killed_by_us"), Some(9), false));  // SIGKILL
+        assert!(is_cap_kill(Some("killed_by_us"), Some(15), false)); // SIGTERM caught + re-exited?
+        assert!(is_cap_kill(Some("killed_by_us"), None, false));     // clean exit somehow
+    }
+
+    #[test]
+    fn is_cap_kill_protected_plus_sigkill_exit_is_true() {
+        // Slice 10d watcher-fix #7: only SIGKILL flips
+        // `protected`. Pre-fix this test included `Some(15)`
+        // (SIGTERM) → updated to only SIGKILL since SIGTERM
+        // is not how the kernel's MemoryMax kills.
+        assert!(is_cap_kill(Some("protected"), Some(libc::SIGKILL), false));
+        // Re-asserted via libc constant rather than the raw 9
+        // literal so the comparison stays platform-correct.
+    }
+
+    #[test]
+    fn is_cap_kill_protected_plus_clean_exit_is_false() {
+        // The transient soft-limit breach case — the watcher
+        // saw memory.events.high increment but the process
+        // recovered (kernel reclaimed pages) and exited
+        // cleanly. NOT a cap kill; no toast.
+        assert!(!is_cap_kill(Some("protected"), None, false));
+    }
+
+    #[test]
+    fn is_cap_kill_no_pids_plus_signal_exit_is_true() {
+        assert!(is_cap_kill(Some("no_pids"), Some(9), false));
+    }
+
+    #[test]
+    fn is_cap_kill_no_pids_plus_clean_exit_is_false() {
+        // Empty cgroup at breach time, then clean exit — the
+        // breach must have been a transient artifact (e.g.
+        // scope teardown race).
+        assert!(!is_cap_kill(Some("no_pids"), None, false));
+    }
+
+    #[test]
+    fn is_cap_kill_already_dead_plus_signal_exit_is_true() {
+        assert!(is_cap_kill(Some("already_dead"), Some(9), false));
+    }
+
+    #[test]
+    fn is_cap_kill_already_dead_plus_clean_exit_is_false() {
+        // Target exited between our PID enumeration and the
+        // signal attempt. If the child then went on to a
+        // clean parent-exit, it wasn't a cap kill.
+        assert!(!is_cap_kill(Some("already_dead"), None, false));
+    }
+
+    #[test]
+    fn is_cap_kill_no_record_is_false_regardless_of_signal() {
+        // No record past baseline = no breach observed
+        // during this spawn. Even if the kernel sent a
+        // signal (e.g. operator-issued SIGKILL via A-w), it
+        // wasn't a cap kill.
+        assert!(!is_cap_kill(None, Some(9), false));
+        assert!(!is_cap_kill(None, None, false));
+    }
+
+    #[test]
+    fn is_cap_kill_unknown_status_string_is_false() {
+        // A status field that doesn't match any of our four
+        // known strings → defensive `false`. A producer bug
+        // shouldn't produce phantom toasts.
+        assert!(!is_cap_kill(Some("future_status_we_dont_know"), Some(9), false));
+    }
+
+    /// Slice 10d watcher-fix #1.5 priority: when both
+    /// `killed_by_us` and lower-priority records exist past
+    /// baseline (e.g. a transient `protected` breach followed
+    /// by a later `killed_by_us`), the probe must surface
+    /// the more-decisive status. This drives the truthiness
+    /// in `is_cap_kill`.
+    #[test]
+    fn probe_picks_killed_by_us_when_mixed_with_lower_priority() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-mixed-statuses").unwrap();
+        let r1 = sample_record_with_status(1, "protected");
+        let r2 = sample_record_with_status(2, "killed_by_us");
+        append_log(&tmp, "ts-mixed-statuses", &format!("{}\n{}\n", r1, r2));
+        let probe = probe_kill_log_since(tmp.path(), "ts-mixed-statuses", baseline);
+        assert_eq!(probe.kill_status.as_deref(), Some("killed_by_us"));
+    }
+
+    /// Symmetric: when only lower-priority statuses exist,
+    /// the probe still surfaces one (so `is_cap_kill` can
+    /// combine with the kernel signal).
+    #[test]
+    fn probe_picks_lower_priority_when_no_killed_by_us() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-prot-only").unwrap();
+        let r1 = sample_record_with_status(1, "protected");
+        append_log(&tmp, "ts-prot-only", &format!("{}\n", r1));
+        let probe = probe_kill_log_since(tmp.path(), "ts-prot-only", baseline);
+        assert_eq!(probe.kill_status.as_deref(), Some("protected"));
+    }
+
+    /// build_last_exit_since integration: a `protected`
+    /// record + signal exit → memory_cap_kill: true.
+    #[test]
+    fn build_last_exit_protected_record_plus_signal_is_cap_kill() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-prot-sig").unwrap();
+        append_log(
+            &tmp,
+            "ts-prot-sig",
+            &format!("{}\n", sample_record_with_status(1, "protected")),
+        );
+        let exit = build_last_exit_since(
+            tmp.path(),
+            "ts-prot-sig",
+            baseline,
+            None,
+            Some(9),
+            false, // no operator kill — pure kernel-driven
+            0.0,
+        );
+        assert!(exit.memory_cap_kill);
+    }
+
+    /// build_last_exit_since integration: a `protected`
+    /// record + clean exit → memory_cap_kill: false (the
+    /// transient soft-limit recovery case).
+    #[test]
+    fn build_last_exit_protected_record_plus_clean_exit_is_not_cap_kill() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-prot-clean").unwrap();
+        append_log(
+            &tmp,
+            "ts-prot-clean",
+            &format!("{}\n", sample_record_with_status(1, "protected")),
+        );
+        let exit = build_last_exit_since(
+            tmp.path(),
+            "ts-prot-clean",
+            baseline,
+            Some(0),
+            None,
+            false,
+            0.0,
+        );
+        assert!(
+            !exit.memory_cap_kill,
+            "transient soft-limit breach + clean exit must NOT flag cap-kill",
+        );
+    }
+
+    // ============================================================
+    // Slice 10d watcher-fix #4: operator-kill flag. Four
+    // table rows from the review.
+    // ============================================================
+
+    /// Slice 10d watcher-fix #5: the operator-kill override
+    /// is conservative — when `operator_kill_requested == true`,
+    /// `killed_by_us` is NOT enough to flip the flag.
+    ///
+    /// Pre-#5 we treated `killed_by_us` as unconditional cap-
+    /// kill. But the record only proves the watcher *attempted*
+    /// a SIGKILL — not that the watcher's signal actually
+    /// delivered the killing blow. In a concurrent race
+    /// (watcher writes record → operator's `kill_session` RPC
+    /// fires before the watcher's signal lands → operator's
+    /// pidfd-SIGKILL wins) the operator was the proximate
+    /// cause, and surfacing a cap-kill toast on an operator-
+    /// initiated A-w is the wrong failure mode.
+    ///
+    /// Trade-off: if the watcher GENUINELY caused the death
+    /// and an operator A-w fired concurrently (rare), the
+    /// toast won't show cap-kill. We accept that case in
+    /// exchange for never falsely claiming cap-kill on an
+    /// operator-initiated exit.
+    #[test]
+    fn is_cap_kill_operator_overrides_killed_by_us_in_race() {
+        // Non-operator case stays true (pure cap-driven kill).
+        assert!(is_cap_kill(Some("killed_by_us"), Some(9), false));
+        assert!(is_cap_kill(Some("killed_by_us"), None, false));
+        // Operator override — false (conservative). Rare race
+        // where the watcher wrote a kill record but the
+        // operator's pidfd-SIGKILL actually delivered the
+        // killing signal.
+        assert!(!is_cap_kill(Some("killed_by_us"), Some(9), true));
+        assert!(!is_cap_kill(Some("killed_by_us"), Some(15), true));
+        assert!(!is_cap_kill(Some("killed_by_us"), None, true));
+    }
+
+    /// Row 2: kernel-driven `MemoryMax` kill — protected record
+    /// past baseline + signal exit + no operator kill. This is
+    /// what fix #1.5 made true; fix #4 keeps it that way when
+    /// `operator_kill_requested == false`.
+    #[test]
+    fn is_cap_kill_protected_plus_signal_no_operator_is_true() {
+        assert!(is_cap_kill(Some("protected"), Some(9), false));
+        assert!(is_cap_kill(Some("no_pids"), Some(9), false));
+        assert!(is_cap_kill(Some("already_dead"), Some(9), false));
+    }
+
+    /// Row 3 — the false-positive #4 closes: operator A-w on a
+    /// session that ALSO had a transient `protected`/`no_pids`/
+    /// `already_dead` record. The signal exit comes from the
+    /// operator's pidfd-SIGKILL, not from the cgroup. Must NOT
+    /// render as cap kill.
+    #[test]
+    fn is_cap_kill_protected_plus_signal_with_operator_kill_is_false() {
+        assert!(!is_cap_kill(Some("protected"), Some(9), true));
+        assert!(!is_cap_kill(Some("no_pids"), Some(9), true));
+        assert!(!is_cap_kill(Some("already_dead"), Some(9), true));
+    }
+
+    /// Row 4: clean exit cases are unaffected by the operator
+    /// flag — clean exit can't have been driven by a SIGKILL
+    /// from any source.
+    #[test]
+    fn is_cap_kill_clean_exit_is_false_regardless_of_operator_flag() {
+        assert!(!is_cap_kill(Some("protected"), None, false));
+        assert!(!is_cap_kill(Some("protected"), None, true));
+        assert!(!is_cap_kill(Some("no_pids"), None, true));
+    }
+
+    /// And: no record + operator kill is still false (no breach
+    /// observed; whatever the operator did is irrelevant to the
+    /// cap-kill flag).
+    #[test]
+    fn is_cap_kill_no_record_plus_operator_is_false() {
+        assert!(!is_cap_kill(None, Some(9), true));
+        assert!(!is_cap_kill(None, None, true));
+    }
+
+    // ============================================================
+    // Slice 10d watcher-fix #7: SIGKILL-specific rows. Only
+    // SIGKILL (== libc::SIGKILL == 9) flips the cap-kill flag
+    // on `protected`/`no_pids`/`already_dead` records. Other
+    // signals (SIGTERM, SIGINT, SIGHUP, SIGABRT, …) are user-
+    // driven and don't reflect cgroup MemoryMax enforcement.
+    // ============================================================
+
+    /// Pin: SIGKILL specifically flips `protected` row → true.
+    /// (Re-asserts existing behavior with the explicit libc
+    /// constant.)
+    #[test]
+    fn is_cap_kill_protected_plus_sigkill_is_true() {
+        assert!(is_cap_kill(Some("protected"), Some(libc::SIGKILL), false));
+        assert!(is_cap_kill(Some("no_pids"), Some(libc::SIGKILL), false));
+        assert!(is_cap_kill(Some("already_dead"), Some(libc::SIGKILL), false));
+    }
+
+    /// Slice 10d watcher-fix #7 named acceptance: SIGTERM
+    /// MUST NOT flip cap-kill. Kernel `MemoryMax` sends
+    /// SIGKILL specifically; SIGTERM is operator-friendly
+    /// cleanup, e.g. service-manager `systemctl stop` or
+    /// manual `kill -TERM`.
+    #[test]
+    fn is_cap_kill_protected_plus_sigterm_is_false() {
+        assert!(!is_cap_kill(Some("protected"), Some(libc::SIGTERM), false));
+        assert!(!is_cap_kill(Some("no_pids"), Some(libc::SIGTERM), false));
+        assert!(!is_cap_kill(Some("already_dead"), Some(libc::SIGTERM), false));
+    }
+
+    /// Sweep other common signals — none should flip.
+    #[test]
+    fn is_cap_kill_protected_plus_non_sigkill_signal_is_false() {
+        for signal in &[
+            libc::SIGINT,
+            libc::SIGHUP,
+            libc::SIGQUIT,
+            libc::SIGABRT,
+            libc::SIGPIPE,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+        ] {
+            assert!(
+                !is_cap_kill(Some("protected"), Some(*signal), false),
+                "signal {} flipped cap-kill on protected (only SIGKILL should)",
+                signal
+            );
+            assert!(
+                !is_cap_kill(Some("no_pids"), Some(*signal), false),
+                "signal {} flipped cap-kill on no_pids",
+                signal
+            );
+            assert!(
+                !is_cap_kill(Some("already_dead"), Some(*signal), false),
+                "signal {} flipped cap-kill on already_dead",
+                signal
+            );
+        }
+    }
+
+    /// Operator + SIGKILL is still false (operator override
+    /// wins regardless of signal — fix #5a).
+    #[test]
+    fn is_cap_kill_protected_plus_sigkill_with_operator_is_false() {
+        assert!(!is_cap_kill(Some("protected"), Some(libc::SIGKILL), true));
+    }
+
+    /// `build_last_exit_since` integration: a `protected`
+    /// record + SIGTERM → false (slice 10d watcher-fix #7).
+    #[test]
+    fn build_last_exit_protected_plus_sigterm_is_not_cap_kill() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-sigterm").unwrap();
+        append_log(
+            &tmp,
+            "ts-sigterm",
+            &format!("{}\n", sample_record_with_status(1, "protected")),
+        );
+        let exit = build_last_exit_since(
+            tmp.path(),
+            "ts-sigterm",
+            baseline,
+            None,
+            Some(libc::SIGTERM),
+            false,
+            0.0,
+        );
+        assert!(
+            !exit.memory_cap_kill,
+            "SIGTERM is not how the kernel kills via MemoryMax — must NOT flag",
+        );
+    }
+
+    /// `build_last_exit_since` integration for fix #4: a
+    /// capped session with a `protected` record past baseline,
+    /// signal exit, AND operator_kill_requested=true → exit
+    /// reports `memory_cap_kill: false` (operator-driven kill).
+    #[test]
+    fn build_last_exit_protected_plus_operator_kill_is_not_cap_kill() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-op-kill").unwrap();
+        append_log(
+            &tmp,
+            "ts-op-kill",
+            &format!("{}\n", sample_record_with_status(1, "protected")),
+        );
+        let exit = build_last_exit_since(
+            tmp.path(),
+            "ts-op-kill",
+            baseline,
+            None,
+            Some(9), // signal-killed
+            true,    // by the operator (A-w)
+            0.0,
+        );
+        assert!(
+            !exit.memory_cap_kill,
+            "operator A-w on a session with a transient protected breach must \
+             NOT render as cap-kill — the operator initiated the kill, the \
+             breach record is coincidental",
+        );
+    }
+
+    /// Slice 10d watcher-fix #5: `killed_by_us` past baseline +
+    /// operator kill → **NOT** cap-kill (conservative operator
+    /// override). The `killed_by_us` record proves the watcher
+    /// *attempted* a SIGKILL; in a concurrent race with the
+    /// operator's `kill_session` RPC, the operator's pidfd-
+    /// SIGKILL can win. We attribute to the operator to avoid
+    /// surfacing a cap-kill toast on an operator-initiated
+    /// exit.
+    ///
+    /// Pre-#5 this test asserted `true`; the rename + invert
+    /// reflects the conservative-override rule.
+    #[test]
+    fn build_last_exit_killed_by_us_plus_operator_kill_is_overridden() {
+        let _g = lock();
+        let tmp = TempDir::new().unwrap();
+        let baseline = capture_baseline_for_spawn(tmp.path(), "ts-cap-vs-op").unwrap();
+        append_log(
+            &tmp,
+            "ts-cap-vs-op",
+            &format!("{}\n", sample_record_with_status(1, "killed_by_us")),
+        );
+        let exit = build_last_exit_since(
+            tmp.path(),
+            "ts-cap-vs-op",
+            baseline,
+            None,
+            Some(9),
+            true, // operator A-w fired
+            0.0,
+        );
+        assert!(
+            !exit.memory_cap_kill,
+            "operator override applies to killed_by_us too — the watcher's \
+             record proves it tried to SIGKILL, not that it caused the \
+             death; an operator A-w racing with the watcher's signal can \
+             win, and we attribute to the operator (conservative)",
+        );
     }
 
     // --- kill_log_path -----------------------------------------------

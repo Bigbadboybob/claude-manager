@@ -185,19 +185,27 @@ struct StartSessionParams {
     /// in place; the producer is the missing piece.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_cap_bytes: Option<u64>,
-    /// Predicted cgroup path for the spawned session's
-    /// systemd-run scope (slice 10c-e-3b-fix2). The TUI computes
-    /// this in `wrap_with_systemd_run` and passes it through; the
-    /// daemon stores it on `DaemonSession.cgroup_path` and echoes
-    /// it in the `start_session` response so the TUI's
-    /// `Session.cgroup_path` mirrors the local-spawn shape.
-    ///
-    /// Daemon doesn't currently *do* anything with this beyond
-    /// the echo + future-watcher hook — slice
-    /// 10d-memory-cap-relocation will pick it up.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cgroup_path: Option<String>,
 }
+
+// Slice 10d-memory-cap-relocation review fix #1: the
+// previously-existing `cgroup_path: Option<String>` field
+// was REMOVED from this struct. Pre-fix the daemon trusted
+// the operator-supplied path and the watcher would signal
+// PIDs from it — a malicious caller could pre-populate a
+// path with PIDs from unrelated processes (shell, other
+// worker, etc.) and the daemon would SIGKILL them on the
+// first breach. Post-fix the daemon DISCOVERS the cgroup
+// from `/proc/<spawn-pid>/cgroup` after Phase 1 spawn (see
+// `crate::path::discover_session_cgroup_path`) — the path
+// is bound to *this* child by the kernel, not by the
+// caller's word.
+//
+// Serde's default behavior is to silently ignore unknown
+// fields (we do NOT use `#[serde(deny_unknown_fields)]`),
+// so old TUI builds that still emit `cgroup_path` in
+// `rpc_start_session` will continue to work; their value
+// is simply dropped on the floor. A behavioral test pins
+// this: `caller_supplied_cgroup_path_is_ignored`.
 
 fn default_cols() -> u16 {
     80
@@ -244,6 +252,27 @@ fn default_rows() -> u16 {
 pub fn start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
+) -> MethodResult {
+    start_session_with_spawn_fn(
+        state_arc,
+        params,
+        crate::session_watch::default_watcher_spawn_fn(),
+    )
+}
+
+/// Inner form that takes an injectable watcher-spawn factory.
+/// Slice 10d-memory-cap-relocation review fix.
+///
+/// Tests pass a factory that returns `Err(io::Error)` to exercise
+/// the spawn-failure path; production calls `start_session` which
+/// supplies the real `Builder::new().name().spawn()` factory.
+/// Surface kept `pub(crate)` so the focused failure-injection test
+/// in this file's `tests` module can reach it without exposing the
+/// injection to external callers.
+pub(crate) fn start_session_with_spawn_fn(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
 ) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
@@ -379,6 +408,15 @@ pub fn start_session(
         spawn_params.kills_dir = crate::path::default_kills_dir();
     }
 
+    // Stash a copy of kills_dir for the slice-10d watcher-spawn
+    // arm below: `spawn_params` is moved into
+    // `PendingSession::spawn` on the next line, so we can't
+    // reach back into it after spawn returns. The watcher needs
+    // the same directory the daemon's reaper-side classification
+    // path reads from — taking the value here ensures they agree.
+    let kills_dir_for_watcher: Option<std::path::PathBuf> =
+        spawn_params.kills_dir.clone();
+
     // === Phase 1: spawn child, no reaper yet. ===
     //
     // Done outside the state lock — spawn_command forks + execs
@@ -389,50 +427,174 @@ pub fn start_session(
     let pending = PendingSession::spawn(spawn_params)
         .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
 
-    // Slice 10c-e-3b-fix4a: post-spawn cgroup verification.
+    // Slice 10d watcher-fix #1: cgroup discovery from
+    // `/proc/<pid>/cgroup` — never trust a caller-supplied path.
     //
-    // When the caller indicated a memory cap (via
-    // `memory_cap_bytes` + `cgroup_path`), the spawned argv is a
-    // `systemd-run --user --scope ...` wrapper. systemd-run
-    // returns success as soon as the *binary* starts, but the
-    // scope itself can still fail to materialize (unit-name
-    // collision, transient systemd error, cgroup-v2 namespace
-    // quirk). Verify the cgroup is actually active before
-    // declaring start_session a success — without this, the
-    // daemon would echo back the predicted cgroup_path and the
-    // operator would believe the cap is in place while the
-    // child runs uncapped. Silent violation of the memory-cap
-    // acceptance criterion.
+    // Pre-fix the daemon trusted `params.cgroup_path` from the
+    // caller and the watcher signalled PIDs based on it. A buggy
+    // or malicious caller could pre-populate an existing cgroup
+    // with PIDs from unrelated processes (their shell, another
+    // worker, etc.), send that path in `start_session`, and have
+    // the daemon SIGKILL those processes on the first memory
+    // breach. Daemon's cgroup verification only checked the path
+    // had procs — not that those procs were *ours*.
     //
-    // Mirrors `tui/src/session.rs::wait_for_cgroup_active`
-    // semantics so local + daemon paths agree on what counts as
-    // a valid memory-capped spawn. Drop on `PendingSession`
-    // SIGKILLs the child if we bail here.
-    let verified_cgroup_path: Option<String> = match p.cgroup_path.as_deref() {
-        Some(predicted) => {
-            let path = PathBuf::from(predicted);
-            if !crate::path::wait_for_cgroup_active(&path, std::time::Duration::from_millis(500)) {
+    // Post-fix the daemon DISCOVERS the cgroup path by reading
+    // `/proc/<spawn-pid>/cgroup` after Phase 1's child spawn. The
+    // kernel writes the cgroup of the live PID; systemd-run will
+    // have moved the child into a `cm-sess-*.scope` cgroup if the
+    // scope setup completed, and the discovery helper verifies
+    // the basename matches that pattern. If the pattern doesn't
+    // match (systemd-run failed mid-setup, scope ended up
+    // elsewhere, caller bypassed the wrapper), we bail with
+    // `Internal` — `pending`'s Drop pidfd-SIGKILLs the child.
+    //
+    // The discovered path is bound to *this specific spawn* by
+    // the kernel — caller's hostile path simply cannot reach the
+    // watcher's signalling code anymore. The slice's `cgroup_path`
+    // wire field is gone (see the module-level comment above
+    // `StartSessionParams`).
+    //
+    // Local-spawn parity in `tui/src/session.rs::Session::new`
+    // does the same discovery; both sides obey "never trust a
+    // path that wasn't read from /proc".
+    let verified_cgroup_path: Option<String> = if p.memory_cap_bytes.is_some() {
+        let pid = pending.pid() as u32;
+        let discovered = match crate::path::discover_session_cgroup_path(
+            pid,
+            std::time::Duration::from_millis(500),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                // pending.Drop pidfd-SIGKILLs the child.
                 return Err((
                     ErrorCode::Internal,
                     format!(
-                        "memory-cap scope did not materialize as active at {} within 500ms — \
-                         systemd-run likely failed (unit-name collision, scope refusal, or \
-                         stale lingering cgroup with no processes). Refusing to return a \
-                         session over an unverified cap.",
-                        predicted
+                        "cgroup discovery from /proc/{}/cgroup failed: {} \
+                         (refusing to return a session whose memory cap \
+                         hasn't been verified against this child's actual \
+                         cgroup)",
+                        pid, e
                     ),
                 ));
             }
-            Some(predicted.to_string())
+        };
+        // Belt-and-suspenders: also verify the cgroup is active
+        // (cgroup.procs non-empty). discover already required a
+        // valid pattern + path existence; the active check
+        // confirms the kernel has actually moved the child into
+        // this cgroup (not just that the directory was created).
+        // Matches the local-spawn `wait_for_cgroup_active`
+        // semantics for parity.
+        if !crate::path::wait_for_cgroup_active(&discovered, std::time::Duration::from_millis(500)) {
+            return Err((
+                ErrorCode::Internal,
+                format!(
+                    "discovered cgroup {} has no procs within 500ms \
+                     (systemd-run scope is half-created — likely a \
+                     transient systemd error)",
+                    discovered.display()
+                ),
+            ));
         }
-        None => {
-            // No cgroup_path requested = no cap requested. The
-            // caller is responsible for matching `memory_cap_bytes`
-            // + `cgroup_path` presence; a request with one but not
-            // the other is a structural caller bug, not a daemon
-            // concern.
-            None
+        Some(discovered.to_string_lossy().into_owned())
+    } else {
+        // No memory cap requested → no cgroup discovery needed.
+        // The caller is responsible for passing `memory_cap_bytes`
+        // when they want a cap.
+        None
+    };
+
+    // === Slice 10d-memory-cap-relocation: spawn the daemon-side
+    // cgroup-OOM watcher BEFORE the lock-held Phase 2. ===
+    //
+    // Pre-10d-fix the watcher spawn happened AFTER the registry
+    // insert and used `.expect()` on the thread spawn. A failure
+    // (resource exhaustion, RLIMIT_NPROC hit) would panic-unwind
+    // the RPC handler *with the session already inserted*: client
+    // gets a broken connection, capped session runs with no
+    // kill-log producer, memory_cap_kill stays `false` forever —
+    // silent half-broken state. Same bug class as the prior
+    // fix2 / fix3 / fix5 / fix6 silent-degrade fixes.
+    //
+    // Post-fix ordering:
+    //   1. cgroup verified above ✓
+    //   2. NOW: spawn watcher. On `Err`, drop `pending` (Drop
+    //      SIGKILLs child via pidfd, waitpids zombie), return
+    //      `Internal`. No registry residue.
+    //   3. lock state, recheck uid collision, arm_reaper,
+    //      insert (with the watcher's `JoinHandle` stashed on
+    //      `DaemonSession.watcher_handle` so a future bounded
+    //      join could go there). On collision, drop pending +
+    //      detach watcher; watcher self-exits via cgroup-vanish
+    //      after pending's Drop SIGKILLs the child.
+    //
+    // Conditions for spawning the watcher:
+    //   1. A cap was requested AND verified (`verified_cgroup_path`
+    //      is `Some` — fix4a already verified the cgroup is active).
+    //   2. `memory_cap_bytes` is set (soft cap; without it the
+    //      watcher has no breach threshold).
+    //   3. `kills_dir` is set (populated above when cap was
+    //      requested, via `default_kills_dir()`).
+    let watcher_handle: Option<std::thread::JoinHandle<()>> = match (
+        verified_cgroup_path.as_ref(),
+        p.memory_cap_bytes,
+        kills_dir_for_watcher,
+    ) {
+        (Some(cgroup_path), Some(soft_cap_bytes), Some(kills_dir)) => {
+            // hard_cap_bytes is forensic-only — the JSONL
+            // consumer (LastExitProbe::snapshot) checks only
+            // whether records EXIST past baseline, not what
+            // their values are. The wire doesn't carry hard
+            // explicitly (the daemon trusts the kernel's
+            // MemoryMax enforcement), so we record 0 as a
+            // placeholder. A future slice can extend the wire
+            // if forensic tools need the actual value.
+            let hard_cap_bytes: u64 = 0;
+            // Slice 10d watcher-fix #6: seed the watcher's
+            // breach baseline from the `memory.events.high`
+            // counter NOW — before `spawn_watcher` returns.
+            // Pre-fix #6 the watcher captured `last_high` at
+            // first iteration of run_watcher, which gave the
+            // ~1s window between cgroup discovery and watcher
+            // thread start (pidfd_open + arm_reaper + insert)
+            // a chance to silently absorb early breaches.
+            // Reading here closes that window down to the
+            // microsecond kernel-level "child spawned but not
+            // yet in cgroup" sub-window (inherent, inactionable).
+            let initial_high = crate::session_watch::read_memory_events_high(
+                std::path::Path::new(cgroup_path),
+            );
+            match crate::session_watch::spawn_watcher(
+                session_uid.clone(),
+                std::path::PathBuf::from(cgroup_path),
+                soft_cap_bytes,
+                hard_cap_bytes,
+                kills_dir,
+                initial_high,
+                watcher_spawn_fn,
+            ) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    // No state lock held, no registry insert
+                    // yet. Drop `pending` so its Drop pidfd-
+                    // SIGKILLs the still-alive child. Surface
+                    // the error to the client so they don't
+                    // believe a capped session is running.
+                    drop(pending);
+                    return Err((
+                        ErrorCode::Internal,
+                        format!(
+                            "spawn cgroup-OOM watcher thread failed: {} \
+                             (refusing to return a session whose memory \
+                             cap has no producer)",
+                            e
+                        ),
+                    ));
+                }
+            }
         }
+        _ => None,
     };
 
     // Reaper-cleanup callback: remove the session from the
@@ -484,6 +646,14 @@ pub fn start_session(
     // If the race is lost, drop the `PendingSession` — its Drop
     // SIGKILLs the child via pidfd — and return Conflict
     // cleanly. The losing thread doesn't strand a child.
+    //
+    // Slice 10d watcher-fix addendum: also drop the
+    // `watcher_handle` here so the spawned watcher thread can
+    // self-terminate via cgroup-vanish after `pending`'s Drop
+    // SIGKILLs the child. Detach is correct (not join) — the
+    // watcher's poll loop checks `cgroup_path.exists()` each
+    // iteration, exiting promptly once systemd cleans up the
+    // scope.
     if state.sessions.contains_key(&session_uid) {
         drop(state); // release before dropping `pending` (Drop is fast but explicit)
         // `pending` drops at end-of-scope; its Drop kills the
@@ -492,6 +662,7 @@ pub fn start_session(
         // but naming it makes the recovery shape obvious to
         // readers.
         drop(pending);
+        drop(watcher_handle);
         return Err((
             ErrorCode::Conflict,
             format!(
@@ -502,9 +673,14 @@ pub fn start_session(
         ));
     }
 
-    let session = pending
+    let mut session = pending
         .arm_reaper(Some(on_exit))
         .map_err(|e| (ErrorCode::Internal, format!("arm reaper: {}", e)))?;
+    // Slice 10d watcher-fix: stash the watcher handle on the
+    // registry-resident session at the same instant we insert
+    // it. The drop-on-detach contract documented on the field
+    // means session-removal paths don't need explicit cleanup.
+    session.watcher_handle = watcher_handle;
     state.sessions.insert(session_uid.clone(), session);
     drop(state);
 
@@ -707,12 +883,28 @@ pub fn kill_session(
 
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let removed = state.sessions.remove(&p.session_uid);
-    if removed.is_none() {
-        return Err((
-            ErrorCode::NotFound,
-            format!("session '{}' not in daemon registry", p.session_uid),
-        ));
-    }
+    let removed = match removed {
+        Some(s) => s,
+        None => {
+            return Err((
+                ErrorCode::NotFound,
+                format!("session '{}' not in daemon registry", p.session_uid),
+            ));
+        }
+    };
+    // Slice 10d watcher-fix #4: mark the operator-kill flag on
+    // the session's `LastExitProbe` BEFORE the SIGKILL goes
+    // out. The probe's flag is read at End-frame snapshot time
+    // and joined with `kill_status` + signal in `is_cap_kill`
+    // so a transient `protected`/`no_pids` record past baseline
+    // doesn't render as a cap kill on a user-initiated A-w.
+    //
+    // The Arc'd `last_exit` outlives `DaemonSession` (the
+    // attach-stream's End-frame consumer holds an
+    // `Arc<LastExitProbe>` clone), so setting the flag here is
+    // observable from the End-frame path even after `removed`
+    // drops below.
+    removed.last_exit.mark_operator_kill_requested();
     // Drop on the moved-out `DaemonSession` runs at scope-end of
     // this match arm — SIGKILL via pidfd, reaper observes exit.
     // The reaper's on_exit callback will try to lock the state and
@@ -1332,101 +1524,201 @@ mod tests {
     }
 
     // ===== Slice 10c-e-3b-fix2: memory-cap plumbing =====
+    //
+    // The pre-slice-10d `memory_cap_bytes_signals_kills_dir_default`
+    // test sent `memory_cap_bytes` against a bare `/bin/bash` argv
+    // (no systemd-run wrapper) and asserted the spawn succeeded.
+    // Post-slice-10d watcher-fix #1 the daemon performs /proc
+    // cgroup discovery + cm-sess-*.scope verification when a cap
+    // is requested — a bare `bash` ends up in the test runner's
+    // own cgroup, which doesn't match the pattern, so the spawn
+    // now (correctly) returns `Internal`. That's the new positive
+    // assertion, covered by `cap_request_outside_cm_sess_scope_returns_internal`
+    // below. The old test is removed as redundant.
+
+    // Slice 10d watcher-fix #1 changed the cgroup-verification
+    // arm from caller-supplied-path verification to /proc-based
+    // discovery. Coverage now lives in:
+    //   - `cap_request_outside_cm_sess_scope_returns_internal`:
+    //     the failure mode when the child isn't in a
+    //     `cm-sess-*.scope` cgroup (e.g. systemd-run wasn't
+    //     used, or scope setup failed mid-flight).
+    //   - `caller_supplied_cgroup_path_is_silently_dropped`:
+    //     the security invariant — a forged path in the JSON
+    //     does NOT influence what the daemon operates on.
+    //   - The /proc parse-layer is exhaustively tested in
+    //     `daemon/src/path.rs` (parse_cgroup_v2_line_*).
+    //   - The success path requires a real `systemd-run`
+    //     scope, which depends on environment; integration
+    //     testing tracks via the `#[ignore]`-gated e2e in
+    //     `daemon/src/session_watch.rs`.
 
     #[test]
-    fn memory_cap_bytes_signals_kills_dir_default() {
-        // Wire-shape acceptance for slice 10c-e-3b-fix2's memory-
-        // cap plumbing: when the TUI sends `memory_cap_bytes`,
-        // the daemon's spawn picks up the default kill-log
-        // directory. The cgroup-OOM watcher hasn't relocated
-        // yet (slice 10d-memory-cap-relocation will do that), so
-        // no kill records actually land — but the kills_dir
-        // being populated is what makes the reaper baseline +
-        // probe path runnable, which is the foundation the
-        // watcher relocation builds on.
+    fn cap_request_outside_cm_sess_scope_returns_internal() {
+        // Slice 10d watcher-fix #1 named acceptance: when a
+        // memory cap is requested (`memory_cap_bytes: Some`)
+        // but the spawned child isn't in a `cm-sess-*.scope`
+        // cgroup, `discover_session_cgroup_path` rejects on
+        // basename pattern → `start_session` returns Internal.
+        // The PendingSession's Drop SIGKILLs the spawned child
+        // via pidfd; no registry residue.
         //
-        // We can't directly inspect the daemon's
-        // `DaemonSession.last_exit.kills_dir` (it's behind the
-        // pubness boundary), so this test pins the observable:
-        // a spawn with `memory_cap_bytes: Some(...)` succeeds
-        // and registers. The internal kills_dir wiring is
-        // exercised by the existing reaper tests; here we just
-        // confirm the wire field is accepted.
+        // In this test the argv is bare `/bin/sleep 30` — no
+        // systemd-run wrapper — so the spawned child ends up
+        // in the test runner's own cgroup (whatever the test
+        // binary is in), which does NOT match `cm-sess-*.scope`.
+        // This is the exact threat model: a caller that asks
+        // for a cap but spawns the agent outside the wrapper.
         let dir = TempDir::new().unwrap();
-        let state = state_with_workspace("ws-memcap", &dir);
+        let state = state_with_workspace("ws-outside-scope", &dir);
         let params = json!({
             "uid": fresh_test_uid(),
-            "workspace_id": "ws-memcap",
-            "label": "memcap-test",
-            "argv": ["/bin/bash"],
+            "workspace_id": "ws-outside-scope",
+            "label": "outside-scope-test",
+            "argv": ["/bin/sleep", "30"],
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
         });
-        let result = start_session(&state, &params).expect("spawn with cap ok");
-        let uid = result["session_uid"].as_str().unwrap().to_string();
-        assert!(state.lock().unwrap().sessions.contains_key(&uid));
-        kill_all_sessions(&state);
-    }
-
-    // NOTE (slice 10c-e-3b-fix4a): the pre-fix4a
-    // `cgroup_path_round_trips_in_response` test asserted that
-    // the daemon echoed the supplied cgroup_path verbatim
-    // without verification. That contract was a silent
-    // memory-cap-criterion violation — a partial systemd-run
-    // failure would leave the child running uncapped while the
-    // daemon claimed success. After fix4a the daemon ONLY
-    // echoes the path after verifying via
-    // `wait_for_cgroup_active`. Coverage now lives in:
-    //   - `unverified_cgroup_path_returns_internal_error`
-    //     (the failure path; doesn't need real systemd-run).
-    //   - For the success path, integration testing requires a
-    //     real systemd-run scope, which depends on environment
-    //     and isn't portable across CI. Track in
-    //     slice-10d-memory-cap-relocation alongside the watcher
-    //     relocation E2E test.
-
-    #[test]
-    fn unverified_cgroup_path_returns_internal_error() {
-        // Slice 10c-e-3b-fix4a named acceptance: when the
-        // caller requests a memory cap (`cgroup_path` present)
-        // but the predicted cgroup doesn't materialize (e.g.
-        // `systemd-run` partially failed, or — in this test —
-        // we just point at a path that won't ever have a
-        // cgroup.procs entry), `start_session` MUST return an
-        // error rather than echoing the unverified path. The
-        // PendingSession's Drop SIGKILLs the spawned child so
-        // we don't leak it.
-        let dir = TempDir::new().unwrap();
-        let state = state_with_workspace("ws-bad-cgroup", &dir);
-        // A path that exists but is NOT a cgroup with active
-        // procs — the tempdir's own root is sufficient. No
-        // `cgroup.procs` file there.
-        let bogus_cgroup = dir.path().display().to_string();
-        let params = json!({
-            "uid": fresh_test_uid(),
-            "workspace_id": "ws-bad-cgroup",
-            "label": "verify-fail",
-            "argv": ["/bin/bash"],
-            "working_dir": dir.path().display().to_string(),
-            "memory_cap_bytes": 64 * 1024 * 1024u64,
-            "cgroup_path": bogus_cgroup.clone(),
-        });
-        // Start. The verification arm should time out (no
-        // cgroup.procs) and return Internal.
         let err =
-            start_session(&state, &params).expect_err("verification should fail");
+            start_session(&state, &params).expect_err("discovery should fail");
         assert_eq!(err.0, ErrorCode::Internal, "expected Internal, got {:?}", err);
         assert!(
-            err.1.contains("memory-cap scope did not materialize") || err.1.contains(&bogus_cgroup),
-            "error should name the verification failure: {}",
+            err.1.contains("cgroup")
+                && (err.1.contains("cm-sess") || err.1.contains("/proc")),
+            "error should name the discovery / pattern-match failure: {}",
             err.1
         );
-        // Registry must NOT contain a stranded entry — the
-        // PendingSession's Drop cleaned up the child.
         assert!(
             state.lock().unwrap().sessions.is_empty(),
-            "verification failure must NOT leave a session in the registry"
+            "discovery failure must NOT leave a session in the registry"
         );
+    }
+
+    /// Slice 10d watcher-fix #1 named security invariant:
+    /// caller-supplied `cgroup_path` in the JSON request is
+    /// silently ignored (the field is no longer in
+    /// `StartSessionParams`; serde drops unknown fields by
+    /// default). The daemon's behavior must depend only on
+    /// what `/proc/<pid>/cgroup` says, not on what the caller
+    /// sent.
+    ///
+    /// Pre-fix the daemon trusted the caller's path: a buggy
+    /// or malicious caller could pre-populate a cgroup with
+    /// PIDs from unrelated processes (shell, another worker)
+    /// and have the daemon's watcher SIGKILL those PIDs on
+    /// the first breach. This test pins the new contract.
+    ///
+    /// We assert by sending an obviously-hostile path
+    /// (`/sys/fs/cgroup/this-is-not-a-cm-sess-scope`) and
+    /// confirming (a) the daemon doesn't echo it, (b) the
+    /// error message — produced by /proc discovery, not by
+    /// trying to read the supplied path — doesn't name it.
+    /// If the supplied path were still in use, either of
+    /// those would surface it.
+    #[test]
+    fn caller_supplied_cgroup_path_is_silently_dropped() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-forged-path", &dir);
+        let hostile = "/sys/fs/cgroup/this-is-not-a-cm-sess-scope".to_string();
+        let params = json!({
+            "uid": fresh_test_uid(),
+            "workspace_id": "ws-forged-path",
+            "label": "forged-path-test",
+            "argv": ["/bin/sleep", "30"],
+            "working_dir": dir.path().display().to_string(),
+            "memory_cap_bytes": 64 * 1024 * 1024u64,
+            // The old caller-supplied field. Daemon should
+            // ignore it entirely; the JSON deserializer drops
+            // unknown fields by default.
+            "cgroup_path": hostile.clone(),
+        });
+        let err = start_session(&state, &params)
+            .expect_err("discovery still fails (child is outside cm-sess scope)");
+        assert_eq!(err.0, ErrorCode::Internal);
+        assert!(
+            !err.1.contains(&hostile),
+            "error message must NOT contain the hostile caller-supplied path \
+             — if it does, the daemon is still observing the field. Got: {}",
+            err.1
+        );
+        // Registry empty (Internal path → pending drop kills + waitpids).
+        assert!(state.lock().unwrap().sessions.is_empty());
+    }
+
+    /// Slice 10d-memory-cap-relocation review fix #0 (watcher
+    /// spawn fallibility): when `spawn_watcher` fails (e.g.
+    /// thread-spawn ulimit hit, resource exhaustion),
+    /// `start_session` must return `Internal` without leaving
+    /// the session in the registry, and the spawned child must
+    /// be reaped via `PendingSession`'s Drop.
+    ///
+    /// **Why `#[ignore]`:** post-watcher-fix #1, the daemon
+    /// performs /proc-based cgroup discovery BEFORE reaching
+    /// the watcher-spawn step. In a test environment without
+    /// a real `systemd-run --user` scope (CI, dev box without
+    /// systemd-user, etc.) discovery returns `Err` because the
+    /// spawned child isn't in a `cm-sess-*.scope` cgroup. The
+    /// watcher-spawn step is unreachable from a test, so
+    /// driving the failure-injection at the integration layer
+    /// requires a real cm-sess-*.scope.
+    ///
+    /// The contract is still pinned in two ways:
+    ///   1. `spawn_watcher_propagates_thread_spawn_error` (in
+    ///      `daemon/src/session_watch.rs::tests`) proves
+    ///      `spawn_watcher` returns `Err` rather than panicking
+    ///      on `Builder::spawn` failure.
+    ///   2. `cap_request_outside_cm_sess_scope_returns_internal`
+    ///      exercises the structurally-identical
+    ///      `drop(pending); return Internal` cleanup pattern at
+    ///      the discovery-failure layer — the same code path
+    ///      style the watcher-spawn-failure arm uses.
+    ///
+    /// To run this test against a real systemd-run environment:
+    /// `cargo test -p cm-daemon watcher_spawn_failure -- --ignored`.
+    #[test]
+    #[ignore]
+    fn watcher_spawn_failure_unwinds_with_no_registry_residue() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-watcher-fail", &dir);
+        let uid = fresh_test_uid();
+        // In a real systemd-run-enabled environment, the
+        // caller would set up argv to wrap with
+        // `systemd-run --user --scope --unit=cm-sess-...`. We
+        // can't reliably do that from this test runner; the
+        // assertion shape below is what the test would verify
+        // if discovery had succeeded.
+        let params = json!({
+            "uid": uid,
+            "workspace_id": "ws-watcher-fail",
+            "label": "watcher-fail-test",
+            "argv": ["/bin/sleep", "30"],
+            "working_dir": dir.path().display().to_string(),
+            "memory_cap_bytes": 64 * 1024 * 1024u64,
+        });
+        let failing_spawn: crate::session_watch::WatcherSpawnFn =
+            Box::new(|_name, _body| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected-spawn-failure",
+                ))
+            });
+        let err = start_session_with_spawn_fn(&state, &params, failing_spawn)
+            .expect_err("watcher spawn failure must propagate as error, not panic");
+        assert_eq!(err.0, ErrorCode::Internal);
+        // Either the discovery failure (likely in CI) or the
+        // watcher-spawn failure (only reachable in a real
+        // systemd-run environment) — both are valid Internal
+        // shapes for this test's intent.
+        assert!(
+            err.1.contains("spawn cgroup-OOM watcher thread failed")
+                || err.1.contains("injected-spawn-failure")
+                || err.1.contains("cgroup discovery"),
+            "expected discovery or spawn failure: {}",
+            err.1
+        );
+        let state_guard = state.lock().unwrap();
+        assert!(!state_guard.sessions.contains_key(&uid));
+        assert!(state_guard.sessions.is_empty());
     }
 
     #[test]
