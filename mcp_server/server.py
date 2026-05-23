@@ -611,8 +611,8 @@ def wait_for_workflow_done(
 ) -> dict:
     """Block until a workflow run finishes, then return its final state.
 
-    Finished means `status` is `Done` or `Detached`, or `done_reason` is
-    set (a `Paused` run is NOT done — this keeps waiting). Internally
+    Finished means `status` is `done` or `detached`, or `done_reason` is
+    set (a `paused` run is NOT done — this keeps waiting). Internally
     polls `get_workflow_state` on `poll_interval_s` (clamped to
     [1.0, 60.0]) until done or `timeout_s` elapses (clamped to
     [1.0, 86400.0]).
@@ -639,7 +639,7 @@ def wait_for_workflow_done(
     while True:
         state = control_client.call("get_workflow_state", {"run_id": run_id})
         status = state.get("status")
-        if status in ("Done", "Detached") or state.get("done_reason") is not None:
+        if status in ("done", "detached") or state.get("done_reason") is not None:
             return {"done": True, "timed_out": False, "state": state}
         if time.monotonic() >= deadline:
             return {"done": False, "timed_out": True, "state": state}
@@ -661,7 +661,7 @@ def wait_for_workflow_stop(
     `workflow_done` — e.g. an agent that just stops without a final
     handoff. The orchestrator can then inspect, prod, or stop the run.
 
-    Done = `status` is `Done`/`Detached` or `done_reason` is set
+    Done = `status` is `done`/`detached` or `done_reason` is set
     (same predicate as `wait_for_workflow_done`).
 
     Internally polls `get_workflow_state` + `list_sessions` on
@@ -690,7 +690,7 @@ def wait_for_workflow_stop(
     while True:
         state = control_client.call("get_workflow_state", {"run_id": run_id})
         status = state.get("status")
-        if status in ("Done", "Detached") or state.get("done_reason") is not None:
+        if status in ("done", "detached") or state.get("done_reason") is not None:
             return {
                 "done": True, "stuck": False, "timed_out": False, "state": state,
             }
