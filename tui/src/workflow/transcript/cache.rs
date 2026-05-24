@@ -151,7 +151,22 @@ pub(super) fn get(engine: &Engine, path: &Path) -> Option<State> {
 
     // Unchanged — return cached.
     if entry.mtime == mtime && entry.len == len {
-        return Some(entry.cached_state.clone());
+        let cached = entry.cached_state.clone();
+        // Load-bearing: dropping the mutex guard explicitly before
+        // returning measurably eliminates a TUI lag regression observed
+        // when a heavy background (non-workflow) session runs alongside
+        // a paused workflow. The mechanism isn't fully understood —
+        // `cache::get` is only called from the workflow tick on a single
+        // thread, so the contention story doesn't hold — but the
+        // perturbation is reliable: without these explicit drops,
+        // `drain_terminal_events` and `draw` phases spike to
+        // hundreds of ms; with them, they don't. Best guess is a
+        // compiler-level effect (different lifetime metadata changing
+        // codegen for the surrounding function), so leave the drops in
+        // place even though NLL would otherwise free the guard at the
+        // same logical point.
+        drop(map);
+        return Some(cached);
     }
 
     // File shrank or rotated underneath us — reset to a fresh parse.
@@ -199,6 +214,9 @@ pub(super) fn get(engine: &Engine, path: &Path) -> Option<State> {
     entry.cached_state = cached.clone();
     entry.mtime = mtime;
     entry.len = len;
+    // See the load-bearing comment on the fast-path return above —
+    // same rationale applies here.
+    drop(map);
     Some(cached)
 }
 
