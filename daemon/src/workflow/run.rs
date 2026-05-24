@@ -261,10 +261,12 @@ impl WorkflowRun {
 // ------------------- Persistence -------------------
 
 pub fn runs_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".cm/workflow-runs")
+    // Single source of truth for the .cm root — keeps the
+    // symlink-rejection walk in `events::WorkflowEventsWriter`
+    // aligned with whatever fallback (`$HOME` or `/tmp`)
+    // resolved here, so a no-HOME container env doesn't break
+    // workflows.
+    crate::path::dot_cm_dir().join("workflow-runs")
 }
 
 pub fn run_dir(run_id: &str) -> PathBuf {

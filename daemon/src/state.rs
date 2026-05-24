@@ -376,6 +376,21 @@ pub struct DaemonState {
     /// consumer distinguish "TUI deliberately has no
     /// sessions" from "TUI hasn't pushed yet."
     pub tui_sessions_pushed: bool,
+    /// 10d-2a: daemon-side workflow runs keyed by run_id.
+    /// **Scaffold only at 10d-2a** — no dispatch arms drive
+    /// this map yet. The TUI's controller continues to own
+    /// in-flight workflow runs through 10d-2's transitional
+    /// sub-slices; 10d-2b adds the `workflow_transition` /
+    /// `workflow_done` auth consumer that reads from this map,
+    /// 10d-2c moves the state machine driver here, and 10d-2d
+    /// adds `start_workflow` / `stop_workflow` /
+    /// `get_workflow_state` / `list_workflows` Operator-only
+    /// dispatch. The `WorkflowRun` type is the same one TUI
+    /// uses today (re-exported from `cm_daemon::workflow::run`),
+    /// so on-disk `state.json` round-trips byte-for-byte between
+    /// the two — see `daemon::workflow::run` for the wire
+    /// shape.
+    pub workflow_runs: HashMap<String, crate::workflow::run::WorkflowRun>,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -441,6 +456,7 @@ impl Default for DaemonState {
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
             tui_sessions: HashMap::new(),
             tui_sessions_pushed: false,
+            workflow_runs: HashMap::new(),
         }
     }
 }

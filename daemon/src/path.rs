@@ -259,12 +259,90 @@ pub fn default_kills_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cm/memory_kills"))
 }
 
+/// Resolve `$HOME/.cm`, with the same `/tmp` fallback every other
+/// `.cm`-rooted resolver uses (`runs_dir()`, the daemon socket bind
+/// path, etc.). Single source of truth for "where the daemon's
+/// trusted state root is" — keeps the symlink-rejection walk's
+/// trusted ancestor aligned with whatever `.cm/<subdir>` resolved
+/// to, so callers don't re-derive from `HOME` and accidentally
+/// diverge in container/no-home environments where the rest of the
+/// daemon works.
+pub fn dot_cm_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".cm")
+}
+
 pub fn ensure_dot_cm_subdir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let meta = std::fs::metadata(dir)?;
     let mut perms = meta.permissions();
     perms.set_mode(0o700);
     std::fs::set_permissions(dir, perms)?;
+    Ok(())
+}
+
+/// Walk from `root` down to `path`, verifying that each intermediate
+/// component between `root` (exclusive) and `path` (inclusive) is
+/// **not a symlink**. Uses `symlink_metadata` (which does NOT follow
+/// symlinks) — unlike `metadata` / `create_dir_all` / `set_permissions`,
+/// which all silently follow.
+///
+/// The point: `O_NOFOLLOW` on the final file open only protects the
+/// last path component. A symlink at any ancestor of the target would
+/// redirect intermediate `create_dir_all` / chmod operations into
+/// attacker-controlled territory before the `O_NOFOLLOW` open even
+/// runs. This helper closes that ancestor-symlink window.
+///
+/// **`root` is trusted** (assumed not to be a symlink and not
+/// validated here — caller's contract is to pass a path that's known
+/// good, like `~/.cm`). `path` MUST start with `root`; otherwise this
+/// returns an error. Missing components (anything past the last
+/// existing ancestor) are not symlinks by definition and don't fail
+/// the check.
+///
+/// Returns `Ok(())` when every present component from `root` (excl.)
+/// through `path` (incl.) is a real directory or regular file (no
+/// symlinks). Returns `io::Error` with `kind() == PermissionDenied`
+/// the moment a symlink is found, naming the offending component.
+pub fn verify_no_symlinks_in_path(path: &Path, root: &Path) -> std::io::Result<()> {
+    let rel = path.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "verify_no_symlinks_in_path: {:?} is not under root {:?}",
+                path, root,
+            ),
+        )
+    })?;
+    let mut cursor = root.to_path_buf();
+    for component in rel.components() {
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to traverse symlink at {:?} (target path: {:?}, root: {:?})",
+                            cursor, path, root,
+                        ),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Component doesn't exist yet — by definition not a
+                // symlink. The caller's subsequent `create_dir_all`
+                // will create it as a real directory, and any further
+                // walk will see it as such. Continue checking lower
+                // components in case any of them DO exist (rare —
+                // create_dir_all builds top-down — but harmless and
+                // defensive).
+            }
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 
