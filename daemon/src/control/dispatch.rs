@@ -234,6 +234,18 @@ pub fn dispatch_request(
         // task-subtree gating here.
         "propose_task" => DispatchOutcome::Done(dispatch_propose_task(state, req)),
 
+        // 10d-2b: workflow_transition / workflow_done relocate
+        // from MCP-server-side `_append_event` (direct file write)
+        // to daemon-side writers calling 10d-2a's
+        // `WorkflowEventsWriter`. Session-callable AND Operator-
+        // callable — the file-writer they replace trusted any
+        // caller. Participant validation lands with 10d-2c when
+        // workflow_runs becomes daemon-owned.
+        "workflow_transition" => {
+            DispatchOutcome::Done(dispatch_workflow_transition(state, req))
+        }
+        "workflow_done" => DispatchOutcome::Done(dispatch_workflow_done(state, req)),
+
         // Sub-2b-3: `mcp_start_session` — Python MCP tool's
         // minimal-shape entry point. Daemon resolves
         // workspace_id / working_dir / argv from caller context
@@ -374,6 +386,35 @@ fn dispatch_propose_task(
     req: &Request,
 ) -> Response {
     match methods::propose_task(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `workflow_transition` — append an event to
+/// `~/.cm/workflow-runs/<run_id>/events.jsonl` via 10d-2a's
+/// `WorkflowEventsWriter`. Replaces the MCP-server-side
+/// `_append_event` direct file write. Session-callable and
+/// Operator-callable; the file-writer it replaces trusted any
+/// caller. Participant validation against `workflow_runs` lands
+/// with 10d-2c.
+fn dispatch_workflow_transition(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::workflow_transition(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `workflow_done` — append a workflow_done event. Same auth
+/// shape as `workflow_transition`; see that handler.
+fn dispatch_workflow_done(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::workflow_done(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -783,12 +824,13 @@ mod tests {
     fn deferred_method_returns_unknown_with_slice_10c_pointer() {
         let state = make_state();
         // Slice 10d-mcp-surface wired list_sessions; sub-2b-2
-        // wired propose_task; pick a workflow tool (deferred to
-        // sub-2c per NOTES.md) to exercise the deferred-arm
-        // fallback.
+        // wired propose_task; 10d-2b wired workflow_transition /
+        // workflow_done. Pick a still-deferred workflow lifecycle
+        // method (`start_workflow` — deferred to 10d-2d per
+        // NOTES.md) to exercise the deferred-arm fallback.
         let resp = dispatch_request(
             &state,
-            &session_request("workflow_transition", serde_json::Value::Null, "ts-x"),
+            &session_request("start_workflow", serde_json::Value::Null, "ts-x"),
         ).into_response();
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
@@ -6091,5 +6133,127 @@ mod tests {
                 serde_json::json!({ "session_uid": &uid }),
             ),
         );
+    }
+
+    // ============================================================
+    // 10d-2b: workflow_transition / workflow_done dispatch tests
+    // ============================================================
+
+    fn with_temp_home_dispatch<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+        f();
+        if let Some(o) = orig {
+            unsafe { std::env::set_var("HOME", o); }
+        }
+        tmp
+    }
+
+    /// 10d-2b: dispatch arm for `workflow_transition` accepts a
+    /// Session caller and writes the event. This is the
+    /// daemon-spawned-agent path (Session caller arises from
+    /// `CM_TUI_SESSION_ID` env on the daemon-minted child).
+    #[test]
+    fn dispatch_workflow_transition_session_caller_writes_event() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            let req = session_request(
+                "workflow_transition",
+                serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "diff lgtm?",
+                    "run_id": "wf_dispatch_session",
+                    "role": "worker",
+                }),
+                "ts-session-1",
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(resp.ok, "Session caller must succeed: {:?}", resp.error);
+            let result = resp.result.expect("result");
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["run_id"], "wf_dispatch_session");
+
+            let (events, _) =
+                crate::workflow::events::read_new("wf_dispatch_session", 0);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].tool, "workflow_transition");
+        });
+    }
+
+    /// 10d-2b: dispatch arm for `workflow_transition` also
+    /// accepts Operator callers — used by TUI-driven test
+    /// fixtures and by future operator tooling. The MCP-server-
+    /// side `_append_event` it replaces trusted any caller;
+    /// daemon parity. (10d-2c will add participant validation
+    /// once daemon owns workflow_runs.)
+    #[test]
+    fn dispatch_workflow_transition_operator_caller_writes_event() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            let req = operator_request(
+                "workflow_transition",
+                serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_dispatch_op",
+                    "role": "worker",
+                }),
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(resp.ok, "Operator caller must succeed: {:?}", resp.error);
+
+            let (events, _) = crate::workflow::events::read_new("wf_dispatch_op", 0);
+            assert_eq!(events.len(), 1);
+        });
+    }
+
+    /// 10d-2b: same shape for `workflow_done` — Session-callable,
+    /// event lands.
+    #[test]
+    fn dispatch_workflow_done_session_caller_writes_event() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            let req = session_request(
+                "workflow_done",
+                serde_json::json!({
+                    "reason": "approved",
+                    "run_id": "wf_done_dispatch",
+                    "role": "manager",
+                }),
+                "ts-manager-1",
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(resp.ok, "Session caller must succeed: {:?}", resp.error);
+
+            let (events, _) =
+                crate::workflow::events::read_new("wf_done_dispatch", 0);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].tool, "workflow_done");
+        });
+    }
+
+    /// 10d-2b: invalid params surface as a clean RPC error, not
+    /// a silent file write. Loud-failure invariant.
+    #[test]
+    fn dispatch_workflow_transition_invalid_params_surfaces_error() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            let req = session_request(
+                "workflow_transition",
+                serde_json::json!({
+                    // Missing `to` field entirely.
+                    "prompt": "p",
+                    "run_id": "wf_bad",
+                    "role": "worker",
+                }),
+                "ts-x",
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(!resp.ok, "missing required field must error");
+            let err = resp.error.expect("error");
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+        });
     }
 }

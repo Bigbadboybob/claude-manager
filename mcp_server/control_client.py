@@ -95,6 +95,13 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "session.set_transcript_path",
     "propose_task",
     "mcp_start_session",
+    # 10d-2b: workflow_transition / workflow_done flip from
+    # MCP-server-side `_append_event` (direct events.jsonl
+    # write) to daemon-side writers via 10d-2a's
+    # `WorkflowEventsWriter`. Session-callable; both daemon-
+    # spawned and TUI-spawned participants can call.
+    "workflow_transition",
+    "workflow_done",
     # Operator-only push from TUI; included for dispatch-surface
     # alignment, not Python-routable.
     "tui.update_sessions_snapshot",

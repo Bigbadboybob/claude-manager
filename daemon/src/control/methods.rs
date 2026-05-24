@@ -2033,6 +2033,154 @@ pub fn propose_task(_state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Met
 }
 
 // ============================================================
+// workflow_transition / workflow_done (10d-2b)
+// ============================================================
+//
+// Pre-2b: the Python MCP `workflow_transition` / `workflow_done`
+// tools (`mcp_server/server.py::_append_event`) wrote
+// `~/.cm/workflow-runs/<id>/events.jsonl` DIRECTLY via file I/O —
+// no socket, no caller validation, just a write driven by the
+// agent's `CM_WORKFLOW_RUN_ID` + `CM_ROLE` env. The TUI's
+// `workflow/controller.rs` tail loop reacted.
+//
+// 2b flips the WRITER to the daemon: Python tools become
+// `control_client.call("workflow_transition", ...)`, the per-
+// method resolver routes the call to the daemon socket (added to
+// `DAEMON_METHODS`), and the daemon's handlers below assemble the
+// event from the RPC params and write via the 2a
+// `WorkflowEventsWriter` (Operator-only-by-mistake auth path
+// avoided — these are Session-callable AND Operator-callable;
+// any participant in a workflow run can call). The TUI's tail
+// loop reacts unchanged.
+//
+// What 2b explicitly does NOT do:
+//   - Participant validation (lookup_session_any → match
+//     workflow_run_id+role). The event's `role` field still
+//     comes from the agent's `CM_ROLE` env via the RPC params,
+//     same trust shape as today's `_append_event`. Validation
+//     lands with 10d-2c when daemon owns the workflow state.
+//   - State mutation. Daemon doesn't keep workflow_runs in sync;
+//     that's still TUI-driven from tail observation. 2c relocates.
+//
+// Auth: any caller — Session OR Operator. Today's `_append_event`
+// trusted any caller (just the agent's env vars). Daemon parity
+// with that — Session-caller rejection would break TUI-spawned
+// participants too. 2c adds the participant check via
+// `lookup_session_any` once workflow_runs is daemon-side.
+
+#[derive(serde::Deserialize)]
+pub struct WorkflowTransitionParams {
+    pub to: String,
+    pub prompt: String,
+    pub run_id: String,
+    pub role: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct WorkflowDoneParams {
+    pub reason: String,
+    pub run_id: String,
+    pub role: String,
+}
+
+fn now_unix_f64() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn new_event_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+pub fn workflow_transition(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: WorkflowTransitionParams = serde_json::from_value(params.clone())
+        .map_err(|e| (
+            ErrorCode::InvalidParams,
+            format!("workflow_transition params: {}", e),
+        ))?;
+    if p.run_id.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "workflow_transition: 'run_id' is required (set CM_WORKFLOW_RUN_ID \
+             on the spawning side)".into(),
+        ));
+    }
+    if p.to.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "workflow_transition: 'to' (target role) is required".into(),
+        ));
+    }
+    let event = crate::workflow::events::Event {
+        id: new_event_id(),
+        ts: now_unix_f64(),
+        run_id: p.run_id.clone(),
+        role: if p.role.trim().is_empty() {
+            "unknown".into()
+        } else {
+            p.role
+        },
+        tool: "workflow_transition".to_string(),
+        args: json!({"to": p.to, "prompt": p.prompt}),
+    };
+    crate::workflow::events::WorkflowEventsWriter::append_event(&event)
+        .map_err(|e| (
+            ErrorCode::Internal,
+            format!("workflow_transition: failed to append event: {}", e),
+        ))?;
+    Ok(json!({
+        "ok": true,
+        "event_id": event.id,
+        "run_id": event.run_id,
+    }))
+}
+
+pub fn workflow_done(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: WorkflowDoneParams = serde_json::from_value(params.clone())
+        .map_err(|e| (
+            ErrorCode::InvalidParams,
+            format!("workflow_done params: {}", e),
+        ))?;
+    if p.run_id.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "workflow_done: 'run_id' is required".into(),
+        ));
+    }
+    let event = crate::workflow::events::Event {
+        id: new_event_id(),
+        ts: now_unix_f64(),
+        run_id: p.run_id.clone(),
+        role: if p.role.trim().is_empty() {
+            "unknown".into()
+        } else {
+            p.role
+        },
+        tool: "workflow_done".to_string(),
+        args: json!({"reason": p.reason}),
+    };
+    crate::workflow::events::WorkflowEventsWriter::append_event(&event)
+        .map_err(|e| (
+            ErrorCode::Internal,
+            format!("workflow_done: failed to append event: {}", e),
+        ))?;
+    Ok(json!({
+        "ok": true,
+        "event_id": event.id,
+        "run_id": event.run_id,
+    }))
+}
+
+// ============================================================
 // mcp_start_session (sub-2b-3)
 // ============================================================
 //
@@ -4405,5 +4553,179 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    // ============================================================
+    // 10d-2b: workflow_transition / workflow_done tests
+    // ============================================================
+
+    /// Spin up an isolated HOME for the test so events.jsonl
+    /// writes land in a tempdir, not the operator's real
+    /// `~/.cm/workflow-runs`. Mirrors `events.rs`'s
+    /// `with_temp_home`.
+    fn with_temp_home<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+        f();
+        if let Some(o) = orig {
+            unsafe { std::env::set_var("HOME", o); }
+        }
+        tmp
+    }
+
+    fn make_state_arc() -> Arc<Mutex<DaemonState>> {
+        Arc::new(Mutex::new(DaemonState::new()))
+    }
+
+    /// 10d-2b acceptance: a `workflow_transition` call lands an
+    /// event in `~/.cm/workflow-runs/<run_id>/events.jsonl` via
+    /// the 10d-2a `WorkflowEventsWriter`. Wire shape pinned so
+    /// the TUI's existing tail loop reads the new event exactly
+    /// like the MCP-server-side `_append_event` produced.
+    #[test]
+    fn workflow_transition_appends_event_with_expected_shape() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let params = json!({
+                "to": "reviewer",
+                "prompt": "diff lgtm?",
+                "run_id": "wf_transition_test",
+                "role": "worker",
+            });
+            let result = workflow_transition(&state, &params).expect("ok");
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["run_id"], "wf_transition_test");
+            let event_id = result["event_id"].as_str().expect("event_id present");
+            assert!(!event_id.is_empty());
+
+            // Read via the existing tailer — the TUI's read path.
+            let (events, _offset) =
+                crate::workflow::events::read_new("wf_transition_test", 0);
+            assert_eq!(events.len(), 1);
+            let ev = &events[0];
+            assert_eq!(ev.id, event_id);
+            assert_eq!(ev.run_id, "wf_transition_test");
+            assert_eq!(ev.role, "worker");
+            assert_eq!(ev.tool, "workflow_transition");
+            match ev.kind() {
+                crate::workflow::events::EventKind::Transition { to, prompt } => {
+                    assert_eq!(to, "reviewer");
+                    assert_eq!(prompt, "diff lgtm?");
+                }
+                _ => panic!("expected Transition kind"),
+            }
+        });
+    }
+
+    /// 10d-2b: `workflow_done` is the same path as transition,
+    /// different tool tag + args. Pin the wire shape.
+    #[test]
+    fn workflow_done_appends_event_with_expected_shape() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let params = json!({
+                "reason": "approved",
+                "run_id": "wf_done_test",
+                "role": "manager",
+            });
+            let result = workflow_done(&state, &params).expect("ok");
+            let event_id = result["event_id"].as_str().expect("event_id");
+
+            let (events, _) =
+                crate::workflow::events::read_new("wf_done_test", 0);
+            assert_eq!(events.len(), 1);
+            let ev = &events[0];
+            assert_eq!(ev.id, event_id);
+            assert_eq!(ev.run_id, "wf_done_test");
+            assert_eq!(ev.role, "manager");
+            assert_eq!(ev.tool, "workflow_done");
+            match ev.kind() {
+                crate::workflow::events::EventKind::Done { reason } => {
+                    assert_eq!(reason, "approved");
+                }
+                _ => panic!("expected Done kind"),
+            }
+        });
+    }
+
+    /// 10d-2b: empty `role` collapses to `"unknown"` — parity
+    /// with the MCP-server-side `_append_event`'s
+    /// `os.environ.get("CM_ROLE", "").strip() or "unknown"`
+    /// default. Tests the fallback path explicitly so a future
+    /// validator change can't silently break it.
+    #[test]
+    fn workflow_transition_empty_role_falls_back_to_unknown() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let params = json!({
+                "to": "reviewer",
+                "prompt": "p",
+                "run_id": "wf_empty_role",
+                "role": "",
+            });
+            workflow_transition(&state, &params).expect("ok");
+
+            let (events, _) = crate::workflow::events::read_new("wf_empty_role", 0);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].role, "unknown");
+        });
+    }
+
+    /// 10d-2b: missing `run_id` → InvalidParams (loud error,
+    /// not silent file write). Pre-fix the file-writer would
+    /// have raised `KeyError` on the Python side; daemon path
+    /// surfaces it as an RPC error.
+    #[test]
+    fn workflow_transition_missing_run_id_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let params = json!({
+                "to": "reviewer",
+                "prompt": "p",
+                "run_id": "",
+                "role": "worker",
+            });
+            let err = workflow_transition(&state, &params)
+                .expect_err("empty run_id must reject");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("run_id"), "msg mentions run_id: {}", err.1);
+        });
+    }
+
+    /// 10d-2b: missing `to` (transition target) → InvalidParams.
+    #[test]
+    fn workflow_transition_missing_to_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let params = json!({
+                "to": "",
+                "prompt": "p",
+                "run_id": "wf_no_to",
+                "role": "worker",
+            });
+            let err = workflow_transition(&state, &params)
+                .expect_err("empty to must reject");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    /// 10d-2b: malformed params (wrong types) → InvalidParams.
+    /// Parity with the existing methods' shape-validation.
+    #[test]
+    fn workflow_transition_malformed_params_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let params = json!({
+                // `to` should be a string; passing an int.
+                "to": 42,
+                "prompt": "p",
+                "run_id": "wf_malformed",
+                "role": "worker",
+            });
+            let err = workflow_transition(&state, &params).expect_err("malformed");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
     }
 }

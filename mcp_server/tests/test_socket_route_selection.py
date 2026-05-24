@@ -468,11 +468,14 @@ class PerMethodRoutingTests(unittest.TestCase):
         self.assertEqual(str(path), "/tmp/d.sock")
 
     def test_tui_only_method_routes_to_tui_socket_under_daemon_spawn(self):
-        """`workflow_transition` ∉ DAEMON_METHODS → CM_TUI_SOCKET
-        even when CM_DAEMON_SOCKET is pinned. This is the
-        load-bearing sub-2c invariant: daemon-spawned agents
-        can reach `workflow_transition` / `workflow_done` via
-        the TUI socket."""
+        """TUI-only methods (NOT in DAEMON_METHODS) → CM_TUI_SOCKET
+        even when CM_DAEMON_SOCKET is pinned. Pinned set shrinks as
+        sub-slices relocate methods to the daemon:
+        - 10d-2b moved `workflow_transition` / `workflow_done` to
+          DAEMON_METHODS (now route to daemon — see the
+          companion test below).
+        - `create_subtask`, `get_workflow_state` remain TUI-routed
+          until later 10d sub-slices."""
         from mcp_server import control_client
 
         with TemporaryDirectory() as tmp:
@@ -486,8 +489,6 @@ class PerMethodRoutingTests(unittest.TestCase):
                 clear=True,
             ):
                 for tui_method in (
-                    "workflow_transition",
-                    "workflow_done",
                     "create_subtask",
                     "get_workflow_state",
                 ):
@@ -499,6 +500,36 @@ class PerMethodRoutingTests(unittest.TestCase):
                             f"{tui_method!r} must route to CM_TUI_SOCKET — "
                             "this is the sub-2c fix for workflow methods "
                             "reachable from daemon-spawned agents",
+                        )
+
+    def test_workflow_methods_route_to_daemon_after_10d_2b(self):
+        """10d-2b: `workflow_transition` / `workflow_done` are
+        now in DAEMON_METHODS and route to the daemon socket
+        when one is pinned. Replaces the MCP-server-side
+        `_append_event` direct file write with a daemon-routed
+        call into 10d-2a's `WorkflowEventsWriter`."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "/tmp/d.sock",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                for daemon_method in ("workflow_transition", "workflow_done"):
+                    with self.subTest(method=daemon_method):
+                        path = control_client.resolve_socket_for_method(
+                            daemon_method,
+                        )
+                        self.assertEqual(
+                            str(path),
+                            "/tmp/d.sock",
+                            f"{daemon_method!r} must route to CM_DAEMON_SOCKET "
+                            "(in DAEMON_METHODS since 10d-2b)",
                         )
 
     def test_daemon_method_falls_back_to_tui_when_no_daemon_pin(self):
@@ -701,7 +732,13 @@ class OptInFlagRoutingTests(unittest.TestCase):
     def test_explicit_cm_daemon_socket_routes_same_as_opt_in(self):
         """Explicit CM_DAEMON_SOCKET (no CM_USE_DAEMON_SOCKET):
         same routing as the opt-in flag — daemon methods to
-        daemon, TUI methods to TUI."""
+        daemon, TUI methods to TUI.
+
+        10d-2b: `workflow_transition` was previously a TUI-only
+        method; it's now in DAEMON_METHODS, so it routes to the
+        daemon socket alongside `mcp_start_session`. Use
+        `create_subtask` (still TUI-only as of 10d-2b) as the
+        TUI-routed exemplar instead."""
         from mcp_server import control_client
 
         with mock.patch.dict(
@@ -718,7 +755,13 @@ class OptInFlagRoutingTests(unittest.TestCase):
             )
             self.assertEqual(
                 control_client.resolve_socket_for_method("workflow_transition"),
+                Path("/tmp/explicit-d.sock"),
+                "workflow_transition is in DAEMON_METHODS since 10d-2b",
+            )
+            self.assertEqual(
+                control_client.resolve_socket_for_method("create_subtask"),
                 Path("/tmp/explicit-t.sock"),
+                "create_subtask is still TUI-only as of 10d-2b",
             )
 
     def test_empty_string_daemon_socket_treated_as_unset(self):
@@ -763,7 +806,11 @@ class LoudFailureOnUnreachableTargetTests(unittest.TestCase):
         raises TransportError. It does NOT silently re-route
         to the daemon socket (which would land on a method-
         not-found because the daemon doesn't dispatch
-        workflow_transition)."""
+        create_subtask).
+
+        10d-2b: switched the exemplar from
+        `workflow_transition` (now in DAEMON_METHODS) to
+        `create_subtask` (still TUI-only as of 10d-2b)."""
         from mcp_server import control_client
 
         with TemporaryDirectory() as tmp:
@@ -788,7 +835,7 @@ class LoudFailureOnUnreachableTargetTests(unittest.TestCase):
                 # Sanity: the resolver returns the TUI path,
                 # not the daemon path.
                 self.assertEqual(
-                    control_client.resolve_socket_for_method("workflow_transition"),
+                    control_client.resolve_socket_for_method("create_subtask"),
                     tui_sock,
                 )
                 # The actual call surfaces TransportError at
@@ -796,7 +843,8 @@ class LoudFailureOnUnreachableTargetTests(unittest.TestCase):
                 # re-route.
                 with self.assertRaises(control_client.TransportError):
                     control_client.call(
-                        "workflow_transition", {"to": "reviewer", "prompt": "x"}
+                        "create_subtask",
+                        {"name": "x", "prompt": "y"},
                     )
 
 

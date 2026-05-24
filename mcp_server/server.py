@@ -888,8 +888,31 @@ def workflow_transition(to: str, prompt: str) -> str:
         to: Name of the role to transition to (must be declared in the workflow).
         prompt: The message to send to that role when it activates.
     """
-    event = _append_event("workflow_transition", {"to": to, "prompt": prompt})
-    return f"Queued transition to '{to}' (event {event['id']})."
+    # 10d-2b: flip from `_append_event` (direct file write) to
+    # `control_client.call` ONLY when a daemon is pinned. Under
+    # TUI-local spawn (SpawnTarget::TuiLocal), the agent's env
+    # has `CM_DAEMON_SOCKET=""` and no daemon serves
+    # workflow_transition — the per-method resolver would fall
+    # back to the TUI socket, but the TUI dispatcher has no
+    # handler for these methods, so the call would round-trip
+    # `UnknownMethod`. The `daemon_socket_pinned()` signal here
+    # matches the resolver's `chose_daemon` decision exactly
+    # (both read the same env shape), so file-write and
+    # daemon-routed paths can never drift.
+    if control_client.daemon_socket_pinned():
+        run_id = os.environ["CM_WORKFLOW_RUN_ID"]
+        role = os.environ.get("CM_ROLE", "").strip() or "unknown"
+        result = control_client.call(
+            "workflow_transition",
+            {"to": to, "prompt": prompt, "run_id": run_id, "role": role},
+        )
+        return f"Queued transition to '{to}' (event {result['event_id']})."
+    else:
+        # TUI-local fallback: preserve pre-10d-2b behavior so
+        # A-f-launched workflow participants keep working. The
+        # TUI's controller tails events.jsonl exactly as today.
+        event = _append_event("workflow_transition", {"to": to, "prompt": prompt})
+        return f"Queued transition to '{to}' (event {event['id']})."
 
 
 @mcp.tool()
@@ -903,8 +926,19 @@ def workflow_done(reason: str) -> str:
     Args:
         reason: Short explanation of why the workflow is complete.
     """
-    event = _append_event("workflow_done", {"reason": reason})
-    return f"Workflow marked done (event {event['id']})."
+    # 10d-2b: see `workflow_transition` above — same daemon-vs-
+    # TUI-local branching rationale.
+    if control_client.daemon_socket_pinned():
+        run_id = os.environ["CM_WORKFLOW_RUN_ID"]
+        role = os.environ.get("CM_ROLE", "").strip() or "unknown"
+        result = control_client.call(
+            "workflow_done",
+            {"reason": reason, "run_id": run_id, "role": role},
+        )
+        return f"Workflow marked done (event {result['event_id']})."
+    else:
+        event = _append_event("workflow_done", {"reason": reason})
+        return f"Workflow marked done (event {event['id']})."
 
 
 if __name__ == "__main__":
