@@ -261,25 +261,10 @@ impl<'a> WorkflowControllerCtx<'a> {
                     ));
                     return actions;
                 }
-                // Engine match: an Existing slot's session type must agree
-                // with the role's TOML-declared engine. The bound session
-                // is the source of truth for the engine actually used at
-                // runtime (templating, respawn paths), so a mismatch
-                // silently overrides the TOML — almost certainly a bug.
-                // Fail loudly instead.
-                if let Some(ts) = self.workspaces[ws_index].sessions.get(*si) {
-                    let session_engine = engine_for_session_type(&ts.session_type);
-                    if session_engine != role.engine {
-                        actions.push(WorkflowAction::SetStatusMsg(format!(
-                            "Role '{}' declares engine '{}' but session '{}' is '{}'",
-                            slot.role,
-                            role.engine.as_session_type(),
-                            ts.label,
-                            ts.session_type,
-                        )));
-                        return actions;
-                    }
-                }
+                // The role's TOML `engine` is only a default for spawning
+                // *new* sessions; when the user explicitly binds an
+                // existing session, its actual type drives templating and
+                // respawn paths, so a different engine is allowed.
             }
         }
 
@@ -1884,9 +1869,6 @@ mod tests {
 
             let mut runs: Vec<WorkflowRun> = Vec::new();
             let mut workflows = HashMap::new();
-            // Worker role must declare Codex engine to match the
-            // codex worker session bound below — launch validation
-            // rejects engine mismatches on Existing slots.
             let mut codex_worker = role_with(Engine::Codex, Context::Persistent);
             codex_worker.needs_mcp = false;
             let mut reviewer_role = role_with(Engine::ClaudeCode, Context::Persistent);

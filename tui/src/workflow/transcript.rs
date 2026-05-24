@@ -3,15 +3,19 @@
 //! The workflow runner uses this to capture an outgoing role's "last message" so
 //! it can be referenced in subsequent prompts via `{{ roles.X.last_message }}`.
 //!
-//! Best-effort: returns `None` on any parse failure. Deliberately simple — we read
-//! the whole file and scan backwards. Transcripts stay small enough that this is
-//! fine.
+//! Best-effort: returns `None` on any parse failure.
+//!
+//! The hot-path helpers (`count_messages`, `role_turn_complete`) consult a
+//! process-global byte-cursor cache so each tick only parses the bytes appended
+//! since the previous call. See the [`cache`] submodule.
 
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use crate::workflow::toml_schema::Engine;
+
+mod cache;
 
 /// Read just the first line of a file. Used to inspect Codex JSONL session
 /// metadata (which lives on the first line) without slurping the whole
@@ -301,62 +305,18 @@ fn claude_turn_complete(worktree_path: &Path, session_id: &str) -> bool {
     let Some(path) = claude_transcript_path(worktree_path, session_id) else {
         return false;
     };
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return false;
-    };
-    // Walk backwards for the most recent assistant record.
-    for line in contents.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-            continue;
-        }
-        let stop_reason = v
-            .pointer("/message/stop_reason")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        return stop_reason == "end_turn";
-    }
-    false
+    cache::get(&Engine::ClaudeCode, &path)
+        .map(|s| s.turn_complete())
+        .unwrap_or(false)
 }
 
 fn codex_turn_complete(session_id: &str) -> bool {
     let Some(path) = codex_transcript_path(session_id) else {
         return false;
     };
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return false;
-    };
-    // Scan backwards. First relevant event wins:
-    //   - task_complete  → done
-    //   - response_item (function_call / reasoning / message) → still working
-    // Everything else (token_count, exec_command_*, function_call_output)
-    // is noise for this purpose.
-    for line in contents.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let top = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let ptype = v.pointer("/payload/type").and_then(|t| t.as_str()).unwrap_or("");
-        if top == "event_msg" && ptype == "task_complete" {
-            return true;
-        }
-        if top == "response_item"
-            && matches!(ptype, "function_call" | "reasoning" | "message")
-        {
-            return false;
-        }
-    }
-    false
+    cache::get(&Engine::Codex, &path)
+        .map(|s| s.turn_complete())
+        .unwrap_or(false)
 }
 
 /// Count JSONL entries whose top-level type indicates `kind`, regardless of
@@ -372,55 +332,26 @@ pub fn count_messages(
     session_id: &str,
     kind: MessageKind,
 ) -> usize {
-    let want = match kind {
-        MessageKind::User => "user",
-        MessageKind::Assistant => "assistant",
-    };
     let path = match engine {
         Engine::ClaudeCode => claude_transcript_path(worktree_path, session_id),
         Engine::Codex => codex_transcript_path(session_id),
     };
     let Some(path) = path else { return 0 };
-    let Ok(contents) = fs::read_to_string(&path) else {
+    // Counts are maintained by the byte-cursor cache (see `cache.rs`) —
+    // every call only re-parses bytes appended since the previous one.
+    // The cache mirrors this function's prior exclusion rules: Claude
+    // skips synthetic user-tool-result records; Codex skips
+    // `event_msg`/`agent_message` (which mirrors a later canonical
+    // `response_item` assistant entry 1:1 — counting both would
+    // double the assistant turn count and fire the on_idle gate one
+    // turn early).
+    let Some(state) = cache::get(engine, &path) else {
         return 0;
     };
-    let mut n = 0;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let ty = match engine {
-            Engine::ClaudeCode => v.get("type").and_then(|t| t.as_str()),
-            Engine::Codex => v
-                .pointer("/payload/role")
-                .and_then(|r| r.as_str())
-                .or_else(|| v.pointer("/role").and_then(|r| r.as_str())),
-            // NOTE: do NOT match `event_msg`/`agent_message` here.
-            // Codex emits agent_message as a streaming sidecar that
-            // mirrors a later `response_item` with role=="assistant"
-            // 1:1 (verified empirically across 20+ sessions, diff=0
-            // in every file, identical text in the pair). Counting
-            // both would double the assistant turn count and fire
-            // the on_idle gate one turn early.
-        };
-        if ty == Some(want) {
-            // Exclude Claude's synthetic user-tool-results — they aren't a
-            // real user turn. For User kind only.
-            if matches!(engine, Engine::ClaudeCode)
-                && kind == MessageKind::User
-                && is_claude_tool_result(&v)
-            {
-                continue;
-            }
-            n += 1;
-        }
+    match kind {
+        MessageKind::Assistant => state.assistant_count(),
+        MessageKind::User => state.user_count(),
     }
-    n
 }
 
 /// Return all messages of `kind` in the given transcript, in order.
@@ -903,5 +834,100 @@ mod tests {
             MessageKind::User,
         );
         assert_eq!(msgs, vec!["real user".to_string()]);
+    }
+
+    /// Two count_messages calls back-to-back with an append in between
+    /// should return the cumulative count. The cache must detect the
+    /// length change and incrementally apply the new lines on top of
+    /// state from the first call. Without the incremental path, the
+    /// pre-cache implementation re-read the whole file every time;
+    /// this test exercises the cache's fast path explicitly.
+    #[test]
+    fn cache_incremental_append_updates_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = [
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"one"}],"stop_reason":"end_turn"}}"##,
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"two"}],"stop_reason":"end_turn"}}"##,
+        ]
+        .join("\n");
+        write_transcript(&tmp, "-tmp-repo", "sid-incr", &(initial + "\n"));
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        let n1 = count_messages(&Engine::ClaudeCode, &wt, "sid-incr", MessageKind::Assistant);
+        assert_eq!(n1, 2);
+
+        // Append a third turn. count_messages must reflect it next call.
+        let f_path = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".claude/projects/-tmp-repo/sid-incr.jsonl"))
+            .unwrap();
+        let appended = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"three"}],"stop_reason":"end_turn"}}"##;
+        let mut prev = std::fs::read_to_string(&f_path).unwrap();
+        prev.push_str(appended);
+        prev.push('\n');
+        std::fs::write(&f_path, prev).unwrap();
+
+        let n2 = count_messages(&Engine::ClaudeCode, &wt, "sid-incr", MessageKind::Assistant);
+        assert_eq!(n2, 3);
+    }
+
+    /// Simulate Claude's `/clear` rotation: the new transcript lives at
+    /// a different path (new sid), so the cache should produce a fresh
+    /// count for the new file regardless of what the old file accrued.
+    /// This is the case that motivates path-keyed entries.
+    #[test]
+    fn cache_rotation_via_new_path_starts_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pre = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"old"}],"stop_reason":"end_turn"}}"##;
+        write_transcript(&tmp, "-tmp-repo", "sid-old", &(pre.to_string() + "\n"));
+        // The post-/clear transcript shares the encoded worktree dir but
+        // gets a different sid → different absolute path.
+        let post = [
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"new1"}],"stop_reason":"end_turn"}}"##,
+            r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"new2"}],"stop_reason":"end_turn"}}"##,
+        ]
+        .join("\n");
+        write_transcript(&tmp, "-tmp-repo", "sid-new", &(post + "\n"));
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        // Prime the old-sid cache entry.
+        let n_old = count_messages(&Engine::ClaudeCode, &wt, "sid-old", MessageKind::Assistant);
+        assert_eq!(n_old, 1);
+        // New sid → new cache entry → count derived from new file only.
+        let n_new = count_messages(&Engine::ClaudeCode, &wt, "sid-new", MessageKind::Assistant);
+        assert_eq!(n_new, 2);
+    }
+
+    /// If a writer flushes a line without its trailing `\n` and we read
+    /// the file *before* the `\n` arrives, the partial line should still
+    /// be counted on the current call (so the gate isn't artificially
+    /// delayed) AND when the `\n` lands later, the count must not
+    /// double-count the same line.
+    #[test]
+    fn cache_partial_trailing_line_is_counted_then_committed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // First line is fully terminated; second line is missing its
+        // trailing `\n`.
+        let partial_body = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first"}],"stop_reason":"end_turn"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"second-partial"}],"stop_reason":"end_turn"}}"##;
+        write_transcript(&tmp, "-tmp-repo", "sid-partial", partial_body);
+        let _h = HomeOverride::new(tmp);
+        let wt = std::path::PathBuf::from("/tmp/repo");
+
+        let n1 = count_messages(&Engine::ClaudeCode, &wt, "sid-partial", MessageKind::Assistant);
+        assert_eq!(n1, 2, "partial trailing line must be counted");
+
+        // Now finish the second line (just append the `\n`). Total
+        // should still be 2 — not 3.
+        let f_path = std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".claude/projects/-tmp-repo/sid-partial.jsonl"))
+            .unwrap();
+        let mut prev = std::fs::read_to_string(&f_path).unwrap();
+        prev.push('\n');
+        std::fs::write(&f_path, prev).unwrap();
+
+        let n2 = count_messages(&Engine::ClaudeCode, &wt, "sid-partial", MessageKind::Assistant);
+        assert_eq!(n2, 2, "completing the same line must not double-count");
     }
 }

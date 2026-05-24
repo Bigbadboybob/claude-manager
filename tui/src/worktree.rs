@@ -326,6 +326,13 @@ pub fn setup_worktree(main_repo: &Path, worktree_path: &Path) {
 /// depends on the worktree path — without this, a failed remove plus
 /// a wiped `worktree_path` leaves the manifest unable to find the
 /// worktree to retry.
+///
+/// Idempotent: if `worktree_path` doesn't exist on disk we treat the
+/// worktree as already gone, run `git worktree prune` to drop any
+/// stale admin records, and return `Ok(())`. Without this, A-x on a
+/// workspace whose directory was deleted out-of-band gets stuck —
+/// git errors with "is not a working tree" and the manifest entry
+/// never gets cleaned up.
 pub fn remove_worktree(
     main_repo: &Path,
     worktree_path: &Path,
@@ -338,11 +345,18 @@ pub fn remove_worktree(
         .output()
         .map_err(|e| format!("spawn git worktree remove: {}", e))?;
     if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(stderr.trim().to_string())
+        return Ok(());
     }
+    if !worktree_path.exists() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(main_repo)
+            .args(["worktree", "prune"])
+            .output();
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(stderr.trim().to_string())
 }
 
 /// Resolve a repo shortname or URL to a local path.
