@@ -228,6 +228,14 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
     fn goal(&self) -> Option<String> {
         self.run.goal.clone()
     }
+
+    fn rejected_findings(&self) -> Vec<String> {
+        self.run
+            .rejected_findings
+            .iter()
+            .map(|r| r.text.clone())
+            .collect()
+    }
 }
 
 impl<'a> WorkflowControllerCtx<'a> {
@@ -756,6 +764,31 @@ impl<'a> WorkflowControllerCtx<'a> {
                             run_id: run_id.clone(),
                             reason,
                         });
+                    }
+                    workflow::events::EventKind::RejectFinding { text } => {
+                        // Apply in place — no state-machine decision to defer.
+                        // Appending to the run's stash and persisting is local
+                        // enough that we don't need a Decision variant.
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            let iteration = self.workflow_runs[idx].iteration;
+                            self.workflow_runs[idx]
+                                .rejected_findings
+                                .push(crate::workflow::run::RejectedFinding {
+                                    text: trimmed.to_string(),
+                                    recorded_at: crate::workflow::run::now_unix(),
+                                    iteration,
+                                });
+                            let _ = workflow::run::save(&self.workflow_runs[idx]);
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "reject_finding recorded ({} chars, total={} rejections)",
+                                    trimmed.len(),
+                                    self.workflow_runs[idx].rejected_findings.len(),
+                                ),
+                            );
+                        }
                     }
                     workflow::events::EventKind::Unknown => {}
                 }

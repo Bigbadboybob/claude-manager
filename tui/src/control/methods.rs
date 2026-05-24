@@ -2310,6 +2310,7 @@ mod tests {
             role_baselines: Default::default(),
             goal: None,
             role_plans: Default::default(),
+            rejected_findings: Vec::new(),
         }
     }
 

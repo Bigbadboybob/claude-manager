@@ -104,6 +104,24 @@ pub struct MessageBaseline {
     pub assistant_count: usize,
 }
 
+/// One entry in the manager-curated rejected-findings stash.
+///
+/// The manager calls `workflow_reject_finding(text)` to add an entry; the
+/// reviewer's activation prompt then includes the running list so a fresh
+/// reviewer (which doesn't see the prior round's conversation) doesn't
+/// re-surface findings the manager has already decided to ignore.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RejectedFinding {
+    /// The text the manager wrote — usually a one-line paraphrase of
+    /// the rejected finding.
+    pub text: String,
+    /// Unix seconds at which the manager recorded it.
+    pub recorded_at: u64,
+    /// Run iteration that was active when the rejection landed. Helps
+    /// debug "which round did this come from" without reading events.jsonl.
+    pub iteration: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowRun {
     pub run_id: String,
@@ -149,6 +167,12 @@ pub struct WorkflowRun {
     /// the live transcript's tail is no longer the plan tool_use.
     #[serde(default)]
     pub role_plans: BTreeMap<String, String>,
+    /// Findings the manager has explicitly dismissed via the
+    /// `workflow_reject_finding` MCP tool. Surfaced to the (fresh-context)
+    /// reviewer on its next activation so it doesn't re-raise the same
+    /// nits round after round.
+    #[serde(default)]
+    pub rejected_findings: Vec<RejectedFinding>,
 }
 
 impl WorkflowRun {
@@ -198,6 +222,7 @@ impl WorkflowRun {
             role_baselines,
             goal,
             role_plans,
+            rejected_findings: Vec::new(),
         }
     }
 
@@ -304,7 +329,7 @@ pub fn new_run_id() -> String {
     format!("wf_{:x}{:x}", secs, rand_part)
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

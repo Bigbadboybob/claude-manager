@@ -26,6 +26,7 @@ pub struct Event {
 pub enum EventKind {
     Transition { to: String, prompt: String },
     Done { reason: String },
+    RejectFinding { text: String },
     Unknown,
 }
 
@@ -55,6 +56,15 @@ impl Event {
                     .unwrap_or("")
                     .to_string();
                 EventKind::Done { reason }
+            }
+            "workflow_reject_finding" => {
+                let text = self
+                    .args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                EventKind::RejectFinding { text }
             }
             _ => EventKind::Unknown,
         }
@@ -181,6 +191,38 @@ mod tests {
             let (events, offset) = read_new("wf_nonexistent", 0);
             assert!(events.is_empty());
             assert_eq!(offset, 0);
+        });
+    }
+
+    /// `workflow_reject_finding` JSONL entry parses into
+    /// `EventKind::RejectFinding` with the text field extracted.
+    #[test]
+    fn reject_finding_event_parses() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_reject";
+            let dir = run::run_dir(run_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = run::events_path(run_id);
+            {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                writeln!(
+                    f,
+                    r#"{{"id":"r1","ts":3.0,"run_id":"wf_reject","role":"manager","tool":"workflow_reject_finding","args":{{"text":"don't re-raise the /tmp symlink nit"}}}}"#
+                )
+                .unwrap();
+            }
+            let (events, _) = read_new(run_id, 0);
+            assert_eq!(events.len(), 1);
+            match events[0].kind() {
+                EventKind::RejectFinding { text } => {
+                    assert_eq!(text, "don't re-raise the /tmp symlink nit");
+                }
+                other => panic!("expected RejectFinding, got {:?}", other),
+            }
         });
     }
 }

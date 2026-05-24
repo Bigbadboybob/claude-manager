@@ -912,5 +912,34 @@ def workflow_done(reason: str) -> str:
     return f"Workflow marked done (event {event['id']})."
 
 
+@mcp.tool()
+def workflow_reject_finding(text: str) -> str:
+    """Permanently dismiss a reviewer finding for the rest of this workflow run.
+
+    Use this when a reviewer surfaces a finding you've decided is not worth
+    acting on (a nit, an out-of-scope concern, a paranoid threat model, etc.)
+    AND you expect the reviewer to keep raising it round after round. The
+    rejection is appended to a stash on the workflow run and surfaced to the
+    reviewer on its next (fresh-context) activation so it knows to stop
+    re-raising the same concern.
+
+    This is a side-effect call. It does NOT end your turn or advance the
+    workflow — follow up with `workflow_transition` or `workflow_done` for
+    that. Call it 0–N times per round, before the final transition.
+
+    Paraphrase the rejected finding into one concise line. "Symlink check on
+    /tmp paranoid for a single-user laptop — won't re-raise" reads better in
+    the reviewer's prompt than pasting the reviewer's whole multi-paragraph
+    finding back.
+
+    Args:
+        text: One-line paraphrase of the rejected finding (plus a short why,
+            optionally). Free-text; surfaced to the reviewer verbatim as a
+            bullet point.
+    """
+    event = _append_event("workflow_reject_finding", {"text": text})
+    return f"Recorded rejection (event {event['id']})."
+
+
 if __name__ == "__main__":
     mcp.run()

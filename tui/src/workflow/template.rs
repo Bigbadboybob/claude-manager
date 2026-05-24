@@ -18,6 +18,13 @@
 //!   {{ roles.<role>.plan }}              the markdown plan from the most recent
 //!                                        ExitPlanMode tool call in that role's
 //!                                        Claude transcript (empty if never used)
+//!   {{ goal }}                           run-level goal set at launch (falls back
+//!                                        to worker.initial_prompt when empty)
+//!   {{ rejected_findings }}              header + bulleted list of findings the
+//!                                        manager has rejected this run via
+//!                                        `workflow_reject_finding`. Empty string
+//!                                        when the stash is empty so first-round
+//!                                        prompts stay clean.
 //! ```
 //!
 //! Negative indices count from the end of the respective slice (e.g.
@@ -62,6 +69,14 @@ pub trait RoleResolver {
     /// `{{ goal }}` template var. Return `None` to fall back to the worker's
     /// `initial_prompt`.
     fn goal(&self) -> Option<String>;
+    /// Free-text findings the manager has dismissed via
+    /// `workflow_reject_finding`. Surfaced via the bare
+    /// `{{ rejected_findings }}` var; empty vec renders to empty string so
+    /// first-round prompts stay clean. Default impl returns empty so simpler
+    /// resolvers don't need to know about the stash.
+    fn rejected_findings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub fn render<R: RoleResolver + ?Sized>(template: &str, resolver: &R) -> String {
@@ -142,6 +157,25 @@ fn resolve<R: RoleResolver + ?Sized>(key: &str, resolver: &R) -> String {
         // Fall back to the worker's initial_prompt when no explicit goal was set.
         return resolver.user_messages("worker").into_iter().next().unwrap_or_default();
     }
+    if key == "rejected_findings" {
+        let items = resolver.rejected_findings();
+        if items.is_empty() {
+            return String::new();
+        }
+        // Header + bulleted list. Header lives inside the var (not the
+        // surrounding template) so the empty case collapses cleanly to
+        // an empty string and the surrounding blank line just becomes
+        // a single blank line.
+        let mut out = String::from(
+            "Previously-rejected findings — the manager has decided these are not worth raising again. Do not re-surface them:\n",
+        );
+        for item in items {
+            out.push_str("- ");
+            out.push_str(item.trim());
+            out.push('\n');
+        }
+        return out;
+    }
     let Some((role, accessor, idx)) = parse_key(key) else {
         return String::new();
     };
@@ -188,6 +222,7 @@ mod tests {
         prior_assistant: std::collections::HashMap<String, Vec<String>>,
         plan: std::collections::HashMap<String, String>,
         goal: Option<String>,
+        rejected: Vec<String>,
     }
 
     impl RoleResolver for Stub {
@@ -214,6 +249,9 @@ mod tests {
         }
         fn goal(&self) -> Option<String> {
             self.goal.clone()
+        }
+        fn rejected_findings(&self) -> Vec<String> {
+            self.rejected.clone()
         }
     }
 
@@ -261,6 +299,7 @@ mod tests {
             prior_assistant,
             plan,
             goal: None,
+            rejected: Vec::new(),
         }
     }
 
@@ -431,5 +470,42 @@ mod tests {
         let mut s = stub();
         s.this_turn.insert("worker".into(), vec!["only thing I said".into()]);
         assert_eq!(render("{{ roles.worker.this_turn }}", &s), "only thing I said");
+    }
+
+    /// Empty stash → empty string. First-round reviewer prompts shouldn't
+    /// include a noisy "(no rejections yet)" block.
+    #[test]
+    fn rejected_findings_empty_renders_empty_string() {
+        assert_eq!(render("{{ rejected_findings }}", &stub()), "");
+    }
+
+    /// Non-empty stash → header + bullets. Header text lives inside the
+    /// var so callers can drop {{ rejected_findings }} into a template
+    /// without conditional logic.
+    #[test]
+    fn rejected_findings_renders_header_and_bullets() {
+        let mut s = stub();
+        s.rejected = vec![
+            "/tmp symlink check is paranoid for single-user laptops".into(),
+            "perf nit on the hot path is below the noise floor".into(),
+        ];
+        let out = render("{{ rejected_findings }}", &s);
+        assert!(
+            out.starts_with("Previously-rejected findings"),
+            "got: {:?}",
+            out
+        );
+        assert!(out.contains("- /tmp symlink check is paranoid for single-user laptops"));
+        assert!(out.contains("- perf nit on the hot path is below the noise floor"));
+    }
+
+    /// Whitespace inside an entry is preserved-but-trimmed; the bullet
+    /// shouldn't have a double-space after the dash.
+    #[test]
+    fn rejected_findings_trims_per_entry() {
+        let mut s = stub();
+        s.rejected = vec!["   leading and trailing whitespace   ".into()];
+        let out = render("{{ rejected_findings }}", &s);
+        assert!(out.contains("- leading and trailing whitespace\n"));
     }
 }
