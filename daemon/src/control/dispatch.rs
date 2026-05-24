@@ -195,6 +195,14 @@ pub fn dispatch_request(
         // rewrite the tree.
         "task.update_tree" => DispatchOutcome::Done(dispatch_task_update_tree(state, req)),
 
+        // 10d-1: TUI-pushed session snapshot so the daemon
+        // can recognize TUI-minted sessions for the future
+        // workflow-method auth (10d-2). Operator-only — same
+        // rationale as task.update_tree.
+        "tui.update_sessions_snapshot" => {
+            DispatchOutcome::Done(dispatch_tui_update_sessions_snapshot(state, req))
+        }
+
         // Sub-2b-1: `resolve_authorized_session` — the Python
         // MCP `read_session_output` tool's first leg of its
         // composed pattern. Returns `{state, engine,
@@ -410,6 +418,31 @@ fn dispatch_task_update_tree(
         );
     }
     match methods::task_update_tree(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `tui.update_sessions_snapshot` — TUI-pushed session
+/// snapshot (10d-1). Operator-only — same rationale as
+/// `task.update_tree`: a Session caller pushing rows could
+/// grant itself visibility into another task's workflow
+/// state once 10d-2's auth consumer reads from this map.
+fn dispatch_tui_update_sessions_snapshot(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if matches!(req.caller, Caller::Session(_)) {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "tui.update_sessions_snapshot is Operator-callable only — a \
+             Session caller rewriting the TUI session map could grant \
+             itself visibility into another task's sessions when the \
+             10d-2 workflow-method auth consumer reads from this map",
+        );
+    }
+    match methods::tui_update_sessions_snapshot(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -313,10 +313,39 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
 
 ### Slice 10d-workflow-controller — Workflow controller relocation
 
-- Move `tui/src/workflow/controller.rs` to `daemon/src/workflow/controller.rs` now that `Session` is daemon-owned (the only remaining blocker on this module per slice 6).
-- TUI's `app.rs` workflow handling becomes RPC calls + manifest/events subscriptions.
+#### 10d-1 — TUI → daemon session-snapshot push (scaffolding) — COMPLETE pending review
 
-**Working-set check:** opt-in off, workflows work locally. Opt-in on, workflows run daemon-side; the TUI is a thin observer.
+Wire shape: `tui.update_sessions_snapshot` (Operator-only) carrying a full-replace snapshot of `{uid, task_id, label, type, hidden, workflow_run_id, workflow_role}` per TUI session. Lands in `DaemonState.tui_sessions: HashMap<String, TuiSessionSnapshot>`, with `tui_sessions_pushed: bool` distinguishing "deliberately empty" from "never pushed". Helper `lookup_session_any` returns `SessionViewAny { uid, daemon_owned, task_id, workspace_id, workflow_run_id, workflow_role }` checking `state.sessions` first, then `state.tui_sessions`. No callers yet — 10d-2 wires the workflow-method auth consumer.
+
+TUI side: push site is `App::save_session_manifest` (the documented funnel; every session-list mutation already flows through it before returning Ok, per the convention at the top of the helper section). Universal coverage without site-by-site audit — at the cost of one extra local UDS round-trip per save (opt-in gated; sub-ms vs. the disk write the funnel already does). Sites that mutate the task tree call the existing `push_state_to_daemon` wrapper (task tree + snapshot — the snapshot half is redundant with the funnel hook but correct and idempotent).
+
+Strict-fatal: the RPC helper surfaces socket failures as `Err`; the TUI's `push_tui_sessions_to_daemon` then `eprintln!`s a clear message. Round-11 invariant: under opt-in the daemon is a hard dependency, so failure must not be silently swallowed.
+
+Tests (4 new, all green 5x):
+- `rpc_tui_update_sessions_snapshot_full_replace` — Operator push lands; second push replaces (not merges).
+- `rpc_tui_update_sessions_snapshot_empty_push_sets_pushed_flag` — pushed flag flips even on empty payload.
+- `rpc_tui_update_sessions_snapshot_rejects_session_caller` — `Caller::Session` → `Unauthorized`, state untouched.
+- `rpc_tui_update_sessions_snapshot_surfaces_socket_failure` — bad socket → `Err` propagates to caller.
+
+#### 10d-2 — Workflow controller relocation, auth consumer (proposal)
+
+**What moves to daemon:** the workflow controller state machine (`tui/src/workflow/controller.rs`, ~2050 lines): role table (engine, context policy, activation prompt), transition graph (static `on_idle` + dynamic from `workflow_transition`/`workflow_done`), template expansion (`{{ roles.<role>.assistant[N] }}` etc.), workflow-run id allocation, and the `events.jsonl` writer. Becomes `daemon/src/workflow/controller.rs` invoked by `start_workflow`/`stop_workflow`/`get_workflow_state` dispatch arms. The auth consumer for `workflow_transition`/`workflow_done` lives here: a `Caller::Session(uid)` call walks `state.lookup_session_any(uid)` → matches `workflow_run_id` against the controller's active run → authorizes.
+
+**What stays in TUI:** the **observer** half. `App` keeps its `workflow_runs: Vec<WorkflowRun>` mirror but populates it exclusively via `events.jsonl` tail (`~/.cm/workflow-runs/<id>/events.jsonl`) instead of in-memory controller state. Keybindings (`A-f` / `A-u` / `A-o` / `A-y`) become RPC calls. The TOML loader (`workflows/feedback.toml` + custom defs) becomes daemon-side at startup — a `daemon.config_dir` env or path passed via launch. TUI calls `list_workflows` to surface options in the launcher UI.
+
+**State machine location:** daemon. The TUI must not mutate workflow state — it observes via events.jsonl + manifest watch.
+
+**TOML loader access:** daemon loads at startup from `${CM_WORKFLOWS_DIR:-$HOME/.cm/workflows}` plus a built-in fallback bundling `feedback.toml`. `list_workflows` exposes the loaded defs; `start_workflow` references them by name. TUI does NOT parse TOML in opt-in mode.
+
+#### 10d-3 — DAEMON_METHODS expansion (proposal)
+
+**What moves:** `workflow_transition` and `workflow_done` flip from file-writer (TUI tails `events.jsonl`) to **socket-routed methods** that take a `workflow_run_id` + state and write the event server-side under controller-held locks. The file becomes a daemon-owned append log, not a producer/consumer rendezvous. DAEMON_METHODS in `mcp_server/server.py` gets these two added; control_client routes them to the daemon socket. Auth consumer is the controller's session→run→role table from 10d-2 — Session-caller for a participant in the active run is authorized; everyone else is `Unauthorized`.
+
+**Why not in 10d-2:** 10d-2 establishes the controller-side machinery; 10d-3 flips the wire shape MCP agents see. Doing them in one slice would conflate "controller works" with "file→socket migration", both with their own failure modes. Sequencing them lets the controller be exercised end-to-end (TUI-driven start, agents writing to events.jsonl as today) before changing the agent-facing surface.
+
+**Working-set check (after all of 10d-1/2/3):** opt-in off, workflows work locally. Opt-in on, workflows run daemon-side; the TUI is a thin observer.
+
+
 
 ### Slice 10e — Manifest ownership flip
 
@@ -375,6 +404,10 @@ Total: roughly 15–20 commits with the 10c subdivision + 10d split. Each leaves
 ## Known costs / future work
 
 - **Per-worktree spawn+detect serialization for the MCP path** (sub-2b-3 review-4 #2). `mcp_start_session` holds a per-worktree mutex from spawn through detector binding so concurrent same-worktree spawns can't cross-bind transcript files. Spawns in different worktrees don't serialize against each other. Acceptable today because workflow agents in the same worktree spawn sequentially in practice (the workflow controller drives transitions one role at a time). A future slice can replace serialization with content-association — e.g. inject a spawn-tag env var that the engine echoes into its first transcript line, then match-by-tag instead of match-by-newest — if latency becomes a problem.
+
+- **TUI crash-cleanup bound for `tui_sessions`** (10d-1 round-3). If the TUI crashes without graceful shutdown, the daemon retains the last-pushed `tui_sessions` snapshot until the restarted TUI's first push replaces it. During that window, a stale uid could authorize as a valid TUI session for workflow methods (post-10d-2), but the downstream session operation would fail because the session itself doesn't exist anywhere actionable. Mitigation in 10d-2: when auth via `tui_sessions` succeeds, treat "session uid resolves to a known task but no live session anywhere" as a clear error, not a bug — document under "transitional crash semantics" when that slice lands. Durable fix: daemon-side connection-lifecycle awareness for the TUI's control-client connection — clear `tui_sessions` when the TUI's RPC connection drops. Requires a connection model that distinguishes TUI from other callers; defer to a later slice, not blocking Phase 1.
+
+- **`DAEMON_METHODS` split: Python-routable vs. dispatch-alignment** (10d-1 round-4). The Python-side `DAEMON_METHODS` frozenset currently serves two roles: (1) routing decisions in `control_client.call` (Python callers route methods in the set to the daemon socket), and (2) the alignment-test snapshot in `test_socket_route_selection.py` (must equal daemon's dispatch arms). 10d-1 added `tui.update_sessions_snapshot` to the set purely for role (2) — Python never calls it; it's Operator-only push from the TUI. Cleaner shape would be `SESSION_CALLABLE_METHODS` (role 1, what Python routes) and `OPERATOR_ONLY_METHODS` (TUI-pushed; not Python-routable), with the alignment test asserting `union == dispatch_arms`. Defer; the inline comment on the entry signals the intent for now.
 
 ## Known flake-class issues (deferred)
 

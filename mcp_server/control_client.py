@@ -95,6 +95,9 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "session.set_transcript_path",
     "propose_task",
     "mcp_start_session",
+    # Operator-only push from TUI; included for dispatch-surface
+    # alignment, not Python-routable.
+    "tui.update_sessions_snapshot",
 })
 
 

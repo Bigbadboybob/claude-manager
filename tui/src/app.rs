@@ -3154,6 +3154,21 @@ impl App {
                 );
             }
         }
+
+        // 10d-1: every session-list mutation site is required by
+        // the convention at the top of the helper section to
+        // call `save_session_manifest` before returning Ok (see
+        // the doc comment on the `start_session_for_new_task`
+        // family). That makes this the single canonical funnel
+        // for "session list / per-session fields changed";
+        // pushing the snapshot to the daemon here gives the
+        // 10d-2 auth consumer universal coverage without a
+        // call-site audit. Cost: one extra local UDS round-trip
+        // per save (opt-in gated; sub-ms vs. the disk write
+        // above). Failure surfaces via the helper's own
+        // `eprintln!` (round-11 invariant: don't silently
+        // swallow under opt-in).
+        self.push_tui_sessions_to_daemon();
     }
 
     /// Load session manifest from disk. On parse failure, the corrupt file is
@@ -3316,6 +3331,22 @@ impl App {
                 break;
             }
         }
+
+        // 10d-1 startup-ordering fix: `drain_backend_events` fires
+        // `reconcile_tasks` BEFORE this hydration runs on the first
+        // `TasksUpdated`, and that path's `push_state_to_daemon`
+        // call would otherwise send the daemon a full-replace
+        // snapshot of empty `tui_sessions` plus a workspaces map
+        // missing every restored entry — semantically a lie about
+        // TUI state, and once 10d-2 wires the workflow-method auth
+        // consumer to `tui_sessions`, every TUI-minted session
+        // restored from manifest would be rejected as "caller
+        // session not found" until some later mutation triggered a
+        // re-push. Push here so the populated state always lands.
+        // Idempotent: the second push fully replaces the first
+        // (full-replace semantics — see
+        // `rpc_tui_update_sessions_snapshot_full_replace`).
+        self.push_state_to_daemon();
     }
 
     /// Spawn a session from a ManifestEntry within a Workspace context.
@@ -5646,7 +5677,7 @@ impl App {
         // diffs from the API. Per-site pushes elsewhere catch the
         // local-only mutations that bypass this path
         // (delete_task, launch_*, resume_locally).
-        self.push_task_tree_to_daemon();
+        self.push_state_to_daemon();
     }
 
     fn set_status_msg(&mut self, msg: &str) {
@@ -5782,6 +5813,7 @@ impl App {
                 }
                 PlanAction::Quit => {
                     self.save_session_manifest();
+                    self.clear_tui_sessions_on_daemon();
                     self.should_quit = true;
                     return true;
                 }
@@ -5836,6 +5868,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('q') => {
                         self.save_session_manifest();
+                        self.clear_tui_sessions_on_daemon();
                         self.should_quit = true;
                         return true;
                     }
@@ -6719,6 +6752,113 @@ impl App {
     /// method clears + re-inserts on every call. Cheaper than
     /// computing diffs in the TUI and avoids drift if a single
     /// incremental push is lost.
+    /// 10d-1: push the TUI's session snapshot to the daemon so
+    /// the daemon recognizes TUI-minted sessions. Lands in
+    /// `daemon::state::DaemonState::tui_sessions` via
+    /// `tui.update_sessions_snapshot`. Full-replace semantics
+    /// (replace-not-merge), same shape as
+    /// [`push_task_tree_to_daemon`].
+    ///
+    /// **No auth consumer yet**: 10d-1 lands the push + storage.
+    /// The workflow-method auth consumer in 10d-2 reads from
+    /// `state.tui_sessions`; without that push wired here, 10d-2
+    /// would have nothing to read.
+    pub(crate) fn push_tui_sessions_to_daemon(&self) {
+        if !crate::daemon_launch::opt_in_enabled() {
+            return;
+        }
+        // Flatten App.workspaces[*].sessions[*] into one vec —
+        // but filter OUT daemon-attached sessions
+        // (`session.daemon_session_uid.is_some()`). Those already
+        // live in `state.sessions` on the daemon; appearing in
+        // `state.tui_sessions` too would double-register them and
+        // make `lookup_session_any`'s ordering load-bearing for
+        // correctness. Keeping the two maps non-overlapping by
+        // construction means the lookup can prefer either without
+        // ambiguity. Carries the auth-relevant fields per
+        // `daemon::state::TuiSessionSnapshot` shape — task_id
+        // (for descendant-task scoping), workflow_run_id /
+        // workflow_role (for workflow-method auth in 10d-2),
+        // label / type / hidden (forward-compat for a merged
+        // list_sessions view in a future slice).
+        let sessions: Vec<crate::client_session::TuiSessionSnapshotPush<'_>> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .filter(|ts| ts.session.daemon_session_uid.is_none())
+            .map(|ts| crate::client_session::TuiSessionSnapshotPush {
+                uid: ts.uid.as_str(),
+                task_id: ts.task_id.as_deref(),
+                label: Some(ts.label.as_str()),
+                session_type: Some(ts.session_type.as_str()),
+                hidden: ts.hidden,
+                workflow_run_id: ts.workflow_run_id.as_deref(),
+                workflow_role: ts.workflow_role.as_deref(),
+            })
+            .collect();
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
+            &daemon_socket,
+            "tui-operator",
+            &sessions,
+        ) {
+            eprintln!(
+                "cm-tui: tui.update_sessions_snapshot failed: {} \
+                 (daemon's TUI-session view will lag until the next push — \
+                 workflow-method auth consumers in 10d-2 may surface as \
+                 'caller not found' for TUI-minted sessions)",
+                e,
+            );
+        }
+    }
+
+    /// 10d-1: unified state-snapshot push. Sites that mutate
+    /// EITHER the task tree OR the session list should call
+    /// this single helper. Pre-10d-1 those sites called
+    /// `push_task_tree_to_daemon` directly; replacing with
+    /// `push_state_to_daemon` means session-list mutations
+    /// (add, remove, hide, label, task rebind) automatically
+    /// keep the daemon's TUI-session view current.
+    pub(crate) fn push_state_to_daemon(&self) {
+        self.push_task_tree_to_daemon();
+        self.push_tui_sessions_to_daemon();
+    }
+
+    /// 10d-1 graceful-shutdown clear: push an explicit empty
+    /// `tui_sessions` snapshot to the daemon. Called from every
+    /// `should_quit = true` site after `save_session_manifest`.
+    /// Without this, the daemon retains the live snapshot the
+    /// final `save_session_manifest` push left behind — and
+    /// once the TUI exits, those rows describe sessions that
+    /// no longer exist, which 10d-2's `lookup_session_any`
+    /// would falsely treat as valid TUI sessions for workflow
+    /// auth.
+    ///
+    /// Crash case (TUI exits without reaching here) is bounded
+    /// in NOTES.md under "TUI crash-cleanup bound for
+    /// tui_sessions" — the next TUI restart's first push (from
+    /// either startup `reconcile_tasks` or `restore_sessions`)
+    /// replaces the stale snapshot. A durable fix requires
+    /// daemon-side connection-lifecycle awareness; defer.
+    pub(crate) fn clear_tui_sessions_on_daemon(&self) {
+        if !crate::daemon_launch::opt_in_enabled() {
+            return;
+        }
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
+            &daemon_socket,
+            "tui-operator",
+            &[],
+        ) {
+            eprintln!(
+                "cm-tui: tui.update_sessions_snapshot (shutdown clear) failed: {} \
+                 (daemon will retain stale tui_sessions rows until next TUI restart's \
+                 first push — see NOTES.md 'TUI crash-cleanup bound')",
+                e,
+            );
+        }
+    }
+
     pub(crate) fn push_task_tree_to_daemon(&self) {
         if !crate::daemon_launch::opt_in_enabled() {
             return;
@@ -7180,7 +7320,7 @@ impl App {
         // (descendant-task resolution looks up the workspace
         // via state.workspaces). Without this push, the agent
         // would race the next API-driven reconcile.
-        self.push_task_tree_to_daemon();
+        self.push_state_to_daemon();
         self.set_status_msg("Workspace created");
     }
 
@@ -7660,7 +7800,7 @@ impl App {
                 self.save_session_manifest();
                 // Sub-2a Finding #1: a resume_locally may have
                 // inserted a new TaskEntry above.
-                self.push_task_tree_to_daemon();
+                self.push_state_to_daemon();
                 self.set_status_msg("Resumed locally");
             }
             Err(e) => {
@@ -7767,7 +7907,7 @@ impl App {
             self.set_status_msg("Task deleted");
             self.save_session_manifest();
             // Sub-2a Finding #1: task removal — refresh tree.
-            self.push_task_tree_to_daemon();
+            self.push_state_to_daemon();
             return;
         }
 
@@ -7834,7 +7974,7 @@ impl App {
         self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
         // Sub-2a Finding #1: workspace delete removed all bound
         // tasks from `self.tasks` — refresh tree.
-        self.push_task_tree_to_daemon();
+        self.push_state_to_daemon();
         self.set_status_msg("Deleted");
     }
 
@@ -7924,7 +8064,7 @@ impl App {
         // (which could be seconds later, or never if the API
         // isn't refreshing), and a concurrent `mcp_start_session`
         // would spawn into the deleted worktree.
-        self.push_task_tree_to_daemon();
+        self.push_state_to_daemon();
     }
 
     /// Pull the active cloud workspace to local (uses the first bound task).
@@ -8114,7 +8254,7 @@ impl App {
                 // Sub-2a Finding #1: launch added a TaskEntry —
                 // refresh daemon's tree so any agent that spawns
                 // off this task immediately authorizes correctly.
-                self.push_task_tree_to_daemon();
+                self.push_state_to_daemon();
                 self.set_status_msg("Task launched");
             }
             Err(e) => {
@@ -8257,7 +8397,7 @@ impl App {
                 self.save_session_manifest();
                 // Sub-2a Finding #1: same as `launch_from_plan`,
                 // a launch may have inserted a new TaskEntry.
-                self.push_task_tree_to_daemon();
+                self.push_state_to_daemon();
                 self.set_status_msg("Task launched into workspace");
             }
             Err(e) => {
@@ -8407,7 +8547,7 @@ impl App {
         // pushes a fresh Workspace with worktree_path). Push
         // so the daemon knows the path BEFORE the user can
         // A-s an agent into it.
-        self.push_task_tree_to_daemon();
+        self.push_state_to_daemon();
         self.view_mode = ViewMode::Sessions;
         self.clamp_cursor();
         self.set_status_msg("Reopened — A-s to add session");

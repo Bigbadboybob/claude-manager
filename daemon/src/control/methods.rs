@@ -1898,6 +1898,57 @@ pub fn task_update_tree(
 }
 
 // ============================================================
+// tui.update_sessions_snapshot (10d-1)
+// ============================================================
+//
+// TUI-pushed session snapshot. The TUI is authoritative for
+// sessions it spawned locally (`SpawnTarget::TuiLocal`); the
+// daemon needs to know about them so 10d-2's workflow-method
+// auth can recognize TUI-minted callers. Today the daemon
+// only knows about sessions in `state.sessions` (those it
+// spawned via `start_session` / `mcp_start_session`).
+//
+// **Auth: Operator-only.** Same rationale as
+// `task.update_tree`: a Session caller rewriting the TUI's
+// session map could escape its own auth scope by inserting a
+// row that grants it visibility into another task.
+//
+// **Replace-not-merge** on every push. The TUI sends the full
+// snapshot; partial diffs aren't a thing.
+//
+// **Empty-vs-unset**: explicit empty map is meaningful ("TUI
+// has no sessions right now"). The `tui_sessions_pushed`
+// flag flips on first push and stays true; future auth
+// consumers (10d-2) use the flag to distinguish "TUI
+// deliberately reported empty" from "TUI hasn't pushed yet."
+
+#[derive(Deserialize)]
+struct TuiUpdateSessionsSnapshotParams {
+    sessions: Vec<crate::state::TuiSessionSnapshot>,
+}
+
+pub fn tui_update_sessions_snapshot(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: TuiUpdateSessionsSnapshotParams = serde_json::from_value(params.clone())
+        .map_err(|e| (
+            ErrorCode::InvalidParams,
+            format!("tui.update_sessions_snapshot params: {}", e),
+        ))?;
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    state.tui_sessions.clear();
+    for entry in p.sessions {
+        state.tui_sessions.insert(entry.uid.clone(), entry);
+    }
+    state.tui_sessions_pushed = true;
+    Ok(json!({
+        "ok": true,
+        "session_count": state.tui_sessions.len(),
+    }))
+}
+
+// ============================================================
 // propose_task (sub-2b-2)
 // ============================================================
 //

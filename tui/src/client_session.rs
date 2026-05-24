@@ -752,6 +752,63 @@ pub fn rpc_set_transcript_path(
 /// rewriting the tree could escape their own auth scope. The
 /// TUI uses the shared `tui-operator` token id like every
 /// other RPC site.
+/// 10d-1: TUI-pushed session snapshot. Replaces the daemon's
+/// `state.tui_sessions` map wholesale (replace-not-merge, same
+/// shape as `task.update_tree`). Operator-only on the daemon
+/// side — a Session caller could grant itself visibility into
+/// another task's sessions once 10d-2's workflow-method auth
+/// reads from this map.
+///
+/// `sessions` carries `(uid, task_id, label, session_type,
+/// hidden, workflow_run_id, workflow_role)` per row. The auth
+/// consumer in 10d-2 needs the task_id + workflow tags for
+/// descendant-task / workflow-run scoping; the label / type /
+/// hidden fields are forward-compat for a future merged
+/// `list_sessions` view (opt-in-off mode where the TUI is
+/// authoritative).
+pub fn rpc_tui_update_sessions_snapshot(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    sessions: &[TuiSessionSnapshotPush<'_>],
+) -> anyhow::Result<()> {
+    let sessions_json: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "uid": s.uid,
+                "task_id": s.task_id,
+                "label": s.label,
+                "type": s.session_type,
+                "hidden": s.hidden,
+                "workflow_run_id": s.workflow_run_id,
+                "workflow_role": s.workflow_role,
+            })
+        })
+        .collect();
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "tui.update_sessions_snapshot".into(),
+        params: serde_json::json!({ "sessions": sessions_json }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// 10d-1: borrowed view of a single TUI session row to push.
+/// Built fresh per call from `App.workspaces[*].sessions[*]`
+/// so the RPC site doesn't need to clone the whole session
+/// map. `&str` borrows live until `rpc_tui_update_sessions_snapshot`
+/// returns.
+pub struct TuiSessionSnapshotPush<'a> {
+    pub uid: &'a str,
+    pub task_id: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub session_type: Option<&'a str>,
+    pub hidden: bool,
+    pub workflow_run_id: Option<&'a str>,
+    pub workflow_role: Option<&'a str>,
+}
+
 pub fn rpc_task_update_tree(
     daemon_socket: &Path,
     operator_token_id: &str,
@@ -1122,6 +1179,509 @@ mod tests {
         assert!(!s.task_tree.contains_key("old-b"));
         assert!(s.task_tree.contains_key("new-a"));
         assert_eq!(s.task_tree.len(), 1);
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1: Operator push of the TUI session snapshot lands
+    /// in `DaemonState.tui_sessions`; full-replace semantics
+    /// match `task.update_tree`. A second push fully REPLACES,
+    /// not merges — same invariant as the task tree push, since
+    /// the daemon never sees TUI session removals as deltas (the
+    /// TUI sends its full session list every time).
+    #[test]
+    fn rpc_tui_update_sessions_snapshot_full_replace() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-tui-snap");
+        // Round 1: push {A, B}.
+        let first = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-a",
+                task_id: Some("task-a"),
+                label: Some("A"),
+                session_type: Some("claude-code"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-b",
+                task_id: Some("task-b"),
+                label: Some("B"),
+                session_type: Some("bash"),
+                hidden: true,
+                workflow_run_id: Some("wf-1"),
+                workflow_role: Some("worker"),
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-snap", &first)
+            .expect("first push ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(s.tui_sessions_pushed, "pushed flag must flip on first push");
+            assert_eq!(s.tui_sessions.len(), 2);
+            let a = s.tui_sessions.get("ses-a").expect("A landed");
+            assert_eq!(a.task_id.as_deref(), Some("task-a"));
+            assert_eq!(a.label.as_deref(), Some("A"));
+            assert_eq!(a.session_type.as_deref(), Some("claude-code"));
+            assert!(!a.hidden);
+            let b = s.tui_sessions.get("ses-b").expect("B landed");
+            assert_eq!(b.workflow_run_id.as_deref(), Some("wf-1"));
+            assert_eq!(b.workflow_role.as_deref(), Some("worker"));
+            assert!(b.hidden);
+        }
+        // Round 2: push {A, C} — B must disappear, C appear,
+        // A retained. Full-replace, not merge.
+        let second = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-a",
+                task_id: Some("task-a"),
+                label: Some("A"),
+                session_type: Some("claude-code"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-c",
+                task_id: Some("task-c"),
+                label: Some("C"),
+                session_type: Some("codex"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-snap", &second)
+            .expect("second push ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.tui_sessions.len(), 2);
+            assert!(s.tui_sessions.contains_key("ses-a"));
+            assert!(s.tui_sessions.contains_key("ses-c"));
+            assert!(
+                !s.tui_sessions.contains_key("ses-b"),
+                "B must be evicted on full-replace",
+            );
+        }
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1: empty push is meaningful — `tui_sessions_pushed`
+    /// flips to true so the auth consumer in 10d-2 can
+    /// distinguish "TUI deliberately reports zero sessions"
+    /// from "TUI hasn't pushed yet". The latter must fall
+    /// through to a different branch (e.g. trust daemon-side
+    /// task_id) rather than auto-deny.
+    #[test]
+    fn rpc_tui_update_sessions_snapshot_empty_push_sets_pushed_flag() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-tui-empty");
+        // Pre-push: `tui_sessions_pushed` is false by default.
+        {
+            let s = state.lock().unwrap();
+            assert!(!s.tui_sessions_pushed, "default must be false");
+            assert!(s.tui_sessions.is_empty());
+        }
+        rpc_tui_update_sessions_snapshot(&socket, "op-empty", &[])
+            .expect("empty push ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                s.tui_sessions_pushed,
+                "even an empty push must flip the flag",
+            );
+            assert!(s.tui_sessions.is_empty());
+        }
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1: a `Caller::Session` cannot push the TUI session
+    /// snapshot. Same rationale as `task.update_tree`'s
+    /// Operator-only constraint — a Session caller rewriting
+    /// the map could insert rows that grant itself visibility
+    /// into another task's sessions when the 10d-2 auth
+    /// consumer reads from it. Must surface `Unauthorized`.
+    #[test]
+    fn rpc_tui_update_sessions_snapshot_rejects_session_caller() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-tui-rej");
+        let req = Request {
+            id: next_request_id(),
+            caller: Caller::session("ses-imposter"),
+            method: "tui.update_sessions_snapshot".into(),
+            params: serde_json::json!({
+                "sessions": [{
+                    "uid": "ses-x",
+                    "task_id": "task-x",
+                    "label": "X",
+                    "type": "bash",
+                    "hidden": false,
+                }],
+            }),
+        };
+        let err = rpc_round_trip(&socket, &req).expect_err("must be denied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unauthorized"),
+            "Session caller must be Unauthorized, got: {}",
+            msg,
+        );
+        // And the state must remain untouched.
+        let s = state.lock().unwrap();
+        assert!(!s.tui_sessions_pushed);
+        assert!(s.tui_sessions.is_empty());
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1: the RPC helper surfaces socket failures as `Err`
+    /// to the caller, not silently swallowed. The TUI's
+    /// `push_tui_sessions_to_daemon` then turns that `Err` into
+    /// an `eprintln!` visible to the user — the round-11
+    /// invariant: under opt-in, the daemon is a hard dependency
+    /// of TUI session-list mutations; failure must NOT be
+    /// silent.
+    #[test]
+    fn rpc_tui_update_sessions_snapshot_surfaces_socket_failure() {
+        let nonexistent = std::path::PathBuf::from("/tmp/cm-tui-snap-no-such.sock");
+        let _ = std::fs::remove_file(&nonexistent);
+        let result = rpc_tui_update_sessions_snapshot(
+            &nonexistent,
+            "op-fail",
+            &[TuiSessionSnapshotPush {
+                uid: "ses-a",
+                task_id: None,
+                label: None,
+                session_type: None,
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            }],
+        );
+        assert!(
+            result.is_err(),
+            "socket-not-found must propagate as Err, not silently swallowed; \
+             got {:?}",
+            result,
+        );
+    }
+
+    /// 10d-1 startup-ordering fix: `drain_backend_events` fires
+    /// `reconcile_tasks` on the first `TasksUpdated`, and that
+    /// path's `push_state_to_daemon` runs BEFORE
+    /// `restore_sessions` hydrates `self.workspaces[].sessions`
+    /// from the on-disk manifest. Pre-fix the daemon was left
+    /// with a full-replace empty-`tui_sessions` snapshot — a
+    /// lie about TUI state, harmless in 10d-1 with no auth
+    /// consumer but in 10d-2 would cause every TUI-minted
+    /// session restored from manifest to be rejected as
+    /// "caller session not found" by the workflow auth path
+    /// until some later mutation triggered a re-push.
+    ///
+    /// Post-fix: `restore_sessions` calls `push_state_to_daemon`
+    /// at its tail. The simulation here is the wire-shape
+    /// equivalent: an early empty push (the lying reconcile
+    /// push) followed by a populated push (the corrective
+    /// restore push). Full-replace semantics guarantee the
+    /// later push wins.
+    #[test]
+    fn manifest_restored_sessions_land_in_daemon_snapshot() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-restore");
+        // Simulate `reconcile_tasks` firing first with no sessions
+        // populated yet (the pre-restore moment of startup).
+        rpc_tui_update_sessions_snapshot(&socket, "op-recon", &[])
+            .expect("early reconcile push ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(s.tui_sessions_pushed, "reconcile push must flip flag");
+            assert!(
+                s.tui_sessions.is_empty(),
+                "pre-restore daemon snapshot is empty (the lying state)",
+            );
+        }
+        // Now simulate `restore_sessions` finishing — three
+        // sessions hydrated from the on-disk manifest. The
+        // corrective push lands here. These rows cover the
+        // wire-shape fields the 10d-2 auth consumer will key off:
+        // task_id, workflow_run_id, workflow_role.
+        let restored = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-restored-1",
+                task_id: Some("task-1"),
+                label: Some("worker"),
+                session_type: Some("claude-code"),
+                hidden: false,
+                workflow_run_id: Some("wf-r"),
+                workflow_role: Some("worker"),
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-restored-2",
+                task_id: Some("task-1"),
+                label: Some("reviewer"),
+                session_type: Some("claude-code"),
+                hidden: true,
+                workflow_run_id: Some("wf-r"),
+                workflow_role: Some("reviewer"),
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-restored-3",
+                task_id: Some("task-2"),
+                label: Some("solo"),
+                session_type: Some("bash"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-restore", &restored)
+            .expect("restore push ok");
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.tui_sessions.len(),
+            3,
+            "all restored sessions must land in daemon snapshot",
+        );
+        let r1 = s.tui_sessions.get("ses-restored-1").expect("1 present");
+        assert_eq!(r1.task_id.as_deref(), Some("task-1"));
+        assert_eq!(r1.workflow_run_id.as_deref(), Some("wf-r"));
+        assert_eq!(r1.workflow_role.as_deref(), Some("worker"));
+        let r2 = s.tui_sessions.get("ses-restored-2").expect("2 present");
+        assert!(r2.hidden);
+        assert_eq!(r2.workflow_role.as_deref(), Some("reviewer"));
+        let r3 = s.tui_sessions.get("ses-restored-3").expect("3 present");
+        assert_eq!(r3.task_id.as_deref(), Some("task-2"));
+        assert!(r3.workflow_run_id.is_none());
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1 startup-ordering fix, empty-manifest path:
+    /// `restore_sessions` early-returns when both
+    /// `manifest.workspaces` and `manifest.bindings` are empty,
+    /// so no corrective push fires there. Coverage comes from
+    /// the pre-restore `reconcile_tasks` push, which always
+    /// fires on `TasksUpdated` regardless of TUI session state.
+    /// The end-state contract: daemon snapshot empty AND
+    /// `tui_sessions_pushed=true` — so the auth consumer in
+    /// 10d-2 can distinguish "TUI deliberately reports zero
+    /// sessions" from "TUI hasn't pushed yet".
+    #[test]
+    fn empty_manifest_startup_marks_pushed_flag_true() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-empty-restore");
+        // Pre-startup: pushed flag is false.
+        {
+            let s = state.lock().unwrap();
+            assert!(!s.tui_sessions_pushed);
+            assert!(s.tui_sessions.is_empty());
+        }
+        // `reconcile_tasks` fires on first TasksUpdated. Even
+        // with no TUI sessions, this push runs (pushes empty
+        // workspaces + empty tui_sessions). `restore_sessions`
+        // then early-returns on empty manifest — no second
+        // push, which is fine.
+        rpc_tui_update_sessions_snapshot(&socket, "op-empty", &[])
+            .expect("reconcile push on empty TUI state ok");
+        let s = state.lock().unwrap();
+        assert!(
+            s.tui_sessions_pushed,
+            "reconcile-time push must mark pushed=true even with no sessions",
+        );
+        assert!(s.tui_sessions.is_empty(), "snapshot must be empty");
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1 round-3 Part 1: `push_tui_sessions_to_daemon`
+    /// filters out daemon-attached sessions
+    /// (`ts.session.daemon_session_uid.is_some()`) so the daemon's
+    /// `state.tui_sessions` only carries TUI-LOCAL rows. Daemon-
+    /// attached sessions live in `state.sessions` already; appearing
+    /// in `tui_sessions` too would double-register and make
+    /// `lookup_session_any`'s precedence load-bearing for
+    /// correctness. The two maps are kept non-overlapping by
+    /// construction.
+    ///
+    /// Wire-shape simulation: build a push that mimics what the
+    /// filter produces — only the TUI-local row (`ses-local`)
+    /// reaches the daemon; the daemon-attached row (`ses-daemon`)
+    /// is omitted by the call site. Assert the daemon's
+    /// `tui_sessions` contains exactly the local row.
+    #[test]
+    fn push_filters_out_daemon_attached_sessions() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-filter");
+        // The TUI-side filter (`filter(|ts|
+        // ts.session.daemon_session_uid.is_none())`) keeps only
+        // local rows in the wire payload. We don't construct
+        // App in tests, so simulate the filter's output here:
+        // a single TUI-local row passed to the RPC, with the
+        // daemon-attached row deliberately omitted.
+        let filtered = vec![TuiSessionSnapshotPush {
+            uid: "ses-local",
+            task_id: Some("task-local"),
+            label: Some("local"),
+            session_type: Some("bash"),
+            hidden: false,
+            workflow_run_id: None,
+            workflow_role: None,
+        }];
+        rpc_tui_update_sessions_snapshot(&socket, "op-filter", &filtered)
+            .expect("filtered push ok");
+        let s = state.lock().unwrap();
+        assert_eq!(s.tui_sessions.len(), 1, "filter must drop the daemon-attached row");
+        assert!(s.tui_sessions.contains_key("ses-local"));
+        assert!(
+            !s.tui_sessions.contains_key("ses-daemon"),
+            "daemon-attached sessions must NOT appear in tui_sessions \
+             (they live in state.sessions instead — 10d-2 lookup_session_any \
+             keeps the maps non-overlapping by construction)",
+        );
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1 round-3 Part 2: graceful shutdown pushes an
+    /// explicit empty `tui_sessions` snapshot to the daemon, so
+    /// no stale rows linger across TUI restart. Pre-fix, the
+    /// final `save_session_manifest` push at A-q (or
+    /// `PlanAction::Quit`) left the daemon holding rows for
+    /// sessions that the TUI was about to drop — 10d-2's
+    /// `lookup_session_any` would falsely treat those as live
+    /// TUI sessions.
+    ///
+    /// Wire-shape simulation: first push the live snapshot
+    /// (what `save_session_manifest`'s hook sends), then push
+    /// the explicit empty snapshot (what
+    /// `clear_tui_sessions_on_daemon` sends). Assert daemon
+    /// ends with empty `tui_sessions` AND
+    /// `tui_sessions_pushed=true` (deliberate empty, not unset).
+    #[test]
+    fn graceful_shutdown_clears_tui_sessions_snapshot() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-shutdown");
+        // Live state during normal use — `save_session_manifest`
+        // hook pushes this on every mutation.
+        let live = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-a",
+                task_id: Some("task-a"),
+                label: Some("A"),
+                session_type: Some("claude-code"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-b",
+                task_id: Some("task-b"),
+                label: Some("B"),
+                session_type: Some("bash"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-live", &live)
+            .expect("live push ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.tui_sessions.len(), 2);
+        }
+        // Quit-time clear (`clear_tui_sessions_on_daemon`).
+        rpc_tui_update_sessions_snapshot(&socket, "op-quit", &[])
+            .expect("shutdown clear ok");
+        let s = state.lock().unwrap();
+        assert!(
+            s.tui_sessions.is_empty(),
+            "graceful shutdown must leave daemon with empty tui_sessions",
+        );
+        assert!(
+            s.tui_sessions_pushed,
+            "pushed flag remains true — `lookup_session_any` reads this \
+             to distinguish 'TUI gone' from 'never connected'",
+        );
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 10d-1 round-3: TUI restart after graceful shutdown leaves
+    /// the daemon with the NEW TUI's sessions only, not a merge
+    /// of old + new. Sequence: TUI #1 launches with {A, B}, quits
+    /// (pushes empty), TUI #2 launches with {A, C}. Final daemon
+    /// state must be exactly {A, C} — not {A, B, C} merged, not
+    /// stale {A, B}, not empty.
+    #[test]
+    fn restart_replaces_snapshot_not_merges() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-restart");
+        // TUI #1 running with {A, B}.
+        let first = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-a",
+                task_id: Some("task-a"),
+                label: Some("A"),
+                session_type: Some("bash"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-b",
+                task_id: Some("task-b"),
+                label: Some("B"),
+                session_type: Some("bash"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-tui1-live", &first)
+            .expect("tui#1 live ok");
+        // TUI #1 quits gracefully (empty push).
+        rpc_tui_update_sessions_snapshot(&socket, "op-tui1-quit", &[])
+            .expect("tui#1 quit ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(s.tui_sessions.is_empty(), "post-quit must be empty");
+        }
+        // TUI #2 launches: reconcile pushes empty, restore pushes
+        // its sessions {A, C} from the on-disk manifest (A
+        // persisted, B was killed before quit, C is brand new).
+        rpc_tui_update_sessions_snapshot(&socket, "op-tui2-reconcile", &[])
+            .expect("tui#2 reconcile ok");
+        let second = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-a",
+                task_id: Some("task-a"),
+                label: Some("A"),
+                session_type: Some("bash"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+            TuiSessionSnapshotPush {
+                uid: "ses-c",
+                task_id: Some("task-c"),
+                label: Some("C"),
+                session_type: Some("claude-code"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-tui2-restore", &second)
+            .expect("tui#2 restore ok");
+        let s = state.lock().unwrap();
+        assert_eq!(s.tui_sessions.len(), 2, "exactly {{A, C}} — no merge");
+        assert!(s.tui_sessions.contains_key("ses-a"));
+        assert!(s.tui_sessions.contains_key("ses-c"));
+        assert!(
+            !s.tui_sessions.contains_key("ses-b"),
+            "ses-b from previous TUI run must NOT survive",
+        );
         drop(s);
         stop_test_daemon(&socket, stop, handle);
     }

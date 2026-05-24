@@ -346,6 +346,86 @@ pub struct DaemonState {
     /// queue out of the state lock and enqueue without
     /// holding the outer `DaemonState` mutex.
     pub worktree_spawn_queues: WorktreeSpawnQueues,
+    /// 10d-1: TUI-pushed session snapshot. The TUI is
+    /// authoritative for sessions it spawned locally
+    /// (`SpawnTarget::TuiLocal`); the daemon needs to know
+    /// about them so 10d-2's workflow-method auth can
+    /// recognize TUI-minted callers (today the daemon only
+    /// knows about sessions in `self.sessions` — those it
+    /// spawned itself).
+    ///
+    /// **Authoritative source:** TUI. The daemon never writes
+    /// to this map except via `tui.update_sessions_snapshot`.
+    /// Replace-not-merge on every push, same shape as
+    /// `task_tree` / `task_workspaces`.
+    ///
+    /// **Empty-vs-unset distinction**: `tui_sessions_pushed`
+    /// is false until the first push. After that, an empty
+    /// `tui_sessions` map is meaningful ("TUI has no
+    /// sessions") and consumers must distinguish that from
+    /// "TUI hasn't pushed yet, no information available".
+    /// The flag flips on first push and never flips back.
+    ///
+    /// 10d-1 lands the push + storage. The auth consumer in
+    /// workflow methods is 10d-2; no callers consume this
+    /// field yet at 10d-1.
+    pub tui_sessions: HashMap<String, TuiSessionSnapshot>,
+    /// 10d-1: see [`tui_sessions`] — `true` once the TUI has
+    /// ever pushed a snapshot (even an empty one), `false`
+    /// before the first push. Lets the future 10d-2 auth
+    /// consumer distinguish "TUI deliberately has no
+    /// sessions" from "TUI hasn't pushed yet."
+    pub tui_sessions_pushed: bool,
+}
+
+/// 10d-1: TUI-side view of a single session. Carried by the
+/// `tui.update_sessions_snapshot` wire shape.
+///
+/// Field set is the minimum the 10d-2 workflow-method auth
+/// needs: identity (uid), task binding (for descendant-task
+/// scope), and workflow tags (for future workflow-method
+/// auth). Type and `hidden` are useful for `list_sessions`
+/// parity if/when that method consumes this map (currently
+/// list_sessions only inspects `state.sessions`, but a
+/// future slice could merge views for opt-in-off mode).
+///
+/// All optional fields use `#[serde(default)]` so the wire
+/// shape can evolve additively. Sub-2a's `task_tree` proved
+/// the pattern.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct TuiSessionSnapshot {
+    pub uid: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default, rename = "type")]
+    pub session_type: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub workflow_run_id: Option<String>,
+    #[serde(default)]
+    pub workflow_role: Option<String>,
+}
+
+/// 10d-1: unified session view used by future workflow-
+/// method auth (10d-2). Tells the consumer whether the
+/// session is daemon-minted (in `state.sessions`) or TUI-
+/// minted (in `state.tui_sessions`), without changing the
+/// answer to "does this session exist and what's its
+/// task_id."
+#[derive(Clone, Debug)]
+pub struct SessionViewAny {
+    pub uid: String,
+    /// `true` if the lookup found the session in
+    /// `state.sessions` (daemon-owned PTY); `false` if it
+    /// came from `state.tui_sessions` (TUI-owned).
+    pub daemon_owned: bool,
+    pub task_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
 }
 
 impl Default for DaemonState {
@@ -359,6 +439,8 @@ impl Default for DaemonState {
             task_tree: HashMap::new(),
             task_workspaces: HashMap::new(),
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
+            tui_sessions: HashMap::new(),
+            tui_sessions_pushed: false,
         }
     }
 }
@@ -403,6 +485,46 @@ impl DaemonState {
         self.workspaces = manifest.workspaces;
         self.bindings = manifest.bindings;
         Ok(true)
+    }
+
+    /// 10d-1: unified session lookup across daemon-owned
+    /// (`self.sessions`) and TUI-pushed (`self.tui_sessions`)
+    /// maps. Daemon-owned wins on collision — `self.sessions`
+    /// is authoritative for the sessions the daemon spawned
+    /// itself.
+    ///
+    /// Returns `None` if neither map knows about `uid`. The
+    /// flag `tui_sessions_pushed` is NOT consulted here:
+    /// callers that need to distinguish "TUI never pushed"
+    /// from "TUI pushed an empty map" should consult the
+    /// flag separately. This helper just answers "does any
+    /// known map have a row for this uid?"
+    ///
+    /// No callers yet at 10d-1 — the auth consumer lands in
+    /// 10d-2's workflow methods. Shipping the lookup here
+    /// keeps the auth wiring in 10d-2 a one-line change.
+    pub fn lookup_session_any(&self, uid: &str) -> Option<SessionViewAny> {
+        if let Some(daemon_sess) = self.sessions.get(uid) {
+            return Some(SessionViewAny {
+                uid: uid.to_string(),
+                daemon_owned: true,
+                task_id: daemon_sess.task_id.clone(),
+                workspace_id: Some(daemon_sess.workspace_id.clone()),
+                workflow_run_id: None,
+                workflow_role: None,
+            });
+        }
+        if let Some(tui_sess) = self.tui_sessions.get(uid) {
+            return Some(SessionViewAny {
+                uid: uid.to_string(),
+                daemon_owned: false,
+                task_id: tui_sess.task_id.clone(),
+                workspace_id: None,
+                workflow_run_id: tui_sess.workflow_run_id.clone(),
+                workflow_role: tui_sess.workflow_role.clone(),
+            });
+        }
+        None
     }
 }
 
