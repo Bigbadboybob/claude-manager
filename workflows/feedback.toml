@@ -41,11 +41,11 @@ User's most recent pre-launch prompt to the worker (the ask that immediately pre
 Most recent pre-launch text from the worker (last thing the worker said before launch, if any):
 {{ roles.worker.prior_assistant[-1] }}
 
-Worker's most recent message (this iteration):
-{{ roles.worker.last_message }}
+Everything the worker has said this iteration (multiple messages joined with `---` separators):
+{{ roles.worker.this_turn }}
 
-Reviewer's most recent review:
-{{ roles.reviewer.last_message }}
+Everything the reviewer has said this iteration:
+{{ roles.reviewer.this_turn }}
 
 Important context about the reviewer: Reviewer will almost always find things to comment on. Protect against scope creep by only relaying comments for essential or low effort fixes. This will come down to cost vs. benefit and relevancy to the original task.
 
@@ -58,11 +58,11 @@ Call exactly one tool. Do not write code yourself.
 subsequent_activation_prompt = """Goal:
 {{ goal }}
 
-Worker's most recent message (this iteration):
-{{ roles.worker.last_message }}
+Everything the worker has said this iteration (multiple messages joined with `---` separators):
+{{ roles.worker.this_turn }}
 
-Reviewer's most recent review:
-{{ roles.reviewer.last_message }}
+Everything the reviewer has said this iteration:
+{{ roles.reviewer.this_turn }}
 
 Same decision rules as before. Remember the reviewer lacks goal context — only relay essential or low-effort fixes that serve the original goal. If the worker did something well this round, acknowledge it. Call exactly one tool (`workflow_transition` or `workflow_done`)."""
 

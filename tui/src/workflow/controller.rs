@@ -147,6 +147,33 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
         .collect()
     }
 
+    fn assistant_since_activation(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        // The role's most recent activation history entry holds the full
+        // list_messages count snapshotted at activation. Slicing the
+        // current list_messages from that offset gives everything the
+        // role has said during this activation.
+        let offset = self
+            .run
+            .history
+            .iter()
+            .rev()
+            .find(|h| h.role == role)
+            .map(|h| h.text_messages_at_start)
+            .unwrap_or(0);
+        workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            workflow::transcript::MessageKind::Assistant,
+        )
+        .into_iter()
+        .skip(offset)
+        .collect()
+    }
+
     fn prior_user_messages(&self, role: &str) -> Vec<String> {
         let Some((engine, wt, sid)) = self.lookup(role) else {
             return Vec::new();
@@ -472,6 +499,29 @@ impl<'a> WorkflowControllerCtx<'a> {
             .first()
             .cloned()
             .unwrap_or_else(|| "worker".into());
+        // Snapshot the initial role's transcript text-bearing count so the
+        // history entry's `text_messages_at_start` can be used by the
+        // `this_turn` resolver to surface everything the initial role has
+        // said post-launch (regardless of whether it has activated again).
+        let initial_text_count = role_sessions
+            .get(&initial_role)
+            .and_then(|b| b.current_session_id.clone())
+            .and_then(|sid| {
+                let ts = self.workspaces[ws_index].sessions.iter().find(|s| {
+                    s.workflow_run_id.as_deref() == Some(&run_id)
+                        && s.workflow_role.as_deref() == Some(&initial_role)
+                })?;
+                let engine = engine_for_session_type(&ts.session_type);
+                let wt = worktree_path.as_deref()?;
+                Some(workflow::transcript::list_messages(
+                    &engine,
+                    wt,
+                    &sid,
+                    workflow::transcript::MessageKind::Assistant,
+                )
+                .len())
+            })
+            .unwrap_or(0);
         let run = WorkflowRun::new(
             run_id.clone(),
             workflow_name.to_string(),
@@ -481,6 +531,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             role_baselines,
             goal,
             role_plans,
+            initial_text_count,
         );
         let _ = workflow::run::save(&run);
         self.workflow_runs.push(run);
@@ -1066,7 +1117,15 @@ impl<'a> WorkflowControllerCtx<'a> {
         // Uses `count_messages` (any assistant JSONL entry counts) so that
         // downstream the idle gate compares turn-to-turn regardless of whether
         // the agent's reply contains text, thinking, or tool_use content.
-        let start_count = {
+        //
+        // Also snapshot the text-bearing count (`list_messages.len()`) so the
+        // `this_turn` resolver can slice out everything the role produces
+        // between this activation and its next deactivation. Two counters
+        // because the two consumers want different things: the idle gate
+        // wants "did the agent take any turn?" (turn count); the manager
+        // template wants "what did the role say to me?" (text count, no
+        // tool-only or thinking-only noise).
+        let (start_count, start_text_count) = {
             let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
             let session_engine =
                 engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
@@ -1074,17 +1133,31 @@ impl<'a> WorkflowControllerCtx<'a> {
                 self.workspaces[ti].worktree_path.as_deref(),
                 current_sid.as_deref(),
             ) {
-                (Some(wt), Some(sid)) => workflow::transcript::count_messages(
-                    &session_engine,
-                    wt,
-                    sid,
-                    workflow::transcript::MessageKind::Assistant,
+                (Some(wt), Some(sid)) => (
+                    workflow::transcript::count_messages(
+                        &session_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::Assistant,
+                    ),
+                    workflow::transcript::list_messages(
+                        &session_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::Assistant,
+                    )
+                    .len(),
                 ),
-                _ => 0,
+                _ => (0, 0),
             }
         };
 
-        self.workflow_runs[run_idx].activate_role(to_role.to_string(), trigger, start_count);
+        self.workflow_runs[run_idx].activate_role(
+            to_role.to_string(),
+            trigger,
+            start_count,
+            start_text_count,
+        );
         let _ = workflow::run::save(&self.workflow_runs[run_idx]);
         let from_label = from_role.as_deref().unwrap_or("?");
         actions.push(WorkflowAction::SetStatusMsg(format!(
@@ -1388,6 +1461,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         )
     }
 

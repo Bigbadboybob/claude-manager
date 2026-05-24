@@ -11227,6 +11227,7 @@ mod transcript_rebind_tests {
             role_baselines,
             None,
             BTreeMap::new(),
+            0,
         );
         run.history[0].assistant_count_at_start = 7;
         let mut runs = vec![run];
