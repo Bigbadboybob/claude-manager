@@ -740,7 +740,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let state_for_send = state.clone();
         std::thread::spawn(move || {
-            let res = crate::control::methods::send_input(&state_for_send, &params_b);
+            let res = crate::control::methods::send_input(&state_for_send, &params_b, None);
             let _ = tx.send(res);
         });
         let result = rx
@@ -758,7 +758,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let state_for_kill = state.clone();
         std::thread::spawn(move || {
-            let res = crate::control::methods::kill_session(&state_for_kill, &kill_params);
+            let res = crate::control::methods::kill_session(&state_for_kill, &kill_params, None);
             let _ = tx.send(res);
         });
         let result = rx
@@ -775,7 +775,7 @@ mod tests {
 
         // Cleanup A.
         let kill_a = serde_json::json!({ "session_uid": "ts-a" });
-        let _ = crate::control::methods::kill_session(&state, &kill_a);
+        let _ = crate::control::methods::kill_session(&state, &kill_a, None);
         // Drain reaper-cleanup callbacks.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -814,7 +814,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let state_for_kill = state.clone();
         std::thread::spawn(move || {
-            let res = crate::control::methods::kill_session(&state_for_kill, &kill_params);
+            let res = crate::control::methods::kill_session(&state_for_kill, &kill_params, None);
             let _ = tx.send(res);
         });
         let result = rx

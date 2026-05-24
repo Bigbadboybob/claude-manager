@@ -69,6 +69,28 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // Sub-2a Finding (round 3) #1: do NOT push an empty
+    // `task.update_tree` at startup. The persistent-host
+    // daemon may already hold a non-empty tree from a previous
+    // TUI session — an unconditional empty push would wipe it
+    // (see `methods::task_update_tree`: clear-then-extend
+    // semantics; `client_session::tests::rpc_task_update_tree_replaces_on_second_push`
+    // pins this). Before reconcile fires, the TUI has nothing
+    // authoritative to publish; the empty `task.update_tree`
+    // would lose information rather than add any. The first
+    // `reconcile_tasks` call (which fires on
+    // `BackendEvent::TasksUpdated` and calls
+    // `push_task_tree_to_daemon` at the tail) is the
+    // authoritative populator — until then, the daemon's
+    // existing tree stands.
+    //
+    // Pre-fix this slot held an unconditional empty push that
+    // wiped the daemon's tree on every TUI startup. If the API
+    // was slow or unreachable, the daemon stayed wiped until
+    // reconcile eventually fired — opening a window where
+    // Session-caller descendant-task auth lost all parent
+    // edges. Deleting the empty push closes that window.
+
     // Setup terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();

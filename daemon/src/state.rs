@@ -68,6 +68,27 @@ pub struct DaemonState {
     /// alongside the ticket. Configured at daemon startup from the
     /// socket path the accept loop bound (see `run()`).
     pub attach_addr: String,
+    /// Planning task tree snapshot. **Source of truth: TUI.** The
+    /// TUI calls `task.update_tree` whenever `App.tasks` mutates
+    /// (slice 10d-mcp-surface-2a). Keyed by `task_id`, value is
+    /// `Some(parent_task_id)` for child tasks / `None` for top-
+    /// level tasks. Reset (not merged) on each update — semantic
+    /// shape is "snapshot replace" so callers don't have to reason
+    /// about stale ancestors.
+    ///
+    /// **Why TUI-authoritative for Phase 1**: cheaper to land than
+    /// daemon-owns-tasks (which would entangle with the planning
+    /// API HTTP layer); the auth check just reads from the cache.
+    /// When the workflow controller relocates daemon-side
+    /// (10d-workflow-controller), the snapshot becomes redundant
+    /// — the controller owns task transitions and can write
+    /// directly. Sub-2c can unwind this dependency.
+    ///
+    /// Used by `crate::control::auth::check_session_caller` for
+    /// the descendant-task-tree authorization branch and by
+    /// `crate::control::methods::list_sessions`'s `task_id` filter
+    /// (slice 10d-mcp-surface-2a no-op → honored).
+    pub task_tree: HashMap<String, Option<String>>,
 }
 
 impl Default for DaemonState {
@@ -78,6 +99,7 @@ impl Default for DaemonState {
             bindings: HashMap::new(),
             tickets: TicketAllocator::new(),
             attach_addr: String::new(),
+            task_tree: HashMap::new(),
         }
     }
 }

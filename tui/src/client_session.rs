@@ -169,6 +169,19 @@ pub struct ClientSessionConfig<'a> {
     /// for unknown workspace_id) — appropriate for any pre-existing
     /// workspace that the daemon definitely knows about.
     pub worktree_path: Option<&'a Path>,
+    /// Sub-2a Finding #1: task this session is bound to, sent on
+    /// the wire so the daemon's `DaemonSession.task_id` is set at
+    /// spawn time rather than left `None` and patched only via
+    /// post-tag (which never updates the daemon copy). Required
+    /// for the Session-caller descendant-task auth walk —
+    /// without it, every daemon-spawned session looks taskless
+    /// and a tasked agent falls into the same-workspace-allow
+    /// branch, the widening the dispatch flip was meant to close.
+    ///
+    /// `None` for genuinely taskless spawns (the bare `A-n` shell
+    /// flow). Operator-spawned sessions inherit task_id from the
+    /// TUI's `TerminalSession.task_id` at the call site.
+    pub task_id: Option<&'a str>,
 }
 
 /// Daemon-attached terminal session. Field shape mirrors
@@ -495,6 +508,16 @@ pub(crate) fn rpc_start_session_full(
     if let Some(bytes) = config.memory_cap_bytes {
         params["memory_cap_bytes"] = serde_json::Value::Number(bytes.into());
     }
+    // Sub-2a Finding #1: send task_id so the daemon records it
+    // on `DaemonSession.task_id` at spawn time. The auth walk
+    // reads it for the descendant-task gate; if absent, the
+    // session looks taskless and a tasked caller's session can
+    // reach sibling-task sessions in the same workspace via the
+    // taskless-allow branch — exactly the widening sub-2a is
+    // meant to close.
+    if let Some(tid) = config.task_id {
+        params["task_id"] = serde_json::Value::String(tid.to_string());
+    }
     // Slice 10d watcher-fix #1: `cgroup_path` is NO LONGER
     // sent on the wire. The daemon discovers the actual cgroup
     // from `/proc/<spawn-pid>/cgroup` post-spawn (see
@@ -619,6 +642,43 @@ pub fn rpc_kill_session(
         caller: Caller::operator(operator_token_id),
         method: "kill_session".into(),
         params: serde_json::json!({ "session_uid": session_uid }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// `task.update_tree` RPC. Sub-2a Finding #1: pushes the TUI's
+/// current task tree to the daemon as a full-replace snapshot.
+/// The daemon caches it in `DaemonState.task_tree` for the
+/// Session-caller descendant-task auth check (see
+/// `daemon/src/control/auth.rs::task_is_self_or_descendant_of`).
+///
+/// `tasks` is the full set of TaskEntries to publish — each item
+/// is `(task_id, parent_task_id)`. Tasks with `task_id == None`
+/// in the TUI (the rare backlog-without-id entries) are excluded
+/// by the caller; this helper assumes every item has a real id.
+///
+/// Operator-only on the daemon side — a Session caller rewriting
+/// the tree could escape their own auth scope. The TUI uses the
+/// shared `tui-operator` token id like every other RPC site.
+pub fn rpc_task_update_tree(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    tasks: &[(String, Option<String>)],
+) -> anyhow::Result<()> {
+    let tasks_json: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|(task_id, parent_task_id)| {
+            serde_json::json!({
+                "task_id": task_id,
+                "parent_task_id": parent_task_id,
+            })
+        })
+        .collect();
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "task.update_tree".into(),
+        params: serde_json::json!({ "tasks": tasks_json }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
@@ -783,6 +843,10 @@ mod tests {
             memory_cap_bytes: None,
             cgroup_path: None,
             worktree_path: None,
+            // Sub-2a Finding #1: tests default to taskless;
+            // tests that exercise tasked-caller paths build
+            // ClientSessionConfig directly.
+            task_id: None,
         }
     }
 
@@ -835,6 +899,335 @@ mod tests {
             "error must name the not_found cause: {}",
             msg
         );
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2a Finding #1: TUI push of the task tree lands in
+    /// `DaemonState.task_tree`. Pin the wire shape end-to-end:
+    /// the daemon sees the parent_task_id chain and a follow-up
+    /// auth walk would resolve descendants.
+    #[test]
+    fn rpc_task_update_tree_lands_in_daemon_state() {
+        let (socket, _working_dir, state, stop, handle) = start_test_daemon("ws-tree");
+        let tasks = vec![
+            ("task-root".to_string(), None),
+            ("task-child".to_string(), Some("task-root".to_string())),
+            ("task-grandchild".to_string(), Some("task-child".to_string())),
+        ];
+        rpc_task_update_tree(&socket, "op-tree", &tasks).expect("update_tree ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.task_tree.get("task-root"), Some(&None));
+            assert_eq!(
+                s.task_tree.get("task-child"),
+                Some(&Some("task-root".to_string()))
+            );
+            assert_eq!(
+                s.task_tree.get("task-grandchild"),
+                Some(&Some("task-child".to_string()))
+            );
+        }
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Snapshot semantics: a second push fully REPLACES the
+    /// daemon's tree, not merges.
+    #[test]
+    fn rpc_task_update_tree_replaces_on_second_push() {
+        let (socket, _working_dir, state, stop, handle) = start_test_daemon("ws-tree-2");
+        let first = vec![
+            ("old-a".to_string(), None),
+            ("old-b".to_string(), Some("old-a".to_string())),
+        ];
+        rpc_task_update_tree(&socket, "op-tree", &first).expect("first ok");
+        let second = vec![("new-a".to_string(), None)];
+        rpc_task_update_tree(&socket, "op-tree", &second).expect("second ok");
+        let s = state.lock().unwrap();
+        assert!(!s.task_tree.contains_key("old-a"));
+        assert!(!s.task_tree.contains_key("old-b"));
+        assert!(s.task_tree.contains_key("new-a"));
+        assert_eq!(s.task_tree.len(), 1);
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2a Finding #1: a `start_session` request carrying
+    /// `task_id` lands on `DaemonSession.task_id`. The pre-fix
+    /// path had the TUI tagging `TerminalSession.task_id`
+    /// post-spawn — purely TUI-local; the daemon's copy stayed
+    /// `None`. With `task_id` left None on the daemon, the
+    /// Session-caller auth walk's tasked-caller branch can't
+    /// fire and EVERY daemon-spawned session falls into the
+    /// taskless same-workspace-allow branch.
+    #[test]
+    fn rpc_start_session_threads_task_id_to_daemon_session() {
+        let (socket, working_dir, state, stop, handle) = start_test_daemon("ws-task-thread");
+        let argv = vec!["/bin/bash".to_string()];
+        let uid = test_uid();
+        let mut config = bash_config(&socket, &working_dir, "op-thr", &uid, "ws-task-thread", "thr", &argv, 80, 24);
+        config.task_id = Some("task-payload");
+        let returned = rpc_start_session(&config).expect("start_session ok");
+        assert_eq!(returned, uid);
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.sessions[&uid].task_id.as_deref(),
+                Some("task-payload"),
+                "daemon must record task_id on DaemonSession at spawn time",
+            );
+        }
+        let _ = rpc_kill_session(&socket, "op-thr", &uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2a Finding #1 acceptance: with task_id threaded
+    /// through, a tasked Session caller can NO LONGER act on a
+    /// sibling-task session in the same workspace. Pre-fix the
+    /// daemon stored `task_id: None` for both sessions, so the
+    /// auth walk hit the taskless same-workspace-allow branch
+    /// and the call succeeded — the widening sub-2a aims to
+    /// close. Post-fix the daemon stores `Some("task-a")` on
+    /// the caller and `Some("task-b")` on the target; with no
+    /// parent/child link, OutOfScope fires.
+    #[test]
+    fn sibling_task_send_input_is_unauthorized_after_task_id_threading() {
+        use crate::client_session::{rpc_kill_session, rpc_start_session};
+        let (socket, working_dir, state, stop, handle) =
+            start_test_daemon("ws-sibling");
+        // Spawn two sessions in the SAME workspace but DIFFERENT
+        // task_ids. Both via the TUI's path so task_id rides the
+        // wire — that's the F1 fix being exercised.
+        let argv = vec!["/bin/bash".to_string()];
+        let caller_uid = test_uid();
+        let mut caller_config = bash_config(
+            &socket, &working_dir, "op-sib", &caller_uid,
+            "ws-sibling", "caller", &argv, 80, 24,
+        );
+        caller_config.task_id = Some("task-a");
+        let _ = rpc_start_session(&caller_config).expect("caller spawn ok");
+        let target_uid = test_uid();
+        let mut target_config = bash_config(
+            &socket, &working_dir, "op-sib", &target_uid,
+            "ws-sibling", "target", &argv, 80, 24,
+        );
+        target_config.task_id = Some("task-b");
+        let _ = rpc_start_session(&target_config).expect("target spawn ok");
+
+        // Sanity: both task_ids landed on the daemon side.
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.sessions[&caller_uid].task_id.as_deref(), Some("task-a"));
+            assert_eq!(s.sessions[&target_uid].task_id.as_deref(), Some("task-b"));
+        }
+
+        // Push a task tree with NO parent/child link between
+        // task-a and task-b. The daemon's auth walk must then
+        // surface OutOfScope on send_input.
+        rpc_task_update_tree(
+            &socket,
+            "op-sib",
+            &[
+                ("task-a".to_string(), None),
+                ("task-b".to_string(), None),
+            ],
+        )
+        .expect("update_tree ok");
+
+        // Hand-craft a Session-caller send_input against the
+        // target's uid; assert Unauthorized.
+        let req = Request {
+            id: next_request_id(),
+            caller: Caller::session(&caller_uid),
+            method: "send_input".into(),
+            params: serde_json::json!({
+                "session_uid": &target_uid,
+                "text": "should-be-denied",
+            }),
+        };
+        let err = rpc_round_trip(&socket, &req).expect_err("must be denied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unauthorized"),
+            "sibling-task target must be Unauthorized, got: {}",
+            msg,
+        );
+
+        let _ = rpc_kill_session(&socket, "op-sib", &caller_uid);
+        let _ = rpc_kill_session(&socket, "op-sib", &target_uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2a Finding #2 integration acceptance: when a
+    /// subtask launches, the local TaskEntry stub initialized
+    /// with `parent_task_id: Some(parent)` and pushed via
+    /// `App::push_task_tree_to_daemon` (which forwards to
+    /// `rpc_task_update_tree`) results in the daemon's
+    /// `task_tree` showing the parent edge IMMEDIATELY — no
+    /// waiting for API reconcile. Pre-fix the stub used
+    /// `parent_task_id: None` and the daemon saw the subtask
+    /// as top-level until reconcile patched it.
+    #[test]
+    fn first_push_after_subtask_launch_publishes_parent_edge() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-f2-edge");
+        // Simulate the slice `push_task_tree_to_daemon` builds
+        // from `self.tasks` AFTER a launch where the stub was
+        // initialized with `parent_task_id: Some("parent-x")`.
+        // The PARENT may already be in self.tasks too (it
+        // typically is — that's what made it a subtask), but
+        // the F2 acceptance hinges on the SUBTASK row carrying
+        // the parent edge.
+        let tasks = vec![
+            ("parent-x".to_string(), None),
+            ("subtask-y".to_string(), Some("parent-x".to_string())),
+        ];
+        rpc_task_update_tree(&socket, "op-f2", &tasks).expect("push ok");
+        let s = state.lock().unwrap();
+        // Daemon sees the parent edge on the FIRST push, not
+        // after a deferred reconcile.
+        assert_eq!(
+            s.task_tree.get("subtask-y"),
+            Some(&Some("parent-x".to_string())),
+            "first push after subtask launch must publish parent edge",
+        );
+        assert_eq!(s.task_tree.get("parent-x"), Some(&None));
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Empty push (startup priming): daemon accepts and the
+    /// resulting `task_tree` is empty. Pins the "TUI startup
+    /// snapshot" wire on a freshly-launched daemon.
+    #[test]
+    fn rpc_task_update_tree_accepts_empty_snapshot() {
+        let (socket, _working_dir, state, stop, handle) = start_test_daemon("ws-tree-3");
+        rpc_task_update_tree(&socket, "op-tree", &[]).expect("empty ok");
+        let s = state.lock().unwrap();
+        assert!(s.task_tree.is_empty());
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2a Finding (round 3) #2: after `create_subtask` adds
+    /// the new subtask's TaskEntry to `app.tasks` (with
+    /// `parent_task_id: Some(caller_task)`), the immediate
+    /// `app.push_task_tree_to_daemon()` call must publish the
+    /// new parent edge. Pre-fix the push was missing — the
+    /// daemon's `task_tree` showed the new subtask as
+    /// top-level (or absent) until the next API reconcile,
+    /// opening a window where descendant-task auth failed for
+    /// the just-created subtask.
+    ///
+    /// Test scope: the same wire mechanism `create_subtask`
+    /// now triggers — `rpc_task_update_tree` carrying parent +
+    /// new-subtask edges — verified against a live test
+    /// daemon. (A full App-level integration test for
+    /// `create_subtask` would require constructing the whole
+    /// `App` with backend / control server / workflows loaded;
+    /// the marginal value over this targeted check is low.
+    /// The first_push_after_subtask_launch_publishes_parent_edge
+    /// test below proves the same chain for launch paths.)
+    #[test]
+    fn create_subtask_push_publishes_parent_edge_immediately() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-subtask-push");
+        // Pre-state: parent already in the daemon's tree (the
+        // tasked caller's task — a top-level row that an
+        // earlier launch published).
+        rpc_task_update_tree(
+            &socket,
+            "op-subtask",
+            &[("task-parent".to_string(), None)],
+        )
+        .expect("seed parent ok");
+        // The post-`create_subtask` `app.tasks` slice as
+        // `push_task_tree_to_daemon` would build it: parent
+        // edge plus the new subtask carrying
+        // `parent_task_id: Some("task-parent")`.
+        let post_create_subtask = vec![
+            ("task-parent".to_string(), None),
+            ("task-newsubtask".to_string(), Some("task-parent".to_string())),
+        ];
+        rpc_task_update_tree(&socket, "op-subtask", &post_create_subtask)
+            .expect("post-create_subtask push ok");
+        // Acceptance: the new subtask's parent edge is visible
+        // on the daemon BEFORE any API reconcile. Pre-fix this
+        // would have failed: `task-newsubtask` wouldn't be in
+        // the tree at all until reconcile, so a tasked-caller
+        // act-on-subtask attempt would fail OutOfScope.
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.task_tree.get("task-newsubtask"),
+            Some(&Some("task-parent".to_string())),
+            "create_subtask's push must publish the parent edge \
+             immediately, not wait for reconcile",
+        );
+        assert_eq!(s.task_tree.get("task-parent"), Some(&None));
+        drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2a Finding (round 3) #1: a freshly-started TUI must
+    /// NOT wipe the persistent-host daemon's existing task tree.
+    /// Pre-fix `main.rs` unconditionally sent an empty
+    /// `task.update_tree` at opt-in startup; persistent-daemon
+    /// state was lost until the next API reconcile (possibly
+    /// indefinitely if the API was unreachable).
+    ///
+    /// Post-fix the startup empty push is gone. This test pins
+    /// the bug-class by exercising both halves:
+    ///   1. Pre-populate the daemon's tree with a parent edge.
+    ///   2. Simulate the post-fix TUI startup — opt-in is on
+    ///      and `ensure_daemon_at_startup` ran, but NO
+    ///      `task.update_tree` is sent because the TUI has
+    ///      nothing authoritative to publish yet.
+    ///   3. Assert the daemon's tree is still intact.
+    /// A second push of `&[]` (simulating the pre-fix
+    /// behavior) is then exercised to prove it WOULD wipe —
+    /// the justification for skipping the startup push.
+    #[test]
+    fn startup_without_push_preserves_existing_daemon_tree() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-startup-preserve");
+        // 1. Pre-populate (simulating a prior TUI session that
+        //    successfully ran reconcile_tasks and pushed).
+        let prior = vec![
+            ("task-root".to_string(), None),
+            ("task-leaf".to_string(), Some("task-root".to_string())),
+        ];
+        rpc_task_update_tree(&socket, "op-startup", &prior).expect("seed ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.task_tree.len(), 2, "seed must land");
+        }
+        // 2. Simulate the post-fix TUI startup — nothing here.
+        //    The fresh TUI has no authoritative state, so no
+        //    push fires.
+        //    (`ensure_daemon_at_startup` was the only RPC the
+        //    pre-fix startup made; it doesn't touch task_tree.)
+        // 3. Daemon's tree must still hold the seeded edge.
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.task_tree.get("task-leaf"),
+                Some(&Some("task-root".to_string())),
+                "TUI startup must not erase a persistent-host \
+                 daemon's existing task tree",
+            );
+            assert_eq!(s.task_tree.get("task-root"), Some(&None));
+        }
+        // Regression evidence: if the TUI HAD sent the empty
+        // push, the daemon would wipe — proving the gate is
+        // load-bearing.
+        rpc_task_update_tree(&socket, "op-startup", &[])
+            .expect("empty push (regression simulation) ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                s.task_tree.is_empty(),
+                "empty push wipes — this is why startup must skip it",
+            );
+        }
         stop_test_daemon(&socket, stop, handle);
     }
 
@@ -1314,6 +1707,7 @@ mod tests {
             memory_cap_bytes: Some(64 * 1024 * 1024),
             cgroup_path: Some(hostile_cgroup),
             worktree_path: None,
+            task_id: None,
         };
         let result = rpc_start_session_full(&config).expect("rpc ok");
 
@@ -1396,6 +1790,7 @@ mod tests {
             memory_cap_bytes: None,
             cgroup_path: None,
             worktree_path: None,
+            task_id: None,
         };
         let session = ClientSession::new(config).expect("spawn cat session");
         let uid = session.session_uid.clone();

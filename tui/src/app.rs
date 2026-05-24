@@ -2635,6 +2635,11 @@ impl App {
         resume_session_id: Option<&str>,
         cols: u16,
         rows: u16,
+        // Sub-2a Finding #1: caller passes the task_id this
+        // session is being spawned under, so the daemon's
+        // DaemonSession.task_id is set at spawn time. None for
+        // genuinely taskless flows (A-n create_local_session).
+        task_id: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
         if !crate::daemon_launch::opt_in_enabled() {
             return None;
@@ -2758,6 +2763,12 @@ impl App {
             // the daemon ignores the hint when the workspace is
             // already registered.
             worktree_path: Some(worktree_path),
+            // Sub-2a Finding #1: thread task_id so the daemon
+            // records it on DaemonSession.task_id. Without it,
+            // every daemon-spawned session looks taskless and
+            // tasked agents fall into the same-workspace-allow
+            // branch — re-introducing the widening sub-2a closes.
+            task_id,
         };
         Some(crate::session::Session::new_attached(config))
     }
@@ -5564,6 +5575,13 @@ impl App {
             }
         }
         self.clamp_cursor();
+        // Sub-2a Finding #1: push the refreshed task tree to the
+        // daemon. Covers TasksUpdated (startup + every backend
+        // refresh), parent_task_id changes, and task add/remove
+        // diffs from the API. Per-site pushes elsewhere catch the
+        // local-only mutations that bypass this path
+        // (delete_task, launch_*, resume_locally).
+        self.push_task_tree_to_daemon();
     }
 
     fn set_status_msg(&mut self, msg: &str) {
@@ -5648,8 +5666,17 @@ impl App {
                     branch,
                     autostart,
                     task_id,
+                    parent_task_id,
                 } => {
-                    self.launch_from_plan(&project, &slug, &prompt, branch.as_deref(), autostart, &task_id);
+                    self.launch_from_plan(
+                        &project,
+                        &slug,
+                        &prompt,
+                        branch.as_deref(),
+                        autostart,
+                        &task_id,
+                        parent_task_id.as_deref(),
+                    );
                     return true;
                 }
                 PlanAction::LaunchTaskIntoWorkspace {
@@ -5659,6 +5686,7 @@ impl App {
                     task_repo_url,
                     project,
                     prompt,
+                    parent_task_id,
                 } => {
                     self.launch_into_workspace(
                         &workspace_id,
@@ -5667,6 +5695,7 @@ impl App {
                         &task_repo_url,
                         &project,
                         &prompt,
+                        parent_task_id.as_deref(),
                     );
                     return true;
                 }
@@ -6549,6 +6578,50 @@ impl App {
         }
     }
 
+    /// Sub-2a Finding #1: full-replace task tree push to the
+    /// daemon. Called after every `self.tasks` mutation so the
+    /// daemon's `DaemonState.task_tree` stays current for the
+    /// Session-caller descendant-task auth walk.
+    ///
+    /// Gated on `CM_USE_DAEMON_SOCKET=1`. With opt-in off the
+    /// daemon isn't running and a connect attempt would just
+    /// log noise; skip the RPC entirely. With opt-in on the
+    /// daemon was launched at startup (see `main.rs:60`), so a
+    /// connect failure here is a real fault — log it and
+    /// continue (the next push will retry; auth meanwhile
+    /// falls back to the pre-push tree).
+    ///
+    /// Full-replace semantics: the daemon's `task_update_tree`
+    /// method clears + re-inserts on every call. Cheaper than
+    /// computing diffs in the TUI and avoids drift if a single
+    /// incremental push is lost.
+    pub(crate) fn push_task_tree_to_daemon(&self) {
+        if !crate::daemon_launch::opt_in_enabled() {
+            return;
+        }
+        let tasks: Vec<(String, Option<String>)> = self
+            .tasks
+            .iter()
+            .filter_map(|t| {
+                t.task_id
+                    .as_ref()
+                    .map(|id| (id.clone(), t.parent_task_id.clone()))
+            })
+            .collect();
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_task_update_tree(
+            &daemon_socket,
+            "tui-operator",
+            &tasks,
+        ) {
+            eprintln!(
+                "cm-tui: task.update_tree failed: {} \
+                 (daemon auth walks will use the pre-push tree until the next mutation)",
+                e,
+            );
+        }
+    }
+
     /// Bulk session removal that preserves the tombstone invariant.
     /// Walks `ws.sessions`, tombstones each entry where `should_drop`
     /// returns true, marks the PTY exited, and removes it. Use this
@@ -6861,6 +6934,12 @@ impl App {
             cloned_transcript_id.as_deref(),
             cols,
             rows,
+            // A-n / create_local_session is taskless by design
+            // (the user creates the workspace before any task
+            // is bound). The session is taskless from the
+            // daemon's POV too — auth uses the taskless-caller
+            // same-workspace branch.
+            None,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -7170,6 +7249,11 @@ impl App {
                 cloned_transcript_id.as_deref(),
                 cols,
                 rows,
+                // Sub-2a Finding #1: A-s spawns a session under
+                // an existing task — pass the task_id through
+                // so the daemon's DaemonSession.task_id is
+                // populated at spawn time, not left None.
+                task_id.as_deref(),
             ),
             _ => None,
         };
@@ -7395,6 +7479,9 @@ impl App {
                 let new_wi = self.workspaces.len() - 1;
                 self.cursor = Cursor::Session(new_wi, 0);
                 self.save_session_manifest();
+                // Sub-2a Finding #1: a resume_locally may have
+                // inserted a new TaskEntry above.
+                self.push_task_tree_to_daemon();
                 self.set_status_msg("Resumed locally");
             }
             Err(e) => {
@@ -7500,6 +7587,8 @@ impl App {
             self.clamp_cursor();
             self.set_status_msg("Task deleted");
             self.save_session_manifest();
+            // Sub-2a Finding #1: task removal — refresh tree.
+            self.push_task_tree_to_daemon();
             return;
         }
 
@@ -7564,6 +7653,9 @@ impl App {
         }
         self.workspaces.remove(wi);
         self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
+        // Sub-2a Finding #1: workspace delete removed all bound
+        // tasks from `self.tasks` — refresh tree.
+        self.push_task_tree_to_daemon();
         self.set_status_msg("Deleted");
     }
 
@@ -7697,6 +7789,13 @@ impl App {
         start_branch: Option<&str>,
         _autostart: bool,
         task_id: &str,
+        // Sub-2a Finding #2: parent edge from the planning row,
+        // used to initialize the local TaskEntry stub before the
+        // first `push_task_tree_to_daemon` fires. Without it, the
+        // first push publishes the subtask as top-level and the
+        // daemon's auth walk can't authorize parent → subtask
+        // until the next reconcile patches it.
+        parent_task_id: Option<&str>,
     ) {
         let repo_url = match self.config.repos.get(project) {
             Some(url) => url.clone(),
@@ -7808,7 +7907,13 @@ impl App {
                     // and writes `project = NULL` to the API, which
                     // the planning refresh then filters out.
                     project: Some(project.to_string()),
-                    parent_task_id: None,
+                    // Sub-2a Finding #2: pin the parent edge from
+                    // the launch action so the first
+                    // `push_task_tree_to_daemon` publishes the
+                    // correct subtask edge — pre-fix this was
+                    // `None` and the daemon saw the subtask as
+                    // top-level until reconcile patched it.
+                    parent_task_id: parent_task_id.map(str::to_string),
                     worktree_mode: WorktreeMode::Inherit,
                 });
 
@@ -7820,6 +7925,10 @@ impl App {
                 fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
                 self.backend.update_plan_task(task_id.to_string(), fields);
                 self.save_session_manifest();
+                // Sub-2a Finding #1: launch added a TaskEntry —
+                // refresh daemon's tree so any agent that spawns
+                // off this task immediately authorizes correctly.
+                self.push_task_tree_to_daemon();
                 self.set_status_msg("Task launched");
             }
             Err(e) => {
@@ -7852,6 +7961,9 @@ impl App {
         task_repo_url: &str,
         project: &str,
         prompt: &str,
+        // Sub-2a Finding #2: parent edge from the planning row.
+        // See `launch_from_plan` for the full backstory.
+        parent_task_id: Option<&str>,
     ) {
         let Some(wi) = self.workspace_index_by_id(workspace_id) else {
             self.set_status_msg("Workspace no longer exists");
@@ -7937,7 +8049,12 @@ impl App {
                         // project synchronously from the planning row so
                         // an early `create_subtask` inherits it.
                         project: Some(project.to_string()),
-                        parent_task_id: None,
+                        // Sub-2a Finding #2: pin the parent edge so the
+                        // first `push_task_tree_to_daemon` publishes the
+                        // correct subtask edge — pre-fix `None` here
+                        // showed the subtask as top-level on the daemon
+                        // until reconcile patched it.
+                        parent_task_id: parent_task_id.map(str::to_string),
                         worktree_mode: WorktreeMode::Inherit,
                     });
                 }
@@ -7952,6 +8069,9 @@ impl App {
                 self.backend
                     .update_plan_task(task_id.to_string(), fields);
                 self.save_session_manifest();
+                // Sub-2a Finding #1: same as `launch_from_plan`,
+                // a launch may have inserted a new TaskEntry.
+                self.push_task_tree_to_daemon();
                 self.set_status_msg("Task launched into workspace");
             }
             Err(e) => {

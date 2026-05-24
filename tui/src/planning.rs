@@ -90,6 +90,13 @@ pub struct PlanTask {
     pub source: String,
     pub is_cloud: bool,
     pub repo_url: String,
+    /// Sub-2a Finding #2: pinned at the planning row so launch
+    /// actions can surface the parent edge in `LaunchTask` /
+    /// `LaunchTaskIntoWorkspace`. Without it the launch site
+    /// would have to look up the parent off the API row again
+    /// — which is exactly the race the finding describes (local
+    /// stub init happens BEFORE the next API reconcile).
+    pub parent_task_id: Option<String>,
 }
 
 impl PlanTask {
@@ -110,6 +117,7 @@ impl PlanTask {
             source: task.source.clone(),
             is_cloud: task.is_cloud,
             repo_url: task.repo_url.clone(),
+            parent_task_id: task.parent_task_id.clone(),
         }
     }
 }
@@ -256,6 +264,17 @@ pub enum PlanAction {
         branch: Option<String>,
         autostart: bool,
         task_id: String,
+        /// Sub-2a Finding #2: subtask launches must surface
+        /// `parent_task_id` from the planning row so the
+        /// launch site can initialize the local TaskEntry
+        /// stub with the correct edge. Pre-fix the stub set
+        /// `parent_task_id: None` and `push_task_tree_to_daemon`
+        /// published the wrong tree until the next API
+        /// reconcile patched it — opening a window where the
+        /// daemon saw a subtask as top-level and the
+        /// descendant-task auth walk could not authorize a
+        /// parent → subtask action.
+        parent_task_id: Option<String>,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -271,6 +290,11 @@ pub enum PlanAction {
         /// `create_subtask` before reconcile backfills `project`.
         project: String,
         prompt: String,
+        /// Sub-2a Finding #2: same backstory as LaunchTask. The
+        /// "into existing workspace" variant carries it too so
+        /// the stub at the call site lands with the correct
+        /// parent edge on first push.
+        parent_task_id: Option<String>,
     },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
@@ -1944,6 +1968,11 @@ impl PlanningView {
                                     task_repo_url: task.repo_url.clone(),
                                     project: pd.project.name.clone(),
                                     prompt,
+                                    // Sub-2a Finding #2: pin the parent
+                                    // at action time so the launch site
+                                    // initializes the local stub with
+                                    // the correct edge.
+                                    parent_task_id: task.parent_task_id.clone(),
                                 };
                             }
                         }
@@ -1982,8 +2011,18 @@ impl PlanningView {
                                 Some(branch_text.trim().to_string())
                             };
                             let task_id = task.id.clone();
+                            let parent_task_id = task.parent_task_id.clone();
                             task.status = PlanStatus::InProgress;
-                            return PlanAction::LaunchTask { project, slug, prompt, branch, autostart: false, task_id };
+                            return PlanAction::LaunchTask {
+                                project,
+                                slug,
+                                prompt,
+                                branch,
+                                autostart: false,
+                                task_id,
+                                // Sub-2a Finding #2: see LaunchTaskIntoWorkspace.
+                                parent_task_id,
+                            };
                         }
                     }
                 }
@@ -3661,6 +3700,7 @@ mod tests {
             source: "user".to_string(),
             is_cloud: false,
             repo_url: stored.to_string(),
+            parent_task_id: None,
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -3671,6 +3711,116 @@ mod tests {
         assert_eq!(project, "forked-repo");
         assert_eq!(repo_url, stored);
         assert_eq!(parent, Some("parent-id-123".to_string()));
+    }
+
+    // ── Sub-2a Finding #2: launch actions carry parent_task_id ───────
+    //
+    // Without this, a subtask launched via A-l / A-f publishes a
+    // local TaskEntry stub with `parent_task_id: None`. The first
+    // `push_task_tree_to_daemon` then sends the subtask to the
+    // daemon as top-level — daemon's auth walk can't see the
+    // parent → subtask edge until the next API reconcile, leaving
+    // a window where descendant-task auth fails for actions that
+    // SHOULD succeed.
+
+    /// Pin: `LaunchTask` carries `parent_task_id` derived from the
+    /// PlanTask. Drives the LaunchConfirm input mode through Enter
+    /// and inspects the returned action.
+    #[test]
+    fn launch_task_action_carries_parent_task_id_for_subtask() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let mut view = PlanningView::new();
+        let mut pd = make_project("repo", "git@example.com:org/repo.git");
+        pd.tasks.push(PlanTask {
+            id: "sub-id".to_string(),
+            slug: "subtask".to_string(),
+            title: "Subtask".to_string(),
+            status: PlanStatus::Backlog,
+            difficulty: None,
+            depends: vec![],
+            branch: None,
+            created: None,
+            description: String::new(),
+            prompt: String::new(),
+            source: "user".to_string(),
+            is_cloud: false,
+            repo_url: "git@example.com:org/repo.git".to_string(),
+            parent_task_id: Some("parent-id".to_string()),
+        });
+        view.project_data.push(pd);
+        view.projects = view
+            .project_data
+            .iter()
+            .map(|pd| pd.project.clone())
+            .collect();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: String::new(),
+        };
+        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = view.handle_event(&enter);
+        match action {
+            PlanAction::LaunchTask { parent_task_id, task_id, .. } => {
+                assert_eq!(task_id, "sub-id");
+                assert_eq!(
+                    parent_task_id,
+                    Some("parent-id".to_string()),
+                    "launch action must carry parent_task_id from PlanTask",
+                );
+            }
+            other => panic!(
+                "expected LaunchTask, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// Top-level task (no parent) → `parent_task_id: None` rides
+    /// through unchanged.
+    #[test]
+    fn launch_task_action_carries_none_for_top_level_task() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let mut view = PlanningView::new();
+        let mut pd = make_project("repo", "git@example.com:org/repo.git");
+        pd.tasks.push(PlanTask {
+            id: "top-id".to_string(),
+            slug: "toplevel".to_string(),
+            title: "Top".to_string(),
+            status: PlanStatus::Backlog,
+            difficulty: None,
+            depends: vec![],
+            branch: None,
+            created: None,
+            description: String::new(),
+            prompt: String::new(),
+            source: "user".to_string(),
+            is_cloud: false,
+            repo_url: "git@example.com:org/repo.git".to_string(),
+            parent_task_id: None,
+        });
+        view.project_data.push(pd);
+        view.projects = view
+            .project_data
+            .iter()
+            .map(|pd| pd.project.clone())
+            .collect();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: String::new(),
+        };
+        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let action = view.handle_event(&enter);
+        match action {
+            PlanAction::LaunchTask { parent_task_id, .. } => {
+                assert_eq!(parent_task_id, None);
+            }
+            other => panic!(
+                "expected LaunchTask, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
     }
 
     // ── Frontmatter round-trip tests ─────────────────────────
@@ -3696,6 +3846,7 @@ mod tests {
             source: "user".to_string(),
             is_cloud: false,
             repo_url: String::new(),
+            parent_task_id: None,
         }
     }
 

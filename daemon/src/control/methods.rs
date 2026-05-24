@@ -791,6 +791,44 @@ fn is_valid_session_type(session_type: &str) -> bool {
     matches!(session_type, "claude-code" | "codex" | "bash")
 }
 
+/// Sub-2a Finding #2: shared helper to convert
+/// `crate::control::auth::AuthDecision` into the typed
+/// `MethodResult` error shape used by send_input / kill_session /
+/// read_session_output. Auth runs INSIDE the same critical
+/// section as the target lookup (closes the TOCTOU window the
+/// pre-fix dispatcher's separate-lock pattern had); these
+/// methods short-circuit on the decision before extracting any
+/// per-session handle.
+fn return_auth_error_if_denied(
+    decision: crate::control::auth::AuthDecision,
+    caller_uid: &str,
+    target_uid: &str,
+) -> MethodResult {
+    use crate::control::auth::AuthDecision;
+    match decision {
+        AuthDecision::Allow => Ok(Value::Null),
+        AuthDecision::CallerNotInRegistry => Err((
+            ErrorCode::Unauthorized,
+            format!(
+                "Session caller '{}' is not in the daemon registry",
+                caller_uid
+            ),
+        )),
+        AuthDecision::TargetNotInRegistry => Err((
+            ErrorCode::NotFound,
+            format!("target session '{}' not in the daemon registry", target_uid),
+        )),
+        AuthDecision::OutOfScope => Err((
+            ErrorCode::Unauthorized,
+            format!(
+                "Session caller '{}' is not authorized for target '{}' \
+                 (outside caller's task subtree / workspace per TUI-mirror rule)",
+                caller_uid, target_uid
+            ),
+        )),
+    }
+}
+
 // ============================================================
 // send_input (slice 10c-d)
 // ============================================================
@@ -834,6 +872,7 @@ fn default_submit() -> bool {
 pub fn send_input(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
+    caller_uid: Option<&str>,
 ) -> MethodResult {
     let p: SendInputParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("send_input params: {}", e)))?;
@@ -866,14 +905,25 @@ pub fn send_input(
         payload.push(b'\n');
     }
 
-    // Slice 10c-e-3b-fix3 deadlock fix: clone the writer Arc out
-    // of state and check liveness under the state lock, then
-    // drop state and do the blocking PTY write under just the
-    // per-writer mutex. Pre-fix3 the state lock was held across
-    // `write_all` — a backpressured PTY would deadlock every
-    // other daemon RPC.
+    // Sub-2a Finding #2 TOCTOU fix: auth + Arc clone happen in
+    // ONE critical section so the target session can't be
+    // removed (or replaced with an entry the caller wouldn't
+    // be authorized for) between authorize-time and act-time.
+    // Pre-fix the dispatcher locked for auth, dropped the lock,
+    // and this method re-locked — leaving a window.
     let writer_arc = {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        // Session-caller auth: under the same lock that does
+        // the target lookup. Operator callers (`caller_uid:
+        // None`) bypass.
+        if let Some(cuid) = caller_uid {
+            let decision = crate::control::auth::check_session_caller(
+                &state,
+                cuid,
+                &p.session_uid,
+            );
+            return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+        }
         let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
             (
                 ErrorCode::NotFound,
@@ -937,11 +987,23 @@ struct KillSessionParams {
 pub fn kill_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
+    caller_uid: Option<&str>,
 ) -> MethodResult {
     let p: KillSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("kill_session params: {}", e)))?;
 
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    // Sub-2a Finding #2 TOCTOU fix: auth + remove happen in one
+    // critical section so a non-descendant target can't slip in
+    // (or out) between authorize-time and remove-time.
+    if let Some(cuid) = caller_uid {
+        let decision = crate::control::auth::check_session_caller(
+            &state,
+            cuid,
+            &p.session_uid,
+        );
+        return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+    }
     let removed = state.sessions.remove(&p.session_uid);
     let removed = match removed {
         Some(s) => s,
@@ -1010,6 +1072,7 @@ struct ReadSessionOutputParams {
 pub fn read_session_output(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
+    caller_uid: Option<&str>,
 ) -> MethodResult {
     let p: ReadSessionOutputParams = serde_json::from_value(params.clone())
         .map_err(|e| {
@@ -1019,14 +1082,32 @@ pub fn read_session_output(
             )
         })?;
 
-    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
-        (
-            ErrorCode::NotFound,
-            format!("session '{}' not in daemon registry", p.session_uid),
-        )
-    })?;
-    let snap = session.fanout.snapshot_since(p.since_cursor);
+    // Sub-2a Finding #2 TOCTOU fix: auth + fanout-Arc clone
+    // happen in one critical section, then we drop the state
+    // lock and call `snapshot_since` on the fanout's own
+    // synchronization. Pre-fix the dispatcher locked for auth,
+    // dropped, and this method re-locked — TOCTOU window open
+    // to a swap-out of the target between authorize-time and
+    // snapshot-time.
+    let fanout = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cuid) = caller_uid {
+            let decision = crate::control::auth::check_session_caller(
+                &state,
+                cuid,
+                &p.session_uid,
+            );
+            return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+        }
+        let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
+            (
+                ErrorCode::NotFound,
+                format!("session '{}' not in daemon registry", p.session_uid),
+            )
+        })?;
+        Arc::clone(&session.fanout)
+    };
+    let snap = fanout.snapshot_since(p.since_cursor);
     Ok(json!({
         "bytes": BASE64.encode(&snap.bytes),
         "start_offset": snap.start_offset,
@@ -1096,25 +1177,103 @@ struct ListSessionsParams {
 pub fn list_sessions(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
-    caller_workspace: Option<&str>,
+    caller_uid: Option<&str>,
 ) -> MethodResult {
     // `null` is treated as default (no params) — the Python
     // MCP tool calls control_client.call("list_sessions", {…})
     // with the params object, but synthetic / Operator callers
     // may send `Null`.
-    let _p: ListSessionsParams = if params.is_null() {
+    let p: ListSessionsParams = if params.is_null() {
         ListSessionsParams::default()
     } else {
         serde_json::from_value(params.clone())
             .map_err(|e| (ErrorCode::InvalidParams, format!("list_sessions params: {}", e)))?
     };
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Sub-2a Finding #3: authorize the requested task scope
+    // BEFORE iterating. Mirrors
+    // `tui/src/control/methods.rs:498-521`:
+    //   - Operator caller: no restriction.
+    //   - Taskless Session caller + explicit task_id: Unauthorized.
+    //   - Tasked Session caller + explicit task_id: must be
+    //     self-or-descendant of caller's task.
+    if let Some(req_task) = p.task_id.as_deref() {
+        if let Some(cuid) = caller_uid {
+            let caller = state.sessions.get(cuid).ok_or_else(|| {
+                (
+                    ErrorCode::Unauthorized,
+                    format!("caller session '{}' not in daemon registry", cuid),
+                )
+            })?;
+            match caller.task_id.as_deref() {
+                None => {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "taskless caller cannot scope list_sessions to task '{}'",
+                            req_task
+                        ),
+                    ));
+                }
+                Some(own_task) => {
+                    if !crate::control::auth::task_is_self_or_descendant_of(
+                        &state.task_tree,
+                        req_task,
+                        own_task,
+                    ) {
+                        return Err((
+                            ErrorCode::Unauthorized,
+                            format!(
+                                "task '{}' is not the caller's task or a descendant",
+                                req_task
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Effective scope task: explicit param if present, else
+    // caller's own task (for Session callers). Operator callers
+    // with no param have `scope_task = None` and see all
+    // sessions; Operator callers WITH `task_id` filter to that
+    // subtree.
+    let scope_task: Option<String> = p.task_id.clone().or_else(|| {
+        caller_uid
+            .and_then(|cuid| state.sessions.get(cuid))
+            .and_then(|s| s.task_id.clone())
+    });
+
     let mut sessions: Vec<Value> = Vec::with_capacity(state.sessions.len());
     for (uid, session) in state.sessions.iter() {
-        if let Some(ws) = caller_workspace {
-            if session.workspace_id != ws {
-                continue;
+        let included = match (scope_task.as_deref(), caller_uid) {
+            // Explicit scope (param OR caller's task): include
+            // only sessions whose task_id is self-or-descendant
+            // of the scope. Mirrors TUI's `Some(scope) =>` arm.
+            (Some(scope), _) => session
+                .task_id
+                .as_deref()
+                .map(|t| {
+                    crate::control::auth::task_is_self_or_descendant_of(
+                        &state.task_tree,
+                        t,
+                        scope,
+                    )
+                })
+                .unwrap_or(false),
+            // No scope, Session caller: defer to the per-session
+            // auth check (taskless caller → same-workspace).
+            (None, Some(cuid)) => {
+                crate::control::auth::check_session_caller(&state, cuid, uid)
+                    .is_allow()
             }
+            // No scope, Operator caller: every session.
+            (None, None) => true,
+        };
+        if !included {
+            continue;
         }
         sessions.push(json!({
             "session_uid": uid,
@@ -1159,6 +1318,59 @@ pub fn list_sessions(
     // contract (`mcp_server/server.py:660` iterates the response
     // as a list).
     Ok(Value::Array(sessions))
+}
+
+// ============================================================
+// task.update_tree (slice 10d-mcp-surface-2a)
+// ============================================================
+//
+// TUI-pushed task-tree snapshot. The Phase 1 source-of-truth
+// decision (see `daemon/src/control/auth.rs` module doc and
+// `daemon/NOTES.md`'s sub-2a entry): TUI owns the planning task
+// tree, daemon caches a snapshot, daemon's Session-caller auth
+// reads from the snapshot.
+//
+// **Snapshot replace semantics**: each call REPLACES
+// `state.task_tree` wholesale. The TUI's caller is responsible
+// for sending the full tree; partial / diff updates aren't
+// supported. This is cheaper to reason about than diff
+// semantics (no question about stale ancestors) and the tree is
+// small enough that wire size isn't a concern (a few hundred
+// tasks at most, each entry is ~50 bytes).
+//
+// Operator-callable only — Session callers can't update the
+// task tree (that'd be a privilege escalation: a Session caller
+// could remove their task's parent_task_id chain to escape
+// authorization).
+
+#[derive(Deserialize)]
+struct TaskUpdateTreeParams {
+    /// Full tree snapshot. Each entry pairs a `task_id` with
+    /// its `parent_task_id` (`None` for top-level tasks).
+    tasks: Vec<TaskUpdateTreeEntry>,
+}
+
+#[derive(Deserialize)]
+struct TaskUpdateTreeEntry {
+    task_id: String,
+    #[serde(default)]
+    parent_task_id: Option<String>,
+}
+
+pub fn task_update_tree(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: TaskUpdateTreeParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("task.update_tree params: {}", e)))?;
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    // Replace, not merge. The TUI sends the full tree on every
+    // update; partial updates aren't a thing (see module doc).
+    state.task_tree.clear();
+    for entry in p.tasks {
+        state.task_tree.insert(entry.task_id, entry.parent_task_id);
+    }
+    Ok(json!({ "ok": true, "task_count": state.task_tree.len() }))
 }
 
 #[cfg(test)]
@@ -2382,7 +2594,7 @@ mod tests {
             "session_uid": &uid,
             "text": "echo hello-send-input-test",
         });
-        let result = send_input(&state, &params).expect("send_input ok");
+        let result = send_input(&state, &params, None).expect("send_input ok");
         assert_eq!(result["ok"], true);
 
         // Observable consequence: bash echoes the line back through
@@ -2422,7 +2634,7 @@ mod tests {
         // 64 KiB + 1 — one byte past the cap.
         let text = "a".repeat(MAX_SEND_INPUT_BYTES + 1);
         let params = json!({ "session_uid": &uid, "text": text });
-        let err = send_input(&state, &params).expect_err("oversize must reject");
+        let err = send_input(&state, &params, None).expect_err("oversize must reject");
         assert_eq!(err.0, ErrorCode::InvalidParams);
         assert!(err.1.contains("exceeds cap"), "error names the cap: {}", err.1);
         kill_all_sessions(&state);
@@ -2447,7 +2659,7 @@ mod tests {
         assert_eq!(text.len(), MAX_SEND_INPUT_BYTES);
 
         let params = json!({ "session_uid": &uid, "text": text });
-        let result = send_input(&state, &params).expect("at-cap must succeed");
+        let result = send_input(&state, &params, None).expect("at-cap must succeed");
         assert_eq!(result["ok"], true);
         kill_all_sessions(&state);
     }
@@ -2463,7 +2675,7 @@ mod tests {
             "text": "no-submit",
             "submit": false,
         });
-        let err = send_input(&state, &params).expect_err("submit=false rejected");
+        let err = send_input(&state, &params, None).expect_err("submit=false rejected");
         assert_eq!(err.0, ErrorCode::InvalidParams);
         assert!(err.1.contains("submit=false"), "message must name the field");
         kill_all_sessions(&state);
@@ -2476,7 +2688,7 @@ mod tests {
             "session_uid": "ts-ghost",
             "text": "anything",
         });
-        let err = send_input(&state, &params).expect_err("unknown uid");
+        let err = send_input(&state, &params, None).expect_err("unknown uid");
         assert_eq!(err.0, ErrorCode::NotFound);
         assert!(err.1.contains("ts-ghost"));
     }
@@ -2493,7 +2705,7 @@ mod tests {
         assert!(state.lock().unwrap().sessions.contains_key(&uid));
 
         let params = json!({ "session_uid": &uid });
-        let result = kill_session(&state, &params).expect("kill ok");
+        let result = kill_session(&state, &params, None).expect("kill ok");
         assert_eq!(result["ok"], true);
         assert!(
             !state.lock().unwrap().sessions.contains_key(&uid),
@@ -2509,7 +2721,7 @@ mod tests {
     fn kill_session_unknown_uid_returns_not_found() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let params = json!({ "session_uid": "ts-never-existed" });
-        let err = kill_session(&state, &params).expect_err("unknown uid");
+        let err = kill_session(&state, &params, None).expect_err("unknown uid");
         assert_eq!(err.0, ErrorCode::NotFound);
     }
 
@@ -2531,6 +2743,7 @@ mod tests {
         let _ = send_input(
             &state,
             &json!({ "session_uid": &uid, "text": "echo marker-first-snap" }),
+            None,
         )
         .expect("send_input");
 
@@ -2541,7 +2754,7 @@ mod tests {
         loop {
             let params = json!({ "session_uid": &uid });
             let result =
-                read_session_output(&state, &params).expect("rso ok");
+                read_session_output(&state, &params, None).expect("rso ok");
             let b64 = result["bytes"].as_str().unwrap();
             let bytes = BASE64.decode(b64).unwrap();
             if String::from_utf8_lossy(&bytes).contains("marker-first-snap") {
@@ -2573,6 +2786,7 @@ mod tests {
         let _ = send_input(
             &state,
             &json!({ "session_uid": &uid, "text": "echo CURSOR-A" }),
+            None,
         )
         .unwrap();
         // Wait for first marker to land.
@@ -2582,6 +2796,7 @@ mod tests {
         let _ = send_input(
             &state,
             &json!({ "session_uid": &uid, "text": "echo CURSOR-B-marker" }),
+            None,
         )
         .unwrap();
         // Poll: read_session_output(since=cursor_after_a) must
@@ -2593,7 +2808,7 @@ mod tests {
                 "since_cursor": cursor_after_a,
             });
             let result =
-                read_session_output(&state, &params).expect("rso ok");
+                read_session_output(&state, &params, None).expect("rso ok");
             let b64 = result["bytes"].as_str().unwrap();
             let bytes = BASE64.decode(b64).unwrap();
             let text = String::from_utf8_lossy(&bytes).to_string();
@@ -2638,7 +2853,7 @@ mod tests {
         }
         let params = json!({ "session_uid": &uid });
         let result =
-            read_session_output(&state, &params).expect("rso ok");
+            read_session_output(&state, &params, None).expect("rso ok");
         assert_eq!(
             result["closed"], true,
             "closed flag must propagate from FanoutSnapshot",
@@ -2650,8 +2865,205 @@ mod tests {
     fn read_session_output_unknown_uid_returns_not_found() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let params = json!({ "session_uid": "ts-ghost" });
-        let err = read_session_output(&state, &params).expect_err("unknown uid");
+        let err = read_session_output(&state, &params, None).expect_err("unknown uid");
         assert_eq!(err.0, ErrorCode::NotFound);
+    }
+
+    // ===========================================================
+    // Sub-2a Finding #2: auth + state-mutation atomicity
+    //
+    // Pre-fix, the dispatcher locked-for-auth then dropped the
+    // lock, and the method body re-locked to mutate. That window
+    // let an Allow decision act on a target that had been swapped
+    // out in the interim. The fix moves auth INTO the method body
+    // (same critical section as the target lookup + Arc-clone).
+    //
+    // These tests pin the *observable* consequence: when auth
+    // fails the method must NOT have performed the side effect.
+    // The "race-style" framing is that auth is co-located with the
+    // mutation under one lock; tests below assert the property by
+    // verifying that a deny decision leaves state untouched even
+    // when the target is still live in the registry (the
+    // pre-existing target wasn't the issue; the window was).
+    // ===========================================================
+
+    /// Helper: insert a stubbed `/bin/sleep` session at a specific
+    /// uid + workspace_id, returning fast (no start_session
+    /// roundtrip + no fresh_test_uid randomization, since these
+    /// tests reference uids by hand).
+    fn insert_session(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        workspace_id: &str,
+    ) {
+        let mut p = crate::session::SpawnParams::new(uid, format!("test-{}", uid), "/bin/sleep");
+        p.args = vec!["30".to_string()];
+        p.workspace_id = workspace_id.to_string();
+        let session = crate::session::DaemonSession::spawn(p).expect("spawn /bin/sleep");
+        let mut s = state.lock().unwrap();
+        s.sessions.insert(uid.to_string(), session);
+    }
+
+    /// Auth-fail on `kill_session` must NOT remove the target. The
+    /// pre-fix dispatcher's split lock would have removed if any
+    /// thread swapped the registry between auth and act. Post-fix
+    /// the auth+remove sit under one lock, so the only way for
+    /// auth to fail and the remove to still occur would be a
+    /// logic bug — pin against that.
+    #[test]
+    fn kill_session_auth_failure_leaves_target_in_registry() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-caller", "ws-1");
+        insert_session(&state, "ts-victim", "ws-2");
+        let params = json!({ "session_uid": "ts-victim" });
+        let err = kill_session(&state, &params, Some("ts-caller")).expect_err("must deny");
+        assert_eq!(err.0, ErrorCode::Unauthorized);
+        // Target STILL present — auth failure aborted before
+        // the registry mutation.
+        let s = state.lock().unwrap();
+        assert!(
+            s.sessions.contains_key("ts-victim"),
+            "auth failure must NOT have removed the target",
+        );
+        assert!(s.sessions.contains_key("ts-caller"));
+        drop(s);
+        kill_all_sessions(&state);
+    }
+
+    /// Auth-fail on `send_input` must NOT clone the writer or
+    /// attempt the PTY write. Hard to observe "didn't write" on
+    /// a real PTY, but the auth-failure error is the
+    /// short-circuit signal — verify the error code AND that
+    /// the target's writer Arc strong count is unchanged (no
+    /// rogue clone leaked from the method body).
+    #[test]
+    fn send_input_auth_failure_does_not_clone_writer() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-caller", "ws-1");
+        insert_session(&state, "ts-victim", "ws-2");
+        let initial_writer_refcount = {
+            let s = state.lock().unwrap();
+            Arc::strong_count(&s.sessions["ts-victim"].writer)
+        };
+        let params = json!({
+            "session_uid": "ts-victim",
+            "text": "should-never-arrive",
+        });
+        let err = send_input(&state, &params, Some("ts-caller")).expect_err("must deny");
+        assert_eq!(err.0, ErrorCode::Unauthorized);
+        let after_writer_refcount = {
+            let s = state.lock().unwrap();
+            Arc::strong_count(&s.sessions["ts-victim"].writer)
+        };
+        assert_eq!(
+            initial_writer_refcount, after_writer_refcount,
+            "auth failure must NOT have cloned the writer Arc \
+             (clone-then-deny would mean the method body's lookup \
+             ran AFTER the auth decision)",
+        );
+        kill_all_sessions(&state);
+    }
+
+    /// Auth-fail on `read_session_output` must NOT clone the
+    /// fanout. Mirror of the send_input refcount assertion above.
+    #[test]
+    fn read_session_output_auth_failure_does_not_clone_fanout() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-caller", "ws-1");
+        insert_session(&state, "ts-victim", "ws-2");
+        let initial_refcount = {
+            let s = state.lock().unwrap();
+            Arc::strong_count(&s.sessions["ts-victim"].fanout)
+        };
+        let params = json!({ "session_uid": "ts-victim" });
+        let err = read_session_output(&state, &params, Some("ts-caller"))
+            .expect_err("must deny");
+        assert_eq!(err.0, ErrorCode::Unauthorized);
+        let after_refcount = {
+            let s = state.lock().unwrap();
+            Arc::strong_count(&s.sessions["ts-victim"].fanout)
+        };
+        assert_eq!(
+            initial_refcount, after_refcount,
+            "auth failure must NOT have cloned the fanout Arc",
+        );
+        kill_all_sessions(&state);
+    }
+
+    /// Auth-pass on `kill_session` from a same-workspace
+    /// taskless caller DOES remove the target — proves the
+    /// auth+act pair atomically commits when the decision is
+    /// Allow. Pairs with the deny tests above to bracket the
+    /// "auth gates the act" invariant.
+    #[test]
+    fn kill_session_auth_allow_removes_target() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-caller", "ws-shared");
+        insert_session(&state, "ts-victim", "ws-shared");
+        let params = json!({ "session_uid": "ts-victim" });
+        let result = kill_session(&state, &params, Some("ts-caller")).expect("must allow");
+        assert_eq!(result["ok"], true);
+        let s = state.lock().unwrap();
+        assert!(!s.sessions.contains_key("ts-victim"));
+        assert!(s.sessions.contains_key("ts-caller"));
+        drop(s);
+        kill_all_sessions(&state);
+    }
+
+    /// Race-style: two threads call `kill_session` on the SAME
+    /// target. Exactly one should observe NotFound (the loser).
+    /// Pre-fix the two threads could race between the
+    /// authorize-lock and the remove-lock, and both could pass
+    /// auth before either removed (the loser would then see
+    /// NotFound when it tried to remove, which it does — but
+    /// the *auth pass* on a now-dead target was the leakage).
+    /// Post-fix, auth+remove are atomic: the loser's auth check
+    /// observes the post-remove state and surfaces NotFound at
+    /// auth time. This test simply verifies the wire outcome
+    /// (one Ok, one NotFound) regardless of the path; ordering
+    /// is non-deterministic but the cardinality is the invariant.
+    #[test]
+    fn concurrent_kill_session_yields_exactly_one_ok() {
+        use std::sync::Barrier;
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-caller-a", "ws-shared");
+        insert_session(&state, "ts-caller-b", "ws-shared");
+        insert_session(&state, "ts-victim", "ws-shared");
+        let barrier = Arc::new(Barrier::new(2));
+        let s1 = state.clone();
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            kill_session(
+                &s1,
+                &json!({ "session_uid": "ts-victim" }),
+                Some("ts-caller-a"),
+            )
+        });
+        let s2 = state.clone();
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            kill_session(
+                &s2,
+                &json!({ "session_uid": "ts-victim" }),
+                Some("ts-caller-b"),
+            )
+        });
+        let r1 = t1.join().expect("t1 panic");
+        let r2 = t2.join().expect("t2 panic");
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let not_founds = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err((ErrorCode::NotFound, _))))
+            .count();
+        assert_eq!(oks, 1, "exactly one thread must succeed");
+        assert_eq!(not_founds, 1, "the other must see NotFound");
+        // Target gone from registry.
+        let s = state.lock().unwrap();
+        assert!(!s.sessions.contains_key("ts-victim"));
+        drop(s);
+        kill_all_sessions(&state);
     }
 
     /// Test helper: drive `read_session_output` polls until the
@@ -2662,7 +3074,7 @@ mod tests {
         loop {
             let params = json!({ "session_uid": uid });
             let result =
-                read_session_output(state, &params).expect("rso ok");
+                read_session_output(state, &params, None).expect("rso ok");
             let b64 = result["bytes"].as_str().unwrap();
             let bytes = BASE64.decode(b64).unwrap();
             if String::from_utf8_lossy(&bytes).contains(marker) {

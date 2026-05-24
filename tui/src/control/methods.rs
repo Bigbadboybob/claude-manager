@@ -1112,6 +1112,19 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     }
 
     app.save_session_manifest();
+    // Sub-2a Finding (round 3) #2: the local TaskEntry above
+    // adds a fresh parent-task edge; without an immediate
+    // `push_task_tree_to_daemon` the daemon's `task_tree`
+    // doesn't see the new subtask until the next API reconcile
+    // fires (typically seconds later). Until then, a tasked
+    // agent acting on the subtask's session — which is exactly
+    // what `create_subtask` is for — would fail the
+    // descendant-task auth walk because the parent edge isn't
+    // visible. Pre-fix: subtask spawn-then-act races reconcile.
+    // Post-fix: edge is live the moment `create_subtask`
+    // returns. Mirrors the launch_* paths which call this at
+    // the tail for the same reason.
+    app.push_task_tree_to_daemon();
     Ok(json!({
         "task_id": new_task_id,
         "worktree_path": worktree_path.to_string_lossy(),

@@ -190,6 +190,11 @@ pub fn dispatch_request(
         // full registry.
         "list_sessions" => DispatchOutcome::Done(dispatch_list_sessions(state, req)),
 
+        // Slice 10d-mcp-surface-2a: TUI-pushed task-tree
+        // snapshot. Operator-only — Session callers can't
+        // rewrite the tree.
+        "task.update_tree" => DispatchOutcome::Done(dispatch_task_update_tree(state, req)),
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -231,17 +236,47 @@ fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
 }
 
 /// `list_sessions` — enumerate the daemon's live session
-/// registry. Operator-only through slice 10d-mcp-surface-1.
-///
-/// TODO(slice 10d-mcp-surface-2): re-enable Session-caller
-/// dispatch with task-subtree scoping (Finding #1 from sub-1
-/// review: same-workspace widened access vs the TUI's task-
-/// scoped rule). The `crate::control::methods::list_sessions`
-/// body's `caller_workspace: Option<&str>` parameter stays in
-/// the signature so the Session-caller arm can re-enable
-/// cleanly once auth lands; sub-1 always passes `None`
-/// (Operator sees all sessions).
+/// registry. Sub-2a Session-caller flow: caller's task/workspace
+/// scoping is computed up front (looking up the caller's
+/// session in the registry) and passed into `methods::list_sessions`
+/// via the `caller_scope` parameter. The method body filters to
+/// sessions the caller is authorized for via
+/// `crate::control::auth::check_session_caller`. Operator
+/// callers bypass scoping (see all sessions).
 fn dispatch_list_sessions(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    // Validate caller-existence up front so we surface
+    // Unauthorized at the dispatcher rather than letting the
+    // method body return an empty list (which would be
+    // ambiguous: "no sessions" vs "you can't see any").
+    if let Some(uid) = &caller_uid {
+        let state_guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state_guard.sessions.contains_key(uid) {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::Unauthorized,
+                format!(
+                    "Session caller '{}' is not in the daemon registry",
+                    uid
+                ),
+            );
+        }
+    }
+    match methods::list_sessions(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `task.update_tree` — TUI-pushed task-tree snapshot
+/// (slice 10d-mcp-surface-2a). Operator-only.
+fn dispatch_task_update_tree(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
@@ -249,10 +284,11 @@ fn dispatch_list_sessions(
         return Response::err(
             req.id.clone(),
             ErrorCode::Unauthorized,
-            "list_sessions is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth lands",
+            "task.update_tree is Operator-callable only — a Session caller \
+             rewriting the task tree could escape their own auth scope",
         );
     }
-    match methods::list_sessions(state, &req.params, None) {
+    match methods::task_update_tree(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -396,26 +432,32 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
     DispatchOutcome::AttachStream { response, handle }
 }
 
-/// `send_input` — write bytes to a session's PTY. Operator-only
-/// through slice 10d-mcp-surface-1.
+/// `send_input` — write bytes to a session's PTY. Session-caller
+/// flow auth-checked via `crate::control::auth::check_session_caller`
+/// (sub-2a TUI-mirror rule: self / same-task / descendant-task /
+/// taskless+same-workspace). Operator callers bypass auth.
 ///
-/// TODO(slice 10d-mcp-surface-2): re-enable Session-caller dispatch
-/// once `DaemonSession.task_id` + the planning task tree are
-/// plumbed daemon-side. Sub-1's same-workspace auth was reverted
-/// because it widened access for task-bound callers vs the TUI's
-/// task-subtree rule (Finding #1 from sub-1 review).
+/// ## Sub-2a Finding #2 TOCTOU fix
+///
+/// Pre-fix the dispatcher called a shared
+/// `authorize_session_caller_for_session_param` helper that
+/// locked-checked-dropped, then `methods::send_input` re-locked
+/// to mutate. The window between the two locks let the target
+/// session be removed (or replaced via uid reuse) AFTER auth
+/// passed but BEFORE the method body acted. Fix: pass the
+/// caller uid into the method so auth + Arc-clone happen in
+/// the same critical section. Operator callers pass
+/// `caller_uid: None`, which the method body interprets as
+/// "skip auth."
 fn dispatch_send_input(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "send_input is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth lands",
-        );
-    }
-    match methods::send_input(state, &req.params) {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::send_input(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -426,22 +468,20 @@ fn dispatch_send_input(
 /// slice 10e (manifest-ownership flip); this slice just removes
 /// from the in-memory registry, which is sufficient for
 /// `session.attach` to subsequently return NotFound.
+///
+/// ## Sub-2a Finding #2 TOCTOU fix
+///
+/// Same shape as `dispatch_send_input` above — auth + remove
+/// happen in the same critical section inside the method body.
 fn dispatch_kill_session(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    // TODO(slice 10d-mcp-surface-2): re-enable Session-caller
-    // dispatch once task-subtree auth lands. Sub-1's same-
-    // workspace auth was reverted (Finding #1 — widened access
-    // vs the TUI rule for task-bound callers).
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "kill_session is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2",
-        );
-    }
-    match methods::kill_session(state, &req.params) {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::kill_session(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -454,21 +494,21 @@ fn dispatch_kill_session(
 /// `resolve_authorized_session` (TUI-side) with a Python
 /// transcript-file read. See `crate::control::methods::read_session_output`
 /// for the full disposition.
+///
+/// ## Sub-2a Finding #2 TOCTOU fix
+///
+/// Same shape as `dispatch_send_input` above — auth + fanout
+/// Arc-clone happen in the same critical section inside the
+/// method body.
 fn dispatch_read_session_output(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    // TODO(slice 10d-mcp-surface-2): re-enable Session-caller
-    // dispatch once task-subtree auth lands. See `dispatch_send_input`
-    // for the reverted same-workspace shape.
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "read_session_output is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2",
-        );
-    }
-    match methods::read_session_output(state, &req.params) {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::read_session_output(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -957,27 +997,68 @@ mod tests {
     // (real PTY spawns, real bytes through the fanout). Tests here
     // focus on dispatcher routing + Session-caller Unauthorized.
 
+    /// Sub-2a: Session-caller `send_input` is auth-checked via
+    /// the TUI-mirror rule. A caller targeting their own
+    /// session passes auth (and reaches the methods layer,
+    /// which `InvalidParams`s on missing `text` — the "got
+    /// past auth" signal).
     #[test]
-    fn send_input_session_caller_still_unauthorized_pending_sub_2() {
-        // Sub-1 review reverted the auth-flip for Session
-        // callers (Finding #1: same-workspace widening vs the
-        // TUI's task-scoped rule). Sub-2 owns the re-enable.
-        let state = state_with_session("ts-live");
+    fn send_input_session_caller_self_passes_auth() {
+        let state = state_with_session_in_workspace("ts-self", "ws-x");
         let resp = dispatch_request(
             &state,
             &session_request(
                 "send_input",
-                serde_json::json!({ "session_uid": "ts-live", "text": "hi" }),
-                "ts-agent",
+                serde_json::json!({ "session_uid": "ts-self" }),
+                "ts-self",
             ),
         ).into_response();
         assert!(!resp.ok);
-        let err = resp.error.expect("error body");
-        assert_eq!(err.code, ErrorCode::Unauthorized);
-        assert!(
-            err.message.contains("sub-2"),
-            "error should point at the slice that re-enables Session-caller dispatch: {}",
-            err.message
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::InvalidParams,
+            "self-target must pass auth and reach methods layer",
+        );
+    }
+
+    /// Sub-2a: Session-caller `send_input` from a taskless
+    /// caller targeting a same-workspace sibling passes auth.
+    #[test]
+    fn send_input_session_caller_taskless_same_workspace_passes_auth() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-shared");
+        add_session(&state, "ts-target", "ws-shared");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "send_input",
+                serde_json::json!({ "session_uid": "ts-target" }),
+                "ts-caller",
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::InvalidParams,
+        );
+    }
+
+    /// Sub-2a: cross-workspace taskless target → Unauthorized.
+    #[test]
+    fn send_input_session_caller_cross_workspace_is_unauthorized() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-target", "ws-2");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "send_input",
+                serde_json::json!({ "session_uid": "ts-target", "text": "hi" }),
+                "ts-caller",
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::Unauthorized,
         );
     }
 
@@ -1000,23 +1081,46 @@ mod tests {
         );
     }
 
+    /// Sub-2a: Session-caller `kill_session` of a sibling
+    /// in the same workspace (taskless caller) passes auth and
+    /// the target is removed.
     #[test]
-    fn kill_session_session_caller_still_unauthorized_pending_sub_2() {
-        // Sub-1 review reverted the auth-flip for Session
-        // callers; sub-2 owns the re-enable.
-        let state = state_with_session("ts-live");
+    fn kill_session_session_caller_taskless_same_workspace_removes_target() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-shared");
+        add_session(&state, "ts-victim", "ws-shared");
         let resp = dispatch_request(
             &state,
             &session_request(
                 "kill_session",
-                serde_json::json!({ "session_uid": "ts-live" }),
-                "ts-agent",
+                serde_json::json!({ "session_uid": "ts-victim" }),
+                "ts-caller",
+            ),
+        ).into_response();
+        assert!(resp.ok, "same-workspace kill must succeed: {:?}", resp.error);
+        let s = state.lock().unwrap();
+        assert!(!s.sessions.contains_key("ts-victim"));
+        assert!(s.sessions.contains_key("ts-caller"));
+    }
+
+    /// Sub-2a: Session-caller `kill_session` of a target in a
+    /// different workspace is rejected.
+    #[test]
+    fn kill_session_session_caller_cross_workspace_is_unauthorized() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-other", "ws-2");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "kill_session",
+                serde_json::json!({ "session_uid": "ts-other" }),
+                "ts-caller",
             ),
         ).into_response();
         assert!(!resp.ok);
-        let err = resp.error.expect("error body");
-        assert_eq!(err.code, ErrorCode::Unauthorized);
-        assert!(err.message.contains("sub-2"));
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::Unauthorized,
+        );
     }
 
     #[test]
@@ -1055,23 +1159,42 @@ mod tests {
         );
     }
 
+    /// Sub-2a: Session-caller `read_session_output` of self
+    /// passes auth (and returns a real snapshot, not just
+    /// InvalidParams — read_session_output only needs the
+    /// session_uid).
     #[test]
-    fn read_session_output_session_caller_still_unauthorized_pending_sub_2() {
-        // Sub-1 review reverted the auth-flip for Session
-        // callers; sub-2 owns the re-enable.
-        let state = state_with_session("ts-live");
+    fn read_session_output_session_caller_self_passes_auth() {
+        let state = state_with_session_in_workspace("ts-self", "ws-x");
         let resp = dispatch_request(
             &state,
             &session_request(
                 "read_session_output",
-                serde_json::json!({ "session_uid": "ts-live" }),
-                "ts-agent",
+                serde_json::json!({ "session_uid": "ts-self" }),
+                "ts-self",
+            ),
+        ).into_response();
+        assert!(resp.ok, "self-target must pass: {:?}", resp.error);
+    }
+
+    /// Cross-workspace target gets Unauthorized.
+    #[test]
+    fn read_session_output_session_caller_cross_workspace_is_unauthorized() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-other", "ws-2");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "read_session_output",
+                serde_json::json!({ "session_uid": "ts-other" }),
+                "ts-caller",
             ),
         ).into_response();
         assert!(!resp.ok);
-        let err = resp.error.expect("error body");
-        assert_eq!(err.code, ErrorCode::Unauthorized);
-        assert!(err.message.contains("sub-2"));
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::Unauthorized,
+        );
     }
 
     #[test]
@@ -1152,27 +1275,54 @@ mod tests {
         }
     }
 
-    /// `list_sessions` accepts the Python MCP tool's
-    /// `include_exited` + `task_id` params for forward-compat
-    /// with the tool's signature. Sub-1 honors both as no-ops
-    /// (daemon doesn't track tombstones or task_id-on-sessions
-    /// yet; sub-2 / slice 10e land the actual filter semantics).
+    /// Sub-2a: `task_id` filter is honored. A session whose
+    /// `task_id` is not the filter (nor a descendant in the
+    /// task tree) is excluded. `include_exited` stays a no-op
+    /// at sub-2a (no tombstones daemon-side until slice 10e).
     #[test]
-    fn list_sessions_accepts_python_mcp_tool_params_as_noop() {
+    fn list_sessions_honors_task_id_filter() {
         let state = state_with_session_in_workspace("ts-a", "ws-1");
+        // Set ts-a's task_id by re-adding with the typed helper
+        // (the basic helper leaves task_id None).
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut("ts-a").unwrap().task_id = Some("task-target".into());
+        }
+        add_session(&state, "ts-other", "ws-1");
+        // ts-other is taskless — should be filtered out by
+        // task_id filter.
         let req = operator_request(
             "list_sessions",
             serde_json::json!({
-                "include_exited": true,
-                "task_id": "some-task-uuid",
+                "task_id": "task-target",
             }),
         );
         let resp = dispatch_request(&state, &req).into_response();
         assert!(resp.ok, "params should be accepted: {:?}", resp.error);
-        let sessions = resp.result.unwrap();
-        let arr = sessions.as_array().expect("top-level array");
-        // task_id filter is a no-op at sub-1 → all sessions
-        // returned despite the filter. Sub-2 implements honor.
+        let arr = resp.result.unwrap();
+        let arr = arr.as_array().expect("top-level array");
+        // Only ts-a matches (its task_id == "task-target");
+        // ts-other has no task_id and is excluded.
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["session_uid"], "ts-a");
+    }
+
+    /// `include_exited` stays a no-op until slice 10e plumbs
+    /// tombstones daemon-side. Pin the wire shape so the
+    /// Python tool's signature is accepted.
+    #[test]
+    fn list_sessions_accepts_include_exited_param() {
+        let state = state_with_session_in_workspace("ts-a", "ws-1");
+        let req = operator_request(
+            "list_sessions",
+            serde_json::json!({ "include_exited": true }),
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok);
+        let arr = resp.result.unwrap();
+        let arr = arr.as_array().expect("top-level array");
+        // include_exited is a no-op at sub-2a — only live
+        // entries returned regardless.
         assert_eq!(arr.len(), 1);
     }
 
@@ -1267,21 +1417,209 @@ mod tests {
         );
     }
 
-    /// Session-caller path is reverted to Unauthorized pending
-    /// sub-2 (Finding #1: same-workspace widened vs the TUI's
-    /// task-scoped rule). Sub-2 owns the re-enable.
+    /// Sub-2a: Session-caller `list_sessions` is auth-checked
+    /// via the TUI-mirror rule. A taskless caller sees only
+    /// same-workspace siblings; cross-workspace sessions are
+    /// filtered out.
     #[test]
-    fn list_sessions_session_caller_still_unauthorized_pending_sub_2() {
+    fn list_sessions_session_caller_taskless_scopes_to_own_workspace() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-sibling", "ws-1");
+        add_session(&state, "ts-other", "ws-2");
+        let req = session_request("list_sessions", serde_json::Value::Null, "ts-caller");
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok, "must succeed: {:?}", resp.error);
+        let arr = resp.result.unwrap();
+        let arr = arr.as_array().expect("top-level array");
+        let uids: Vec<&str> = arr.iter().map(|s| s["session_uid"].as_str().unwrap()).collect();
+        // Caller sees itself + same-workspace sibling. Cross-
+        // workspace ts-other is filtered out by the auth scope.
+        assert_eq!(uids, vec!["ts-caller", "ts-sibling"]);
+    }
+
+    /// Session-caller not in registry → Unauthorized (caught
+    /// at dispatch before reaching the method body).
+    #[test]
+    fn list_sessions_session_caller_not_in_registry_is_unauthorized() {
         let state = state_with_session_in_workspace("ts-a", "ws-1");
-        let req = session_request("list_sessions", serde_json::Value::Null, "ts-a");
+        let req = session_request("list_sessions", serde_json::Value::Null, "ts-ghost");
         let resp = dispatch_request(&state, &req).into_response();
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
         assert_eq!(err.code, ErrorCode::Unauthorized);
         assert!(
-            err.message.contains("sub-2"),
-            "error should point at the re-enable slice: {}",
+            err.message.contains("not in the daemon registry"),
+            "error should name the missing-caller cause: {}",
             err.message,
+        );
+    }
+
+    // ============================================================
+    // task.update_tree (sub-2a TUI-pushed snapshot)
+    // ============================================================
+
+    #[test]
+    fn task_update_tree_operator_replaces_snapshot() {
+        let state = make_state();
+        let req = operator_request(
+            "task.update_tree",
+            serde_json::json!({
+                "tasks": [
+                    { "task_id": "task-root", "parent_task_id": null },
+                    { "task_id": "task-child", "parent_task_id": "task-root" },
+                ],
+            }),
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok, "operator must succeed: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["task_count"], 2);
+        // Verify the snapshot landed in state.
+        let s = state.lock().unwrap();
+        assert_eq!(s.task_tree.get("task-root"), Some(&None));
+        assert_eq!(
+            s.task_tree.get("task-child"),
+            Some(&Some("task-root".to_string())),
+        );
+    }
+
+    #[test]
+    fn task_update_tree_replaces_not_merges() {
+        let state = make_state();
+        // First push: two tasks.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "task.update_tree",
+                serde_json::json!({
+                    "tasks": [
+                        { "task_id": "old-a", "parent_task_id": null },
+                        { "task_id": "old-b", "parent_task_id": null },
+                    ],
+                }),
+            ),
+        );
+        // Second push: replace with a different tree.
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "task.update_tree",
+                serde_json::json!({
+                    "tasks": [
+                        { "task_id": "new-a", "parent_task_id": null },
+                    ],
+                }),
+            ),
+        ).into_response();
+        assert!(resp.ok);
+        let s = state.lock().unwrap();
+        // Old tasks gone, new task present.
+        assert_eq!(s.task_tree.len(), 1);
+        assert!(!s.task_tree.contains_key("old-a"));
+        assert!(!s.task_tree.contains_key("old-b"));
+        assert!(s.task_tree.contains_key("new-a"));
+    }
+
+    #[test]
+    fn task_update_tree_session_caller_is_unauthorized() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-x");
+        let req = session_request(
+            "task.update_tree",
+            serde_json::json!({ "tasks": [] }),
+            "ts-caller",
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert!(
+            err.message.contains("escape their own auth scope"),
+            "error should explain why: {}",
+            err.message,
+        );
+    }
+
+    /// End-to-end: TUI pushes the task tree → daemon caches →
+    /// a tasked Session caller can act on a descendant target
+    /// across workspaces. Pins the full sub-2a contract.
+    #[test]
+    fn task_subtree_auth_e2e_descendant_across_workspaces() {
+        // ts-parent in ws-1 has task-parent; ts-child in ws-2
+        // has task-child whose parent is task-parent. Without
+        // the task tree, parent → child is OutOfScope (different
+        // workspaces, no shared task). With the tree pushed,
+        // it's Allow.
+        let state = make_state();
+        // Insert both sessions via add_session_typed-style with
+        // task_id set.
+        {
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-parent",
+                "parent",
+                "/bin/sleep",
+            );
+            sp.args = vec!["30".into()];
+            sp.workspace_id = "ws-1".into();
+            sp.task_id = Some("task-parent".into());
+            let session = crate::session::DaemonSession::spawn(sp).unwrap();
+            state.lock().unwrap().sessions.insert("ts-parent".into(), session);
+        }
+        {
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-child",
+                "child",
+                "/bin/sleep",
+            );
+            sp.args = vec!["30".into()];
+            sp.workspace_id = "ws-2".into();
+            sp.task_id = Some("task-child".into());
+            let session = crate::session::DaemonSession::spawn(sp).unwrap();
+            state.lock().unwrap().sessions.insert("ts-child".into(), session);
+        }
+        // Before pushing the tree, parent → child is OutOfScope.
+        let before = dispatch_request(
+            &state,
+            &session_request(
+                "send_input",
+                serde_json::json!({ "session_uid": "ts-child", "text": "hi" }),
+                "ts-parent",
+            ),
+        ).into_response();
+        assert!(!before.ok);
+        assert_eq!(before.error.unwrap().code, ErrorCode::Unauthorized);
+        // TUI pushes the task tree.
+        let push = dispatch_request(
+            &state,
+            &operator_request(
+                "task.update_tree",
+                serde_json::json!({
+                    "tasks": [
+                        { "task_id": "task-parent", "parent_task_id": null },
+                        { "task_id": "task-child", "parent_task_id": "task-parent" },
+                    ],
+                }),
+            ),
+        ).into_response();
+        assert!(push.ok);
+        // Now parent → child succeeds (reaches methods layer,
+        // which InvalidParams's only because real send_input
+        // would deliver bytes — we want to confirm auth passed).
+        let after = dispatch_request(
+            &state,
+            &session_request(
+                "send_input",
+                serde_json::json!({ "session_uid": "ts-child" }),
+                "ts-parent",
+            ),
+        ).into_response();
+        assert!(!after.ok);
+        // Reached the methods layer (InvalidParams on missing
+        // `text`) — that's the "got past auth" signal.
+        assert_eq!(
+            after.error.unwrap().code,
+            ErrorCode::InvalidParams,
+            "tasked-caller descendant target must pass auth after task tree push",
         );
     }
 }

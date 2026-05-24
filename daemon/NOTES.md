@@ -202,6 +202,25 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
 
 **Sub-2 sub-slicing plan.** Sub-2 is too large for a single commit (per the sub-1 cadence lesson — 10c was the last slice that tried to bundle too much). Split into sub-sub-slices, each its own commit on clean review:
 
+**Sub-2a — Shipped (unstaged at handoff time).** Task-tree plumbing + auth relaxation + Session-caller dispatch flip for the four read/mutate methods. `start_session` deferred to sub-2b alongside `propose_task` (the wire-shape question is paired with `mcp_start_session` design).
+
+  - `DaemonState.task_tree: HashMap<task_id, Option<parent_task_id>>` added — TUI-pushed snapshot, replace-not-merge semantics.
+  - `task.update_tree` method + Operator-only dispatch arm. Session callers can't rewrite the tree (would escape their own auth scope).
+  - `auth.rs::task_is_self_or_descendant_of` helper mirrors `tui/src/control/methods.rs::task_is_self_or_descendant_of` exactly (same `MAX_TASK_DEPTH=64` cap, cycle detection, missing-task graceful default).
+  - `auth.rs::check_session_caller` rule extended to mirror TUI's `caller_authorized_for`:
+    - self → Allow.
+    - tasked caller + target's task is self-or-descendant → Allow (workspace-agnostic, mirrors TUI's branch-mode subtask shape).
+    - tasked caller + taskless target → OutOfScope.
+    - tasked caller + sibling task (no descendant relationship) → OutOfScope (no workspace fall-back — round-1 widening lesson).
+    - taskless caller + same workspace → Allow.
+    - taskless caller + different workspace → OutOfScope.
+  - Dispatch flip for `send_input`, `kill_session`, `read_session_output`, `list_sessions` via shared `authorize_session_caller_for_session_param` helper. Operator callers bypass; Session callers go through `check_session_caller`.
+  - `list_sessions`:
+    - Session-caller arm: caller_uid passed into the method body, which filters to entries the caller is authorized for via `check_session_caller`. Operator callers pass `None` and see all.
+    - `task_id` filter now honored: walks `state.task_tree` via `task_is_self_or_descendant_of`. Taskless sessions excluded when `task_id` is set.
+    - `include_exited` still a no-op (tombstones land in slice 10e).
+  - Tests: 22 `auth::tests` (15 new — taskless/tasked combinations, walk edge cases, cycle/depth defenses), 4 `task.update_tree` (Operator-pushes replace, snapshot-not-merge, Session-caller-rejected, e2e descendant-across-workspaces), repurposed dispatch tests for `send_input` / `kill_session` / `read_session_output` / `list_sessions` (self / same-workspace / cross-workspace flow), `list_sessions_honors_task_id_filter`, `list_sessions_session_caller_taskless_scopes_to_own_workspace`, `list_sessions_session_caller_not_in_registry_is_unauthorized`. The `*_session_caller_still_unauthorized_pending_sub_2` tests for the four flipped arms are gone; `start_session_session_caller_still_unauthorized_pending_sub_2` stays (sub-2b owns its re-enable).
+
   - **sub-2a — Task subtree + auth relaxation + dispatch flip for the already-implemented methods.**
     - `DaemonSession.task_id` (already threaded in sub-1's scaffolding).
     - `DaemonState` gets a task-subtree view. **Source-of-truth question** to resolve before coding: is the daemon authoritative for the task tree (loads from + writes to the planning API), or does the TUI continue owning it and the daemon mirrors a snapshot? The current state is "TUI owns it"; Phase 1 doc allows either. Cheapest first cut: TUI pushes `task.update_tree(tasks: [{task_id, parent_task_id}, …])` whenever it mutates `App.tasks`, daemon stores it on `DaemonState.tasks: HashMap<task_uid, parent_task_uid>` and uses it for the descendant walk. Reuse the `MAX_TASK_DEPTH=64` cap from `tui/src/control/methods.rs::task_is_self_or_descendant_of`.
@@ -210,7 +229,13 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
     - `list_sessions` task_id filter (sub-1 no-op) → honor the filter via the same task-subtree walk.
     - Estimated 3-5 commits with the same per-finding reviewer rhythm as 10c-e / 10d-memory-cap.
 
-  - **sub-2b — `propose_task`.** Straightforward HTTP forwarder to the planning API (cloud-mode) or local-file writer (local mode — sub-2b decides which). Auth: same task-subtree rule. Per-tool sub-slice; small.
+  - **sub-2b — `propose_task` + `resolve_authorized_session` (the Python-MCP-tool-composed RPCs).**
+    - `propose_task`: straightforward HTTP forwarder to the planning API (cloud-mode) or local-file writer (local mode — sub-2b decides which). Auth: same task-subtree rule. Per-tool sub-slice; small.
+    - `resolve_authorized_session` (added per sub-2a round-3 reviewer): the Python MCP `read_session_output` tool at `mcp_server/server.py:426` composes `resolve_authorized_session` (auth + transcript path) with a Python file read. Sub-2a's `read_session_output` ships the fanout-snapshot wire and the dispatch flip, but the Python tool's `resolve→read` two-step still calls into the TUI for the resolver leg — so under `CM_USE_DAEMON_SOCKET=1` the agent's `read_session_output` invocation hits `UnknownMethod` on the daemon for the resolve step even though the rest of the chain works. The named acceptance criterion ("MCP agent inside a daemon-spawned session can call read_session_output") ships when this lands.
+    - Implementation sketch: `DaemonSession` gains a `transcript_path: Option<PathBuf>` field, set at spawn time from a TUI-supplied wire field (the TUI knows Claude's `~/.claude/projects/<encoded>/*.jsonl` vs Codex's `~/.codex/sessions/YYYY/MM/DD/<id>.jsonl` conventions; daemon doesn't). The `resolve_authorized_session` dispatch arm reads `transcript_path` + applies the same task-subtree auth walk sub-2a wired for `read_session_output`'s fanout path.
+    - Side benefit: collapses the two-step Python `resolve→read` into a single daemon RPC for callers who don't need disk-backed history (already partly covered by sub-2a's fanout snapshot, but the Python tool stays parsed-message-shape).
+    - Auth: same task-subtree rule. Operator callers bypass. Sub-2a's `check_session_caller` is the right gate; no new auth code needed.
+    - Per-tool sub-slice; medium (~3 commits — wire shape, dispatch arm, transcript_path threading).
 
   - **sub-2c — Workflow MCP methods (`workflow_transition`, `workflow_done`).** These touch the workflow controller. Phase 1 keeps the controller TUI-side (`tui/src/workflow/controller.rs`) and the daemon writes to `events.jsonl` which the TUI tails (per the design doc's intentional staging — Phase 2 cuts the file dependency). Order question: sub-2c can ship before `10d-workflow-controller` (the controller stays TUI-side; daemon just writes events.jsonl which is shared via fs). Or interleave with `10d-workflow-controller` if that lands first. NOTES.md should record the order chosen when sub-2c starts.
 
