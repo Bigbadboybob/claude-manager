@@ -763,9 +763,14 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 ts: &self.workspaces[ti].sessions[si],
                                 worktree_path: wt,
                             };
+                            // `assistant_turn_completed_since` is `count > base
+                            // && is_idle` by default — calling all three runs
+                            // the transcript parse four times per role per
+                            // tick. Derive `will_fire` from the two we already
+                            // need for logging.
                             let count = agent.count_assistant_turns(ctx);
                             let complete = agent.is_idle(ctx);
-                            let fire = agent.assistant_turn_completed_since(ctx, start_count);
+                            let fire = count > start_count && complete;
                             (fire, count, complete)
                         }
                         None => (false, 0, false),

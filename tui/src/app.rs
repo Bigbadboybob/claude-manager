@@ -2568,6 +2568,11 @@ pub struct App {
     /// before restore_sessions populates self.workspaces.
     manifest_bindings: HashMap<String, String>,
     last_session_id_check: Instant,
+    /// Last time `tick_workflows` actually ran. The drain loop calls
+    /// it every iteration, but each workflow tick does several transcript
+    /// reads per active role — throttling to ~10Hz keeps that work off
+    /// the keystroke-to-paint path without delaying transitions noticeably.
+    last_workflow_tick: Instant,
     /// Workflow definitions loaded from `workflows/*.toml` at startup.
     pub workflows: HashMap<String, Workflow>,
     /// Files in the workflows directory that failed to parse or validate at
@@ -2713,6 +2718,7 @@ impl App {
             sessions_restored: false,
             manifest_bindings,
             last_session_id_check: Instant::now(),
+            last_workflow_tick: Instant::now(),
             workflows,
             workflow_load_errors,
             workflow_runs,
@@ -4623,7 +4629,18 @@ impl App {
         let should_check_session_ids =
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 
-        let mut had_event = false;
+        // Only PTY events that affect the *visible* UI should force a
+        // redraw — Wakeup floods from a background session don't change
+        // anything on screen (the alacritty grid is kept in sync inside
+        // the FairMutex regardless; we just don't repaint it when the
+        // user isn't looking at it). Without this gate, a chatty agent
+        // running in a non-focused pane drives the redraw loop at PTY-
+        // batch frequency and starves keystroke→paint latency.
+        let focused_idx: Option<(usize, usize)> = match &self.cursor {
+            Cursor::Session(wi, si) => Some((*wi, *si)),
+            _ => None,
+        };
+        let mut visible_dirty = false;
         struct DetectedSid {
             ws_id: String,
             sid: String,
@@ -4637,29 +4654,57 @@ impl App {
         // workflow reviewer + a regular codex pane) can't both pick the
         // same newly-written transcript file. Updated as the loop binds new
         // sids so later iterations see them too.
-        let mut bound_sids: std::collections::HashSet<String> = self
-            .workspaces
-            .iter()
-            .flat_map(|w| w.sessions.iter())
-            .filter_map(|s| s.transcript_id.clone())
-            .collect();
+        //
+        // Only build it on ticks where we're actually going to run sid
+        // detection — otherwise this allocates a fresh HashSet + clones
+        // every session's transcript_id on every drain (5+ Hz) for nothing.
+        let mut bound_sids: std::collections::HashSet<String> = if should_check_session_ids {
+            self.workspaces
+                .iter()
+                .flat_map(|w| w.sessions.iter())
+                .filter_map(|s| s.transcript_id.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         // Status-bar notes for write failures encountered during this drain.
         // Collected here and applied after the loop because we cannot borrow
         // `&mut self.status_msg` while iterating `&mut self.workspaces`.
         let mut write_failure_notes: Vec<String> = Vec::new();
-        for ws in &mut self.workspaces {
-            for ts in &mut ws.sessions {
+        for (wi, ws) in self.workspaces.iter_mut().enumerate() {
+            for (si, ts) in ws.sessions.iter_mut().enumerate() {
+                let is_focused = focused_idx == Some((wi, si));
                 while let Ok(event) = ts.session.event_rx.try_recv() {
-                    had_event = true;
                     match event {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
                             ts.session.exited = true;
+                            visible_dirty = true;
                         }
                         TermEvent::Title(title) => {
                             ts.session.title = title;
+                            visible_dirty = true;
                         }
                         TermEvent::Wakeup => {
-                            ts.session.wakeup_times.push(now);
+                            // Background sessions can chatter at any rate
+                            // without forcing a repaint — only the focused
+                            // pane's grid is on screen.
+                            if is_focused {
+                                visible_dirty = true;
+                            }
+                            // Coalesce wakeup_times: alacritty fires one
+                            // Wakeup per PTY-output batch, which during heavy
+                            // output lands at kHz rates. Burst detection
+                            // only needs `>=5 in 2s`, so dropping to one
+                            // entry per 50ms keeps the in-memory window
+                            // bounded to ~40 entries even for the chattiest
+                            // sessions without changing observed behavior.
+                            let should_record = ts.session.wakeup_times.last().map_or(
+                                true,
+                                |last| now.duration_since(*last) >= Duration::from_millis(50),
+                            );
+                            if should_record {
+                                ts.session.wakeup_times.push(now);
+                            }
                         }
                         TermEvent::ClipboardStore(_, text) => {
                             // Forward OSC 52 clipboard store to the outer terminal.
@@ -4725,11 +4770,13 @@ impl App {
                         let quiet = ts.session.wakeup_times.is_empty();
                         if quiet && ts.status == SessionStatus::Running {
                             ts.status = SessionStatus::Idle;
+                            visible_dirty = true;
                             if ts.notify_on_idle {
                                 notify_session_idle(&ts.label);
                             }
                         } else if burst && ts.status != SessionStatus::Running {
                             ts.status = SessionStatus::Running;
+                            visible_dirty = true;
                         }
                     }
                 }
@@ -4964,7 +5011,14 @@ impl App {
         if should_check_session_ids {
             self.last_session_id_check = now;
         }
-        if had_event {
+        // sid_detections always result in sidebar/transcript binding changes,
+        // and manifest_needs_save tracks the same set of mutations that change
+        // what's painted. Mark them visible_dirty here so the focused-gate
+        // above doesn't accidentally suppress an important repaint.
+        if !sid_detections.is_empty() || manifest_needs_save {
+            visible_dirty = true;
+        }
+        if visible_dirty {
             self.needs_redraw = true;
         }
 
@@ -4984,7 +5038,18 @@ impl App {
         // Drive workflow transitions after per-session bookkeeping — this way
         // any session state changes above (idle detection, new session_id) are
         // visible to the workflow engine.
-        self.tick_workflows();
+        //
+        // Throttled: each tick does several transcript reads per active
+        // workflow role. At drain frequency (loop cadence) that adds up fast
+        // when workflows are running. 100ms latency on transition firing is
+        // imperceptible to the user.
+        const WORKFLOW_TICK_MIN_INTERVAL: Duration = Duration::from_millis(100);
+        if !self.workflow_runs.is_empty()
+            && now.duration_since(self.last_workflow_tick) >= WORKFLOW_TICK_MIN_INTERVAL
+        {
+            self.last_workflow_tick = now;
+            self.tick_workflows();
+        }
     }
 
     /// Drain new entries from `~/.claude/history.jsonl`. For each rotation-
