@@ -185,6 +185,11 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_read_session_output(state, req))
         }
 
+        // Slice 10d-mcp-surface: list_sessions. Session callers
+        // see only their own workspace; Operator callers see the
+        // full registry.
+        "list_sessions" => DispatchOutcome::Done(dispatch_list_sessions(state, req)),
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -196,20 +201,58 @@ pub fn dispatch_request(
     }
 }
 
-/// `start_session` — spawn a daemon-owned session. Operator-callable
-/// only at slice 10c-b; Session callers get `Unauthorized` with a
-/// pointer to 10c-d (when descendant-task-tree validation against
-/// a live task list lands). See `crate::control::methods` module
-/// doc for the full disposition.
+/// `start_session` — spawn a daemon-owned session. Operator-only
+/// at slice 10c-b through 10d-mcp-surface-1.
+///
+/// TODO(slice 10d-mcp-surface-2): re-enable Session-caller dispatch
+/// once (a) `DaemonSession` carries `task_id` and the daemon has
+/// access to the planning task tree (descendant-task auth), and
+/// (b) the wire shape supports the Python MCP tool's minimal
+/// `{type, label, prompt?, task_id?}` start_session params (today
+/// the daemon requires `uid`, `workspace_id`, `argv`, `working_dir`
+/// which the Session-caller can't supply). The same-workspace
+/// auth shape briefly explored in sub-1 was reverted because
+/// (a) it widened access for task-bound callers vs the TUI rule
+/// (Finding #1 from sub-1 review), and (b) the wire-shape mismatch
+/// would have caused agents to get `InvalidParams` errors even
+/// when auth passed (Finding #3).
 fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     if matches!(req.caller, Caller::Session(_)) {
         return Response::err(
             req.id.clone(),
             ErrorCode::Unauthorized,
-            "start_session is Operator-callable only at slice 10c-b; Session-caller path (with descendant-task-tree validation) wires in 10c-d alongside send_input / kill_session relocations",
+            "start_session is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth + wire-shape alignment with the Python MCP tool",
         );
     }
     match methods::start_session(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `list_sessions` — enumerate the daemon's live session
+/// registry. Operator-only through slice 10d-mcp-surface-1.
+///
+/// TODO(slice 10d-mcp-surface-2): re-enable Session-caller
+/// dispatch with task-subtree scoping (Finding #1 from sub-1
+/// review: same-workspace widened access vs the TUI's task-
+/// scoped rule). The `crate::control::methods::list_sessions`
+/// body's `caller_workspace: Option<&str>` parameter stays in
+/// the signature so the Session-caller arm can re-enable
+/// cleanly once auth lands; sub-1 always passes `None`
+/// (Operator sees all sessions).
+fn dispatch_list_sessions(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if matches!(req.caller, Caller::Session(_)) {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "list_sessions is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth lands",
+        );
+    }
+    match methods::list_sessions(state, &req.params, None) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -354,9 +397,13 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
 }
 
 /// `send_input` — write bytes to a session's PTY. Operator-only
-/// at slice 10c-d; Session callers get Unauthorized with a
-/// pointer to 10c-e (when descendant-task-tree validation lands).
-/// Body lives in `crate::control::methods::send_input`.
+/// through slice 10d-mcp-surface-1.
+///
+/// TODO(slice 10d-mcp-surface-2): re-enable Session-caller dispatch
+/// once `DaemonSession.task_id` + the planning task tree are
+/// plumbed daemon-side. Sub-1's same-workspace auth was reverted
+/// because it widened access for task-bound callers vs the TUI's
+/// task-subtree rule (Finding #1 from sub-1 review).
 fn dispatch_send_input(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
@@ -365,7 +412,7 @@ fn dispatch_send_input(
         return Response::err(
             req.id.clone(),
             ErrorCode::Unauthorized,
-            "send_input is Operator-callable only at slice 10c-d; Session-caller path (with descendant-task-tree validation) wires in 10c-e alongside agent-module relocation",
+            "send_input is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth lands",
         );
     }
     match methods::send_input(state, &req.params) {
@@ -383,11 +430,15 @@ fn dispatch_kill_session(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
+    // TODO(slice 10d-mcp-surface-2): re-enable Session-caller
+    // dispatch once task-subtree auth lands. Sub-1's same-
+    // workspace auth was reverted (Finding #1 — widened access
+    // vs the TUI rule for task-bound callers).
     if matches!(req.caller, Caller::Session(_)) {
         return Response::err(
             req.id.clone(),
             ErrorCode::Unauthorized,
-            "kill_session is Operator-callable only at slice 10c-d; Session-caller path wires in 10c-e",
+            "kill_session is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2",
         );
     }
     match methods::kill_session(state, &req.params) {
@@ -407,11 +458,14 @@ fn dispatch_read_session_output(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
+    // TODO(slice 10d-mcp-surface-2): re-enable Session-caller
+    // dispatch once task-subtree auth lands. See `dispatch_send_input`
+    // for the reverted same-workspace shape.
     if matches!(req.caller, Caller::Session(_)) {
         return Response::err(
             req.id.clone(),
             ErrorCode::Unauthorized,
-            "read_session_output is Operator-callable only at slice 10c-d; Session-caller path wires in 10c-e",
+            "read_session_output is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2",
         );
     }
     match methods::read_session_output(state, &req.params) {
@@ -534,9 +588,11 @@ mod tests {
     #[test]
     fn deferred_method_returns_unknown_with_slice_10c_pointer() {
         let state = make_state();
+        // Slice 10d-mcp-surface wired `list_sessions`; pick a method
+        // still served by the TUI to exercise the deferred-arm fallback.
         let resp = dispatch_request(
             &state,
-            &session_request("list_sessions", serde_json::Value::Null, "ts-x"),
+            &session_request("propose_task", serde_json::Value::Null, "ts-x"),
         ).into_response();
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
@@ -566,10 +622,19 @@ mod tests {
     /// before the dispatcher arm reads it. The session's Drop sends
     /// SIGKILL when the Arc<Mutex<DaemonState>> drops at end of test.
     fn state_with_session(uid: &str) -> Arc<Mutex<DaemonState>> {
+        state_with_session_in_workspace(uid, "")
+    }
+
+    /// Workspace-parameterized variant introduced in slice
+    /// 10d-mcp-surface-1 for the Session-caller auth tests.
+    /// Leaves `state_with_session` callers untouched (empty
+    /// workspace_id matches the pre-#10d default).
+    fn state_with_session_in_workspace(uid: &str, workspace_id: &str) -> Arc<Mutex<DaemonState>> {
         let state = make_state();
         let mut params =
             crate::session::SpawnParams::new(uid, "test", "/bin/sleep");
         params.args = vec!["30".into()];
+        params.workspace_id = workspace_id.to_string();
         let session =
             crate::session::DaemonSession::spawn(params).expect("spawn /bin/sleep");
         {
@@ -577,6 +642,37 @@ mod tests {
             s.sessions.insert(uid.into(), session);
         }
         state
+    }
+
+    /// Insert a second session into an existing state — used by
+    /// auth tests that need two sessions in the same or
+    /// different workspaces.
+    fn add_session(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        workspace_id: &str,
+    ) {
+        add_session_typed(state, uid, workspace_id, "claude-code");
+    }
+
+    /// Like `add_session` but with explicit `session_type` —
+    /// used by `list_sessions_returns_correct_type_for_*` tests
+    /// that pin the wire field.
+    fn add_session_typed(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        workspace_id: &str,
+        session_type: &str,
+    ) {
+        let mut params =
+            crate::session::SpawnParams::new(uid, "test", "/bin/sleep");
+        params.args = vec!["30".into()];
+        params.workspace_id = workspace_id.to_string();
+        params.session_type = session_type.to_string();
+        let session =
+            crate::session::DaemonSession::spawn(params).expect("spawn /bin/sleep");
+        let mut s = state.lock().unwrap();
+        s.sessions.insert(uid.into(), session);
     }
 
     #[test]
@@ -781,11 +877,12 @@ mod tests {
     // children spawned.
 
     #[test]
-    fn start_session_session_caller_is_unauthorized_with_slice_10c_d_pointer() {
-        // The named disposition: Session callers can't reach
-        // start_session until descendant-task-tree validation lands
-        // in 10c-d. Until then, they get Unauthorized with a
-        // pointer to the slice that lights them up.
+    fn start_session_session_caller_still_unauthorized_pending_sub_2() {
+        // Sub-1 review reverted the auth-flip for Session
+        // callers (Findings #1-#3: same-workspace widening +
+        // wire-shape mismatch with Python MCP tool). Session-
+        // caller dispatch re-enables in sub-2 alongside
+        // task-subtree auth and wire-shape alignment.
         let state = make_state();
         let req = session_request(
             "start_session",
@@ -799,12 +896,12 @@ mod tests {
             "ts-agent",
         );
         let resp = dispatch_request(&state, &req).into_response();
-        assert!(!resp.ok, "Session caller must get Unauthorized");
+        assert!(!resp.ok);
         let err = resp.error.expect("error body");
         assert_eq!(err.code, ErrorCode::Unauthorized);
         assert!(
-            err.message.contains("10c-d"),
-            "error should point at the slice that lights this up: {}",
+            err.message.contains("sub-2"),
+            "error should point at the slice that re-enables Session-caller dispatch: {}",
             err.message
         );
     }
@@ -861,7 +958,10 @@ mod tests {
     // focus on dispatcher routing + Session-caller Unauthorized.
 
     #[test]
-    fn send_input_session_caller_is_unauthorized() {
+    fn send_input_session_caller_still_unauthorized_pending_sub_2() {
+        // Sub-1 review reverted the auth-flip for Session
+        // callers (Finding #1: same-workspace widening vs the
+        // TUI's task-scoped rule). Sub-2 owns the re-enable.
         let state = state_with_session("ts-live");
         let resp = dispatch_request(
             &state,
@@ -874,7 +974,11 @@ mod tests {
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
         assert_eq!(err.code, ErrorCode::Unauthorized);
-        assert!(err.message.contains("10c-e"));
+        assert!(
+            err.message.contains("sub-2"),
+            "error should point at the slice that re-enables Session-caller dispatch: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -897,7 +1001,9 @@ mod tests {
     }
 
     #[test]
-    fn kill_session_session_caller_is_unauthorized() {
+    fn kill_session_session_caller_still_unauthorized_pending_sub_2() {
+        // Sub-1 review reverted the auth-flip for Session
+        // callers; sub-2 owns the re-enable.
         let state = state_with_session("ts-live");
         let resp = dispatch_request(
             &state,
@@ -908,10 +1014,9 @@ mod tests {
             ),
         ).into_response();
         assert!(!resp.ok);
-        assert_eq!(
-            resp.error.expect("error body").code,
-            ErrorCode::Unauthorized,
-        );
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert!(err.message.contains("sub-2"));
     }
 
     #[test]
@@ -951,7 +1056,9 @@ mod tests {
     }
 
     #[test]
-    fn read_session_output_session_caller_is_unauthorized() {
+    fn read_session_output_session_caller_still_unauthorized_pending_sub_2() {
+        // Sub-1 review reverted the auth-flip for Session
+        // callers; sub-2 owns the re-enable.
         let state = state_with_session("ts-live");
         let resp = dispatch_request(
             &state,
@@ -962,10 +1069,9 @@ mod tests {
             ),
         ).into_response();
         assert!(!resp.ok);
-        assert_eq!(
-            resp.error.expect("error body").code,
-            ErrorCode::Unauthorized,
-        );
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert!(err.message.contains("sub-2"));
     }
 
     #[test]
@@ -987,5 +1093,195 @@ mod tests {
         assert!(result["start_offset"].is_number());
         assert!(result["evicted_since_cursor"].is_boolean());
         assert!(result["closed"].is_boolean());
+    }
+
+    // ============================================================
+    // Slice 10d-mcp-surface-1: scaffolding-only tests.
+    //
+    // The Session-caller dispatch arms were briefly auth-flipped
+    // during sub-1 development; review caught three findings
+    // (same-workspace widening vs TUI rule, list_sessions wire
+    // mismatch with Python MCP tool, start_session wire mismatch).
+    // Sub-1 reverted the flips with TODO(sub-2) markers and kept
+    // the auth scaffolding (auth module + workspace_id threading
+    // on DaemonSession). Tests here pin the reverted shape so
+    // sub-2 inherits a clean baseline.
+    // ============================================================
+
+    // --- list_sessions (Operator-side; sub-2 owns Session-side) ------
+
+    /// Operator caller sees every session in the wire shape the
+    /// Python MCP tool expects: top-level JSON array of
+    /// `{session_uid, label, type, state, idle, managed_by_uid}`
+    /// objects (mirrors `mcp_server/server.py:319-322`).
+    #[test]
+    fn list_sessions_operator_returns_python_mcp_tool_wire_shape() {
+        let state = state_with_session_in_workspace("ts-a", "ws-1");
+        add_session(&state, "ts-b", "ws-2");
+        let req = operator_request("list_sessions", serde_json::Value::Null);
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok, "operator must succeed: {:?}", resp.error);
+        let result = resp.result.expect("result body");
+        // Top-level array — NOT `{sessions: [...]}`. This is
+        // the contract `mcp_server/server.py:660` iterates.
+        let sessions = result.as_array().expect("response is a top-level array");
+        assert_eq!(sessions.len(), 2, "operator sees all sessions");
+        let uids: Vec<&str> = sessions.iter()
+            .map(|s| s["session_uid"].as_str().unwrap())
+            .collect();
+        assert_eq!(uids, vec!["ts-a", "ts-b"], "stable order by session_uid");
+        // Each entry has the Python tool's expected fields.
+        for s in sessions {
+            assert!(s["session_uid"].is_string());
+            assert!(s["label"].is_string());
+            assert!(s["type"].is_string());
+            assert!(s["state"].is_string());
+            assert!(s["idle"].is_boolean());
+            // managed_by_uid is null for sessions spawned without
+            // an MCP parent (the default for these test sessions).
+            assert!(s["managed_by_uid"].is_null());
+            // Sub-1 defaults: type defaults to "claude-code"
+            // (overridden via SpawnParams.session_type when the
+            // wire carries it; the test helper uses the
+            // SpawnParams default), state="ready" (the only
+            // reachable value from this code path — see the
+            // doc-comment in `methods::list_sessions`),
+            // idle=false (daemon doesn't track idle yet).
+            assert_eq!(s["state"], "ready");
+            assert_eq!(s["idle"], false);
+        }
+    }
+
+    /// `list_sessions` accepts the Python MCP tool's
+    /// `include_exited` + `task_id` params for forward-compat
+    /// with the tool's signature. Sub-1 honors both as no-ops
+    /// (daemon doesn't track tombstones or task_id-on-sessions
+    /// yet; sub-2 / slice 10e land the actual filter semantics).
+    #[test]
+    fn list_sessions_accepts_python_mcp_tool_params_as_noop() {
+        let state = state_with_session_in_workspace("ts-a", "ws-1");
+        let req = operator_request(
+            "list_sessions",
+            serde_json::json!({
+                "include_exited": true,
+                "task_id": "some-task-uuid",
+            }),
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok, "params should be accepted: {:?}", resp.error);
+        let sessions = resp.result.unwrap();
+        let arr = sessions.as_array().expect("top-level array");
+        // task_id filter is a no-op at sub-1 → all sessions
+        // returned despite the filter. Sub-2 implements honor.
+        assert_eq!(arr.len(), 1);
+    }
+
+    /// Slice 10d-mcp-surface-1 review fix #1: the `type` field
+    /// reflects the actual session_type stored on `DaemonSession`,
+    /// not the default. Pre-fix this defaulted to "claude-code"
+    /// for every session (rpc_start_session never sent the
+    /// field on the wire); the Python MCP tool's dispatch on
+    /// `type` would have misrouted codex / bash sessions.
+    #[test]
+    fn list_sessions_returns_correct_type_for_codex_session() {
+        let state = state_with_session_in_workspace("ts-claude", "ws-1");
+        add_session_typed(&state, "ts-codex", "ws-1", "codex");
+        let req = operator_request("list_sessions", serde_json::Value::Null);
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok);
+        let sessions = resp.result.unwrap();
+        let arr = sessions.as_array().expect("top-level array");
+        let codex = arr.iter()
+            .find(|s| s["session_uid"] == "ts-codex")
+            .expect("codex entry");
+        assert_eq!(codex["type"], "codex", "codex session must surface as type='codex'");
+        let claude = arr.iter()
+            .find(|s| s["session_uid"] == "ts-claude")
+            .expect("claude entry");
+        assert_eq!(claude["type"], "claude-code");
+    }
+
+    #[test]
+    fn list_sessions_returns_correct_type_for_bash_session() {
+        let state = state_with_session_in_workspace("ts-c", "ws-1");
+        add_session_typed(&state, "ts-shell", "ws-1", "bash");
+        let req = operator_request("list_sessions", serde_json::Value::Null);
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok);
+        let arr = resp.result.unwrap();
+        let arr = arr.as_array().expect("top-level array");
+        let shell = arr.iter()
+            .find(|s| s["session_uid"] == "ts-shell")
+            .expect("bash entry");
+        assert_eq!(shell["type"], "bash");
+    }
+
+    /// Slice 10d-mcp-surface-1 review fix #2: `state` is
+    /// always `"ready"` for entries in the live registry. Pre-
+    /// fix the value was `"running"` which doesn't match the
+    /// Python tool's `ready|pending|exited` enum.
+    #[test]
+    fn list_sessions_emits_ready_state_for_live_session() {
+        let state = state_with_session_in_workspace("ts-a", "ws-1");
+        let req = operator_request("list_sessions", serde_json::Value::Null);
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok);
+        let arr = resp.result.unwrap();
+        let entry = &arr.as_array().expect("top-level array")[0];
+        assert_eq!(
+            entry["state"], "ready",
+            "live registry entry must surface as state='ready' (Python tool's enum)",
+        );
+    }
+
+    /// Slice 10d-mcp-surface-1 review fix #1: the daemon
+    /// validates `session_type` at the wire boundary. Unknown
+    /// values get `InvalidParams` rather than landing on
+    /// `DaemonSession.session_type` and propagating downstream.
+    #[test]
+    fn start_session_with_invalid_session_type_returns_invalid_params() {
+        // Operator-callable path is the only Session-typed entry
+        // sub-1 exposes (Session-caller dispatch is reverted to
+        // Unauthorized). Verify the validator runs for
+        // Operator callers — the typed boundary.
+        let state = make_state();
+        let req = operator_request(
+            "start_session",
+            serde_json::json!({
+                "uid": "ts-deadbeef-1",
+                "workspace_id": "ws-test",
+                "label": "x",
+                "session_type": "future_unknown_engine",
+                "argv": ["/bin/bash"],
+                "working_dir": "/tmp",
+            }),
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("session_type") && err.message.contains("claude-code"),
+            "error should name the field and list canonical values: {}",
+            err.message,
+        );
+    }
+
+    /// Session-caller path is reverted to Unauthorized pending
+    /// sub-2 (Finding #1: same-workspace widened vs the TUI's
+    /// task-scoped rule). Sub-2 owns the re-enable.
+    #[test]
+    fn list_sessions_session_caller_still_unauthorized_pending_sub_2() {
+        let state = state_with_session_in_workspace("ts-a", "ws-1");
+        let req = session_request("list_sessions", serde_json::Value::Null, "ts-a");
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert!(
+            err.message.contains("sub-2"),
+            "error should point at the re-enable slice: {}",
+            err.message,
+        );
     }
 }

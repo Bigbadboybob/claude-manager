@@ -185,6 +185,29 @@ struct StartSessionParams {
     /// in place; the producer is the missing piece.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_cap_bytes: Option<u64>,
+    /// Session-type discriminator (`"claude-code"` / `"codex"` /
+    /// `"bash"`). Slice 10d-mcp-surface-1 surfaces this on
+    /// `list_sessions`; future slices (workflow controller
+    /// engine selection) may branch on it. Defaults to
+    /// `"claude-code"` for backwards compat with older TUI
+    /// builds that don't yet send the field.
+    #[serde(default = "default_session_type")]
+    session_type: String,
+    /// Parent session uid for sessions spawned via MCP
+    /// `start_session` from an agent. Surfaced on
+    /// `list_sessions`. `None` for operator-started sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_by_uid: Option<String>,
+    /// Planning task uid this session is bound to. Surfaced on
+    /// `list_sessions`; slice 10d-mcp-surface-2 will use it for
+    /// the Session-caller descendant-task-tree auth check.
+    /// `None` for taskless sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+}
+
+fn default_session_type() -> String {
+    "claude-code".to_string()
 }
 
 // Slice 10d-memory-cap-relocation review fix #1: the
@@ -293,6 +316,16 @@ pub(crate) fn start_session_with_spawn_fn(
     // documented format" so a typo / off-by-one bug surfaces
     // loudly. Format: `ts-<hex>-<hex>` (see
     // `tui/src/app.rs::new_session_uid`).
+    if !is_valid_session_type(&p.session_type) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "session_type must be one of \"claude-code\", \"codex\", \"bash\"; got '{}'",
+                p.session_type
+            ),
+        ));
+    }
+
     if !is_valid_session_uid(&p.uid) {
         return Err((
             ErrorCode::InvalidParams,
@@ -373,6 +406,16 @@ pub(crate) fn start_session_with_spawn_fn(
     // `wrap_with_systemd_run`), so element-wise parity holds.
     let program = p.argv[0].clone();
     let mut spawn_params = SpawnParams::new(&session_uid, &p.label, &program);
+    // Slice 10d-mcp-surface-1: workspace_id + session_type +
+    // managed_by_uid + task_id are recorded on the DaemonSession
+    // so `list_sessions` can surface them on the wire (the
+    // Python MCP tool's contract). Session-caller auth (sub-2)
+    // will use workspace_id and task_id for the descendant-task
+    // check.
+    spawn_params.workspace_id = p.workspace_id.clone();
+    spawn_params.session_type = p.session_type.clone();
+    spawn_params.managed_by_uid = p.managed_by_uid.clone();
+    spawn_params.task_id = p.task_id.clone();
     spawn_params.args = p.argv[1..].to_vec();
     spawn_params.working_dir = Some(working_dir);
     spawn_params.cols = p.cols;
@@ -731,6 +774,23 @@ fn is_valid_session_uid(uid: &str) -> bool {
     }
 }
 
+/// Slice 10d-mcp-surface-1 fix #1: enforce the canonical
+/// `session_type` vocabulary the Python MCP tool's caller code
+/// dispatches on. Pre-fix, an unknown value (typo, future drift,
+/// caller bug) would have landed on `DaemonSession.session_type`
+/// and propagated to `list_sessions`'s `type` field — MCP
+/// consumers downstream would either misroute or fail to match.
+/// Rejecting at the wire boundary keeps the registry's
+/// session_type domain closed.
+///
+/// The three canonical values are the same set
+/// `tui/src/app.rs::try_spawn_via_daemon` maps to from the TUI's
+/// internal vocabulary (`"claude"` → `"claude-code"` happens
+/// caller-side).
+fn is_valid_session_type(session_type: &str) -> bool {
+    matches!(session_type, "claude-code" | "codex" | "bash")
+}
+
 // ============================================================
 // send_input (slice 10c-d)
 // ============================================================
@@ -974,6 +1034,131 @@ pub fn read_session_output(
         "evicted_since_cursor": snap.evicted_since_cursor,
         "closed": snap.closed,
     }))
+}
+
+// ============================================================
+// list_sessions (slice 10d-mcp-surface-1: scaffolding only)
+// ============================================================
+//
+// Returns a snapshot of the daemon's live session registry. For
+// sub-1: Operator-only (Session-caller dispatch deferred to
+// sub-2 alongside task-subtree auth).
+//
+// **Wire shape — Python MCP tool contract** (`mcp_server/server.py:319`):
+// the response is a TOP-LEVEL JSON ARRAY (not wrapped in
+// `{sessions: [...]}`), and each entry carries the fields the
+// Python tool's caller code reads at `mcp_server/server.py:660`:
+//
+//   `[{ session_uid, label, type, state, idle, managed_by_uid }, …]`
+//
+// Sub-1 review caught the previous `{sessions: [{uid, ...}]}`
+// shape as a contract break (Finding #2). Aligning now so the
+// Operator-caller path (and sub-2's Session-caller flip) just
+// works without a wire-shape churn.
+//
+// Field semantics (sub-1):
+//
+//   - `session_uid`: `DaemonSession.uid`.
+//   - `label`: `DaemonSession.title`. (TUI calls it "label";
+//      daemon calls it "title". The wire uses "label" for
+//      Python MCP tool parity.)
+//   - `type`: `DaemonSession.session_type` (`"claude-code"` /
+//      `"codex"` / `"bash"` etc.).
+//   - `state`: always `"running"` at sub-1. Phase 1 daemon
+//      doesn't track tombstones (those still live on the TUI
+//      side until slice 10e flips manifest ownership). The
+//      `include_exited` param is accepted but a no-op.
+//   - `idle`: always `false` at sub-1. Daemon doesn't track PTY
+//      idleness yet; future slice can plumb the idle-detection
+//      output through the fanout.
+//   - `managed_by_uid`: `DaemonSession.managed_by_uid`.
+//
+// `caller_workspace: Option<&str>` parameter stays for sub-2's
+// Session-caller scoping. Sub-1's `dispatch_list_sessions`
+// always passes `None` (Operator sees all).
+
+/// Wire params for `list_sessions`. The Python MCP tool sends
+/// `{include_exited: bool, task_id?: string}`. Sub-1 accepts both
+/// fields for forward-compat with the tool signature but
+/// honors them as documented above (no-ops for now).
+#[derive(Deserialize, Default)]
+struct ListSessionsParams {
+    /// Future-proofs the wire signature for slice 10e
+    /// (manifest ownership flip). Sub-1 accepts but ignores.
+    #[serde(default)]
+    include_exited: bool,
+    /// Future-proofs the wire signature for slice 10d-mcp-
+    /// surface-2 (task-subtree auth). Sub-1 accepts but ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+}
+
+pub fn list_sessions(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_workspace: Option<&str>,
+) -> MethodResult {
+    // `null` is treated as default (no params) — the Python
+    // MCP tool calls control_client.call("list_sessions", {…})
+    // with the params object, but synthetic / Operator callers
+    // may send `Null`.
+    let _p: ListSessionsParams = if params.is_null() {
+        ListSessionsParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("list_sessions params: {}", e)))?
+    };
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let mut sessions: Vec<Value> = Vec::with_capacity(state.sessions.len());
+    for (uid, session) in state.sessions.iter() {
+        if let Some(ws) = caller_workspace {
+            if session.workspace_id != ws {
+                continue;
+            }
+        }
+        sessions.push(json!({
+            "session_uid": uid,
+            "label": session.title,
+            "type": session.session_type,
+            // Slice 10d-mcp-surface-1 fix #2: every entry in
+            // `state.sessions` is post-exec live by construction
+            // — `start_session` only inserts AFTER
+            // `PendingSession::arm_reaper` returns (see
+            // `methods.rs::start_session_with_spawn_fn`'s Phase
+            // 2). And when a child exits, the reaper-cleanup
+            // callback REMOVES the entry from the registry. So
+            // every session this loop sees is ready, never
+            // pending or exited — `"ready"` is the only
+            // reachable value from this code path.
+            //
+            // The Python MCP tool's contract enum is
+            // `ready | pending | exited`. `pending` reflects
+            // the TUI's local-spawn "spawned but no transcript
+            // bound yet" gap — the daemon's two-phase spawn
+            // collapses that gap to "either the spawn succeeded
+            // and the session is ready, or the spawn failed and
+            // no entry exists." `exited` reaches consumers via
+            // `manifest.watch` tombstones (slice 10e), not via
+            // `list_sessions`.
+            "state": "ready",
+            // Sub-1: daemon doesn't track PTY idleness yet. The
+            // Python MCP tool uses this to decide when to poll
+            // again (`mcp_server/server.py:660`); always-false
+            // means callers see the session as busy until a
+            // future slice plumbs the idle signal.
+            "idle": false,
+            "managed_by_uid": session.managed_by_uid,
+        }));
+    }
+    // Stable order for deterministic test assertions and for
+    // human-debuggable output.
+    sessions.sort_by(|a, b| {
+        a["session_uid"].as_str().unwrap_or("").cmp(b["session_uid"].as_str().unwrap_or(""))
+    });
+    // Top-level array, NOT `{sessions: [...]}` — Python MCP tool
+    // contract (`mcp_server/server.py:660` iterates the response
+    // as a list).
+    Ok(Value::Array(sessions))
 }
 
 #[cfg(test)]

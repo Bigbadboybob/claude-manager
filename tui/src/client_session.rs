@@ -113,6 +113,18 @@ pub struct ClientSessionConfig<'a> {
     /// Human-readable label for the sidebar — passed through to
     /// `start_session`'s `label` param.
     pub label: &'a str,
+    /// Session-type discriminator passed to the daemon's
+    /// `start_session` (slice 10d-mcp-surface-1). Canonical
+    /// values: `"claude-code"`, `"codex"`, `"bash"` — these
+    /// match the wire enum the Python MCP tool's caller code
+    /// dispatches on. The daemon stores it on `DaemonSession`
+    /// and surfaces it via `list_sessions`'s `type` field.
+    ///
+    /// Pre-fix #1 this wasn't sent on the wire; daemon-side
+    /// `session_type` defaulted to `"claude-code"`, mislabeling
+    /// codex / bash sessions and breaking the Python tool's
+    /// dispatch on the `type` field.
+    pub session_type: &'a str,
     /// Full argv to exec. `argv[0]` is the program; any wrappers
     /// (e.g. `systemd-run --user --scope -- claude ...` for a
     /// memory-capped session) are baked in by the caller. The
@@ -464,6 +476,13 @@ pub(crate) fn rpc_start_session_full(
         "uid": config.uid,
         "workspace_id": config.workspace_id,
         "label": config.label,
+        // Slice 10d-mcp-surface-1 fix #1: `session_type` must
+        // travel on the wire so the daemon's `list_sessions`
+        // surfaces the correct `type` field for the Python MCP
+        // tool's dispatch. Pre-fix this was omitted and the
+        // daemon defaulted to "claude-code", mislabeling
+        // codex / bash sessions.
+        "session_type": config.session_type,
         "argv": config.argv,
         "working_dir": config.working_dir.display().to_string(),
         "env": config.env,
@@ -752,6 +771,10 @@ mod tests {
             uid,
             workspace_id,
             label,
+            // Tests default to "bash" (the bare-shell helper);
+            // type-specific tests override via direct
+            // ClientSessionConfig construction.
+            session_type: "bash",
             argv,
             working_dir,
             env: std::collections::BTreeMap::new(),
@@ -1282,6 +1305,7 @@ mod tests {
             uid: &uid,
             workspace_id: "ws-memcap",
             label: "memcap",
+            session_type: "bash",
             argv: &argv,
             working_dir: std::path::Path::new("/tmp"),
             env: std::collections::BTreeMap::new(),
@@ -1363,6 +1387,7 @@ mod tests {
             uid: &uid_pre,
             workspace_id: "ws-chunking-e2e",
             label: "chunking-e2e",
+            session_type: "bash",
             argv: &argv,
             working_dir: &working_dir,
             env: std::collections::BTreeMap::new(),

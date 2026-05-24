@@ -184,6 +184,30 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
 
 **Working-set check:** opt-in off, MCP routes to `tui.sock` as today. Opt-in on, MCP routes to `daemon.sock` and Session-caller validation kicks in.
 
+**Slice 10d-mcp-surface-1 — Scaffolding only (shipped):** sub-1 was originally scoped to flip Session-caller dispatch for the four already-implemented arms + add `list_sessions`. Review caught **three findings** that made the dispatch flip unsafe to ship in sub-1:
+
+  - **Finding #1 (auth widening):** the same-workspace rule daemon-side widened access for task-bound callers vs the TUI's `caller_authorized_for` rule (`tui/src/control/methods.rs:166`), which restricts task-bound callers to their task subtree. The Phase 1 acceptance criterion says "CM_TUI_SESSION_ID scoping behaves identically to today (descendant-only)" — same-workspace violates that for task-bound callers.
+  - **Finding #2 (`list_sessions` wire mismatch):** the response shape `{sessions: [{uid, workspace_id, title}]}` doesn't match what the Python MCP tool's caller code reads at `mcp_server/server.py:660` (iterates as a top-level list, reads `label`, `idle`, `managed_by_uid`).
+  - **Finding #3 (`start_session` wire mismatch):** Python MCP tool sends `{type, label, prompt?, task_id?}` (`mcp_server/server.py:359`) but daemon requires `uid`, `workspace_id`, `argv`, `working_dir`. Session callers would get `InvalidParams` even when auth passes.
+
+**Sub-1 ships as scaffolding only — Session-caller dispatch arms reverted to Operator-only with `TODO(slice 10d-mcp-surface-2)` markers in `daemon/src/control/dispatch.rs` (`dispatch_send_input`, `dispatch_kill_session`, `dispatch_read_session_output`, `dispatch_start_session`, `dispatch_list_sessions`).** What sub-1 retains:
+
+  - `daemon/src/control/auth.rs` (new module): `check_session_caller(state, caller_uid, target_uid) -> AuthDecision` with table-row enum variants. The Phase 1 same-workspace rule is wrong for task-bound callers, but the module + `AuthDecision` shape is the right scaffold for sub-2's task-subtree implementation.
+  - `DaemonSession` / `SpawnParams` / `PendingSessionInner` gain `workspace_id`, `session_type`, `managed_by_uid`, `task_id` — threaded through the two-phase spawn so sub-2 has everything it needs for the task-subtree auth.
+  - `StartSessionParams` gains `session_type` (defaults to `"claude-code"`), `managed_by_uid`, `task_id` — daemon-spawned sessions carry these to `list_sessions`.
+  - `list_sessions` method body returns the Python MCP tool's wire shape: top-level JSON array of `{session_uid, label, type, state, idle, managed_by_uid}`. `include_exited` + `task_id` params accepted (no-ops until sub-2 / slice 10e).
+  - 7 `auth::tests` (table-row unit tests) survive — they test the module in isolation.
+  - 3 `list_sessions_*` tests: Operator returns Python-MCP-tool wire shape (positive); accepts `include_exited` + `task_id` params as no-ops (positive); Session caller still Unauthorized pending sub-2 (negative).
+  - Dispatch tests for the five reverted arms renamed `*_session_caller_still_unauthorized_pending_sub_2` with assertions on the `sub-2` pointer in the error message.
+
+**Rejected / deferred findings — sub-2 owns these:**
+
+  - Task-subtree authorization daemon-side. Requires plumbing the planning task list to `DaemonState` (today it lives in `App.tasks` on the TUI). Same `caller_authorized_for` semantics as `tui/src/control/methods.rs:157` — walks `parent_task_id` chain capped at `MAX_TASK_DEPTH`. The `auth.rs` module is the right scaffold; sub-2 swaps the same-workspace rule for a descendant-task-tree rule.
+  - Wire-shape alignment for `start_session` Session-caller path. Today the daemon requires `uid`, `workspace_id`, `argv`, `working_dir`; the Python tool sends `{type, label, prompt?, task_id?}`. Sub-2 either extends the daemon's `start_session` to derive missing fields server-side (workspace_id from caller's session, working_dir from workspace's worktree_path, argv from the MCP-config builder) OR has the Python tool build the full param shape using state it already has.
+  - Re-enabling the five reverted dispatch arms (`send_input`, `kill_session`, `read_session_output`, `start_session`, `list_sessions`) for Session callers — once (a) and (b) land.
+
+Out of scope for sub-2 too (further follow-up slices): `propose_task` (HTTP forwarder to the planning API), `workflow_transition` / `workflow_done` (events.jsonl writer), `create_subtask` / `list_subtasks` / `mark_subtask_done`, `wait_for_session_idle` / `wait_for_workflow_*`. Each of these has its own per-tool design question; tracking separately as `10d-mcp-surface-3` etc. when their precondition state is in place.
+
 ### Slice 10d-workflow-controller — Workflow controller relocation
 
 - Move `tui/src/workflow/controller.rs` to `daemon/src/workflow/controller.rs` now that `Session` is daemon-owned (the only remaining blocker on this module per slice 6).

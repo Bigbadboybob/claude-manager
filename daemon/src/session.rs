@@ -354,6 +354,28 @@ pub struct SpawnParams {
     /// `DaemonState.sessions` and embedded in kill-log paths,
     /// MCP env vars, etc.
     pub uid: String,
+    /// Workspace the session is associated with. Recorded on
+    /// `DaemonSession` so the slice 10d-mcp-surface Session-caller
+    /// auth can answer "is target in caller's workspace?".
+    pub workspace_id: String,
+    /// Session-type discriminator surfaced by `list_sessions` to
+    /// the Python MCP tool. Values mirror the TUI's existing
+    /// vocabulary (`"claude-code"`, `"codex"`, `"bash"`). Phase 1
+    /// daemon doesn't act on this beyond surfacing — future
+    /// slices can branch on it (e.g. workflow controller
+    /// engine selection).
+    pub session_type: String,
+    /// Parent session uid for sessions spawned via MCP
+    /// `start_session` from an agent. Surfaced by `list_sessions`
+    /// alongside the "managed-by" sidebar marker. `None` for
+    /// operator-started sessions.
+    pub managed_by_uid: Option<String>,
+    /// Planning task uid this session is bound to, when launched
+    /// from a tasked workspace. Surfaced by `list_sessions` and
+    /// (slice 10d-mcp-surface-2) used by the Session-caller
+    /// descendant-task-tree authorization. `None` for taskless
+    /// sessions.
+    pub task_id: Option<String>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -426,6 +448,17 @@ impl SpawnParams {
     ) -> Self {
         Self {
             uid: uid.into(),
+            // Tests that don't care about auth pass empty;
+            // production via `start_session` always overrides.
+            workspace_id: String::new(),
+            // Defaults are "claude-code" for session_type and
+            // None for the two optional fields. Production via
+            // `start_session` overrides session_type when the
+            // wire carries it; managed_by_uid + task_id stay
+            // None until a future wire extension carries them.
+            session_type: "claude-code".to_string(),
+            managed_by_uid: None,
+            task_id: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -672,6 +705,28 @@ impl LastExitProbe {
 pub struct DaemonSession {
     pub uid: String,
     pub title: String,
+    /// Workspace this session was spawned into. Populated from
+    /// `StartSessionParams.workspace_id` at spawn time; used by
+    /// the slice 10d-mcp-surface Session-caller auth check to
+    /// answer "is target session in the same workspace as the
+    /// caller session?". Phase 1 auth is same-workspace + self;
+    /// future slices plumb task-tree to enable descendant-task
+    /// scoping.
+    pub workspace_id: String,
+    /// Session-type discriminator (`"claude-code"` / `"codex"` /
+    /// `"bash"`) surfaced by `list_sessions` to the Python MCP
+    /// tool. Mirrors the TUI's `TerminalSession.session_type`
+    /// vocabulary.
+    pub session_type: String,
+    /// Parent session uid for sessions spawned via MCP
+    /// `start_session`. `None` for operator-started sessions.
+    /// Surfaced by `list_sessions` and (sub-2) used for the
+    /// "managed-by" sidebar marker.
+    pub managed_by_uid: Option<String>,
+    /// Planning task uid this session is bound to. `None` for
+    /// taskless sessions. Slice 10d-mcp-surface-2 uses this for
+    /// the Session-caller descendant-task-tree auth check.
+    pub task_id: Option<String>,
     /// `Arc` so the reader thread can hold a clone independently of
     /// the `DaemonSession` instance — the thread pushes bytes into
     /// the fanout, the dispatcher / attach.open consumers subscribe
@@ -821,6 +876,10 @@ pub struct PendingSession {
 
 struct PendingSessionInner {
     uid: String,
+    workspace_id: String,
+    session_type: String,
+    managed_by_uid: Option<String>,
+    task_id: Option<String>,
     title: String,
     fanout: Arc<PtyByteFanout>,
     pid: libc::pid_t,
@@ -1035,6 +1094,10 @@ impl PendingSession {
         Ok(PendingSession {
             inner: Some(PendingSessionInner {
                 uid: params.uid,
+                workspace_id: params.workspace_id,
+                session_type: params.session_type,
+                managed_by_uid: params.managed_by_uid,
+                task_id: params.task_id,
                 title: params.title,
                 fanout,
                 pid,
@@ -1078,6 +1141,10 @@ impl PendingSession {
             .expect("arm_reaper called on already-taken PendingSession");
         let PendingSessionInner {
             uid,
+            workspace_id,
+            session_type,
+            managed_by_uid,
+            task_id,
             title,
             fanout,
             pid,
@@ -1144,6 +1211,10 @@ impl PendingSession {
         Ok(DaemonSession {
             uid,
             title,
+            workspace_id,
+            session_type,
+            managed_by_uid,
+            task_id,
             fanout,
             pid,
             pidfd,

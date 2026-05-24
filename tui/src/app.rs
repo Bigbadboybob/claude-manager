@@ -2717,6 +2717,21 @@ impl App {
         // sees the same predicted path the local-spawn helper
         // produces.
         let memory_cap_bytes = memory_cap.as_ref().map(|c| c.soft_bytes);
+        // Slice 10d-mcp-surface-1 fix #1: map TUI's session_type
+        // ("claude" / "codex" / "bash") to the canonical wire
+        // vocabulary the Python MCP tool dispatches on
+        // ("claude-code" / "codex" / "bash"). The branches above
+        // already gate to these three values; any other type
+        // would have early-returned None from this function.
+        let wire_session_type = match session_type {
+            "claude" => "claude-code",
+            "codex" => "codex",
+            "bash" => "bash",
+            // The branch above returns None for anything else,
+            // so this arm is unreachable in production; default
+            // defensively rather than panic.
+            other => other,
+        };
         let config = crate::client_session::ClientSessionConfig {
             daemon_socket: &daemon_socket,
             // The token_id is just a label on the Caller::Operator
@@ -2730,6 +2745,7 @@ impl App {
             uid: session_uid,
             workspace_id,
             label,
+            session_type: wire_session_type,
             argv: &argv,
             working_dir: worktree_path,
             env,

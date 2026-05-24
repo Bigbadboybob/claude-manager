@@ -17,6 +17,7 @@
 //!     migration (10b–10e), at which point the deferred half of
 //!     slice 4 (`server.rs` + `queue.rs` relocation) lands here.
 
+pub mod auth;
 pub mod dispatch;
 pub mod methods;
 pub mod protocol;

@@ -153,12 +153,12 @@ fn round_trip(socket: &std::path::Path, req: &Request) -> Response {
 
 #[test]
 fn deferred_method_returns_unknown_with_slice_10c_pointer() {
-    // The 10b cutoff: methods whose bodies live in `tui/src/control/methods.rs`
-    // and depend on App state still return UnknownMethod from the
-    // daemon, with an error message pointing at the migration slice.
-    // `list_sessions` is one of those — its body needs live runtime
-    // `Workspace`/`TerminalSession`, not the manifest snapshot the
-    // daemon currently has.
+    // Methods whose bodies still live in `tui/src/control/methods.rs`
+    // (`propose_task`, `workflow_*`, subtask tools, …) return
+    // UnknownMethod from the daemon with an error message pointing
+    // at the migration slice. Slice 10d-mcp-surface-1 wired
+    // `list_sessions`; pick a method that's still deferred to
+    // exercise the fallback arm.
     let _serialize = serialize_tests();
     let (socket, stop, handle) = start_test_daemon();
     assert!(wait_for_socket(&socket), "socket must appear");
@@ -166,7 +166,7 @@ fn deferred_method_returns_unknown_with_slice_10c_pointer() {
     let req = Request {
         id: "deferred-test".into(),
         caller: Caller::session("ts-x"),
-        method: "list_sessions".into(),
+        method: "propose_task".into(),
         params: serde_json::Value::Null,
     };
     let resp = round_trip(&socket, &req);
