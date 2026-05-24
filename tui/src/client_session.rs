@@ -182,6 +182,21 @@ pub struct ClientSessionConfig<'a> {
     /// flow). Operator-spawned sessions inherit task_id from the
     /// TUI's `TerminalSession.task_id` at the call site.
     pub task_id: Option<&'a str>,
+    /// Sub-2b-1: transcript file path, when the TUI knows it at
+    /// spawn time. The daemon stores this on
+    /// `DaemonSession.transcript_path` so its
+    /// `resolve_authorized_session` returns `state: "ready"` with
+    /// the path; otherwise `state: "pending"`.
+    ///
+    /// `None` is the common fresh-spawn case (Claude/Codex
+    /// transcript file is created post-spawn — the TUI doesn't
+    /// know the path until its detector picks it up). Resume /
+    /// clone flows where the TUI passes `--resume <id>` upfront
+    /// CAN supply a predicted path; future plumbing will. The
+    /// resolver returns pending until then; the Python MCP
+    /// `read_session_output` tool short-circuits to empty
+    /// messages and polls.
+    pub transcript_path: Option<&'a str>,
 }
 
 /// Daemon-attached terminal session. Field shape mirrors
@@ -518,6 +533,14 @@ pub(crate) fn rpc_start_session_full(
     if let Some(tid) = config.task_id {
         params["task_id"] = serde_json::Value::String(tid.to_string());
     }
+    // Sub-2b-1: send transcript_path so the daemon's
+    // `resolve_authorized_session` can serve the Python MCP
+    // `read_session_output` tool's compose pattern without a
+    // TUI round-trip. `None` for fresh spawns; the daemon
+    // returns `state: "pending"` and the Python tool polls.
+    if let Some(tp) = config.transcript_path {
+        params["transcript_path"] = serde_json::Value::String(tp.to_string());
+    }
     // Slice 10d watcher-fix #1: `cgroup_path` is NO LONGER
     // sent on the wire. The daemon discovers the actual cgroup
     // from `/proc/<spawn-pid>/cgroup` post-spawn (see
@@ -642,6 +665,37 @@ pub fn rpc_kill_session(
         caller: Caller::operator(operator_token_id),
         method: "kill_session".into(),
         params: serde_json::json!({ "session_uid": session_uid }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// `session.set_transcript_path` RPC. Sub-2b-1 review #1: the
+/// TUI's transcript-discovery detector (the
+/// `pending_jsonl_files` → `transcript_id` binding in
+/// `app.rs::drain_terminal_events`) calls this when it resolves
+/// a Claude/Codex transcript file for a daemon-attached
+/// session. The daemon stores the path on
+/// `DaemonSession.transcript_path` so its
+/// `resolve_authorized_session` transitions from `pending` to
+/// `ready` and the Python MCP `read_session_output` tool can
+/// parse the file.
+///
+/// Operator-only on the daemon side — TUI uses `tui-operator`
+/// token id (same as the other Operator RPCs).
+pub fn rpc_set_transcript_path(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    session_uid: &str,
+    transcript_path: &str,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.set_transcript_path".into(),
+        params: serde_json::json!({
+            "session_uid": session_uid,
+            "transcript_path": transcript_path,
+        }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
@@ -847,6 +901,10 @@ mod tests {
             // tests that exercise tasked-caller paths build
             // ClientSessionConfig directly.
             task_id: None,
+            // Sub-2b-1: tests default to None; the
+            // start_session_threads_transcript_path_into_resolve_response
+            // test in dispatch.rs builds the wire shape directly.
+            transcript_path: None,
         }
     }
 
@@ -1105,6 +1163,83 @@ mod tests {
         let s = state.lock().unwrap();
         assert!(s.task_tree.is_empty());
         drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2b-1 review #1: TUI post-detection push via
+    /// `rpc_set_transcript_path` lands on the daemon. Models
+    /// the production flow: session spawns with no transcript
+    /// (resolver returns pending), TUI's detector later
+    /// discovers the path and pushes, resolver flips to ready.
+    #[test]
+    fn rpc_set_transcript_path_pushes_post_spawn_discovery() {
+        let (socket, working_dir, _state, stop, handle) =
+            start_test_daemon("ws-set-trsc");
+        let argv = vec!["/bin/sleep".to_string(), "30".to_string()];
+        let uid = test_uid();
+        let config = bash_config(
+            &socket, &working_dir, "op-set", &uid,
+            "ws-set-trsc", "set-trsc", &argv, 80, 24,
+        );
+        // Spawn WITHOUT transcript_path (fresh-spawn case).
+        let _ = rpc_start_session(&config).expect("spawn ok");
+        // Resolve: pending.
+        let req = Request {
+            id: next_request_id(),
+            caller: Caller::operator("op-set"),
+            method: "resolve_authorized_session".into(),
+            params: serde_json::json!({ "session_uid": &uid }),
+        };
+        let before = rpc_round_trip(&socket, &req).expect("pre-resolve");
+        assert_eq!(before.result.unwrap()["state"], "pending");
+        // TUI detector resolved a path — push it.
+        let discovered = "/home/u/.claude/projects/x/post-detect.jsonl";
+        rpc_set_transcript_path(&socket, "op-set", &uid, discovered)
+            .expect("push ok");
+        // Resolve: ready, with the pushed path.
+        let after = rpc_round_trip(&socket, &req).expect("post-resolve");
+        let r = after.result.expect("result");
+        assert_eq!(r["state"], "ready");
+        assert_eq!(r["transcript_path"], discovered);
+        let _ = rpc_kill_session(&socket, "op-set", &uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Sub-2b-1: `rpc_start_session_full` rides
+    /// `ClientSessionConfig.transcript_path` onto the wire, and
+    /// the daemon's `resolve_authorized_session` surfaces it.
+    /// End-to-end TUI → daemon proof of the wire shape addition.
+    /// Pre-sub-2b-1 the Python MCP `read_session_output` tool
+    /// hit `UnknownMethod` on its first leg
+    /// (`resolve_authorized_session`); post-fix the chain works.
+    #[test]
+    fn rpc_start_session_threads_transcript_path_into_resolve_authorized() {
+        let (socket, working_dir, _state, stop, handle) =
+            start_test_daemon("ws-trsc-e2e");
+        let argv = vec!["/bin/sleep".to_string(), "30".to_string()];
+        let uid = test_uid();
+        let mut config = bash_config(
+            &socket, &working_dir, "op-trsc", &uid,
+            "ws-trsc-e2e", "trsc-e2e", &argv, 80, 24,
+        );
+        let predicted_path = "/home/u/.claude/projects/encoded-x/abc-123.jsonl";
+        config.transcript_path = Some(predicted_path);
+        let _ = rpc_start_session(&config).expect("spawn ok");
+        // Now resolve via a follow-up RPC; assert the daemon
+        // returns state=ready with our path.
+        let req = Request {
+            id: next_request_id(),
+            caller: Caller::operator("op-trsc"),
+            method: "resolve_authorized_session".into(),
+            params: serde_json::json!({ "session_uid": &uid }),
+        };
+        let resp = rpc_round_trip(&socket, &req).expect("resolve ok");
+        let r = resp.result.expect("result");
+        assert_eq!(r["state"], "ready", "daemon must echo transcript_path");
+        assert_eq!(r["transcript_path"], predicted_path);
+        assert_eq!(r["engine"], "claude-code");
+        // Cleanup.
+        let _ = rpc_kill_session(&socket, "op-trsc", &uid);
         stop_test_daemon(&socket, stop, handle);
     }
 
@@ -1708,6 +1843,7 @@ mod tests {
             cgroup_path: Some(hostile_cgroup),
             worktree_path: None,
             task_id: None,
+            transcript_path: None,
         };
         let result = rpc_start_session_full(&config).expect("rpc ok");
 
@@ -1791,6 +1927,7 @@ mod tests {
             cgroup_path: None,
             worktree_path: None,
             task_id: None,
+            transcript_path: None,
         };
         let session = ClientSession::new(config).expect("spawn cat session");
         let uid = session.session_uid.clone();

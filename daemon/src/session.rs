@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// Default per-session PTY-output ring-buffer capacity. The design
 /// doc names this 1 MiB; configurable per session type in a later
@@ -102,7 +103,18 @@ pub struct FanoutSnapshot {
 
 pub struct PtyByteFanout {
     inner: Mutex<FanoutInner>,
+    /// Sub-2b-1 review-r#2 #1: shared activity timestamp.
+    /// `None` for fanouts constructed via the unit-test
+    /// `PtyByteFanout::new` shortcut (idle isn't observable
+    /// without a `DaemonSession`). `Some` for production
+    /// fanouts via `PendingSession::spawn`.
+    last_activity_at: Option<SharedLastActivity>,
 }
+
+/// Shared cell stamped by both the reader thread (output) and
+/// `send_input` (input). `resolve_authorized_session` reads it
+/// to compute the wire-level `idle` field.
+pub type SharedLastActivity = Arc<Mutex<Option<Instant>>>;
 
 struct FanoutInner {
     buffer: VecDeque<u8>,
@@ -135,6 +147,23 @@ struct FanoutInner {
 
 impl PtyByteFanout {
     pub fn new(capacity: usize) -> Self {
+        Self::with_activity_tracker(capacity, None)
+    }
+
+    /// Sub-2b-1 review-r#2 #1: variant used by `PendingSession::spawn`
+    /// that wires the per-session `last_activity_at` Arc so the
+    /// reader thread can stamp activity on every `push` without an
+    /// extra cross-struct hop. The shared cell sits on
+    /// `DaemonSession.last_activity_at`; `send_input` and the
+    /// reader-thread output path both update it through the same
+    /// `SharedLastActivity` clone. Pre-fix the fanout stamped its
+    /// own private cell and `send_input` didn't touch any cell at
+    /// all — `wait_for_session_idle` returned early immediately
+    /// after input because the daemon never saw the activity.
+    pub fn with_activity_tracker(
+        capacity: usize,
+        last_activity_at: Option<SharedLastActivity>,
+    ) -> Self {
         Self {
             inner: Mutex::new(FanoutInner {
                 buffer: VecDeque::with_capacity(capacity),
@@ -143,6 +172,7 @@ impl PtyByteFanout {
                 closed: false,
                 bytes_written: 0,
             }),
+            last_activity_at,
         }
     }
 
@@ -201,6 +231,18 @@ impl PtyByteFanout {
         // subscribers. `retain` drops senders whose receiver has been
         // closed — that's how a dropped attach connection cleans up.
         inner.subscribers.retain(|tx| tx.send(bytes.to_vec()).is_ok());
+
+        // Sub-2b-1 review-r#2 #1: stamp shared activity AFTER the
+        // fanout's own lock is released to avoid lock-order
+        // questions vs `send_input` (which acquires its own
+        // per-session writer mutex; we don't want
+        // fanout→activity vs writer→activity to overlap). Drop
+        // the inner guard explicitly for that reason.
+        drop(inner);
+        if let Some(ts) = self.last_activity_at.as_ref() {
+            let mut slot = ts.lock().unwrap_or_else(|p| p.into_inner());
+            *slot = Some(Instant::now());
+        }
     }
 
     /// Return a "give me what's buffered right now" snapshot,
@@ -376,6 +418,22 @@ pub struct SpawnParams {
     /// descendant-task-tree authorization. `None` for taskless
     /// sessions.
     pub task_id: Option<String>,
+    /// Transcript file path for this session, when the TUI knows
+    /// it at spawn time (e.g. clone/resume seed flows). Surfaced
+    /// by `resolve_authorized_session` (sub-2b-1) so the Python
+    /// MCP `read_session_output` tool can read transcript
+    /// messages directly. `None` until either the TUI sends it
+    /// at spawn or a post-detection update RPC lands (deferred
+    /// — not in 2b-1's scope). When `None`,
+    /// `resolve_authorized_session` returns `state: "pending"`
+    /// and `transcript_path: null`; the Python tool
+    /// short-circuits to empty messages + poll-again behavior.
+    ///
+    /// Stored as `Option<String>` (not `PathBuf`) because the
+    /// daemon never opens this file — it only echoes the path
+    /// back over the wire; PathBuf adds OS-encoding ceremony
+    /// without benefit.
+    pub transcript_path: Option<String>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -459,6 +517,7 @@ impl SpawnParams {
             session_type: "claude-code".to_string(),
             managed_by_uid: None,
             task_id: None,
+            transcript_path: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -727,6 +786,40 @@ pub struct DaemonSession {
     /// taskless sessions. Slice 10d-mcp-surface-2 uses this for
     /// the Session-caller descendant-task-tree auth check.
     pub task_id: Option<String>,
+    /// Transcript file path for this session (sub-2b-1).
+    /// Populated from `StartSessionParams.transcript_path` at
+    /// spawn time when the TUI knows the path, else `None`. The
+    /// daemon never reads this file — it only echoes the value
+    /// back via `resolve_authorized_session` so the Python MCP
+    /// `read_session_output` tool can parse the transcript
+    /// without a TUI round-trip. See the field doc on
+    /// `SpawnParams.transcript_path` for the pending-vs-ready
+    /// state semantics.
+    pub transcript_path: Option<String>,
+    /// Sub-2b-1 review-r#2 #2: transcript generation counter.
+    /// Initialized to 0; incremented by `session.set_transcript_path`
+    /// when the incoming path differs from `transcript_path`
+    /// (e.g. `/clear`, `/compact`, codex resume rebind — the TUI
+    /// re-detects a new JSONL file). Surfaced by
+    /// `resolve_authorized_session` so Python tool cursors
+    /// (`v1:<generation>:<offset>`) reset when the underlying
+    /// file rotates, avoiding applying old-file offsets to the
+    /// new transcript.
+    ///
+    /// Same-path re-pushes (no-op semantics on the path) MUST
+    /// NOT bump generation — otherwise idempotent re-discovery
+    /// pings from the TUI would invalidate the agent's cursor
+    /// every poll.
+    pub generation: u64,
+    /// Sub-2b-1 review-r#2 #1: shared "last activity" cell.
+    /// Bumped by both the fanout (output side, via the reader
+    /// thread) AND `methods::send_input` (input side). Read by
+    /// `resolve_authorized_session` to compute `idle`.
+    /// Pre-fix only output bumped the cell, so an agent calling
+    /// `send_input` then immediately `wait_for_session_idle`
+    /// would return early because the daemon never observed
+    /// the input as activity.
+    pub last_activity_at: SharedLastActivity,
     /// `Arc` so the reader thread can hold a clone independently of
     /// the `DaemonSession` instance — the thread pushes bytes into
     /// the fanout, the dispatcher / attach.open consumers subscribe
@@ -880,6 +973,14 @@ struct PendingSessionInner {
     session_type: String,
     managed_by_uid: Option<String>,
     task_id: Option<String>,
+    transcript_path: Option<String>,
+    /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
+    /// from `PendingSession::spawn` → `arm_reaper` →
+    /// `DaemonSession`. The fanout already holds an Arc clone
+    /// for the output side; this is the same Arc, kept around
+    /// so the `DaemonSession` lands with the matching cell on
+    /// arm-time.
+    last_activity_at: SharedLastActivity,
     title: String,
     fanout: Arc<PtyByteFanout>,
     pid: libc::pid_t,
@@ -1046,7 +1147,32 @@ impl PendingSession {
             }
         };
 
-        let fanout = Arc::new(PtyByteFanout::new(params.fanout_capacity));
+        // Sub-2b-1 review-r#2 #1: shared activity-timestamp cell.
+        // Cloned three ways: into the fanout (stamped on every
+        // output push by the reader thread), onto the `DaemonSession`
+        // (stamped by `send_input` and read by
+        // `resolve_authorized_session`), and into the `PendingSessionInner`
+        // which carries it from spawn through `arm_reaper`.
+        //
+        // Sub-2b-1 review-r#4 #1: stamped to `Some(spawn_time)`
+        // here — NOT left as `None`. Pre-r#4 a fresh session
+        // (no I/O yet) had `last_activity_at: None`, which the
+        // idle predicate mapped to "infinitely long ago" →
+        // `idle: true` immediately. Agents polling
+        // `wait_for_session_idle` would observe idle=true on a
+        // session that hadn't even attached its transcript yet
+        // and return prematurely. Stamping spawn-time means
+        // the session needs `IDLE_THRESHOLD` of post-spawn
+        // quiet before idle flips — matching the TUI's behavior
+        // where `SessionStatus::Running` is the spawn default
+        // and only the next event-drain tick flips to Idle if
+        // `wakeup_times` is empty.
+        let last_activity_at: SharedLastActivity =
+            Arc::new(Mutex::new(Some(Instant::now())));
+        let fanout = Arc::new(PtyByteFanout::with_activity_tracker(
+            params.fanout_capacity,
+            Some(Arc::clone(&last_activity_at)),
+        ));
         let reader_fanout = Arc::clone(&fanout);
         let reader_handle = match std::thread::Builder::new()
             .name(format!("cm-session-{}-reader", params.uid))
@@ -1098,6 +1224,8 @@ impl PendingSession {
                 session_type: params.session_type,
                 managed_by_uid: params.managed_by_uid,
                 task_id: params.task_id,
+                transcript_path: params.transcript_path,
+                last_activity_at,
                 title: params.title,
                 fanout,
                 pid,
@@ -1145,6 +1273,8 @@ impl PendingSession {
             session_type,
             managed_by_uid,
             task_id,
+            transcript_path,
+            last_activity_at,
             title,
             fanout,
             pid,
@@ -1215,6 +1345,13 @@ impl PendingSession {
             session_type,
             managed_by_uid,
             task_id,
+            transcript_path,
+            // Sub-2b-1 review-r#2 #2: generation starts at 0;
+            // `session.set_transcript_path` increments on
+            // path-change. Subscribed-from-spawn callers
+            // observe generation=0 until a rebind happens.
+            generation: 0,
+            last_activity_at,
             fanout,
             pid,
             pidfd,
@@ -1258,7 +1395,62 @@ impl Drop for PendingSession {
     }
 }
 
+/// Sub-2b-1 review-r#3 #2: cloned-Arc pair used by every input
+/// path that writes to a daemon-owned PTY. Centralizes the
+/// "write bytes + stamp activity" invariant in one place so
+/// future input paths (Resize-with-input, paste throttling,
+/// etc.) cannot accidentally skip the stamp the way
+/// `stream::handle_input_frame` did pre-fix.
+///
+/// **Why cloned Arcs, not `&DaemonSession`**: a method on
+/// `&DaemonSession` would force callers to hold the
+/// `DaemonState` mutex across `write_all`. The slice
+/// 10c-e-3b-fix3 deadlock fix ruled that out — a backpressured
+/// PTY would freeze every other daemon RPC. The handle pattern
+/// keeps the lock-then-clone-then-drop-then-write shape
+/// load-bearing.
+pub struct InputHandle {
+    writer: SessionWriter,
+    last_activity_at: SharedLastActivity,
+}
+
+impl InputHandle {
+    /// Write `bytes` to the PTY then stamp activity. Stamp is
+    /// AFTER the write so a failed write doesn't lie about
+    /// "session was active." Lock order: writer mutex first
+    /// (blocking I/O), then activity mutex (fast cell swap).
+    /// Both are released by the time this returns.
+    pub fn write_and_stamp(&self, bytes: &[u8]) -> std::io::Result<()> {
+        {
+            let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+            w.write_all(bytes)?;
+            w.flush()?;
+        }
+        {
+            let mut slot = self
+                .last_activity_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *slot = Some(Instant::now());
+        }
+        Ok(())
+    }
+}
+
 impl DaemonSession {
+    /// Sub-2b-1 review-r#3 #2: clone the writer + activity
+    /// Arcs into an `InputHandle`. Caller pattern: lock state
+    /// → call this on the `&DaemonSession` → drop state lock
+    /// → call `handle.write_and_stamp(bytes)`. The handle
+    /// outlives any state-mutex critical section so blocking
+    /// PTY writes don't stall other daemon RPCs.
+    pub fn input_handle(&self) -> InputHandle {
+        InputHandle {
+            writer: Arc::clone(&self.writer),
+            last_activity_at: Arc::clone(&self.last_activity_at),
+        }
+    }
+
     /// Convenience: one-shot spawn that combines [`PendingSession::spawn`]
     /// + [`PendingSession::arm_reaper(None)`]. Used by tests and by
     /// other callers that don't need a registry-cleanup callback.

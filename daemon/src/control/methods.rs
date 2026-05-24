@@ -204,6 +204,23 @@ struct StartSessionParams {
     /// `None` for taskless sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
+    /// Sub-2b-1: transcript file path for this session, when the
+    /// TUI knows it at spawn time. The daemon stores this on
+    /// `DaemonSession.transcript_path` and surfaces it via the
+    /// new `resolve_authorized_session` method so the Python
+    /// MCP `read_session_output` tool can locate the file
+    /// without round-tripping through the TUI's control socket.
+    ///
+    /// `None` is the common case at first spawn (Claude/Codex
+    /// transcript file is born after the agent starts writing —
+    /// the daemon doesn't know the path until a detection event
+    /// fires). With `None` the resolver returns
+    /// `state: "pending"` and the Python tool short-circuits to
+    /// empty messages + poll-again behavior. A post-detection
+    /// update RPC (out of 2b-1 scope) will let the TUI push the
+    /// path once it's discovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript_path: Option<String>,
 }
 
 fn default_session_type() -> String {
@@ -416,6 +433,13 @@ pub(crate) fn start_session_with_spawn_fn(
     spawn_params.session_type = p.session_type.clone();
     spawn_params.managed_by_uid = p.managed_by_uid.clone();
     spawn_params.task_id = p.task_id.clone();
+    // Sub-2b-1: thread transcript_path so
+    // `resolve_authorized_session` has something to return for
+    // sessions where the TUI knew the path at spawn time
+    // (clone/resume seed flows). `None` is the common case for
+    // fresh spawns and yields `state: "pending"` until a
+    // post-detection update RPC lands.
+    spawn_params.transcript_path = p.transcript_path.clone();
     spawn_params.args = p.argv[1..].to_vec();
     spawn_params.working_dir = Some(working_dir);
     spawn_params.cols = p.cols;
@@ -911,7 +935,14 @@ pub fn send_input(
     // be authorized for) between authorize-time and act-time.
     // Pre-fix the dispatcher locked for auth, dropped the lock,
     // and this method re-locked — leaving a window.
-    let writer_arc = {
+    // Sub-2b-1 review-r#3 #2: extract an `InputHandle` under
+    // the state lock, drop the state lock, then write+stamp
+    // through the centralized helper. Pre-fix the write +
+    // post-write stamp were inlined here and the stream input
+    // path didn't stamp at all — the handle pattern keeps the
+    // invariant in one place so future input paths can't skip
+    // it.
+    let handle = {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Session-caller auth: under the same lock that does
         // the target lookup. Operator callers (`caller_uid:
@@ -943,19 +974,16 @@ pub fn send_input(
                 ),
             ));
         }
-        Arc::clone(&session.writer)
+        session.input_handle()
     };
-    // State lock is dropped — now safe to do the blocking write
-    // under just the per-writer mutex.
-    {
-        let mut w = writer_arc.lock().unwrap_or_else(|p| p.into_inner());
-        w.write_all(&payload).and_then(|_| w.flush()).map_err(|e| {
-            (
-                ErrorCode::Internal,
-                format!("send_input write to PTY: {}", e),
-            )
-        })?;
-    }
+    // State lock is dropped — write + stamp happen on the
+    // handle's cloned Arcs.
+    handle.write_and_stamp(&payload).map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("send_input write to PTY: {}", e),
+        )
+    })?;
 
     Ok(json!({ "ok": true }))
 }
@@ -1275,37 +1303,26 @@ pub fn list_sessions(
         if !included {
             continue;
         }
+        // Sub-2b-1 review-r#3 #1: single helper computes
+        // `(state, idle)` for both `list_sessions` and
+        // `resolve_authorized_session`. Pre-fix list_sessions
+        // hardcoded `"ready"` + `false`, even though sub-2b-1
+        // already had the data needed to compute both
+        // (`transcript_path` + `last_activity_at`). Same daemon,
+        // two methods, different answers — the Python MCP
+        // tool's `wait_for_session_idle` was polling
+        // list_sessions while `read_session_output` resolved
+        // through resolve_authorized_session, so the
+        // wait-then-read flow could observe idle=false from
+        // resolve while list said idle=false anyway. Now both
+        // agree.
+        let (state_str, idle) = compute_session_state_and_idle(session);
         sessions.push(json!({
             "session_uid": uid,
             "label": session.title,
             "type": session.session_type,
-            // Slice 10d-mcp-surface-1 fix #2: every entry in
-            // `state.sessions` is post-exec live by construction
-            // — `start_session` only inserts AFTER
-            // `PendingSession::arm_reaper` returns (see
-            // `methods.rs::start_session_with_spawn_fn`'s Phase
-            // 2). And when a child exits, the reaper-cleanup
-            // callback REMOVES the entry from the registry. So
-            // every session this loop sees is ready, never
-            // pending or exited — `"ready"` is the only
-            // reachable value from this code path.
-            //
-            // The Python MCP tool's contract enum is
-            // `ready | pending | exited`. `pending` reflects
-            // the TUI's local-spawn "spawned but no transcript
-            // bound yet" gap — the daemon's two-phase spawn
-            // collapses that gap to "either the spawn succeeded
-            // and the session is ready, or the spawn failed and
-            // no entry exists." `exited` reaches consumers via
-            // `manifest.watch` tombstones (slice 10e), not via
-            // `list_sessions`.
-            "state": "ready",
-            // Sub-1: daemon doesn't track PTY idleness yet. The
-            // Python MCP tool uses this to decide when to poll
-            // again (`mcp_server/server.py:660`); always-false
-            // means callers see the session as busy until a
-            // future slice plumbs the idle signal.
-            "idle": false,
+            "state": state_str,
+            "idle": idle,
             "managed_by_uid": session.managed_by_uid,
         }));
     }
@@ -1318,6 +1335,292 @@ pub fn list_sessions(
     // contract (`mcp_server/server.py:660` iterates the response
     // as a list).
     Ok(Value::Array(sessions))
+}
+
+// ============================================================
+// resolve_authorized_session (sub-2b-1)
+// ============================================================
+//
+// The Python MCP `read_session_output` tool (`mcp_server/server.py:400`)
+// is a TWO-step pattern:
+//   1. Call `resolve_authorized_session` with the target session_uid.
+//      Daemon returns `{state, engine, transcript_path, generation, idle}`
+//      after the same Session-caller descendant-task-tree auth walk
+//      sub-2a wired for `send_input` / `kill_session` /
+//      `read_session_output` / `list_sessions`.
+//   2. With the resolved `transcript_path`, the Python tool reads
+//      the transcript file directly via its own parsers
+//      (`mcp_server/transcripts/{claude.py,codex.py}`). No further
+//      daemon round-trip for the actual message bytes.
+//
+// Pre-sub-2b-1 only the TUI served `resolve_authorized_session`. A
+// daemon-spawned agent hitting `read_session_output` via the
+// daemon socket got `UnknownMethod` on step 1 — even though step 2's
+// fanout-snapshot `read_session_output` (sub-2a) is implemented on
+// the daemon. This wires step 1 daemon-side so the Python tool's
+// two-step works end-to-end against the daemon socket.
+//
+// ## What the daemon does NOT do
+//
+// Engine-specific path conventions (Claude's
+// `~/.claude/projects/<encoded>/*.jsonl` vs Codex's
+// `~/.codex/sessions/YYYY/MM/DD/<id>.jsonl`) stay TUI-side. The TUI
+// already has the agent module (`tui/src/agent/`) for path
+// resolution and the post-spawn detector for the moment the file
+// appears on disk. The TUI sends the resolved `transcript_path` to
+// the daemon at spawn time when it knows the value (e.g. clone /
+// resume seed flows where the id is supplied upfront). A
+// post-detection update RPC (`session.set_transcript_path`) for
+// the fresh-spawn case is deferred to a follow-up; until then the
+// daemon's stored value stays `None` for fresh spawns and the
+// resolver returns `state: "pending"` (the Python tool then
+// short-circuits to empty messages + poll-again behavior, matching
+// the TUI's `RuntimeStateKind::Pending` arm).
+//
+// ## Response shape
+//
+// `{state, engine, transcript_path, generation, idle}` — same keys
+// the TUI returns, same wire vocabulary. The Python tool reads
+// every key with `.get(..., default)` (see `server.py:433-437`), so
+// fields the daemon can't compute yet (`generation`, `idle`) carry
+// safe defaults (0, false). `engine` is derived from
+// `DaemonSession.session_type` via the same `engine_str`
+// transformation the TUI uses.
+
+#[derive(Deserialize)]
+struct ResolveAuthorizedSessionParams {
+    session_uid: String,
+}
+
+/// Resolve a session's transcript metadata for the Python MCP
+/// tool's two-step read pattern. See module-level doc above for
+/// the why; this is just the wire shape implementation.
+pub fn resolve_authorized_session(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: ResolveAuthorizedSessionParams = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("resolve_authorized_session params: {}", e),
+            )
+        })?;
+
+    // Sub-2a Finding #2 TOCTOU shape: auth + read-target happen
+    // in one critical section. Target lookup happens AFTER auth
+    // passes so a deny decision doesn't leak metadata via timing
+    // on the existence check.
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cuid) = caller_uid {
+        let decision = crate::control::auth::check_session_caller(
+            &state,
+            cuid,
+            &p.session_uid,
+        );
+        return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+    }
+    let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
+        (
+            ErrorCode::NotFound,
+            format!("session '{}' not in daemon registry", p.session_uid),
+        )
+    })?;
+
+    let (state_str, idle) = compute_session_state_and_idle(session);
+    let transcript_path = session.transcript_path.clone();
+    let engine = engine_str(&session.session_type);
+    // Sub-2b-1 review-r#2 #2: surface the generation counter
+    // so the Python `read_session_output` tool's cursor
+    // (`v1:<generation>:<offset>`) resets when the underlying
+    // transcript file rotates (e.g. `/clear`, codex resume).
+    let generation = session.generation;
+    Ok(json!({
+        "state": state_str,
+        "engine": engine,
+        "transcript_path": transcript_path,
+        "generation": generation,
+        "idle": idle,
+    }))
+}
+
+/// Sub-2b-1 (review #2): PTY-quiet threshold for daemon-side
+/// idle computation. Mirrors the TUI's
+/// `DEFAULT_IDLE_TIMEOUT_SECS = 2` in `tui/src/app.rs:225` so
+/// both surfaces agree on the "how long without output is
+/// idle?" answer.
+const IDLE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Sub-2b-1 review-r#3 #1: single source of truth for the
+/// `(state, idle)` pair both `resolve_authorized_session` and
+/// `list_sessions` report. Pre-fix `list_sessions` hardcoded
+/// `state: "ready"` and `idle: false`, so the same daemon
+/// would give two different answers for the same session
+/// depending on which method the caller used. The Python MCP
+/// tool's `wait_for_session_idle` polls `list_sessions` while
+/// `read_session_output` calls `resolve_authorized_session` —
+/// the divergence broke wait-then-read flows.
+///
+/// State derivation (matches the TUI's `RuntimeStateKind`):
+///   - `transcript_path: Some(_)` → `"ready"`.
+///   - `transcript_path: None` → `"pending"` (the TUI's
+///     "spawned but no transcript bound yet" gap; Python tool
+///     short-circuits to empty messages + poll-again on
+///     this).
+///
+/// `exited` is NOT returned today — daemon removes sessions
+/// from `state.sessions` on exit (sub-2a's kill_session +
+/// reaper-cleanup callback). Tombstone retention lands in
+/// slice 10e (daemon-side manifest ownership); when it does
+/// this helper grows an `Exited` arm reading from
+/// `state.workspaces[..].tombstones`. Both call sites pick
+/// the new arm up for free.
+///
+/// Idle derivation: `last_activity_at.elapsed() >=
+/// IDLE_THRESHOLD`. Production sessions stamp spawn-time at
+/// construction (sub-2b-1 review-r#4 #1), so the `None` arm
+/// here is unreachable for live sessions — kept as a defensive
+/// fallback that yields `idle: true` for the test-only
+/// `PtyByteFanout::new` shortcut (which builds a fanout
+/// without an Arc into a parent `DaemonSession`).
+///
+/// Spawn-time init means a fresh session reports `idle: false`
+/// for `IDLE_THRESHOLD` after creation — mirroring TUI's
+/// `SessionStatus::Running` default, which only flips to
+/// `Idle` on the next event-drain tick if `wakeup_times`
+/// has stayed empty.
+///
+/// Intentionally SLIGHTLY more permissive than TUI's
+/// wire-level idle (which ANDs in `pending_prompt` /
+/// `pending_clear` checks — TUI-side state the daemon can't
+/// see). The window where they diverge is narrow (TUI's
+/// `deliver_pending_write` fires on quiet, so pending input
+/// is consumed within milliseconds of becoming deliverable);
+/// agents that race see at most one premature unblock,
+/// self-correcting on the next poll.
+pub(super) fn compute_session_state_and_idle(
+    session: &crate::session::DaemonSession,
+) -> (&'static str, bool) {
+    let state_str = if session.transcript_path.is_some() {
+        "ready"
+    } else {
+        "pending"
+    };
+    let idle = {
+        let slot = session
+            .last_activity_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match *slot {
+            None => true,
+            Some(t) => t.elapsed() >= IDLE_THRESHOLD,
+        }
+    };
+    (state_str, idle)
+}
+
+// ============================================================
+// session.set_transcript_path (sub-2b-1 review #1)
+// ============================================================
+//
+// Claude/Codex transcript files are born AFTER process spawn —
+// the path isn't known at `start_session` time for fresh
+// sessions. The TUI's existing post-spawn detector (the
+// `pending_jsonl_files` → `transcript_id` flow in
+// `tui/src/app.rs::drain_terminal_events`) discovers the path
+// seconds after spawn by polling the
+// `~/.claude/projects/<encoded>/` (Claude) /
+// `~/.codex/sessions/YYYY/MM/DD/` (Codex) directories. When the
+// TUI binds a fresh `transcript_id`, this RPC fires to push the
+// resolved path to the daemon so its
+// `resolve_authorized_session` transitions from `pending` to
+// `ready`.
+//
+// **Auth: Operator-only.** The TUI is the authoritative source
+// for transcript paths (only the TUI runs the detector that
+// resolves engine-specific naming conventions to a concrete
+// filesystem path). A Session-caller setting this could lie
+// about which file the resolver returns to the Python tool —
+// security-equivalent to a Session-caller editing the task tree
+// (also Operator-only).
+//
+// **Idempotent**: re-pushing the same path is a no-op semantically
+// (the daemon stores the latest value). The TUI is expected to
+// guard against repeat pushes via its own "needs push" flag to
+// keep the RPC traffic bounded, but the daemon doesn't reject
+// re-pushes — a re-push after `/clear`-driven rebind WOULD
+// legitimately update.
+
+#[derive(Deserialize)]
+struct SetTranscriptPathParams {
+    session_uid: String,
+    /// New value for `DaemonSession.transcript_path`. The TUI
+    /// sends a non-empty string when its detector resolves a
+    /// path; an explicit empty string is rejected as
+    /// InvalidParams (callers should not push to clear — let
+    /// the session naturally exit instead).
+    transcript_path: String,
+}
+
+pub fn set_transcript_path(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: SetTranscriptPathParams = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("session.set_transcript_path params: {}", e),
+            )
+        })?;
+    if p.transcript_path.is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "transcript_path must be non-empty".into(),
+        ));
+    }
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
+        (
+            ErrorCode::NotFound,
+            format!("session '{}' not in daemon registry", p.session_uid),
+        )
+    })?;
+    // Sub-2b-1 review-r#2 #2: bump generation iff the path
+    // actually changed. Same-path re-pushes are idempotent —
+    // the TUI's detector might re-push the same path multiple
+    // times across polls; bumping every push would invalidate
+    // the agent's cursor needlessly. Only true rotations
+    // (`/clear`, `/compact`, codex resume that re-detects a new
+    // file) bump.
+    let changed = session.transcript_path.as_deref() != Some(p.transcript_path.as_str());
+    if changed {
+        session.generation = session.generation.saturating_add(1);
+    }
+    session.transcript_path = Some(p.transcript_path);
+    Ok(json!({
+        "ok": true,
+        "generation": session.generation,
+    }))
+}
+
+/// Map daemon-side `session_type` (`"claude-code"` / `"codex"` /
+/// `"bash"`) onto the canonical engine string the Python tool
+/// dispatches its parser on. Mirrors the TUI's
+/// `tui/src/control/methods.rs::engine_str` exactly so both
+/// surfaces agree on the wire vocabulary.
+fn engine_str(session_type: &str) -> &'static str {
+    match session_type {
+        "codex" => "codex",
+        // The TUI's helper defaults to "claude-code" for
+        // anything not "codex" — `bash` sessions return
+        // "claude-code" too (they have no transcript so the
+        // engine field is moot; Python tool short-circuits on
+        // `transcript_path: None`). Preserve that quirk so
+        // wire shapes match byte-for-byte.
+        _ => "claude-code",
+    }
 }
 
 // ============================================================

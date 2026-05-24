@@ -195,6 +195,28 @@ pub fn dispatch_request(
         // rewrite the tree.
         "task.update_tree" => DispatchOutcome::Done(dispatch_task_update_tree(state, req)),
 
+        // Sub-2b-1: `resolve_authorized_session` — the Python
+        // MCP `read_session_output` tool's first leg of its
+        // composed pattern. Returns `{state, engine,
+        // transcript_path, generation, idle}` so the tool can
+        // parse the transcript file directly (no per-message
+        // daemon round-trip). Session-caller auth runs in the
+        // method body (sub-2a's TOCTOU shape).
+        "resolve_authorized_session" => {
+            DispatchOutcome::Done(dispatch_resolve_authorized_session(state, req))
+        }
+
+        // Sub-2b-1 review #1: TUI pushes the discovered
+        // transcript path post-detection so the resolver can
+        // transition `pending` → `ready`. Operator-only — the
+        // TUI is the source of truth for engine-specific path
+        // conventions; a Session-caller setting this could lie
+        // to the resolver about which file the Python tool
+        // reads (same auth shape as `task.update_tree`).
+        "session.set_transcript_path" => {
+            DispatchOutcome::Done(dispatch_set_transcript_path(state, req))
+        }
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -269,6 +291,51 @@ fn dispatch_list_sessions(
         }
     }
     match methods::list_sessions(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `resolve_authorized_session` — sub-2b-1. Returns
+/// `{state, engine, transcript_path, generation, idle}` for the
+/// Python MCP `read_session_output` tool's compose pattern.
+/// Caller extraction + Operator-bypass shape mirrors the
+/// sub-2a dispatch arms (`send_input` / `kill_session` /
+/// `read_session_output`). Method body does auth + lookup in
+/// one critical section.
+fn dispatch_resolve_authorized_session(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::resolve_authorized_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.set_transcript_path` — TUI pushes the discovered
+/// transcript path post-detection (sub-2b-1 review #1).
+/// Operator-only — see method-level doc on
+/// `methods::set_transcript_path` for the auth rationale.
+fn dispatch_set_transcript_path(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if matches!(req.caller, Caller::Session(_)) {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "session.set_transcript_path is Operator-callable only — \
+             the TUI owns transcript-path discovery; a Session caller \
+             setting this would let an agent redirect the Python MCP \
+             `read_session_output` tool to an attacker-chosen file",
+        );
+    }
+    match methods::set_transcript_path(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1263,14 +1330,18 @@ mod tests {
             // managed_by_uid is null for sessions spawned without
             // an MCP parent (the default for these test sessions).
             assert!(s["managed_by_uid"].is_null());
-            // Sub-1 defaults: type defaults to "claude-code"
-            // (overridden via SpawnParams.session_type when the
-            // wire carries it; the test helper uses the
-            // SpawnParams default), state="ready" (the only
-            // reachable value from this code path — see the
-            // doc-comment in `methods::list_sessions`),
-            // idle=false (daemon doesn't track idle yet).
-            assert_eq!(s["state"], "ready");
+            // Type defaults to "claude-code" (the SpawnParams
+            // default). `state` is `"pending"` because the test
+            // helper doesn't set transcript_path — sub-2b-1
+            // review-r#3 #1 unified this with
+            // resolve_authorized_session, which also reports
+            // "pending" for sessions without a path. `idle` is
+            // `false` because sub-2b-1 review-r#4 #1 stamps
+            // spawn-time at construction; a freshly-spawned
+            // session reports busy until `IDLE_THRESHOLD` of
+            // post-spawn quiet. Both keys' shapes are still
+            // pinned above (is_string / is_boolean).
+            assert_eq!(s["state"], "pending");
             assert_eq!(s["idle"], false);
         }
     }
@@ -1366,21 +1437,51 @@ mod tests {
         assert_eq!(shell["type"], "bash");
     }
 
-    /// Slice 10d-mcp-surface-1 review fix #2: `state` is
-    /// always `"ready"` for entries in the live registry. Pre-
-    /// fix the value was `"running"` which doesn't match the
-    /// Python tool's `ready|pending|exited` enum.
+    /// Slice 10d-mcp-surface-1 review fix #2 + sub-2b-1 review-r#3 #1:
+    /// `state` is one of the Python tool's `ready|pending|exited`
+    /// enum (pre-fix it was `"running"`, which the tool didn't
+    /// recognize). Under r#3, the value is computed from
+    /// `transcript_path` (Some → ready, None → pending) instead
+    /// of being hardcoded. The pre-r#3 test asserted "ready"
+    /// because list_sessions hardcoded it; post-r#3 a session
+    /// without a transcript_path correctly reports "pending"
+    /// (matching `resolve_authorized_session`).
+    ///
+    /// Both flavors verified here:
+    ///   - default test-helper session → pending (no path).
+    ///   - same session after `set_transcript_path` → ready.
     #[test]
-    fn list_sessions_emits_ready_state_for_live_session() {
+    fn list_sessions_emits_helper_driven_state_matching_resolve() {
         let state = state_with_session_in_workspace("ts-a", "ws-1");
-        let req = operator_request("list_sessions", serde_json::Value::Null);
-        let resp = dispatch_request(&state, &req).into_response();
-        assert!(resp.ok);
-        let arr = resp.result.unwrap();
+        // No transcript_path → pending.
+        let arr = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        ).into_response().result.unwrap();
+        let entry = &arr.as_array().expect("top-level array")[0];
+        assert_eq!(
+            entry["state"], "pending",
+            "fresh session without transcript_path: pending",
+        );
+        // Set path → ready.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-a",
+                    "transcript_path": "/tmp/x.jsonl",
+                }),
+            ),
+        );
+        let arr = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        ).into_response().result.unwrap();
         let entry = &arr.as_array().expect("top-level array")[0];
         assert_eq!(
             entry["state"], "ready",
-            "live registry entry must surface as state='ready' (Python tool's enum)",
+            "after set_transcript_path: ready",
         );
     }
 
@@ -1620,6 +1721,989 @@ mod tests {
             after.error.unwrap().code,
             ErrorCode::InvalidParams,
             "tasked-caller descendant target must pass auth after task tree push",
+        );
+    }
+
+    // ============================================================
+    // resolve_authorized_session (sub-2b-1)
+    // ============================================================
+
+    /// Helper: insert a session with a known `transcript_path`
+    /// at spawn time, for the "ready" branch.
+    fn add_session_with_transcript(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        workspace_id: &str,
+        transcript_path: &str,
+    ) {
+        let mut params = crate::session::SpawnParams::new(uid, "test", "/bin/sleep");
+        params.args = vec!["30".into()];
+        params.workspace_id = workspace_id.to_string();
+        params.transcript_path = Some(transcript_path.to_string());
+        let session = crate::session::DaemonSession::spawn(params).expect("spawn ok");
+        let mut s = state.lock().unwrap();
+        s.sessions.insert(uid.into(), session);
+    }
+
+    /// Operator caller, transcript_path supplied at spawn time →
+    /// state=ready, transcript_path in response, engine derived
+    /// from session_type. Mirrors the wire shape the Python MCP
+    /// `read_session_output` tool's first leg expects.
+    #[test]
+    fn resolve_authorized_session_operator_ready_echoes_transcript_path() {
+        let state = make_state();
+        add_session_with_transcript(
+            &state,
+            "ts-live",
+            "ws-1",
+            "/home/user/.claude/projects/encoded/abc-123.jsonl",
+        );
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-live" }),
+            ),
+        ).into_response();
+        assert!(resp.ok, "operator must succeed: {:?}", resp.error);
+        let r = resp.result.expect("result");
+        assert_eq!(r["state"], "ready");
+        assert_eq!(r["engine"], "claude-code");
+        assert_eq!(
+            r["transcript_path"],
+            "/home/user/.claude/projects/encoded/abc-123.jsonl",
+        );
+        // Generation defaults to 0 (daemon doesn't track /clear
+        // yet — sub-2b-1 review-r#2 #2 bumps on path change,
+        // and `add_session_with_transcript` skips the
+        // `set_transcript_path` rpc that increments). Idle is
+        // computed from `last_activity_at`; sub-2b-1 review-r#4
+        // #1 stamps spawn-time at construction so a fresh
+        // session reports `idle: false` until `IDLE_THRESHOLD`
+        // has elapsed. Dedicated tests pin the idle semantics
+        // independently (`resolve_idle_*`,
+        // `send_input_bumps_last_activity_*`).
+        assert_eq!(r["generation"], 0);
+        assert_eq!(r["idle"], false);
+    }
+
+    /// Session without a `transcript_path` (the common fresh-
+    /// spawn case before any detection RPC) → state=pending,
+    /// transcript_path=null. Python tool short-circuits to
+    /// empty messages + poll-again on pending.
+    #[test]
+    fn resolve_authorized_session_no_transcript_returns_pending() {
+        let state = make_state();
+        add_session(&state, "ts-fresh", "ws-1"); // helper sets no transcript_path
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-fresh" }),
+            ),
+        ).into_response();
+        assert!(resp.ok);
+        let r = resp.result.expect("result");
+        assert_eq!(r["state"], "pending");
+        assert!(r["transcript_path"].is_null());
+    }
+
+    /// Codex sessions get `engine: "codex"` (the Python tool
+    /// dispatches its parser on this field — wrong value would
+    /// route a Codex transcript through the Claude parser).
+    #[test]
+    fn resolve_authorized_session_engine_string_matches_session_type_for_codex() {
+        let state = make_state();
+        let mut params = crate::session::SpawnParams::new("ts-cdx", "test", "/bin/sleep");
+        params.args = vec!["30".into()];
+        params.workspace_id = "ws-1".into();
+        params.session_type = "codex".into();
+        params.transcript_path = Some("/home/u/.codex/sessions/2026/01/15/x.jsonl".into());
+        let session = crate::session::DaemonSession::spawn(params).expect("spawn");
+        state.lock().unwrap().sessions.insert("ts-cdx".into(), session);
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-cdx" }),
+            ),
+        ).into_response();
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["engine"], "codex");
+    }
+
+    /// Unknown session_uid → NotFound (operator path; Session
+    /// callers hit auth first).
+    #[test]
+    fn resolve_authorized_session_unknown_uid_is_not_found() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-ghost" }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, ErrorCode::NotFound);
+    }
+
+    /// Session-caller targeting self → Allow → ready/pending
+    /// shape returned. Pin the auth-passing path so a regression
+    /// that wires auth incorrectly would surface here.
+    #[test]
+    fn resolve_authorized_session_session_caller_self_passes_auth() {
+        let state = state_with_session_in_workspace("ts-self", "ws-x");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-self" }),
+                "ts-self",
+            ),
+        ).into_response();
+        assert!(resp.ok, "self must pass auth: {:?}", resp.error);
+        // No transcript supplied at spawn → pending.
+        assert_eq!(resp.result.unwrap()["state"], "pending");
+    }
+
+    /// Session-caller targeting a cross-workspace sibling →
+    /// Unauthorized (taskless caller can't reach across
+    /// workspaces; same rule sub-2a wired for the other arms).
+    #[test]
+    fn resolve_authorized_session_cross_workspace_is_unauthorized() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-other", "ws-2");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-other" }),
+                "ts-caller",
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, ErrorCode::Unauthorized);
+    }
+
+    // ============================================================
+    // session.set_transcript_path (sub-2b-1 review #1)
+    // ============================================================
+
+    /// Operator push lands on `DaemonSession.transcript_path` and
+    /// the next `resolve_authorized_session` returns
+    /// `state: "ready"` with the supplied value. The fix for the
+    /// "transcript_path always None in production" finding.
+    #[test]
+    fn set_transcript_path_operator_updates_daemon_session() {
+        let state = make_state();
+        add_session(&state, "ts-late", "ws-1");
+        // Before push: pending.
+        let before = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-late" }),
+            ),
+        ).into_response();
+        assert_eq!(before.result.unwrap()["state"], "pending");
+        // Push.
+        let set = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-late",
+                    "transcript_path": "/home/u/.claude/projects/x/late.jsonl",
+                }),
+            ),
+        ).into_response();
+        assert!(set.ok, "set must succeed: {:?}", set.error);
+        // After push: ready.
+        let after = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-late" }),
+            ),
+        ).into_response();
+        let r = after.result.unwrap();
+        assert_eq!(r["state"], "ready");
+        assert_eq!(r["transcript_path"], "/home/u/.claude/projects/x/late.jsonl");
+    }
+
+    /// Session-caller cannot push transcript_path — Operator-only.
+    /// Defends against a Session-caller redirecting the Python
+    /// MCP `read_session_output` tool to an attacker-chosen file.
+    #[test]
+    fn set_transcript_path_session_caller_is_unauthorized() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-x");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-caller",
+                    "transcript_path": "/etc/passwd",
+                }),
+                "ts-caller",
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert!(
+            err.message.contains("attacker-chosen"),
+            "error must spell out the threat model: {}",
+            err.message,
+        );
+    }
+
+    /// Unknown session_uid → NotFound (the standard
+    /// dispatch-layer parameter validation).
+    #[test]
+    fn set_transcript_path_unknown_uid_is_not_found() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-ghost",
+                    "transcript_path": "/whatever",
+                }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, ErrorCode::NotFound);
+    }
+
+    /// Empty transcript_path → InvalidParams. Callers should not
+    /// push to clear (let the session naturally exit instead).
+    #[test]
+    fn set_transcript_path_empty_string_is_invalid_params() {
+        let state = make_state();
+        add_session(&state, "ts-fresh", "ws-1");
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-fresh",
+                    "transcript_path": "",
+                }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, ErrorCode::InvalidParams);
+    }
+
+    /// Re-push updates the stored value (e.g. /clear-driven
+    /// rebind). Pin the latest-wins semantic.
+    #[test]
+    fn set_transcript_path_repush_overwrites() {
+        let state = make_state();
+        add_session(&state, "ts-rebind", "ws-1");
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-rebind",
+                    "transcript_path": "/path/v1.jsonl",
+                }),
+            ),
+        );
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-rebind",
+                    "transcript_path": "/path/v2.jsonl",
+                }),
+            ),
+        );
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-rebind" }),
+            ),
+        ).into_response();
+        assert_eq!(
+            resp.result.unwrap()["transcript_path"],
+            "/path/v2.jsonl",
+        );
+    }
+
+    // ============================================================
+    // resolve_authorized_session.idle (sub-2b-1 review #2)
+    // ============================================================
+
+    /// Sub-2b-1 review-r#4 #1: fresh session reports
+    /// `idle: false` because spawn-time is stamped at
+    /// construction. Pre-r#4 `last_activity_at` was `None`,
+    /// which the idle predicate mapped to "infinitely long
+    /// ago" → idle=true. Agents polling
+    /// `wait_for_session_idle` would observe idle=true on a
+    /// session that hadn't even attached its transcript yet
+    /// and return prematurely.
+    ///
+    /// (Time-based flip to idle=true after
+    /// `IDLE_THRESHOLD` of post-spawn quiet is exercised by
+    /// `resolve_idle_flips_true_after_threshold_of_quiet`.)
+    #[test]
+    fn resolve_idle_false_immediately_after_spawn() {
+        let state = make_state();
+        add_session(&state, "ts-fresh-spawn", "ws-1");
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-fresh-spawn" }),
+            ),
+        ).into_response();
+        assert_eq!(
+            resp.result.unwrap()["idle"],
+            false,
+            "fresh session must not report idle=true — \
+             spawn-time stamp protects against \
+             wait_for_session_idle returning before the agent \
+             has had a chance to attach its transcript",
+        );
+    }
+
+    /// Sub-2b-1 review-r#2 #1: `send_input` bumps
+    /// `last_activity_at`. Pre-fix the daemon only stamped
+    /// output, so an agent calling `send_input` then
+    /// `wait_for_session_idle` would return early because the
+    /// daemon never observed input as activity.
+    #[test]
+    fn send_input_bumps_last_activity_so_idle_flips_false() {
+        // Spawn /bin/sleep (no output) and verify the session
+        // is idle initially.
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().display().to_string();
+        let state = make_state();
+        let uid = format!(
+            "ts-{:x}-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            42,
+        );
+        let spawn = dispatch_request(
+            &state,
+            &operator_request(
+                "start_session",
+                serde_json::json!({
+                    "uid": &uid,
+                    "workspace_id": "ws-act",
+                    "label": "act",
+                    "argv": ["/bin/sleep", "30"],
+                    "working_dir": &worktree,
+                    "worktree_path": &worktree,
+                }),
+            ),
+        ).into_response();
+        assert!(spawn.ok, "spawn: {:?}", spawn.error);
+        // Wait past IDLE_THRESHOLD so any spawn-time noise has
+        // gone quiet (cat/sleep emit no bytes; reader thread
+        // just blocks). The pre-spawn baseline last_activity
+        // is None, so this might already be idle — sleep
+        // anyway to be deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        let before = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": &uid }),
+            ),
+        ).into_response();
+        assert_eq!(before.result.unwrap()["idle"], true);
+        // Send input. /bin/sleep ignores stdin, so this bump
+        // does NOT cause output activity — input alone must
+        // suffice for the daemon to see idle=false.
+        let send = dispatch_request(
+            &state,
+            &operator_request(
+                "send_input",
+                serde_json::json!({
+                    "session_uid": &uid,
+                    "text": "ignored-by-sleep",
+                }),
+            ),
+        ).into_response();
+        assert!(send.ok, "send_input: {:?}", send.error);
+        // Immediately after send: idle MUST be false.
+        let after = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": &uid }),
+            ),
+        ).into_response();
+        assert_eq!(
+            after.result.unwrap()["idle"],
+            false,
+            "send_input must bump activity — pre-fix this stayed true \
+             because only output bumped the clock",
+        );
+        // Cleanup.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "kill_session",
+                serde_json::json!({ "session_uid": &uid }),
+            ),
+        );
+    }
+
+    /// Sub-2b-1 review-r#2 #2: `set_transcript_path` increments
+    /// `generation` on path change. Idempotent re-pushes
+    /// (same path) MUST NOT bump — otherwise idle-polling
+    /// TUI detector re-pushes invalidate the agent's cursor
+    /// every tick.
+    #[test]
+    fn set_transcript_path_increments_generation_on_change_only() {
+        let state = make_state();
+        add_session(&state, "ts-gen", "ws-1");
+        // Initial resolve: generation=0 (no path set).
+        let r0 = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-gen" }),
+            ),
+        ).into_response();
+        assert_eq!(r0.result.unwrap()["generation"], 0);
+        // Set path A: first transition, generation = 1.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-gen",
+                    "transcript_path": "/a/x.jsonl",
+                }),
+            ),
+        );
+        let r1 = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-gen" }),
+            ),
+        ).into_response();
+        assert_eq!(r1.result.unwrap()["generation"], 1);
+        // Re-push same path A: no bump.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-gen",
+                    "transcript_path": "/a/x.jsonl",
+                }),
+            ),
+        );
+        let r1b = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-gen" }),
+            ),
+        ).into_response();
+        assert_eq!(
+            r1b.result.unwrap()["generation"],
+            1,
+            "idempotent re-push of same path MUST NOT bump generation",
+        );
+        // Set path B (rotation): generation = 2.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-gen",
+                    "transcript_path": "/b/y.jsonl",
+                }),
+            ),
+        );
+        let r2 = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-gen" }),
+            ),
+        ).into_response();
+        assert_eq!(r2.result.unwrap()["generation"], 2);
+        // Set path A again (rotate back): generation = 3.
+        // Idempotency is on the PATH, not the file identity —
+        // the cursor must invalidate.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-gen",
+                    "transcript_path": "/a/x.jsonl",
+                }),
+            ),
+        );
+        let r3 = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-gen" }),
+            ),
+        ).into_response();
+        assert_eq!(r3.result.unwrap()["generation"], 3);
+    }
+
+    // ============================================================
+    // Sub-2b-1 review-r#3 #1: list_sessions ↔ resolve agreement
+    // ============================================================
+
+    /// Both methods must report the same `(state, idle)` for
+    /// the same session under every reachable combination:
+    ///   - pending + fresh spawn → state=pending, idle=false
+    ///     (spawn-time stamp; sub-2b-1 review-r#4 #1)
+    ///   - pending + post-threshold quiet → state=pending,
+    ///     idle=true
+    ///   - ready + fresh spawn → state=ready, idle=false
+    ///   - ready + recent activity → state=ready, idle=false
+    ///   - ready + post-threshold quiet → state=ready,
+    ///     idle=true (covered by other tests; one
+    ///     time-passes case is enough here)
+    ///
+    /// Pre-fix list_sessions hardcoded `("ready", false)`, so a
+    /// caller polling list_sessions for "session is ready and
+    /// idle" would observe a different answer than the same
+    /// caller resolving via resolve_authorized_session. The
+    /// Python MCP `wait_for_session_idle` polls list_sessions
+    /// while `read_session_output` resolves through
+    /// resolve_authorized_session — divergent answers broke
+    /// the wait-then-read flow.
+    #[test]
+    fn list_sessions_and_resolve_agree_on_state_and_idle() {
+        let state = make_state();
+        add_session(&state, "ts-agree", "ws-1");
+
+        // Case 1: fresh spawn, no transcript_path.
+        // Both methods → state=pending, idle=false (spawn-time
+        // stamp keeps the session busy until IDLE_THRESHOLD).
+        let r1_resolve = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-agree" }),
+            ),
+        ).into_response().result.unwrap();
+        let r1_list = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        ).into_response().result.unwrap();
+        let r1_list_entry = r1_list.as_array().unwrap()
+            .iter()
+            .find(|s| s["session_uid"] == "ts-agree")
+            .expect("ts-agree in list");
+        assert_eq!(r1_resolve["state"], "pending");
+        assert_eq!(r1_list_entry["state"], "pending");
+        assert_eq!(r1_resolve["idle"], false);
+        assert_eq!(r1_list_entry["idle"], false);
+        assert_eq!(
+            r1_resolve["state"], r1_list_entry["state"],
+            "resolve.state must match list.state",
+        );
+        assert_eq!(
+            r1_resolve["idle"], r1_list_entry["idle"],
+            "resolve.idle must match list.idle",
+        );
+
+        // Case 2: set transcript path → state=ready, both
+        // methods.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-agree",
+                    "transcript_path": "/tmp/agree.jsonl",
+                }),
+            ),
+        );
+        let r2_resolve = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-agree" }),
+            ),
+        ).into_response().result.unwrap();
+        let r2_list = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        ).into_response().result.unwrap();
+        let r2_list_entry = r2_list.as_array().unwrap()
+            .iter()
+            .find(|s| s["session_uid"] == "ts-agree")
+            .expect("ts-agree in list");
+        assert_eq!(r2_resolve["state"], "ready");
+        assert_eq!(r2_list_entry["state"], "ready");
+        assert_eq!(
+            r2_resolve["state"], r2_list_entry["state"],
+            "ready: resolve.state == list.state",
+        );
+
+        // Case 3: drive activity via fanout push → both
+        // methods report idle=false.
+        {
+            let s = state.lock().unwrap();
+            s.sessions["ts-agree"].fanout.push(b"hi");
+        }
+        let r3_resolve = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-agree" }),
+            ),
+        ).into_response().result.unwrap();
+        let r3_list = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        ).into_response().result.unwrap();
+        let r3_list_entry = r3_list.as_array().unwrap()
+            .iter()
+            .find(|s| s["session_uid"] == "ts-agree")
+            .expect("ts-agree in list");
+        assert_eq!(r3_resolve["idle"], false);
+        assert_eq!(r3_list_entry["idle"], false);
+        assert_eq!(
+            r3_resolve["idle"], r3_list_entry["idle"],
+            "post-activity: resolve.idle == list.idle",
+        );
+    }
+
+    // ============================================================
+    // Sub-2b-1 review-r#3 #2: attach-stream input bumps idle
+    // ============================================================
+
+    /// Drive an Input frame through the attach-stream path and
+    /// verify it bumps `last_activity_at`. Pre-fix the stream
+    /// path cloned only the writer Arc and skipped the activity
+    /// stamp — operator typing through attach.open didn't move
+    /// the daemon's idle clock.
+    ///
+    /// We don't go through the full attach socket here (that's
+    /// a heavier integration test); we exercise the same
+    /// `InputHandle` path the stream handler now uses, which
+    /// is what the fix centralizes. The shared helper means
+    /// the stream path and `methods::send_input` cannot
+    /// diverge by construction.
+    #[test]
+    fn stream_input_path_via_input_handle_bumps_activity() {
+        use std::time::Duration;
+        let state = make_state();
+        add_session(&state, "ts-stream", "ws-1");
+        // Wait past the threshold so the fresh-spawn idle
+        // baseline is unambiguously idle=true.
+        std::thread::sleep(Duration::from_millis(2_100));
+        let before = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-stream" }),
+            ),
+        ).into_response();
+        assert_eq!(before.result.unwrap()["idle"], true);
+        // Simulate the stream handler's path: extract the
+        // input handle, drop the state lock, call
+        // `write_and_stamp` (the same call the stream path
+        // makes for every Input frame). The PTY is a real
+        // /bin/sleep so writes go to /dev/null effectively;
+        // what matters is the activity stamp.
+        let handle = {
+            let s = state.lock().unwrap();
+            s.sessions["ts-stream"].input_handle()
+        };
+        // /bin/sleep ignores stdin, but write_and_stamp still
+        // returns Ok and stamps activity post-write. (If the
+        // child were dead the write would Err and stamp would
+        // not fire — also correct behavior.)
+        handle
+            .write_and_stamp(b"keystroke-through-attach\n")
+            .expect("write+stamp");
+        let after = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-stream" }),
+            ),
+        ).into_response();
+        assert_eq!(
+            after.result.unwrap()["idle"],
+            false,
+            "attach-stream Input must bump activity — pre-r#3 \
+             the stream handler skipped the stamp, so an \
+             operator typing didn't move the idle clock",
+        );
+    }
+
+    /// Sub-2b-1 review-r#4 #2: simulate the TUI's
+    /// workflow-launch transcript binding. The TUI's
+    /// `WorkflowControllerCtx::launch_workflow` sets/rebinds
+    /// `transcript_id` for each Existing slot (initial-bind
+    /// + codex-resume-rebind branches) and then post-loop
+    /// calls `push_transcript_path_to_daemon_if_attached`
+    /// for each updated index. Verify the daemon side: a
+    /// workflow launch followed by the push transitions
+    /// pending → ready and resets generation correctly.
+    #[test]
+    fn workflow_launch_pushes_transcript_path_to_daemon() {
+        let state = make_state();
+        add_session(&state, "ts-wf", "ws-1");
+        // Pre-launch resolve: pending (no transcript yet).
+        let pre = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-wf" }),
+            ),
+        ).into_response();
+        let pre_r = pre.result.unwrap();
+        assert_eq!(pre_r["state"], "pending");
+        assert_eq!(pre_r["generation"], 0);
+        // Workflow launch: TUI detects transcript and pushes
+        // the path. This is the wire equivalent of what
+        // workflow/controller.rs:341+ now does post-loop.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-wf",
+                    "transcript_path": "/proj/wf/worker-role.jsonl",
+                }),
+            ),
+        );
+        let post = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-wf" }),
+            ),
+        ).into_response();
+        let post_r = post.result.unwrap();
+        assert_eq!(post_r["state"], "ready");
+        assert_eq!(post_r["transcript_path"], "/proj/wf/worker-role.jsonl");
+        assert_eq!(
+            post_r["generation"], 1,
+            "first transcript_path push bumps gen 0 → 1",
+        );
+        // Codex resume rebind during workflow launch: same
+        // session, different file. Generation must bump.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-wf",
+                    "transcript_path": "/proj/wf/worker-resumed.jsonl",
+                }),
+            ),
+        );
+        let rebind = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-wf" }),
+            ),
+        ).into_response();
+        let rebind_r = rebind.result.unwrap();
+        assert_eq!(rebind_r["transcript_path"], "/proj/wf/worker-resumed.jsonl");
+        assert_eq!(
+            rebind_r["generation"], 2,
+            "rebind to a different path bumps gen 1 → 2",
+        );
+    }
+
+    /// Sub-2b-1 review-r#2 #3: simulate the TUI's history-
+    /// rotation push (a session bound to file A rotates to
+    /// file B; the TUI's
+    /// `push_transcript_path_to_daemon_if_attached` fires at
+    /// the rebind site). Verifies the daemon transitions
+    /// cleanly: new path surfaced + generation bumped so any
+    /// in-flight Python tool cursor invalidates.
+    #[test]
+    fn history_rotation_path_swap_bumps_generation_and_surfaces_new_path() {
+        let state = make_state();
+        add_session(&state, "ts-rotate", "ws-1");
+        // Initial bind (discovery loop pushes path A).
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-rotate",
+                    "transcript_path": "/proj/x/abc-pre-rotate.jsonl",
+                }),
+            ),
+        );
+        // History rotation: TUI detects new sid, calls
+        // `ts.rebind_transcript(Some(new_sid))`, then the
+        // post-rebind hook pushes the new path.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.set_transcript_path",
+                serde_json::json!({
+                    "session_uid": "ts-rotate",
+                    "transcript_path": "/proj/x/def-post-rotate.jsonl",
+                }),
+            ),
+        );
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-rotate" }),
+            ),
+        ).into_response();
+        let r = resp.result.expect("result");
+        assert_eq!(r["transcript_path"], "/proj/x/def-post-rotate.jsonl");
+        assert_eq!(
+            r["generation"], 2,
+            "rotation = generation bump; agent's cursor invalidates",
+        );
+    }
+
+    /// Time-based transition: push bytes (busy), wait past
+    /// `IDLE_THRESHOLD` (2s), verify idle flips to true. This
+    /// is the actual `wait_for_session_idle` user story
+    /// (worker writes a result, agent sees idle and reads the
+    /// transcript).
+    #[test]
+    fn resolve_idle_flips_true_after_threshold_of_quiet() {
+        let state = make_state();
+        add_session(&state, "ts-flip", "ws-1");
+        {
+            let s = state.lock().unwrap();
+            s.sessions["ts-flip"].fanout.push(b"busy\n");
+        }
+        // Immediately after push: not idle.
+        let busy = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-flip" }),
+            ),
+        ).into_response();
+        assert_eq!(busy.result.unwrap()["idle"], false);
+        // Past IDLE_THRESHOLD (2s) of quiet.
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        let after = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-flip" }),
+            ),
+        ).into_response();
+        assert_eq!(
+            after.result.unwrap()["idle"],
+            true,
+            "fanout quiet >= IDLE_THRESHOLD must flip idle=true",
+        );
+    }
+
+    /// Recent fanout activity → idle=false. The "agent is
+    /// producing output" case the Python `wait_for_session_idle`
+    /// polls against.
+    #[test]
+    fn resolve_idle_false_after_recent_fanout_push() {
+        let state = make_state();
+        add_session(&state, "ts-busy", "ws-1");
+        // Drive a fanout push directly (bypasses the PTY reader
+        // thread so the test is deterministic).
+        {
+            let s = state.lock().unwrap();
+            s.sessions["ts-busy"].fanout.push(b"hello\n");
+        }
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": "ts-busy" }),
+            ),
+        ).into_response();
+        assert_eq!(
+            resp.result.unwrap()["idle"],
+            false,
+            "fresh fanout push must report busy (idle=false)",
+        );
+    }
+
+    /// `transcript_path` rides through `start_session` and lands
+    /// on `DaemonSession.transcript_path`, observable via
+    /// `resolve_authorized_session`. Pins the wire-shape
+    /// addition end-to-end against the real `start_session`
+    /// arm (the unit-level field tests above use the test
+    /// helper `add_session_with_transcript`).
+    #[test]
+    fn start_session_threads_transcript_path_into_resolve_response() {
+        // Tempdir for working_dir (auto-register branch).
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().display().to_string();
+        let state = make_state();
+        // Pre-generate a TUI-format uid for the spawn.
+        let uid = format!(
+            "ts-{:x}-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            0,
+        );
+        let spawn_resp = dispatch_request(
+            &state,
+            &operator_request(
+                "start_session",
+                serde_json::json!({
+                    "uid": &uid,
+                    "workspace_id": "ws-trsc",
+                    "label": "trsc",
+                    "argv": ["/bin/sleep", "30"],
+                    "working_dir": worktree,
+                    "worktree_path": worktree,
+                    "transcript_path": "/tmp/x.jsonl",
+                }),
+            ),
+        ).into_response();
+        assert!(
+            spawn_resp.ok,
+            "start_session must accept transcript_path field: {:?}",
+            spawn_resp.error,
+        );
+        let resolved = dispatch_request(
+            &state,
+            &operator_request(
+                "resolve_authorized_session",
+                serde_json::json!({ "session_uid": &uid }),
+            ),
+        ).into_response();
+        assert!(resolved.ok);
+        let r = resolved.result.expect("result");
+        assert_eq!(r["state"], "ready");
+        assert_eq!(r["transcript_path"], "/tmp/x.jsonl");
+        // Cleanup so the test's reaper thread doesn't outlive
+        // the daemon state and trip the lock-on-drop callback.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "kill_session",
+                serde_json::json!({ "session_uid": &uid }),
+            ),
         );
     }
 }

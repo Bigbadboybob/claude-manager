@@ -325,6 +325,19 @@ impl<'a> WorkflowControllerCtx<'a> {
             .flat_map(|w| w.sessions.iter())
             .filter_map(|s| s.transcript_id.clone())
             .collect();
+        // Sub-2b-1 review-r#4 #2: session indices whose
+        // `transcript_id` was set or rebound during this
+        // workflow launch. Deferred to a post-loop walk so we
+        // can take `&Workspace + &TerminalSession` without
+        // conflicting with the mutable `sessions.get_mut(*si)`
+        // borrow active inside each iteration. The post-loop
+        // walk then calls
+        // `App::push_transcript_path_to_daemon_if_attached`
+        // for each so the daemon's
+        // `resolve_authorized_session` flips `pending` →
+        // `ready`. No-op for local-only sessions (the helper
+        // gates on `daemon_session_uid.is_some()`).
+        let mut transcript_updated_sis: Vec<usize> = Vec::new();
         for slot in &slots {
             let role = &wf.roles[&slot.role];
             let (session_label, session_id, effective_engine) = match slot.source() {
@@ -360,6 +373,11 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 bound_sids.insert(sid.clone());
                                 ts.transcript_id = Some(sid);
                                 ts.pending_jsonl_files = None;
+                                // Sub-2b-1 review-r#4 #2: queue
+                                // for daemon transcript_path push
+                                // after the loop body's mutable
+                                // `ts` borrow ends.
+                                transcript_updated_sis.push(*si);
                             }
                         } else if ts.session_type == "codex" {
                             let current_sid = ts.transcript_id.clone();
@@ -376,6 +394,11 @@ impl<'a> WorkflowControllerCtx<'a> {
                                     bound_sids.insert(sid.clone());
                                     ts.rebind_transcript(Some(sid.clone()));
                                     ts.pending_jsonl_files = None;
+                                    // Sub-2b-1 review-r#4 #2:
+                                    // codex resume-rebind. Same
+                                    // post-loop push as the
+                                    // initial-bind arm above.
+                                    transcript_updated_sis.push(*si);
                                     log_tick(
                                         &run_id,
                                         &format!(
@@ -478,6 +501,29 @@ impl<'a> WorkflowControllerCtx<'a> {
                     session_label,
                     current_session_id: session_id,
                 },
+            );
+        }
+
+        // Sub-2b-1 review-r#4 #2: post-loop daemon push for
+        // every session whose `transcript_id` was set/rebound
+        // during this workflow launch. Mutable `ts` borrows
+        // inside the loop blocked an inline push (the helper
+        // takes `&Workspace + &TerminalSession`); deferring
+        // here is the cleanest shape. Dedup in case the same
+        // `si` was queued twice (initial-bind + codex-rebind
+        // would only fire in mutually exclusive branches but
+        // belt-and-suspenders for any future code path).
+        transcript_updated_sis.sort_unstable();
+        transcript_updated_sis.dedup();
+        for si in &transcript_updated_sis {
+            let Some(ws) = self.workspaces.get(ws_index) else {
+                continue;
+            };
+            let Some(ts) = ws.sessions.get(*si) else {
+                continue;
+            };
+            crate::app::App::push_transcript_path_to_daemon_if_attached(
+                ts, ws,
             );
         }
 

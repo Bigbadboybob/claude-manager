@@ -2769,6 +2769,14 @@ impl App {
             // tasked agents fall into the same-workspace-allow
             // branch — re-introducing the widening sub-2a closes.
             task_id,
+            // Sub-2b-1: transcript_path is None at spawn time
+            // for fresh sessions; the TUI's existing post-spawn
+            // detector (`pending_jsonl_files`) discovers the
+            // path later. A follow-up will push it to the daemon
+            // via a `session.set_transcript_path` RPC. Until
+            // then daemon's `resolve_authorized_session` returns
+            // `pending` and the Python tool polls.
+            transcript_path: None,
         };
         Some(crate::session::Session::new_attached(config))
     }
@@ -4355,6 +4363,13 @@ impl App {
             sid: String,
             workflow: Option<(String, String)>,
             old_sid: Option<String>,
+            /// Sub-2b-1 review #1: workspace + session index of
+            /// the bound session, so the post-binding-loop
+            /// daemon push can reach the immutable
+            /// `&Workspace`/`&TerminalSession` without
+            /// re-resolving via `ws_id`.
+            ws_index: usize,
+            session_index: usize,
         }
         let mut sid_detections: Vec<DetectedSid> = Vec::new();
         let mut manifest_needs_save = false;
@@ -4667,10 +4682,31 @@ impl App {
                         sid,
                         workflow,
                         old_sid,
+                        // Sub-2b-1 review #1: carry (wi, si)
+                        // so the post-loop daemon push can
+                        // reach the immutable workspace+session
+                        // without re-resolving via ws_id.
+                        ws_index: wi,
+                        session_index: si,
                     });
                     manifest_needs_save = true;
                 }
             }
+        }
+
+        // Sub-2b-1 review #1: now that the mutable
+        // binding-loop scope has ended, push the resolved
+        // transcript_path to the daemon for each
+        // freshly-detected (or rebound) sid. Immutable borrow
+        // is now safe.
+        for detected in &sid_detections {
+            let Some(ws) = self.workspaces.get(detected.ws_index) else {
+                continue;
+            };
+            let Some(ts) = ws.sessions.get(detected.session_index) else {
+                continue;
+            };
+            Self::push_transcript_path_to_daemon_if_attached(ts, ws);
         }
 
         // Sync any newly detected session_ids to the DB. Resolve each ws_id
@@ -4826,6 +4862,17 @@ impl App {
             // the old file applied to the new file).
             self.workspaces[r.wi].sessions[r.si]
                 .rebind_transcript(Some(r.new_sid.clone()));
+            // Sub-2b-1 review-r#2 #3: history rotation
+            // changes the transcript file on disk; daemon
+            // must learn the new path so its
+            // `resolve_authorized_session` continues returning
+            // the live file (and bumps its own `generation`
+            // for cursor invalidation).
+            if let Some(ws) = self.workspaces.get(r.wi) {
+                if let Some(ts) = ws.sessions.get(r.si) {
+                    Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                }
+            }
             // Workflow-specific bookkeeping only when the session is a
             // workflow participant — non-workflow rebinds just need the
             // transcript_id swap + generation bump above.
@@ -5311,6 +5358,17 @@ impl App {
                         &run_id,
                         &format!("delivery-correlated: role={} sid={}", role, sid),
                     );
+                }
+            }
+            // Sub-2b-1 review #1: same as the discovery loop —
+            // push the resolved transcript_path to the daemon
+            // so its resolver flips pending → ready. Drop the
+            // mutable borrow on `ts` (assigned above), then
+            // re-borrow immutably via index.
+            let _ = ts;
+            if let Some(ws) = self.workspaces.get(wi) {
+                if let Some(ts) = ws.sessions.get(si) {
+                    Self::push_transcript_path_to_daemon_if_attached(ts, ws);
                 }
             }
         }
@@ -6578,6 +6636,65 @@ impl App {
         }
     }
 
+    /// Sub-2b-1 (review #1): push the resolved transcript path
+    /// to the daemon when the TUI's detector binds (or rebinds)
+    /// `ts.transcript_id` for a daemon-attached session. Without
+    /// this, the daemon's `resolve_authorized_session` returns
+    /// `state: "pending"` forever — the wire would tell the
+    /// Python MCP `read_session_output` tool to poll, and the
+    /// tool would never see a transcript.
+    ///
+    /// **No-ops when**:
+    ///   - opt-in is off (no daemon to push to).
+    ///   - session is not daemon-attached (`daemon_session_uid`
+    ///     is `None` → the TUI's own `resolve_authorized_session`
+    ///     serves the resolver leg).
+    ///   - the agent module can't resolve a path (rare; e.g.
+    ///     transcript_id became invalid or the agent type has
+    ///     no transcript like bash).
+    ///
+    /// Called from every site that sets `ts.transcript_id` to
+    /// `Some`. Re-pushing on rebind (`/clear`, codex-resume) is
+    /// intentional — the daemon stores the latest value.
+    /// Best-effort: log on RPC error and continue (the next
+    /// rebind retries).
+    pub(crate) fn push_transcript_path_to_daemon_if_attached(
+        ts: &TerminalSession,
+        ws: &Workspace,
+    ) {
+        let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
+            return;
+        };
+        if !crate::daemon_launch::opt_in_enabled() {
+            return;
+        }
+        // Resolve path via the engine-specific agent module
+        // (the TUI's source of truth for Claude/Codex conventions).
+        let Some(wt) = ws.worktree_path.as_deref() else {
+            return;
+        };
+        let agent = crate::agent::agent_for(&ts.session_type);
+        let ctx = crate::agent::AgentCtx { ts, worktree_path: wt };
+        let Some(path) = agent.transcript_path(ctx) else {
+            return;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_set_transcript_path(
+            &daemon_socket,
+            "tui-operator",
+            daemon_uid,
+            &path_str,
+        ) {
+            eprintln!(
+                "cm-tui: session.set_transcript_path({}, {}) failed: {} \
+                 (daemon's resolve_authorized_session will stay pending \
+                 until the next rebind retries)",
+                daemon_uid, path_str, e,
+            );
+        }
+    }
+
     /// Sub-2a Finding #1: full-replace task tree push to the
     /// daemon. Called after every `self.tasks` mutation so the
     /// daemon's `DaemonState.task_tree` stays current for the
@@ -7015,6 +7132,19 @@ impl App {
         };
         let new_wi = self.workspaces.len();
         self.workspaces.push(ws);
+        // Sub-2b-1 review-r#2 #3: seeded sessions have a known
+        // transcript_id at construction time (the clone's id —
+        // see `cloned_transcript_id`). The discovery loop's
+        // `initial_bind` branch won't fire for them
+        // (transcript_id is already Some), so push the
+        // transcript_path here explicitly. No-op for local-only
+        // sessions (the push helper gates on
+        // `daemon_session_uid.is_some()`).
+        if let Some(ws) = self.workspaces.get(new_wi) {
+            if let Some(ts) = ws.sessions.get(0) {
+                Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+            }
+        }
         self.cursor = Cursor::Session(new_wi, 0);
         self.save_session_manifest();
         self.set_status_msg("Workspace created");
@@ -7347,6 +7477,21 @@ impl App {
                 }
                 let si = self.workspaces[ws_index].sessions.len();
                 self.workspaces[ws_index].sessions.push(ts);
+                // Sub-2b-1 review-r#2 #3: same as
+                // `create_local_session` — seeded Claude
+                // sessions know their transcript_id at
+                // construction (cloned id), so push to the
+                // daemon now. The discovery loop's
+                // `initial_bind` arm won't fire because
+                // transcript_id is already Some. Codex's id is
+                // a seed-file id; the discovery loop's
+                // codex_resume_rebind window catches that and
+                // pushes when the actual rollout file appears.
+                if let Some(ws) = self.workspaces.get(ws_index) {
+                    if let Some(ts) = ws.sessions.get(si) {
+                        Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                    }
+                }
                 self.cursor = Cursor::Session(ws_index, si);
                 self.save_session_manifest();
                 self.set_status_msg(&format!("Started {} session", session_type));

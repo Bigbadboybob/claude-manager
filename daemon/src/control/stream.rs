@@ -341,20 +341,26 @@ fn run_inbound(
                     );
                     continue;
                 }
-                // Slice 10c-e-3b-fix3 deadlock fix: clone the writer
-                // Arc out of state, THEN drop the state lock, THEN
-                // do the blocking PTY write. Pre-fix3 the state
-                // mutex was held across `write_all`, so any
-                // backpressured PTY (paste larger than the kernel
-                // buffer, child not draining stdin) deadlocked
-                // every other daemon RPC.
-                let writer_arc = {
+                // Slice 10c-e-3b-fix3 deadlock fix + sub-2b-1
+                // review-r#3 #2: clone the centralized
+                // `InputHandle` (writer + activity Arcs) out of
+                // state under the state lock, THEN drop the
+                // state lock, THEN do the blocking write +
+                // activity stamp through the handle. Pre-fix
+                // (r#3) this path cloned only the writer Arc
+                // and skipped the activity stamp — so an
+                // operator typing through the attach stream
+                // (the primary input path for daemon-attached
+                // sessions) didn't bump idle, and
+                // `wait_for_session_idle` returned immediately
+                // after typing.
+                let handle = {
                     let s = state.lock().unwrap_or_else(|p| p.into_inner());
                     s.sessions
                         .get(session_uid)
-                        .map(|sess| Arc::clone(&sess.writer))
+                        .map(|sess| sess.input_handle())
                 };
-                let Some(writer_arc) = writer_arc else {
+                let Some(handle) = handle else {
                     // Session removed mid-stream. Drop this
                     // input; the outbound side will see the
                     // fanout close and write End shortly.
@@ -364,13 +370,9 @@ fn run_inbound(
                     );
                     continue;
                 };
-                // State lock is dropped. Do the actual write
-                // under just the per-writer mutex.
-                let result = {
-                    let mut w = writer_arc.lock().unwrap_or_else(|p| p.into_inner());
-                    w.write_all(&decoded).and_then(|_| w.flush())
-                };
-                if let Err(e) = result {
+                // State lock is dropped. Do the actual write +
+                // stamp via the handle's cloned Arcs.
+                if let Err(e) = handle.write_and_stamp(&decoded) {
                     eprintln!(
                         "cm-daemon: attach stream {} send_input failed: {} (session may have exited)",
                         session_uid, e,
