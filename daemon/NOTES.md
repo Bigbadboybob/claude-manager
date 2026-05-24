@@ -134,6 +134,27 @@ place beats round-by-round re-litigation.
 - After **10c-e-{1,2,3a,3b,3b-fix}**: Opt-in OFF byte-identical to today. Opt-in ON is structurally complete but `try_spawn_via_daemon` not yet called from the user-facing handlers.
 - After **10c-e-3c**: Opt-in ON does the full RPC dance from a user keystroke. Smoke (PTY mechanics) is viable.
 
+### Rejected findings (sub-2c)
+
+Standing rejections from the sub-2c review cycle. Same protocol
+as the 10c-e-3 list above — record the reasoning here so future
+review doesn't re-litigate.
+
+- **Daemon-minted sessions cannot call TUI-only methods until 10d-workflow-controller** — sub-2c review round-13. Reviewer reported: daemon-minted sessions (those spawned via `mcp_start_session`) calling `workflow_transition`, `create_subtask`, `start_workflow`, etc. reach the TUI socket per the sub-2c per-method router, but the TUI's auth check rejects them with "caller session not found" because the TUI's auth walks `App.workspaces` (TUI-minted sessions) and doesn't know about daemon-minted ones.
+
+  This is the intentional slice boundary between sub-2c (per-method routing infrastructure) and 10d-workflow-controller (controller relocation):
+
+  - sub-2c delivers routing infrastructure: route+method+destination bound as one decision; `DAEMON_METHODS` set authoritative; `CM_USE_DAEMON_SOCKET=1` opt-in respected; method/path resolution unified.
+  - 10d-workflow-controller moves the workflow controller to the daemon, adds `workflow_transition` / `workflow_done` / `start_workflow` / `stop_workflow` / `get_workflow_state` / `list_workflows` to daemon dispatch (and to `DAEMON_METHODS`), and adds TUI→daemon session push (the **durable** direction) so the daemon's workflow-method auth recognizes TUI-minted sessions.
+
+  Adding daemon→TUI session push in sub-2c would be **throwaway** — that push direction goes away after 10d (push reverses to TUI→daemon). Don't do throwaway work; defer to 10d which handles the durable shape.
+
+  The named Phase 1 acceptance criterion "MCP agent inside a daemon-spawned session can call workflow_transition, workflow_done" is satisfied at Phase 1 completion (via 10d-workflow-controller), not at each intermediate slice. Sub-2c's contribution to that criterion is the routing primitive that 10d builds on.
+
+  Subtask methods (`create_subtask`, `list_subtasks`, `mark_subtask_done`) are NOT named in Phase 1 acceptance criteria; they remain TUI-only and outside `DAEMON_METHODS`. Daemon-minted sessions calling them will get the same auth rejection until they relocate (likely as sub-2d or part of 10d-workflow-controller depending on the planning-API coupling).
+
+  **Round-12 test 1 scoping**: the sub-2c review listed "End-to-end: spawn an MCP agent via daemon, call `workflow_transition` against an active workflow run; assert the event appears in events.jsonl" as test #1. That end-to-end test was NOT implemented in sub-2c because it would fail in the current transitional state (auth rejection). The sub-2c test surface instead pins the routing primitive: `PerMethodRoutingTests::test_tui_only_method_routes_to_tui_socket_under_daemon_spawn` verifies the resolver picks the TUI socket for `workflow_transition` regardless of daemon pinning, and `LoudFailureOnUnreachableTargetTests::test_tui_only_method_fails_loudly_when_tui_socket_missing` pins the no-silent-cross-routing contract. The end-to-end test rightly belongs to 10d-workflow-controller, where `workflow_transition` reaches a daemon handler that auths against the daemon's session map.
+
 ### Slice 10d-memory-cap-relocation — Cgroup-OOM watcher relocation
 
 > **Note**: Promoted to its own slice during 10c-e-3b-fix2 review. The plumbing for memory-cap End-frame attribution (`SpawnParams.kills_dir` populated when `memory_cap_bytes` is set, daemon-side cgroup_path round-trip on the `start_session` response) lands in 10c-e-3b-fix2. The *producer* of kill-log records — the cgroup-OOM watcher — relocates here. Sequenced before mcp-surface because the memory_cap_kill named acceptance criterion is foundational.

@@ -70,6 +70,34 @@ class SocketRoute:
         self.chose_daemon = chose_daemon
 
 
+# Sub-2c: methods the daemon dispatches. The Python resolver
+# routes these to `CM_DAEMON_SOCKET` (when set); everything
+# else routes to `CM_TUI_SOCKET`. Drift between this set and
+# the daemon's actual dispatch arms is caught by
+# `tests/test_socket_route_selection.py::DaemonMethodsAlignmentTests`
+# which reads `daemon/src/control/dispatch.rs` and asserts the
+# match-arm method names match this set.
+#
+# Internal methods (TUI-pushed, not agent-called) are still
+# included for correctness — the resolver gives the right
+# answer regardless of who's calling.
+DAEMON_METHODS: frozenset[str] = frozenset({
+    "ping",
+    "start_session",
+    "session.attach",
+    "attach.open",
+    "send_input",
+    "kill_session",
+    "read_session_output",
+    "list_sessions",
+    "task.update_tree",
+    "resolve_authorized_session",
+    "session.set_transcript_path",
+    "propose_task",
+    "mcp_start_session",
+})
+
+
 def resolve_socket_route() -> SocketRoute:
     """Resolve the control-socket path AND whether the daemon was
     selected as the target.
@@ -113,6 +141,77 @@ def default_socket_path() -> Path:
     return resolve_socket_route().path
 
 
+def daemon_socket_pinned() -> bool:
+    """True iff the resolver has chosen the daemon socket. The
+    canonical signal for "am I running under a daemon-spawn
+    agent (vs TUI-local)?". MCP tool wrappers use it to pick
+    between daemon-shape and TUI-shape method names (e.g.
+    `mcp_start_session` vs `start_session`).
+
+    Sub-2c review-1: delegates to `resolve_socket_route()` so
+    the opt-in `CM_USE_DAEMON_SOCKET=1` path is honored. Pre-fix
+    this checked `CM_DAEMON_SOCKET` directly and missed the
+    opt-in route — `mcp_start_session` / `propose_task` /
+    `list_sessions` would fall through to the TUI socket under
+    the opt-in flag, breaking the round-13 work.
+    """
+    return resolve_socket_route().chose_daemon
+
+
+def resolve_tui_socket_path() -> Path:
+    """Resolve the TUI control-socket path independently of the
+    daemon route decision. `CM_TUI_SOCKET` wins if set (non-
+    empty); otherwise fall back to `$HOME/.cm/tui.sock`. Empty
+    / whitespace-only values count as unset (round-13
+    invariant)."""
+    tui_env = os.environ.get("CM_TUI_SOCKET", "").strip()
+    if tui_env:
+        return Path(tui_env)
+    home = Path(os.environ.get("HOME", "/tmp"))
+    return home / ".cm" / "tui.sock"
+
+
+def resolve_socket_for_method(method: str) -> Path:
+    """Sub-2c: route a method to the right socket.
+
+    Methods in `DAEMON_METHODS` route to the daemon socket when
+    the unified resolver chose daemon (any of:
+    `CM_DAEMON_SOCKET` set, OR `CM_USE_DAEMON_SOCKET=1` with
+    `~/.cm/daemon.sock` present — see `resolve_socket_route`
+    for the full precedence list). Otherwise they fall back to
+    `CM_TUI_SOCKET` (the TUI implements many of these methods
+    too, so this is the natural fallback for TuiLocal-spawned
+    agents).
+
+    Methods NOT in `DAEMON_METHODS` always route to
+    `CM_TUI_SOCKET` — they have no daemon implementation, so a
+    daemon socket pin doesn't help. This is the load-bearing
+    piece of the sub-2c fix: under daemon-spawn,
+    `workflow_transition` / `workflow_done` route to the TUI
+    socket (which `build_env` now populates alongside the
+    daemon socket).
+
+    Sub-2c review-1: socket-path resolution is delegated to
+    `resolve_socket_route()` (daemon side) and
+    `resolve_tui_socket_path()` (TUI side) so this function
+    doesn't re-implement env-var precedence. The pre-fix
+    direct-env-check missed `CM_USE_DAEMON_SOCKET=1` —
+    regression of the round-13 opt-in path.
+
+    No silent cross-routing: if a daemon method is called and
+    the daemon socket is unreachable (file missing, connect
+    refused), connect fails loudly (TransportError). The
+    resolver does NOT fall back to TUI for daemon methods when
+    daemon is chosen — that would route `mcp_start_session`
+    to the TUI, which doesn't understand the daemon's minimal
+    shape.
+    """
+    route = resolve_socket_route()
+    if method in DAEMON_METHODS and route.chose_daemon:
+        return route.path
+    return resolve_tui_socket_path()
+
+
 def caller_session_uid() -> str:
     """Pull `CM_TUI_SESSION_ID` from env. Empty if missing — callers
     should treat that as "no UID known" and let the server return
@@ -133,21 +232,22 @@ def call(
     we do is `None` → `{}` so callers don't have to special-case methods
     whose result is intentionally absent.
 
-    Sub-2b-3 review-8 #2: `socket_path` lets the caller pass a
-    pre-resolved path so the method-string selection (made via
-    `resolve_socket_route().chose_daemon`) and the actual socket
-    dial bind to the SAME resolution. Pre-fix, `server.py`
-    resolved the route once to pick `mcp_start_session` vs
-    `start_session`, then `call()` independently re-resolved
-    the path — a daemon socket appearing or disappearing
-    between the two resolutions would route the wrong method
-    to the wrong server. Two-step callers should always pass
-    `socket_path` from the same `resolve_socket_route()` they
-    consulted for method selection.
+    Sub-2c: the default resolver is `resolve_socket_for_method`
+    — daemon-supported methods (`DAEMON_METHODS`) route to
+    `CM_DAEMON_SOCKET`; everything else routes to
+    `CM_TUI_SOCKET`. This lets `workflow_transition` /
+    `workflow_done` reach the TUI from a daemon-spawned agent
+    while `mcp_start_session` / `list_sessions` reach the
+    daemon. See `resolve_socket_for_method` for the precedence
+    rules and no-silent-fallback contract.
 
-    Callers that don't care about routing (single-method
-    helpers, ad-hoc CLI usage) can omit `socket_path` and the
-    function resolves itself.
+    Sub-2b-3 review-8 #2 (still load-bearing): `socket_path`
+    lets the caller pre-resolve and pass through, ensuring the
+    method-string choice and the actual dial bind to the same
+    resolution. Useful for two-step callers in `server.py`
+    that pick between daemon-shape and TUI-shape method
+    names — the same `resolve_socket_route()` or
+    `daemon_socket_pinned()` call drives both decisions.
 
     Raises:
         ControlError: the daemon/TUI returned `ok=false`.
@@ -163,7 +263,11 @@ def call(
     if len(body) > 4 * 1024 * 1024:
         raise TransportError("request body exceeds 4 MiB cap")
 
-    path = socket_path if socket_path is not None else default_socket_path()
+    path = (
+        socket_path
+        if socket_path is not None
+        else resolve_socket_for_method(method)
+    )
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)

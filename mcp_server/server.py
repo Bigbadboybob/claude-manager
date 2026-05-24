@@ -169,10 +169,11 @@ def propose_task(
     # way the local PlanningClient does). We detect here and
     # forward.
     #
-    # Sub-2b-3 review-5 #3 + review-8 #2: resolve the route
-    # ONCE and pass through to `call` so the socket dial
-    # uses the same path that informed the daemon-vs-direct
-    # branch decision.
+    # Sub-2c review-2: single-decision binding (restoring the
+    # round-8 #2 fix). `resolve_socket_route()` is called ONCE
+    # and its `path` is passed through to `call(socket_path=)`,
+    # so the daemon-vs-PlanningClient branch decision AND the
+    # actual dial are bound to the same resolution.
     route = control_client.resolve_socket_route()
     if route.chose_daemon:
         from cli.planning_client import _detect_repo_url
@@ -400,15 +401,19 @@ def start_session(
         params["prompt"] = prompt
     if task_id:
         params["task_id"] = task_id
-    # Sub-2b-3 review-5 #3 + review-8 #2: single-resolution
-    # routing — `resolve_socket_route()` is called ONCE, and
-    # its `path` is passed through to `control_client.call`
-    # so the socket dial uses exactly the path that informed
-    # the method selection. Pre-review-8 the route was
-    # resolved twice (once here for method, once inside
-    # `call()` for socket), and a daemon socket
-    # appearing/disappearing between the two resolutions
-    # could send the wrong method shape to the wrong server.
+    # Sub-2c review-2: single-decision binding (restoring the
+    # round-8 #2 fix). `resolve_socket_route()` is called ONCE
+    # to get both the chosen path AND the route-chose-daemon
+    # bool. Method is picked from the bool; the SAME path is
+    # passed through to `call(socket_path=...)` so the dial
+    # uses exactly the resolution that informed the method
+    # choice.
+    #
+    # Pre-fix the method was picked from
+    # `daemon_socket_pinned()` and `call()` independently re-
+    # resolved — a daemon socket appearing or disappearing
+    # between the two resolutions would route the wrong
+    # method shape to the wrong server.
     route = control_client.resolve_socket_route()
     method = "mcp_start_session" if route.chose_daemon else "start_session"
     return control_client.call(method, params, socket_path=route.path)

@@ -100,6 +100,29 @@ pub fn default_socket_path() -> PathBuf {
     home.join(".cm/daemon.sock")
 }
 
+/// Resolve the TUI control-socket path.
+///
+/// Sub-2c: the daemon-side `mcp_config::build_env` needs the TUI
+/// socket path so daemon-spawned agents can reach
+/// `workflow_transition` / `workflow_done` / other TUI-only methods.
+/// Mirrors `tui/src/control/server.rs::default_socket_path` exactly:
+///
+///   1. `$CM_TUI_SOCKET` if set to a non-empty value.
+///   2. `$HOME/.cm/tui.sock`.
+///   3. `/tmp/.cm/tui.sock` as a last-ditch fallback.
+///
+/// Empty / whitespace-only env values count as "unset" — same
+/// hygiene as `default_socket_path()`.
+pub fn default_tui_socket_path() -> PathBuf {
+    if let Some(p) = path::env_socket_override("CM_TUI_SOCKET") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join(".cm/tui.sock")
+}
+
 /// The *canonical* default socket path — always `$HOME/.cm/daemon.sock`,
 /// regardless of `$CM_DAEMON_SOCKET`. `bind_socket` uses this to decide
 /// whether to tighten the parent directory: hardening is only applied

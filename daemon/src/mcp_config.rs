@@ -54,17 +54,23 @@ fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
 /// Build the env block injected into the MCP server child.
 /// Mirrors `tui/src/mcp_config.rs::build_env` for
 /// `SpawnTarget::Daemon` (the only target relevant here — agents
-/// spawned through the daemon's MCP-tool path route their own
-/// MCP callbacks back to the daemon socket).
+/// spawned through the daemon's `mcp_start_session` path).
 ///
-/// Wire shape:
+/// Sub-2c wire shape:
 ///   - `CM_TUI_SESSION_ID = <new session uid>` — caller scope
 ///     identity for the new agent's own MCP calls.
-///   - `CM_DAEMON_SOCKET = <absolute path to daemon.sock>` — pin.
-///   - `CM_TUI_SOCKET = ""` — authoritative empty (overrides any
-///     inherited `CM_TUI_SOCKET` from the daemon's env so the
-///     resolver lands on the daemon socket, not a legacy TUI
-///     pin). Same pattern as the TUI's build_env.
+///   - `CM_DAEMON_SOCKET = <absolute path to daemon.sock>` — pin
+///     used by daemon-supported methods
+///     (`mcp_start_session`, `list_sessions`, `propose_task`,
+///     etc.) via the Python `DAEMON_METHODS` resolver.
+///   - `CM_TUI_SOCKET = <absolute path to tui.sock>` — pin used
+///     by TUI-only methods (`workflow_transition`,
+///     `workflow_done`, `create_subtask`, etc.). Pre-sub-2c this
+///     was authoritative-empty; the daemon-spawned agent
+///     couldn't reach TUI-only methods then. The workflow
+///     controller stays TUI-side until slice 10d-workflow-
+///     controller relocates it, so daemon-spawned agents need
+///     both sockets in flight.
 pub fn build_env(session_uid: &str) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
@@ -72,7 +78,10 @@ pub fn build_env(session_uid: &str) -> BTreeMap<String, String> {
         "CM_DAEMON_SOCKET".into(),
         absolutized_socket_or_raw(&crate::default_socket_path()),
     );
-    env.insert("CM_TUI_SOCKET".into(), String::new());
+    env.insert(
+        "CM_TUI_SOCKET".into(),
+        absolutized_socket_or_raw(&crate::default_tui_socket_path()),
+    );
     env
 }
 
@@ -309,16 +318,23 @@ mod tests {
     }
 
     #[test]
-    fn build_env_pins_daemon_socket_and_blanks_tui_socket() {
+    fn build_env_pins_both_sockets_with_real_paths() {
+        // Sub-2c: daemon-spawned agents need reach to BOTH
+        // sockets — daemon for `mcp_start_session` /
+        // `list_sessions` / `propose_task` / etc., and TUI for
+        // `workflow_transition` / `workflow_done` /
+        // `create_subtask` / etc. The Python resolver routes
+        // per-method via DAEMON_METHODS.
         let env = build_env("ts-abc-1");
         assert_eq!(env.get("CM_TUI_SESSION_ID").map(String::as_str), Some("ts-abc-1"));
         let daemon = env.get("CM_DAEMON_SOCKET").expect("daemon socket present");
         assert!(!daemon.is_empty(), "daemon socket must be a non-empty path");
         let tui = env.get("CM_TUI_SOCKET").expect("tui socket present");
-        assert_eq!(
-            tui, "",
-            "tui socket must be authoritative-empty so the MCP \
-             resolver doesn't fall back to an inherited TUI pin",
+        assert!(
+            !tui.is_empty(),
+            "sub-2c: tui socket must be a real path so the agent can \
+             reach TUI-only methods (workflow_transition / workflow_done / \
+             create_subtask / etc.) from the daemon-spawned session",
         );
     }
 
@@ -357,10 +373,17 @@ mod tests {
             parsed["mcpServers"]["claude-manager"]["env"]["CM_TUI_SESSION_ID"],
             "ts-claude-1",
         );
-        assert_eq!(
-            parsed["mcpServers"]["claude-manager"]["env"]["CM_TUI_SOCKET"],
-            "",
-            "TUI socket pin must be authoritative-empty in the written JSON too",
+        // Sub-2c: TUI socket pin is now a real path so the
+        // daemon-spawned agent can reach `workflow_transition` /
+        // `workflow_done` etc. The Python resolver routes
+        // per-method via DAEMON_METHODS.
+        let tui_sock_in_json =
+            &parsed["mcpServers"]["claude-manager"]["env"]["CM_TUI_SOCKET"];
+        assert!(
+            tui_sock_in_json.as_str().map(|s| !s.is_empty()).unwrap_or(false),
+            "TUI socket pin must be a real path in the written JSON \
+             (sub-2c): got {:?}",
+            tui_sock_in_json,
         );
     }
 

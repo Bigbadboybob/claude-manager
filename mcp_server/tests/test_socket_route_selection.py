@@ -139,10 +139,15 @@ class StartSessionMethodSelectionTests(unittest.TestCase):
     `resolve_socket_route().chose_daemon`.
     """
 
-    def test_opt_in_flag_selects_mcp_start_session(self):
-        """`CM_USE_DAEMON_SOCKET=1` + daemon.sock present → the
-        wrapper sends `mcp_start_session`. This is the regression
-        the slice closes."""
+    def test_daemon_socket_env_selects_mcp_start_session(self):
+        """Sub-2c: under daemon-spawn the TUI's `build_env`
+        populates `CM_DAEMON_SOCKET` (plus `CM_TUI_SOCKET` too).
+        The wrapper's method-selection consults
+        `daemon_socket_pinned()` — non-empty `CM_DAEMON_SOCKET`
+        → `mcp_start_session`. Pre-2c the opt-in
+        `CM_USE_DAEMON_SOCKET=1` had its own route-decision
+        branch; sub-2c folds that into the env-var-driven model
+        (`build_env` is the single producer of the env)."""
         from mcp_server import control_client
 
         captured: dict = {}
@@ -156,24 +161,29 @@ class StartSessionMethodSelectionTests(unittest.TestCase):
             cm_dir = Path(tmp) / ".cm"
             cm_dir.mkdir()
             (cm_dir / "daemon.sock").touch()
+            (cm_dir / "tui.sock").touch()
+            # Production env shape under SpawnTarget::Daemon
+            # (sub-2c): both sockets pinned, no opt-in flag
+            # leaking in.
             with mock.patch.dict(
                 "os.environ",
-                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": str(cm_dir / "daemon.sock"),
+                    "CM_TUI_SOCKET": str(cm_dir / "tui.sock"),
+                },
                 clear=True,
             ), mock.patch.object(control_client, "call", side_effect=fake_call):
-                # Import here so the patched control_client is in scope.
                 from mcp_server import server as mcp_server
 
-                # `start_session` is a plain module-level
-                # function; FastMCP's @tool decorator returns the
-                # original callable, so we invoke directly.
                 mcp_server.start_session(type="bash", label="test")
 
         self.assertEqual(
             captured.get("method"),
             "mcp_start_session",
-            "CM_USE_DAEMON_SOCKET=1 must route start_session→mcp_start_session "
-            "so the daemon's minimal-shape handler accepts the wire payload",
+            "daemon-spawn env (CM_DAEMON_SOCKET pinned) must route "
+            "start_session→mcp_start_session so the daemon's minimal-"
+            "shape handler accepts the wire payload",
         )
 
     def test_explicit_cm_daemon_socket_selects_mcp_start_session(self):
@@ -316,12 +326,59 @@ class RouteResolutionPassthroughTests(unittest.TestCase):
 
 
 class StartSessionPassesResolvedSocketToCallTests(unittest.TestCase):
-    """Verifies `server.py::start_session` resolves once and
-    passes the path through. Without the pass-through (legacy
-    code), the test would observe `socket_path=None` at the
-    call boundary."""
+    """Sub-2c review-2 (restoring round-8 #2): the
+    method-string choice and the actual socket dial must bind
+    to ONE resolution. `server.start_session` calls
+    `resolve_socket_route()` once and passes the result both
+    as the method-selection signal AND as `socket_path=` to
+    `control_client.call()`, so a daemon socket
+    appearing/disappearing between two independent
+    resolutions can't route the wrong method to the wrong
+    server."""
 
     def test_start_session_passes_resolved_path_to_call(self):
+        from mcp_server import control_client
+
+        captured: dict = {}
+
+        def fake_call(method, params, *args, socket_path=None, **kw):
+            captured["method"] = method
+            captured["socket_path"] = socket_path
+            return {"session_uid": "ts-fake"}
+
+        with TemporaryDirectory() as tmp:
+            cm_dir = Path(tmp) / ".cm"
+            cm_dir.mkdir()
+            (cm_dir / "daemon.sock").touch()
+            (cm_dir / "tui.sock").touch()
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": str(cm_dir / "daemon.sock"),
+                    "CM_TUI_SOCKET": str(cm_dir / "tui.sock"),
+                },
+                clear=True,
+            ), mock.patch.object(control_client, "call", side_effect=fake_call):
+                from mcp_server import server as mcp_server
+
+                mcp_server.start_session(type="bash", label="test")
+        self.assertEqual(captured.get("method"), "mcp_start_session")
+        self.assertEqual(
+            captured.get("socket_path"),
+            cm_dir / "daemon.sock",
+            "sub-2c review-2: server.start_session must pass the "
+            "resolved socket_path to call() so the method choice and "
+            "the dial are bound to one resolution",
+        )
+
+    def test_start_session_under_opt_in_flag_passes_daemon_path(self):
+        """Under `CM_USE_DAEMON_SOCKET=1` (round-13 opt-in,
+        no explicit CM_DAEMON_SOCKET), the resolved path is
+        `~/.cm/daemon.sock`. server.start_session must pass
+        THAT path to call() — pre-fix the path was missing
+        and `call()` re-resolved (which would also pick the
+        opt-in path, but the binding wasn't there)."""
         from mcp_server import control_client
 
         captured: dict = {}
@@ -343,11 +400,441 @@ class StartSessionPassesResolvedSocketToCallTests(unittest.TestCase):
                 from mcp_server import server as mcp_server
 
                 mcp_server.start_session(type="bash", label="test")
+        self.assertEqual(captured.get("method"), "mcp_start_session")
         self.assertEqual(
             captured.get("socket_path"),
             cm_dir / "daemon.sock",
-            "server.start_session must pass the resolved socket_path "
-            "(review-8 #2 — single-resolution two-step routing)",
+            "opt-in flag must pass `~/.cm/daemon.sock` through to call()",
+        )
+
+    def test_start_session_tui_local_passes_tui_path(self):
+        """TUI-spawn (no daemon pin, no opt-in): method is
+        `start_session`, path is the TUI socket. Both bound
+        in one resolution."""
+        from mcp_server import control_client
+
+        captured: dict = {}
+
+        def fake_call(method, params, *args, socket_path=None, **kw):
+            captured["method"] = method
+            captured["socket_path"] = socket_path
+            return {"session_uid": "ts-fake"}
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ", {"HOME": tmp}, clear=True
+            ), mock.patch.object(control_client, "call", side_effect=fake_call):
+                from mcp_server import server as mcp_server
+
+                mcp_server.start_session(type="bash", label="test")
+        self.assertEqual(captured.get("method"), "start_session")
+        self.assertEqual(
+            captured.get("socket_path"),
+            Path(tmp) / ".cm" / "tui.sock",
+            "TUI-spawn: server.start_session must pass the TUI socket "
+            "path to call()",
+        )
+
+
+class PerMethodRoutingTests(unittest.TestCase):
+    """Sub-2c: under daemon-spawn the TUI's `build_env` populates
+    BOTH `CM_DAEMON_SOCKET` and `CM_TUI_SOCKET` with real paths.
+    `control_client.call(method, ...)` routes per-method via
+    `DAEMON_METHODS`:
+      - methods in the set → CM_DAEMON_SOCKET (no silent
+        fallback when daemon is pinned)
+      - methods not in the set → CM_TUI_SOCKET (the agent's
+        only path to `workflow_transition` / `workflow_done`
+        from inside a daemon-spawned session)
+    """
+
+    def test_daemon_method_routes_to_daemon_socket_when_pinned(self):
+        """`mcp_start_session` ∈ DAEMON_METHODS → daemon socket
+        when CM_DAEMON_SOCKET is pinned, regardless of
+        CM_TUI_SOCKET being populated too."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "/tmp/d.sock",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                path = control_client.resolve_socket_for_method("mcp_start_session")
+        self.assertEqual(str(path), "/tmp/d.sock")
+
+    def test_tui_only_method_routes_to_tui_socket_under_daemon_spawn(self):
+        """`workflow_transition` ∉ DAEMON_METHODS → CM_TUI_SOCKET
+        even when CM_DAEMON_SOCKET is pinned. This is the
+        load-bearing sub-2c invariant: daemon-spawned agents
+        can reach `workflow_transition` / `workflow_done` via
+        the TUI socket."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "/tmp/d.sock",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                for tui_method in (
+                    "workflow_transition",
+                    "workflow_done",
+                    "create_subtask",
+                    "get_workflow_state",
+                ):
+                    with self.subTest(method=tui_method):
+                        path = control_client.resolve_socket_for_method(tui_method)
+                        self.assertEqual(
+                            str(path),
+                            "/tmp/t.sock",
+                            f"{tui_method!r} must route to CM_TUI_SOCKET — "
+                            "this is the sub-2c fix for workflow methods "
+                            "reachable from daemon-spawned agents",
+                        )
+
+    def test_daemon_method_falls_back_to_tui_when_no_daemon_pin(self):
+        """Under TuiLocal-spawn (CM_DAEMON_SOCKET unset), a
+        daemon-supported method like `list_sessions` falls back
+        to CM_TUI_SOCKET — the TUI implements list_sessions too,
+        so this is the legitimate path."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {"HOME": tmp, "CM_TUI_SOCKET": "/tmp/t.sock"},
+                clear=True,
+            ):
+                path = control_client.resolve_socket_for_method("list_sessions")
+        self.assertEqual(
+            str(path),
+            "/tmp/t.sock",
+            "TuiLocal-spawn (no daemon pin) falls back to TUI socket "
+            "even for daemon-supported methods",
+        )
+
+    def test_empty_daemon_pin_treated_as_unset(self):
+        """`CM_DAEMON_SOCKET=""` (empty) counts as unset —
+        same hygiene as the Rust env_socket_override helper.
+        Under TuiLocal target the daemon socket is the empty
+        string (authoritative empty); the resolver must NOT
+        try to dial '' as a path."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                path = control_client.resolve_socket_for_method("list_sessions")
+                self.assertEqual(str(path), "/tmp/t.sock")
+                self.assertFalse(
+                    control_client.daemon_socket_pinned(),
+                    "empty CM_DAEMON_SOCKET must not be treated as pinned",
+                )
+
+
+class ProposeTaskPassesResolvedSocketToCallTests(unittest.TestCase):
+    """Sub-2c review-2: `propose_task` must also bind the
+    daemon-branch decision to the same resolution it uses for
+    `call(socket_path=)`. Pre-fix the branch checked
+    `daemon_socket_pinned()` and `call()` re-resolved
+    independently — same TOCTOU as start_session."""
+
+    def test_propose_task_passes_resolved_path_under_daemon_pin(self):
+        from mcp_server import control_client
+
+        captured: dict = {}
+
+        def fake_call(method, params, *args, socket_path=None, **kw):
+            captured["method"] = method
+            captured["socket_path"] = socket_path
+            return {"id": "t-fake", "name": "n"}
+
+        def fake_detect_repo_url():
+            return "git@github.com:fake/repo.git"
+
+        with TemporaryDirectory() as tmp:
+            cm_dir = Path(tmp) / ".cm"
+            cm_dir.mkdir()
+            (cm_dir / "daemon.sock").touch()
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": str(cm_dir / "daemon.sock"),
+                    "CM_TUI_SOCKET": str(cm_dir / "tui.sock"),
+                },
+                clear=True,
+            ), mock.patch.object(control_client, "call", side_effect=fake_call):
+                # Stub out the planning_client repo-url detector
+                # so propose_task doesn't try to shell out to git.
+                with mock.patch.dict(
+                    "sys.modules",
+                    {"cli.planning_client": mock.MagicMock(
+                        _detect_repo_url=fake_detect_repo_url,
+                    )},
+                ):
+                    from mcp_server import server as mcp_server
+                    mcp_server.propose_task(
+                        project="p", name="n", description="d", prompt="x"
+                    )
+        self.assertEqual(captured.get("method"), "propose_task")
+        self.assertEqual(
+            captured.get("socket_path"),
+            cm_dir / "daemon.sock",
+            "propose_task must bind the daemon-branch decision to "
+            "the socket_path passed to call() (round-8 #2 / sub-2c review-2)",
+        )
+
+
+class OptInFlagRoutingTests(unittest.TestCase):
+    """Sub-2c review-1: `CM_USE_DAEMON_SOCKET=1` (without
+    explicit `CM_DAEMON_SOCKET`) is THE flag the project uses
+    to enable daemon mode for testing — it's the round-13
+    opt-in path. Sub-2c initially regressed this by checking
+    `CM_DAEMON_SOCKET` directly in
+    `resolve_socket_for_method`; the unified resolver now
+    delegates daemon-path selection to `resolve_socket_route`,
+    which honors both the explicit env var AND the opt-in flag.
+
+    Each test below pins one of the reviewer-named cases.
+    """
+
+    def test_opt_in_flag_routes_daemon_methods_to_daemon_socket(self):
+        """`CM_USE_DAEMON_SOCKET=1` + daemon.sock present
+        (no explicit CM_DAEMON_SOCKET): every method in
+        DAEMON_METHODS that an agent would call routes to
+        the daemon socket."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            cm_dir = Path(tmp) / ".cm"
+            cm_dir.mkdir()
+            (cm_dir / "daemon.sock").touch()
+            with mock.patch.dict(
+                "os.environ",
+                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
+                clear=True,
+            ):
+                for method in (
+                    "ping",
+                    "mcp_start_session",
+                    "propose_task",
+                    "list_sessions",
+                    "send_input",
+                    "read_session_output",
+                    "kill_session",
+                ):
+                    with self.subTest(method=method):
+                        path = control_client.resolve_socket_for_method(method)
+                        self.assertEqual(
+                            path,
+                            cm_dir / "daemon.sock",
+                            f"opt-in flag must route {method!r} to daemon "
+                            "socket (regression of round-13 opt-in path)",
+                        )
+
+    def test_opt_in_flag_routes_tui_methods_to_tui_socket(self):
+        """`CM_USE_DAEMON_SOCKET=1`: TUI-only methods like
+        `workflow_transition` still route to CM_TUI_SOCKET
+        (the opt-in flag affects DAEMON_METHODS routing, not
+        TUI methods)."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            cm_dir = Path(tmp) / ".cm"
+            cm_dir.mkdir()
+            (cm_dir / "daemon.sock").touch()
+            (cm_dir / "tui.sock").touch()
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_USE_DAEMON_SOCKET": "1",
+                    "CM_TUI_SOCKET": str(cm_dir / "tui.sock"),
+                },
+                clear=True,
+            ):
+                path = control_client.resolve_socket_for_method("workflow_transition")
+        self.assertEqual(path, cm_dir / "tui.sock")
+
+    def test_no_env_routes_everything_to_tui_socket(self):
+        """Neither CM_DAEMON_SOCKET nor CM_USE_DAEMON_SOCKET set:
+        every method falls back to TUI socket (the home-relative
+        default for ad-hoc CLI callers)."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ", {"HOME": tmp}, clear=True
+            ):
+                expected = Path(tmp) / ".cm" / "tui.sock"
+                for method in (
+                    "mcp_start_session",
+                    "list_sessions",
+                    "workflow_transition",
+                    "ping",
+                ):
+                    with self.subTest(method=method):
+                        path = control_client.resolve_socket_for_method(method)
+                        self.assertEqual(
+                            path,
+                            expected,
+                            f"no daemon env → {method!r} falls back to TUI socket",
+                        )
+
+    def test_explicit_cm_daemon_socket_routes_same_as_opt_in(self):
+        """Explicit CM_DAEMON_SOCKET (no CM_USE_DAEMON_SOCKET):
+        same routing as the opt-in flag — daemon methods to
+        daemon, TUI methods to TUI."""
+        from mcp_server import control_client
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "CM_DAEMON_SOCKET": "/tmp/explicit-d.sock",
+                "CM_TUI_SOCKET": "/tmp/explicit-t.sock",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                control_client.resolve_socket_for_method("mcp_start_session"),
+                Path("/tmp/explicit-d.sock"),
+            )
+            self.assertEqual(
+                control_client.resolve_socket_for_method("workflow_transition"),
+                Path("/tmp/explicit-t.sock"),
+            )
+
+    def test_empty_string_daemon_socket_treated_as_unset(self):
+        """`CM_DAEMON_SOCKET=""` is the round-13 invariant
+        (the build_env authoritative-empty under TuiLocal).
+        Must NOT be treated as pinned. Without
+        CM_USE_DAEMON_SOCKET, everything routes to TUI."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {"HOME": tmp, "CM_DAEMON_SOCKET": ""},
+                clear=True,
+            ):
+                expected = Path(tmp) / ".cm" / "tui.sock"
+                self.assertEqual(
+                    control_client.resolve_socket_for_method("mcp_start_session"),
+                    expected,
+                    "empty CM_DAEMON_SOCKET must be treated as unset (round-13)",
+                )
+                self.assertFalse(
+                    control_client.daemon_socket_pinned(),
+                    "empty CM_DAEMON_SOCKET must not be pinned",
+                )
+
+
+class LoudFailureOnUnreachableTargetTests(unittest.TestCase):
+    """Sub-2c: when the resolver picks a socket for a method
+    based on `DAEMON_METHODS`, and that socket is unreachable
+    (file missing, connect refused), the failure surfaces as
+    `TransportError` — NOT silently re-routed to the other
+    socket. This is the safety property the reviewer named:
+    `workflow_transition` under daemon-spawn with a missing
+    TUI socket must fail loudly, never accidentally land on
+    the daemon (which doesn't implement it).
+    """
+
+    def test_tui_only_method_fails_loudly_when_tui_socket_missing(self):
+        """Under daemon-spawn with both env vars set but the
+        TUI socket file missing, calling a TUI-only method
+        raises TransportError. It does NOT silently re-route
+        to the daemon socket (which would land on a method-
+        not-found because the daemon doesn't dispatch
+        workflow_transition)."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            cm_dir = Path(tmp) / ".cm"
+            cm_dir.mkdir()
+            # Only the daemon socket exists; TUI socket does
+            # not. Both env vars are set (sub-2c build_env
+            # shape), so the resolver returns the TUI path
+            # for non-daemon methods.
+            daemon_sock = cm_dir / "daemon.sock"
+            tui_sock = cm_dir / "tui.sock"  # NOT created
+            daemon_sock.touch()
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": str(daemon_sock),
+                    "CM_TUI_SOCKET": str(tui_sock),
+                },
+                clear=True,
+            ):
+                # Sanity: the resolver returns the TUI path,
+                # not the daemon path.
+                self.assertEqual(
+                    control_client.resolve_socket_for_method("workflow_transition"),
+                    tui_sock,
+                )
+                # The actual call surfaces TransportError at
+                # connect time — loud failure, not silent
+                # re-route.
+                with self.assertRaises(control_client.TransportError):
+                    control_client.call(
+                        "workflow_transition", {"to": "reviewer", "prompt": "x"}
+                    )
+
+
+class DaemonMethodsAlignmentTests(unittest.TestCase):
+    """Sub-2c: snapshot test that `DAEMON_METHODS` matches the
+    daemon's actual dispatch arms in
+    `daemon/src/control/dispatch.rs`. If the daemon adds a new
+    method and forgets to update `DAEMON_METHODS`, the call
+    would route to TUI (which returns method-not-found — loud
+    failure, but the test catches it earlier at build time).
+    """
+
+    def test_daemon_methods_matches_dispatch_arms(self):
+        from mcp_server.control_client import DAEMON_METHODS
+
+        dispatch_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "daemon" / "src" / "control" / "dispatch.rs"
+        )
+        content = dispatch_path.read_text()
+        # Match Rust dispatch arms of the form:
+        #     "method_name" => DispatchOutcome::Done(...)
+        # or  "method_name" => { ... }
+        # Only arms inside the dispatch_request match — they all
+        # have the same `        "..." =>` indentation prefix.
+        import re
+        arms = re.findall(r'^\s{8}"([a-zA-Z0-9_.]+)"\s*=>', content, re.MULTILINE)
+        # `_` => is the catch-all; not a method name.
+        dispatch_methods = {m for m in arms if m and not m.startswith("_")}
+        # The set must match exactly. If the daemon adds a method,
+        # update DAEMON_METHODS; if a method is removed from
+        # daemon dispatch, drop it from DAEMON_METHODS.
+        self.assertEqual(
+            set(DAEMON_METHODS),
+            dispatch_methods,
+            "DAEMON_METHODS must match daemon/src/control/dispatch.rs arms. "
+            f"Only-in-DAEMON_METHODS: {set(DAEMON_METHODS) - dispatch_methods!r}; "
+            f"only-in-dispatch.rs: {dispatch_methods - set(DAEMON_METHODS)!r}",
         )
 
 
