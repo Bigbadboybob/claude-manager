@@ -1676,6 +1676,90 @@ pub fn task_update_tree(
     Ok(json!({ "ok": true, "task_count": state.task_tree.len() }))
 }
 
+// ============================================================
+// propose_task (sub-2b-2)
+// ============================================================
+//
+// The Python MCP `propose_task` tool (`mcp_server/server.py:124`)
+// pre-2b-2 called `cli.planning_client.PlanningClient().propose_task(...)`,
+// which POSTs directly to the planning API's `/tasks` endpoint.
+// That worked but bypassed every sub-2a auth gate and left the
+// daemon unable to log/audit/policy proposals.
+//
+// Sub-2b-2 moves the API talk daemon-side. Python now routes
+// through `control_client.call("propose_task", …)`; the daemon
+// owns the `CM_API_URL` + `CM_API_TOKEN` ingress and the
+// `POST /tasks` egress. Any caller (Operator or Session) may
+// propose — same rule the Python tool enforces today (no
+// task-subtree gating; the project owner reviews the queue and
+// accepts/rejects manually).
+//
+// **Auth shape**: both Operator and Session callers proceed.
+// We don't gate on `check_session_caller` because there's no
+// "target session" — the agent proposes a task into a project
+// queue, which it doesn't need to "own" in any session-scoped
+// sense. The TUI's existing UX is also unrestricted (any user
+// can propose; the project owner decides).
+
+#[derive(Deserialize)]
+struct ProposeTaskParams {
+    project: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    prompt: String,
+    /// Git remote URL the task is for. The Python tool today
+    /// auto-detects via `git remote get-url origin` if missing;
+    /// the daemon doesn't know the agent's cwd, so we require
+    /// the caller to send it. The Python tool wrapper is
+    /// responsible for inferring + filling this when the agent
+    /// omitted it.
+    repo_url: String,
+    #[serde(default)]
+    difficulty: Option<i32>,
+    #[serde(default)]
+    depends: Option<Vec<String>>,
+}
+
+pub fn propose_task(_state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let p: ProposeTaskParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("propose_task params: {}", e)))?;
+    if p.project.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "propose_task: 'project' is required and non-empty".into(),
+        ));
+    }
+    if p.name.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "propose_task: 'name' is required and non-empty".into(),
+        ));
+    }
+    if p.repo_url.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "propose_task: 'repo_url' is required (the Python tool wrapper \
+             should auto-detect via `git remote get-url origin` and forward; \
+             daemon doesn't know the agent's cwd)".into(),
+        ));
+    }
+    let req = crate::planning_client::ProposeTaskRequest {
+        project: &p.project,
+        name: &p.name,
+        description: &p.description,
+        prompt: &p.prompt,
+        repo_url: &p.repo_url,
+        difficulty: p.difficulty,
+        depends: p.depends.as_deref(),
+    };
+    match crate::planning_client::propose_task(&req) {
+        Ok(task) => Ok(task),
+        Err(e) => Err(e.to_method_err()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

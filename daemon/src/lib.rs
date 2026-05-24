@@ -57,6 +57,7 @@ pub mod attach;
 pub mod control;
 pub mod manifest;
 pub mod path;
+pub mod planning_client;
 pub mod reaper;
 pub mod session;
 pub mod session_watch;

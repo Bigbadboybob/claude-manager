@@ -156,15 +156,48 @@ def propose_task(
     _check_parameter_confusion("description", description)
     _check_parameter_confusion("prompt", prompt)
     _check_parameter_confusion("name", name)
-    client = PlanningClient()
-    task = client.propose_task(
-        project=project,
-        name=name,
-        description=description,
-        prompt=prompt,
-        difficulty=difficulty,
-        depends=depends,
-    )
+    # Sub-2b-2 (10d-mcp-surface-2b-2): route through the daemon
+    # when CM_DAEMON_SOCKET is set. Daemon now owns the planning
+    # API talk (centralizes auth/audit/policy; survives TUI
+    # restarts). Falls back to the direct PlanningClient path
+    # when no daemon socket is configured — ad-hoc CLI usage,
+    # tests, agents not spawned through the TUI.
+    #
+    # Wire shape: daemon's propose_task expects `repo_url`
+    # explicitly (the daemon doesn't know the agent's cwd, so
+    # it can't auto-detect via `git remote get-url origin` the
+    # way the local PlanningClient does). We detect here and
+    # forward.
+    if os.environ.get("CM_DAEMON_SOCKET", "").strip():
+        from cli.planning_client import _detect_repo_url
+        repo_url = _detect_repo_url()
+        params = {
+            "project": project,
+            "name": name,
+            "description": description,
+            "prompt": prompt,
+            "repo_url": repo_url,
+        }
+        if difficulty is not None:
+            params["difficulty"] = difficulty
+        if depends:
+            params["depends"] = list(depends)
+        try:
+            task = control_client.call("propose_task", params)
+        except control_client.ControlError as e:
+            # Surface the daemon's error message + code to the
+            # agent so it sees what the planning queue rejected.
+            return f"propose_task failed ({e.code}): {e.message}"
+    else:
+        client = PlanningClient()
+        task = client.propose_task(
+            project=project,
+            name=name,
+            description=description,
+            prompt=prompt,
+            difficulty=difficulty,
+            depends=depends,
+        )
     # Inline round-trip preview so the caller sees what actually landed
     # without an extra get_task. Truncated to keep the response readable.
     desc_preview = (description or "")[:140]

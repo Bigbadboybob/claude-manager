@@ -217,6 +217,15 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_set_transcript_path(state, req))
         }
 
+        // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
+        // to the planning API. Both Operator and Session callers
+        // allowed (any agent can propose; project owner reviews
+        // the queue and accepts/rejects). Auth shape matches the
+        // Python tool's pre-2b-2 behavior of "anyone with
+        // CM_API_TOKEN can call /tasks" — we don't reinvent
+        // task-subtree gating here.
+        "propose_task" => DispatchOutcome::Done(dispatch_propose_task(state, req)),
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -312,6 +321,21 @@ fn dispatch_resolve_authorized_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::resolve_authorized_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `propose_task` — sub-2b-2. Both Operator and Session callers
+/// allowed (the planning queue is intentionally open to all
+/// agents; the project owner accepts/rejects manually). The
+/// method body does its own param validation + HTTP forwarding
+/// via `daemon::planning_client::propose_task`.
+fn dispatch_propose_task(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::propose_task(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -695,11 +719,13 @@ mod tests {
     #[test]
     fn deferred_method_returns_unknown_with_slice_10c_pointer() {
         let state = make_state();
-        // Slice 10d-mcp-surface wired `list_sessions`; pick a method
-        // still served by the TUI to exercise the deferred-arm fallback.
+        // Slice 10d-mcp-surface wired list_sessions; sub-2b-2
+        // wired propose_task; pick a workflow tool (deferred to
+        // sub-2c per NOTES.md) to exercise the deferred-arm
+        // fallback.
         let resp = dispatch_request(
             &state,
-            &session_request("propose_task", serde_json::Value::Null, "ts-x"),
+            &session_request("workflow_transition", serde_json::Value::Null, "ts-x"),
         ).into_response();
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
@@ -2448,6 +2474,157 @@ mod tests {
             "attach-stream Input must bump activity — pre-r#3 \
              the stream handler skipped the stamp, so an \
              operator typing didn't move the idle clock",
+        );
+    }
+
+    // ============================================================
+    // propose_task (sub-2b-2)
+    // ============================================================
+
+    /// Param validation: missing `project` → InvalidParams. Same
+    /// shape for `name` and `repo_url`. Tests pin the
+    /// daemon-side validator surface (Python tool wrapper
+    /// independently enforces some of the same rules).
+    #[test]
+    fn propose_task_rejects_missing_project() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "propose_task",
+                serde_json::json!({
+                    "project": "",
+                    "name": "x",
+                    "repo_url": "git@x.com:a/b.git",
+                }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("project"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn propose_task_rejects_missing_name() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "propose_task",
+                serde_json::json!({
+                    "project": "p",
+                    "name": "  ",
+                    "repo_url": "git@x.com:a/b.git",
+                }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(err.message.contains("name"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn propose_task_rejects_missing_repo_url() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "propose_task",
+                serde_json::json!({
+                    "project": "p",
+                    "name": "n",
+                    "repo_url": "",
+                }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("repo_url"),
+            "must explain why the daemon can't auto-detect: {}",
+            err.message,
+        );
+    }
+
+    /// No `CM_API_URL`/`CM_API_TOKEN` in the test env → the
+    /// method body's HTTP call fails with `MissingConfig`,
+    /// surfaced as `Internal` with a diagnostic naming the
+    /// missing var. Pins the daemon-side error path that
+    /// the Python tool surfaces when CM_DAEMON_SOCKET is set
+    /// but the daemon wasn't launched with planning-API
+    /// credentials.
+    #[test]
+    fn propose_task_without_api_env_surfaces_internal_with_diagnostic() {
+        // Clear any inherited env (other tests in this binary
+        // run set/clear these too; serialize via the env_lock
+        // in planning_client::tests so we don't race them).
+        let _g = crate::planning_client::test_env_lock();
+        // SAFETY: serialized by the env_lock above.
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "propose_task",
+                serde_json::json!({
+                    "project": "p",
+                    "name": "n",
+                    "repo_url": "git@x.com:a/b.git",
+                }),
+            ),
+        ).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("CM_API_URL"),
+            "diagnostic must name the missing env var so operators \
+             know what to configure: {}",
+            err.message,
+        );
+    }
+
+    /// Session callers AND Operator callers both reach the
+    /// method body (no auth gate). Pin both via the
+    /// missing-env-var path (gives a deterministic
+    /// "method body ran" signal without needing a stub HTTP
+    /// server in this dispatch-level test). The
+    /// `planning_client::tests` cover the actual HTTP-side
+    /// success path.
+    #[test]
+    fn propose_task_allows_session_caller() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let state = state_with_session_in_workspace("ts-prop", "ws-1");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "propose_task",
+                serde_json::json!({
+                    "project": "p",
+                    "name": "n",
+                    "repo_url": "git@x.com:a/b.git",
+                }),
+                "ts-prop",
+            ),
+        ).into_response();
+        // Session caller passes auth (no gate); the method
+        // body's missing-env-var check then surfaces Internal.
+        assert!(!resp.ok);
+        let err = resp.error.unwrap();
+        assert_eq!(
+            err.code, ErrorCode::Internal,
+            "session caller must pass auth and reach the method body — \
+             the failure here is the missing CM_API_URL, not Unauthorized",
         );
     }
 
