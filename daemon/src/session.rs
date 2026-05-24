@@ -434,6 +434,22 @@ pub struct SpawnParams {
     /// back over the wire; PathBuf adds OS-encoding ceremony
     /// without benefit.
     pub transcript_path: Option<String>,
+    /// Sub-2b-3 review-fix #1: memory-cap inheritance fields.
+    /// Daemon-spawned children inherit the parent's cap when an
+    /// agent calls `mcp_start_session` to spawn a subtask child.
+    /// Pre-fix the daemon didn't carry the cap bytes so a capped
+    /// agent could spawn an uncapped child via the MCP path —
+    /// directly defeating the resource guard the TUI applies at
+    /// spawn time (`tui/src/app.rs::try_spawn_via_daemon`).
+    ///
+    /// Wire shape: TUI's `start_session` sends all three so the
+    /// daemon-side `DaemonSession` carries enough state to
+    /// re-wrap argv for subtask spawns. `mcp_start_session` reads
+    /// these off the caller and wraps via the daemon-local
+    /// `wrap_with_systemd_run` helper.
+    pub memory_cap_soft_bytes: Option<u64>,
+    pub memory_cap_hard_bytes: Option<u64>,
+    pub cgroup_prefix: Option<PathBuf>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -518,6 +534,9 @@ impl SpawnParams {
             managed_by_uid: None,
             task_id: None,
             transcript_path: None,
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -796,6 +815,15 @@ pub struct DaemonSession {
     /// `SpawnParams.transcript_path` for the pending-vs-ready
     /// state semantics.
     pub transcript_path: Option<String>,
+    /// Sub-2b-3 review-fix #1: memory-cap inheritance.
+    /// `mcp_start_session` reads these off the caller and wraps
+    /// the subtask child's argv via daemon-local
+    /// `wrap_with_systemd_run` so cap is preserved across MCP-
+    /// driven spawn chains. `None` for sessions launched
+    /// without a cap (the wrap is a passthrough in that case).
+    pub memory_cap_soft_bytes: Option<u64>,
+    pub memory_cap_hard_bytes: Option<u64>,
+    pub cgroup_prefix: Option<PathBuf>,
     /// Sub-2b-1 review-r#2 #2: transcript generation counter.
     /// Initialized to 0; incremented by `session.set_transcript_path`
     /// when the incoming path differs from `transcript_path`
@@ -974,6 +1002,14 @@ struct PendingSessionInner {
     managed_by_uid: Option<String>,
     task_id: Option<String>,
     transcript_path: Option<String>,
+    /// Sub-2b-3 review-fix #1: cap-inheritance fields carried
+    /// from `SpawnParams` through `arm_reaper` onto the
+    /// `DaemonSession`. `mcp_start_session` reads them off the
+    /// caller's session and wraps the subtask child's argv with
+    /// systemd-run so the cap is inherited.
+    memory_cap_soft_bytes: Option<u64>,
+    memory_cap_hard_bytes: Option<u64>,
+    cgroup_prefix: Option<PathBuf>,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
     /// from `PendingSession::spawn` → `arm_reaper` →
     /// `DaemonSession`. The fanout already holds an Arc clone
@@ -1225,6 +1261,9 @@ impl PendingSession {
                 managed_by_uid: params.managed_by_uid,
                 task_id: params.task_id,
                 transcript_path: params.transcript_path,
+                memory_cap_soft_bytes: params.memory_cap_soft_bytes,
+                memory_cap_hard_bytes: params.memory_cap_hard_bytes,
+                cgroup_prefix: params.cgroup_prefix,
                 last_activity_at,
                 title: params.title,
                 fanout,
@@ -1274,6 +1313,9 @@ impl PendingSession {
             managed_by_uid,
             task_id,
             transcript_path,
+            memory_cap_soft_bytes,
+            memory_cap_hard_bytes,
+            cgroup_prefix,
             last_activity_at,
             title,
             fanout,
@@ -1346,6 +1388,9 @@ impl PendingSession {
             managed_by_uid,
             task_id,
             transcript_path,
+            memory_cap_soft_bytes,
+            memory_cap_hard_bytes,
+            cgroup_prefix,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
             // path-change. Subscribed-from-spawn callers

@@ -71,6 +71,86 @@ const BASE64: base64::engine::GeneralPurpose =
 /// at build time and points at the mirror.
 pub const MAX_SEND_INPUT_BYTES: usize = 64 * 1024;
 
+/// Sub-2b-3 review-9: default bound on how long
+/// `mcp_start_session` waits for the per-worktree slot
+/// before returning `Conflict`. 20s leaves ~10s of headroom
+/// under the Python `control_client.call()` 30s default
+/// timeout — see [`set_slot_wait_timeout_for_test`] for the
+/// test override.
+pub const SLOT_WAIT_TIMEOUT_DEFAULT_MS: u64 = 20_000;
+
+/// Atomic override (milliseconds) for the
+/// `mcp_start_session` per-worktree slot-wait timeout. `0`
+/// means "use the default of [`SLOT_WAIT_TIMEOUT_DEFAULT_MS`]".
+/// Tests set this to a short value (e.g. 1 second) so the
+/// timeout path is exercised without making the test suite
+/// wait the full 20s. Production never touches this — only
+/// the `set_slot_wait_timeout_for_test` helper does, and it's
+/// only callable inside `#[cfg(test)]`.
+static SLOT_WAIT_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn slot_wait_timeout() -> std::time::Duration {
+    let override_ms = SLOT_WAIT_TIMEOUT_OVERRIDE_MS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ms = if override_ms == 0 {
+        SLOT_WAIT_TIMEOUT_DEFAULT_MS
+    } else {
+        override_ms
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+/// Test-only: override the slot-wait timeout for the
+/// duration of a test. Returns a guard that restores the
+/// previous value on drop. Sub-2b-3 review-9 — exercised by
+/// the bounded-wait timeout test without making the suite
+/// wait the full 20s.
+#[cfg(test)]
+pub fn set_slot_wait_timeout_for_test(timeout: std::time::Duration) -> SlotWaitTimeoutGuard {
+    let ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+    let prev = SLOT_WAIT_TIMEOUT_OVERRIDE_MS.swap(ms, std::sync::atomic::Ordering::Relaxed);
+    SlotWaitTimeoutGuard { prev }
+}
+
+#[cfg(test)]
+pub struct SlotWaitTimeoutGuard {
+    prev: u64,
+}
+
+#[cfg(test)]
+impl Drop for SlotWaitTimeoutGuard {
+    fn drop(&mut self) {
+        SLOT_WAIT_TIMEOUT_OVERRIDE_MS.store(self.prev, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Sub-2b-3 review-10: resolve the `hard_cap_bytes` value to
+/// hand to `spawn_watcher` from the wire-supplied
+/// `memory_cap_hard_bytes`.
+///
+/// Pre-review-10 the watcher-startup site passed literal `0`
+/// even when the wire carried the real cap (review-4 #1 made
+/// `memory_cap_hard_bytes` mandatory alongside
+/// `memory_cap_bytes`), so the daemon-spawned path emitted
+/// JSONL records with `"hard_cap_bytes": 0` — diverging from
+/// the TUI-local watcher which emits the configured value.
+/// The named acceptance criterion is "indistinguishable from
+/// today's signal 9 toast"; divergent diagnostics break
+/// that.
+///
+/// Defensive `None → 0`: review-4 #1's entry-point
+/// validation rejects partial cap tuples, so on the validated
+/// path `memory_cap_hard_bytes` MUST be `Some` when
+/// `memory_cap_bytes` is. The `0` fallback guards against a
+/// future wire-shape regression without changing observable
+/// behavior on the validated path.
+pub(crate) fn resolve_watcher_hard_cap_bytes(
+    memory_cap_hard_bytes_wire: Option<u64>,
+) -> u64 {
+    memory_cap_hard_bytes_wire.unwrap_or(0)
+}
+
 /// Return type for every method handler in this module. Mirrors the
 /// shape `tui/src/control/methods.rs::MethodResult` uses today, so
 /// the eventual 10c-d relocation is mechanical.
@@ -185,6 +265,22 @@ struct StartSessionParams {
     /// in place; the producer is the missing piece.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     memory_cap_bytes: Option<u64>,
+    /// Sub-2b-3 review-fix #1: hard cap byte count. Pre-fix
+    /// only the soft byte count rode the wire (as a
+    /// kills_dir signal); without the hard count, the
+    /// daemon couldn't re-wrap argv for child spawns via
+    /// `mcp_start_session`. The TUI now sends both so a
+    /// capped agent's MCP-driven subtask spawn inherits the
+    /// same (soft, hard) pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_cap_hard_bytes: Option<u64>,
+    /// Sub-2b-3 review-fix #1: cgroup directory prefix where
+    /// systemd-run lands the scope unit. Daemon's
+    /// `mcp_start_session` reads this off the caller's
+    /// session to build the child's scope path. `None` for
+    /// uncapped sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup_prefix: Option<String>,
     /// Session-type discriminator (`"claude-code"` / `"codex"` /
     /// `"bash"`). Slice 10d-mcp-surface-1 surfaces this on
     /// `list_sessions`; future slices (workflow controller
@@ -353,6 +449,37 @@ pub(crate) fn start_session_with_spawn_fn(
         ));
     }
 
+    // Sub-2b-3 review-4 #1: reject partial cap tuples at the
+    // entry point. The cap triple `(memory_cap_bytes,
+    // memory_cap_hard_bytes, cgroup_prefix)` is either all
+    // three (capped session) or all three None (uncapped). A
+    // partial tuple means the producer (TUI) sent an
+    // inconsistent payload — accepting it would store an
+    // incomplete cap on `DaemonSession`, and the downstream
+    // inheritance path in `mcp_start_session` would silently
+    // fall through to "no cap" because it requires the full
+    // triple to wrap argv. That's a cap-bypass via wire-shape
+    // confusion. Fail closed here so the invariant
+    // `cap_complete_iff_capped` holds for every session in
+    // `state.sessions`, which lets the inheritance branch
+    // trust its `(Some, Some, Some)` match and surface partial
+    // tuples as bugs rather than fall through.
+    let cap_soft = p.memory_cap_bytes.is_some();
+    let cap_hard = p.memory_cap_hard_bytes.is_some();
+    let cap_prefix = p.cgroup_prefix.is_some();
+    if (cap_soft || cap_hard || cap_prefix) && !(cap_soft && cap_hard && cap_prefix) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "memory_cap fields are all-or-nothing: \
+                 memory_cap_bytes={}, memory_cap_hard_bytes={}, cgroup_prefix={}. \
+                 Send all three (capped) or none (uncapped) — partial tuples \
+                 would silently degrade to an uncapped child via mcp_start_session.",
+                cap_soft, cap_hard, cap_prefix,
+            ),
+        ));
+    }
+
     // Lock just for workspace lookup (with optional auto-register),
     // then drop. We must NOT hold the state lock across
     // `DaemonSession::spawn` (slow — opens PTY, forks child) or
@@ -474,6 +601,11 @@ pub(crate) fn start_session_with_spawn_fn(
     if p.memory_cap_bytes.is_some() {
         spawn_params.kills_dir = crate::path::default_kills_dir();
     }
+    // Sub-2b-3 review-fix #1: thread cap fields onto the
+    // spawned session so descendant MCP spawns can inherit.
+    spawn_params.memory_cap_soft_bytes = p.memory_cap_bytes;
+    spawn_params.memory_cap_hard_bytes = p.memory_cap_hard_bytes;
+    spawn_params.cgroup_prefix = p.cgroup_prefix.as_deref().map(PathBuf::from);
 
     // Stash a copy of kills_dir for the slice-10d watcher-spawn
     // arm below: `spawn_params` is moved into
@@ -609,15 +741,25 @@ pub(crate) fn start_session_with_spawn_fn(
         kills_dir_for_watcher,
     ) {
         (Some(cgroup_path), Some(soft_cap_bytes), Some(kills_dir)) => {
-            // hard_cap_bytes is forensic-only — the JSONL
-            // consumer (LastExitProbe::snapshot) checks only
-            // whether records EXIST past baseline, not what
-            // their values are. The wire doesn't carry hard
-            // explicitly (the daemon trusts the kernel's
-            // MemoryMax enforcement), so we record 0 as a
-            // placeholder. A future slice can extend the wire
-            // if forensic tools need the actual value.
-            let hard_cap_bytes: u64 = 0;
+            // Sub-2b-3 review-10: pass the real
+            // `memory_cap_hard_bytes` to the watcher. Pre-fix
+            // this passed literal `0` even when the wire
+            // carried the real cap (review-4 #1 made
+            // `memory_cap_hard_bytes` mandatory alongside
+            // `memory_cap_bytes`), so the daemon-spawned
+            // path emitted JSONL records with
+            // `"hard_cap_bytes": 0` — diverging from the
+            // TUI-local watcher which emits the configured
+            // value. The named acceptance criterion is
+            // "indistinguishable from today's signal 9
+            // toast"; divergent diagnostics break that.
+            //
+            // Routed through `resolve_watcher_hard_cap_bytes`
+            // so the resolver is testable in isolation
+            // (the watcher-startup code path requires a real
+            // cgroup + systemd-run wrapper to reach in tests).
+            let hard_cap_bytes: u64 =
+                resolve_watcher_hard_cap_bytes(p.memory_cap_hard_bytes);
             // Slice 10d watcher-fix #6: seed the watcher's
             // breach baseline from the `memory.events.high`
             // counter NOW — before `spawn_watcher` returns.
@@ -1649,8 +1791,29 @@ fn engine_str(session_type: &str) -> &'static str {
 #[derive(Deserialize)]
 struct TaskUpdateTreeParams {
     /// Full tree snapshot. Each entry pairs a `task_id` with
-    /// its `parent_task_id` (`None` for top-level tasks).
+    /// its `parent_task_id` (`None` for top-level tasks) and,
+    /// since sub-2b-3 review-2 #1, an optional `workspace_id`
+    /// — the workspace this task is bound to (`None` for tasks
+    /// still in backlog).
     tasks: Vec<TaskUpdateTreeEntry>,
+    /// Sub-2b-3 review-2 #1: workspace metadata pushed
+    /// alongside the task tree. Lets `mcp_start_session`
+    /// resolve a descendant task's `working_dir` without
+    /// needing a live anchor session in that workspace (the
+    /// pre-fix resolver walked `state.sessions` for an
+    /// existing session; that fails for first-spawn-into-fresh-
+    /// subtask which is the common case `mcp_start_session`
+    /// serves).
+    ///
+    /// Replace-not-merge in lockstep with `tasks`. Field is
+    /// `#[serde(default)]` so older TUI builds that don't
+    /// know about it can still push trees without
+    /// `workspaces`; the daemon falls back to the empty map
+    /// and `mcp_start_session` for a descendant task without
+    /// a bound workspace surfaces NotFound (matches pre-fix
+    /// behavior for tasks not yet anchored).
+    #[serde(default)]
+    workspaces: Vec<TaskUpdateTreeWorkspaceEntry>,
 }
 
 #[derive(Deserialize)]
@@ -1658,6 +1821,25 @@ struct TaskUpdateTreeEntry {
     task_id: String,
     #[serde(default)]
     parent_task_id: Option<String>,
+    /// Sub-2b-3 review-2 #1: which workspace this task is
+    /// bound to. `None` for backlog tasks; daemon stores
+    /// task→workspace mappings only for entries with
+    /// `Some(workspace_id)`.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TaskUpdateTreeWorkspaceEntry {
+    workspace_id: String,
+    /// Worktree path — daemon stores on
+    /// `state.workspaces[workspace_id].worktree_path`. The
+    /// daemon's existing `state.workspaces` map already
+    /// carries this (`start_session`'s auto-register branch
+    /// populates it); the new wire field extends coverage to
+    /// workspaces that haven't been spawned into yet.
+    #[serde(default)]
+    worktree_path: Option<String>,
 }
 
 pub fn task_update_tree(
@@ -1670,10 +1852,49 @@ pub fn task_update_tree(
     // Replace, not merge. The TUI sends the full tree on every
     // update; partial updates aren't a thing (see module doc).
     state.task_tree.clear();
+    state.task_workspaces.clear();
     for entry in p.tasks {
+        if let Some(ws) = entry.workspace_id.clone() {
+            state.task_workspaces.insert(entry.task_id.clone(), ws);
+        }
         state.task_tree.insert(entry.task_id, entry.parent_task_id);
     }
-    Ok(json!({ "ok": true, "task_count": state.task_tree.len() }))
+    // Sub-2b-3 review-2 #1: merge-not-replace on
+    // `state.workspaces`. The daemon's own `start_session`
+    // auto-register branch adds workspace entries with the
+    // full `ManifestWorkspace` shape (worktree_path + repo_url
+    // + worker_vm + ...); the TUI's task.update_tree push
+    // carries only `worktree_path` per workspace. Replacing
+    // the whole map would lose data already discovered by
+    // session-spawn. Instead, upsert worktree_path on a per-
+    // workspace basis: existing entries get their
+    // worktree_path updated (TUI is authoritative for the
+    // mapping); missing entries are inserted with a minimal
+    // ManifestWorkspace.
+    for ws_entry in p.workspaces {
+        let entry = state
+            .workspaces
+            .entry(ws_entry.workspace_id.clone())
+            .or_insert_with(|| crate::manifest::ManifestWorkspace {
+                id: ws_entry.workspace_id.clone(),
+                worktree_path: None,
+                ..Default::default()
+            });
+        // Sub-2b-3 review-3 #2: assign unconditionally — the
+        // TUI's Option<String> wire shape uses `None` to mean
+        // "no live worktree" (workspace was closed, pushed to
+        // cloud, etc.). Pre-fix this only updated on `Some`, so
+        // the daemon retained a stale path after the TUI
+        // signalled the worktree was gone, and `mcp_start_session`
+        // would still spawn into the dead path instead of
+        // surfacing NotFound.
+        entry.worktree_path = ws_entry.worktree_path.map(std::path::PathBuf::from);
+    }
+    Ok(json!({
+        "ok": true,
+        "task_count": state.task_tree.len(),
+        "workspace_count": state.task_workspaces.len(),
+    }))
 }
 
 // ============================================================
@@ -1760,11 +1981,653 @@ pub fn propose_task(_state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Met
     }
 }
 
+// ============================================================
+// mcp_start_session (sub-2b-3)
+// ============================================================
+//
+// The Python MCP `start_session` tool (`mcp_server/server.py:361`)
+// sends `{type, label, prompt?, task_id?}` — much smaller than
+// the daemon's existing `start_session` wire shape (`{uid,
+// workspace_id, label, session_type, argv, working_dir, env,
+// cols, rows, ...}`) which the TUI's `ClientSession::new` builds.
+//
+// Two reasons for a separate method (not a discriminated union):
+//   1. Security boundary. TUI is trusted to supply argv verbatim
+//      (it owns mcp_config::build_args). Session callers cannot
+//      be — agents would arbitrary-exec anything through the
+//      argv field. Separate methods make the boundary obvious.
+//   2. Evolution paths. A future field on one shape (e.g. a
+//      TUI-only argv-mod option) shouldn't perturb the other.
+//
+// **Daemon-local argv mapping**: slice 10c-e-3b deliberately
+// removed type→argv mapping from the daemon's general spawn
+// path. Sub-2b-3 brings a minimal mapping back — scoped to
+// THIS method only — via `crate::mcp_config::build_args`. The
+// general `start_session` method keeps its strict "caller
+// supplies argv" shape. Documented at
+// `daemon/src/mcp_config.rs` module head.
+//
+// **Auth**: Session callers allowed. When `task_id` is supplied,
+// it must be self-or-descendant of the caller's task per
+// sub-2a's `task_is_self_or_descendant_of`. Taskless caller +
+// explicit task_id → Unauthorized. Operator callers also
+// allowed (uniform with other methods).
+
+#[derive(Deserialize)]
+struct McpStartSessionParams {
+    #[serde(rename = "type")]
+    type_: String,
+    label: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+pub fn mcp_start_session(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: McpStartSessionParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("mcp_start_session params: {}", e)))?;
+    // Type validation BEFORE the caller lookup so a bogus type
+    // surfaces InvalidParams without needing a live caller.
+    if !is_valid_session_type(&p.type_) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "type must be one of \"claude-code\", \"codex\", \"bash\"; got '{}'",
+                p.type_
+            ),
+        ));
+    }
+    if p.label.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "label must be non-empty".into(),
+        ));
+    }
+    // Sub-2b-3 review-8 #1: validate prompt length BEFORE
+    // spawn. The post-spawn delivery path goes through the
+    // same write_and_stamp helper attach-stream Input frames
+    // use, but the input-cap check (`send_input` enforces
+    // `MAX_SEND_INPUT_BYTES`) was being bypassed for
+    // mcp_start_session-delivered prompts. Pre-fix an agent
+    // could stuff a huge prompt into `start_session` and
+    // bypass the 64 KiB cap. Reject up-front so no orphan
+    // session is created.
+    if let Some(prompt_text) = p.prompt.as_deref() {
+        if prompt_text.len() > MAX_SEND_INPUT_BYTES {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "prompt field {} bytes exceeds cap of {} bytes \
+                     (same cap as send_input — review-8 #1)",
+                    prompt_text.len(),
+                    MAX_SEND_INPUT_BYTES,
+                ),
+            ));
+        }
+    }
+
+    // Resolve caller context: caller's session, workspace_id,
+    // task_id, working_dir, memory_cap inheritance. The lock is
+    // held briefly to clone what we need; we then drop it before
+    // any spawn work.
+    //
+    // **Working_dir resolution** (sub-2b-3 review-fix #3):
+    // mirrors `tui/src/control/methods.rs::start_session` —
+    // when `task_id` is supplied AND it's a DESCENDANT of the
+    // caller's task (i.e. not the caller's own task), look up
+    // that descendant task's bound workspace and use its
+    // `worktree_path`. Branch-mode subtasks live in fresh
+    // child worktrees; using the caller's worktree there would
+    // spawn the child in the wrong tree while still tagging
+    // it with the descendant task.
+    //
+    // **Cap inheritance** (sub-2b-3 review-fix #1): pull all
+    // three cap fields off the caller's `DaemonSession`. None
+    // for an uncapped caller; the wrap is a passthrough then.
+    let (
+        caller_workspace_id,
+        caller_task_id,
+        working_dir,
+        cap_inherit,
+    ) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "mcp_start_session is callable only by Session callers \
+             (the daemon resolves workspace_id / working_dir from \
+             the caller's session). Operator callers should use the \
+             full-shape `start_session` instead.".into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        // Task auth: if caller supplied a task_id, it must be
+        // self-or-descendant of caller's task. Taskless caller +
+        // explicit task_id → Unauthorized.
+        if let Some(req_task) = p.task_id.as_deref() {
+            match caller.task_id.as_deref() {
+                None => {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "taskless caller cannot bind new session to task '{}'",
+                            req_task
+                        ),
+                    ));
+                }
+                Some(own) => {
+                    if !crate::control::auth::task_is_self_or_descendant_of(
+                        &state.task_tree,
+                        req_task,
+                        own,
+                    ) {
+                        return Err((
+                            ErrorCode::Unauthorized,
+                            format!(
+                                "task '{}' is not the caller's task or a descendant",
+                                req_task
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        // Sub-2b-3 review-fix #3 + review-2 #1: working_dir +
+        // workspace_id resolution. If the caller bound the new
+        // session to a descendant task that lives in a
+        // DIFFERENT workspace (branch-mode subtask), the child
+        // spawns into THAT workspace's worktree, not the
+        // caller's.
+        //
+        // Resolution path:
+        //   - No `task_id` supplied OR task_id == caller's own
+        //     task → caller's workspace.
+        //   - task_id is a descendant → look up the bound
+        //     workspace via `state.task_workspaces` (pushed by
+        //     the TUI via `task.update_tree`). This works for
+        //     fresh descendant tasks with NO live anchor
+        //     session yet — the pre-review-2 resolver walked
+        //     `state.sessions` for a session tagged with the
+        //     task, which failed for first-spawn-into-fresh-
+        //     subtask (the common case `mcp_start_session`
+        //     serves).
+        let descendant_task_target = p.task_id.as_deref()
+            .filter(|req| caller.task_id.as_deref() != Some(*req));
+        let target_workspace_id: String = match descendant_task_target {
+            Some(req_task) => state
+                .task_workspaces
+                .get(req_task)
+                .cloned()
+                .ok_or((
+                    ErrorCode::NotFound,
+                    format!(
+                        "task '{}' has no bound workspace in the daemon's task \
+                         snapshot — the TUI must push task.update_tree with \
+                         `workspace_id` populated for descendant-task subtree \
+                         spawns to resolve (sub-2b-3 review-2 #1)",
+                        req_task
+                    ),
+                ))?,
+            None => caller.workspace_id.clone(),
+        };
+        let ws = state.workspaces.get(&target_workspace_id).ok_or((
+            ErrorCode::NotFound,
+            format!(
+                "target workspace '{}' not in daemon manifest snapshot",
+                target_workspace_id
+            ),
+        ))?;
+        let wt = ws.worktree_path.clone().ok_or((
+            ErrorCode::NotFound,
+            format!(
+                "target workspace '{}' has no worktree_path; \
+                 cannot resolve working_dir for new session",
+                target_workspace_id
+            ),
+        ))?;
+        // Sub-2b-3 review-fix #1: inherit cap from caller.
+        //
+        // Sub-2b-3 review-4 #1: fail closed on partial cap
+        // tuples. Pre-fix the `_ => None` arm swallowed any
+        // incomplete `(soft, hard, prefix)` and produced an
+        // uncapped child — a cap-bypass vector via wire-shape
+        // inconsistency. With the entry-point validation in
+        // `start_session_with_spawn_fn` rejecting partial
+        // tuples, this branch should be unreachable in
+        // practice; if state somehow grows an inconsistent
+        // session (test fixture, manual mutation, future bug)
+        // we surface it as Internal rather than silently
+        // spawning a cap-stripped child.
+        let cap_inherit = match (
+            caller.memory_cap_soft_bytes,
+            caller.memory_cap_hard_bytes,
+            caller.cgroup_prefix.clone(),
+        ) {
+            (Some(soft), Some(hard), Some(prefix)) => {
+                Some(InheritedCap { soft_bytes: soft, hard_bytes: hard, cgroup_prefix: prefix })
+            }
+            (None, None, None) => None,
+            (soft, hard, prefix) => {
+                return Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "parent session '{}' has incomplete cap metadata \
+                         (soft={:?}, hard={:?}, cgroup_prefix={:?}); refusing \
+                         to spawn uncapped child — the (soft, hard, prefix) \
+                         triple is all-or-nothing (sub-2b-3 review-4 #1)",
+                        cuid, soft, hard, prefix,
+                    ),
+                ));
+            }
+        };
+        (
+            target_workspace_id,
+            caller.task_id.clone(),
+            wt,
+            cap_inherit,
+        )
+    };
+
+    // Sub-2b-3 review-7: per-worktree slot wraps
+    // {pre-snapshot + spawn + detect}, not just {detect}.
+    //
+    // Pre-review-7 the slot only serialized the detector
+    // polling phase. Two same-worktree spawns could both
+    // create transcripts before either detector polled, and
+    // detector A would see B's (newer) transcript as the
+    // "newest unfamiliar" and cross-bind. The round-3 dedup
+    // didn't catch this because at A's poll time, no session
+    // had yet bound B's file — dedup only excludes already-
+    // claimed paths.
+    //
+    // Fix: acquire the slot, THEN take the pre-spawn
+    // snapshot, THEN spawn the child. The second same-worktree
+    // spawn waits at `wait_for_turn` until the first's
+    // detector has bound. By the time the second's
+    // pre-snapshot runs, the first child's transcript is on
+    // disk AND already on its session's `transcript_path`,
+    // so the second detector's "newest unfamiliar" lookup
+    // unambiguously resolves to the second's own file.
+    //
+    // The main thread holds the slot through the spawn pipeline
+    // and then transfers the ticket into the detector thread,
+    // which continues to hold the slot through polling. This
+    // preserves the round-5 async-return invariant: spawn-main
+    // returns as soon as the spawn pipeline completes;
+    // detection runs in the background under the same slot.
+    //
+    // **Bash spawns continue to skip the queue** (review-6 #2b)
+    // — they don't write transcripts, so no serialization is
+    // needed.
+    let detector_engine = crate::transcript_detect::DetectorEngine::from_session_type(&p.type_);
+    let queue_ticket: Option<crate::state::WorktreeSpawnTicket> = if detector_engine.is_some() {
+        let queue_arc: Arc<crate::state::WorktreeSpawnQueue> = {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let registry_arc = state.worktree_spawn_queues.clone();
+            drop(state);
+            let mut registry = registry_arc.lock().unwrap_or_else(|p| p.into_inner());
+            registry
+                .entry(working_dir.clone())
+                .or_insert_with(|| Arc::new(crate::state::WorktreeSpawnQueue::new()))
+                .clone()
+        };
+        let seq = queue_arc.enqueue();
+        let ticket = crate::state::WorktreeSpawnTicket::new(queue_arc.clone(), seq);
+        // Sub-2b-3 review-9: bounded wait. Pre-fix this
+        // called `wait_for_turn(seq)` unbounded — a slow
+        // in-flight detector (up to the 60s detector
+        // `MAX_DURATION`) could keep the Python
+        // `control_client.call()` 30s default timeout
+        // firing while we were still inside the handler;
+        // the daemon would later resume, spawn the child,
+        // and create an orphan session the client believed
+        // had failed.
+        //
+        // With a 20s bound (well below 30s with headroom),
+        // a timeout drops the ticket (Drop fires signal_done
+        // → releases the slot for the next waiter) and
+        // returns `Conflict`. The agent's retry will
+        // eventually succeed once the prior detector
+        // completes.
+        let slot_wait_timeout = slot_wait_timeout();
+        if queue_arc.wait_for_turn_timeout(seq, slot_wait_timeout).is_err() {
+            // `ticket` drops here → signal_done(seq) →
+            // next waiter in the FIFO can proceed. Without
+            // this, a timeout would leave the slot held
+            // indefinitely and block all later spawns in
+            // this worktree.
+            drop(ticket);
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "another mcp_start_session is in flight in worktree '{}' \
+                     (waited {:?}); retry shortly — the prior detector will \
+                     release the slot when it completes or times out \
+                     (sub-2b-3 review-9: bounded slot wait)",
+                    working_dir.display(),
+                    slot_wait_timeout,
+                ),
+            ));
+        }
+        Some(ticket)
+    } else {
+        None
+    };
+
+    // Sub-2b-3 review-2 #2 + review-7: snapshot transcript
+    // ids AFTER acquiring the slot. Prior in-flight detectors
+    // have already bound — the snapshot captures their
+    // transcripts (plus any pre-existing ones), so the
+    // detector's "new unfamiliar" search after this thread's
+    // engine writes its file unambiguously resolves to this
+    // session's own transcript.
+    //
+    // Bash sessions skip both the snapshot and the queue.
+    let detector_snapshot: Vec<String> = match detector_engine {
+        Some(crate::transcript_detect::DetectorEngine::ClaudeCode) => {
+            crate::transcript_detect::snapshot_claude_transcript_ids(&working_dir)
+        }
+        Some(crate::transcript_detect::DetectorEngine::Codex) => {
+            crate::transcript_detect::snapshot_codex_transcript_ids(&working_dir)
+        }
+        None => Vec::new(),
+    };
+
+    // Generate a fresh uid in the TUI format. Same generator
+    // shape as `tui/src/app.rs::new_session_uid` —
+    // `ts-<nanos>-<counter>`.
+    let session_uid = new_daemon_minted_session_uid();
+
+    // Build raw argv via the daemon-local mcp_config helper.
+    // Writes the per-session claude.json (claude) or builds
+    // codex overrides (codex). Bash gets `/bin/bash` with no
+    // args.
+    let (program, argv_tail) = crate::mcp_config::build_args(&p.type_, &session_uid)
+        .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
+
+    // Sub-2b-3 review-fix #1: wrap argv with systemd-run when
+    // the caller carries a cap. Mirrors the TUI's
+    // `try_spawn_via_daemon` wrap (see
+    // `tui/src/session.rs::wrap_with_systemd_run`) so a capped
+    // agent's MCP-driven subtask inherits the same memory
+    // ceiling. Pre-fix the daemon spawned the child raw,
+    // letting an agent escape its cap via the MCP path.
+    let (final_program, final_argv_tail) = match cap_inherit.as_ref() {
+        Some(cap) => {
+            let cap_spec = crate::mcp_config::CapSpec {
+                soft_bytes: cap.soft_bytes,
+                hard_bytes: cap.hard_bytes,
+                session_uid: &session_uid,
+                cgroup_prefix: &cap.cgroup_prefix,
+            };
+            let (wrapped_program, wrapped_args, _cgroup_path) =
+                crate::mcp_config::wrap_with_systemd_run(&program, &argv_tail, Some(&cap_spec));
+            (wrapped_program, wrapped_args)
+        }
+        None => (program, argv_tail),
+    };
+    let mut argv = Vec::with_capacity(final_argv_tail.len() + 1);
+    argv.push(final_program);
+    argv.extend(final_argv_tail);
+
+    // Build env: daemon-injected pins plus nothing else.
+    let env_map = crate::mcp_config::build_env(&session_uid);
+    let env_obj: serde_json::Map<String, Value> = env_map
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+
+    // Compose the full StartSessionParams JSON. We delegate to
+    // the existing `start_session` method to keep the spawn
+    // pipeline in one place (validation, two-phase spawn,
+    // reaper, registry insert).
+    let task_id_for_spawn = p.task_id.clone().or(caller_task_id);
+    let mut full_params = serde_json::Map::new();
+    full_params.insert("uid".into(), Value::String(session_uid.clone()));
+    full_params.insert("workspace_id".into(), Value::String(caller_workspace_id));
+    full_params.insert("label".into(), Value::String(p.label.clone()));
+    full_params.insert("argv".into(), Value::Array(
+        argv.into_iter().map(Value::String).collect(),
+    ));
+    full_params.insert(
+        "working_dir".into(),
+        Value::String(working_dir.to_string_lossy().into_owned()),
+    );
+    full_params.insert("env".into(), Value::Object(env_obj));
+    full_params.insert("session_type".into(), Value::String(p.type_.clone()));
+    if let Some(cuid) = caller_uid {
+        full_params.insert("managed_by_uid".into(), Value::String(cuid.to_string()));
+    }
+    if let Some(tid) = task_id_for_spawn {
+        full_params.insert("task_id".into(), Value::String(tid));
+    }
+    if let Some(cap) = cap_inherit.as_ref() {
+        full_params.insert(
+            "memory_cap_bytes".into(),
+            Value::Number(cap.soft_bytes.into()),
+        );
+        full_params.insert(
+            "memory_cap_hard_bytes".into(),
+            Value::Number(cap.hard_bytes.into()),
+        );
+        full_params.insert(
+            "cgroup_prefix".into(),
+            Value::String(cap.cgroup_prefix.to_string_lossy().into_owned()),
+        );
+    }
+
+    let start_result = start_session(state_arc, &Value::Object(full_params))?;
+
+    // Sub-2b-3 review-fix #2: deliver `prompt` if supplied.
+    // Pre-fix this was logged-and-dropped — silent contract
+    // break with the Python MCP tool which advertises prompt
+    // delivery. Now we look up the new session's InputHandle
+    // and write the prompt + trailing newline through the
+    // shared `write_and_stamp` helper (same path used by the
+    // attach-stream Input frame handler). Newline appended
+    // when missing so the receiving agent sees a complete
+    // submission (matches the TUI's `submit=true` shape on
+    // `send_input`).
+    //
+    // **No quiet-wait gating yet**: the TUI's existing
+    // `PendingWrite::wait_for_quiet` machinery isn't
+    // relocated daemon-side. For sub-2b-3 the prompt goes
+    // straight to the PTY post-spawn; the agent buffers
+    // appropriately. A future slice can add a daemon-side
+    // pending-prompt queue if races with engine startup
+    // become observable.
+    if let Some(prompt) = p.prompt.as_deref() {
+        if !prompt.is_empty() {
+            let handle_opt = {
+                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                state.sessions.get(&session_uid).map(|s| s.input_handle())
+            };
+            let Some(handle) = handle_opt else {
+                // Session disappeared between spawn and prompt
+                // delivery — exceptional but possible (fast-
+                // exit reaper removed the registry entry).
+                // Sub-2b-3 review-8 #1: surface as Internal
+                // rather than silent log. The caller's
+                // contract is "prompt was delivered if I get
+                // ok"; honoring it means failing closed when
+                // the session is gone.
+                return Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "mcp_start_session: session '{}' vanished \
+                         between spawn and prompt-write",
+                        session_uid,
+                    ),
+                ));
+            };
+            let mut payload = prompt.as_bytes().to_vec();
+            if !payload.ends_with(b"\n") {
+                payload.push(b'\n');
+            }
+            if let Err(e) = handle.write_and_stamp(&payload) {
+                // Sub-2b-3 review-8 #1: kill the just-spawned
+                // session and surface the error. Pre-fix
+                // a write failure logged + returned `ok`,
+                // leaving a half-initialized session with no
+                // delivered prompt — the caller has no way
+                // to know the prompt didn't land. Removing
+                // the session from the registry drops the
+                // DaemonSession, which SIGKILLs the child via
+                // its pidfd-based Drop.
+                let err_msg = format!(
+                    "mcp_start_session: prompt-delivery write failed for '{}': {}; \
+                     session was killed (review-8 #1 — no half-initialized sessions)",
+                    session_uid, e,
+                );
+                let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = state.sessions.remove(&session_uid);
+                drop(state);
+                return Err((ErrorCode::Internal, err_msg));
+            }
+        }
+    }
+
+    // Sub-2b-3 review-5 #1 + review-6: dispatch the detector
+    // to a background thread, transferring the queue ticket
+    // into the closure. Spawn-main returns immediately —
+    // necessary to stay under the Python MCP
+    // `control_client.call()` 30s default timeout (detector
+    // can take up to 60s polling).
+    //
+    // The ticket's `Drop` releases the queue slot when the
+    // detector closure ends (success, timeout, or panic) —
+    // see `WorktreeSpawnTicket` for the RAII contract.
+    //
+    // Bash sessions have `queue_ticket = None` and run no
+    // detector — nothing to transfer, nothing to release.
+    //
+    // Clients that need transcript-bound readiness call
+    // `wait_for_session_idle` or poll
+    // `resolve_authorized_session` (same shape the TUI uses
+    // today).
+    //
+    // The TUI-spawned-session path is NOT routed through here
+    // — TUI sessions have their own detector wired via
+    // `App::push_transcript_path_to_daemon_if_attached`.
+    if let (Some(engine), Some(ticket)) = (detector_engine, queue_ticket) {
+        // Sub-2b-3 review-11: fail-closed on detector-spawn
+        // failure. Pre-fix the `Builder::spawn` Err was
+        // dropped silently — the session stayed in the
+        // registry with no detector, and (with no TUI
+        // participant to push `session.set_transcript_path`
+        // later) MCP-spawned sessions would stay `pending`
+        // forever. Same bug class the watcher path fixed via
+        // `WatcherSpawnFn`.
+        //
+        // On Err here: the ticket was moved into
+        // `spawn_queued_detector` and dropped on its failure
+        // path (Drop fires `signal_done` → slot released).
+        // We must ALSO remove the just-spawned session from
+        // the registry so its DaemonSession's pidfd-based
+        // Drop SIGKILLs the child — otherwise an orphan
+        // session lives without a detector.
+        if let Err(e) = crate::transcript_detect::spawn_queued_detector(
+            state_arc.clone(),
+            session_uid.clone(),
+            engine,
+            working_dir.clone(),
+            detector_snapshot,
+            ticket,
+            crate::transcript_detect::default_detector_spawn_fn(),
+        ) {
+            let err_msg = format!(
+                "mcp_start_session: failed to spawn transcript detector \
+                 thread for '{}': {} (session killed to avoid orphan; \
+                 review-11)",
+                session_uid, e,
+            );
+            let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = state.sessions.remove(&session_uid);
+            drop(state);
+            return Err((ErrorCode::Internal, err_msg));
+        }
+    }
+
+    Ok(start_result)
+}
+
+/// Sub-2b-3 review-fix #1: cap-inherit triple cloned out of the
+/// caller's `DaemonSession` under the state lock and used after
+/// the lock drops to wrap the child's argv. All three fields
+/// must be present together — partial caps (e.g. soft only)
+/// can't drive a systemd-run wrap.
+struct InheritedCap {
+    soft_bytes: u64,
+    hard_bytes: u64,
+    cgroup_prefix: std::path::PathBuf,
+}
+
+/// Sub-2b-3: daemon-minted session uid. Mirrors the shape of
+/// `tui/src/app.rs::new_session_uid` so the validator in
+/// `is_valid_session_uid` accepts it. Per-process counter +
+/// monotonic nanos.
+fn new_daemon_minted_session_uid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ts-{:x}-{:x}", nanos, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::ManifestWorkspace;
     use tempfile::TempDir;
+
+    /// Sub-2b-3 review-10: pin the watcher-startup
+    /// hard-cap resolution. Pre-fix the watcher-startup
+    /// site at methods.rs L735 used a literal `0` regardless
+    /// of what was on the wire — so cap-killed sessions
+    /// emitted JSONL records with `hard_cap_bytes: 0`,
+    /// diverging from the TUI-local watcher. This test
+    /// pins the resolver's behavior; combined with the
+    /// production call site routing through it AND the
+    /// end-to-end JSONL assertion in
+    /// `session_watch::tests::producer_end_to_end_kills_and_writes_record`
+    /// (which now also asserts the hard_cap_bytes field
+    /// matches the spawn_watcher argument), the wire→
+    /// watcher→JSONL chain is verified.
+    #[test]
+    fn resolve_watcher_hard_cap_bytes_passes_through_wire_value() {
+        const N: u64 = 128 * 1024 * 1024;
+        assert_eq!(
+            resolve_watcher_hard_cap_bytes(Some(N)),
+            N,
+            "wire value must reach the watcher unchanged — \
+             a literal 0 here was the review-10 bug",
+        );
+        // Smaller value, ensure it's not a constant.
+        assert_eq!(
+            resolve_watcher_hard_cap_bytes(Some(42)),
+            42,
+        );
+    }
+
+    #[test]
+    fn resolve_watcher_hard_cap_bytes_defensive_none_yields_zero() {
+        // Review-4 #1's entry-point validation rejects
+        // partial cap tuples, so on the validated path this
+        // branch is unreachable when the watcher is being
+        // spawned. The `0` fallback is defense-in-depth
+        // against a future wire-shape regression.
+        assert_eq!(resolve_watcher_hard_cap_bytes(None), 0);
+    }
 
     /// Construct a `DaemonState` with one workspace whose
     /// `worktree_path` points at a usable temp directory, already
@@ -2355,6 +3218,13 @@ mod tests {
         // for a cap but spawns the agent outside the wrapper.
         let dir = TempDir::new().unwrap();
         let state = state_with_workspace("ws-outside-scope", &dir);
+        // Sub-2b-3 review-4 #1: the cap triple is now all-or-
+        // nothing at the entry point — `memory_cap_bytes` alone
+        // is rejected as `InvalidParams`. Send the full triple
+        // so the test reaches the cgroup-discovery path it's
+        // pinning. The hard byte count and cgroup_prefix
+        // values are unimportant here; only the discovery step
+        // is being tested.
         let params = json!({
             "uid": fresh_test_uid(),
             "workspace_id": "ws-outside-scope",
@@ -2362,6 +3232,8 @@ mod tests {
             "argv": ["/bin/sleep", "30"],
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
+            "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
+            "cgroup_prefix": "/sys/fs/cgroup/user.slice",
         });
         let err =
             start_session(&state, &params).expect_err("discovery should fail");
@@ -2404,6 +3276,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = state_with_workspace("ws-forged-path", &dir);
         let hostile = "/sys/fs/cgroup/this-is-not-a-cm-sess-scope".to_string();
+        // Sub-2b-3 review-4 #1: send the full cap triple so
+        // the test reaches the discovery branch (post-validation).
+        // The hostile `cgroup_path` field below is the
+        // pre-fix legacy that must STILL be ignored.
         let params = json!({
             "uid": fresh_test_uid(),
             "workspace_id": "ws-forged-path",
@@ -2411,6 +3287,8 @@ mod tests {
             "argv": ["/bin/sleep", "30"],
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
+            "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
+            "cgroup_prefix": "/sys/fs/cgroup/user.slice",
             // The old caller-supplied field. Daemon should
             // ignore it entirely; the JSON deserializer drops
             // unknown fields by default.

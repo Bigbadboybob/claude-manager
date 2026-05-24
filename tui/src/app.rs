@@ -2757,6 +2757,13 @@ impl App {
             cols,
             rows,
             memory_cap_bytes,
+            // Sub-2b-3 review-fix #1: send the hard cap byte
+            // count + cgroup_prefix so the daemon can re-wrap
+            // argv for descendant `mcp_start_session` spawns
+            // and the subtask inherits the cap. Pre-fix only
+            // the soft byte count flowed.
+            memory_cap_hard_bytes: memory_cap.as_ref().map(|c| c.hard_bytes),
+            cgroup_prefix: memory_cap.as_ref().map(|c| c.cgroup_prefix.as_path()),
             cgroup_path: cgroup_path.as_deref(),
             // Auto-register the workspace if the daemon doesn't
             // know about it yet (pre-10e bridge). Always pass —
@@ -6716,13 +6723,32 @@ impl App {
         if !crate::daemon_launch::opt_in_enabled() {
             return;
         }
-        let tasks: Vec<(String, Option<String>)> = self
+        // Sub-2b-3 review-2 #1: push `workspace_id` per task AND
+        // a workspaces map carrying `worktree_path`. Lets the
+        // daemon's `mcp_start_session` resolve a descendant
+        // task's workspace without needing a live anchor
+        // session in that workspace (the pre-fix resolver
+        // walked `state.sessions` for an existing tagged
+        // session — failed for first-spawn-into-fresh-subtask).
+        let tasks: Vec<(String, Option<String>, Option<String>)> = self
             .tasks
             .iter()
             .filter_map(|t| {
-                t.task_id
-                    .as_ref()
-                    .map(|id| (id.clone(), t.parent_task_id.clone()))
+                t.task_id.as_ref().map(|id| {
+                    (id.clone(), t.parent_task_id.clone(), t.workspace_id.clone())
+                })
+            })
+            .collect();
+        let workspaces: Vec<(String, Option<String>)> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    w.id.clone(),
+                    w.worktree_path
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                )
             })
             .collect();
         let daemon_socket = cm_daemon::default_socket_path();
@@ -6730,6 +6756,7 @@ impl App {
             &daemon_socket,
             "tui-operator",
             &tasks,
+            &workspaces,
         ) {
             eprintln!(
                 "cm-tui: task.update_tree failed: {} \
@@ -7147,6 +7174,13 @@ impl App {
         }
         self.cursor = Cursor::Session(new_wi, 0);
         self.save_session_manifest();
+        // Sub-2b-3 review-5 #2: A-n added a new workspace with
+        // a fresh worktree_path. The daemon needs that mapping
+        // BEFORE a freshly-spawned agent calls mcp_start_session
+        // (descendant-task resolution looks up the workspace
+        // via state.workspaces). Without this push, the agent
+        // would race the next API-driven reconcile.
+        self.push_task_tree_to_daemon();
         self.set_status_msg("Workspace created");
     }
 
@@ -7884,6 +7918,13 @@ impl App {
             task.is_cloud = true;
         }
         self.save_session_manifest();
+        // Sub-2b-3 review-5 #2: push the cleared worktree_path
+        // to the daemon. Without this, the daemon retains the
+        // stale local path until the next reconcile_tasks
+        // (which could be seconds later, or never if the API
+        // isn't refreshing), and a concurrent `mcp_start_session`
+        // would spawn into the deleted worktree.
+        self.push_task_tree_to_daemon();
     }
 
     /// Pull the active cloud workspace to local (uses the first bound task).
@@ -8361,6 +8402,12 @@ impl App {
         self.workspaces[final_wi].is_closed = false;
         self.cursor = Cursor::Workspace(final_wi);
         self.save_session_manifest();
+        // Sub-2b-3 review-5 #2: reopen may have provisioned a
+        // new workspace (the `None => { ... }` arm above
+        // pushes a fresh Workspace with worktree_path). Push
+        // so the daemon knows the path BEFORE the user can
+        // A-s an agent into it.
+        self.push_task_tree_to_daemon();
         self.view_mode = ViewMode::Sessions;
         self.clamp_cursor();
         self.set_status_msg("Reopened — A-s to add session");

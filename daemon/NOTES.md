@@ -244,11 +244,45 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
     - Files: `daemon/src/planning_client.rs` (new, small HTTP wrapper); `methods::propose_task`; dispatch arm; tests against a stub HTTP server (`wiremock` or hand-rolled `tokio` listener) for path/payload/auth-header pinning; e2e through `daemon/tests/accept_loop.rs`.
     - Per-tool sub-slice; small if the daemon already has `tokio` (it does, for the cgroup watcher).
 
-  - **sub-2b-3 — `start_session` minimal-params wire shape + Session-caller flip.**
-    - The Python MCP `start_session` tool sends `{type, label, prompt?, task_id?}` per `server.py:359`. Daemon must accept this minimal shape (sub-2b-1 expanded the operator wire to carry full `argv`/`uid`/`workspace_id`/`working_dir`; Session callers need a discriminated variant that resolves these from the caller's session).
-    - Decision pending at slice-start: separate `mcp_start_session` method (cleanest, matches the user's preference from earlier rounds) vs untagged-union on `StartSessionParams`. Lean separate method.
-    - Resolution rules: `workspace_id` ← caller's `workspace_id`, `working_dir` ← workspace's `worktree_path`, `argv` ← `mcp_config::build_args(SpawnTarget::Daemon, engine, new_uid, …)`, `uid` ← `new_session_uid()`, `task_id` ← caller's `task_id` (or the wire-supplied subtask hint).
-    - Re-enables `start_session_session_caller_still_unauthorized_pending_sub_2` (the holdover sub-1 test); rename to assert the flipped path post-fix.
+  - **sub-2b-3 — `mcp_start_session` minimal-params + Session-caller flip.** Last piece of sub-2b. Once shipped, the named criterion "MCP agent inside a daemon-spawned session can call start_session" ships and sub-2b closes.
+
+    **Problem shape.** The Python MCP `start_session` tool (`mcp_server/server.py:361`) sends `{type, label, prompt?, task_id?}` — much smaller than the daemon's current `start_session` wire shape `{uid, workspace_id, label, session_type, argv, working_dir, env, cols, rows, ...}` which TUI's `ClientSession::new` (`tui/src/client_session.rs::rpc_start_session_full`) builds. Today a Session-caller hitting daemon's `start_session` with the minimal shape gets `InvalidParams` (missing required fields). Sub-1's dispatch arm also explicitly rejects Session callers with `Unauthorized` (`start_session_session_caller_still_unauthorized_pending_sub_2` test). Both blocks need lifting.
+
+    **Decision: separate method, not discriminated union.** New daemon method `mcp_start_session` accepts the minimal shape; the existing `start_session` keeps the full shape for TUI use. Reasons:
+    - The two shapes have different security postures — the TUI is trusted to supply `argv` verbatim (it builds via `mcp_config::build_args`); a Session caller cannot be trusted to send arbitrary argv. A separate method makes the security boundary obvious in the wire surface (and in code review).
+    - A discriminated union would force every call site through the same params struct, which couples the two evolution paths (a future field added for one would affect the other's schema).
+    - Method-name distinction lets Python's `control_client.call("mcp_start_session", …)` route cleanly without payload-shape sniffing.
+
+    **Resolution rules** (`mcp_start_session` derives the full SpawnParams from minimal params + caller context):
+    - `uid`: daemon generates fresh via `new_session_uid()` (same format the TUI uses: `ts-<nanos>-<counter>`). Pre-spawn validation ensures no collision with `state.sessions`.
+    - `workspace_id`: copy from caller's `DaemonSession.workspace_id`.
+    - `working_dir`: look up the workspace in `DaemonState.workspaces`; use its `worktree_path`. Error `NotFound` if the workspace isn't registered or has no worktree.
+    - `task_id`: when supplied by the caller, must be self-or-descendant of caller's task per `task_is_self_or_descendant_of` (sub-2a's auth walk). When omitted, default to caller's own `task_id`. A taskless caller supplying a `task_id` → `Unauthorized` (mirrors the TUI's `start_session` rule).
+    - `argv`: derive from `type`. Daemon needs a minimal type→argv mapping (the inverse of what slice 10c-e-3b removed). Scoped to MCP-only callers, NOT the TUI's path — TUI continues to build argv via `mcp_config::build_args` and send the full wire. Document the exception in the method's doc comment so future readers understand why daemon has the mapping back. Mapping:
+        - `"claude-code"` → `claude --dangerously-skip-permissions --mcp-config <per-session-path>`.
+        - `"codex"` → `codex --dangerously-bypass-approvals-and-sandbox -c <per-session-overrides>`.
+        - `"bash"` → `/bin/bash` (no MCP injection — matches the TUI's `bash` path).
+    - `env`: daemon injects `CM_TUI_SESSION_ID=<new_uid>`, `CM_DAEMON_SOCKET=<abs-path>`, `CM_TUI_SOCKET=""` (authoritative empty — same pattern as TUI's `build_env(SpawnTarget::Daemon, …)`). Plus any vars the caller supplied (additive, daemon-injected pins win).
+    - `cols`/`rows`: defaults to 80×24. A future enhancement could plumb the caller's terminal size, but Python MCP tool doesn't know it today.
+    - `memory_cap_bytes` / `cgroup_path`: inherit from caller's session. Matches user-mental-model: a subtask agent should run under the same memory cap as the parent. **Caveat**: the daemon doesn't currently expose memory_cap_bytes on `DaemonSession` (sub-2b-1 carries `last_activity_at`/`transcript_path`/`generation` but not the cap). Need to add: `DaemonSession.memory_cap_bytes: Option<u64>` + `DaemonSession.cgroup_path: Option<String>` (already exists I think — verify at start). Inherit at `mcp_start_session` time.
+    - `transcript_path`: `None` at spawn (no clone seed for MCP-spawned subtasks). TUI's existing detector + `session.set_transcript_path` push covers the binding post-spawn.
+
+    **MCP-config-file shape (where the work lands).** Claude needs `--mcp-config <path-to-json>` pointing at a per-session JSON file that lists the MCP servers + their env. Codex takes inline `-c` overrides. Both are built TUI-side today in `tui/src/mcp_config.rs`. The daemon needs equivalent functionality. Two options:
+    1. **Relocate `mcp_config.rs` to a shared crate** (or to daemon, with TUI re-importing). Heavy refactor; touches many TUI call sites.
+    2. **Daemon-local minimal version**: a small subset of `mcp_config.rs` covering JUST what `mcp_start_session` needs (write claude JSON, build codex overrides). Code-duplication cost is real but bounded; can be unified in a later cleanup slice.
+
+    **Lean option 2** for sub-2b-3. The TUI's `mcp_config.rs` keeps growing with workflow-aware logic, plan-mode behavior, etc.; relocating it sweeps in unrelated concerns. A daemon-local helper at `daemon/src/mcp_config.rs` (or inline in `methods::mcp_start_session`) keeps the diff scoped. Future cleanup slice (probably during 10d-workflow-controller relocation) merges the two.
+
+    **Dispatcher arm**: new `mcp_start_session` arm. Both Operator and Session callers allowed; Session-caller path runs `check_session_caller`-style auth on `task_id` if supplied. The existing `start_session` arm keeps its current Session-caller-Unauthorized behavior (TUI is the only legitimate `start_session` caller; agents go through `mcp_start_session`).
+
+    **Tests**:
+    - Spawn via `mcp_start_session` with minimal params; observe daemon resolves uid/workspace_id/argv/working_dir from caller context; child runs correctly.
+    - Auth: Session caller, no `task_id` supplied → inherits caller's task. Explicit `task_id` in same subtree → Allow. Different-subtree task_id → Unauthorized. Taskless caller + explicit task_id → Unauthorized.
+    - Wire shape: each engine type produces the expected argv (claude → `--mcp-config <path>`, codex → `-c <overrides>`, bash → `/bin/bash`).
+    - Existing `start_session_session_caller_still_unauthorized_pending_sub_2` test (the sub-1 holdover) STAYS as-is — Session callers still can't use the FULL-shape `start_session`; only `mcp_start_session`.
+    - Python side: `mcp_server/server.py:361 start_session` switches its `control_client.call` from `"start_session"` to `"mcp_start_session"` when `CM_DAEMON_SOCKET` is set; falls back to `"start_session"` against the TUI socket otherwise (TUI continues to handle the minimal shape via its existing `tui/src/control/methods.rs::start_session`).
+
+    **Estimated work**: per-tool sub-slice; medium-to-large. New daemon-local MCP config helper, new method, new dispatch arm, new tests, Python-side routing flip, plus the `DaemonSession.memory_cap_bytes` field addition if it isn't already there.
 
   - **sub-2c — Workflow MCP methods (`workflow_transition`, `workflow_done`).** These touch the workflow controller. Phase 1 keeps the controller TUI-side (`tui/src/workflow/controller.rs`) and the daemon writes to `events.jsonl` which the TUI tails (per the design doc's intentional staging — Phase 2 cuts the file dependency). Order question: sub-2c can ship before `10d-workflow-controller` (the controller stays TUI-side; daemon just writes events.jsonl which is shared via fs). Or interleave with `10d-workflow-controller` if that lands first. NOTES.md should record the order chosen when sub-2c starts.
 
@@ -312,6 +346,18 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
 - Slice 10f: 1 commit (the actual flip) + 1 commit (cleanup).
 
 Total: roughly 15–20 commits with the 10c subdivision + 10d split. Each leaves the tree green. The opt-in stays the integration safety net through 10a–10e; 10f removes it.
+
+## Future work
+
+- **Socket-close cancellation for `mcp_start_session` slot wait** (sub-2b-3 review-9): the bounded 20s wait closes the orphan-on-client-timeout bug, but the cleaner shape is to abort the wait when the client socket closes. The daemon's current RPC framework (synchronous per-connection threads, blocking reads) doesn't expose a "client disconnected" signal during a blocking wait; wiring it would require either an async runtime or a peer-poll thread. Deferred — the bounded wait alone is sufficient for the named acceptance criterion.
+
+## Known costs / future work
+
+- **Per-worktree spawn+detect serialization for the MCP path** (sub-2b-3 review-4 #2). `mcp_start_session` holds a per-worktree mutex from spawn through detector binding so concurrent same-worktree spawns can't cross-bind transcript files. Spawns in different worktrees don't serialize against each other. Acceptable today because workflow agents in the same worktree spawn sequentially in practice (the workflow controller drives transitions one role at a time). A future slice can replace serialization with content-association — e.g. inject a spawn-tag env var that the engine echoes into its first transcript line, then match-by-tag instead of match-by-newest — if latency becomes a problem.
+
+## Known flake-class issues (deferred)
+
+- `control::methods::tests::read_session_output_with_cursor_returns_only_new_bytes` flakes under high test-binary parallelism. The test spawns a real `bash` PTY and asserts that a since-cursor read excludes pre-cursor output. Under parallel load, the bash startup banner / first-prompt `[?2004h` interleaves into the post-cursor read window — the assertion sees pre-cursor text in the response. Reproduces only with `cargo test --workspace`; passes serialized (`--test-threads=1`) or run alone. Surfaced during sub-2b-3 review-3 — not introduced by that slice. Defer to a dedicated PTY-test-isolation slice; the fix likely needs either a synchronization signal (waiting for the prompt before issuing the marker echo) or a stronger cursor that anchors on a known sentinel rather than byte offsets.
 
 ## What this doc is NOT
 

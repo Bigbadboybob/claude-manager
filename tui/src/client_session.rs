@@ -151,6 +151,20 @@ pub struct ClientSessionConfig<'a> {
     /// until then `memory_cap_kill` will stay `false` for
     /// daemon-spawned sessions even when this is `Some`.
     pub memory_cap_bytes: Option<u64>,
+    /// Sub-2b-3 review-fix #1: hard cap byte count. Pre-fix
+    /// only the soft byte count rode the wire — the daemon
+    /// needs both to re-wrap argv for descendant
+    /// `mcp_start_session` spawns. The TUI's `MemoryCap` carries
+    /// `(soft_bytes, hard_bytes)`; pass both through.
+    pub memory_cap_hard_bytes: Option<u64>,
+    /// Sub-2b-3 review-fix #1: cgroup prefix
+    /// (`memory_cap.cgroup_prefix`). Daemon needs this to build
+    /// the scope unit's cgroup path when wrapping descendant
+    /// argv. Distinct from `cgroup_path` below (which is the
+    /// PREDICTED full path including the unit name for THIS
+    /// session); cap inheritance needs the PREFIX so the
+    /// daemon can generate fresh unit names for children.
+    pub cgroup_prefix: Option<&'a Path>,
     /// Predicted systemd-run scope cgroup path (slice 10c-e-3b-fix2).
     /// `Some` paired with `memory_cap_bytes: Some(_)`. Passed
     /// through to the daemon (which echoes it on the response)
@@ -523,6 +537,19 @@ pub(crate) fn rpc_start_session_full(
     if let Some(bytes) = config.memory_cap_bytes {
         params["memory_cap_bytes"] = serde_json::Value::Number(bytes.into());
     }
+    // Sub-2b-3 review-fix #1: also send the hard cap byte count
+    // and the cgroup_prefix. Daemon stores them on
+    // `DaemonSession` so descendant `mcp_start_session` spawns
+    // can re-wrap argv with the same (soft, hard, prefix) and
+    // the subtask inherits the cap. Pre-fix only the soft byte
+    // count rode the wire and the daemon couldn't re-wrap.
+    if let Some(bytes) = config.memory_cap_hard_bytes {
+        params["memory_cap_hard_bytes"] = serde_json::Value::Number(bytes.into());
+    }
+    if let Some(prefix) = config.cgroup_prefix {
+        params["cgroup_prefix"] =
+            serde_json::Value::String(prefix.display().to_string());
+    }
     // Sub-2a Finding #1: send task_id so the daemon records it
     // on `DaemonSession.task_id` at spawn time. The auth walk
     // reads it for the descendant-task gate; if absent, the
@@ -714,17 +741,39 @@ pub fn rpc_set_transcript_path(
 /// Operator-only on the daemon side — a Session caller rewriting
 /// the tree could escape their own auth scope. The TUI uses the
 /// shared `tui-operator` token id like every other RPC site.
+/// Sub-2b-3 review-2 #1: each task entry now carries an
+/// optional bound `workspace_id` so the daemon can resolve a
+/// descendant task's workspace without needing a live anchor
+/// session there. Per-workspace `worktree_path` rides in the
+/// `workspaces` slice (replace-not-merge on the daemon side
+/// in lockstep with the task list).
+///
+/// Operator-only on the daemon side — a Session caller
+/// rewriting the tree could escape their own auth scope. The
+/// TUI uses the shared `tui-operator` token id like every
+/// other RPC site.
 pub fn rpc_task_update_tree(
     daemon_socket: &Path,
     operator_token_id: &str,
-    tasks: &[(String, Option<String>)],
+    tasks: &[(String, Option<String>, Option<String>)],
+    workspaces: &[(String, Option<String>)],
 ) -> anyhow::Result<()> {
     let tasks_json: Vec<serde_json::Value> = tasks
         .iter()
-        .map(|(task_id, parent_task_id)| {
+        .map(|(task_id, parent_task_id, workspace_id)| {
             serde_json::json!({
                 "task_id": task_id,
                 "parent_task_id": parent_task_id,
+                "workspace_id": workspace_id,
+            })
+        })
+        .collect();
+    let workspaces_json: Vec<serde_json::Value> = workspaces
+        .iter()
+        .map(|(workspace_id, worktree_path)| {
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "worktree_path": worktree_path,
             })
         })
         .collect();
@@ -732,7 +781,10 @@ pub fn rpc_task_update_tree(
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
         method: "task.update_tree".into(),
-        params: serde_json::json!({ "tasks": tasks_json }),
+        params: serde_json::json!({
+            "tasks": tasks_json,
+            "workspaces": workspaces_json,
+        }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
@@ -895,6 +947,9 @@ mod tests {
             cols,
             rows,
             memory_cap_bytes: None,
+            // Sub-2b-3 review-fix #1: tests default to uncapped.
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             cgroup_path: None,
             worktree_path: None,
             // Sub-2a Finding #1: tests default to taskless;
@@ -967,12 +1022,12 @@ mod tests {
     #[test]
     fn rpc_task_update_tree_lands_in_daemon_state() {
         let (socket, _working_dir, state, stop, handle) = start_test_daemon("ws-tree");
-        let tasks = vec![
-            ("task-root".to_string(), None),
-            ("task-child".to_string(), Some("task-root".to_string())),
-            ("task-grandchild".to_string(), Some("task-child".to_string())),
+        let tasks: Vec<(String, Option<String>, Option<String>)> = vec![
+            ("task-root".to_string(), None, None),
+            ("task-child".to_string(), Some("task-root".to_string()), None),
+            ("task-grandchild".to_string(), Some("task-child".to_string()), None),
         ];
-        rpc_task_update_tree(&socket, "op-tree", &tasks).expect("update_tree ok");
+        rpc_task_update_tree(&socket, "op-tree", &tasks, &[]).expect("update_tree ok");
         {
             let s = state.lock().unwrap();
             assert_eq!(s.task_tree.get("task-root"), Some(&None));
@@ -988,18 +1043,80 @@ mod tests {
         stop_test_daemon(&socket, stop, handle);
     }
 
+    /// Sub-2b-3 review-5 #2: the TUI's `finish_push` clears a
+    /// workspace's `worktree_path` locally and then pushes
+    /// the updated tree to the daemon. This test pins the
+    /// wire shape that flow uses: the workspaces map carries
+    /// the now-`None` worktree_path for the cloud-pushed
+    /// workspace, and the daemon drops the stale path
+    /// immediately.
+    ///
+    /// Pre-fix (review-5), `finish_push` skipped the push so
+    /// the daemon kept the old path until the next reconcile,
+    /// during which a concurrent `mcp_start_session` would
+    /// spawn into a deleted worktree.
+    #[test]
+    fn finish_push_wire_shape_clears_daemon_worktree_path() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-finish-push");
+        // Round 1: push workspace WITH a worktree_path
+        // (pre-`finish_push` state).
+        let workspaces_pre: Vec<(String, Option<String>)> = vec![(
+            "ws-pushed".to_string(),
+            Some("/tmp/about-to-be-pushed-to-cloud".to_string()),
+        )];
+        rpc_task_update_tree(&socket, "op-fp", &[], &workspaces_pre)
+            .expect("pre push ok");
+        {
+            let s = state.lock().unwrap();
+            let ws = s.workspaces.get("ws-pushed").expect("workspace landed");
+            assert_eq!(
+                ws.worktree_path
+                    .as_deref()
+                    .map(|p| p.display().to_string()),
+                Some("/tmp/about-to-be-pushed-to-cloud".to_string()),
+                "pre-finish_push state has the local path",
+            );
+        }
+        // Round 2: simulate `finish_push` — same workspace id,
+        // worktree_path now `None`. This is the shape `App::
+        // finish_push` produces via
+        // `push_task_tree_to_daemon`'s iterator over
+        // `self.workspaces`.
+        let workspaces_post: Vec<(String, Option<String>)> = vec![
+            ("ws-pushed".to_string(), None),
+        ];
+        rpc_task_update_tree(&socket, "op-fp", &[], &workspaces_post)
+            .expect("post push ok");
+        {
+            let s = state.lock().unwrap();
+            let ws = s
+                .workspaces
+                .get("ws-pushed")
+                .expect("workspace still present (entry retained, path cleared)");
+            assert!(
+                ws.worktree_path.is_none(),
+                "finish_push push must clear worktree_path on the daemon \
+                 before any other refresh trigger; still holding {:?}",
+                ws.worktree_path,
+            );
+        }
+        stop_test_daemon(&socket, stop, handle);
+    }
+
     /// Snapshot semantics: a second push fully REPLACES the
     /// daemon's tree, not merges.
     #[test]
     fn rpc_task_update_tree_replaces_on_second_push() {
         let (socket, _working_dir, state, stop, handle) = start_test_daemon("ws-tree-2");
-        let first = vec![
-            ("old-a".to_string(), None),
-            ("old-b".to_string(), Some("old-a".to_string())),
+        let first: Vec<(String, Option<String>, Option<String>)> = vec![
+            ("old-a".to_string(), None, None),
+            ("old-b".to_string(), Some("old-a".to_string()), None),
         ];
-        rpc_task_update_tree(&socket, "op-tree", &first).expect("first ok");
-        let second = vec![("new-a".to_string(), None)];
-        rpc_task_update_tree(&socket, "op-tree", &second).expect("second ok");
+        rpc_task_update_tree(&socket, "op-tree", &first, &[]).expect("first ok");
+        let second: Vec<(String, Option<String>, Option<String>)> =
+            vec![("new-a".to_string(), None, None)];
+        rpc_task_update_tree(&socket, "op-tree", &second, &[]).expect("second ok");
         let s = state.lock().unwrap();
         assert!(!s.task_tree.contains_key("old-a"));
         assert!(!s.task_tree.contains_key("old-b"));
@@ -1085,9 +1202,10 @@ mod tests {
             &socket,
             "op-sib",
             &[
-                ("task-a".to_string(), None),
-                ("task-b".to_string(), None),
+                ("task-a".to_string(), None, None),
+                ("task-b".to_string(), None, None),
             ],
+            &[],
         )
         .expect("update_tree ok");
 
@@ -1135,11 +1253,11 @@ mod tests {
         // typically is — that's what made it a subtask), but
         // the F2 acceptance hinges on the SUBTASK row carrying
         // the parent edge.
-        let tasks = vec![
-            ("parent-x".to_string(), None),
-            ("subtask-y".to_string(), Some("parent-x".to_string())),
+        let tasks: Vec<(String, Option<String>, Option<String>)> = vec![
+            ("parent-x".to_string(), None, None),
+            ("subtask-y".to_string(), Some("parent-x".to_string()), None),
         ];
-        rpc_task_update_tree(&socket, "op-f2", &tasks).expect("push ok");
+        rpc_task_update_tree(&socket, "op-f2", &tasks, &[]).expect("push ok");
         let s = state.lock().unwrap();
         // Daemon sees the parent edge on the FIRST push, not
         // after a deferred reconcile.
@@ -1159,7 +1277,7 @@ mod tests {
     #[test]
     fn rpc_task_update_tree_accepts_empty_snapshot() {
         let (socket, _working_dir, state, stop, handle) = start_test_daemon("ws-tree-3");
-        rpc_task_update_tree(&socket, "op-tree", &[]).expect("empty ok");
+        rpc_task_update_tree(&socket, "op-tree", &[], &[]).expect("empty ok");
         let s = state.lock().unwrap();
         assert!(s.task_tree.is_empty());
         drop(s);
@@ -1272,18 +1390,19 @@ mod tests {
         rpc_task_update_tree(
             &socket,
             "op-subtask",
-            &[("task-parent".to_string(), None)],
+            &[("task-parent".to_string(), None, None)],
+            &[],
         )
         .expect("seed parent ok");
         // The post-`create_subtask` `app.tasks` slice as
         // `push_task_tree_to_daemon` would build it: parent
         // edge plus the new subtask carrying
         // `parent_task_id: Some("task-parent")`.
-        let post_create_subtask = vec![
-            ("task-parent".to_string(), None),
-            ("task-newsubtask".to_string(), Some("task-parent".to_string())),
+        let post_create_subtask: Vec<(String, Option<String>, Option<String>)> = vec![
+            ("task-parent".to_string(), None, None),
+            ("task-newsubtask".to_string(), Some("task-parent".to_string()), None),
         ];
-        rpc_task_update_tree(&socket, "op-subtask", &post_create_subtask)
+        rpc_task_update_tree(&socket, "op-subtask", &post_create_subtask, &[])
             .expect("post-create_subtask push ok");
         // Acceptance: the new subtask's parent edge is visible
         // on the daemon BEFORE any API reconcile. Pre-fix this
@@ -1326,11 +1445,11 @@ mod tests {
             start_test_daemon("ws-startup-preserve");
         // 1. Pre-populate (simulating a prior TUI session that
         //    successfully ran reconcile_tasks and pushed).
-        let prior = vec![
-            ("task-root".to_string(), None),
-            ("task-leaf".to_string(), Some("task-root".to_string())),
+        let prior: Vec<(String, Option<String>, Option<String>)> = vec![
+            ("task-root".to_string(), None, None),
+            ("task-leaf".to_string(), Some("task-root".to_string()), None),
         ];
-        rpc_task_update_tree(&socket, "op-startup", &prior).expect("seed ok");
+        rpc_task_update_tree(&socket, "op-startup", &prior, &[]).expect("seed ok");
         {
             let s = state.lock().unwrap();
             assert_eq!(s.task_tree.len(), 2, "seed must land");
@@ -1354,7 +1473,7 @@ mod tests {
         // Regression evidence: if the TUI HAD sent the empty
         // push, the daemon would wipe — proving the gate is
         // load-bearing.
-        rpc_task_update_tree(&socket, "op-startup", &[])
+        rpc_task_update_tree(&socket, "op-startup", &[], &[])
             .expect("empty push (regression simulation) ok");
         {
             let s = state.lock().unwrap();
@@ -1840,6 +1959,8 @@ mod tests {
             cols: 80,
             rows: 24,
             memory_cap_bytes: Some(64 * 1024 * 1024),
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             cgroup_path: Some(hostile_cgroup),
             worktree_path: None,
             task_id: None,
@@ -1924,6 +2045,8 @@ mod tests {
             cols: 200,
             rows: 50,
             memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             cgroup_path: None,
             worktree_path: None,
             task_id: None,

@@ -962,6 +962,22 @@ mod tests {
         assert_eq!(v["session_uid"], session_uid);
         assert_eq!(v["pid"], child_pid as u64);
         assert_eq!(v["soft_cap_bytes"], 64u64 * 1024 * 1024);
+        // Sub-2b-3 review-10: the daemon-spawn watcher
+        // startup site (methods.rs) used to pass literal
+        // `0` for hard_cap_bytes, diverging from the
+        // TUI-local watcher's actual MemoryMax. This
+        // assertion pins that the JSONL record now carries
+        // the value passed to `spawn_watcher` end-to-end —
+        // a regression at the methods.rs site (or in the
+        // watcher's plumbing of hard_cap_bytes through
+        // run_watcher → write_kill_log_to) would surface
+        // here as a 0 instead of 128 MiB.
+        assert_eq!(
+            v["hard_cap_bytes"], 128u64 * 1024 * 1024,
+            "hard_cap_bytes in the JSONL must match what was \
+             passed to spawn_watcher (review-10): got {}",
+            v["hard_cap_bytes"],
+        );
     }
 
     /// Failure-injection test for the spawn path. Pre-fix

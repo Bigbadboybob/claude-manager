@@ -168,7 +168,13 @@ def propose_task(
     # it can't auto-detect via `git remote get-url origin` the
     # way the local PlanningClient does). We detect here and
     # forward.
-    if os.environ.get("CM_DAEMON_SOCKET", "").strip():
+    #
+    # Sub-2b-3 review-5 #3 + review-8 #2: resolve the route
+    # ONCE and pass through to `call` so the socket dial
+    # uses the same path that informed the daemon-vs-direct
+    # branch decision.
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
         from cli.planning_client import _detect_repo_url
         repo_url = _detect_repo_url()
         params = {
@@ -183,7 +189,7 @@ def propose_task(
         if depends:
             params["depends"] = list(depends)
         try:
-            task = control_client.call("propose_task", params)
+            task = control_client.call("propose_task", params, socket_path=route.path)
         except control_client.ControlError as e:
             # Surface the daemon's error message + code to the
             # agent so it sees what the planning queue rejected.
@@ -394,7 +400,18 @@ def start_session(
         params["prompt"] = prompt
     if task_id:
         params["task_id"] = task_id
-    return control_client.call("start_session", params)
+    # Sub-2b-3 review-5 #3 + review-8 #2: single-resolution
+    # routing — `resolve_socket_route()` is called ONCE, and
+    # its `path` is passed through to `control_client.call`
+    # so the socket dial uses exactly the path that informed
+    # the method selection. Pre-review-8 the route was
+    # resolved twice (once here for method, once inside
+    # `call()` for socket), and a daemon socket
+    # appearing/disappearing between the two resolutions
+    # could send the wrong method shape to the wrong server.
+    route = control_client.resolve_socket_route()
+    method = "mcp_start_session" if route.chose_daemon else "start_session"
+    return control_client.call(method, params, socket_path=route.path)
 
 
 @mcp.tool()

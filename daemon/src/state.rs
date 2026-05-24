@@ -28,12 +28,249 @@
 //! handle, workflow controller state) joins this struct as later
 //! sub-slices land.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::attach::TicketAllocator;
 use crate::manifest::{Manifest, ManifestWorkspace};
 use crate::session::DaemonSession;
+
+/// Sub-2b-3 review-5 #1: per-worktree FIFO sequence queue.
+///
+/// Replaces the review-4 raw mutex so `mcp_start_session` can
+/// return immediately (within the Python MCP
+/// `control_client.call()` 30s default timeout) while
+/// detection still serializes against prior in-flight
+/// detectors in the same worktree — necessary for transcript
+/// ownership correctness (review-3 dedup + review-4 serial
+/// argument).
+///
+/// Shape: each spawn into a worktree mints a monotonic
+/// sequence number; the detector waits until all prior seqs
+/// have signaled completion before polling, then signals its
+/// own completion on the way out.
+///
+/// **Spawns in DIFFERENT worktrees use DIFFERENT queue Arcs
+/// and don't serialize against each other**.
+///
+/// ## Sub-2b-3 review-6 #2a: strict in-order advance
+///
+/// Pre-fix the cursor advance was `completed_seq.max(my_seq +
+/// 1)` — any seq calling `signal_done` could jump the cursor
+/// ahead of in-flight earlier seqs. Combined with bash spawns
+/// (whose `signal_done` fired immediately, before any prior
+/// detector had bound), the queue could let detector C
+/// proceed while detector A was still polling. That defeats
+/// the ownership-serialization guarantee that round-4 +
+/// round-5 set up.
+///
+/// New shape:
+///   - `done_count` tracks the exclusive upper bound of the
+///     contiguous completed prefix (seqs in `[0, done_count)`
+///     are done).
+///   - `pending_done` buffers out-of-order completions until
+///     `done_count` catches up.
+///   - `signal_done(my_seq)` advances `done_count` ONLY when
+///     `my_seq == done_count`; otherwise it inserts `my_seq`
+///     into `pending_done`. After each advance, drain
+///     `pending_done` of any seqs that are now next-in-line.
+///
+/// With this, no out-of-order `signal_done` call can let a
+/// later seq's detector slip past an earlier in-flight one.
+pub struct WorktreeSpawnQueue {
+    state: Mutex<WorktreeSpawnQueueState>,
+    cond: Condvar,
+}
+
+struct WorktreeSpawnQueueState {
+    /// Sequence number of the next spawn to enqueue.
+    next_seq: u64,
+    /// Exclusive upper bound of the contiguous completed
+    /// prefix. Sequence numbers in `[0, done_count)` have all
+    /// signaled completion AND every prefix gap has been
+    /// filled. A detector with `my_seq` starts polling when
+    /// `done_count >= my_seq` (all prior seqs done).
+    done_count: u64,
+    /// Out-of-order completions: seqs >= `done_count` that
+    /// have signaled done but are waiting for the cursor to
+    /// catch up. Drained into `done_count` whenever the next
+    /// in-line completes (sub-2b-3 review-6 #2a). In our
+    /// current design with bash skipping the queue entirely
+    /// (review-6 #2b), only the detector-thread `Drop` path
+    /// can populate this set — and detectors are themselves
+    /// FIFO via `wait_for_turn`, so the set typically stays
+    /// empty. Keeping it as a defensive shape makes the queue
+    /// correct against future non-detector signalers.
+    pending_done: BTreeSet<u64>,
+}
+
+impl WorktreeSpawnQueue {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(WorktreeSpawnQueueState {
+                next_seq: 0,
+                done_count: 0,
+                pending_done: BTreeSet::new(),
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Atomically mint a fresh sequence number. Used by
+    /// `mcp_start_session` main thread; cheap, non-blocking.
+    pub fn enqueue(&self) -> u64 {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let seq = s.next_seq;
+        s.next_seq += 1;
+        seq
+    }
+
+    /// Block until all sequence numbers strictly less than
+    /// `my_seq` have signaled completion. Called by the
+    /// detector thread before polling so its dedup check
+    /// against `state.sessions.values().transcript_path`
+    /// observes every prior detector's binding.
+    pub fn wait_for_turn(&self, my_seq: u64) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while s.done_count < my_seq {
+            s = self.cond.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Sub-2b-3 review-9: bounded variant of
+    /// [`wait_for_turn`]. Returns `Ok(())` when the turn is
+    /// acquired; returns `Err(())` if the wait elapsed
+    /// without `done_count` reaching `my_seq`.
+    ///
+    /// `mcp_start_session` uses this with a 20s bound — well
+    /// below the Python `control_client.call()` 30s default
+    /// timeout. Pre-fix the wait was unbounded; a slow
+    /// in-flight detector (up to the 60s detector
+    /// `MAX_DURATION`) could leave the client timeout
+    /// firing while the daemon was still inside
+    /// `mcp_start_session` — the daemon would later resume,
+    /// spawn the child, and create an orphan session the
+    /// client believed had failed.
+    ///
+    /// Callers that hit the timeout MUST drop their ticket
+    /// (signal_done fires via RAII) and surface a transient
+    /// error to the agent. The agent's retry will succeed
+    /// once the prior detector completes.
+    pub fn wait_for_turn_timeout(
+        &self,
+        my_seq: u64,
+        timeout: std::time::Duration,
+    ) -> Result<(), ()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while s.done_count < my_seq {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(());
+            }
+            let remaining = deadline - now;
+            let (next_s, timeout_result) = self
+                .cond
+                .wait_timeout(s, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            s = next_s;
+            if timeout_result.timed_out() && s.done_count < my_seq {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark `my_seq` as completed (sub-2b-3 review-6 #2a:
+    /// strict in-order advance). If `my_seq` is next-in-line
+    /// (`my_seq == done_count`), advance `done_count` and
+    /// drain any contiguous buffered completions. Otherwise
+    /// buffer it in `pending_done` until the cursor catches
+    /// up. A stale signal (`my_seq < done_count`) is
+    /// idempotent — already counted.
+    ///
+    /// Notifies all so any seq blocked in `wait_for_turn`
+    /// rechecks. Notification fires even when the signal was
+    /// only buffered (cheap; waiters re-check the same
+    /// predicate).
+    pub fn signal_done(&self, my_seq: u64) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if my_seq < s.done_count {
+            // Already counted — defensive idempotency.
+            return;
+        }
+        if my_seq == s.done_count {
+            s.done_count += 1;
+            // Drain any buffered next-in-line completions.
+            loop {
+                let next = s.done_count;
+                if s.pending_done.remove(&next) {
+                    s.done_count += 1;
+                } else {
+                    break;
+                }
+            }
+            self.cond.notify_all();
+        } else {
+            // Out-of-order completion — buffer until the
+            // cursor catches up. With review-6 #2b excluding
+            // bash and detectors serializing via
+            // `wait_for_turn`, this branch is typically
+            // unreachable; kept as a defensive shape so a
+            // future non-detector signaler can't break FIFO.
+            s.pending_done.insert(my_seq);
+        }
+    }
+}
+
+/// RAII guard owning a queue slot. Drop calls
+/// `signal_done` so any early return — error in
+/// `mcp_start_session` between enqueue and the detector
+/// thread spawn, panic inside the detector, timeout — still
+/// releases the slot. Subsequent same-worktree spawns can't
+/// block forever (sub-2b-3 review-6 #1).
+///
+/// The guard is `Send` (its fields are `Arc` + `u64` + `bool`)
+/// so it can transfer ownership into the detector thread.
+/// In the success path `mcp_start_session` moves the ticket
+/// into the spawned thread's closure; the thread drops it
+/// after detection completes or times out. In the error
+/// path, the guard drops on function return.
+pub struct WorktreeSpawnTicket {
+    queue: Arc<WorktreeSpawnQueue>,
+    seq: u64,
+    signaled: bool,
+}
+
+impl WorktreeSpawnTicket {
+    pub fn new(queue: Arc<WorktreeSpawnQueue>, seq: u64) -> Self {
+        Self { queue, seq, signaled: false }
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Read-only handle to the underlying queue Arc. The
+    /// detector thread uses this to call `wait_for_turn` and
+    /// inspect the queue without consuming the ticket
+    /// (consumption would defeat the Drop-on-panic guarantee).
+    pub fn queue_arc_clone(&self) -> Arc<WorktreeSpawnQueue> {
+        self.queue.clone()
+    }
+}
+
+impl Drop for WorktreeSpawnTicket {
+    fn drop(&mut self) {
+        if !self.signaled {
+            self.queue.signal_done(self.seq);
+            self.signaled = true;
+        }
+    }
+}
+
+pub type WorktreeSpawnQueues = Arc<Mutex<HashMap<PathBuf, Arc<WorktreeSpawnQueue>>>>;
 
 /// Daemon process state. Lives behind `Arc<Mutex<DaemonState>>` in
 /// `run()`; per-connection threads lock it for the duration of one
@@ -89,6 +326,26 @@ pub struct DaemonState {
     /// `crate::control::methods::list_sessions`'s `task_id` filter
     /// (slice 10d-mcp-surface-2a no-op → honored).
     pub task_tree: HashMap<String, Option<String>>,
+    /// Sub-2b-3 review-2 #1: task → workspace_id mapping
+    /// pushed by the TUI alongside `task_tree` via the
+    /// `task.update_tree` RPC. Used by `mcp_start_session` to
+    /// resolve a descendant task's bound workspace WITHOUT
+    /// requiring a live anchor session in that workspace
+    /// first. Pre-fix the resolver walked `state.sessions` for
+    /// a session tagged with the requested task — which fails
+    /// for first-spawn-into-fresh-subtask (the common case
+    /// `mcp_start_session` is meant to serve).
+    ///
+    /// Replace-not-merge on every `task.update_tree` push, in
+    /// lockstep with `task_tree`. Missing entries are valid (a
+    /// task in `task_tree` with no `task_workspaces` entry is
+    /// in backlog — no workspace yet).
+    pub task_workspaces: HashMap<String, String>,
+    /// Sub-2b-3 review-5 #1: per-worktree FIFO spawn queues.
+    /// `Arc`-shared so the spawn-main path can clone the
+    /// queue out of the state lock and enqueue without
+    /// holding the outer `DaemonState` mutex.
+    pub worktree_spawn_queues: WorktreeSpawnQueues,
 }
 
 impl Default for DaemonState {
@@ -100,6 +357,8 @@ impl Default for DaemonState {
             tickets: TicketAllocator::new(),
             attach_addr: String::new(),
             task_tree: HashMap::new(),
+            task_workspaces: HashMap::new(),
+            worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

@@ -50,51 +50,67 @@ class TransportError(Exception):
     to retry."""
 
 
-def default_socket_path() -> Path:
-    """Resolve the control socket path.
+class SocketRoute:
+    """Resolved socket path + the routing decision that picked it.
 
-    Resolution order:
-      1. `$CM_DAEMON_SOCKET` env var. Injected by the TUI when it
-         spawned this agent with `CM_USE_DAEMON_SOCKET=1`. When
-         present, this is the authoritative pin — the agent talks
-         to the daemon socket, not the TUI's.
-      2. `$CM_TUI_SOCKET` env var. The current default injection by
-         the TUI's MCP-config builder. Daemon-spawned agents always
-         get exactly one of these two pins, so the resolver never
-         sees both.
-      3. `~/.cm/tui.sock` — fallback for ad-hoc callers running
-         outside any env injection. The daemon binds
-         `~/.cm/daemon.sock` but doesn't yet dispatch MCP RPCs (it
-         closes incoming connections), so defaulting to it would
-         break every MCP call.
-
-    Opt-in development override (for ad-hoc callers without env
-    injection):
-      `CM_USE_DAEMON_SOCKET=1` prefers `~/.cm/daemon.sock` when it
-      exists, falling back to `tui.sock` if absent. Used to exercise
-      the daemon path during integration work. Once daemon-side
-      dispatch is wired (deferred half of slice 4 of
-      doc/persistent-host-daemon.md), the default flips and this
-      opt-in becomes a no-op.
-
-    Returns the resolved path unconditionally — connectivity is the
-    caller's problem; this function just resolves where to dial.
+    Sub-2b-3 review-5 #3: separating "which path do I dial" from
+    "did the resolver pick the daemon" lets MCP tool wrappers
+    (`server.py`) choose method names that match the socket
+    target. Pre-fix, `default_socket_path()` would route to the
+    daemon under `CM_USE_DAEMON_SOCKET=1` but the per-tool
+    method selection only looked at `CM_DAEMON_SOCKET` — so the
+    opt-in flag would route `start_session` to the daemon's
+    full-shape handler, which rejects the minimal MCP wire
+    shape with InvalidParams. Routing both decisions through
+    this struct ensures the two signals can't drift.
     """
-    # An explicit daemon-socket pin trumps everything: the TUI
-    # already decided this agent talks to the daemon, no
-    # filesystem probes needed.
+
+    def __init__(self, path: Path, chose_daemon: bool) -> None:
+        self.path = path
+        self.chose_daemon = chose_daemon
+
+
+def resolve_socket_route() -> SocketRoute:
+    """Resolve the control-socket path AND whether the daemon was
+    selected as the target.
+
+    Resolution order (matches `default_socket_path()`'s legacy
+    sequence, with `chose_daemon` set as appropriate at each
+    branch):
+
+      1. `$CM_DAEMON_SOCKET` env var. Explicit daemon pin.
+         Injected by the TUI when it spawned this agent with
+         `CM_USE_DAEMON_SOCKET=1`. `chose_daemon=True`.
+      2. `$CM_TUI_SOCKET` env var. Explicit TUI pin.
+         `chose_daemon=False`.
+      3. `CM_USE_DAEMON_SOCKET=1` opt-in: if `~/.cm/daemon.sock`
+         exists, route to the daemon. `chose_daemon=True`.
+      4. Fallback to `~/.cm/tui.sock`. `chose_daemon=False`.
+
+    Returns the resolved route unconditionally — connectivity
+    is the caller's problem; this function just resolves where
+    to dial and which dialect to speak.
+    """
     daemon_env = os.environ.get("CM_DAEMON_SOCKET", "").strip()
     if daemon_env:
-        return Path(daemon_env)
+        return SocketRoute(Path(daemon_env), chose_daemon=True)
     tui_env = os.environ.get("CM_TUI_SOCKET", "").strip()
     if tui_env:
-        return Path(tui_env)
+        return SocketRoute(Path(tui_env), chose_daemon=False)
     home = Path(os.environ.get("HOME", "/tmp"))
     if os.environ.get("CM_USE_DAEMON_SOCKET", "").strip() == "1":
         daemon_sock = home / ".cm" / "daemon.sock"
         if daemon_sock.exists():
-            return daemon_sock
-    return home / ".cm" / "tui.sock"
+            return SocketRoute(daemon_sock, chose_daemon=True)
+    return SocketRoute(home / ".cm" / "tui.sock", chose_daemon=False)
+
+
+def default_socket_path() -> Path:
+    """Backward-compatible path-only helper. New code should call
+    `resolve_socket_route()` directly so the routing decision is
+    visible alongside the path — see `SocketRoute` for the
+    rationale."""
+    return resolve_socket_route().path
 
 
 def caller_session_uid() -> str:
@@ -104,15 +120,37 @@ def caller_session_uid() -> str:
     return os.environ.get("CM_TUI_SESSION_ID", "").strip()
 
 
-def call(method: str, params: dict | None = None, *, timeout: float = 30.0):
+def call(
+    method: str,
+    params: dict | None = None,
+    *,
+    timeout: float = 30.0,
+    socket_path: Path | None = None,
+):
     """Send a single request and block on the response. Returns the
     `result` value from the Response envelope on success — typically a
     dict, but `list_sessions` returns a list. The only normalization
     we do is `None` → `{}` so callers don't have to special-case methods
     whose result is intentionally absent.
 
+    Sub-2b-3 review-8 #2: `socket_path` lets the caller pass a
+    pre-resolved path so the method-string selection (made via
+    `resolve_socket_route().chose_daemon`) and the actual socket
+    dial bind to the SAME resolution. Pre-fix, `server.py`
+    resolved the route once to pick `mcp_start_session` vs
+    `start_session`, then `call()` independently re-resolved
+    the path — a daemon socket appearing or disappearing
+    between the two resolutions would route the wrong method
+    to the wrong server. Two-step callers should always pass
+    `socket_path` from the same `resolve_socket_route()` they
+    consulted for method selection.
+
+    Callers that don't care about routing (single-method
+    helpers, ad-hoc CLI usage) can omit `socket_path` and the
+    function resolves itself.
+
     Raises:
-        ControlError: the TUI returned `ok=false`.
+        ControlError: the daemon/TUI returned `ok=false`.
         TransportError: socket connect/read/parse failure.
     """
     request = {
@@ -125,7 +163,7 @@ def call(method: str, params: dict | None = None, *, timeout: float = 30.0):
     if len(body) > 4 * 1024 * 1024:
         raise TransportError("request body exceeds 4 MiB cap")
 
-    path = default_socket_path()
+    path = socket_path if socket_path is not None else default_socket_path()
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
