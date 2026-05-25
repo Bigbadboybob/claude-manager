@@ -3775,6 +3775,12 @@ pub fn workflow_done(
         state.workflow_runs.insert(updated.run_id.clone(), updated);
     }
 
+    // GC the per-run writer-lock entry now that the run is done —
+    // no more append_event calls expected for this run_id. Bounds
+    // the static `WRITER_LOCKS` HashMap that would otherwise grow
+    // monotonically for the daemon's lifetime (post-review #10).
+    crate::workflow::events::WorkflowEventsWriter::release_writer_lock(&event.run_id);
+
     Ok(json!({
         "ok": true,
         "event_id": event.id,

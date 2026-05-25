@@ -909,7 +909,14 @@ def workflow_transition(to: str, prompt: str) -> str:
     # (both read the same env shape), so file-write and
     # daemon-routed paths can never drift.
     if control_client.daemon_socket_pinned():
-        run_id = os.environ["CM_WORKFLOW_RUN_ID"]
+        run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
+        if not run_id:
+            raise RuntimeError(
+                "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
+                "usable inside a workflow-participant session. If you "
+                "intended to call this from outside a workflow, that's not "
+                "supported; ask the orchestrator to launch a workflow first."
+            )
         role = os.environ.get("CM_ROLE", "").strip() or "unknown"
         result = control_client.call(
             "workflow_transition",
@@ -938,7 +945,14 @@ def workflow_done(reason: str) -> str:
     # 10d-2b: see `workflow_transition` above — same daemon-vs-
     # TUI-local branching rationale.
     if control_client.daemon_socket_pinned():
-        run_id = os.environ["CM_WORKFLOW_RUN_ID"]
+        run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
+        if not run_id:
+            raise RuntimeError(
+                "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
+                "usable inside a workflow-participant session. If you "
+                "intended to call this from outside a workflow, that's not "
+                "supported; ask the orchestrator to launch a workflow first."
+            )
         role = os.environ.get("CM_ROLE", "").strip() or "unknown"
         result = control_client.call(
             "workflow_done",

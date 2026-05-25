@@ -266,6 +266,22 @@ pub struct ClientSession {
     pub memory_cap_kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+// Post-review #15 (deferred): a `Drop` impl that calls
+// `rpc_kill_session` as a safety net for panic-paths / unexpected
+// drops would prevent orphan daemon children. But it conflicts
+// with `Session::new_attached`'s partial-move pattern at
+// `tui/src/session.rs:274-300`: Rust forbids moving fields out of
+// a type that implements `Drop`. Fixing properly requires
+// extracting a `ClientSessionKillGuard` sub-struct (which can
+// implement `Drop` while the rest of the fields move out around
+// it) OR wrapping the destructure-on-construct path in a
+// `ManuallyDrop` / `into_inner` API. Both are bigger refactors
+// than this batch's scope; tracked as a follow-up. Current
+// safety: the explicit `A-w` and workspace-teardown paths fire
+// `App::kill_daemon_session_if_attached` before the
+// `TerminalSession` is dropped, so orphans only happen on panic
+// / future code that bypasses those handlers.
+
 impl ClientSession {
     /// Drive the full RPC dance and return a fully-armed
     /// `ClientSession`. See the module docs for the step

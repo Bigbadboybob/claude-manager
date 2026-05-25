@@ -330,6 +330,30 @@ fn writer_lock_for(run_id: &str) -> std::sync::Arc<Mutex<()>> {
 }
 
 impl WorkflowEventsWriter {
+    /// GC hook: drop the per-run writer-lock entry once the run is
+    /// known done (e.g. after `workflow_done` lands). Without this,
+    /// `WRITER_LOCKS` accumulates one `Arc<Mutex<()>>` per unique
+    /// run_id for the daemon's entire lifetime — small but
+    /// monotonic, which the persistent-host model can't afford.
+    /// Safe to call multiple times for the same run_id; safe to
+    /// call for an unknown run_id (no-op). Idempotent.
+    ///
+    /// Caller must hold no other reference to the lock when calling
+    /// — otherwise the next `writer_lock_for(run_id)` would mint a
+    /// new lock and concurrent writes against the stale `Arc` would
+    /// race. In practice `workflow_done` is the only authority that
+    /// declares a run finished, and it calls this after the final
+    /// `append_event` returns.
+    pub fn release_writer_lock(run_id: &str) {
+        let map = match WRITER_LOCKS.get() {
+            Some(m) => m,
+            None => return, // no writes ever happened; nothing to GC
+        };
+        let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(run_id);
+    }
+
+
     /// Append `event` to `~/.cm/workflow-runs/<event.run_id>/events.jsonl`.
     /// Creates the run directory at mode `0o700` (tightening if it
     /// already exists with looser perms — same shape as the
