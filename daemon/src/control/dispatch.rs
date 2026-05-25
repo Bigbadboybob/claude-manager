@@ -6232,6 +6232,7 @@ mod tests {
                 crate::workflow::run::RoleBinding {
                     session_label: role.to_string(),
                     current_session_id: None,
+                    daemon_session_uid: None,
                 },
             );
         }

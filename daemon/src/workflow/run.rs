@@ -76,11 +76,29 @@ pub struct HistoryEntry {
 /// We identify the session durably by its label (unique within a task). The
 /// `current_session_id` updates when a `fresh`-context role is respawned and the
 /// underlying Claude/Codex conversation ID changes.
+///
+/// **Field semantics** (10d-2c-2-2-b round-5 F1):
+/// - `current_session_id`: the agent's *transcript id* (JSONL file basename
+///   for Claude; session uid for Codex). Used by the templating resolver to
+///   locate the role's transcript. NOT the same as the daemon-side
+///   `DaemonSession.uid`.
+/// - `daemon_session_uid`: stable daemon-side session uid (matches
+///   `DaemonSession.uid` keys in `DaemonState.sessions`). `Some(_)` iff the
+///   role was bound to a daemon-spawned session at launch / rebind time.
+///   `None` for TUI-only sessions and pre-r5 on-disk records.
+///   Populated by `tui/src/workflow/controller.rs` at every site that writes
+///   `current_session_id` — co-write the matching uid from
+///   `TerminalSession.session.daemon_session_uid`. Used by the daemon's
+///   workflow poller (`cm_daemon::workflow::poller::daemon_owns_run`) as the
+///   durable ownership signal — no longer relies on the best-effort
+///   `session.set_workflow_context` RPC tags.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoleBinding {
     pub session_label: String,
     #[serde(default)]
     pub current_session_id: Option<String>,
+    #[serde(default)]
+    pub daemon_session_uid: Option<String>,
 }
 
 /// Message counts at the moment the workflow run was launched. Later reads of
@@ -682,6 +700,7 @@ mod tests {
             RoleBinding {
                 session_label: "claude".to_string(),
                 current_session_id: Some("sid-1".into()),
+                daemon_session_uid: None,
             },
         );
         roles.insert(
@@ -689,6 +708,7 @@ mod tests {
             RoleBinding {
                 session_label: "reviewer".to_string(),
                 current_session_id: None,
+                daemon_session_uid: None,
             },
         );
         WorkflowRun::new(
@@ -843,6 +863,7 @@ mod tests {
             RoleBinding {
                 session_label: "claude".into(),
                 current_session_id: Some("sid-w".into()),
+                daemon_session_uid: None,
             },
         );
         let mut run = WorkflowRun::new(

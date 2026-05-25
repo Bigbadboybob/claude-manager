@@ -11849,6 +11849,7 @@ mod transcript_rebind_tests {
             workflow::run::RoleBinding {
                 session_label: "worker".into(),
                 current_session_id: Some("old-sid".into()),
+                daemon_session_uid: None,
             },
         );
         let mut role_baselines = BTreeMap::new();

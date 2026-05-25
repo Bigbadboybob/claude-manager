@@ -2265,6 +2265,34 @@ pub struct WorkflowTransitionParams {
     pub prompt: String,
     pub run_id: String,
     pub role: String,
+    /// 10d-2c-2-2-b F2: optional precondition guard. When set,
+    /// the closure validates `run.active_role == expected_from`
+    /// INSIDE the flock and returns Conflict on mismatch. The
+    /// daemon's `cm-workflow-poller` passes
+    /// `Some(snapshot_active_role)` so a state.json change
+    /// between snapshot and apply (e.g., a concurrent MCP
+    /// `workflow_transition` from an agent) aborts the
+    /// poller's call without mutating state.
+    ///
+    /// MCP-direct callers (TUI launch, MCP `start_workflow`)
+    /// leave this `None` — the existing Session-caller auth
+    /// check (`active_role == caller's bound workflow_role`)
+    /// is the implicit precondition there. Operators (this is
+    /// the only path that bypasses Session-auth) get the
+    /// explicit precondition via this field.
+    #[serde(default)]
+    pub expected_from: Option<String>,
+    /// 10d-2c-2-2-b F3: optional trigger discriminator. When
+    /// `Some("static_idle")`, the event's `args.trigger` field
+    /// carries it; the TUI tail reads `args.trigger` and
+    /// constructs `TriggerKind::StaticIdle{from_role}` for the
+    /// history entry. Default (None) → TUI uses
+    /// `TriggerKind::McpTransition{...}` as before.
+    ///
+    /// Daemon poller sets `Some("static_idle")`; MCP callers
+    /// don't set it.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2284,6 +2312,51 @@ fn now_unix_f64() -> f64 {
 
 fn new_event_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 10d-2c-2-2-b round-4 F2: daemon-internal capture of the
+/// outgoing role's last assistant message for the closing
+/// history entry. Mirrors TUI's `fire_transition` capture
+/// (`tui/src/workflow/controller.rs:1719-1735`) but reads
+/// state via the daemon's session registry instead of
+/// `App.workspaces`.
+///
+/// Returns None if any lookup fails — same shape as TUI's
+/// `if let Some((sid, wt))` block. Reasons for None include:
+/// run not on disk yet, no active role, no session bound for
+/// the active role, no worktree_path on the workspace, or no
+/// readable transcript (race with agent startup).
+///
+/// Single-source contract: this function uses the same
+/// `crate::workflow::transcript::last_message` that TUI's
+/// resolver and `fire_transition` use. Engine derivation
+/// mirrors the TUI rule (`engine_for_session_type(session_type)`).
+fn capture_outgoing_last_message(
+    state: &DaemonState,
+    run_id: &str,
+) -> Option<String> {
+    let run = crate::workflow::run::load_one(run_id)?;
+    let active = run.active_role.as_deref()?;
+    let binding = run.role_sessions.get(active)?;
+    let sid = binding.current_session_id.as_deref()?;
+    // Review-round-5 F2: use the shared three-tier fallback
+    // (uid → daemon-tag → TUI-tag with task_id derivation).
+    // Pre-r5-r5 this function did tag-based lookup only; a
+    // daemon-owned session without `set_workflow_context` tags
+    // would fail the lookup and `last_message` would be None on
+    // the closing history entry — permanent audit-data loss.
+    let ctx = crate::workflow::poller::resolve_role_session_context(
+        state, &run, active,
+    )?;
+    let worktree = state
+        .workspaces
+        .get(&ctx.workspace_id)
+        .and_then(|ws| ws.worktree_path.clone())?;
+    let engine = match ctx.session_type.as_str() {
+        "codex" => crate::workflow::toml_schema::Engine::Codex,
+        _ => crate::workflow::toml_schema::Engine::ClaudeCode,
+    };
+    crate::workflow::transcript::last_message(&engine, &worktree, sid)
 }
 
 pub fn workflow_transition(
@@ -2331,6 +2404,30 @@ pub fn workflow_transition(
         };
     let is_session_caller = matches!(caller, Caller::Session(_));
 
+    // 10d-2c-2-2-b round-4 F2: capture the outgoing role's
+    // last assistant message BEFORE `try_modify` so the closure
+    // can pass it to `close_active_role(Some(last_message))`.
+    // Pre-fix every daemon-routed transition (both Session-
+    // caller MCP and Operator-caller poller) called
+    // `close_active_role(None)` and the TUI tail's history
+    // append never set `last_message` either — permanent data
+    // loss in the audit UI for daemon-routed runs.
+    //
+    // Daemon-internal capture: no caller param, no parallel-impl
+    // drift surface. Reads disk + state.sessions to find the
+    // active role's transcript and engine, then calls
+    // `transcript::last_message` (same function the TUI's
+    // `fire_transition` uses for TUI-direct static fires).
+    //
+    // If any lookup fails (run not on disk yet, role unbound,
+    // worktree unknown), capture is None — same fall-through
+    // shape as TUI's `fire_transition` (its `if let Some((sid,
+    // wt))` block).
+    let captured_last_message: Option<String> = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        capture_outgoing_last_message(&state, &p.run_id)
+    };
+
     // 10d-2c-1 review round-1 (F1) → round-4 → round-5 (F2):
     // event write happens AFTER `try_modify` (round-2 shape) with
     // a bounded retry. Sequence:
@@ -2366,13 +2463,34 @@ pub fn workflow_transition(
     // writes the captured value via the shared `Arc<Mutex>`
     // below. We assign `event.from_role` AFTER `try_modify`
     // returns Ok but BEFORE `append_event_with_retry`.
+    // 10d-2c-2-2-b F3: event's `args.trigger` carries the
+    // poller-source discriminator. TUI tail reads it to
+    // construct `TriggerKind::StaticIdle` instead of the default
+    // `McpTransition`. Absent for MCP-direct callers.
+    //
+    // Round-4 F1 (security): only honor `trigger` from Operator
+    // callers. Pre-fix a Session caller (MCP agent) could send
+    // `{"trigger":"static_idle"}` to make their dynamic
+    // transition look like a static idle one — dropping
+    // prompt/event_id audit fields from the TUI tail's
+    // history append. The daemon-poller (the only legitimate
+    // source for static_idle) uses Operator caller, so this
+    // narrows the override to that path.
+    let trigger_str: Option<&str> = match caller {
+        Caller::Operator(_) => p.trigger.as_deref(),
+        Caller::Session(_) => None,
+    };
+    let mut args = json!({"to": p.to, "prompt": p.prompt});
+    if let Some(t) = trigger_str {
+        args["trigger"] = serde_json::Value::String(t.to_string());
+    }
     let mut event = crate::workflow::events::Event {
         id: new_event_id(),
         ts: now_unix_f64(),
         run_id: p.run_id.clone(),
         role: role_for_event.clone(),
         tool: "workflow_transition".to_string(),
-        args: json!({"to": p.to, "prompt": p.prompt}),
+        args,
         source: "daemon".to_string(),
         from_role: None,
         iteration: 0,
@@ -2408,6 +2526,10 @@ pub fn workflow_transition(
     // worktree lookup. Deferred to 10d-2c-2.
     let to_role = p.to.clone();
     let run_id_for_closure = p.run_id.clone();
+    // 10d-2c-2-2-b F2: capture for closure use. Operator-callers
+    // (currently only the daemon-poller) set this; Session-callers
+    // leave it None (their auth check above subsumes it).
+    let expected_from = p.expected_from.clone();
     let rollback_state: Arc<Mutex<Option<crate::workflow::run::WorkflowRun>>> =
         Arc::new(Mutex::new(None));
     let rollback_for_closure = rollback_state.clone();
@@ -2425,6 +2547,11 @@ pub fn workflow_transition(
     // gave the LATEST value to every queued event.
     let captured_iteration: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let captured_iteration_for_closure = captured_iteration.clone();
+    // 10d-2c-2-2-b round-4 F2: move pre-captured last_message
+    // into closure scope. Cloned because the outer `event`
+    // builder doesn't need it (the value lives on the
+    // outgoing history entry, not the event payload).
+    let captured_last_message_for_closure = captured_last_message.clone();
     let outcome = crate::workflow::run::try_modify(
         &p.run_id,
         move |run| -> Result<(), (ErrorCode, String)> {
@@ -2448,6 +2575,29 @@ pub fn workflow_transition(
                         format!(
                             "workflow_transition: caller is not a participant of run {}",
                             run_id_for_closure,
+                        ),
+                    ));
+                }
+            }
+            // 10d-2c-2-2-b F2: expected_from precondition. Operator
+            // callers bypass the Session-caller auth check above,
+            // which would otherwise serve as the "caller is in
+            // the right state" guard. Without this, an Operator
+            // (e.g., the daemon's workflow poller) calling with
+            // a stale snapshot would mutate state regardless of
+            // whether the active_role still matches what the
+            // caller observed. Session callers don't set this
+            // — their auth check above subsumes the precondition.
+            if let Some(expected) = expected_from.as_deref() {
+                let actual = run.active_role.as_deref();
+                if actual != Some(expected) {
+                    return Err((
+                        ErrorCode::Conflict,
+                        format!(
+                            "workflow_transition: expected_from {:?} does not match \
+                             current active_role {:?} for run {} — stale snapshot, \
+                             retry from current state",
+                            expected, actual, run_id_for_closure,
                         ),
                     ));
                 }
@@ -2498,7 +2648,14 @@ pub fn workflow_transition(
             *captured_from_role_for_closure
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = run.active_role.clone();
-            run.close_active_role(None);
+            // 10d-2c-2-2-b round-4 F2: pass the pre-captured
+            // last_message so the closing history entry carries
+            // the outgoing role's last assistant turn. Pre-fix
+            // every daemon-routed transition called
+            // `close_active_role(None)` and the audit UI showed
+            // `(active)` for what should have been a closed
+            // role with its last message recorded.
+            run.close_active_role(captured_last_message_for_closure.clone());
             run.iteration += 1;
             run.active_role = Some(to_role);
             // Round-15: capture POST-mutation iteration so the
@@ -5377,6 +5534,7 @@ mod tests {
                 crate::workflow::run::RoleBinding {
                     session_label: role.to_string(),
                     current_session_id: None,
+                    daemon_session_uid: None,
                 },
             );
         }
@@ -7216,6 +7374,277 @@ mod tests {
                 ),
                 "count=1 > baseline=0 BUT not idle (tool_use \
                  pending) → gate must stay shut",
+            );
+        });
+    }
+
+    // ============================================================
+    // 10d-2c-2-2-b round-4 F1 + F2 tests
+    // ============================================================
+
+    /// F1 — Session caller's `trigger: "static_idle"` param is
+    /// IGNORED. Pre-fix the event's `args.trigger` field would
+    /// have been populated from a Session-caller's input,
+    /// letting an MCP agent forge a static-idle history entry
+    /// (dropping prompt/event_id audit fields).
+    #[test]
+    fn workflow_transition_session_caller_cannot_forge_static_idle_trigger() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Seed run + insert a daemon session for the worker
+            // role so the Session-caller auth check passes
+            // (caller's bound role == active_role).
+            seed_workflow_run("wf_f1_forge_attempt", "worker");
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-forger",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "/tmp/seed-task-key".to_string();
+                sp.workflow_run_id = Some("wf_f1_forge_attempt".to_string());
+                sp.workflow_role = Some("worker".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-forger".to_string(), ds);
+            }
+            let caller = Caller::session("ts-forger");
+            // Session caller attempts to forge static_idle.
+            let params = json!({
+                "to": "reviewer",
+                "prompt": "p",
+                "run_id": "wf_f1_forge_attempt",
+                "role": "worker",
+                "trigger": "static_idle",
+            });
+            workflow_transition(&state, &caller, &params)
+                .expect("transition ok (auth passes)");
+            // Event's args.trigger MUST be absent — Session
+            // caller's forgery attempt was filtered.
+            let (events, _) =
+                crate::workflow::events::read_new("wf_f1_forge_attempt", 0);
+            assert_eq!(events.len(), 1);
+            let trigger = events[0].args.get("trigger");
+            assert!(
+                trigger.is_none(),
+                "Session caller's 'trigger' param must be filtered; \
+                 got args.trigger = {:?}",
+                trigger,
+            );
+        });
+    }
+
+    /// F1 companion — Operator caller's `trigger: "static_idle"`
+    /// param IS honored. The daemon-poller path depends on this.
+    #[test]
+    fn workflow_transition_operator_caller_can_set_static_idle_trigger() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_f1_operator_trigger", "worker");
+            let params = json!({
+                "to": "reviewer",
+                "prompt": "",
+                "run_id": "wf_f1_operator_trigger",
+                "role": "worker",
+                "trigger": "static_idle",
+            });
+            workflow_transition(
+                &state,
+                &Caller::operator("daemon-poller"),
+                &params,
+            )
+            .expect("operator transition ok");
+            let (events, _) =
+                crate::workflow::events::read_new("wf_f1_operator_trigger", 0);
+            assert_eq!(events.len(), 1);
+            let trigger = events[0]
+                .args
+                .get("trigger")
+                .and_then(|v| v.as_str());
+            assert_eq!(
+                trigger,
+                Some("static_idle"),
+                "Operator caller's 'trigger' param must be honored \
+                 so the TUI tail's history append uses \
+                 TriggerKind::StaticIdle. Got args.trigger = {:?}",
+                trigger,
+            );
+        });
+    }
+
+    /// F2 — Handler captures the outgoing role's last assistant
+    /// message and stores it on the closing history entry. Pre-fix
+    /// every daemon-routed transition (Session AND Operator
+    /// callers) called `close_active_role(None)`, permanently
+    /// losing `last_message` from the audit log.
+    #[test]
+    /// Review-round-5 F2 — capture works for daemon-owned
+    /// sessions WITHOUT `workflow_run_id`/`workflow_role` tags
+    /// (simulates `set_workflow_context` push that never
+    /// landed). The new three-tier fallback uses the uid binding
+    /// on `RoleBinding.daemon_session_uid` as the first lookup.
+    /// Pre-fix this test would have failed because the
+    /// tag-based lookup couldn't find the session.
+    #[test]
+    fn workflow_transition_captures_last_message_via_uid_without_tags() {
+        let _tmp = with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-rr5-f2");
+            std::fs::create_dir_all(&wt).unwrap();
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("sid-untagged.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"captured via uid path"}]}}"##,
+            )
+            .unwrap();
+
+            let state = make_state_arc();
+            seed_workflow_run("wf_rr5_f2_uid", "worker");
+            // Bind: worker → sid-untagged transcript + daemon
+            // uid `ts-untagged-w`. NO workflow_run_id/role tags
+            // set on the daemon session (simulates failed
+            // set_workflow_context).
+            crate::workflow::run::modify("wf_rr5_f2_uid", |r| {
+                if let Some(b) = r.role_sessions.get_mut("worker") {
+                    b.current_session_id = Some("sid-untagged".to_string());
+                    b.daemon_session_uid =
+                        Some("ts-untagged-w".to_string());
+                }
+            })
+            .expect("bind worker");
+
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-rr5-f2".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-rr5-f2".to_string(), ws);
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-untagged-w",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws-rr5-f2".to_string();
+                // NB: NOT setting workflow_run_id/workflow_role.
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                assert!(
+                    ds.workflow_run_id.is_none(),
+                    "test precondition: daemon session has no tags",
+                );
+                s.sessions.insert("ts-untagged-w".to_string(), ds);
+            }
+
+            workflow_transition(
+                &state,
+                &Caller::operator("daemon-poller"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_rr5_f2_uid",
+                    "role": "worker",
+                }),
+            )
+            .expect("transition ok");
+
+            let post = crate::workflow::run::load_one("wf_rr5_f2_uid")
+                .expect("load post");
+            let worker_entry = post
+                .history
+                .iter()
+                .find(|h| h.role == "worker")
+                .expect("worker history");
+            assert_eq!(
+                worker_entry.last_message.as_deref(),
+                Some("captured via uid path"),
+                "uid-first fallback must capture last_message even \
+                 without workflow_run_id/role tags. Got: {:?}",
+                worker_entry.last_message,
+            );
+        });
+    }
+
+    fn workflow_transition_captures_outgoing_last_message_on_history() {
+        let _tmp = with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-f2");
+            std::fs::create_dir_all(&wt).unwrap();
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("sid-worker-f2.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"the captured last message"}]}}"##,
+            )
+            .unwrap();
+
+            let state = make_state_arc();
+            seed_workflow_run("wf_f2_last_msg", "worker");
+            // Bind worker's transcript_id so the daemon-side
+            // capture helper can find it.
+            crate::workflow::run::modify("wf_f2_last_msg", |r| {
+                if let Some(b) = r.role_sessions.get_mut("worker") {
+                    b.current_session_id =
+                        Some("sid-worker-f2".to_string());
+                }
+            })
+            .expect("bind worker sid");
+            // Daemon session with workspace_id matching the
+            // workspace we'll register; workflow_role tags so
+            // capture_outgoing_last_message finds it.
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-f2".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-f2".to_string(), ws);
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-worker-f2",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws-f2".to_string();
+                sp.workflow_run_id = Some("wf_f2_last_msg".to_string());
+                sp.workflow_role = Some("worker".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-worker-f2".to_string(), ds);
+            }
+
+            workflow_transition(
+                &state,
+                &Caller::operator("daemon-poller"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_f2_last_msg",
+                    "role": "worker",
+                }),
+            )
+            .expect("transition ok");
+
+            let post = crate::workflow::run::load_one("wf_f2_last_msg")
+                .expect("load post-transition run");
+            // Worker's history entry (the one we just closed)
+            // should have last_message populated.
+            let worker_entry = post
+                .history
+                .iter()
+                .find(|h| h.role == "worker")
+                .expect("worker history entry");
+            assert_eq!(
+                worker_entry.last_message.as_deref(),
+                Some("the captured last message"),
+                "last_message must be captured on the closing \
+                 history entry; pre-fix it would be None. Got: {:?}",
+                worker_entry.last_message,
             );
         });
     }

@@ -429,7 +429,7 @@ impl<'a> WorkflowControllerCtx<'a> {
         let mut transcript_updated_sis: Vec<usize> = Vec::new();
         for slot in &slots {
             let role = &wf.roles[&slot.role];
-            let (session_label, session_id, effective_engine) = match slot.source() {
+            let (session_label, session_id, effective_engine, daemon_session_uid) = match slot.source() {
                 WorkflowSlotSource::Existing(si) => {
                     // Tag with workflow metadata, and if sid isn't known yet,
                     // try to detect it NOW (newest JSONL heuristic) so the
@@ -537,10 +537,16 @@ impl<'a> WorkflowControllerCtx<'a> {
                     };
                     let session_label_clone = ts.label.clone();
                     let session_id_clone = ts.transcript_id.clone();
+                    // 10d-2c-2-2-b round-5 F1: co-capture the
+                    // daemon session uid (Some iff this role is
+                    // bound to a daemon-spawned session).
+                    // Becomes the durable ownership signal in
+                    // `RoleBinding.daemon_session_uid`.
+                    let daemon_uid_clone = ts.session.daemon_session_uid.clone();
                     if let Some(msg) = respawn_warning {
                         actions.push(WorkflowAction::SetStatusMsg(msg));
                     }
-                    (session_label_clone, session_id_clone, eng)
+                    (session_label_clone, session_id_clone, eng, daemon_uid_clone)
                 }
                 WorkflowSlotSource::New(engine) => {
                     match self.spawn_workflow_session(
@@ -550,7 +556,15 @@ impl<'a> WorkflowControllerCtx<'a> {
                         &run_id,
                         inherit_task_id.clone(),
                     ) {
-                        Some((label, sid)) => (label, sid, engine.clone()),
+                        // Round-5 F1: spawn_workflow_session
+                        // returns (label, sid). Workflow respawns
+                        // are TUI-local in Phase 1 (see the
+                        // method's "SpawnTarget::TuiLocal" comment),
+                        // so daemon_session_uid is always None
+                        // for this branch. When workflows
+                        // eventually relocate to daemon-spawn,
+                        // this becomes Some(uid).
+                        Some((label, sid)) => (label, sid, engine.clone(), None),
                         None => {
                             actions.push(WorkflowAction::SetStatusMsg(format!(
                                 "Failed to spawn {}",
@@ -601,6 +615,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                 RoleBinding {
                     session_label,
                     current_session_id: session_id,
+                    daemon_session_uid,
                 },
             );
         }
@@ -812,6 +827,14 @@ impl<'a> WorkflowControllerCtx<'a> {
                 // `0` for pre-r15 on-disk events; the appender
                 // falls back to `r.iteration` then.
                 event_iteration: u32,
+                /// 10d-2c-2-2-b F3: `args.trigger` discriminator
+                /// from the event. `Some("static_idle")` when the
+                /// daemon poller fired this via `workflow_transition`
+                /// with `trigger: "static_idle"`; `None` for MCP-
+                /// direct callers and pre-F3 daemon transitions.
+                /// Drives `TriggerKind` selection at history-append
+                /// time.
+                trigger: Option<String>,
             },
             Done {
                 run_id: String,
@@ -997,6 +1020,16 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 }
                             })
                             .or_else(|| active_role.clone());
+                        // 10d-2c-2-2-b F3: extract `args.trigger`
+                        // discriminator at decision-build time. The
+                        // daemon poller sets this to "static_idle"
+                        // when firing via `workflow_transition`;
+                        // MCP-direct callers leave it absent.
+                        let trigger = ev
+                            .args
+                            .get("trigger")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
                         if let Some(from) = from_opt {
                             decisions.push(Decision::ActivateDynamic {
                                 run_id: run_id.clone(),
@@ -1007,6 +1040,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 daemon_routed,
                                 new_offset: *post_event_offset,
                                 event_iteration: ev.iteration,
+                                trigger,
                             });
                         } else {
                             // No from_role derivable at all
@@ -1120,11 +1154,37 @@ impl<'a> WorkflowControllerCtx<'a> {
                     );
                     if will_fire {
                         if let Some(t) = wf.static_transition_on_idle(active) {
-                            decisions.push(Decision::ActivateStatic {
-                                run_id: run_id.clone(),
-                                to: t.to.clone(),
-                                from: active.to_string(),
-                            });
+                            // 10d-2c-2-2-b (2c-2-3 bundle): per-run
+                            // ownership gate. If the active role's
+                            // session is daemon-spawned
+                            // (`daemon_session_uid.is_some()`), the
+                            // daemon's `cm-workflow-poller` thread
+                            // fires the static `on_idle` — see
+                            // `cm_daemon::workflow::poller::daemon_owns_run`.
+                            // TUI staying out avoids a same-tick
+                            // double-fire on state.json. Both sides
+                            // consult the equivalent condition from
+                            // their authoritative source
+                            // (`daemon_session_uid` for TUI,
+                            // `state.sessions` membership for daemon).
+                            if self.workspaces[ti].sessions[si]
+                                .session
+                                .daemon_session_uid
+                                .is_some()
+                            {
+                                log_tick(
+                                    &run_id,
+                                    "skipping static on_idle: daemon owns \
+                                     this run's active role session — \
+                                     daemon poller fires",
+                                );
+                            } else {
+                                decisions.push(Decision::ActivateStatic {
+                                    run_id: run_id.clone(),
+                                    to: t.to.clone(),
+                                    from: active.to_string(),
+                                });
+                            }
                         }
                     }
                 }
@@ -1175,7 +1235,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                         None,
                     );
                 }
-                Decision::ActivateDynamic { run_id, to, from, prompt, event_id, daemon_routed, new_offset, event_iteration } => {
+                Decision::ActivateDynamic { run_id, to, from, prompt, event_id, daemon_routed, new_offset, event_iteration, trigger: trigger_str } => {
                     if daemon_routed {
                         // 10d-2c-1 review round-1 (F2 + F4 +
                         // P1 #1/#2):
@@ -1296,10 +1356,25 @@ impl<'a> WorkflowControllerCtx<'a> {
                         // and stale baseline, breaking the on_idle
                         // gate and corrupting history's session_id.
                         let start_count = self.compute_role_assistant_count(&run_id, &to);
-                        let trigger = TriggerKind::McpTransition {
-                            from_role: from.clone(),
-                            prompt: prompt.clone(),
-                            event_id: event_id.clone(),
+                        // 10d-2c-2-2-b F3: daemon poller fires
+                        // static `on_idle` via `workflow_transition`
+                        // with `args.trigger = "static_idle"`. The
+                        // history entry must record
+                        // `TriggerKind::StaticIdle` for parity with
+                        // the TUI-direct static path; pre-fix the
+                        // TUI tail hard-coded `McpTransition` for
+                        // all daemon-source events, mis-tagging
+                        // poller-driven idle fires in history.
+                        let trigger = if trigger_str.as_deref() == Some("static_idle") {
+                            TriggerKind::StaticIdle {
+                                from_role: from.clone(),
+                            }
+                        } else {
+                            TriggerKind::McpTransition {
+                                from_role: from.clone(),
+                                prompt: prompt.clone(),
+                                event_id: event_id.clone(),
+                            }
                         };
                         let captured_offset = new_offset;
                         let captured_reset = reset_mutations;
@@ -1561,9 +1636,14 @@ impl<'a> WorkflowControllerCtx<'a> {
                 .keys()
                 .cloned()
                 .collect();
-            // Gather (role, new_sid) pairs that need an update —
-            // computed from the in-memory comparison only.
-            let mut updates: Vec<(String, Option<String>)> = Vec::new();
+            // Gather (role, new_sid, new_daemon_uid) tuples. Round-5
+            // F1: also re-sync `daemon_session_uid` from the live
+            // `TerminalSession.session.daemon_session_uid`. Pre-r5
+            // this only synced transcript_id; the daemon-poller's
+            // ownership gate would miss a session that lost or
+            // gained its daemon attachment between writes.
+            let mut updates: Vec<(String, Option<String>, Option<String>)> =
+                Vec::new();
             for role in role_names {
                 let Some((ti, si)) = locate_workflow_session(self.workspaces, &run_id, &role)
                 else {
@@ -1571,12 +1651,17 @@ impl<'a> WorkflowControllerCtx<'a> {
                 };
 
                 let live = self.workspaces[ti].sessions[si].transcript_id.clone();
-                let binding_sid = self.workflow_runs[idx]
+                let live_daemon_uid =
+                    self.workspaces[ti].sessions[si].session.daemon_session_uid.clone();
+                let binding = self.workflow_runs[idx]
                     .role_sessions
-                    .get(&role)
+                    .get(&role);
+                let binding_sid = binding
                     .and_then(|b| b.current_session_id.clone());
-                if live != binding_sid {
-                    updates.push((role, live));
+                let binding_daemon_uid = binding
+                    .and_then(|b| b.daemon_session_uid.clone());
+                if live != binding_sid || live_daemon_uid != binding_daemon_uid {
+                    updates.push((role, live, live_daemon_uid));
                 }
             }
             if updates.is_empty() {
@@ -1586,9 +1671,10 @@ impl<'a> WorkflowControllerCtx<'a> {
             // touches role_sessions only (TUI-owned).
             let updates_for_closure = updates.clone();
             let updated = workflow::run::modify(&run_id, move |r| {
-                for (role, new_sid) in updates_for_closure {
+                for (role, new_sid, new_daemon_uid) in updates_for_closure {
                     if let Some(b) = r.role_sessions.get_mut(&role) {
                         b.current_session_id = new_sid;
+                        b.daemon_session_uid = new_daemon_uid;
                     }
                 }
             });
@@ -1598,11 +1684,12 @@ impl<'a> WorkflowControllerCtx<'a> {
                 // Modify failed (e.g., run was deleted off disk).
                 // Mirror the updates in memory anyway so subsequent
                 // in-process logic doesn't see stale bindings.
-                for (role, new_sid) in updates {
+                for (role, new_sid, new_daemon_uid) in updates {
                     if let Some(b) =
                         self.workflow_runs[idx].role_sessions.get_mut(&role)
                     {
                         b.current_session_id = new_sid;
+                        b.daemon_session_uid = new_daemon_uid;
                     }
                 }
             }
@@ -2374,6 +2461,7 @@ mod tests {
             RoleBinding {
                 session_label: "worker".to_string(),
                 current_session_id: None,
+                daemon_session_uid: None,
             },
         );
         role_sessions.insert(
@@ -2381,6 +2469,7 @@ mod tests {
             RoleBinding {
                 session_label: "reviewer".to_string(),
                 current_session_id: None,
+                daemon_session_uid: None,
             },
         );
         WorkflowRun::new(
@@ -2431,6 +2520,433 @@ mod tests {
         .expect("codex transcript");
     }
 
+    /// 10d-2c-2-2-b T2 (2c-2-3 gate) — when the active role's
+    /// session is daemon-spawned (`daemon_session_uid.is_some()`),
+    /// the TUI's controller MUST NOT push
+    /// `Decision::ActivateStatic`. The daemon's
+    /// `cm-workflow-poller` fires for this run instead.
+    ///
+    /// Setup: a run with worker as active role, worker session
+    /// has `daemon_session_uid = Some(...)`, and the transcript
+    /// shows count > baseline + is idle so the gate WOULD fire if
+    /// not for the new ownership check.
+    ///
+    /// Assertion: after `tick()`, the on-disk run's `active_role`
+    /// is still "worker" (no transition), and iteration is
+    /// unchanged. The daemon-side `Decision::ActivateStatic` fire
+    /// path is covered in
+    /// `cm_daemon::workflow::poller::tests::poll_once_fires_activate_static_*`.
+    #[test]
+    fn tui_static_idle_gate_skips_when_active_role_is_daemon_spawned() {
+        with_temp_home(|| {
+            let run_id = "wf_t2_tui_gate_daemon_owned";
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).expect("mkdir wt");
+            // Write a claude transcript with one complete
+            // assistant turn so `is_idle` + count > baseline
+            // would normally fire the gate.
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            std::fs::write(
+                proj.join("sid-worker.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+            )
+            .expect("write transcript");
+
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Bind worker's transcript_id so the resolver +
+            // is_idle gate can locate the JSONL.
+            run.role_sessions
+                .get_mut("worker")
+                .unwrap()
+                .current_session_id = Some("sid-worker".to_string());
+            workflow::run::save(&run).expect("seed run");
+            let mut runs = vec![run];
+
+            // Build the worker session WITH daemon_session_uid =
+            // Some(...) — this is what the new gate keys off.
+            let mut worker_session = stub_session(
+                "worker",
+                "claude-code",
+                run_id,
+                "worker",
+                Some("sid-worker"),
+            );
+            worker_session.session.daemon_session_uid =
+                Some("ts-daemon-worker".to_string());
+            let mut workspaces =
+                vec![workspace_with(vec![worker_session], Some(wt.clone()))];
+
+            // Minimal workflow def: worker → reviewer on idle.
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let wf = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![Transition {
+                    from: "worker".to_string(),
+                    on: TriggerOn::Idle,
+                    to: "reviewer".to_string(),
+                }],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), wf);
+
+            let dummy = dummy_cap_state();
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.tick();
+            }
+
+            // No transition fired — daemon owns this run, TUI
+            // poller stays out. `active_role` is still worker.
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert_eq!(
+                post.active_role.as_deref(),
+                Some("worker"),
+                "TUI gate must skip when daemon owns: active_role \
+                 stays at worker; got {:?}",
+                post.active_role,
+            );
+            assert_eq!(
+                post.iteration, 1,
+                "iteration must not advance: gate skipped, no \
+                 close_active_role mutation",
+            );
+        });
+    }
+
+    /// F3 — TUI tail processing a daemon-source event whose
+    /// `args.trigger == "static_idle"` records the history entry
+    /// with `TriggerKind::StaticIdle{from_role}`, NOT
+    /// `TriggerKind::McpTransition`. Pre-fix all daemon-source
+    /// events landed as McpTransition, mis-tagging poller-driven
+    /// idle fires.
+    #[test]
+    fn tui_tail_records_static_idle_trigger_from_daemon_poller_event() {
+        with_temp_home(|| {
+            let run_id = "wf_f3_static_idle_history";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Write a daemon-source event with
+            // `args.trigger = "static_idle"` — what the poller's
+            // internal `workflow_transition` call emits.
+            let ev = workflow::events::Event {
+                id: "evt-f3-static".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "",
+                    "trigger": "static_idle",
+                }),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 2,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append ev");
+
+            // Minimal workspace with the worker session bound so
+            // `locate_workflow_session` and the prompt-delivery
+            // path find it. daemon_session_uid set so the TUI
+            // gate doesn't skip the run.
+            let mut worker_session =
+                stub_session("worker", "claude-code", run_id, "worker", None);
+            worker_session.session.daemon_session_uid =
+                Some("ts-daemon-worker".to_string());
+            let mut reviewer_session =
+                stub_session("reviewer", "claude-code", run_id, "reviewer", None);
+            reviewer_session.session.daemon_session_uid =
+                Some("ts-daemon-reviewer".to_string());
+            let mut workspaces = vec![workspace_with(
+                vec![worker_session, reviewer_session],
+                Some(std::path::PathBuf::from("/tmp/f3-wt")),
+            )];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let wf = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), wf);
+
+            let dummy = dummy_cap_state();
+            let mut runs = vec![run];
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.tick();
+            }
+
+            // History should have an entry for "reviewer" with
+            // `TriggerKind::StaticIdle{from_role: "worker"}`.
+            let post = workflow::run::load_one(run_id).expect("post load");
+            let reviewer_entry = post
+                .history
+                .iter()
+                .rev()
+                .find(|h| h.role == "reviewer")
+                .expect("reviewer history entry");
+            match &reviewer_entry.trigger {
+                workflow::run::TriggerKind::StaticIdle { from_role } => {
+                    assert_eq!(
+                        from_role, "worker",
+                        "StaticIdle.from_role should be worker, got {:?}",
+                        from_role,
+                    );
+                }
+                other => panic!(
+                    "expected TriggerKind::StaticIdle, got {:?}",
+                    other,
+                ),
+            }
+        });
+    }
+
+    /// F1/F4 gate-decision parity. Drive the TUI's
+    /// static-idle gate path AND the daemon's `poll_once`
+    /// gate path with the same inputs (same run, same workflow,
+    /// same transcript). Both must agree on fire/skip.
+    ///
+    /// 2c-2-2-b's original parity test only covered resolver
+    /// OUTPUT (template rendering). This expansion covers the
+    /// gate's FIRE decision — exactly the surface where F1
+    /// (different baseline source) and F4 (different empty-prompt
+    /// behavior) silently diverged.
+    #[test]
+    fn gate_fire_decisions_parity_between_tui_and_daemon() {
+        with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-gate-parity");
+            std::fs::create_dir_all(&wt).expect("mkdir");
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            // One complete assistant turn — count = 1, idle = true.
+            std::fs::write(
+                proj.join("sid-w.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"complete"}]}}"##,
+            )
+            .expect("write transcript");
+
+            // Build a run with active_role="worker" and a
+            // history entry for worker with
+            // assistant_count_at_start=0 (baseline). The active
+            // assistant_count is now 1, so the gate should fire
+            // on both sides.
+            let mut role_sessions = BTreeMap::new();
+            role_sessions.insert(
+                "worker".to_string(),
+                RoleBinding {
+                    session_label: "worker".to_string(),
+                    current_session_id: Some("sid-w".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            let baselines = BTreeMap::new();
+            let run = WorkflowRun::new(
+                "wf-gate-parity".to_string(),
+                "feedback".to_string(),
+                "/tmp/gate-parity".to_string(),
+                role_sessions,
+                "worker".to_string(),
+                baselines,
+                None,
+                BTreeMap::new(),
+            );
+
+            // TUI gate behavior: count_assistant_turns >
+            // active_assistant_start_count AND is_idle. The TUI's
+            // `tick_local` does this inline (controller.rs:1093).
+            // We replicate the predicate here for the parity test.
+            let tui_baseline = run.active_assistant_start_count().unwrap_or(0);
+            let tui_count = workflow::transcript::count_messages(
+                &Engine::ClaudeCode,
+                &wt,
+                "sid-w",
+                workflow::transcript::MessageKind::Assistant,
+            );
+            let tui_idle = workflow::transcript::role_turn_complete(
+                &Engine::ClaudeCode,
+                &wt,
+                "sid-w",
+            );
+            let tui_would_fire = tui_count > tui_baseline && tui_idle;
+
+            // Daemon gate behavior: same predicate via the
+            // bundled helper.
+            let dae_would_fire =
+                workflow::transcript::assistant_turn_completed_since(
+                    &Engine::ClaudeCode,
+                    &wt,
+                    "sid-w",
+                    run.active_assistant_start_count().unwrap_or(0),
+                );
+
+            assert_eq!(
+                tui_would_fire, dae_would_fire,
+                "gate decisions diverge: TUI={}, daemon={} \
+                 (count={}, baseline={}, idle={})",
+                tui_would_fire, dae_would_fire, tui_count, tui_baseline, tui_idle,
+            );
+            // Should be TRUE for this scenario — both fire.
+            assert!(
+                tui_would_fire,
+                "test setup: both should fire (1 turn > 0 baseline, idle)",
+            );
+        });
+    }
+
+    /// Resolver parity (T6). Daemon's `DaemonWorkflowResolver`
+    /// and TUI's `WorkflowResolver` must produce byte-identical
+    /// rendered output for the same logical inputs (workflow_def
+    /// + run + role bindings + worktree + role engines).
+    ///
+    /// **The contract**: any divergence here means a future
+    /// behavior change drifts between daemon-driven and TUI-driven
+    /// static-idle fires. If a future read-path needs to diverge
+    /// (e.g., daemon reads from a different transcript source),
+    /// surface it as an EXPLICIT trait method, don't silently
+    /// fork.
+    #[test]
+    fn daemon_and_tui_resolvers_produce_identical_template_output() {
+        with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-parity");
+            std::fs::create_dir_all(&wt).expect("mkdir wt");
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            std::fs::write(
+                proj.join("sid-w.jsonl"),
+                r##"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first prompt"}]}}
+{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"answer one"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second prompt"}]}}
+{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"answer two"}]}}
+"##,
+            )
+            .expect("write transcript");
+
+            // Build the run with worker bound + a baseline that
+            // skips the first user/assistant pair (so prior_* vs
+            // current_* slicing diverges meaningfully across the
+            // two resolvers if there's any drift).
+            let mut role_sessions = BTreeMap::new();
+            role_sessions.insert(
+                "worker".to_string(),
+                RoleBinding {
+                    session_label: "worker".to_string(),
+                    current_session_id: Some("sid-w".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            let mut baselines = BTreeMap::new();
+            baselines.insert(
+                "worker".to_string(),
+                MessageBaseline {
+                    user_count: 1,
+                    assistant_count: 1,
+                },
+            );
+            let run = WorkflowRun::new(
+                "wf-parity".to_string(),
+                "feedback".to_string(),
+                "/parity".to_string(),
+                role_sessions,
+                "worker".to_string(),
+                baselines,
+                Some("the run goal".to_string()),
+                BTreeMap::new(),
+            );
+
+            let mut role_engines = BTreeMap::new();
+            role_engines.insert("worker".to_string(), Engine::ClaudeCode);
+
+            // TUI side.
+            let tui_resolver = WorkflowResolver {
+                run: &run,
+                worktree_path: Some(wt.as_path()),
+                role_engines: role_engines.clone(),
+            };
+            // Daemon side. Same crate boundary; importable here
+            // because the parity test lives in the TUI crate,
+            // which depends on cm-daemon.
+            let dae_resolver =
+                cm_daemon::workflow::poller::DaemonWorkflowResolver {
+                    run: &run,
+                    worktree_path: Some(wt.as_path()),
+                    role_engines,
+                };
+
+            // Three template shapes covering: post-baseline,
+            // pre-baseline, last-message alias, goal.
+            for tpl in [
+                "{{ roles.worker.user[0] }}",
+                "{{ roles.worker.assistant[0] }}",
+                "{{ roles.worker.prior_user[-1] }}",
+                "{{ roles.worker.prior_assistant[-1] }}",
+                "{{ roles.worker.last_message }}",
+                "{{ goal }}",
+                "review: {{ roles.worker.last_message }} ({{ goal }})",
+            ] {
+                let tui_out = workflow::template::render(tpl, &tui_resolver);
+                let dae_out = workflow::template::render(tpl, &dae_resolver);
+                assert_eq!(
+                    tui_out, dae_out,
+                    "resolver outputs diverge for template {:?}: \
+                     TUI={:?}, daemon={:?}",
+                    tpl, tui_out, dae_out,
+                );
+            }
+        });
+    }
+
     /// 10d-2c-1 review round-14 — named acceptance test.
     /// When multiple daemon transitions queue up before the TUI
     /// processes any of them, each queued event must record the
@@ -2457,6 +2973,7 @@ mod tests {
                 RoleBinding {
                     session_label: "manager".to_string(),
                     current_session_id: None,
+                    daemon_session_uid: None,
                 },
             );
             workflow::run::save(&run).expect("seed save");
@@ -3037,6 +3554,7 @@ mod tests {
                 RoleBinding {
                     session_label: "manager".to_string(),
                     current_session_id: None,
+                    daemon_session_uid: None,
                 },
             );
             workflow::run::save(&run).expect("seed save");

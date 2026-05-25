@@ -60,12 +60,17 @@
 //! This is enforced by code structure: `collect_snapshots` returns
 //! `Vec<TickSnapshot>` only, no guard.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::control::protocol::Caller;
 use crate::state::DaemonState;
+use crate::workflow::run::WorkflowRun;
+use crate::workflow::toml_schema::{Engine, Workflow};
 
 /// Default tick interval (microseconds). 250ms is a balance between
 /// responsiveness (a quiet agent's turn-complete fires the next
@@ -79,31 +84,37 @@ pub const DEFAULT_TICK_INTERVAL_MICROS: u64 = 250_000;
 /// `set_tick_interval_for_test(0)` from busy-looping a CPU core.
 const MIN_TICK_INTERVAL_MICROS: u64 = 1_000; // 1ms floor
 
-/// One per-run decision emitted by `poll_once`. 2c-2-2-a's gate
-/// returns `false` unconditionally so every decision is `Skip`; the
-/// shape is here so the tests can assert "decisions were produced
-/// and inspected, but none fired" without changing the API later.
+/// One per-run decision emitted by `poll_once`. 2c-2-2-b makes
+/// `ActivateStatic` a fire path: `poll_once` calls
+/// `workflow_transition` internally for each, reusing the same
+/// handler MCP callers use (battle-tested across 2c-1's 15 reviewer
+/// rounds). Skip carries a typed reason for log + test visibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Daemon-owned active role had a completed turn since baseline;
-    /// a static `on_idle` transition would fire. 2c-2-2-b wires the
-    /// actual mutation; 2c-2-2-a logs only.
+    /// a static `on_idle` transition fires. Carries the rendered
+    /// activation prompt — built daemon-side via
+    /// [`DaemonWorkflowResolver`] so the TUI tail can deliver it
+    /// even when the TUI was offline at fire time.
     ActivateStatic {
         run_id: String,
         from_role: String,
         to_role: String,
+        rendered_prompt: String,
     },
-    /// Run was inspected but no fire — either no `on_idle` defined,
-    /// the gate doesn't favor daemon ownership, or the agent isn't
-    /// idle yet. Carries `reason` for log/test visibility.
+    /// Run was inspected but no fire — gate didn't favor daemon
+    /// ownership, the agent isn't idle, or some precondition isn't
+    /// met yet. Carries `reason` for log/test visibility.
     Skip { run_id: String, reason: SkipReason },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// `daemon_owns_run` returned false for this tick. 2c-2-2-a
-    /// returns this for every run (gate is hard-coded false).
+    /// Active role's session isn't daemon-owned. The TUI's
+    /// controller fires for this run. See [`daemon_owns_run`].
     TuiOwns,
+    /// Run is paused. Pollers skip paused runs until resumed.
+    Paused,
     /// Run has no active role (transient state during start/stop).
     NoActiveRole,
     /// Active role's session has no transcript id yet (spawn in
@@ -114,7 +125,7 @@ pub enum SkipReason {
     NoWorktreePath,
     /// Workflow definition isn't loaded yet (TUI hasn't pushed
     /// `workflow_update_definitions` yet, or the workflow name on
-    /// the run doesn't match any pushed definition).
+    /// the run doesn't match any pushed definition). R10.
     NoWorkflowDefinition,
     /// Workflow definition has no `on_idle` transition from the
     /// active role.
@@ -122,19 +133,78 @@ pub enum SkipReason {
     /// Gate ran, idle predicate ran, but the agent isn't idle since
     /// baseline. Most common steady-state skip.
     NotIdle,
+    /// Active role's session wasn't found in either
+    /// `state.sessions` or `state.tui_sessions` (the gate
+    /// couldn't determine ownership). Self-resolves once
+    /// `tui_sessions` push catches up (R11).
+    SessionNotFound,
+    /// 10d-2c-2-2-b F1: no history entry for the currently-active
+    /// role yet. Happens in the 10d-2c-1 round-1 gap window —
+    /// daemon's `workflow_transition` handler advances
+    /// `active_role` under flock, but the TUI tail's history-entry
+    /// append happens later when it consumes the event. The
+    /// daemon-poller can see the post-mutation state.json before
+    /// the TUI gets there. Using `role_baselines` (launch-time)
+    /// in this window would be a STALE baseline for any role on
+    /// its 2nd+ activation — false-positive idle fires. Skip with
+    /// this reason; next tick (after TUI appends) the gate has a
+    /// real `active_assistant_start_count` to compare against.
+    ///
+    /// Parity note: TUI's path uses
+    /// `WorkflowRun::active_assistant_start_count().unwrap_or(0)`
+    /// — the `unwrap_or(0)` is BENIGN there because the TUI tail
+    /// performs the history append in the same `modify` closure
+    /// that consumes the daemon event, so TUI never observes the
+    /// gap. Daemon-poller does observe the gap, hence the skip.
+    /// This divergence is intentional + commented at the call
+    /// site in `evaluate_snapshot`.
+    NoHistoryEntry,
 }
 
 /// What `collect_snapshots` returns under the lock. Pure data — no
 /// borrows back into `DaemonState`. The poller body iterates these
 /// AFTER dropping the state mutex so transcript I/O doesn't block
 /// dispatch threads. See the `lock-contention pattern` docs above.
+///
+/// 2c-2-2-b: enough state to evaluate the gate + render the
+/// activation prompt without re-acquiring the lock. Anything that
+/// would require a re-read (e.g. checking `state.sessions` for the
+/// gate, or workflow_definitions for the template) is captured here.
 #[derive(Debug, Clone)]
 struct TickSnapshot {
     run_id: String,
-    /// Reserved for 2c-2-2-b; logged only in 2c-2-2-a.
-    #[allow(dead_code)]
     workflow_name: String,
     active_role: Option<String>,
+    paused: bool,
+    /// Cloned `WorkflowRun` for the resolver to read (role_baselines,
+    /// role_plans, goal, history). Cheap clone — `WorkflowRun` is
+    /// small and the poller fires at most one transition per run
+    /// per tick.
+    run: WorkflowRun,
+    /// Worktree path for the run's workspace, if known.
+    /// `state.workspaces.get(&run.task_key).worktree_path`. None
+    /// during sub-2b-3's async-detector window (R8 from prior
+    /// proposal); skip with `NoWorktreePath`.
+    worktree_path: Option<PathBuf>,
+    /// Per-role session_type, used to derive the engine for
+    /// transcript reads. Built by walking `state.sessions` +
+    /// `state.tui_sessions` looking for entries whose
+    /// `workflow_run_id` + `workflow_role` match this run.
+    role_session_types: BTreeMap<String, String>,
+    /// True iff the active role's session lives in `state.sessions`
+    /// (daemon-spawned). Otherwise the TUI's poller owns this run.
+    /// 2c-2-2-b's gate. Captured here so the apply phase doesn't
+    /// need to re-walk session maps under the lock.
+    daemon_owns: bool,
+    /// True iff we found ANY session (daemon or TUI) for the active
+    /// role. Distinguishes "TUI owns" from "no session bound yet"
+    /// (R11 — TUI snapshot push lag).
+    active_session_found: bool,
+    /// Snapshot of the workflow definition, if loaded. Cloned
+    /// because the apply phase may run under a fresh state lock
+    /// in [`fire_static_transition`] and we don't want to re-lookup
+    /// (R12: definition could be replaced mid-tick).
+    workflow: Option<Workflow>,
 }
 
 /// Record of the most recent `poll_once` panic. Read by the
@@ -161,6 +231,24 @@ pub struct WorkflowPoller {
     /// total panic count. Populated alongside the stderr log.
     /// `None` until the first panic; tests assert on `Some(...)`.
     panic_record: Arc<Mutex<Option<PanicRecord>>>,
+    /// Test-only: skip the apply phase so `poll_once` returns
+    /// decisions without actually invoking `workflow_transition`.
+    /// Lets gate-output tests (T1, T2 daemon-side, R10) run
+    /// without the full flock + events.jsonl + state.json
+    /// machinery. Production always reads this as `false`.
+    disable_apply_for_test: AtomicBool,
+    /// 10d-2c-2-2-b F2 test seam (pulled forward from 2c-2-2-c):
+    /// runs between snapshot collection and the apply phase.
+    /// Tests inject a closure that mutates `DaemonState` to
+    /// simulate a concurrent role swap. The apply phase's
+    /// `expected_from` check inside `workflow_transition` then
+    /// aborts with Conflict.
+    ///
+    /// `Mutex<Option<Box<dyn ...>>>` instead of an OnceCell so
+    /// tests can set, run, set-different, run again. Production
+    /// never sets this.
+    pre_apply_hook:
+        Mutex<Option<Box<dyn Fn(&mut DaemonState) + Send + Sync>>>,
 }
 
 impl WorkflowPoller {
@@ -173,7 +261,32 @@ impl WorkflowPoller {
             tick_micros: Arc::new(AtomicU64::new(DEFAULT_TICK_INTERVAL_MICROS)),
             handle: Mutex::new(None),
             panic_record: Arc::new(Mutex::new(None)),
+            disable_apply_for_test: AtomicBool::new(false),
+            pre_apply_hook: Mutex::new(None),
         }
+    }
+
+    /// Test-only setter. Skips the apply phase so callers can
+    /// assert on the produced `Decision` vec without invoking the
+    /// `workflow_transition` handler (which would touch
+    /// events.jsonl, state.json, per-run flocks, etc.). The full
+    /// fire pipeline is exercised by the existing
+    /// `workflow_transition_*` test suite + 2c-2-2-c's race tests.
+    pub fn set_disable_apply_for_test(&self, disable: bool) {
+        self.disable_apply_for_test.store(disable, Ordering::SeqCst);
+    }
+
+    /// 10d-2c-2-2-b F2 test seam: install a hook that runs between
+    /// the snapshot-collect phase and the apply phase. Tests use
+    /// this to inject a stale-snapshot race (e.g., flip
+    /// `active_role` between snapshot and apply) and assert
+    /// `workflow_transition`'s `expected_from` check catches it.
+    /// Production never sets this.
+    pub fn set_pre_apply_hook_for_test<F>(&self, hook: F)
+    where
+        F: Fn(&mut DaemonState) + Send + Sync + 'static,
+    {
+        *self.pre_apply_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Read the most recent `poll_once` panic, if any. `None` until
@@ -244,6 +357,14 @@ impl WorkflowPoller {
     /// `poll_once` itself is allowed to panic in tests that want to
     /// assert "this would have panicked"; `run_loop` is what guards
     /// the daemon against the panic.
+    ///
+    /// Phases:
+    /// 1. Collect snapshots under the lock (pure read).
+    /// 2. Evaluate each snapshot lock-free (transcript I/O,
+    ///    prompt rendering).
+    /// 3. Apply `Decision::ActivateStatic` decisions via internal
+    ///    `workflow_transition` calls — the same handler MCP
+    ///    callers use.
     pub fn poll_once(&self) -> Vec<Decision> {
         // Phase 1: collect snapshots under the lock. Pure read.
         let snapshots = {
@@ -251,33 +372,276 @@ impl WorkflowPoller {
             collect_snapshots(&s)
         }; // lock dropped here — transcript I/O happens lock-free
 
-        // Phase 2: evaluate each snapshot lock-free. 2c-2-2-a's
-        // `daemon_owns_run` is hard-coded false; 2c-2-2-b will
-        // consult `state.sessions` via a quick re-read.
-        let mut decisions = Vec::with_capacity(snapshots.len());
-        for snap in &snapshots {
-            decisions.push(self.evaluate_snapshot(snap));
+        // Phase 2: evaluate each snapshot lock-free.
+        let decisions: Vec<Decision> = snapshots
+            .iter()
+            .map(|snap| self.evaluate_snapshot(snap))
+            .collect();
+
+        // 10d-2c-2-2-b F2 test seam: invoke pre_apply_hook (if
+        // installed) between evaluate and apply. Tests use this
+        // to simulate a concurrent state mutation so the
+        // `expected_from` precondition in `workflow_transition`
+        // fires. Production never installs this hook.
+        {
+            let hook_guard = self.pre_apply_hook.lock().unwrap();
+            if let Some(hook) = hook_guard.as_ref() {
+                let mut state = self.state.lock().unwrap();
+                hook(&mut state);
+            }
         }
 
-        // Phase 3: 2c-2-2-a has no fire path (all decisions are
-        // Skip). 2c-2-2-b adds the `try_modify` apply step here.
+        // Phase 3: apply each ActivateStatic via the existing
+        // `workflow_transition` handler. The handler does its own
+        // flock + try_modify + event-write; if the snapshot is
+        // stale (e.g. active_role flipped between snapshot and
+        // here), the handler's auth/precondition check fails and
+        // returns Conflict — we log and move on.
+        //
+        // Apply errors don't promote into the returned `decisions`
+        // vector (the test invariants only assert which decisions
+        // were PRODUCED, not which applied). 2c-2-2-c's race tests
+        // assert the apply outcome separately via state inspection.
+        if !self.disable_apply_for_test.load(Ordering::SeqCst) {
+            for d in &decisions {
+                if let Decision::ActivateStatic {
+                    run_id,
+                    from_role,
+                    to_role,
+                    rendered_prompt,
+                } = d
+                {
+                    if let Err(e) = self.fire_static_transition(
+                        run_id,
+                        from_role,
+                        to_role,
+                        rendered_prompt,
+                    ) {
+                        eprintln!(
+                            "cm-daemon: workflow poller failed to fire static \
+                             transition for run={} from={} to={}: {}",
+                            run_id, from_role, to_role, e,
+                        );
+                    }
+                }
+            }
+        }
+
         decisions
     }
 
-    /// 2c-2-2-a stub: returns `Decision::Skip { TuiOwns }`
-    /// unconditionally. 2c-2-2-b replaces this with the real
-    /// gate that checks `state.sessions` for active-role
-    /// session membership.
+    /// 2c-2-2-b real evaluate. The hot path:
+    /// 1. `active_role` must be set.
+    /// 2. Not paused.
+    /// 3. Daemon owns the active role's session (per
+    ///    `TickSnapshot.daemon_owns`).
+    /// 4. Workflow definition loaded + has on_idle from active.
+    /// 5. Worktree path known.
+    /// 6. `assistant_turn_completed_since(engine, wt, sid,
+    ///    baseline)` returns true.
+    /// 7. Activation prompt renders to non-empty string.
     fn evaluate_snapshot(&self, snap: &TickSnapshot) -> Decision {
-        let Some(_active) = snap.active_role.as_deref() else {
+        if snap.paused {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::Paused,
+            };
+        }
+        let Some(active) = snap.active_role.as_deref() else {
             return Decision::Skip {
                 run_id: snap.run_id.clone(),
                 reason: SkipReason::NoActiveRole,
             };
         };
-        Decision::Skip {
+        if !snap.active_session_found {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::SessionNotFound,
+            };
+        }
+        if !snap.daemon_owns {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::TuiOwns,
+            };
+        }
+        let Some(wf) = snap.workflow.as_ref() else {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NoWorkflowDefinition,
+            };
+        };
+        let Some(transition) = wf.static_transition_on_idle(active) else {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NoOnIdleTransition,
+            };
+        };
+        let Some(worktree) = snap.worktree_path.as_deref() else {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NoWorktreePath,
+            };
+        };
+        let Some(binding) = snap.run.role_sessions.get(active) else {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NoTranscriptId,
+            };
+        };
+        let Some(sid) = binding.current_session_id.as_deref() else {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NoTranscriptId,
+            };
+        };
+        let session_type = snap
+            .role_session_types
+            .get(active)
+            .map(|s| s.as_str())
+            .unwrap_or("claude-code");
+        let engine = engine_for_session_type(session_type);
+        // F1: read baseline from the most recent history entry
+        // for the active role — matches TUI's
+        // `tui/src/workflow/controller.rs:1087` use of
+        // `active_assistant_start_count()`. Pre-fix the daemon
+        // read `role_baselines[active].assistant_count` (the
+        // LAUNCH-time floor); after the 2nd+ activation that's
+        // stale and the gate fires every tick.
+        //
+        // None means the 10d-2c-1 round-1 gap: state.json has
+        // active_role advanced but TUI hasn't yet appended the
+        // history entry for it. Skip with NoHistoryEntry; the
+        // next tick (after TUI catches up) proceeds normally.
+        let Some(baseline) = snap.run.active_assistant_start_count() else {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NoHistoryEntry,
+            };
+        };
+        let fire = crate::workflow::transcript::assistant_turn_completed_since(
+            &engine, worktree, sid, baseline,
+        );
+        if !fire {
+            return Decision::Skip {
+                run_id: snap.run_id.clone(),
+                reason: SkipReason::NotIdle,
+            };
+        }
+
+        // Render activation prompt. Same shape as the TUI's
+        // `WorkflowResolver` path; uses
+        // `subsequent_activation_prompt` when the target role has
+        // prior activations in `run.history` (matches
+        // `tui/src/workflow/controller.rs:1687-1695`).
+        let to_role = transition.to.clone();
+        let target_role_spec = match wf.roles.get(&to_role) {
+            Some(r) => r,
+            None => {
+                return Decision::Skip {
+                    run_id: snap.run_id.clone(),
+                    reason: SkipReason::NoOnIdleTransition,
+                };
+            }
+        };
+        let prior_activations =
+            snap.run.history.iter().filter(|h| h.role == to_role).count();
+        let template = if prior_activations > 0 {
+            target_role_spec
+                .subsequent_activation_prompt
+                .as_deref()
+                .or(target_role_spec.activation_prompt.as_deref())
+        } else {
+            target_role_spec.activation_prompt.as_deref()
+        };
+        // F4: do NOT skip on missing-template or empty-rendered
+        // prompt. TUI's path `tui/src/workflow/controller.rs:2089`
+        // fires the transition either way: it just skips the
+        // PTY write when rendered is empty (and the TUI tail's
+        // `template_source = if !supplied_prompt.is_empty()
+        // { ... } else { default_template.unwrap_or_default() }`
+        // falls back to local template rendering when
+        // `args.prompt` is empty). Mirror: produce
+        // ActivateStatic with whatever the rendered string ends
+        // up as. Pre-fix daemon-owned promptless workflows
+        // would WEDGE — gate sees idle, refuses to fire, every
+        // tick.
+        let mut role_engines = BTreeMap::new();
+        for role in wf.roles.keys() {
+            let st = snap
+                .role_session_types
+                .get(role)
+                .map(|s| s.as_str())
+                .unwrap_or("claude-code");
+            role_engines.insert(role.clone(), engine_for_session_type(st));
+        }
+        let resolver = DaemonWorkflowResolver {
+            run: &snap.run,
+            worktree_path: snap.worktree_path.as_deref(),
+            role_engines,
+        };
+        let rendered = template
+            .map(|t| crate::workflow::template::render(t, &resolver))
+            .unwrap_or_default();
+
+        Decision::ActivateStatic {
             run_id: snap.run_id.clone(),
-            reason: SkipReason::TuiOwns,
+            from_role: active.to_string(),
+            to_role,
+            rendered_prompt: rendered,
+        }
+    }
+
+    /// Fire a static `on_idle` transition by invoking the existing
+    /// `workflow_transition` handler internally. Reuses all of
+    /// 2c-1's flock + try_modify + rollback + event-write
+    /// machinery — no new RMW path.
+    ///
+    /// `role` on the call's params is the OUTGOING `from_role`
+    /// (matches "what an MCP caller in that role would write" per
+    /// the round-2 review and adjustment 2 of 2c-2-2-b's plan).
+    /// Observability shouldn't lie: `event.source = "daemon"`
+    /// distinguishes daemon-routed events; `event.role` carries the
+    /// active role whose idle triggered the fire.
+    fn fire_static_transition(
+        &self,
+        run_id: &str,
+        from_role: &str,
+        to_role: &str,
+        rendered_prompt: &str,
+    ) -> Result<(), String> {
+        // 10d-2c-2-2-b F2 + F3:
+        // - `expected_from`: snapshot's active_role. If state.json
+        //   changed between snapshot and apply (concurrent MCP
+        //   `workflow_transition`, dynamic role swap), the
+        //   handler aborts with Conflict; no double-mutation.
+        // - `trigger`: "static_idle" so the TUI tail's history
+        //   append uses `TriggerKind::StaticIdle{from_role}`
+        //   instead of `TriggerKind::McpTransition` (which would
+        //   otherwise be the default for daemon-source events).
+        //
+        // Also: pre-existing `role` field carries the active role
+        // for observability (matches "what an MCP caller in
+        // that role would write"). `event.source = "daemon"`
+        // already distinguishes daemon-routed events from MCP-
+        // routed; the `trigger` field is the additional
+        // discriminator for poller-vs-MCP within daemon source.
+        let params = serde_json::json!({
+            "run_id": run_id,
+            "to": to_role,
+            "role": from_role,
+            "prompt": rendered_prompt,
+            "expected_from": from_role,
+            "trigger": "static_idle",
+        });
+        let caller = Caller::operator("daemon-poller");
+        match crate::control::methods::workflow_transition(
+            &self.state,
+            &caller,
+            &params,
+        ) {
+            Ok(_) => Ok(()),
+            Err((code, msg)) => Err(format!("{:?}: {}", code, msg)),
         }
     }
 
@@ -354,22 +718,451 @@ impl WorkflowPoller {
     }
 }
 
-/// Pure read over `DaemonState`. Builds the per-run snapshots used
-/// in the lock-free phase of `poll_once`. Kept as a free function
-/// rather than a method so the contract — "no I/O, no mutations,
-/// runs entirely under the state lock" — is visible in the
-/// signature.
+/// 10d-2c-2-2-b reviewer-fix: build per-run snapshots from
+/// **on-disk state.json files**, not from `state.workflow_runs`.
+///
+/// The cache stays populated only via daemon's own
+/// `workflow_transition` / `workflow_done` handlers (the round-1
+/// design: handlers re-load disk under flock on every entry).
+/// TUI-side writes — workflow launch, deferred history-entry
+/// append (10d-2c-1 round-1 Option A), `sync_role_session_ids`,
+/// pause/stop/resume — go straight to disk and don't touch the
+/// daemon's cache. Pre-fix the poller saw:
+///   1. **Launch invisibility**: TUI-launched runs not in cache →
+///      `state.workflow_runs.values()` empty → no decisions →
+///      daemon-owned static fires never happen.
+///   2. **History-append staleness**: TUI's deferred history
+///      append lands on disk but daemon's cache stays stale →
+///      poller returns `Skip{NoHistoryEntry}` forever even after
+///      disk has the entry.
+///
+/// Both make the daemon poller functionally inert for actual
+/// workflows. Fix: read disk on every `poll_once` via `load_all()`
+/// (which the TUI's controller already uses for the same reason).
+/// The cost is 1 readdir + N `state.json` reads per tick (~250ms
+/// production interval, typically 1-5 active runs); negligible.
+///
+/// Lock contention: `load_all`'s deserialize takes its own
+/// per-file flocks via the file-system layer (state.json.lock).
+/// If a handler-side `modify` is mid-flight, the disk read sees
+/// the pre-modify or post-modify state but never torn — flock
+/// guarantees atomic visibility.
+///
+/// The `state` parameter is still needed for the read-side gate
+/// inputs (`state.sessions`, `state.workspaces`,
+/// `state.workflow_definitions`, `state.tui_sessions`) — those
+/// ARE properly daemon-owned. Only `workflow_runs` was the
+/// non-authoritative cache.
 fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
-    state
-        .workflow_runs
-        .values()
+    let runs = crate::workflow::run::load_all();
+    runs
+        .iter()
         .filter(|run| run.is_active())
-        .map(|run| TickSnapshot {
-            run_id: run.run_id.clone(),
-            workflow_name: run.workflow_name.clone(),
-            active_role: run.active_role.clone(),
+        .map(|run| {
+            // Per-role session_type, derived by walking BOTH
+            // Round-5 review-round-5 F1: per-role session_type
+            // resolution via the shared `resolve_role_session_context`
+            // helper's three-tier fallback (uid → daemon-tag →
+            // TUI-tag). Pre-r5-r5 this walked sessions for tag
+            // matches only — daemon-owned sessions without
+            // `set_workflow_context` tags would have no entry
+            // here, the engine would default to ClaudeCode, and a
+            // Codex transcript would never be read correctly. The
+            // helper aligns this signal with `daemon_owns_run`.
+            let mut role_session_types: BTreeMap<String, String> =
+                BTreeMap::new();
+            for role in run.role_sessions.keys() {
+                if let Some(st) = resolve_role_session_type(state, run, role) {
+                    role_session_types.insert(role.clone(), st);
+                }
+            }
+
+            let active = run.active_role.as_deref();
+            // Round-5 F1: `active_session_found` covers BOTH the
+            // tag-based path (role_session_types is built from
+            // workflow_run_id/workflow_role match — for the
+            // engine-derivation read path) AND the durable
+            // uid-binding path (the new ownership signal).
+            // Pre-r5 this only checked tags, so a daemon
+            // session without tags but with a proper
+            // `daemon_session_uid` binding would skip with
+            // SessionNotFound and never fire.
+            let active_session_found = active
+                .map(|r| {
+                    role_session_types.contains_key(r)
+                        || run
+                            .role_sessions
+                            .get(r)
+                            .and_then(|b| b.daemon_session_uid.as_deref())
+                            .map(|uid| state.sessions.contains_key(uid))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let daemon_owns = daemon_owns_run(state, run);
+
+            // Worktree resolution via session tags, NOT
+            // `run.task_key`. The session bound to this run +
+            // active role carries the authoritative
+            // `workspace_id` — `run.task_key` is the
+            // launch-time workspace_id and can drift (the
+            // session might rebind to a different workspace
+            // via TUI flows). TUI's `fire_transition` uses
+            // the same approach:
+            // `locate_workflow_session` → `workspaces[ti].worktree_path`
+            // at `tui/src/workflow/controller.rs:1709, 1724`.
+            //
+            // Round-5 F1 + review-round-5 F1: workspace
+            // resolution via the shared helper's three-tier
+            // fallback (uid → daemon-tag → TUI-tag). Round-3 F3
+            // introduced session-tag-based resolution; round-5
+            // review extends to the uid-first path. Falls back
+            // to `run.task_key` only when no session is bound at
+            // all (the pre-spawn / pre-snapshot window).
+            let session_workspace_id: Option<String> = run
+                .active_role
+                .as_deref()
+                .and_then(|active| resolve_role_session_context(state, run, active))
+                .map(|ctx| ctx.workspace_id);
+            let workspace_lookup_key = session_workspace_id
+                .as_deref()
+                .unwrap_or(run.task_key.as_str());
+            let worktree_path = state
+                .workspaces
+                .get(workspace_lookup_key)
+                .and_then(|ws| ws.worktree_path.clone());
+
+            let workflow = state.workflow_definitions.get(&run.workflow_name).cloned();
+
+            TickSnapshot {
+                run_id: run.run_id.clone(),
+                workflow_name: run.workflow_name.clone(),
+                active_role: run.active_role.clone(),
+                paused: run.paused,
+                run: run.clone(),
+                worktree_path,
+                role_session_types,
+                daemon_owns,
+                active_session_found,
+                workflow,
+            }
         })
         .collect()
+}
+
+/// 2c-2-2-b ownership gate (round-5 F1: uid-based, durable signal).
+///
+/// Daemon owns a run iff `run.role_sessions[active].daemon_session_uid`
+/// is set AND `state.sessions` contains that uid.
+///
+/// **Why uid-based over tag-based**: pre-r5 the gate walked
+/// `state.sessions` for a session tagged with `workflow_run_id` +
+/// `workflow_role`. Those tags are populated by the best-effort
+/// `session.set_workflow_context` RPC — if that push fails or
+/// hasn't landed yet, the daemon session lacks tags and the
+/// gate would say "TUI owns" while the TUI's own gate (checking
+/// `TerminalSession.daemon_session_uid`) said "daemon owns".
+/// Result: workflow stalled, neither poller fires.
+///
+/// Post-r5: the gate uses
+/// `run.role_sessions[active].daemon_session_uid`, which the TUI
+/// populates at every `current_session_id` write site, then
+/// state.json membership check. Both signals are durable
+/// (workflow record on disk, daemon registry in memory). The
+/// `set_workflow_context` tags become defense-in-depth for
+/// `lookup_session_any` (auth path), not load-bearing for
+/// ownership.
+///
+/// TUI's equivalent gate (`controller.rs:1121` skip when
+/// `session.daemon_session_uid.is_some()`) checks the SAME
+/// session-uid signal, just from a different angle. The
+/// two-poller agreement invariant rests on this signal
+/// alignment.
+pub fn daemon_owns_run(state: &DaemonState, run: &WorkflowRun) -> bool {
+    let Some(active) = run.active_role.as_deref() else {
+        return false;
+    };
+    let Some(binding) = run.role_sessions.get(active) else {
+        return false;
+    };
+    let Some(uid) = binding.daemon_session_uid.as_deref() else {
+        return false;
+    };
+    state.sessions.contains_key(uid)
+}
+
+/// Round-5 (review round 5) shared helper: resolve the
+/// authoritative session context (session_type + workspace_id) for
+/// a workflow run's role. Three-tier fallback aligned with the
+/// round-5 F1 ownership signal:
+///   1. Uid-based: `run.role_sessions[role].daemon_session_uid` →
+///      `state.sessions.get(uid)`. Durable, matches what
+///      `daemon_owns_run` uses.
+///   2. Daemon tag-based: walk `state.sessions` for a session
+///      whose `workflow_run_id` + `workflow_role` match.
+///      Defense-in-depth for sessions whose
+///      `session.set_workflow_context` push landed.
+///   3. TUI tag-based: walk `state.tui_sessions` for a tag match;
+///      derive workspace_id from `task_id` via `state.bindings`
+///      (TUI snapshots don't carry workspace_id directly).
+///
+/// Returns None if no session can be resolved at all. Used by:
+///   - `collect_snapshots` for per-role engine derivation +
+///     worktree resolution (pre-r5 used tags only → untagged
+///     daemon-owned sessions defaulted to ClaudeCode + wrong
+///     worktree).
+///   - `crate::control::methods::capture_outgoing_last_message`
+///     for the closing history entry's `last_message` capture
+///     (same pre-r5 bug class).
+pub fn resolve_role_session_context(
+    state: &DaemonState,
+    run: &WorkflowRun,
+    role: &str,
+) -> Option<RoleSessionContext> {
+    // Tier 1: uid-based.
+    if let Some(uid) = run
+        .role_sessions
+        .get(role)
+        .and_then(|b| b.daemon_session_uid.as_deref())
+    {
+        if let Some(s) = state.sessions.get(uid) {
+            return Some(RoleSessionContext {
+                session_type: s.session_type.clone(),
+                workspace_id: s.workspace_id.clone(),
+            });
+        }
+    }
+    // Tier 2: daemon tag-based.
+    if let Some(s) = state.sessions.values().find(|s| {
+        s.workflow_run_id.as_deref() == Some(&run.run_id)
+            && s.workflow_role.as_deref() == Some(role)
+    }) {
+        return Some(RoleSessionContext {
+            session_type: s.session_type.clone(),
+            workspace_id: s.workspace_id.clone(),
+        });
+    }
+    // Tier 3: TUI tag-based with task_id → workspace derivation.
+    if let Some(ts) = state.tui_sessions.values().find(|s| {
+        s.workflow_run_id.as_deref() == Some(&run.run_id)
+            && s.workflow_role.as_deref() == Some(role)
+    }) {
+        let session_type = ts
+            .session_type
+            .clone()
+            .unwrap_or_else(|| "claude-code".to_string());
+        // `TuiSessionSnapshot` doesn't carry workspace_id; derive
+        // via task_id binding.
+        let workspace_id = ts
+            .task_id
+            .as_deref()
+            .and_then(|tid| state.bindings.get(tid).cloned());
+        if let Some(ws_id) = workspace_id {
+            return Some(RoleSessionContext {
+                session_type,
+                workspace_id: ws_id,
+            });
+        }
+    }
+    None
+}
+
+/// Output of [`resolve_role_session_context`]. Carries the two
+/// pieces of state most callers need: session_type (for engine
+/// derivation via `engine_for_session_type`) and workspace_id
+/// (for worktree lookup via `state.workspaces`).
+#[derive(Debug, Clone)]
+pub struct RoleSessionContext {
+    pub session_type: String,
+    pub workspace_id: String,
+}
+
+/// Type-only variant: resolves just `session_type` via the same
+/// three-tier fallback as [`resolve_role_session_context`] but
+/// does NOT require workspace_id to be derivable. Used by
+/// `collect_snapshots` for engine derivation, which doesn't need
+/// the workspace — that path is handled separately. Separating
+/// the two lets a TUI session without task_id binding still
+/// surface its engine to the resolver (workspace-id derivation
+/// would fail for it).
+pub fn resolve_role_session_type(
+    state: &DaemonState,
+    run: &WorkflowRun,
+    role: &str,
+) -> Option<String> {
+    if let Some(uid) = run
+        .role_sessions
+        .get(role)
+        .and_then(|b| b.daemon_session_uid.as_deref())
+    {
+        if let Some(s) = state.sessions.get(uid) {
+            return Some(s.session_type.clone());
+        }
+    }
+    if let Some(s) = state.sessions.values().find(|s| {
+        s.workflow_run_id.as_deref() == Some(&run.run_id)
+            && s.workflow_role.as_deref() == Some(role)
+    }) {
+        return Some(s.session_type.clone());
+    }
+    if let Some(ts) = state.tui_sessions.values().find(|s| {
+        s.workflow_run_id.as_deref() == Some(&run.run_id)
+            && s.workflow_role.as_deref() == Some(role)
+    }) {
+        return Some(
+            ts.session_type
+                .clone()
+                .unwrap_or_else(|| "claude-code".to_string()),
+        );
+    }
+    None
+}
+
+/// Map a `TerminalSession.session_type` string to an `Engine`.
+/// Mirrors `tui/src/app.rs::engine_for_session_type` exactly — the
+/// parity test pins this. Default is ClaudeCode for any unknown
+/// value (matches the TUI's permissive default).
+fn engine_for_session_type(session_type: &str) -> Engine {
+    match session_type {
+        "codex" => Engine::Codex,
+        _ => Engine::ClaudeCode,
+    }
+}
+
+/// Daemon-side equivalent of `tui/src/workflow/controller.rs::WorkflowResolver`.
+/// Implements [`crate::workflow::template::RoleResolver`] for the
+/// activation-prompt template engine.
+///
+/// **Single-source contract**: this resolver's outputs must equal
+/// the TUI's resolver outputs for the same logical inputs (workflow
+/// definition, run, role, session uid, worktree). Pinned by the
+/// `daemon_and_tui_resolvers_produce_identical_output` parity test
+/// (lives on the TUI side, in `tui/src/workflow/controller.rs`'s
+/// test module, since that's the only place where both impls are
+/// importable in the same crate).
+///
+/// The differences from the TUI resolver are READ-PATH-ONLY:
+/// - TUI reads from `App.workspaces[ti].sessions[si].transcript_id`
+///   + `App.workspaces[ti].worktree_path`.
+/// - Daemon reads from `DaemonState.workspaces[task_key].worktree_path`
+///   + the snapshot's `role_session_types` map.
+///
+/// Both end up calling the same `crate::workflow::transcript::*`
+/// functions, so the actual transcript-read output is byte-for-byte
+/// identical given identical inputs.
+pub struct DaemonWorkflowResolver<'a> {
+    pub run: &'a WorkflowRun,
+    pub worktree_path: Option<&'a Path>,
+    pub role_engines: BTreeMap<String, Engine>,
+}
+
+impl<'a> DaemonWorkflowResolver<'a> {
+    fn lookup(&self, role: &str) -> Option<(Engine, &'a Path, &'a str)> {
+        let engine = self.role_engines.get(role).cloned()?;
+        let binding = self.run.role_sessions.get(role)?;
+        let sid = binding.current_session_id.as_deref()?;
+        let worktree = self.worktree_path?;
+        Some((engine, worktree, sid))
+    }
+}
+
+impl<'a> crate::workflow::template::RoleResolver for DaemonWorkflowResolver<'a> {
+    fn user_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let offset = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.user_count)
+            .unwrap_or(0);
+        crate::workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            crate::workflow::transcript::MessageKind::User,
+        )
+        .into_iter()
+        .skip(offset)
+        .collect()
+    }
+
+    fn assistant_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let offset = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.assistant_count)
+            .unwrap_or(0);
+        crate::workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            crate::workflow::transcript::MessageKind::Assistant,
+        )
+        .into_iter()
+        .skip(offset)
+        .collect()
+    }
+
+    fn prior_user_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let baseline = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.user_count)
+            .unwrap_or(0);
+        crate::workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            crate::workflow::transcript::MessageKind::User,
+        )
+        .into_iter()
+        .take(baseline)
+        .collect()
+    }
+
+    fn prior_assistant_messages(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let baseline = self
+            .run
+            .role_baselines
+            .get(role)
+            .map(|b| b.assistant_count)
+            .unwrap_or(0);
+        crate::workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            crate::workflow::transcript::MessageKind::Assistant,
+        )
+        .into_iter()
+        .take(baseline)
+        .collect()
+    }
+
+    fn latest_plan(&self, role: &str) -> Option<String> {
+        if let Some(plan) = self.run.role_plans.get(role) {
+            if !plan.is_empty() {
+                return Some(plan.clone());
+            }
+        }
+        let (engine, wt, sid) = self.lookup(role)?;
+        crate::workflow::transcript::latest_plan(&engine, wt, sid)
+    }
+
+    fn goal(&self) -> Option<String> {
+        self.run.goal.clone()
+    }
 }
 
 /// Best-effort decode of a `catch_unwind` payload. Most panics carry
@@ -396,6 +1189,31 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    /// Build a `DaemonState` with one active workflow run AND
+    /// persist that run to disk (`~/.cm/workflow-runs/<id>/state.json`).
+    /// The disk save is required because the reviewer-fix
+    /// switched `collect_snapshots` to read disk via
+    /// `workflow::run::load_all()` instead of the
+    /// `state.workflow_runs` cache. Tests that build runs only
+    /// in-memory would see empty snapshots otherwise.
+    ///
+    /// CALLER REQUIREMENT: must hold `crate::test_support::env_lock()`
+    /// and have `HOME` pointing at a tempdir BEFORE calling this —
+    /// the disk save lands under `$HOME/.cm/workflow-runs/`.
+    /// Round-5 F1 test helper: after spawning a daemon session,
+    /// patch the run's `role_sessions[role].daemon_session_uid`
+    /// so the new uid-based ownership gate sees it. Mirrors what
+    /// `tui/src/workflow/controller.rs::launch_workflow` does in
+    /// production (co-writes the uid alongside `current_session_id`).
+    fn bind_daemon_uid_to_role(run_id: &str, role: &str, uid: &str) {
+        crate::workflow::run::modify(run_id, |r| {
+            if let Some(b) = r.role_sessions.get_mut(role) {
+                b.daemon_session_uid = Some(uid.to_string());
+            }
+        })
+        .expect("bind daemon_session_uid for test");
+    }
+
     fn make_state_with_one_active_run(run_id: &str) -> Arc<Mutex<DaemonState>> {
         let mut roles = BTreeMap::new();
         roles.insert(
@@ -403,6 +1221,7 @@ mod tests {
             RoleBinding {
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-worker".to_string()),
+                daemon_session_uid: None,
             },
         );
         let mut baselines = BTreeMap::new();
@@ -423,28 +1242,89 @@ mod tests {
             None,
             BTreeMap::new(),
         );
+        // Persist to disk so `load_all()` in `collect_snapshots`
+        // surfaces it. Pre-reviewer-fix the cache alone was
+        // enough — that was the bug.
+        crate::workflow::run::save(&run).expect("save run to disk");
         let mut state = DaemonState::default();
         state.workflow_runs.insert(run_id.to_string(), run);
         Arc::new(Mutex::new(state))
     }
 
+    /// R11 — A run whose active role's session isn't visible in
+    /// either `state.sessions` (daemon-spawned) OR
+    /// `state.tui_sessions` (TUI-only snapshot) gets
+    /// `SessionNotFound`. This is the "TUI snapshot push lag"
+    /// surface from the 2c-2-2-b proposal. Self-resolves on next
+    /// snapshot push.
     #[test]
-    fn poll_once_returns_skip_tui_owns_for_every_active_run() {
-        // 2c-2-2-a invariant: gate is hard-coded false, so every
-        // run produces `Skip { TuiOwns }`. Behavior is unchanged
-        // from pre-2c-2-2.
+    fn poll_once_returns_session_not_found_when_no_snapshot_registered() {
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
         let state = make_state_with_one_active_run("r1");
         let poller = WorkflowPoller::new(state);
         let decisions = poller.poll_once();
         assert_eq!(decisions.len(), 1);
         assert!(matches!(
             &decisions[0],
-            Decision::Skip { run_id, reason: SkipReason::TuiOwns } if run_id == "r1"
+            Decision::Skip { run_id, reason: SkipReason::SessionNotFound }
+                if run_id == "r1"
+        ), "expected Skip{{SessionNotFound}}, got {:?}", decisions[0]);
+    }
+
+    /// T2 daemon-side companion: a run whose active role is bound
+    /// to a TUI-only session (visible only via
+    /// `state.tui_sessions`, not in `state.sessions`) gets
+    /// `Skip{TuiOwns}`. The TUI controller fires for this run; the
+    /// daemon poller stays out.
+    #[test]
+    fn poll_once_returns_tui_owns_when_active_role_session_is_tui_only() {
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+        let state = make_state_with_one_active_run("r1");
+        {
+            let mut s = state.lock().unwrap();
+            s.tui_sessions.insert(
+                "tui-uid-1".to_string(),
+                crate::state::TuiSessionSnapshot {
+                    uid: "tui-uid-1".to_string(),
+                    task_id: None,
+                    label: Some("worker".to_string()),
+                    session_type: Some("claude-code".to_string()),
+                    hidden: false,
+                    workflow_run_id: Some("r1".to_string()),
+                    workflow_role: Some("worker".to_string()),
+                },
+            );
+            s.tui_sessions_pushed = true;
+        }
+        let poller = WorkflowPoller::new(state);
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1);
+        assert!(matches!(
+            &decisions[0],
+            Decision::Skip { run_id, reason: SkipReason::TuiOwns }
+                if run_id == "r1"
         ), "expected Skip{{TuiOwns}}, got {:?}", decisions[0]);
     }
 
     #[test]
     fn poll_once_returns_empty_when_no_active_runs() {
+        // Round-5 F2: wrap in env_lock + tempdir HOME — the
+        // reviewer-fix in round-3 switched `collect_snapshots`
+        // to `workflow::run::load_all()` which reads
+        // `$HOME/.cm/workflow-runs/`. Pre-isolation this test
+        // saw the dev's real workflow-runs dir when run
+        // standalone and would assert non-empty.
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
         let state = Arc::new(Mutex::new(DaemonState::default()));
         let poller = WorkflowPoller::new(state);
         let decisions = poller.poll_once();
@@ -640,6 +1520,669 @@ mod tests {
         );
     }
 
+    /// T1 — Daemon-owned active role fires `ActivateStatic` with a
+    /// rendered prompt. Uses `disable_apply_for_test(true)` so the
+    /// test only asserts the GATE output; the full handler is
+    /// exercised by the existing `workflow_transition_*` suite.
+    ///
+    /// Setup mirrors the production hot path:
+    /// - state.sessions has a daemon-tagged session for "worker"
+    ///   bound to run_id "r1" (so `daemon_owns_run` returns true).
+    /// - state.workspaces has a worktree path matching run.task_key.
+    /// - state.workflow_definitions has a "feedback" workflow with
+    ///   on_idle worker→reviewer + an activation_prompt template.
+    /// - A claude-shape JSONL with one complete assistant turn so
+    ///   `assistant_turn_completed_since` returns true.
+    #[test]
+    fn poll_once_fires_activate_static_when_daemon_owns_idle_worker() {
+        use crate::session::DaemonSession;
+        // Hold env_lock for the whole test so HOME mutation is
+        // serialized against other HOME-touching tests. See
+        // `with_home_lock` doc.
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+        let home = _tmp_home.path();
+
+        // Worktree with a claude transcript for "worker" — one
+        // complete assistant turn (end_turn). count_messages
+        // returns 1; baseline is 0; gate fires.
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r1");
+        {
+            let mut s = state.lock().unwrap();
+            // Workspace with worktree_path pointing at our tempdir.
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            // Workflow definition: worker→reviewer on idle, with a
+            // simple activation prompt template.
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("worker start".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some(
+                        "review {{ roles.worker.last_message }}".to_string(),
+                    ),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+            // Daemon-tagged session for "worker" → gate returns
+            // true. Spawn via /bin/sleep with workflow context.
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.session_type = "claude-code".to_string();
+            sp.workflow_run_id = Some("r1".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn /bin/sleep");
+            s.sessions.insert("ts-worker".to_string(), ds);
+        }
+        // Round-5 F1: bind the daemon uid into the run's role
+        // binding so the new uid-based gate fires.
+        bind_daemon_uid_to_role("r1", "worker", "ts-worker");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1, "expected one decision for r1");
+        match &decisions[0] {
+            Decision::ActivateStatic {
+                run_id,
+                from_role,
+                to_role,
+                rendered_prompt,
+            } => {
+                assert_eq!(run_id, "r1");
+                assert_eq!(from_role, "worker");
+                assert_eq!(to_role, "reviewer");
+                // Template rendered with worker's last assistant
+                // message ("done"). Pin substrings so a future
+                // template-engine refactor catches divergence.
+                assert!(
+                    rendered_prompt.starts_with("review "),
+                    "rendered prompt should start with 'review ': {:?}",
+                    rendered_prompt,
+                );
+                assert!(
+                    rendered_prompt.contains("done"),
+                    "rendered prompt should contain worker's last message \
+                     'done': {:?}",
+                    rendered_prompt,
+                );
+            }
+            other => panic!("expected ActivateStatic, got {:?}", other),
+        }
+    }
+
+    /// Reviewer-fix: `poll_once` reads runs from **disk**
+    /// (`workflow::run::load_all`), NOT from
+    /// `state.workflow_runs`. Without this, TUI-launched runs
+    /// (which write disk + TUI's in-memory `App.workflow_runs`
+    /// but never touch daemon's cache) would be invisible to
+    /// the poller.
+    ///
+    /// Test: write a state.json directly to disk WITHOUT
+    /// populating `state.workflow_runs`. Assert `poll_once`
+    /// sees the run.
+    #[test]
+    fn poll_once_reads_runs_from_disk_not_cache() {
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        // Build a run and persist to disk via the same path TUI
+        // uses (`workflow::run::save`). Critically: do NOT
+        // insert anything into `state.workflow_runs`.
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: Some("sid-disk".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        let run = WorkflowRun::new(
+            "r-disk-only".to_string(),
+            "feedback".to_string(),
+            "/tmp/wf-poller-test".to_string(),
+            role_sessions,
+            "worker".to_string(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        crate::workflow::run::save(&run).expect("save run to disk");
+
+        // DaemonState is empty (no workflow_runs entry).
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        assert!(
+            state.lock().unwrap().workflow_runs.is_empty(),
+            "test precondition: state.workflow_runs cache is empty",
+        );
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        // Filter to only OUR run — under workspace parallelism
+        // some other test's tempdir might have leaked runs into
+        // the env_lock-shared HOME (though env_lock serializes,
+        // the methods.rs `with_temp_home` pattern releases the
+        // lock before the caller's `_tmp` drops, so cross-test
+        // tempdir-residue races are theoretically possible).
+        // The contract we want to pin is "the poller sees runs
+        // on disk that aren't in the cache" — checking our
+        // specific run_id is in the decision list is sufficient.
+        let saw_our_run = decisions.iter().any(|d| match d {
+            Decision::Skip { run_id, .. }
+            | Decision::ActivateStatic { run_id, .. } => run_id == "r-disk-only",
+        });
+        assert!(
+            saw_our_run,
+            "poller must see the disk-only run; pre-fix it would \
+             have seen empty cache and returned no decisions for \
+             this run_id. Got decisions: {:?}",
+            decisions,
+        );
+    }
+
+    /// Companion to the disk-read test: after the TUI's deferred
+    /// history-entry append lands on disk (via `run::modify`),
+    /// the next `poll_once` observes it. Pre-fix the daemon's
+    /// cache would have stayed stale forever (it's only
+    /// refreshed by daemon's own handlers).
+    ///
+    /// Setup: run with `active_role = "reviewer"` but no
+    /// history entry for reviewer (the round-1 gap window).
+    /// First poll → Skip{NoHistoryEntry}. TUI appends a
+    /// history entry via `run::modify`. Second poll → no
+    /// longer NoHistoryEntry.
+    #[test]
+    fn poll_once_observes_disk_history_after_tui_appends() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        // Worktree + transcript so worktree-skip doesn't fire.
+        let wt = _tmp_home.path().join("wt-disk-hist");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // Build run with active_role=reviewer, no reviewer history.
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: Some("sid-w".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        role_sessions.insert(
+            "reviewer".to_string(),
+            RoleBinding {
+                session_label: "reviewer".to_string(),
+                current_session_id: Some("sid-r".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        let mut run = WorkflowRun::new(
+            "r-disk-hist".to_string(),
+            "feedback".to_string(),
+            "/tmp/wf-poller-disk-hist".to_string(),
+            role_sessions,
+            "worker".to_string(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        // Manually flip active_role to "reviewer" without
+        // appending a history entry → gap window.
+        run.active_role = Some("reviewer".to_string());
+        crate::workflow::run::save(&run).expect("seed save");
+
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-disk-hist".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces
+                .insert("/tmp/wf-poller-disk-hist".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("w".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("r".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "reviewer".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "worker".to_string(),
+                    }],
+                },
+            );
+            // Daemon session so the gate says "daemon owns."
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-d-r",
+                "reviewer",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-disk-hist".to_string();
+            sp.workflow_run_id = Some("r-disk-hist".to_string());
+            sp.workflow_role = Some("reviewer".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-d-r".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-disk-hist", "reviewer", "ts-d-r");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+
+        // First poll: NoHistoryEntry.
+        let decisions = poller.poll_once();
+        assert!(
+            matches!(
+                &decisions[0],
+                Decision::Skip {
+                    reason: SkipReason::NoHistoryEntry,
+                    ..
+                }
+            ),
+            "first poll should skip with NoHistoryEntry; got {:?}",
+            decisions[0],
+        );
+
+        // TUI's deferred history append: write a reviewer entry
+        // via `run::modify` (the actual path the TUI tail uses).
+        crate::workflow::run::modify("r-disk-hist", |r| {
+            r.append_history_entry_for_event_target_role(
+                "reviewer",
+                2,
+                crate::workflow::run::TriggerKind::StaticIdle {
+                    from_role: "worker".to_string(),
+                },
+                0,
+            );
+        })
+        .expect("append history entry");
+
+        // Second poll: NoHistoryEntry no longer; proceeds to
+        // gate check (which will skip with NotIdle since no
+        // transcript turns).
+        let decisions2 = poller.poll_once();
+        assert!(
+            !matches!(
+                &decisions2[0],
+                Decision::Skip {
+                    reason: SkipReason::NoHistoryEntry,
+                    ..
+                }
+            ),
+            "after TUI appends history on disk, poll must observe \
+             it; pre-fix the cache would have stayed stale and \
+             this would still be NoHistoryEntry. Got {:?}",
+            decisions2[0],
+        );
+    }
+
+    /// F1 — Daemon uses `active_assistant_start_count()` for the
+    /// idle baseline, NOT `role_baselines[active].assistant_count`.
+    /// Two sub-cases:
+    ///   (a) Run with NO history entry for the active role yet
+    ///       (10d-2c-1 round-1 gap window — daemon advanced
+    ///       `active_role` but TUI hasn't appended history yet).
+    ///       Skip with `NoHistoryEntry`.
+    ///   (b) Run with a history entry for the active role whose
+    ///       `assistant_count_at_start` reflects current
+    ///       activation. Gate uses that as baseline.
+    ///
+    /// Both pinned in one test: build a run with NO history entry
+    /// for "reviewer" (active_role set to reviewer, history only
+    /// contains the initial worker entry from `WorkflowRun::new`).
+    /// Assert SkipReason::NoHistoryEntry.
+    #[test]
+    fn poll_once_skips_no_history_entry_in_round1_gap_window() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        // Worktree + transcript so evaluate doesn't skip on
+        // NoWorktreePath. We need to get past every earlier
+        // skip check to reach the baseline lookup.
+        let wt = _tmp_home.path().join("wt-f1");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let state = make_state_with_one_active_run("r-f1-gap");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            // Register a workflow definition so evaluate gets
+            // past the NoWorkflowDefinition skip.
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("worker".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("review".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            // reviewer → worker on_idle so the active role
+            // (reviewer in this test) has an on_idle transition.
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "reviewer".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "worker".to_string(),
+                    }],
+                },
+            );
+
+            // Advance active_role to "reviewer" but DON'T append
+            // a history entry for reviewer — this is the gap
+            // window where daemon-poller would see stale baseline
+            // if it used `role_baselines`. Mutate cache AND
+            // re-save to disk (reviewer-fix: poller reads disk,
+            // not cache).
+            let run = s.workflow_runs.get_mut("r-f1-gap").unwrap();
+            run.role_sessions.insert(
+                "reviewer".to_string(),
+                RoleBinding {
+                    session_label: "reviewer".to_string(),
+                    current_session_id: Some("sid-reviewer".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            run.active_role = Some("reviewer".to_string());
+            // Verify the gap: history only has the initial
+            // worker entry, none for reviewer.
+            assert!(
+                run.active_assistant_start_count().is_none(),
+                "test setup precondition: active_assistant_start_count \
+                 should be None in the gap window (active_role=reviewer, \
+                 history only has worker entry)",
+            );
+            // Re-save so the disk-read in collect_snapshots sees
+            // the mutated state.
+            crate::workflow::run::save(run).expect("re-save mutated run");
+
+            // Daemon session for reviewer so the ownership gate
+            // says "daemon owns."
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-daemon-reviewer",
+                "reviewer",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-f1-gap".to_string());
+            sp.workflow_role = Some("reviewer".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-daemon-reviewer".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-f1-gap", "reviewer", "ts-daemon-reviewer");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            matches!(
+                &decisions[0],
+                Decision::Skip {
+                    run_id,
+                    reason: SkipReason::NoHistoryEntry
+                } if run_id == "r-f1-gap"
+            ),
+            "expected Skip{{NoHistoryEntry}} in the round-1 gap \
+             window; got {:?}",
+            decisions[0],
+        );
+    }
+
+    /// R10 — Workflow definition not yet pushed (TUI hasn't called
+    /// `workflow_update_definitions` yet). Daemon poller produces
+    /// `Skip{NoWorkflowDefinition}`. Self-resolves on next push.
+    #[test]
+    fn poll_once_returns_no_workflow_definition_when_unloaded() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let state = make_state_with_one_active_run("r-no-def");
+        {
+            let mut s = state.lock().unwrap();
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker-no-def",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-no-def".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker-no-def".to_string(), ds);
+            // Deliberately DO NOT insert anything into
+            // `workflow_definitions` — that's the R10 surface.
+        }
+        bind_daemon_uid_to_role("r-no-def", "worker", "ts-worker-no-def");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            matches!(
+                &decisions[0],
+                Decision::Skip {
+                    run_id,
+                    reason: SkipReason::NoWorkflowDefinition
+                } if run_id == "r-no-def"
+            ),
+            "expected Skip{{NoWorkflowDefinition}}, got {:?}",
+            decisions[0],
+        );
+    }
+
+    /// Daemon-side resolver smoke + structural sanity. The
+    /// cross-crate parity test (daemon resolver vs TUI resolver
+    /// producing identical output for the same workflow_def +
+    /// run + session_id + worktree) is asserted from the TUI side
+    /// in `tui/src/workflow/controller.rs::tests` (added in this
+    /// same slice) — that's the only crate where both impls are
+    /// importable at once. This test pins the daemon side reads
+    /// what the gate needs.
+    #[test]
+    fn daemon_resolver_reads_baseline_and_renders_template() {
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+        let wt = _tmp_home.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-w.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"latest worker turn"}]}}"##,
+        )
+        .unwrap();
+
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: Some("sid-w".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        let mut baselines = BTreeMap::new();
+        baselines.insert(
+            "worker".to_string(),
+            MessageBaseline {
+                user_count: 0,
+                assistant_count: 0,
+            },
+        );
+        let run = WorkflowRun::new(
+            "r-resolver".to_string(),
+            "feedback".to_string(),
+            "/tmp/wf-poller-resolver".to_string(),
+            role_sessions,
+            "worker".to_string(),
+            baselines,
+            None,
+            BTreeMap::new(),
+        );
+        let mut engines = BTreeMap::new();
+        engines.insert("worker".to_string(), Engine::ClaudeCode);
+        let resolver = DaemonWorkflowResolver {
+            run: &run,
+            worktree_path: Some(wt.as_path()),
+            role_engines: engines,
+        };
+
+        // assistant_messages skips the baseline (assistant_count=0
+        // → no skip) and surfaces the one post-baseline turn.
+        let am: Vec<String> = <DaemonWorkflowResolver as crate::workflow::template::RoleResolver>::assistant_messages(&resolver, "worker");
+        assert_eq!(am.len(), 1, "one post-baseline turn expected");
+        assert!(am[0].contains("latest worker turn"));
+
+        // Template rendering: {{ roles.worker.last_message }}
+        // resolves to the assistant turn.
+        let rendered = crate::workflow::template::render(
+            "review: {{ roles.worker.last_message }}",
+            &resolver,
+        );
+        assert!(
+            rendered.contains("latest worker turn"),
+            "template should embed the worker's last message: {:?}",
+            rendered,
+        );
+    }
+
     /// API contract: `start()` returns `io::Result<()>` so a
     /// transient thread-spawn failure doesn't crash daemon startup.
     /// The reviewer flagged that `.expect("spawn workflow poller
@@ -669,6 +2212,605 @@ mod tests {
         let r2: std::io::Result<()> = poller.start();
         assert!(r2.is_ok(), "second start should be idempotent: {:?}", r2);
         poller.shutdown();
+    }
+
+    /// F2 — Stale-snapshot apply rejected by `expected_from`.
+    /// Poller snapshots `active_role = "worker"`. Pre-apply hook
+    /// flips state.json's `active_role` to "reviewer". When the
+    /// poller invokes `workflow_transition` with
+    /// `expected_from: "worker"`, the handler's precondition
+    /// check inside `try_modify` sees `active_role == "reviewer"`
+    /// and aborts with Conflict. No state mutation. No event.
+    #[test]
+    fn poll_once_stale_snapshot_rejected_via_expected_from() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        // Build the same scenario as T1 — daemon-owned idle
+        // worker → reviewer with template + transcript — but
+        // inject a pre-apply hook that flips active_role to
+        // "reviewer" between snapshot and apply.
+        let wt = _tmp_home.path().join("wt-f2");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-f2-stale");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("worker prompt".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("review".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+            // Add reviewer binding for the post-flip state.
+            s.workflow_runs
+                .get_mut("r-f2-stale")
+                .unwrap()
+                .role_sessions
+                .insert(
+                    "reviewer".to_string(),
+                    RoleBinding {
+                        session_label: "reviewer".to_string(),
+                        current_session_id: Some("sid-reviewer".to_string()),
+                        daemon_session_uid: None,
+                    },
+                );
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker-f2",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-f2-stale".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker-f2".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-f2-stale", "worker", "ts-worker-f2");
+
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        // Install hook: flip active_role between snapshot and
+        // apply ON DISK (reviewer-fix made the disk
+        // authoritative; the handler's try_modify reads disk
+        // under flock). The poller snapshots active_role =
+        // "worker"; hook flips disk to "reviewer"; apply phase
+        // calls workflow_transition with
+        // `expected_from = "worker"`, handler's check sees
+        // disk's active_role = "reviewer" → Conflict.
+        poller.set_pre_apply_hook_for_test(|_state: &mut DaemonState| {
+            crate::workflow::run::modify("r-f2-stale", |r| {
+                r.active_role = Some("reviewer".to_string());
+            })
+            .expect("flip active_role on disk for race simulation");
+        });
+        // Apply is ENABLED for this test — we want the handler
+        // to run and reject.
+        let pre_disk = crate::workflow::run::load_one("r-f2-stale")
+            .expect("disk load before");
+        let pre_iteration = pre_disk.iteration;
+        let _ = poller.poll_once();
+        let post_disk = crate::workflow::run::load_one("r-f2-stale")
+            .expect("disk load after");
+        // The hook flipped active_role on disk; the handler's
+        // expected_from check (expected=worker, actual=reviewer)
+        // returned Conflict; mutation rejected. Active_role
+        // stays at the hook's value; iteration unchanged.
+        assert_eq!(
+            post_disk.active_role.as_deref(),
+            Some("reviewer"),
+            "active_role reflects the hook's flip (no further \
+             advance by the rejected apply)",
+        );
+        assert_eq!(
+            post_disk.iteration, pre_iteration,
+            "iteration must not advance: handler rejected with \
+             Conflict before mutation",
+        );
+    }
+
+    /// F4 — Empty rendered prompt does NOT skip the transition;
+    /// daemon fires anyway with `args.prompt = ""`. The TUI tail's
+    /// existing empty-prompt handling skips just the PTY write.
+    /// Pre-fix daemon-owned promptless workflows would wedge.
+    #[test]
+    fn poll_once_fires_when_activation_prompt_is_absent() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-f4");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-f4-empty");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("ignored".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            // Reviewer has NO activation_prompt — daemon must
+            // still fire the transition.
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: None,
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker-f4",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-f4-empty".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker-f4".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-f4-empty", "worker", "ts-worker-f4");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1);
+        match &decisions[0] {
+            Decision::ActivateStatic {
+                run_id,
+                from_role,
+                to_role,
+                rendered_prompt,
+            } => {
+                assert_eq!(run_id, "r-f4-empty");
+                assert_eq!(from_role, "worker");
+                assert_eq!(to_role, "reviewer");
+                // Empty prompt — but transition STILL fires.
+                assert_eq!(
+                    rendered_prompt, "",
+                    "rendered prompt is empty (no template) but \
+                     the transition still fires; pre-fix this was \
+                     a Skip{{NoActivationPrompt}}",
+                );
+            }
+            other => panic!(
+                "expected ActivateStatic with empty prompt, got {:?}",
+                other,
+            ),
+        }
+    }
+
+    /// Review-round-5 F1 — `role_session_types` engine resolution
+    /// uses the uid-first fallback, NOT tags only. A daemon-owned
+    /// CODEX session without `set_workflow_context` tags must
+    /// still surface as `session_type = "codex"`. Pre-fix it
+    /// would fall through to default "claude-code" and the
+    /// engine-derivation in `evaluate_snapshot` would read the
+    /// wrong transcript format.
+    #[test]
+    fn resolve_role_session_type_uid_path_returns_correct_engine_without_tags() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: Some("sid-x".to_string()),
+                daemon_session_uid: Some("ts-codex-untagged".to_string()),
+            },
+        );
+        let run = WorkflowRun::new(
+            "r-engine".to_string(),
+            "feedback".to_string(),
+            "ws-engine".to_string(),
+            role_sessions,
+            "worker".to_string(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+
+        let mut state = DaemonState::default();
+        let mut sp = crate::session::SpawnParams::new(
+            "ts-codex-untagged",
+            "worker",
+            "/bin/sleep",
+        );
+        sp.args = vec!["60".to_string()];
+        sp.workspace_id = "ws-engine".to_string();
+        sp.session_type = "codex".to_string();
+        // NB: workflow_run_id + workflow_role deliberately NOT set
+        // — simulates `set_workflow_context` push that never
+        // landed. Pre-r5-r5 the tag-only fallback would miss
+        // this session entirely.
+        let ds: DaemonSession =
+            crate::session::DaemonSession::spawn(sp).expect("spawn");
+        state.sessions.insert("ts-codex-untagged".to_string(), ds);
+
+        let resolved = resolve_role_session_type(&state, &run, "worker");
+        assert_eq!(
+            resolved.as_deref(),
+            Some("codex"),
+            "uid-first fallback must surface codex even without \
+             workflow_run_id/workflow_role tags. Got: {:?}",
+            resolved,
+        );
+    }
+
+    /// Round-5 F1 acceptance — gate fires for a daemon-attached
+    /// session in `state.sessions` WITHOUT `workflow_run_id`/
+    /// `workflow_role` tags, as long as the run's role binding
+    /// has the matching `daemon_session_uid`. Pre-r5 the gate
+    /// walked `state.sessions` for tags; if
+    /// `session.set_workflow_context` push hadn't landed, daemon
+    /// would skip with TuiOwns and the workflow would stall.
+    /// Post-r5 the gate uses the durable on-disk binding.
+    #[test]
+    fn poll_once_gate_fires_without_workflow_tags_when_binding_has_uid() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-r5");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-r5-untagged");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-r5".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-r5".to_string(), ws);
+
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("w".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("r".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            // Daemon session UID is inserted, but workflow_run_id +
+            // workflow_role are deliberately LEFT UNSET — this
+            // simulates the failure mode where
+            // `session.set_workflow_context` never landed.
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-untagged",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "ws-r5".to_string();
+            // NB: workflow_run_id and workflow_role NOT set.
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            assert!(
+                ds.workflow_run_id.is_none(),
+                "test precondition: daemon session has no tags",
+            );
+            s.sessions.insert("ts-untagged".to_string(), ds);
+        }
+        // Bind the daemon uid into the run's role binding — the
+        // durable signal that pre-r5 was missing.
+        bind_daemon_uid_to_role("r-r5-untagged", "worker", "ts-untagged");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        let our = decisions
+            .iter()
+            .find(|d| match d {
+                Decision::Skip { run_id, .. } | Decision::ActivateStatic { run_id, .. } => {
+                    run_id == "r-r5-untagged"
+                }
+            })
+            .expect("our run produced a decision");
+        assert!(
+            matches!(our, Decision::ActivateStatic { .. }),
+            "F1: gate must fire when binding.daemon_session_uid \
+             matches a session in state.sessions, regardless of \
+             whether the session has workflow_run_id/workflow_role \
+             tags. Pre-r5 this would have been Skip{{TuiOwns}}. \
+             Got {:?}",
+            our,
+        );
+    }
+
+    /// Round-4 F3 — worktree resolution via session tags, NOT
+    /// `run.task_key`. When `run.task_key` drifts (e.g. workspace
+    /// renamed at TUI level, or run was launched with a different
+    /// workspace_id than the session currently uses), the
+    /// session's `workspace_id` is authoritative.
+    ///
+    /// Setup: run.task_key = "ws-stale" (no entry in
+    /// state.workspaces). Session for the active role points
+    /// at "ws-real" (which has a worktree_path). The poller
+    /// must use ws-real, not fall back to ws-stale.
+    #[test]
+    fn poll_once_resolves_worktree_via_session_workspace_id_not_task_key() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-real");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        // Build run with task_key = "ws-stale" — a workspace_id
+        // that has NO entry in state.workspaces. Pre-F3 the
+        // poller would have looked here and found nothing,
+        // skipping with NoWorktreePath.
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: Some("sid-worker".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        let run = WorkflowRun::new(
+            "r-f3-drift".to_string(),
+            "feedback".to_string(),
+            "ws-stale".to_string(),
+            role_sessions,
+            "worker".to_string(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        crate::workflow::run::save(&run).expect("save");
+
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            // workspace ENTRY is for "ws-real", NOT "ws-stale".
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-real".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-real".to_string(), ws);
+
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("w".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("r".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            // Session's workspace_id is "ws-real" — this is the
+            // authoritative tag the poller must use.
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-w-f3",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "ws-real".to_string();
+            sp.workflow_run_id = Some("r-f3-drift".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-w-f3".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-f3-drift", "worker", "ts-w-f3");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        // Find our run's decision.
+        let our_decision = decisions
+            .iter()
+            .find(|d| match d {
+                Decision::Skip { run_id, .. } | Decision::ActivateStatic { run_id, .. } => {
+                    run_id == "r-f3-drift"
+                }
+            })
+            .expect("our run produced a decision");
+        // Should fire (worktree resolved via session tag). Pre-F3
+        // would skip with NoWorktreePath because task_key
+        // "ws-stale" isn't in state.workspaces.
+        assert!(
+            matches!(our_decision, Decision::ActivateStatic { .. }),
+            "F3: worktree must resolve via session's workspace_id, \
+             not the stale task_key. Got {:?}",
+            our_decision,
+        );
     }
 
     /// Tick-interval atomic: setter clamps to the floor; getter
