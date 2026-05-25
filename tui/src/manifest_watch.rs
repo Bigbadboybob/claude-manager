@@ -1,0 +1,929 @@
+//! Slice 10e-c: TUI-side consumer for the daemon's `manifest.watch`
+//! streaming RPC (landed in 10e-b at commit `c6d20d8`).
+//!
+//! Wire shape (matches `daemon/src/control/dispatch.rs::
+//! dispatch_manifest_watch` + `daemon/src/control/stream.rs::
+//! handle_manifest_watch_stream`):
+//!
+//!   1. Dial the daemon socket.
+//!   2. Send `manifest.watch` JSON-RPC request (operator caller,
+//!      empty params).
+//!   3. Read OK response `{ "subscribed": true }`.
+//!   4. The same socket transitions to a one-way streaming mode.
+//!      Frames are length-prefixed `cm_daemon::control::wire::
+//!      StreamFrame` JSON. Kinds we observe:
+//!        - `ManifestSnapshot` (sent once, first): payload carries
+//!          `{workspaces, bindings}` — ignored in 10e-c (TUI loaded
+//!          the same disk state at startup; subsequent diffs are
+//!          the novel info). 10e-d may reconcile.
+//!        - `ManifestDiff`: payload is a variant-tagged
+//!          `cm_daemon::manifest::ManifestDiff` JSON. Deserialized
+//!          and forwarded to the main loop via mpsc.
+//!        - `Heartbeat`: liveness probe. Silent no-op consumer-side.
+//!        - Any other kind: a wire-protocol bug; log + drop the
+//!          frame, keep reading.
+//!
+//! Lifecycle:
+//!   - Spawned at `App::new` ONLY when daemon mode is opt-in via
+//!     `CM_USE_DAEMON_SOCKET=1` (see [`should_spawn`]). Without
+//!     opt-in, no consumer thread runs and the App's
+//!     `manifest_watch_rx` is `None`.
+//!   - Owns a reconnect loop with exponential backoff (1s → 30s).
+//!     Daemon restart, socket-not-yet-bound, transient network
+//!     blips: the consumer retries with bounded backoff. On
+//!     successful reconnect the daemon's `manifest.watch` returns
+//!     a fresh snapshot — the TUI's in-memory state stays
+//!     authoritative; missed mutations during the disconnect
+//!     window flow through later diffs / the next save's
+//!     read-from-disk reconciliation.
+//!   - Exits its outer loop (no reconnect) on `SendError`. That
+//!     means the main loop's `Receiver` was dropped — the App is
+//!     gone, no reason to keep dialing.
+//!
+//! The consumer thread NEVER touches `App` directly — all
+//! communication flows through the `mpsc::Sender<ManifestDiff>`
+//! into the main loop's `drain_manifest_watch_events`, which
+//! mutates `App` under the single-thread invariant the rest of
+//! the TUI relies on.
+
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use cm_daemon::control::protocol::{Caller, CallerOperator, Request, StreamKind};
+use cm_daemon::control::wire;
+use cm_daemon::manifest::{LastExit, ManifestDiff};
+
+/// 10e-c r1 F1: post-disconnect snapshot reconciliation payload.
+/// Each entry is one session's uid + that session's
+/// `last_exit` (`None` if the daemon doesn't have one for it).
+///
+/// Why this shape vs. the raw daemon snapshot JSON: the TUI's
+/// `apply_manifest_snapshot` only consumes per-uid `last_exit` —
+/// the rest of the daemon's snapshot (workspaces, bindings) is
+/// loaded from disk at TUI startup and isn't reconciled here.
+/// Flattening to a (uid, last_exit) list keeps the App-side
+/// apply loop simple.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ManifestSnapshotPayload {
+    /// `(uid, last_exit)` pairs extracted from the daemon's
+    /// snapshot's `workspaces[*].sessions[*]`. Order is
+    /// daemon-iteration order (HashMap of workspaces × Vec of
+    /// sessions); the App-side apply walks this and updates
+    /// `preserved_last_exit` conservatively per the F1 merge
+    /// rule (only when local is None).
+    pub session_last_exits: Vec<(String, Option<LastExit>)>,
+}
+
+/// 10e-c r1 F1: typed event the consumer sends to the main loop.
+/// Diff and Snapshot are mutually exclusive at the wire-frame
+/// level; one event variant per frame.
+///
+/// Channel was `Sender<ManifestDiff>` pre-r1; r1 widened to this
+/// enum to surface the snapshot reconciliation step in the
+/// type system. Pre-r1 the snapshot was silently dropped on the
+/// consumer side, which clobbered the daemon's last_exit on
+/// reconnect (the F1 finding).
+#[derive(Debug, Clone)]
+pub enum ManifestEvent {
+    /// Initial snapshot frame from the daemon after a fresh
+    /// subscribe. Sent once per (re)connect, before any diff
+    /// frames.
+    Snapshot(ManifestSnapshotPayload),
+    /// One live broadcast — `ManifestDiff::Exited` carries the
+    /// memory_cap_kill flag the named criterion needs.
+    Diff(ManifestDiff),
+}
+
+/// Hardcoded operator-caller token used for all TUI→daemon RPCs.
+/// Matches `app.rs`'s existing convention (line ~2789 of app.rs).
+const OPERATOR_TOKEN_ID: &str = "tui-operator";
+
+/// Reconnect backoff base (first dial-failure sleep before retry).
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Reconnect backoff cap. Bounds the worst-case retry interval
+/// when the daemon is permanently down — prevents a tight spin
+/// against a misconfigured/unavailable daemon.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Handle stashed on `App` for lifecycle management. The consumer
+/// thread is a "daemon" (process-lifetime) thread; we don't join
+/// on App drop — process exit reaps it. Kept here mostly as
+/// documentation that the thread exists.
+///
+/// 10e-c r1 F1: receiver carries `ManifestEvent` (was
+/// `ManifestDiff`). Snapshot frames now surface as
+/// `ManifestEvent::Snapshot(...)` so the App's apply path can
+/// reconcile post-disconnect.
+pub struct ManifestWatchConsumer {
+    /// Receiver drained per tick by the App.
+    pub event_rx: mpsc::Receiver<ManifestEvent>,
+    /// Join handle, retained for tests + future explicit shutdown.
+    /// Not joined on App drop.
+    pub _thread: JoinHandle<()>,
+}
+
+/// Decide whether to spawn the consumer. The TUI works without a
+/// daemon (legacy single-process mode); spawning a consumer that
+/// tight-loops trying to dial a non-existent socket would burn
+/// CPU + clutter logs. Gate on the opt-in flag.
+///
+/// `daemon_socket_exists` is NOT required at decision time —
+/// daemon-launch can race with the consumer's first dial. The
+/// reconnect loop handles "socket appears shortly after spawn"
+/// gracefully via the backoff retry.
+pub fn should_spawn() -> bool {
+    crate::daemon_launch::opt_in_enabled()
+}
+
+/// App-side helper: resolve the daemon socket + opt-in flag,
+/// spawn the consumer if both conditions hold, return
+/// `(Some(rx), Some(thread))` or `(None, None)`. Called once
+/// from `App::new`.
+///
+/// Folded behind one helper so `App::new`'s constructor stays
+/// readable — the daemon-mode-vs-legacy decision lives here.
+pub fn maybe_spawn_for_app() -> (
+    Option<mpsc::Receiver<ManifestEvent>>,
+    Option<JoinHandle<()>>,
+) {
+    if !should_spawn() {
+        return (None, None);
+    }
+    let socket_path = cm_daemon::default_socket_path();
+    let consumer = spawn(socket_path);
+    (Some(consumer.event_rx), Some(consumer._thread))
+}
+
+/// Spawn the consumer thread + return the handle. Caller wires
+/// `diff_rx` into `App.manifest_watch_rx`.
+///
+/// `socket_path` is resolved by the caller (production via
+/// `cm_daemon::default_socket_path()`; tests pass a path to a
+/// synthetic listener). Stays test-friendly.
+pub fn spawn(socket_path: PathBuf) -> ManifestWatchConsumer {
+    let (event_tx, event_rx) = mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("cm-tui-manifest-watch".to_string())
+        .spawn(move || run_consumer(&socket_path, event_tx))
+        .expect("spawn manifest.watch consumer thread");
+    ManifestWatchConsumer {
+        event_rx,
+        _thread: thread,
+    }
+}
+
+/// Consumer thread body. Two nested loops:
+///   - Outer (reconnect): dial socket; on failure, sleep with
+///     exponential backoff (1s → 30s cap); on success, reset
+///     backoff and enter inner.
+///   - Inner (stream-read): drain `StreamFrame`s; on
+///     `ManifestDiff` send to channel; on socket error break to
+///     outer for reconnect; on `SendError` (channel disconnect →
+///     App gone), return entirely.
+///
+/// Made `pub(crate)` so the 10e-c test module can drive it
+/// against a synthetic Unix listener.
+pub(crate) fn run_consumer(
+    socket_path: &Path,
+    event_tx: mpsc::Sender<ManifestEvent>,
+) {
+    let mut backoff = RECONNECT_BACKOFF_BASE;
+    loop {
+        match connect_and_subscribe(socket_path) {
+            Ok(stream) => {
+                // Reset backoff on each successful subscription.
+                // A flaky daemon that goes down/up shouldn't
+                // accumulate exponential delay across sessions.
+                backoff = RECONNECT_BACKOFF_BASE;
+                match drive_stream(stream, &event_tx) {
+                    DriveOutcome::ChannelDisconnected => {
+                        // App dropped its receiver. Done forever.
+                        return;
+                    }
+                    DriveOutcome::StreamEnded => {
+                        // Socket-side error / daemon disconnect.
+                        // Fall through to outer reconnect.
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: manifest.watch connect failed: {} (retrying in {}s)",
+                    e,
+                    backoff.as_secs(),
+                );
+            }
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Why the inner stream loop ended. Drives the outer loop's
+/// reconnect-vs-give-up decision.
+enum DriveOutcome {
+    /// Channel `Sender::send` returned `Err(SendError)` — the
+    /// main loop's `Receiver` was dropped. App is gone; no point
+    /// reconnecting. Outer loop returns.
+    ChannelDisconnected,
+    /// Socket read returned EOF or error — daemon disconnect.
+    /// Outer loop should backoff + reconnect.
+    StreamEnded,
+}
+
+/// Dial + send `manifest.watch` RPC + verify OK response.
+/// Returns the live socket on success (now in streaming mode);
+/// the caller reads frames off it via [`drive_stream`].
+fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    let req = Request {
+        id: format!(
+            "mw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ),
+        caller: Caller::Operator(CallerOperator {
+            token_id: OPERATOR_TOKEN_ID.to_string(),
+        }),
+        method: "manifest.watch".to_string(),
+        params: serde_json::json!({}),
+    };
+    wire::write_request(&mut stream, &req)
+        .map_err(|e| std::io::Error::other(format!("write manifest.watch request: {}", e)))?;
+    let resp = wire::read_response(&mut stream)
+        .map_err(|e| std::io::Error::other(format!("read manifest.watch response: {}", e)))?
+        .ok_or_else(|| {
+            std::io::Error::other("daemon closed connection before manifest.watch response")
+        })?;
+    if !resp.ok {
+        let err = resp.error.as_ref();
+        return Err(std::io::Error::other(format!(
+            "manifest.watch RPC failed: {} ({:?})",
+            err.map(|e| e.message.as_str()).unwrap_or("<no message>"),
+            err.map(|e| e.code),
+        )));
+    }
+    Ok(stream)
+}
+
+/// Read frames until socket EOF/error OR channel disconnect.
+/// Returns the outcome so the outer loop can decide whether to
+/// reconnect.
+fn drive_stream(
+    mut stream: UnixStream,
+    event_tx: &mpsc::Sender<ManifestEvent>,
+) -> DriveOutcome {
+    loop {
+        match wire::read_stream_frame(&mut stream) {
+            Ok(Some(frame)) => match frame.kind {
+                StreamKind::ManifestSnapshot => {
+                    // 10e-c r1 F1: parse the snapshot's
+                    // workspaces → flatten to (uid, last_exit)
+                    // pairs → forward as ManifestEvent::Snapshot.
+                    // The App-side conservative-merge applies:
+                    // only update local preserved_last_exit when
+                    // it's None (daemon's snapshot is
+                    // authoritative for sessions whose last_exit
+                    // we don't yet know).
+                    match parse_snapshot_payload(&frame.payload) {
+                        Ok(payload) => {
+                            if event_tx
+                                .send(ManifestEvent::Snapshot(payload))
+                                .is_err()
+                            {
+                                return DriveOutcome::ChannelDisconnected;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "cm-tui: manifest.watch snapshot parse failed: {} \
+                                 — dropping snapshot, keep reading diffs",
+                                e,
+                            );
+                        }
+                    }
+                }
+                StreamKind::ManifestDiff => {
+                    match serde_json::from_value::<ManifestDiff>(frame.payload.clone()) {
+                        Ok(diff) => {
+                            if event_tx
+                                .send(ManifestEvent::Diff(diff))
+                                .is_err()
+                            {
+                                // R8: main loop's Receiver dropped.
+                                // App is gone; outer loop returns
+                                // (don't reconnect).
+                                return DriveOutcome::ChannelDisconnected;
+                            }
+                        }
+                        Err(e) => {
+                            // Wire-protocol bug: log + drop the
+                            // frame, keep reading. Future variants
+                            // a future daemon might emit could
+                            // land here; we don't want to drop
+                            // the whole subscription.
+                            eprintln!(
+                                "cm-tui: manifest.watch diff deserialize failed: {} (payload: {})",
+                                e, frame.payload,
+                            );
+                        }
+                    }
+                }
+                StreamKind::Heartbeat => {
+                    // 10e-b r1: liveness probe. Silent no-op
+                    // consumer-side; the daemon uses the write
+                    // success/failure to detect our disconnect.
+                }
+                other => {
+                    eprintln!(
+                        "cm-tui: manifest.watch received unexpected kind {:?} — dropping frame",
+                        other,
+                    );
+                }
+            },
+            Ok(None) => {
+                // Clean EOF from daemon side (shutdown).
+                return DriveOutcome::StreamEnded;
+            }
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: manifest.watch read error: {} — reconnecting",
+                    e,
+                );
+                return DriveOutcome::StreamEnded;
+            }
+        }
+    }
+}
+
+/// 10e-c r1 F1: parse the daemon's snapshot frame payload into
+/// the flat per-uid `(uid, Option<LastExit>)` list the App's
+/// apply path expects. The daemon's snapshot wire shape is
+/// `{"workspaces": HashMap<String, ManifestWorkspace>, "bindings": ...}`
+/// (set by `daemon::control::dispatch::dispatch_manifest_watch`).
+/// We only consume the `workspaces[*].sessions[*]` walk; the
+/// `bindings` map and other workspace metadata stay TUI-loaded-
+/// from-disk.
+///
+/// Tolerant parser: skips workspaces/sessions whose JSON shape
+/// is malformed in unexpected ways. The TUI's `ManifestEntry`
+/// type is the daemon's `ManifestEntry` (re-exported), so the
+/// normal wire shape parses cleanly.
+fn parse_snapshot_payload(
+    payload: &serde_json::Value,
+) -> Result<ManifestSnapshotPayload, String> {
+    let workspaces = payload
+        .get("workspaces")
+        .ok_or_else(|| "snapshot missing 'workspaces' field".to_string())?
+        .as_object()
+        .ok_or_else(|| "snapshot 'workspaces' is not an object".to_string())?;
+    let mut session_last_exits: Vec<(String, Option<LastExit>)> = Vec::new();
+    for (_ws_id, ws_value) in workspaces {
+        let sessions = match ws_value.get("sessions").and_then(|v| v.as_array()) {
+            Some(s) => s,
+            None => continue, // tolerant: skip malformed workspace
+        };
+        for entry in sessions {
+            let uid = match entry.get("uid").and_then(|v| v.as_str()) {
+                Some(u) => u.to_string(),
+                None => continue,
+            };
+            // `last_exit` is `#[serde(skip_serializing_if = "Option::is_none")]`
+            // on ManifestEntry — so a session with no exit
+            // simply omits the field entirely, not Null.
+            let last_exit = match entry.get("last_exit") {
+                Some(v) if !v.is_null() => {
+                    match serde_json::from_value::<LastExit>(v.clone()) {
+                        Ok(le) => Some(le),
+                        Err(_) => continue, // skip malformed entry
+                    }
+                }
+                _ => None,
+            };
+            session_last_exits.push((uid, last_exit));
+        }
+    }
+    Ok(ManifestSnapshotPayload {
+        session_last_exits,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    /// Listen on a tempdir-bound socket. Returns `(socket_path,
+    /// listener, tempdir-guard)`. The tempdir guard must stay in
+    /// scope so the socket file isn't cleaned up mid-test.
+    fn spawn_test_listener() -> (PathBuf, UnixListener, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cm-test.sock");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        (path, listener, dir)
+    }
+
+    /// Accept one client; send the OK response then a sequence of
+    /// stream frames; close. Returns the request the client sent.
+    fn accept_and_send_frames(
+        listener: &UnixListener,
+        frames: Vec<cm_daemon::control::protocol::StreamFrame>,
+    ) -> Request {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let req = wire::read_request(&mut stream)
+            .expect("read request")
+            .expect("request present");
+        // Send OK response matching the dispatcher's wire shape.
+        let resp = cm_daemon::control::protocol::Response::ok(
+            req.id.clone(),
+            serde_json::json!({ "subscribed": true }),
+        );
+        wire::write_response(&mut stream, &resp).expect("write response");
+        for frame in frames {
+            wire::write_stream_frame(&mut stream, &frame).expect("write stream frame");
+        }
+        // Don't close — let the test decide when to drop.
+        // (Drop happens when caller drops the stream returned via
+        // future variant of this helper; for now we hold the
+        // stream local and let it drop at function-end.)
+        req
+    }
+
+    /// T13 — consumer sends a well-formed `manifest.watch` request:
+    /// method matches, caller is Operator, params is `{}`.
+    #[test]
+    fn consumer_sends_well_formed_manifest_watch_request() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let sock_clone = sock.clone();
+        let consumer = std::thread::spawn(move || {
+            // Use connect_and_subscribe only — we don't want to
+            // enter drive_stream and block on read.
+            let _ = connect_and_subscribe(&sock_clone);
+        });
+
+        // Accept + read the request.
+        let (mut stream, _) = listener.accept().expect("accept");
+        let req = wire::read_request(&mut stream)
+            .expect("read request")
+            .expect("request present");
+        // Send OK to unblock the consumer's response read.
+        let resp = cm_daemon::control::protocol::Response::ok(
+            req.id.clone(),
+            serde_json::json!({ "subscribed": true }),
+        );
+        wire::write_response(&mut stream, &resp).expect("write response");
+        consumer.join().expect("consumer thread");
+
+        assert_eq!(req.method, "manifest.watch");
+        match req.caller {
+            Caller::Operator(op) => {
+                assert_eq!(op.token_id, OPERATOR_TOKEN_ID);
+            }
+            other => panic!("expected Operator caller, got {:?}", other),
+        }
+        // Params is `{}` (an empty object), not Null.
+        assert!(req.params.is_object());
+        assert_eq!(req.params.as_object().unwrap().len(), 0);
+    }
+
+    /// T14 — diff frames after the OK response land in the
+    /// receiver. Uses real `wire::write_stream_frame` on the
+    /// listener side; consumer's `drive_stream` deserializes via
+    /// the production `serde_json::from_value` path.
+    #[test]
+    fn consumer_forwards_manifest_diff_frames_to_channel() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sock_clone = sock.clone();
+        let _consumer = std::thread::spawn(move || {
+            run_consumer(&sock_clone, event_tx);
+        });
+
+        // Build a snapshot frame + 2 diff frames + 1 heartbeat.
+        let frames = vec![
+            cm_daemon::control::protocol::StreamFrame::manifest_snapshot(
+                "req-t14",
+                serde_json::json!({ "workspaces": {}, "bindings": {} }),
+            ),
+            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-t14",
+                serde_json::to_value(ManifestDiff::Tombstoned {
+                    uid: "ts-t14-a".into(),
+                    exited_at: 1.0,
+                })
+                .unwrap(),
+            ),
+            cm_daemon::control::protocol::StreamFrame::heartbeat("req-t14"),
+            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-t14",
+                serde_json::to_value(ManifestDiff::Tombstoned {
+                    uid: "ts-t14-b".into(),
+                    exited_at: 2.0,
+                })
+                .unwrap(),
+            ),
+        ];
+        let _req = accept_and_send_frames(&listener, frames);
+
+        // Receiver gets snapshot (now forwarded post-r1) + 2
+        // diffs (heartbeat ignored).
+        let snap_event =
+            event_rx.recv_timeout(Duration::from_secs(2)).expect("snapshot");
+        match snap_event {
+            ManifestEvent::Snapshot(payload) => {
+                // Snapshot frame's workspaces was empty `{}` —
+                // no sessions to extract.
+                assert!(
+                    payload.session_last_exits.is_empty(),
+                    "empty workspaces snapshot → no per-uid last_exits",
+                );
+            }
+            other => panic!("expected Snapshot, got {:?}", other),
+        }
+        let first =
+            event_rx.recv_timeout(Duration::from_secs(2)).expect("first diff");
+        match first {
+            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+                assert_eq!(uid, "ts-t14-a");
+            }
+            other => panic!("expected Diff(Tombstoned ts-t14-a), got {:?}", other),
+        }
+        let second =
+            event_rx.recv_timeout(Duration::from_secs(2)).expect("second diff");
+        match second {
+            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+                assert_eq!(uid, "ts-t14-b");
+            }
+            other => panic!("expected Diff(Tombstoned ts-t14-b), got {:?}", other),
+        }
+    }
+
+    /// T17 — Heartbeat frames don't propagate. (Folded into T14's
+    /// assertions: the channel sees exactly the 2 diff frames out
+    /// of [snapshot, diff, heartbeat, diff] sent. Adding a focused
+    /// version too for explicit pinning.)
+    #[test]
+    fn consumer_drops_heartbeat_frames_silently() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sock_clone = sock.clone();
+        let _consumer = std::thread::spawn(move || {
+            run_consumer(&sock_clone, event_tx);
+        });
+
+        // Three heartbeats, no diffs.
+        let frames = (0..3)
+            .map(|_| {
+                cm_daemon::control::protocol::StreamFrame::heartbeat("req-t17")
+            })
+            .collect();
+        let _req = accept_and_send_frames(&listener, frames);
+
+        // Receiver gets nothing within a bounded window.
+        match event_rx.recv_timeout(Duration::from_millis(200)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Daemon-end closed; could happen if the listener
+                // dropped. Acceptable as long as no diff arrived.
+            }
+            Ok(diff) => panic!(
+                "expected no diffs (heartbeats only); got {:?}",
+                diff,
+            ),
+        }
+    }
+
+    /// T19 — consumer exits its outer loop on `SendError`
+    /// (channel receiver dropped). NOT reconnects in a tight
+    /// loop. Drives the consumer manually with a closed receiver.
+    #[test]
+    fn consumer_exits_on_channel_disconnect_no_reconnect_spin() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let (event_tx, event_rx) = mpsc::channel();
+        // Drop the receiver IMMEDIATELY — but keep a "did the
+        // consumer thread return?" flag.
+        drop(event_rx);
+
+        let sock_clone = sock.clone();
+        let consumer = std::thread::spawn(move || {
+            run_consumer(&sock_clone, event_tx);
+        });
+
+        // Accept the connection, send OK + one diff. The
+        // consumer's first try_send on the closed channel
+        // returns Err → DriveOutcome::ChannelDisconnected →
+        // outer loop returns.
+        let frames = vec![
+            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-t19",
+                serde_json::to_value(ManifestDiff::Tombstoned {
+                    uid: "ts-t19".into(),
+                    exited_at: 0.0,
+                })
+                .unwrap(),
+            ),
+        ];
+        let _req = accept_and_send_frames(&listener, frames);
+
+        // Consumer thread MUST exit within a bounded window.
+        // Without the SendError early-return, it would keep
+        // reconnecting to the listener forever (listener accepts
+        // a 2nd connection on next loop iteration).
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(2);
+        while !consumer.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "consumer thread did NOT exit on channel \
+                     disconnect; pre-fix it would have looped \
+                     forever (tight reconnect-then-SendError spin)",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = consumer.join();
+    }
+
+    /// T18 — reconnect resilience: kill the listener mid-stream,
+    /// respawn it, consumer reconnects on its own and delivers
+    /// subsequent diffs.
+    ///
+    /// MUST-LAND per round-3 review. Integration-style via
+    /// UnixListener bind/unbind, no real daemon binary needed.
+    #[test]
+    fn consumer_reconnects_after_listener_drop_and_rebind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("cm-t18.sock");
+
+        // Phase 1: bind, accept, send 1 diff, drop.
+        let listener1 = UnixListener::bind(&sock).expect("bind 1");
+        let (event_tx, event_rx) = mpsc::channel();
+        let sock_clone = sock.clone();
+        let _consumer = std::thread::spawn(move || {
+            run_consumer(&sock_clone, event_tx);
+        });
+
+        {
+            let (mut stream, _) = listener1.accept().expect("accept 1");
+            let req = wire::read_request(&mut stream)
+                .expect("read req 1")
+                .expect("req 1 present");
+            let resp = cm_daemon::control::protocol::Response::ok(
+                req.id.clone(),
+                serde_json::json!({ "subscribed": true }),
+            );
+            wire::write_response(&mut stream, &resp).expect("resp 1");
+            let frame = cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-1",
+                serde_json::to_value(ManifestDiff::Tombstoned {
+                    uid: "ts-pre-disconnect".into(),
+                    exited_at: 1.0,
+                })
+                .unwrap(),
+            );
+            wire::write_stream_frame(&mut stream, &frame).expect("frame 1");
+            // 10e-c r1: snapshot is now forwarded — drain it
+            // first so we can then assert the diff arrived
+            // after the snapshot.
+            // Phase 1 we didn't send a snapshot frame, so there
+            // isn't one to drain here. Just receive the diff.
+            // (We DID send an empty workspaces snapshot in
+            // accept_and_send_frames for other tests, but T18
+            // uses a custom phase loop and doesn't send the
+            // snapshot frame in phase 1.)
+            let _first_event = event_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first event (diff)");
+            // Phase 1 cleanup: drop the listener AND the stream
+            // (closing the stream's daemon end → consumer's
+            // read_stream_frame returns Ok(None) → consumer
+            // enters outer reconnect loop).
+            drop(stream);
+            drop(listener1);
+        }
+
+        // Remove the socket file so rebind doesn't AddrInUse.
+        let _ = std::fs::remove_file(&sock);
+
+        // Phase 2: rebind. Consumer's reconnect-with-backoff
+        // dials this fresh listener. First retry sleeps 1s, so
+        // give the test ~5s window.
+        let listener2 = UnixListener::bind(&sock).expect("bind 2");
+        // 10e-c r1 F2: NON-blocking accept inside the deadline
+        // loop. If reconnect regresses, accept returns WouldBlock
+        // each iteration and the deadline check fires within
+        // 50ms — clear panic message instead of a hung CI.
+        listener2
+            .set_nonblocking(true)
+            .expect("set nonblocking true");
+
+        let accept_deadline =
+            std::time::Instant::now() + Duration::from_secs(5);
+        let mut stream2 = loop {
+            match listener2.accept() {
+                Ok((s, _)) => {
+                    // Switch back to blocking for the
+                    // request-response phase below; nonblocking
+                    // there would force us into a second polling
+                    // loop on read.
+                    s.set_nonblocking(false)
+                        .expect("post-accept set_nonblocking false");
+                    break s;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= accept_deadline {
+                        panic!(
+                            "consumer did NOT reconnect within 5s window — \
+                             pre-r1 the consumer's outer reconnect loop \
+                             would have re-dialed; this test pinned that \
+                             behavior. Regression possible.",
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("accept failed: {}", e),
+            }
+        };
+
+        let req2 = wire::read_request(&mut stream2)
+            .expect("read req 2")
+            .expect("req 2 present");
+        let resp2 = cm_daemon::control::protocol::Response::ok(
+            req2.id.clone(),
+            serde_json::json!({ "subscribed": true }),
+        );
+        wire::write_response(&mut stream2, &resp2).expect("resp 2");
+
+        let frame2 = cm_daemon::control::protocol::StreamFrame::manifest_diff(
+            "req-2",
+            serde_json::to_value(ManifestDiff::Tombstoned {
+                uid: "ts-post-reconnect".into(),
+                exited_at: 2.0,
+            })
+            .unwrap(),
+        );
+        wire::write_stream_frame(&mut stream2, &frame2).expect("frame 2");
+
+        // Receive the post-reconnect diff. Phase-2 didn't send
+        // a snapshot frame either, so the next event IS the diff.
+        let post = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("post-reconnect diff MUST arrive");
+        match post {
+            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+                assert_eq!(uid, "ts-post-reconnect");
+            }
+            other => panic!(
+                "expected Diff(Tombstoned ts-post-reconnect), got {:?}",
+                other,
+            ),
+        }
+    }
+
+    /// T-malformed — daemon sends a malformed ManifestDiff
+    /// payload (deserialize fails). Consumer drops THE FRAME and
+    /// keeps reading. Subsequent valid frames still arrive.
+    #[test]
+    fn consumer_drops_malformed_diff_frame_and_keeps_reading() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sock_clone = sock.clone();
+        let _consumer = std::thread::spawn(move || {
+            run_consumer(&sock_clone, event_tx);
+        });
+
+        let frames = vec![
+            // Malformed diff: payload doesn't match ManifestDiff
+            // enum shape.
+            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-malformed",
+                serde_json::json!({ "not_a_variant": "garbage" }),
+            ),
+            // Valid follow-up diff.
+            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-malformed",
+                serde_json::to_value(ManifestDiff::Tombstoned {
+                    uid: "ts-valid-after-malformed".into(),
+                    exited_at: 1.0,
+                })
+                .unwrap(),
+            ),
+        ];
+        let _req = accept_and_send_frames(&listener, frames);
+
+        // accept_and_send_frames sends an OK + frames. Our
+        // helper here built only `manifest_diff` frames (no
+        // snapshot), so first event from the receiver IS the
+        // valid diff (malformed was logged + dropped).
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid diff after malformed");
+        match event {
+            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+                assert_eq!(uid, "ts-valid-after-malformed");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    /// T21 (10e-c r1 F1) — snapshot's per-uid last_exit info is
+    /// forwarded to the App via `ManifestEvent::Snapshot`.
+    /// Daemon-side wire shape: `{workspaces, bindings}` where each
+    /// `workspaces[ws].sessions[*]` carries a `last_exit` field.
+    /// Consumer parses + flattens into the per-uid list.
+    ///
+    /// Mutation-verified locally by dropping the consumer's
+    /// snapshot-handling arm; the test then fails because the
+    /// receiver never sees `ManifestEvent::Snapshot` and times
+    /// out. Documented as a structural defense — the pre-r1
+    /// "snapshot ignored" bug would specifically clobber the
+    /// daemon's last_exit on reconnect (F1 finding).
+    #[test]
+    fn consumer_forwards_snapshot_last_exit_on_reconnect() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sock_clone = sock.clone();
+        let _consumer = std::thread::spawn(move || {
+            run_consumer(&sock_clone, event_tx);
+        });
+
+        // Snapshot frame with two sessions: one with last_exit
+        // populated (memory_cap_kill: true), one without.
+        let last_exit = LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(42),
+            exited_at: 1_700_000_000.0,
+        };
+        let snapshot_payload = serde_json::json!({
+            "workspaces": {
+                "ws-1": {
+                    "id": "ws-1",
+                    "name": "test",
+                    "sessions": [
+                        {
+                            "uid": "ts-with-exit",
+                            "label": "x",
+                            "session_type": "claude-code",
+                            "last_exit": {
+                                "code": 137,
+                                "memory_cap_kill": true,
+                                "kills_file_offset": 42,
+                                "exited_at": 1_700_000_000.0,
+                            },
+                        },
+                        {
+                            "uid": "ts-without-exit",
+                            "label": "y",
+                            "session_type": "claude-code",
+                        },
+                    ],
+                },
+            },
+            "bindings": {},
+        });
+        let frames = vec![
+            cm_daemon::control::protocol::StreamFrame::manifest_snapshot(
+                "req-t21",
+                snapshot_payload,
+            ),
+        ];
+        let _req = accept_and_send_frames(&listener, frames);
+
+        // Receive the snapshot event.
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot MUST arrive (was silently dropped pre-r1)");
+        match event {
+            ManifestEvent::Snapshot(payload) => {
+                assert_eq!(payload.session_last_exits.len(), 2);
+                // First entry: ts-with-exit has Some(last_exit).
+                let with_exit = payload
+                    .session_last_exits
+                    .iter()
+                    .find(|(uid, _)| uid == "ts-with-exit")
+                    .expect("ts-with-exit in snapshot");
+                let parsed_exit = with_exit.1.as_ref().expect("last_exit present");
+                assert_eq!(parsed_exit, &last_exit);
+                // Second entry: ts-without-exit has None.
+                let without_exit = payload
+                    .session_last_exits
+                    .iter()
+                    .find(|(uid, _)| uid == "ts-without-exit")
+                    .expect("ts-without-exit in snapshot");
+                assert!(without_exit.1.is_none());
+            }
+            other => panic!("expected Snapshot event, got {:?}", other),
+        }
+    }
+}

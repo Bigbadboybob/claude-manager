@@ -2480,6 +2480,31 @@ pub struct App {
     /// capped session's watcher thread.
     pub memory_kill_tx: std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
     pub memory_kill_rx: std::sync::mpsc::Receiver<crate::session_watch::MemoryKillEvent>,
+    /// 10e-c: TUI consumer for daemon's `manifest.watch` stream.
+    /// `Some` only when daemon mode is opt-in active
+    /// (`CM_USE_DAEMON_SOCKET=1`); the consumer thread dials the
+    /// daemon socket, subscribes, and forwards
+    /// `ManifestEvent`s (snapshot + diffs) through this receiver.
+    /// `None` in legacy single-process mode — no consumer
+    /// thread spawned.
+    ///
+    /// 10e-c r1 F1: events were `ManifestDiff` pre-r1 — r1
+    /// widened to `ManifestEvent` so the post-disconnect
+    /// snapshot reconciliation surfaces in the type system.
+    ///
+    /// Drained per tick by `drain_manifest_watch_events`. Each
+    /// event applies to `TerminalSession.preserved_last_exit`:
+    /// Diff(Exited) sets it unconditionally; Snapshot
+    /// conservatively only fills it when local is None
+    /// (avoids clobbering live broadcasts the TUI processed
+    /// pre-disconnect). Unknown uids are silent no-ops (R5).
+    pub manifest_watch_rx:
+        Option<std::sync::mpsc::Receiver<crate::manifest_watch::ManifestEvent>>,
+    /// 10e-c: thread handle for the manifest.watch consumer. Held
+    /// for the App's lifetime so it isn't auto-joined on Drop;
+    /// the thread is a "daemon" thread reaped by process exit.
+    /// `None` when consumer wasn't spawned.
+    pub _manifest_watch_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -2561,6 +2586,15 @@ impl App {
         }
         let (memory_kill_tx, memory_kill_rx) = std::sync::mpsc::channel();
 
+        // 10e-c: spawn the manifest.watch consumer only when
+        // daemon mode is opt-in active. Without opt-in, the TUI
+        // runs in legacy single-process mode and there's no
+        // daemon to subscribe to; spawning a consumer that
+        // tight-loops trying to dial a non-existent socket would
+        // be wasted work + log noise.
+        let (manifest_watch_rx, _manifest_watch_thread) =
+            crate::manifest_watch::maybe_spawn_for_app();
+
         App {
             tasks: Vec::new(),
             workspaces: Vec::new(),
@@ -2592,6 +2626,8 @@ impl App {
             memory_cap_status,
             memory_kill_tx,
             memory_kill_rx,
+            manifest_watch_rx,
+            _manifest_watch_thread,
         }
     }
 
@@ -5397,6 +5433,139 @@ impl App {
                 } => (session_uid, format!("memory cap kill failed: {}", reason)),
             };
             self.log_activity(&caller, summary);
+        }
+    }
+
+    /// 10e-c: drain the manifest.watch consumer's channel and
+    /// apply each diff to in-memory TUI state. Called per tick
+    /// from the main loop. No-op when the consumer wasn't
+    /// spawned (legacy single-process mode — `manifest_watch_rx`
+    /// is `None`).
+    pub fn drain_manifest_watch_events(&mut self) {
+        // Collect first so we can `&mut self` apply without
+        // holding the immutable `Receiver` borrow across the
+        // mutating call. mpsc::Receiver doesn't lend itself to
+        // splitting borrows; the drain → buffer → apply shape
+        // is the canonical Rust workaround.
+        let mut events: Vec<crate::manifest_watch::ManifestEvent> = Vec::new();
+        if let Some(rx) = self.manifest_watch_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Consumer thread exited (App being
+                        // dropped, or the consumer hit its own
+                        // SendError exit path — though that
+                        // fires on OUR side dropping the rx, so
+                        // this branch is mostly "consumer died
+                        // for some reason"). Either way, no more
+                        // events incoming; stop draining.
+                        break;
+                    }
+                }
+            }
+        }
+        for ev in events {
+            match ev {
+                crate::manifest_watch::ManifestEvent::Diff(diff) => {
+                    self.apply_manifest_diff(diff);
+                }
+                crate::manifest_watch::ManifestEvent::Snapshot(payload) => {
+                    self.apply_manifest_snapshot(payload);
+                }
+            }
+        }
+    }
+
+    /// 10e-c r1 F1: apply a post-(re)connect snapshot.
+    /// Conservative-merge per uid:
+    ///   - If the snapshot has `Some(last_exit)` AND the local
+    ///     session's `preserved_last_exit` is `None`, adopt the
+    ///     snapshot's value. This is the load-bearing case: a
+    ///     disconnect window during which the daemon broadcast
+    ///     `Exited` diffs we missed — the snapshot recovers them.
+    ///   - If the local is already `Some`, leave it. The TUI
+    ///     either processed the broadcast live OR loaded the
+    ///     value from disk at startup; either way it's already
+    ///     authoritative locally.
+    ///   - If the snapshot has `None` for a uid, no-op (no
+    ///     `Some → None` regression).
+    ///
+    /// R5 still applies: snapshot entries for uids the TUI
+    /// doesn't track are silently ignored (untagged-session
+    /// case — daemon's snapshot may reflect sessions in
+    /// workspaces this TUI hasn't loaded yet).
+    pub(crate) fn apply_manifest_snapshot(
+        &mut self,
+        snapshot: crate::manifest_watch::ManifestSnapshotPayload,
+    ) {
+        for (uid, snap_last_exit) in snapshot.session_last_exits {
+            let Some(snap) = snap_last_exit else {
+                continue;
+            };
+            for ws in &mut self.workspaces {
+                for ts in &mut ws.sessions {
+                    if ts.uid == uid {
+                        if ts.preserved_last_exit.is_none() {
+                            ts.preserved_last_exit = Some(snap.clone());
+                            self.needs_redraw = true;
+                        }
+                        // Inner break: we found the matching
+                        // session in this workspace, no need to
+                        // keep walking it. Outer loop continues
+                        // to the next uid (a snapshot uid
+                        // appears in at most one workspace).
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 10e-c: apply a single `ManifestDiff` to in-memory state.
+    /// Extracted from `drain_manifest_watch_events` so tests can
+    /// drive the application logic without spinning up the
+    /// consumer thread + a fake daemon listener.
+    ///
+    /// 10e-c scope: only `Exited` is consumed. The other variants
+    /// (Added / Updated / Tombstoned) are no-ops — they're for
+    /// 10e-d / 10f to consume when broader manifest sync lands.
+    /// Unknown uids are silent no-ops (R5 from the 10e plan).
+    pub(crate) fn apply_manifest_diff(
+        &mut self,
+        diff: cm_daemon::manifest::ManifestDiff,
+    ) {
+        use cm_daemon::manifest::ManifestDiff;
+        match diff {
+            ManifestDiff::Exited { uid, last_exit } => {
+                for ws in &mut self.workspaces {
+                    for ts in &mut ws.sessions {
+                        if ts.uid == uid {
+                            ts.preserved_last_exit = Some(last_exit);
+                            // Status may visibly change (cap-kill
+                            // toast surfacing in 10e-d will read
+                            // preserved_last_exit on bind). Mark
+                            // dirty so the next render picks up
+                            // any indicator changes.
+                            self.needs_redraw = true;
+                            return;
+                        }
+                    }
+                }
+                // R5: untracked uid — silent no-op. The diff
+                // referenced a session the TUI doesn't know
+                // about (e.g. a session the daemon spawned via
+                // MCP into a workspace this TUI hasn't loaded;
+                // future divergence cases). No panic, no log.
+            }
+            ManifestDiff::Added { .. }
+            | ManifestDiff::Updated { .. }
+            | ManifestDiff::Tombstoned { .. } => {
+                // 10e-c scope: only Exited carries the named-
+                // criterion field (memory_cap_kill). Other
+                // variants land in future slices' consumers.
+            }
         }
     }
 
@@ -11928,6 +12097,285 @@ mod manifest_entry_seeded_from_tests {
         );
         // Mutation also survives (sanity).
         assert_eq!(after_reload.label, "label-after");
+    }
+}
+
+/// 10e-c: tests for the `App::apply_manifest_diff` consumer-side
+/// application of daemon-broadcast `ManifestDiff`s. Exercises the
+/// integration point between the manifest.watch consumer thread
+/// (which sends `ManifestDiff`s through `manifest_watch_rx`) and
+/// the TUI's in-memory session state.
+///
+/// Constructing a full `App` for these tests is heavy (backend
+/// thread, control socket, preflight, etc.). Instead we build a
+/// minimal `App` shell via the same trick the existing
+/// `stop_workflow_local_cleanup_tests` module uses: focused
+/// field-level state + direct method invocation. The method is
+/// `pub(crate)` to enable this.
+#[cfg(test)]
+mod apply_manifest_diff_tests {
+    use super::*;
+    use cm_daemon::manifest::{LastExit, ManifestDiff};
+
+    /// Build a minimal `App` with a single workspace containing
+    /// one terminal session. The session's `preserved_last_exit`
+    /// starts as `None` (the default for a fresh session per
+    /// `make_simple_session_with_uid` line 480).
+    ///
+    /// The session's PTY is `/bin/true` because constructing a
+    /// `Session` requires a real PTY. The test only cares about
+    /// `preserved_last_exit`; the PTY exit doesn't matter (and
+    /// Drop SIGKILLs the child cleanly anyway).
+    fn build_app_with_session(uid: &str) -> App {
+        // Spawn a real PTY via /bin/true so Session::new succeeds.
+        // The session immediately exits; that's irrelevant for
+        // the preserved_last_exit assertion.
+        let session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            std::collections::HashMap::new(),
+            None,
+        )
+        .expect("test PTY");
+        let ts = make_simple_session_with_uid(
+            uid.to_string(),
+            "test-label",
+            "claude",
+            session,
+            None,
+        );
+        // Minimal Workspace.
+        let ws = Workspace {
+            id: "ws-test".into(),
+            name: "test-ws".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![ts],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        };
+
+        // Build App via the standard ctor THEN inject the
+        // workspace. App::new needs a Config; the test_support
+        // home_lock guards against $HOME mutations colliding
+        // with other tests (App::new reads ~/.cm/...).
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Restore HOME for the rest of the test process.
+        if let Some(h) = orig_home {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        // Inject our test workspace. Leak the tempdir so the
+        // backend thread (still alive) doesn't error on later
+        // ~/.cm accesses — App::new spawns it before we restored
+        // HOME, so it captured the tempdir path. Acceptable
+        // memory cost for a unit test.
+        std::mem::forget(tmp);
+        app.workspaces.push(ws);
+        app
+    }
+
+    /// T15 — `apply_manifest_diff` with `ManifestDiff::Exited`
+    /// updates `preserved_last_exit` on the matching session.
+    #[test]
+    fn apply_exited_diff_updates_preserved_last_exit_on_matching_session() {
+        let mut app = build_app_with_session("ts-t15");
+        // Pre-condition: preserved_last_exit is None.
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+
+        let diff = ManifestDiff::Exited {
+            uid: "ts-t15".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: true,
+                kills_file_offset: Some(42),
+                exited_at: 1.0,
+            },
+        };
+        app.apply_manifest_diff(diff);
+
+        let got = app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .as_ref()
+            .expect("apply must populate preserved_last_exit");
+        assert!(got.memory_cap_kill, "memory_cap_kill flag must transfer");
+        assert_eq!(got.kills_file_offset, Some(42));
+        assert!(
+            app.needs_redraw,
+            "needs_redraw must be set so the next render \
+             picks up status indicator changes",
+        );
+    }
+
+    /// T16 — `ManifestDiff::Exited` with an unknown uid is a
+    /// silent no-op (R5). No panic; no mutation to unrelated
+    /// sessions.
+    #[test]
+    fn apply_exited_diff_with_unknown_uid_is_silent_noop() {
+        let mut app = build_app_with_session("ts-t16-known");
+        app.needs_redraw = false; // reset
+
+        let diff = ManifestDiff::Exited {
+            uid: "ts-t16-stranger".into(),
+            last_exit: LastExit {
+                code: Some(1),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        };
+        app.apply_manifest_diff(diff);
+
+        // Unrelated session unchanged.
+        assert!(
+            app.workspaces[0].sessions[0]
+                .preserved_last_exit
+                .is_none(),
+            "unknown uid must NOT mutate unrelated sessions' \
+             preserved_last_exit",
+        );
+        // No redraw triggered by a no-op apply.
+        assert!(
+            !app.needs_redraw,
+            "unknown uid must NOT trigger a redraw",
+        );
+    }
+
+    /// T20-companion — non-Exited variants (`Added`, `Updated`,
+    /// `Tombstoned`) are no-ops in 10e-c. Pin to catch future
+    /// scope creep that would silently start consuming them
+    /// without explicit handling.
+    #[test]
+    fn apply_non_exited_variants_are_noop_in_10e_c() {
+        let mut app = build_app_with_session("ts-t20");
+        app.needs_redraw = false;
+
+        // Added: no preserved_last_exit mutation, no redraw.
+        app.apply_manifest_diff(ManifestDiff::Added {
+            uid: "ts-t20".into(),
+            entry: serde_json::Value::Null,
+        });
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+        assert!(!app.needs_redraw);
+
+        // Updated: same.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-t20".into(),
+            entry: serde_json::Value::Null,
+        });
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+        assert!(!app.needs_redraw);
+
+        // Tombstoned: same.
+        app.apply_manifest_diff(ManifestDiff::Tombstoned {
+            uid: "ts-t20".into(),
+            exited_at: 1.0,
+        });
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+        assert!(!app.needs_redraw);
+    }
+
+    /// T22 (10e-c r1 F1) — `apply_manifest_snapshot` adopts the
+    /// daemon's last_exit when the local field is `None`, AND
+    /// triggers a redraw. This is the "stale-None clobber" fix:
+    /// pre-r1 the snapshot was ignored on reconnect, so a session
+    /// the daemon already knew about (with last_exit set) would
+    /// keep showing as live until something else updated it.
+    #[test]
+    fn apply_snapshot_adopts_last_exit_when_local_is_none() {
+        let mut app = build_app_with_session("ts-t22");
+        app.needs_redraw = false;
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+
+        let last_exit = LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(7),
+            exited_at: 1.0,
+        };
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            session_last_exits: vec![(
+                "ts-t22".into(),
+                Some(last_exit.clone()),
+            )],
+        };
+        app.apply_manifest_snapshot(payload);
+
+        let got = app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .as_ref()
+            .expect("snapshot must populate preserved_last_exit when local is None");
+        assert_eq!(got, &last_exit);
+        assert!(app.needs_redraw, "snapshot adoption must request redraw");
+    }
+
+    /// T23 (10e-c r1 F1) — conservative merge: when the local
+    /// `preserved_last_exit` is already `Some(...)`, the snapshot's
+    /// value must NOT overwrite it. Local information wins because
+    /// it's typically fresher than the daemon's startup snapshot.
+    #[test]
+    fn apply_snapshot_does_not_overwrite_existing_local_last_exit() {
+        let mut app = build_app_with_session("ts-t23");
+        let local_exit = LastExit {
+            code: Some(0),
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 2.0,
+        };
+        app.workspaces[0].sessions[0].preserved_last_exit = Some(local_exit.clone());
+        app.needs_redraw = false;
+
+        let snapshot_exit = LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(99),
+            exited_at: 1.0,
+        };
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            session_last_exits: vec![(
+                "ts-t23".into(),
+                Some(snapshot_exit),
+            )],
+        };
+        app.apply_manifest_snapshot(payload);
+
+        let got = app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .as_ref()
+            .expect("local last_exit must be preserved");
+        assert_eq!(
+            got, &local_exit,
+            "conservative merge: local Some(...) wins over snapshot's value",
+        );
+        assert!(
+            !app.needs_redraw,
+            "no mutation → no redraw",
+        );
     }
 }
 

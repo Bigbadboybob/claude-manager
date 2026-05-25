@@ -9,6 +9,7 @@ mod config;
 mod control;
 mod daemon_launch;
 mod input;
+mod manifest_watch;
 mod mcp_config;
 mod memory_cap;
 mod planning;
@@ -169,6 +170,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_memory_kill_events();
         log_slow_phase("drain_memory_kill_events", t.elapsed());
+
+        // 10e-c: drain ManifestDiff frames from the
+        // manifest.watch consumer (daemon-mode opt-in only;
+        // no-op in legacy single-process mode).
+        let t = Instant::now();
+        app.drain_manifest_watch_events();
+        log_slow_phase("drain_manifest_watch_events", t.elapsed());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();
