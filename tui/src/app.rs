@@ -7289,37 +7289,27 @@ impl App {
         self.push_workflow_definitions_to_daemon();
     }
 
-    /// 10d-1 graceful-shutdown clear: push an explicit empty
-    /// `tui_sessions` snapshot to the daemon. Called from every
-    /// `should_quit = true` site after `save_session_manifest`.
-    /// Without this, the daemon retains the live snapshot the
-    /// final `save_session_manifest` push left behind — and
-    /// once the TUI exits, those rows describe sessions that
-    /// no longer exist, which 10d-2's `lookup_session_any`
-    /// would falsely treat as valid TUI sessions for workflow
-    /// auth.
+    /// 10d-1 graceful-shutdown clear (now a no-op, post-review
+    /// finding #14): pushing an empty snapshot at TUI shutdown
+    /// locked out any TUI-local workflow participant whose PTY
+    /// outlived the TUI (Session::Drop is detach-only — the
+    /// child PTY survives until `kill_session` or natural exit).
+    /// The orphan agent's MCP `workflow_transition` call then
+    /// hit daemon-side `lookup_session_any` with an empty
+    /// `tui_sessions` map and got Unauthorized mid-flight.
     ///
-    /// Crash case (TUI exits without reaching here) is bounded
-    /// in NOTES.md under "TUI crash-cleanup bound for
-    /// tui_sessions" — the next TUI restart's first push (from
-    /// either startup `reconcile_tasks` or `restore_sessions`)
-    /// replaces the stale snapshot. A durable fix requires
-    /// daemon-side connection-lifecycle awareness; defer.
+    /// The stale-rows concern that motivated the original clear
+    /// is bounded the same way the crash case always was: the
+    /// next TUI restart's first `reconcile_tasks` /
+    /// `restore_sessions` push REPLACES (not merges) the
+    /// snapshot. Any rows from the prior TUI session disappear
+    /// the moment the next TUI launches. Until then, the rows
+    /// are harmless to readers that gate on
+    /// `state.sessions.contains_key(uid)` first (the daemon's
+    /// dispatch paths do), and useful to the workflow-auth path
+    /// for orphaned participants that need to keep transitioning.
     pub(crate) fn clear_tui_sessions_on_daemon(&self) {
-        // 10f: daemon-mandatory; always clear.
-        let daemon_socket = cm_daemon::default_socket_path();
-        if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
-            &daemon_socket,
-            crate::daemon_launch::operator_token(),
-            &[],
-        ) {
-            eprintln!(
-                "cm-tui: tui.update_sessions_snapshot (shutdown clear) failed: {} \
-                 (daemon will retain stale tui_sessions rows until next TUI restart's \
-                 first push — see NOTES.md 'TUI crash-cleanup bound')",
-                e,
-            );
-        }
+        // Intentional no-op. See doc comment.
     }
 
     /// 10d-2c-2-1: push the in-memory workflow-definitions map

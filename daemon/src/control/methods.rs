@@ -1070,6 +1070,22 @@ fn return_auth_error_if_denied(
     caller_uid: &str,
     target_uid: &str,
 ) -> MethodResult {
+    return_auth_error_if_denied_with_state(decision, caller_uid, target_uid, None)
+}
+
+/// Variant that also consults `state.tui_sessions` so a target uid
+/// missing from `state.sessions` but present in the TUI's snapshot
+/// returns a clearer "TUI-owned, can't be proxied" error instead of
+/// the generic NotFound. Used by `send_input` / `kill_session` /
+/// `read_session_output` where the distinction matters for
+/// diagnostics; pure-Operator helpers can still go through the
+/// state-less wrapper above.
+fn return_auth_error_if_denied_with_state(
+    decision: crate::control::auth::AuthDecision,
+    caller_uid: &str,
+    target_uid: &str,
+    state: Option<&DaemonState>,
+) -> MethodResult {
     use crate::control::auth::AuthDecision;
     match decision {
         AuthDecision::Allow => Ok(Value::Null),
@@ -1080,10 +1096,26 @@ fn return_auth_error_if_denied(
                 caller_uid
             ),
         )),
-        AuthDecision::TargetNotInRegistry => Err((
-            ErrorCode::NotFound,
-            format!("target session '{}' not in the daemon registry", target_uid),
-        )),
+        AuthDecision::TargetNotInRegistry => {
+            if let Some(s) = state {
+                if s.tui_sessions.contains_key(target_uid) {
+                    return Err((
+                        ErrorCode::Conflict,
+                        format!(
+                            "target session '{}' is TUI-owned; the daemon does not \
+                             proxy mutations / reads to TUI-owned sessions yet. \
+                             Route this call through the TUI socket directly, or \
+                             wait for the post-Phase-1 cross-route work to land.",
+                            target_uid
+                        ),
+                    ));
+                }
+            }
+            Err((
+                ErrorCode::NotFound,
+                format!("target session '{}' not in the daemon registry", target_uid),
+            ))
+        }
         AuthDecision::OutOfScope => Err((
             ErrorCode::Unauthorized,
             format!(
@@ -1205,7 +1237,7 @@ pub fn send_input(
                 cuid,
                 &p.session_uid,
             );
-            return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+            return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
         }
         let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
             (
@@ -1282,7 +1314,7 @@ pub fn kill_session(
             cuid,
             &p.session_uid,
         );
-        return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
     }
     // 10e-a r1 F2: do NOT remove the session from the registry
     // here. Pre-r1 we removed-then-Drop'd, which fired SIGKILL
@@ -1388,7 +1420,7 @@ pub fn read_session_output(
                 cuid,
                 &p.session_uid,
             );
-            return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+            return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
         }
         let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
             (
@@ -1537,15 +1569,18 @@ pub fn list_sessions(
             .and_then(|s| s.task_id.clone())
     });
 
-    let mut sessions: Vec<Value> = Vec::with_capacity(state.sessions.len());
-    for (uid, session) in state.sessions.iter() {
-        let included = match (scope_task.as_deref(), caller_uid) {
+    let mut sessions: Vec<Value> =
+        Vec::with_capacity(state.sessions.len() + state.tui_sessions.len());
+
+    // Helper: should the given (uid, task_id) be included given
+    // the current scope_task / caller_uid context? Used by both
+    // the daemon-owned and TUI-owned loops below.
+    let should_include = |uid: &str, task_id: Option<&str>| -> bool {
+        match (scope_task.as_deref(), caller_uid) {
             // Explicit scope (param OR caller's task): include
             // only sessions whose task_id is self-or-descendant
             // of the scope. Mirrors TUI's `Some(scope) =>` arm.
-            (Some(scope), _) => session
-                .task_id
-                .as_deref()
+            (Some(scope), _) => task_id
                 .map(|t| {
                     crate::control::auth::task_is_self_or_descendant_of(
                         &state.task_tree,
@@ -1562,23 +1597,20 @@ pub fn list_sessions(
             }
             // No scope, Operator caller: every session.
             (None, None) => true,
-        };
-        if !included {
+        }
+    };
+
+    // Daemon-owned sessions (live PTY in `state.sessions`).
+    for (uid, session) in state.sessions.iter() {
+        if !should_include(uid, session.task_id.as_deref()) {
             continue;
         }
         // Sub-2b-1 review-r#3 #1: single helper computes
         // `(state, idle)` for both `list_sessions` and
-        // `resolve_authorized_session`. Pre-fix list_sessions
-        // hardcoded `"ready"` + `false`, even though sub-2b-1
-        // already had the data needed to compute both
-        // (`transcript_path` + `last_activity_at`). Same daemon,
-        // two methods, different answers — the Python MCP
-        // tool's `wait_for_session_idle` was polling
-        // list_sessions while `read_session_output` resolved
-        // through resolve_authorized_session, so the
-        // wait-then-read flow could observe idle=false from
-        // resolve while list said idle=false anyway. Now both
-        // agree.
+        // `resolve_authorized_session` so the Python MCP tool's
+        // `wait_for_session_idle` (which polls list_sessions) and
+        // `read_session_output` (which resolves via
+        // resolve_authorized_session) agree.
         let (state_str, idle) = compute_session_state_and_idle(session);
         sessions.push(json!({
             "session_uid": uid,
@@ -1587,6 +1619,39 @@ pub fn list_sessions(
             "state": state_str,
             "idle": idle,
             "managed_by_uid": session.managed_by_uid,
+        }));
+    }
+    // TUI-owned sessions (post-Phase-1 unified view, fixes review
+    // finding #2). Daemon-spawned agents need to see sibling
+    // sessions that the TUI launched locally. We surface them with
+    // best-available metadata from the snapshot:
+    //   - `state`: "ready" — the TUI's snapshot only contains
+    //     live entries (TUI clears its push on session exit), so
+    //     "ready" is accurate at snapshot time. `pending` /
+    //     `exited` reach consumers via `manifest.watch` diffs.
+    //   - `idle`: false — the daemon doesn't track TUI sessions'
+    //     activity timestamps. Conservative default (the Python
+    //     MCP tool's `wait_for_session_idle` will block instead of
+    //     returning a stale `true`).
+    //   - `managed_by_uid`: null — TUI snapshot doesn't carry
+    //     parent-session correlation.
+    // Daemon-owned takes precedence: if a uid is in BOTH maps
+    // (shouldn't happen, but TUI's push filter is best-effort),
+    // skip the TUI entry rather than emit duplicates.
+    for (uid, snap) in state.tui_sessions.iter() {
+        if state.sessions.contains_key(uid) {
+            continue;
+        }
+        if !should_include(uid, snap.task_id.as_deref()) {
+            continue;
+        }
+        sessions.push(json!({
+            "session_uid": uid,
+            "label": snap.label.clone().unwrap_or_default(),
+            "type": snap.session_type.clone().unwrap_or_else(|| "claude-code".into()),
+            "state": "ready",
+            "idle": false,
+            "managed_by_uid": Value::Null,
         }));
     }
     // Stable order for deterministic test assertions and for
@@ -1682,7 +1747,7 @@ pub fn resolve_authorized_session(
             cuid,
             &p.session_uid,
         );
-        return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
+        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
     }
     let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
         (
@@ -2106,6 +2171,12 @@ pub fn task_update_tree(
     // worktree_path updated (TUI is authoritative for the
     // mapping); missing entries are inserted with a minimal
     // ManifestWorkspace.
+    // Build the set of pushed workspace_ids so we can GC entries
+    // that disappeared from the TUI's snapshot AND have no live
+    // sessions referencing them (Batch 1B fix for finding #7,
+    // stale-workspace accumulation across TUI sessions).
+    let pushed_ws_ids: std::collections::HashSet<String> =
+        p.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
     for ws_entry in p.workspaces {
         let entry = state
             .workspaces
@@ -2115,16 +2186,41 @@ pub fn task_update_tree(
                 worktree_path: None,
                 ..Default::default()
             });
-        // Sub-2b-3 review-3 #2: assign unconditionally — the
-        // TUI's Option<String> wire shape uses `None` to mean
-        // "no live worktree" (workspace was closed, pushed to
-        // cloud, etc.). Pre-fix this only updated on `Some`, so
-        // the daemon retained a stale path after the TUI
-        // signalled the worktree was gone, and `mcp_start_session`
-        // would still spawn into the dead path instead of
-        // surfacing NotFound.
+        // Sub-2b-3 review-3 #2: assign unconditionally. The TUI's
+        // Option<String> wire shape carries None for both
+        // "deliberately deleted" (finish_push after cloud upload)
+        // AND "I don't have a path yet" (workspace anchor, cloud
+        // workspace, in-flight reconcile). The two interpretations
+        // CONFLICT — Batch 1B post-review finding #6 raised the
+        // don't-know case but flipping to Some-only broke the
+        // finish_push contract (`finish_push_wire_shape_clears_daemon_worktree_path`
+        // test) that the daemon clears on TUI's deliberate-delete
+        // push. The wire shape needs a sentinel to distinguish
+        // the two; until that lands, keep the existing clear-on-
+        // None behavior (which matches the user-visible "TUI
+        // owns the source of truth" rule) and accept the daemon-
+        // discovered-path-cleared edge case. Tracked as a wire-
+        // shape follow-up.
         entry.worktree_path = ws_entry.worktree_path.map(std::path::PathBuf::from);
     }
+    // GC workspaces that fell out of the TUI's push AND have no
+    // live daemon-owned session anchoring them. Without this,
+    // closed workspaces accumulate forever in the persistent
+    // daemon's state.workspaces map (finding #7). The "no live
+    // session" guard prevents removing a workspace the daemon
+    // itself just auto-registered from a fresh spawn (the spawn
+    // path adds to state.workspaces BEFORE the TUI's next push
+    // sees it). Operator-side `mcp_start_session` will fail
+    // NotFound if it later resolves a task to a removed
+    // workspace — same surface as the no-such-workspace path.
+    let live_ws_ids: std::collections::HashSet<String> = state
+        .sessions
+        .values()
+        .map(|s| s.workspace_id.clone())
+        .collect();
+    state.workspaces.retain(|ws_id, _| {
+        pushed_ws_ids.contains(ws_id) || live_ws_ids.contains(ws_id)
+    });
     Ok(json!({
         "ok": true,
         "task_count": state.task_tree.len(),
