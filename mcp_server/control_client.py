@@ -93,6 +93,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "task.update_tree",
     "resolve_authorized_session",
     "session.set_transcript_path",
+    # 10d-2c-1 review round-5 (F1): TUI pushes workflow context
+    # onto an already-spawned daemon session via this RPC after
+    # `launch_workflow` binds an Existing-slot participant.
+    # Operator-only on the daemon side — agents can't call it.
+    "session.set_workflow_context",
     "propose_task",
     "mcp_start_session",
     # 10d-2b: workflow_transition / workflow_done flip from

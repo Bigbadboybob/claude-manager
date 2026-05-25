@@ -521,13 +521,24 @@ impl DaemonState {
     /// keeps the auth wiring in 10d-2 a one-line change.
     pub fn lookup_session_any(&self, uid: &str) -> Option<SessionViewAny> {
         if let Some(daemon_sess) = self.sessions.get(uid) {
+            // 10d-2c-1 review round-5 (F1): for daemon-owned
+            // sessions, workflow context lives on `DaemonSession`
+            // itself (populated at spawn time via
+            // `StartSessionParams.workflow_run_id` / `.workflow_role`
+            // OR after-the-fact via the
+            // `session.set_workflow_context` RPC). DO NOT fall
+            // through to `tui_sessions` for workflow fields —
+            // round-3's snapshot filter removes daemon-attached
+            // sessions from the TUI's pushed map, so the fallthrough
+            // would always be `None` AND would set the wrong
+            // authoritative source. Daemon-owned is canonical here.
             return Some(SessionViewAny {
                 uid: uid.to_string(),
                 daemon_owned: true,
                 task_id: daemon_sess.task_id.clone(),
                 workspace_id: Some(daemon_sess.workspace_id.clone()),
-                workflow_run_id: None,
-                workflow_role: None,
+                workflow_run_id: daemon_sess.workflow_run_id.clone(),
+                workflow_role: daemon_sess.workflow_role.clone(),
             });
         }
         if let Some(tui_sess) = self.tui_sessions.get(uid) {

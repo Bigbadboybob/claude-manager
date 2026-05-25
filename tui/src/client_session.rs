@@ -211,6 +211,15 @@ pub struct ClientSessionConfig<'a> {
     /// `read_session_output` tool short-circuits to empty
     /// messages and polls.
     pub transcript_path: Option<&'a str>,
+    /// 10d-2c-1 review round-5 (F1): workflow run id this session
+    /// is a participant of, when the spawn happens with workflow
+    /// context already known. Stored on `DaemonSession` so
+    /// `lookup_session_any` returns it for the daemon-side auth
+    /// check in `workflow_transition` / `workflow_done`. `None`
+    /// for non-workflow spawns; after-the-fact tagging on an
+    /// already-spawned session uses `rpc_set_workflow_context`.
+    pub workflow_run_id: Option<&'a str>,
+    pub workflow_role: Option<&'a str>,
 }
 
 /// Daemon-attached terminal session. Field shape mirrors
@@ -568,6 +577,17 @@ pub(crate) fn rpc_start_session_full(
     if let Some(tp) = config.transcript_path {
         params["transcript_path"] = serde_json::Value::String(tp.to_string());
     }
+    // 10d-2c-1 review round-5 (F1): workflow context for daemon-side
+    // `lookup_session_any` → `workflow_transition` / `workflow_done`
+    // auth. Both fields must be sent together (the daemon refuses
+    // half-tagged spawns at the after-the-fact RPC; spawn-time
+    // accepts None/None as "non-workflow").
+    if let Some(run_id) = config.workflow_run_id {
+        params["workflow_run_id"] = serde_json::Value::String(run_id.to_string());
+    }
+    if let Some(role) = config.workflow_role {
+        params["workflow_role"] = serde_json::Value::String(role.to_string());
+    }
     // Slice 10d watcher-fix #1: `cgroup_path` is NO LONGER
     // sent on the wire. The daemon discovers the actual cgroup
     // from `/proc/<spawn-pid>/cgroup` post-spawn (see
@@ -722,6 +742,40 @@ pub fn rpc_set_transcript_path(
         params: serde_json::json!({
             "session_uid": session_uid,
             "transcript_path": transcript_path,
+        }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// 10d-2c-1 review round-5 (F1): push workflow context onto an
+/// already-spawned daemon session. Used by
+/// `controller::launch_workflow` after tagging a daemon-attached
+/// `TerminalSession` so the daemon's `DaemonSession` mirrors the
+/// TUI's view — without this RPC, `lookup_session_any` returns
+/// `(None, None)` for daemon-attached workflow participants and
+/// auth on `workflow_transition` / `workflow_done` rejects them.
+///
+/// Operator-only on the daemon side; the TUI uses the shared
+/// `tui-operator` token id.
+///
+/// Best-effort caller: pass `None` / `None` to clear (workflow
+/// stopped on the session). Pass `Some(_)` for both to set; the
+/// daemon refuses half-tagged (one Some, one None) updates.
+pub fn rpc_set_workflow_context(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    workflow_run_id: Option<&str>,
+    workflow_role: Option<&str>,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.set_workflow_context".into(),
+        params: serde_json::json!({
+            "uid": uid,
+            "workflow_run_id": workflow_run_id,
+            "workflow_role": workflow_role,
         }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
@@ -1017,6 +1071,11 @@ mod tests {
             // start_session_threads_transcript_path_into_resolve_response
             // test in dispatch.rs builds the wire shape directly.
             transcript_path: None,
+            // 10d-2c-1 review round-5 (F1): tests default to
+            // non-workflow; tests that exercise workflow-tagged
+            // spawn build ClientSessionConfig directly.
+            workflow_run_id: None,
+            workflow_role: None,
         }
     }
 
@@ -2525,6 +2584,8 @@ mod tests {
             worktree_path: None,
             task_id: None,
             transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
         };
         let result = rpc_start_session_full(&config).expect("rpc ok");
 
@@ -2611,6 +2672,8 @@ mod tests {
             worktree_path: None,
             task_id: None,
             transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
         };
         let session = ClientSession::new(config).expect("spawn cat session");
         let uid = session.session_uid.clone();

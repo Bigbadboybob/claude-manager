@@ -155,6 +155,31 @@ review doesn't re-litigate.
 
   **Round-12 test 1 scoping**: the sub-2c review listed "End-to-end: spawn an MCP agent via daemon, call `workflow_transition` against an active workflow run; assert the event appears in events.jsonl" as test #1. That end-to-end test was NOT implemented in sub-2c because it would fail in the current transitional state (auth rejection). The sub-2c test surface instead pins the routing primitive: `PerMethodRoutingTests::test_tui_only_method_routes_to_tui_socket_under_daemon_spawn` verifies the resolver picks the TUI socket for `workflow_transition` regardless of daemon pinning, and `LoudFailureOnUnreachableTargetTests::test_tui_only_method_fails_loudly_when_tui_socket_missing` pins the no-silent-cross-routing contract. The end-to-end test rightly belongs to 10d-workflow-controller, where `workflow_transition` reaches a daemon handler that auths against the daemon's session map.
 
+### Rejected findings (10d-2c-1)
+
+Standing rejections from the 10d-2c-1 review cycle.
+
+- **Two-file atomicity between state.json and events.jsonl** — 10d-2c-1 review rounds 2 → 3 → 4 → 5.
+
+  The `workflow_transition` / `workflow_done` handlers write two separate files under different locks:
+  - `state.json` (under flock on `state.json.lock`) records the authoritative workflow state.
+  - `events.jsonl` (under a per-run `Mutex` lock on the writer) carries the event the TUI tail observes to deliver activation prompts and finish state.
+
+  Across review rounds we cycled through the failure modes:
+  - **Round-2's original shape (event BEFORE try_modify)**: auth check ran INSIDE try_modify, so a rejected call left an event on disk that the TUI tail would deliver as a forged prompt. **Security regression.** Rejected.
+  - **Round-3 shape (event AFTER try_modify, no recovery)**: state.json advanced first; if append_event failed, state had moved but no event landed; workflow stalled.
+  - **Round-4 shape (event INSIDE try_modify closure)**: closure returned Err on event-write failure → try_modify aborted → state stayed consistent. BUT: if the event write succeeded and the state.json save THEN failed, we had the inverse hole (event-no-state-save) — TUI would deliver prompts for a role the daemon didn't know was active.
+  - **Round-5 shape (event AFTER try_modify, with retry + idempotency)**: added bounded retry on append_event and an `active_role == to` idempotency short-circuit so caller retries recover. Idempotency was load-bearing for recovery, but it had a subtle role-boundary bug: an external caller retry after state advanced would hit Unauthorized because `active_role` had moved past the caller's bound role, so the auth check (`wf_role == active_role`) rejected the retry before the idempotency check could fire. The reviewer surfaced this in round 6.
+  - **Round-6 shape (event AFTER try_modify, with retry + ROLLBACK on exhaustion — current)**: state.json mutation is captured as a pre-mutation snapshot INSIDE the closure (under flock, after validation). If `append_event_with_retry` exhausts, the snapshot is written back via a follow-up `run::modify`. External caller-side retry sees the pre-mutation state — auth still matches the caller's bound role; the full RMW re-runs from scratch. Round-5's idempotency short-circuit is REMOVED — rollback replaces it.
+
+  **A truly atomic two-file commit still requires a WAL or a single-file commit log.** That's an entire durability slice, not a fix that fits within 10d-2c-1's scope. Round-6 restores transactional "both commit or neither commit" semantics for the recoverable case (any append_event failure that the rollback path can address); the remaining failure mode is "rollback save also fails", documented below.
+
+  **Round-6 rollback failure mode**: if `run::modify(rollback_snap)` itself returns Err (disk-write impossible — full disk, read-only fs, permissions drift), `state.json` is left in the (uncommitted) post-mutation shape with no matching event. The daemon logs loudly with the run_id, the original event-write error, AND the rollback error. **This is unrecoverable territory** — matches the disk-write-impossible failure class. Manual recovery: remove `~/.cm/workflow-runs/<run_id>/state.json.lock`, edit `state.json` by hand to restore consistency (the daemon's log line carries the pre-mutation snapshot indirectly via the rolled-back `active_role` / `iteration` / `status` values to compare against). The original event-write failure is the primary error returned to the caller; the rollback failure is a secondary log line.
+
+  **Durable fix belongs to a later durability slice.** Likely shape: write the (state-mutation, event) pair as a single record into a workflow commit log (`~/.cm/workflow-runs/<id>/journal`), with `state.json` and `events.jsonl` becoming derived projections that get rebuilt at boot from the journal tail. That's a load-bearing slice across the workflow controller + TUI tail + daemon and far out of scope for 10d-2c-1.
+
+  **If a later reviewer pass surfaces another atomicity-split-brain finding on `workflow_transition` / `workflow_done` outside the durability slice, point them to this entry and move on.** The cap is intentional. (Reviewer surfaced this in rounds 2, 3, 4, 5, 6 of 10d-2c-1 review. Round 6 restores transactional semantics for the recoverable case via rollback; remaining gaps belong to the WAL slice.)
+
 ### Rejected findings (10d-2a)
 
 Standing rejections from the 10d-2a review cycle.

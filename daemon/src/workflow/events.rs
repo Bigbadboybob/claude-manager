@@ -28,6 +28,65 @@ pub struct Event {
     pub role: String,
     pub tool: String,
     pub args: serde_json::Value,
+    /// 10d-2c-1 review round-1 (P1 #1/#2): origin tag for the
+    /// TUI's tail-observer state-machine. Two values matter
+    /// in Phase 1:
+    /// - `"daemon"` — daemon's `workflow_transition` /
+    ///   `workflow_done` handlers wrote the event AND ALREADY
+    ///   applied the state-mutation half. The TUI tail must
+    ///   NOT re-mutate; only deliver the activation prompt.
+    /// - `"tui-mcp"` — Python MCP-server-side `_append_event`
+    ///   wrote the event (TUI-local SpawnTarget fallback path
+    ///   from 10d-2b). State NOT yet mutated; TUI tail must
+    ///   still call `fire_transition` / `finish_run` to apply
+    ///   the mutation locally.
+    ///
+    /// Defaults to `""` (absent on the wire) so pre-2c-1
+    /// events on disk parse fine. An absent / unknown source is
+    /// treated as `"tui-mcp"` (pre-2c-1 behavior) for the
+    /// tail-observer's branch — same fallback as the
+    /// `daemon_socket_pinned()`-driven Python tools take.
+    #[serde(default)]
+    pub source: String,
+    /// 10d-2c-1 review round-7 (F2): outgoing role for a
+    /// `workflow_transition` event, captured PRE-MUTATION by
+    /// the daemon's `workflow_transition` closure under flock.
+    ///
+    /// Why: after the daemon's state mutation, `state.json`'s
+    /// `active_role` is already the NEW role (`to`). The TUI's
+    /// tail observer can no longer derive the outgoing role
+    /// from `active_role` — that read would give `to`, not the
+    /// actual prior role. Worse on TUI restart: TUI loads
+    /// state.json fresh (active_role = reviewer), then
+    /// processes the daemon-source worker→reviewer event, and
+    /// records `from_role = reviewer` (wrong) in history.
+    ///
+    /// The TUI's daemon-routed tail handler reads `from_role`
+    /// from the event itself; the TuiLocal path (Python
+    /// `_append_event`) doesn't populate it and the TUI falls
+    /// back to deriving from in-memory `active_role` (which is
+    /// correct for TuiLocal because state hasn't mutated when
+    /// the tail processes the event).
+    ///
+    /// `None` for `workflow_done` events (the active role is
+    /// being torn down, no "next role"); `None` for pre-round-7
+    /// events on disk (backward-compat via `#[serde(default)]`).
+    #[serde(default)]
+    pub from_role: Option<String>,
+    /// 10d-2c-1 review round-15: post-mutation iteration value,
+    /// captured under flock by the daemon's `workflow_transition`
+    /// / `workflow_done` closure. The TUI's history append uses
+    /// this to record per-event activation iteration — pre-r15
+    /// it read `self.iteration` from current state.json, which
+    /// caused multiple queued events to all record the LATEST
+    /// iteration (the daemon's final state) rather than the
+    /// per-event activation iteration.
+    ///
+    /// `0` for pre-r15 events on disk (backward-compat via
+    /// `#[serde(default)]`); TUI falls back to `self.iteration`
+    /// when `event.iteration == 0`.
+    #[serde(default)]
+    pub iteration: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +126,89 @@ impl Event {
             _ => EventKind::Unknown,
         }
     }
+}
+
+/// 10d-2c-1 review round-10: per-event variant of [`read_new`].
+/// Returns each parsed event paired with the byte offset
+/// **immediately after** that event's line (i.e., the offset to
+/// persist if processing through that event succeeds).
+///
+/// Used by the TUI's tail to advance `events_offset` per-event
+/// rather than once at batch end. Pre-round-10 the tail
+/// advanced to the batch-final offset on every successful event
+/// — a Failed event in the middle of a batch was permanently
+/// skipped because earlier successes had already advanced past
+/// it (and later successes would advance past it on the next
+/// tick). Round-10's per-event offset + stop-at-first-failure
+/// keeps the failed event re-readable.
+///
+/// 10d-2c-1 review round-12 (F2): returns a tuple
+/// `(events, final_consumed_offset)`. `final_consumed_offset`
+/// is the byte position after the last newline-terminated line
+/// consumed (parsed or malformed-but-consumed). The caller
+/// uses this to advance `events_offset` past malformed lines
+/// that don't surface as Events — pre-r12 a malformed line in
+/// events.jsonl wedged offset at 0 forever because
+/// `events_with_offsets.is_empty()` triggered the static-idle
+/// path (which doesn't advance offset).
+pub fn read_new_with_offsets(run_id: &str, offset: u64) -> (Vec<(Event, u64)>, u64) {
+    let path = run::events_path(run_id);
+    let Ok(mut f) = File::open(&path) else {
+        return (Vec::new(), offset);
+    };
+    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if offset >= file_len {
+        return (Vec::new(), offset);
+    }
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return (Vec::new(), offset);
+    }
+    let mut reader = BufReader::new(f);
+    let mut out: Vec<(Event, u64)> = Vec::new();
+    let mut consumed: u64 = 0;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // Same torn-record + recovery semantics as
+                // `read_new` — see that function for the round-5
+                // / round-6 commentary on un-terminated tails.
+                if !buf.ends_with('\n') {
+                    let line = buf.trim();
+                    if !line.is_empty() {
+                        if let Ok(ev) = serde_json::from_str::<Event>(line) {
+                            consumed += n as u64;
+                            out.push((ev, offset + consumed));
+                        }
+                    }
+                    break;
+                }
+                // Round-12 (F2): advance `consumed` BEFORE the
+                // parse attempt. Newline-terminated lines are
+                // permanently consumed (the writer never goes
+                // back to fix a malformed line). Pre-r12 only
+                // parsed-successfully lines were counted via
+                // `out.push((ev, offset + consumed))`; the
+                // caller had no way to learn about
+                // malformed-but-consumed bytes.
+                consumed += n as u64;
+                let line = buf.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(ev) = serde_json::from_str::<Event>(line) {
+                    out.push((ev, offset + consumed));
+                }
+                // Malformed JSON: bytes consumed (offset
+                // advances via the final_consumed_offset
+                // return), no event surfaced.
+            }
+            Err(_) => break,
+        }
+    }
+    (out, offset + consumed)
 }
 
 /// Read new events for `run_id` starting at `offset`. Returns the parsed events
@@ -222,7 +364,7 @@ impl WorkflowEventsWriter {
         // `uuid.uuid4().hex`), but a future caller could pass an
         // untrusted id; validating here means no path-traversal
         // hole regardless of caller.
-        validate_run_id(&event.run_id)?;
+        run::validate_run_id(&event.run_id)?;
 
         let lock = writer_lock_for(&event.run_id);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -359,44 +501,16 @@ fn file_ends_unterminated(f: &std::fs::File) -> io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// 10d-2a round 2: containment-safe `run_id` validation.
-///
-/// Reject anything that could escape `~/.cm/workflow-runs/` via
-/// path-traversal (`/`, `..`, `.`) or otherwise confuse the
-/// filesystem (null bytes, empty, oversize). The codebase produces
-/// run_ids in two shapes today — `wf_<base36>` from
-/// `run::new_run_id` and hex UUIDs from MCP's `uuid.uuid4().hex` —
-/// both fit the conservative `[A-Za-z0-9_-]` allowlist used here.
-fn validate_run_id(id: &str) -> io::Result<()> {
-    const MAX_LEN: usize = 128;
-    if id.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "run_id is empty",
-        ));
-    }
-    if id.len() > MAX_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("run_id too long: {} > {}", id.len(), MAX_LEN),
-        ));
-    }
-    if id == "." || id == ".." {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("run_id is a path-traversal token: {:?}", id),
-        ));
-    }
-    for c in id.chars() {
-        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("disallowed character in run_id {:?}: {:?}", id, c),
-            ));
-        }
-    }
-    Ok(())
-}
+// 10d-2c-1 review round-3 (F2): `validate_run_id` moved to
+// `crate::workflow::run::validate_run_id` so EVERY filesystem-
+// touching entry point (load_one, save, modify, try_modify,
+// append_event) shares one validator. The validation must
+// happen BEFORE any path is constructed from the run_id —
+// otherwise a malformed id like `../../../etc/passwd` reaches
+// the disk through `run::run_dir`.
+//
+// `append_event` calls the shared validator at the top, same
+// as before.
 
 #[cfg(test)]
 mod tests {
@@ -800,6 +914,9 @@ mod tests {
             role: "worker".to_string(),
             tool: tool.to_string(),
             args,
+            source: String::new(),
+            from_role: None,
+            iteration: 0,
         }
     }
 
@@ -889,6 +1006,9 @@ mod tests {
                             role: format!("role-{}", t),
                             tool: "workflow_transition".to_string(),
                             args: serde_json::json!({"to": "next", "prompt": payload}),
+                            source: String::new(),
+                            from_role: None,
+                            iteration: 0,
                         };
                         WorkflowEventsWriter::append_event(&ev).expect("append ok");
                     }
@@ -1075,6 +1195,9 @@ mod tests {
                     role: "worker".to_string(),
                     tool: "workflow_done".to_string(),
                     args: serde_json::json!({"reason": "ok"}),
+                    source: String::new(),
+                    from_role: None,
+                    iteration: 0,
                 };
                 let result = WorkflowEventsWriter::append_event(&ev);
                 assert!(
@@ -1131,6 +1254,9 @@ mod tests {
                     role: "worker".to_string(),
                     tool: "workflow_done".to_string(),
                     args: serde_json::json!({"reason": "ok"}),
+                    source: String::new(),
+                    from_role: None,
+                    iteration: 0,
                 };
                 WorkflowEventsWriter::append_event(&ev)
                     .unwrap_or_else(|e| panic!("good run_id {:?} must accept, got: {:?}", id, e));

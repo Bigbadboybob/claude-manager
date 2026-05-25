@@ -216,6 +216,64 @@ fn note_workflow_transcript_binding(
     changed
 }
 
+/// 10d-2c-1 review round-6 (F1): apply the TUI-owned mutations
+/// for a `/clear`-or-`/compact`-driven history rotation to a
+/// `WorkflowRun`. Used by `apply_history_rotation` to keep the
+/// in-memory + on-disk shape in lockstep — same field-level
+/// updates applied via `workflow::run::modify` (so concurrent
+/// daemon writes to active_role / iteration / status survive)
+/// AND, if/when needed, against the in-memory slot via
+/// `slice::from_mut`.
+///
+/// Fields touched (TUI-owned):
+///   - `role_sessions[role].current_session_id` ← new sid.
+///   - `role_baselines[role]` ← `MessageBaseline::default()`.
+///   - Active role's last history entry, if it's for `role`:
+///     `assistant_count_at_start = 0`, `session_id = Some(new_sid)`.
+fn apply_history_rotation_to_run(run: &mut WorkflowRun, role: &str, new_sid: &str) {
+    if let Some(b) = run.role_sessions.get_mut(role) {
+        b.current_session_id = Some(new_sid.to_string());
+    }
+    run.role_baselines
+        .insert(role.to_string(), workflow::run::MessageBaseline::default());
+    if run.active_role.as_deref() == Some(role) {
+        if let Some(h) = run.history.last_mut() {
+            h.assistant_count_at_start = 0;
+            h.session_id = Some(new_sid.to_string());
+        }
+    }
+}
+
+/// 10d-2c-1 review round-9: field-level mutator for
+/// `stop_workflow_run`'s `workflow::run::modify` closure.
+/// Lifted to a free function so the terminal-state guard can be
+/// tested in isolation (no full `App` setup needed).
+///
+/// Semantics:
+///   - `Done` → no-op. UI stop shortcut on a session whose
+///     workflow has already completed naturally must not
+///     overwrite the `Done` status. The MCP `stop_workflow`
+///     path has had this guard since Phase 7
+///     (`tui/src/control/methods.rs::stop_workflow`); round-9
+///     brings the UI path into line.
+///   - Anything else (Running, Paused, Detached) → mark Detached.
+///     Detached is the post-stop state; stopping a Detached run
+///     again is a benign re-detach.
+///
+/// Surfaces when: startup loads only active runs into
+/// `self.workflow_runs`, but restored sessions still carry
+/// `workflow_run_id` pointing at a completed Done workflow.
+/// Operator presses the stop shortcut on that session — pre-r9
+/// `state.json.status` flipped `Done` → `Detached` on disk,
+/// erasing the distinction between successful completion and
+/// operator abort.
+pub(crate) fn apply_stop_workflow_status(r: &mut WorkflowRun) {
+    if matches!(r.status, workflow::RunStatus::Done) {
+        return;
+    }
+    r.mark_detached();
+}
+
 /// Marker that an Enter keystroke is queued to fire at or after `fire_at`. The
 /// actual bytes are computed from the current terminal mode at submit time.
 pub struct PendingEnter {
@@ -2640,6 +2698,14 @@ impl App {
         // DaemonSession.task_id is set at spawn time. None for
         // genuinely taskless flows (A-n create_local_session).
         task_id: Option<&str>,
+        // 10d-2c-1 review round-5 (F1): workflow context at
+        // spawn time, when the caller spawns a daemon-attached
+        // session that's already a workflow participant. `None`
+        // for the regular A-n / A-s paths; the workflow-launch
+        // on existing daemon-attached sessions uses
+        // `rpc_set_workflow_context` after the fact.
+        workflow_run_id: Option<&str>,
+        workflow_role: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
         if !crate::daemon_launch::opt_in_enabled() {
             return None;
@@ -2784,6 +2850,14 @@ impl App {
             // then daemon's `resolve_authorized_session` returns
             // `pending` and the Python tool polls.
             transcript_path: None,
+            // 10d-2c-1 review round-5 (F1): callers that spawn a
+            // workflow participant with workflow context already
+            // known pass these. A-n / A-s spawns from the regular
+            // sidebar paths pass `None`; the after-the-fact
+            // tagging path (workflow launched on this session
+            // later) uses `rpc_set_workflow_context` instead.
+            workflow_run_id,
+            workflow_role,
         };
         Some(crate::session::Session::new_attached(config))
     }
@@ -4772,8 +4846,34 @@ impl App {
                     detected.old_sid.as_deref(),
                     &detected.sid,
                 ) {
-                    if let Some(run) = self.workflow_runs.iter().find(|r| &r.run_id == run_id) {
-                        let _ = workflow::run::save(run);
+                    // 10d-2c-1 review round-6 (F1): apply the
+                    // same field-level mutations to the on-disk
+                    // run so a concurrent daemon write (active
+                    // role, iteration, status) survives the
+                    // RMW. TUI owns role_sessions /
+                    // role_baselines / current-active-role's
+                    // history.last() correlation — daemon owns
+                    // everything else.
+                    let new_sid = detected.sid.clone();
+                    let old_sid = detected.old_sid.clone();
+                    let role_owned = role.clone();
+                    let run_id_owned = run_id.clone();
+                    let run_id_for_closure = run_id_owned.clone();
+                    let updated = workflow::run::modify(&run_id_owned, move |r| {
+                        note_workflow_transcript_binding(
+                            std::slice::from_mut(r),
+                            &run_id_for_closure,
+                            &role_owned,
+                            old_sid.as_deref(),
+                            &new_sid,
+                        );
+                    });
+                    if let Ok(updated) = updated {
+                        if let Some(slot) =
+                            self.workflow_runs.iter_mut().find(|r| &r.run_id == run_id)
+                        {
+                            *slot = updated;
+                        }
                     }
                     if let Some(old_sid) = detected.old_sid.as_deref() {
                         log_tick(
@@ -4915,21 +5015,27 @@ impl App {
             // workflow participant — non-workflow rebinds just need the
             // transcript_id swap + generation bump above.
             if let Some((run_id, role)) = &r.workflow {
-                if let Some(run) =
-                    self.workflow_runs.iter_mut().find(|run| &run.run_id == run_id)
-                {
-                    if let Some(b) = run.role_sessions.get_mut(role) {
-                        b.current_session_id = Some(r.new_sid.clone());
+                // 10d-2c-1 review round-6 (F1): apply the TUI-owned
+                // mutations through `modify` so concurrent daemon
+                // writes (active_role / iteration / status /
+                // events_offset) on the same run survive the RMW.
+                // The closure is field-targeted: role_sessions[*],
+                // role_baselines, and the active role's history-
+                // last() correlation — all TUI territory. Daemon-
+                // owned fields are untouched.
+                let new_sid = r.new_sid.clone();
+                let role_owned = role.clone();
+                let updated = workflow::run::modify(run_id, move |run| {
+                    apply_history_rotation_to_run(run, &role_owned, &new_sid);
+                });
+                if let Ok(updated) = updated {
+                    if let Some(slot) = self
+                        .workflow_runs
+                        .iter_mut()
+                        .find(|run| &run.run_id == run_id)
+                    {
+                        *slot = updated;
                     }
-                    run.role_baselines
-                        .insert(role.clone(), workflow::run::MessageBaseline::default());
-                    if run.active_role.as_deref() == Some(role.as_str()) {
-                        if let Some(h) = run.history.last_mut() {
-                            h.assistant_count_at_start = 0;
-                            h.session_id = Some(r.new_sid.clone());
-                        }
-                    }
-                    let _ = workflow::run::save(run);
                     log_tick(
                         run_id,
                         &format!(
@@ -5382,16 +5488,30 @@ impl App {
             ts.pending_jsonl_files = None;
             ts.last_delivery = None;
             if let (Some(run_id), Some(role)) = (run_id, role) {
-                if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-                    if let Some(b) = run.role_sessions.get_mut(&role) {
-                        b.current_session_id = Some(sid.clone());
+                // 10d-2c-1 review round-6 (F1): mutate-via-modify
+                // so a concurrent daemon write doesn't get
+                // overwritten. TUI-owned fields only:
+                // role_sessions[role].current_session_id, and
+                // the active role's last history entry's
+                // session_id correlation.
+                let sid_owned = sid.clone();
+                let role_owned = role.clone();
+                let updated = workflow::run::modify(&run_id, move |r| {
+                    if let Some(b) = r.role_sessions.get_mut(&role_owned) {
+                        b.current_session_id = Some(sid_owned.clone());
                     }
-                    if run.active_role.as_deref() == Some(role.as_str()) {
-                        if let Some(h) = run.history.last_mut() {
-                            h.session_id = Some(sid.clone());
+                    if r.active_role.as_deref() == Some(role_owned.as_str()) {
+                        if let Some(h) = r.history.last_mut() {
+                            h.session_id = Some(sid_owned.clone());
                         }
                     }
-                    let _ = workflow::run::save(run);
+                });
+                if let Ok(updated) = updated {
+                    if let Some(slot) =
+                        self.workflow_runs.iter_mut().find(|r| r.run_id == run_id)
+                    {
+                        *slot = updated;
+                    }
                     log_tick(
                         &run_id,
                         &format!("delivery-correlated: role={} sid={}", role, sid),
@@ -6735,6 +6855,52 @@ impl App {
         }
     }
 
+    /// 10d-2c-1 review round-5 (F1): push workflow context onto
+    /// an already-spawned daemon-attached session so the daemon's
+    /// `DaemonSession.workflow_run_id` / `.workflow_role` mirrors
+    /// the TUI's `TerminalSession` tags after a `launch_workflow`
+    /// bind-existing-slot. Without this RPC,
+    /// `lookup_session_any` returns `(None, None)` for daemon-
+    /// owned workflow participants (round-3's `tui_sessions`
+    /// filter excluded them) and the auth check in
+    /// `workflow_transition` / `workflow_done` rejects them.
+    ///
+    /// **No-ops when**:
+    ///   - opt-in is off.
+    ///   - the session isn't daemon-attached (`daemon_session_uid`
+    ///     is `None` → TUI is authoritative; daemon doesn't know
+    ///     about it; tui_sessions snapshot carries the tags).
+    ///
+    /// Best-effort: log on RPC error and continue (next launch
+    /// retries, manual workflow stop/start clears stale state).
+    pub(crate) fn push_workflow_context_to_daemon_if_attached(
+        ts: &TerminalSession,
+        run_id: Option<&str>,
+        role: Option<&str>,
+    ) {
+        let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
+            return;
+        };
+        if !crate::daemon_launch::opt_in_enabled() {
+            return;
+        }
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_set_workflow_context(
+            &daemon_socket,
+            "tui-operator",
+            daemon_uid,
+            run_id,
+            role,
+        ) {
+            eprintln!(
+                "cm-tui: session.set_workflow_context({}, {:?}, {:?}) failed: {} \
+                 (daemon-attached workflow participant will fail auth on \
+                 workflow_transition until next retry)",
+                daemon_uid, run_id, role, e,
+            );
+        }
+    }
+
     /// Sub-2a Finding #1: full-replace task tree push to the
     /// daemon. Called after every `self.tasks` mutation so the
     /// daemon's `DaemonState.task_tree` stays current for the
@@ -7224,6 +7390,12 @@ impl App {
             // daemon's POV too — auth uses the taskless-caller
             // same-workspace branch.
             None,
+            // A-n / create_local_session is not a workflow
+            // participant at spawn time; if the user later
+            // launches a workflow on this session,
+            // `rpc_set_workflow_context` updates the daemon copy.
+            None,
+            None,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -7558,6 +7730,12 @@ impl App {
                 // so the daemon's DaemonSession.task_id is
                 // populated at spawn time, not left None.
                 task_id.as_deref(),
+                // A-s spawns a session under an existing task,
+                // but workflow membership is decided later (when
+                // the user runs A-f on it). No workflow context
+                // at spawn time.
+                None,
+                None,
             ),
             _ => None,
         };
@@ -9991,7 +10169,18 @@ impl App {
                     }
                 }
             }
-            let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+            // 10d-2c-1 review round-6 (F1): targeted modify so a
+            // race with a daemon-side transition mutation can't
+            // clobber the daemon's active_role / iteration
+            // advance. TUI is authoritative for task_id binding;
+            // daemon doesn't touch it.
+            let tid_owned = tid.to_string();
+            let updated = workflow::run::modify(&run_id, move |r| {
+                r.task_id = Some(tid_owned);
+            });
+            if let Ok(updated) = updated {
+                self.workflow_runs[run_idx] = updated;
+            }
             self.save_session_manifest();
         }
 
@@ -10093,12 +10282,21 @@ impl App {
             Some(id) => id,
             None => return,
         };
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            if matches!(run.status, workflow::RunStatus::Running) {
-                run.set_paused(true);
-                let _ = workflow::run::save(run);
-                self.set_status_msg("Workflow paused (A-u to resume)");
+        // 10d-2c-1 review round-6 (F1): targeted modify under
+        // flock — applies the pause field to whatever's on disk
+        // (including any daemon-written advance since our in-mem
+        // copy was loaded) and keeps the in-mem copy in sync via
+        // the returned run.
+        let updated = workflow::run::modify(&run_id, |r| {
+            if matches!(r.status, workflow::RunStatus::Running) {
+                r.set_paused(true);
             }
+        });
+        if let Ok(updated) = updated {
+            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                *slot = updated;
+            }
+            self.set_status_msg("Workflow paused (A-u to resume)");
         }
     }
 
@@ -10110,10 +10308,19 @@ impl App {
                 return;
             }
         };
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            if matches!(run.status, workflow::RunStatus::Paused) {
-                run.set_paused(false);
-                let _ = workflow::run::save(run);
+        // 10d-2c-1 review round-6 (F1): same shape as pause.
+        let mut was_paused = false;
+        let updated = workflow::run::modify(&run_id, |r| {
+            if matches!(r.status, workflow::RunStatus::Paused) {
+                r.set_paused(false);
+                was_paused = true;
+            }
+        });
+        if let Ok(updated) = updated {
+            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                *slot = updated;
+            }
+            if was_paused {
                 self.set_status_msg(&format!("Resumed workflow {}", run_id));
             } else {
                 self.set_status_msg("Workflow is not paused");
@@ -10128,9 +10335,21 @@ impl App {
     /// behave like normal standalone sessions from here on. The sessions
     /// themselves stay open and their transcripts are preserved.
     pub(crate) fn stop_workflow_run(&mut self, run_id: &str) {
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            run.mark_detached();
-            let _ = workflow::run::save(run);
+        // 10d-2c-1 review round-6 (F1): targeted modify so a
+        // concurrent daemon write doesn't get clobbered. Detach
+        // is final; the field-level set still applies cleanly on
+        // top of whatever the daemon left.
+        //
+        // 10d-2c-1 review round-9: terminal-state guard.
+        // [`apply_stop_workflow_status`] preserves `Done` so the
+        // UI stop shortcut never overwrites a naturally-completed
+        // run — matches the MCP `stop_workflow`'s guard predicate
+        // (`tui/src/control/methods.rs::stop_workflow`).
+        let updated = workflow::run::modify(run_id, apply_stop_workflow_status);
+        if let Ok(updated) = updated {
+            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                *slot = updated;
+            }
         }
         for ws in &mut self.workspaces {
             for ts in &mut ws.sessions {
@@ -10991,6 +11210,116 @@ fn copy_to_clipboard(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod stop_workflow_terminal_guard_tests {
+    //! 10d-2c-1 review round-9: pin the terminal-state guard in
+    //! `apply_stop_workflow_status`. UI stop shortcut must not
+    //! overwrite `Done` (naturally completed). Mirrors the MCP
+    //! `stop_workflow`'s guard predicate so the two paths agree.
+    use super::*;
+    use crate::workflow::run::RunStatus;
+
+    fn with_temp_home<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+        f();
+        if let Some(o) = orig {
+            unsafe { std::env::set_var("HOME", o); }
+        } else {
+            unsafe { std::env::remove_var("HOME"); }
+        }
+        tmp
+    }
+
+    fn seed_run(run_id: &str, status: RunStatus, done_reason: Option<&str>) {
+        let mut run = WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".to_string(),
+            "task-key".to_string(),
+            std::collections::BTreeMap::new(),
+            "worker".to_string(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+        );
+        run.status = status;
+        run.done_reason = done_reason.map(str::to_string);
+        workflow::run::save(&run).expect("seed save");
+    }
+
+    /// Named acceptance test: state.json with `status: Done` +
+    /// `done_reason` survives a stop_workflow_run call. Pre-r9
+    /// the closure body unconditionally ran `mark_detached()`,
+    /// flipping `Done` → `Detached` and erasing the distinction
+    /// between successful completion and operator abort.
+    #[test]
+    fn stop_workflow_run_noops_on_terminal_done() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_r9_done_preserved";
+            seed_run(run_id, RunStatus::Done, Some("worker said done"));
+
+            // Drive the same modify-closure shape stop_workflow_run
+            // uses. We don't construct a full App; the fix lives
+            // entirely in `apply_stop_workflow_status`, so a
+            // focused state.json round-trip pins the behavior.
+            let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                matches!(post.status, RunStatus::Done),
+                "Done must NOT be overwritten by stop; got {:?}",
+                post.status,
+            );
+            assert_eq!(
+                post.done_reason.as_deref(),
+                Some("worker said done"),
+                "done_reason must NOT be cleared by stop",
+            );
+        });
+    }
+
+    /// Companion test: state.json with `status: Running` is
+    /// marked `Detached`. Guards against over-correcting r9
+    /// (e.g. treating every non-Detached as terminal).
+    #[test]
+    fn stop_workflow_run_marks_detached_on_running() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_r9_running_detaches";
+            seed_run(run_id, RunStatus::Running, None);
+
+            let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                matches!(post.status, RunStatus::Detached),
+                "Running must transition to Detached on stop; got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// Companion: Paused also transitions to Detached. Captures
+    /// the "anything-not-Done" branch.
+    #[test]
+    fn stop_workflow_run_marks_detached_on_paused() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_r9_paused_detaches";
+            seed_run(run_id, RunStatus::Paused, None);
+
+            let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                matches!(post.status, RunStatus::Detached),
+                "Paused must transition to Detached on stop; got {:?}",
+                post.status,
+            );
+        });
+    }
 }
 
 #[cfg(test)]

@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 
 use base64::Engine;
 
-use crate::control::protocol::ErrorCode;
+use crate::control::protocol::{Caller, ErrorCode};
 use crate::session::{DaemonExitStatus, PendingSession, SpawnParams};
 use crate::state::DaemonState;
 
@@ -317,6 +317,28 @@ struct StartSessionParams {
     /// path once it's discovered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transcript_path: Option<String>,
+    /// 10d-2c-1 review round-5 (F1): workflow run id this session
+    /// is a participant of, when the spawn happens with workflow
+    /// context already known. Stored on `DaemonSession` so
+    /// `lookup_session_any` returns it for the auth check in
+    /// `workflow_transition` / `workflow_done`. `None` for non-
+    /// workflow spawns; the daemon's auth check then refuses any
+    /// `workflow_transition` from this session, which is correct
+    /// (a non-workflow daemon session has no business firing a
+    /// transition).
+    ///
+    /// Note: this covers spawn-time tagging only. When the TUI
+    /// launches a workflow on an already-spawned daemon session
+    /// (the Existing-slot path in
+    /// `controller::launch_workflow`), it uses
+    /// `session.set_workflow_context` to update the field
+    /// after-the-fact — same DaemonSession field, different
+    /// write path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_run_id: Option<String>,
+    /// Role name within the workflow run. See [`workflow_run_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_role: Option<String>,
 }
 
 fn default_session_type() -> String {
@@ -567,6 +589,15 @@ pub(crate) fn start_session_with_spawn_fn(
     // fresh spawns and yields `state: "pending"` until a
     // post-detection update RPC lands.
     spawn_params.transcript_path = p.transcript_path.clone();
+    // 10d-2c-1 review round-5 (F1): plumb workflow context onto
+    // the DaemonSession so `lookup_session_any` returns it for
+    // the auth check in `workflow_transition` / `workflow_done`.
+    // `None` for non-workflow spawns (A-n / A-s without an
+    // active workflow); the after-the-fact tagging path
+    // (workflow launched on an already-spawned daemon session)
+    // uses `session.set_workflow_context`.
+    spawn_params.workflow_run_id = p.workflow_run_id.clone();
+    spawn_params.workflow_role = p.workflow_role.clone();
     spawn_params.args = p.argv[1..].to_vec();
     spawn_params.working_dir = Some(working_dir);
     spawn_params.cols = p.cols;
@@ -1747,6 +1778,116 @@ pub fn set_transcript_path(
     }))
 }
 
+// ============================================================
+// session.set_workflow_context (10d-2c-1 review round-5 F1)
+// ============================================================
+//
+// After-the-fact tagging: when the TUI launches a workflow on an
+// already-spawned daemon-attached session (the Existing-slot path
+// in `controller::launch_workflow`), it pushes the
+// (workflow_run_id, workflow_role) pair to the daemon so the
+// `DaemonSession` mirrors what the TUI's `TerminalSession` now
+// carries. Without this RPC, `lookup_session_any` would return
+// `(None, None)` for daemon-owned workflow participants — round-3's
+// `tui_sessions` filter excluded them from the fallback map —
+// and the auth check in `workflow_transition` / `workflow_done`
+// would reject them. That's the bug the round-5 F1 fix closes
+// for the existing-session-becomes-participant case (the typical
+// worker shape).
+//
+// **Caller**: Operator only. Session callers must not be able to
+// re-assign their own workflow context (would let an agent
+// declare itself part of an arbitrary workflow run and forge
+// transitions).
+//
+// **Idempotent**: pushing the same (run_id, role) is a no-op;
+// pushing `(None, None)` clears workflow context (e.g. workflow
+// stopped on the session). Daemon doesn't validate that the
+// run_id exists in `workflow_runs` — that's the TUI's
+// responsibility (the TUI only calls this after a successful
+// `launch_workflow`).
+//
+// Wire shape:
+//   { uid: <session_uid>,
+//     workflow_run_id: <string | null>,
+//     workflow_role: <string | null> }
+//
+// Response:
+//   { ok: true, daemon_owned: bool }
+//
+// `daemon_owned: false` is a sentinel for TUI callers that
+// invoke this on a session the daemon doesn't own (round-3
+// snapshot filter would have removed it from `tui_sessions` too);
+// no-op success rather than NotFound so the TUI can fire
+// this for every workflow participant without branching.
+
+#[derive(Deserialize)]
+struct SetWorkflowContextParams {
+    /// Session uid to tag. Must be a daemon-owned session
+    /// (present in `state.sessions`); see `daemon_owned` in the
+    /// response for the no-op case.
+    uid: String,
+    /// New workflow_run_id. `None` clears the field.
+    #[serde(default)]
+    workflow_run_id: Option<String>,
+    /// New workflow_role. `None` clears the field.
+    #[serde(default)]
+    workflow_role: Option<String>,
+}
+
+pub fn set_workflow_context(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: SetWorkflowContextParams = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("session.set_workflow_context params: {}", e),
+            )
+        })?;
+    if p.uid.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "session.set_workflow_context: 'uid' is required".into(),
+        ));
+    }
+    // Defense-in-depth: if exactly one of (run_id, role) is
+    // present, that's almost certainly a caller bug — workflow
+    // context is meaningful only as a pair. Refuse instead of
+    // silently storing a half-tagged session that would later
+    // surface as a confusing auth-decline.
+    let half_tagged = p.workflow_run_id.is_some() ^ p.workflow_role.is_some();
+    if half_tagged {
+        return Err((
+            ErrorCode::InvalidParams,
+            "session.set_workflow_context: workflow_run_id and \
+             workflow_role must both be set or both be null"
+                .into(),
+        ));
+    }
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let session = match state.sessions.get_mut(&p.uid) {
+        Some(s) => s,
+        None => {
+            // No-op success for TUI-owned sessions. The TUI calls
+            // this for every workflow participant; an Existing
+            // slot bound to a TUI-local session legitimately
+            // misses the daemon registry.
+            return Ok(json!({
+                "ok": true,
+                "daemon_owned": false,
+            }));
+        }
+    };
+    session.workflow_run_id = p.workflow_run_id;
+    session.workflow_role = p.workflow_role;
+    Ok(json!({
+        "ok": true,
+        "daemon_owned": true,
+    }))
+}
+
 /// Map daemon-side `session_type` (`"claude-code"` / `"codex"` /
 /// `"bash"`) onto the canonical engine string the Python tool
 /// dispatches its parser on. Mirrors the TUI's
@@ -2096,7 +2237,8 @@ fn new_event_id() -> String {
 }
 
 pub fn workflow_transition(
-    _state_arc: &Arc<Mutex<DaemonState>>,
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
     params: &Value,
 ) -> MethodResult {
     let p: WorkflowTransitionParams = serde_json::from_value(params.clone())
@@ -2117,23 +2259,371 @@ pub fn workflow_transition(
             "workflow_transition: 'to' (target role) is required".into(),
         ));
     }
-    let event = crate::workflow::events::Event {
+    let role_for_event = if p.role.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        p.role.clone()
+    };
+
+    // Pre-fetch the caller's workflow_run_id + workflow_role
+    // from `lookup_session_any` BEFORE entering the flock.
+    // The auth comparison happens INSIDE the flock against the
+    // loaded run.active_role to avoid TOCTOU. Operators bypass
+    // the check (operator is trusted by definition).
+    let session_workflow_info: Option<(Option<String>, Option<String>)> =
+        if let Caller::Session(uid) = caller {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .lookup_session_any(&uid.session_uid)
+                .map(|s| (s.workflow_run_id, s.workflow_role))
+        } else {
+            None
+        };
+    let is_session_caller = matches!(caller, Caller::Session(_));
+
+    // 10d-2c-1 review round-1 (F1) → round-4 → round-5 (F2):
+    // event write happens AFTER `try_modify` (round-2 shape) with
+    // a bounded retry. Sequence:
+    //   1. `try_modify` runs auth + status + target-role + the
+    //      round-5 idempotency check, then mutates state.json
+    //      under flock.
+    //   2. `append_event_with_retry` writes the event with up to
+    //      3 attempts (50ms / 100ms / 200ms backoff) before
+    //      bubbling Err.
+    //
+    // Failure mode if `append_event_with_retry` exhausts: state
+    // advanced, no event on disk. The TUI tail observes nothing
+    // for this transition; the workflow stalls on the daemon's
+    // side until either (a) a caller-side retry lands and the
+    // round-5 idempotency check skips the mutation while
+    // re-appending the event, or (b) operator notices the loud
+    // log. Document deflection of this two-file atomicity class
+    // lives in `daemon/NOTES.md` ("Rejected findings (10d-2c-1)").
+    //
+    // The reverse failure mode (round-4 shape: event-inside-closure)
+    // had an event-no-state-save corner that wedged the TUI
+    // delivery branch when the closure-side append failed; this
+    // shape's failure ("state advances + event missing") is
+    // strictly more recoverable, since state is the load-bearing
+    // record (TUI's tail re-loads `state.json` periodically and
+    // its workflow loop's idempotency catches the missing
+    // event). Choosing the lesser-evil mode is explicit per the
+    // round-5 deflection.
+    // 10d-2c-1 review round-7 (F2): `from_role` is captured
+    // INSIDE the closure (pre-mutation, under flock) so the TUI
+    // tail receives the authoritative outgoing role on the
+    // event. Built outside the closure first; the closure
+    // writes the captured value via the shared `Arc<Mutex>`
+    // below. We assign `event.from_role` AFTER `try_modify`
+    // returns Ok but BEFORE `append_event_with_retry`.
+    let mut event = crate::workflow::events::Event {
         id: new_event_id(),
         ts: now_unix_f64(),
         run_id: p.run_id.clone(),
-        role: if p.role.trim().is_empty() {
-            "unknown".into()
-        } else {
-            p.role
-        },
+        role: role_for_event.clone(),
         tool: "workflow_transition".to_string(),
         args: json!({"to": p.to, "prompt": p.prompt}),
+        source: "daemon".to_string(),
+        from_role: None,
+        iteration: 0,
     };
-    crate::workflow::events::WorkflowEventsWriter::append_event(&event)
-        .map_err(|e| (
+
+    // 10d-2c-1 + review round-1 (F1 + F3 + P1 #3 + Option A) +
+    // round-6 (F2 rollback): state.json RMW under flock(2), with
+    // auth + status + target-role validation INSIDE the closure
+    // so they see the latest authoritative `active_role` +
+    // `status` (no TOCTOU). Mutation is **minimal**: close the
+    // outgoing role's history entry, bump iteration, set new
+    // active_role. No history.push (Option A — deferred to TUI
+    // tail).
+    //
+    // Round-6 rollback: capture the pre-mutation state INSIDE
+    // the closure (under flock, after validation passes) and
+    // expose it to the outer scope via an Arc<Mutex<Option<>>>.
+    // If `append_event_with_retry` exhausts (state advanced but
+    // event missing), the post-call restore writes
+    // `rollback_state` back, so an external caller-side retry
+    // sees the original pre-mutation state and the daemon's
+    // auth check still matches the caller's bound role.
+    //
+    // Round-5's idempotency short-circuit (`active_role == to`)
+    // is REMOVED — rollback restores the pre-mutation state, so
+    // there's no "state already advanced" condition the
+    // closure needs to absorb. If the daemon ever sees
+    // `active_role == to` on entry under non-rollback
+    // conditions, some other process advanced it; that's a
+    // Conflict, not an idempotent success.
+    //
+    // `last_message` capture is NOT done here — needs session+
+    // worktree lookup. Deferred to 10d-2c-2.
+    let to_role = p.to.clone();
+    let run_id_for_closure = p.run_id.clone();
+    let rollback_state: Arc<Mutex<Option<crate::workflow::run::WorkflowRun>>> =
+        Arc::new(Mutex::new(None));
+    let rollback_for_closure = rollback_state.clone();
+    // 10d-2c-1 review round-7 (F2): captures the
+    // pre-mutation `active_role` for the Event's `from_role`
+    // field. Same shape as `rollback_state` — exposed to the
+    // outer scope via Arc<Mutex<>>.
+    let captured_from_role: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_from_role_for_closure = captured_from_role.clone();
+    // 10d-2c-1 review round-15: capture POST-mutation iteration
+    // inside the closure (under flock, after `iteration += 1`).
+    // The TUI's history append uses this per-event value so
+    // queued events record their actual activation iteration —
+    // pre-r15 it read state.json's current `iteration` which
+    // gave the LATEST value to every queued event.
+    let captured_iteration: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let captured_iteration_for_closure = captured_iteration.clone();
+    let outcome = crate::workflow::run::try_modify(
+        &p.run_id,
+        move |run| -> Result<(), (ErrorCode, String)> {
+            // P1 #3 auth: Session callers must be the
+            // active-role's participant. Operators bypass.
+            if is_session_caller {
+                let active = run.active_role.as_deref();
+                let allowed = session_workflow_info
+                    .as_ref()
+                    .map(|(wf_id, wf_role)| {
+                        wf_id.as_deref() == Some(&run_id_for_closure)
+                            && wf_role.as_deref() == active
+                    })
+                    .unwrap_or(false);
+                if !allowed {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        // Message names the run_id but NOT the
+                        // active role — don't leak workflow state
+                        // to non-participants.
+                        format!(
+                            "workflow_transition: caller is not a participant of run {}",
+                            run_id_for_closure,
+                        ),
+                    ));
+                }
+            }
+            // F3 (status): only Running runs accept transitions.
+            // Paused/Done/Detached are conflicts — the run is in
+            // a state where firing a transition would corrupt
+            // semantics (e.g., post-Done activation history).
+            if !matches!(run.status, crate::workflow::run::RunStatus::Running) {
+                return Err((
+                    ErrorCode::Conflict,
+                    format!(
+                        "workflow_transition: run {} is not Running (status={:?}); \
+                         transitions only fire on Running runs",
+                        run_id_for_closure, run.status,
+                    ),
+                ));
+            }
+            // F3 (target role): target must be a known role in
+            // the workflow's role bindings. Catches typos and
+            // protects against an agent inventing role names.
+            if !run.role_sessions.contains_key(&to_role) {
+                let mut valid: Vec<&str> = run
+                    .role_sessions
+                    .keys()
+                    .map(|s| s.as_str())
+                    .collect();
+                valid.sort();
+                return Err((
+                    ErrorCode::Conflict,
+                    format!(
+                        "workflow_transition: target role {:?} not declared in run {} \
+                         (valid roles: {:?})",
+                        to_role, run_id_for_closure, valid,
+                    ),
+                ));
+            }
+            // Round-6 (F2) rollback: snapshot pre-mutation state
+            // AFTER validation but BEFORE mutation. The outer
+            // scope reads this via `rollback_state.lock()` if
+            // append_event_with_retry exhausts and we need to
+            // restore.
+            *rollback_for_closure.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(run.clone());
+            // Round-7 (F2): capture the pre-mutation
+            // `active_role` so the Event carries the
+            // authoritative outgoing role for the TUI tail.
+            *captured_from_role_for_closure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = run.active_role.clone();
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some(to_role);
+            // Round-15: capture POST-mutation iteration so the
+            // Event carries the per-event activation iteration
+            // for the TUI tail's history append.
+            *captured_iteration_for_closure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = run.iteration;
+            Ok(())
+        },
+    );
+    let updated = match outcome {
+        crate::workflow::run::TryModifyOutcome::Ok(r) => r,
+        crate::workflow::run::TryModifyOutcome::Aborted(e) => return Err(e),
+        crate::workflow::run::TryModifyOutcome::Persist(
+            crate::workflow::run::PersistError::Io(io_err),
+        ) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            return Err((
+                ErrorCode::NotFound,
+                format!(
+                    "workflow_transition: workflow run {} has no state.json on disk \
+                     (was it ever launched?)",
+                    p.run_id,
+                ),
+            ));
+        }
+        crate::workflow::run::TryModifyOutcome::Persist(
+            crate::workflow::run::PersistError::Io(io_err),
+        ) if io_err.kind() == std::io::ErrorKind::InvalidInput => {
+            // F2 (round 3): run_id validation surfaces as
+            // InvalidInput from `run::try_modify` — translate to
+            // InvalidParams for the caller.
+            return Err((
+                ErrorCode::InvalidParams,
+                format!("workflow_transition: invalid run_id: {}", io_err),
+            ));
+        }
+        crate::workflow::run::TryModifyOutcome::Persist(other) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("workflow_transition: state.json mutation failed: {}", other),
+            ));
+        }
+    };
+
+    // Round-7 (F2): copy the captured pre-mutation
+    // `from_role` onto the event before it lands on disk. The
+    // TUI tail's daemon-routed handler reads this field for
+    // `McpTransition.from_role`; deriving from the post-mutation
+    // in-memory `active_role` would record the WRONG outgoing
+    // role (`to`, not the actual previous role).
+    event.from_role = captured_from_role
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    // Round-15: copy POST-mutation iteration for the TUI tail's
+    // per-event history append.
+    event.iteration = *captured_iteration
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    // Round-6 (F2): append event with bounded retry. If
+    // exhausted, ROLL BACK the state.json mutation to the
+    // pre-mutation snapshot captured inside the closure so the
+    // external caller-side retry sees the original state and
+    // the daemon's auth check still matches the caller's bound
+    // role. Pre-fix (round-5) state stayed advanced; an external
+    // retry would hit Unauthorized because active_role had
+    // moved past the caller's role. NOTES.md captures the
+    // rollback failure mode (rollback-save-also-fails) as
+    // unrecoverable.
+    if let Err(e) = append_event_with_retry(&event) {
+        eprintln!(
+            "cm-daemon: workflow_transition({} → {}): state.json advanced but \
+             append_event failed after retries: {} — rolling back state to \
+             pre-mutation snapshot so caller retry sees the original state. \
+             See NOTES.md \"Rejected findings (10d-2c-1)\" for the rollback \
+             failure mode.",
+            event.run_id, p.to, e,
+        );
+        // Take the pre-mutation snapshot out of the Arc; restore
+        // it to disk under flock.
+        let snapshot = rollback_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(snap) = snapshot {
+            // 10d-2c-1 review round-12 (F1): field-targeted
+            // rollback. Pre-r12 the rollback did `*r = snap`
+            // wholesale, clobbering any TUI-owned field updates
+            // that landed in the window between mutation and
+            // rollback (sync_role_session_ids, pause/stop,
+            // events_offset advance from tail, role_baselines
+            // for fresh resets). Round-12 restores ONLY the
+            // daemon-owned fields `workflow_transition`
+            // actually changed:
+            //   - active_role  (mutation flipped to `to`)
+            //   - iteration    (mutation bumped by 1)
+            // TUI-owned fields stay at whatever value they hold
+            // on disk now (which may include TUI updates that
+            // landed during the retry window). Symmetric to the
+            // round-6 F1 fix on the TUI side ("TUI wholesale
+            // save clobbers daemon state") — same principle:
+            // each writer touches only its own fields.
+            if let Err(re) = crate::workflow::run::modify(&p.run_id, move |r| {
+                r.active_role = snap.active_role.clone();
+                r.iteration = snap.iteration;
+                // 10d-2c-1 review round-13: `close_active_role`
+                // (called by the daemon's mutation just before
+                // setting `active_role = to`) set the last
+                // history entry's `deactivated_at` and
+                // `last_message`. Round-12 missed restoring
+                // those; post-rollback the run had
+                // `active_role = worker` (rolled back) but
+                // worker's history entry still showed
+                // `deactivated_at: Some(...)` — inconsistent,
+                // and `close_active_role` is idempotent so a
+                // caller retry couldn't repair it. Restore by
+                // matching `(role, iteration)` against
+                // `snap.history.last()` — the active-at-
+                // snapshot-time entry. Don't restore the whole
+                // history Vec (TUI may have appended entries
+                // during the retry window).
+                if let Some(snap_active) = snap.history.last() {
+                    if let Some(disk_entry) = r
+                        .history
+                        .iter_mut()
+                        .find(|h| h.role == snap_active.role
+                            && h.iteration == snap_active.iteration)
+                    {
+                        disk_entry.deactivated_at = snap_active.deactivated_at;
+                        disk_entry.last_message = snap_active.last_message.clone();
+                    }
+                }
+            }) {
+                // Rollback-save-also-fails. Log loudly; the run
+                // is now in an inconsistent state and needs
+                // manual recovery (e.g., remove
+                // `~/.cm/workflow-runs/<run_id>/state.json.lock`
+                // and edit `state.json` by hand). The original
+                // event-write failure is the primary error to
+                // return to the caller; the rollback failure is
+                // a secondary log line.
+                eprintln!(
+                    "cm-daemon: workflow_transition({}): ROLLBACK ALSO FAILED: \
+                     {} — state.json on disk reflects the (uncommitted) \
+                     post-mutation shape with no matching event; manual \
+                     recovery required",
+                    p.run_id, re,
+                );
+            }
+        } else {
+            // Closure didn't capture a snapshot (e.g., returned
+            // Err before the snapshot statement). Nothing to
+            // restore; the on-disk state should already be
+            // untouched.
+            eprintln!(
+                "cm-daemon: workflow_transition({}): no pre-mutation \
+                 snapshot captured (closure returned early); on-disk \
+                 state should be untouched",
+                p.run_id,
+            );
+        }
+        return Err((
             ErrorCode::Internal,
             format!("workflow_transition: failed to append event: {}", e),
-        ))?;
+        ));
+    }
+
+    // Refresh the daemon's in-memory cache.
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.workflow_runs.insert(updated.run_id.clone(), updated);
+    }
+
     Ok(json!({
         "ok": true,
         "event_id": event.id,
@@ -2141,8 +2631,59 @@ pub fn workflow_transition(
     }))
 }
 
+/// 10d-2c-1 review round-5 (F2): bounded retry around
+/// `WorkflowEventsWriter::append_event`. Three attempts with
+/// 50ms / 100ms / 200ms backoff between them. The caller (the
+/// workflow handlers) uses this AFTER `try_modify` succeeds —
+/// state.json is already durable by the time we get here.
+///
+/// Why 3 attempts: enough to ride out a transient flush/fs hiccup
+/// (the kind that the kernel resolves on its own), few enough to
+/// not stretch the JSON-RPC round-trip past operator expectations
+/// (~350ms total worst case). The backoff is short for the same
+/// reason — this is a foreground RPC, not a background job.
+///
+/// Persistent failures (full disk, read-only fs, permissions
+/// drift) won't recover via retry; they surface as Err to the
+/// caller and the loud log line documents the inconsistency.
+/// See `daemon/NOTES.md` "Rejected findings (10d-2c-1)" for the
+/// deflection rationale.
+fn append_event_with_retry(
+    event: &crate::workflow::events::Event,
+) -> std::io::Result<()> {
+    const BACKOFFS_MS: &[u64] = &[50, 100, 200];
+    let mut attempt: usize = 0;
+    loop {
+        match crate::workflow::events::WorkflowEventsWriter::append_event(event) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= BACKOFFS_MS.len() + 1 {
+                    return Err(e);
+                }
+                // Log every retry so operators can correlate
+                // transient failure clusters even when the
+                // final attempt succeeds.
+                eprintln!(
+                    "cm-daemon: append_event(run={}, event={}) attempt {} \
+                     failed: {} (retrying after {}ms)",
+                    event.run_id,
+                    event.id,
+                    attempt,
+                    e,
+                    BACKOFFS_MS[attempt - 1],
+                );
+                std::thread::sleep(std::time::Duration::from_millis(
+                    BACKOFFS_MS[attempt - 1],
+                ));
+            }
+        }
+    }
+}
+
 pub fn workflow_done(
-    _state_arc: &Arc<Mutex<DaemonState>>,
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
     params: &Value,
 ) -> MethodResult {
     let p: WorkflowDoneParams = serde_json::from_value(params.clone())
@@ -2156,23 +2697,210 @@ pub fn workflow_done(
             "workflow_done: 'run_id' is required".into(),
         ));
     }
-    let event = crate::workflow::events::Event {
+    let role_for_event = if p.role.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        p.role.clone()
+    };
+
+    // Pre-fetch caller info for the auth check (see
+    // `workflow_transition` for the rationale).
+    let session_workflow_info: Option<(Option<String>, Option<String>)> =
+        if let Caller::Session(uid) = caller {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .lookup_session_any(&uid.session_uid)
+                .map(|s| (s.workflow_run_id, s.workflow_role))
+        } else {
+            None
+        };
+    let is_session_caller = matches!(caller, Caller::Session(_));
+
+    // F1 (round-1) + F2 (round-5 revert): event in memory now,
+    // appended AFTER try_modify with bounded retry. Same
+    // rationale as `workflow_transition`.
+    //
+    // Round-7 (F2): `workflow_done` events carry `from_role:
+    // None` — the active role is being torn down, no "next
+    // role" semantics apply. The TUI tail's daemon-routed Done
+    // handler doesn't need the field. Pre-round-7 events on
+    // disk also have `None` via `#[serde(default)]`.
+    let mut event = crate::workflow::events::Event {
         id: new_event_id(),
         ts: now_unix_f64(),
         run_id: p.run_id.clone(),
-        role: if p.role.trim().is_empty() {
-            "unknown".into()
-        } else {
-            p.role
-        },
+        role: role_for_event,
         tool: "workflow_done".to_string(),
         args: json!({"reason": p.reason}),
+        source: "daemon".to_string(),
+        from_role: None,
+        iteration: 0,
     };
-    crate::workflow::events::WorkflowEventsWriter::append_event(&event)
-        .map_err(|e| (
+
+    // 10d-2c-1 + review round-1 (F1 + F3 + P1 #3) + round-6 (F2
+    // rollback): same auth + status validation shape as
+    // `workflow_transition`. Round-5's idempotency
+    // short-circuit (`status == Done`) is REMOVED — rollback
+    // restores pre-mutation state on event-write exhaustion, so
+    // a caller retry sees Running again and re-runs the full
+    // RMW. If `status == Done` is observed on entry without a
+    // rollback, some other process set it; that's a Conflict.
+    let reason = p.reason.clone();
+    let run_id_for_closure = p.run_id.clone();
+    let rollback_state: Arc<Mutex<Option<crate::workflow::run::WorkflowRun>>> =
+        Arc::new(Mutex::new(None));
+    let rollback_for_closure = rollback_state.clone();
+    // Round-15: capture post-mutation iteration (workflow_done
+    // doesn't bump iteration, but the field surfaces the value
+    // for parity with workflow_transition).
+    let captured_iteration: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let captured_iteration_for_closure = captured_iteration.clone();
+    let outcome = crate::workflow::run::try_modify(
+        &p.run_id,
+        move |run| -> Result<(), (ErrorCode, String)> {
+            if is_session_caller {
+                let active = run.active_role.as_deref();
+                let allowed = session_workflow_info
+                    .as_ref()
+                    .map(|(wf_id, wf_role)| {
+                        wf_id.as_deref() == Some(&run_id_for_closure)
+                            && wf_role.as_deref() == active
+                    })
+                    .unwrap_or(false);
+                if !allowed {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "workflow_done: caller is not a participant of run {}",
+                            run_id_for_closure,
+                        ),
+                    ));
+                }
+            }
+            if !matches!(run.status, crate::workflow::run::RunStatus::Running) {
+                return Err((
+                    ErrorCode::Conflict,
+                    format!(
+                        "workflow_done: run {} is not Running (status={:?}); \
+                         workflow_done only fires on Running runs",
+                        run_id_for_closure, run.status,
+                    ),
+                ));
+            }
+            // Round-6 (F2) rollback: snapshot pre-mutation state
+            // AFTER validation but BEFORE mutation.
+            *rollback_for_closure.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(run.clone());
+            run.close_active_role(None);
+            run.active_role = None;
+            run.status = crate::workflow::run::RunStatus::Done;
+            run.done_reason = Some(reason);
+            // Round-15: capture iteration (workflow_done doesn't
+            // bump it, but parity with workflow_transition).
+            *captured_iteration_for_closure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = run.iteration;
+            Ok(())
+        },
+    );
+    let updated = match outcome {
+        crate::workflow::run::TryModifyOutcome::Ok(r) => r,
+        crate::workflow::run::TryModifyOutcome::Aborted(e) => return Err(e),
+        crate::workflow::run::TryModifyOutcome::Persist(
+            crate::workflow::run::PersistError::Io(io_err),
+        ) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            return Err((
+                ErrorCode::NotFound,
+                format!(
+                    "workflow_done: workflow run {} has no state.json on disk",
+                    p.run_id,
+                ),
+            ));
+        }
+        crate::workflow::run::TryModifyOutcome::Persist(
+            crate::workflow::run::PersistError::Io(io_err),
+        ) if io_err.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!("workflow_done: invalid run_id: {}", io_err),
+            ));
+        }
+        crate::workflow::run::TryModifyOutcome::Persist(other) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("workflow_done: state.json mutation failed: {}", other),
+            ));
+        }
+    };
+
+    // Round-15: copy post-mutation iteration onto the event.
+    event.iteration = *captured_iteration
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    // Round-6 (F2): same rollback shape as
+    // `workflow_transition` — restore pre-mutation snapshot if
+    // event-write exhausts.
+    if let Err(e) = append_event_with_retry(&event) {
+        eprintln!(
+            "cm-daemon: workflow_done(run={}): state.json advanced but \
+             append_event failed after retries: {} — rolling back state to \
+             pre-mutation snapshot",
+            event.run_id, e,
+        );
+        let snapshot = rollback_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(snap) = snapshot {
+            // 10d-2c-1 review round-12 (F1): field-targeted
+            // rollback. `workflow_done` mutated active_role
+            // (→ None), status (→ Done), and done_reason
+            // (→ Some(reason)). Restore exactly those three.
+            // TUI-owned fields stay at whatever value they
+            // currently hold (the TUI may have written
+            // events_offset / role_sessions / etc. concurrently
+            // during the event-write retry window). See
+            // `workflow_transition`'s round-12 commentary for
+            // the full rationale.
+            if let Err(re) = crate::workflow::run::modify(&p.run_id, move |r| {
+                r.active_role = snap.active_role.clone();
+                r.status = snap.status.clone();
+                r.done_reason = snap.done_reason.clone();
+                // 10d-2c-1 review round-13: restore the
+                // deactivated-at-snapshot history entry (the
+                // one `close_active_role` mutated). Same shape
+                // as the `workflow_transition` rollback.
+                if let Some(snap_active) = snap.history.last() {
+                    if let Some(disk_entry) = r
+                        .history
+                        .iter_mut()
+                        .find(|h| h.role == snap_active.role
+                            && h.iteration == snap_active.iteration)
+                    {
+                        disk_entry.deactivated_at = snap_active.deactivated_at;
+                        disk_entry.last_message = snap_active.last_message.clone();
+                    }
+                }
+            }) {
+                eprintln!(
+                    "cm-daemon: workflow_done({}): ROLLBACK ALSO FAILED: \
+                     {} — manual recovery required",
+                    p.run_id, re,
+                );
+            }
+        }
+        return Err((
             ErrorCode::Internal,
             format!("workflow_done: failed to append event: {}", e),
-        ))?;
+        ));
+    }
+
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.workflow_runs.insert(updated.run_id.clone(), updated);
+    }
+
     Ok(json!({
         "ok": true,
         "event_id": event.id,
@@ -4579,6 +5307,43 @@ mod tests {
         Arc::new(Mutex::new(DaemonState::new()))
     }
 
+    /// 10d-2c-1 test helper: seed a minimal-but-valid
+    /// `state.json` on disk for `run_id` so the handler's
+    /// load-modify-write under flock has something to load.
+    /// Returns the seeded run so callers can compare pre/post
+    /// fields without re-loading.
+    ///
+    /// 10d-2c-1 review round-1 (F3): seeds the standard
+    /// `feedback`-shaped role binding map (`worker`, `reviewer`,
+    /// `manager`) so transitions to any of these pass the
+    /// daemon's target-role validation. Tests that need a
+    /// non-feedback role shape should construct their own.
+    fn seed_workflow_run(run_id: &str, initial_role: &str) -> crate::workflow::run::WorkflowRun {
+        use std::collections::BTreeMap;
+        let mut role_sessions = BTreeMap::new();
+        for role in ["worker", "reviewer", "manager"] {
+            role_sessions.insert(
+                role.to_string(),
+                crate::workflow::run::RoleBinding {
+                    session_label: role.to_string(),
+                    current_session_id: None,
+                },
+            );
+        }
+        let run = crate::workflow::run::WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".to_string(),
+            "/tmp/seed-task-key".to_string(),
+            role_sessions,
+            initial_role.to_string(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        crate::workflow::run::save(&run).expect("seed save ok");
+        run
+    }
+
     /// 10d-2b acceptance: a `workflow_transition` call lands an
     /// event in `~/.cm/workflow-runs/<run_id>/events.jsonl` via
     /// the 10d-2a `WorkflowEventsWriter`. Wire shape pinned so
@@ -4588,13 +5353,16 @@ mod tests {
     fn workflow_transition_appends_event_with_expected_shape() {
         let _tmp = with_temp_home(|| {
             let state = make_state_arc();
+            // 10d-2c-1: seed state.json so the handler's
+            // load-modify-write has something to load.
+            seed_workflow_run("wf_transition_test", "worker");
             let params = json!({
                 "to": "reviewer",
                 "prompt": "diff lgtm?",
                 "run_id": "wf_transition_test",
                 "role": "worker",
             });
-            let result = workflow_transition(&state, &params).expect("ok");
+            let result = workflow_transition(&state, &Caller::operator("op-test"), &params).expect("ok");
             assert_eq!(result["ok"], true);
             assert_eq!(result["run_id"], "wf_transition_test");
             let event_id = result["event_id"].as_str().expect("event_id present");
@@ -4619,18 +5387,97 @@ mod tests {
         });
     }
 
+    /// 10d-2c-1 review round-7 (F2): the event carries the
+    /// PRE-MUTATION `from_role` (captured by the daemon's
+    /// closure under flock). Pre-fix the TUI's tail derived
+    /// `from_role` from in-memory `active_role` AFTER the
+    /// daemon's mutation, recording `from_role = to` (wrong).
+    /// Post-fix the event itself is authoritative.
+    #[test]
+    fn workflow_transition_event_carries_pre_mutation_from_role() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_from_role_pin", "worker");
+            // Daemon's mutation will flip active_role from
+            // "worker" to "reviewer"; the event's from_role
+            // must be the PRE-mutation value ("worker").
+            let result = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_from_role_pin",
+                    "role": "worker",
+                }),
+            )
+            .expect("ok");
+            assert_eq!(result["ok"], true);
+
+            // State.json now has post-mutation active_role.
+            let post = crate::workflow::run::load_one("wf_from_role_pin").unwrap();
+            assert_eq!(
+                post.active_role.as_deref(),
+                Some("reviewer"),
+                "daemon mutation must advance active_role to `to`",
+            );
+
+            // The event carries the PRE-mutation outgoing role.
+            let (events, _) =
+                crate::workflow::events::read_new("wf_from_role_pin", 0);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].from_role.as_deref(),
+                Some("worker"),
+                "event.from_role must be the PRE-mutation active_role \
+                 (the outgoing role), not the post-mutation `to`",
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-7 (F2): `workflow_done` events
+    /// carry `from_role: None` — the active role is being torn
+    /// down, no "next role" semantics apply.
+    #[test]
+    fn workflow_done_event_carries_none_from_role() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_done_no_from", "manager");
+            workflow_done(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "reason": "approved",
+                    "run_id": "wf_done_no_from",
+                    "role": "manager",
+                }),
+            )
+            .expect("ok");
+            let (events, _) =
+                crate::workflow::events::read_new("wf_done_no_from", 0);
+            assert_eq!(events.len(), 1);
+            assert!(
+                events[0].from_role.is_none(),
+                "workflow_done events must have from_role=None; \
+                 got {:?}",
+                events[0].from_role,
+            );
+        });
+    }
+
     /// 10d-2b: `workflow_done` is the same path as transition,
     /// different tool tag + args. Pin the wire shape.
     #[test]
     fn workflow_done_appends_event_with_expected_shape() {
         let _tmp = with_temp_home(|| {
             let state = make_state_arc();
+            seed_workflow_run("wf_done_test", "manager");
             let params = json!({
                 "reason": "approved",
                 "run_id": "wf_done_test",
                 "role": "manager",
             });
-            let result = workflow_done(&state, &params).expect("ok");
+            let result = workflow_done(&state, &Caller::operator("op-test"), &params).expect("ok");
             let event_id = result["event_id"].as_str().expect("event_id");
 
             let (events, _) =
@@ -4659,13 +5506,14 @@ mod tests {
     fn workflow_transition_empty_role_falls_back_to_unknown() {
         let _tmp = with_temp_home(|| {
             let state = make_state_arc();
+            seed_workflow_run("wf_empty_role", "worker");
             let params = json!({
                 "to": "reviewer",
                 "prompt": "p",
                 "run_id": "wf_empty_role",
                 "role": "",
             });
-            workflow_transition(&state, &params).expect("ok");
+            workflow_transition(&state, &Caller::operator("op-test"), &params).expect("ok");
 
             let (events, _) = crate::workflow::events::read_new("wf_empty_role", 0);
             assert_eq!(events.len(), 1);
@@ -4687,7 +5535,7 @@ mod tests {
                 "run_id": "",
                 "role": "worker",
             });
-            let err = workflow_transition(&state, &params)
+            let err = workflow_transition(&state, &Caller::operator("op-test"), &params)
                 .expect_err("empty run_id must reject");
             assert_eq!(err.0, ErrorCode::InvalidParams);
             assert!(err.1.contains("run_id"), "msg mentions run_id: {}", err.1);
@@ -4705,7 +5553,7 @@ mod tests {
                 "run_id": "wf_no_to",
                 "role": "worker",
             });
-            let err = workflow_transition(&state, &params)
+            let err = workflow_transition(&state, &Caller::operator("op-test"), &params)
                 .expect_err("empty to must reject");
             assert_eq!(err.0, ErrorCode::InvalidParams);
         });
@@ -4724,8 +5572,1361 @@ mod tests {
                 "run_id": "wf_malformed",
                 "role": "worker",
             });
-            let err = workflow_transition(&state, &params).expect_err("malformed");
+            let err = workflow_transition(&state, &Caller::operator("op-test"), &params).expect_err("malformed");
             assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    // ============================================================
+    // 10d-2c-1: state.json read-modify-write under flock(2) tests
+    // ============================================================
+
+    /// 10d-2c-1 acceptance: a `workflow_transition` call not only
+    /// appends the event but ALSO mutates `state.json`. The
+    /// outgoing role's history entry gets `deactivated_at` set;
+    /// the new history entry has `trigger: McpTransition{event_id}`;
+    /// `active_role` is the target; `iteration` is bumped.
+    #[test]
+    fn workflow_transition_mutates_state_json_on_disk() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let pre = seed_workflow_run("wf_state_mut", "worker");
+            assert_eq!(pre.active_role.as_deref(), Some("worker"));
+            assert_eq!(pre.iteration, 1);
+            assert_eq!(pre.history.len(), 1);
+
+            let result = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "look at this",
+                    "run_id": "wf_state_mut",
+                    "role": "worker",
+                }),
+            )
+            .expect("ok");
+            let event_id = result["event_id"].as_str().unwrap().to_string();
+
+            let post =
+                crate::workflow::run::load_one("wf_state_mut").expect("state.json present");
+            assert_eq!(
+                post.active_role.as_deref(),
+                Some("reviewer"),
+                "active_role advances to target",
+            );
+            assert_eq!(post.iteration, 2, "iteration bumps on activate");
+            // 10d-2c-1 review round-1 Option A: daemon does NOT
+            // append the new history entry — TUI tail observer
+            // appends it (with correct `assistant_count_at_start`
+            // from transcript-tail visibility). After daemon's
+            // mutation only, history.len() stays at 1 (the
+            // outgoing role, now closed).
+            assert_eq!(
+                post.history.len(),
+                1,
+                "Option A: daemon defers history.push to TUI tail",
+            );
+            assert!(
+                post.history[0].deactivated_at.is_some(),
+                "outgoing role's history entry must be closed",
+            );
+            assert_eq!(post.history[0].role, "worker");
+            // The event_id is in the events.jsonl file (already
+            // tested via the existing
+            // `workflow_transition_appends_event_with_expected_shape`
+            // test). The TUI tail will pull it from there when
+            // it appends the deferred history entry.
+            let _ = event_id;
+        });
+    }
+
+    /// 10d-2c-1 acceptance: `workflow_done` mutates `state.json`
+    /// — closes the active role's history, drops `active_role`
+    /// to None, flips `status` to Done, records the reason.
+    #[test]
+    fn workflow_done_mutates_state_json_on_disk() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_done_mut", "manager");
+            workflow_done(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "reason": "ship it",
+                    "run_id": "wf_done_mut",
+                    "role": "manager",
+                }),
+            )
+            .expect("ok");
+
+            let post =
+                crate::workflow::run::load_one("wf_done_mut").expect("state.json present");
+            assert!(post.active_role.is_none(), "active_role dropped on Done");
+            assert!(
+                matches!(post.status, crate::workflow::run::RunStatus::Done),
+                "status flips to Done",
+            );
+            assert_eq!(post.done_reason.as_deref(), Some("ship it"));
+            assert!(
+                post.history.last().unwrap().deactivated_at.is_some(),
+                "the previously-active role's history is closed",
+            );
+        });
+    }
+
+    /// 10d-2c-1: the daemon refreshes its in-memory
+    /// `state.workflow_runs` cache on each handler entry — the
+    /// post-call cache reflects the on-disk mutation. (Per the
+    /// user's "treat the in-memory map as a write-side cache"
+    /// rule: we update on write so tests can assert against it
+    /// without re-loading the disk file.)
+    #[test]
+    fn workflow_transition_refreshes_in_memory_cache() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_cache_refresh", "worker");
+            // Pre-call: the in-memory map is empty (10d-2a's
+            // `workflow_runs` field is the cache; nothing put
+            // it there yet for this test).
+            {
+                let s = state.lock().unwrap();
+                assert!(s.workflow_runs.is_empty());
+            }
+            workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_cache_refresh",
+                    "role": "worker",
+                }),
+            )
+            .expect("ok");
+            let s = state.lock().unwrap();
+            let cached = s
+                .workflow_runs
+                .get("wf_cache_refresh")
+                .expect("cache refreshed on write");
+            assert_eq!(cached.active_role.as_deref(), Some("reviewer"));
+            assert_eq!(cached.iteration, 2);
+        });
+    }
+
+    /// 10d-2c-1: if an outside writer mutates `state.json`
+    /// between handler calls, the daemon picks up that mutation
+    /// on the NEXT handler entry. Validates the user-spec
+    /// directive: "don't trust the in-memory copy as
+    /// authoritative; re-load from disk on each handler
+    /// entry."
+    #[test]
+    fn workflow_transition_re_reads_disk_on_each_handler_entry() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_re_read", "worker");
+
+            // First call — daemon's mutation: worker → reviewer.
+            workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "first",
+                    "run_id": "wf_re_read",
+                    "role": "worker",
+                }),
+            )
+            .expect("first ok");
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(
+                    s.workflow_runs["wf_re_read"].active_role.as_deref(),
+                    Some("reviewer"),
+                );
+            }
+
+            // Outside writer (simulated TUI-static-path) mutates
+            // state.json under the same flock-protected helper.
+            // Sets active_role back to "worker" and bumps
+            // iteration further to simulate a static transition.
+            crate::workflow::run::modify("wf_re_read", |run| {
+                run.active_role = Some("worker".to_string());
+                run.iteration = 99;
+            })
+            .expect("outside modify");
+
+            // Sanity: daemon's cache is now stale.
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(
+                    s.workflow_runs["wf_re_read"].active_role.as_deref(),
+                    Some("reviewer"),
+                    "in-memory cache is stale (deliberately)",
+                );
+                assert_eq!(s.workflow_runs["wf_re_read"].iteration, 2);
+            }
+
+            // Second call — daemon must re-read the outside
+            // mutation. The transition fires from active_role=worker
+            // (the outside writer's value) to "manager", picking
+            // up the iteration=99 baseline.
+            workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "manager",
+                    "prompt": "second",
+                    "run_id": "wf_re_read",
+                    "role": "worker",
+                }),
+            )
+            .expect("second ok");
+            let s = state.lock().unwrap();
+            let cached = &s.workflow_runs["wf_re_read"];
+            assert_eq!(
+                cached.active_role.as_deref(),
+                Some("manager"),
+                "second transition fires from outside-written state",
+            );
+            assert_eq!(
+                cached.iteration, 100,
+                "iteration bumps from 99 (outside) to 100",
+            );
+            // 10d-2c-1 review round-1 Option A: daemon doesn't
+            // append the new history entry — that's TUI tail's
+            // job. So the "from_role reflects disk state" check
+            // moves to a different observable: the outgoing
+            // role's `deactivated_at` (closed by close_active_role
+            // on the just-read state). The outside-written state
+            // had active_role="worker" (with iteration=99); after
+            // re-read + close_active_role + iteration+=1, the
+            // worker entry should now be closed.
+            //
+            // (The original entry in seed's history is "worker"
+            // initial; after first transition daemon closed it
+            // and active_role was "reviewer"; the outside_modify
+            // reset active_role to "worker" but DIDN'T re-open
+            // the history — `deactivated_at` stayed set. So
+            // looking at the worker entry's `deactivated_at`
+            // here isn't load-bearing.)
+            //
+            // What IS load-bearing: the post-transition
+            // active_role is "manager" and iteration is 100,
+            // both already asserted. That proves the read came
+            // from disk, not cache.
+            let _ = cached;
+        });
+    }
+
+    /// 10d-2c-1: `workflow_transition` on a run_id with no
+    /// state.json returns `NotFound`, not a panic or silent
+    /// success. Pre-fix the file-writer would have written the
+    /// event but not detected the missing state — the workflow
+    /// would silently stall. Post-fix it loud-fails.
+    #[test]
+    fn workflow_transition_no_state_json_returns_not_found() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Intentionally NOT seeded — state.json missing.
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_no_state",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("must reject");
+            assert_eq!(err.0, ErrorCode::NotFound);
+            assert!(
+                err.1.contains("state.json"),
+                "msg mentions state.json: {}",
+                err.1,
+            );
+        });
+    }
+
+    /// 10d-2c-1 concurrent write: a daemon-side
+    /// `workflow_transition` racing a parallel `run::save`
+    /// (simulating TUI's static-path save) under flock leaves
+    /// `state.json` parseable — no torn bytes — and ONE of the
+    /// two writes wins on the conflicting fields. Tests
+    /// flock's mutual-exclusion contract.
+    #[test]
+    fn workflow_transition_concurrent_with_outside_save_no_corruption() {
+        let _tmp = with_temp_home(|| {
+            use std::sync::Arc as StdArc;
+            use std::thread;
+
+            let state = make_state_arc();
+            let seeded = seed_workflow_run("wf_concurrent", "worker");
+            let run_for_outside = StdArc::new(seeded);
+
+            // Many parallel writers — N daemon-side transition
+            // attempts + N outside `run::save` calls. The flock
+            // serializes them; final state must parse and have
+            // a consistent shape.
+            const N: usize = 16;
+            let mut handles = Vec::new();
+            for i in 0..N {
+                let state_clone = state.clone();
+                handles.push(thread::spawn(move || {
+                    // 10d-2c-1 review round-1 F3: must use a
+                    // role that exists in the seed (worker /
+                    // reviewer / manager). Cycle through these
+                    // three to exercise concurrent contention.
+                    let roles = ["worker", "reviewer", "manager"];
+                    workflow_transition(
+                        &state_clone,
+                        &Caller::operator("op-test"),
+                        &json!({
+                            "to": roles[i % 3],
+                            "prompt": "p",
+                            "run_id": "wf_concurrent",
+                            "role": "worker",
+                        }),
+                    )
+                }));
+                let run_clone = run_for_outside.clone();
+                handles.push(thread::spawn(move || {
+                    // Touch the disk: load+save preserves
+                    // events_offset (simulating TUI's static-
+                    // path persisting events_offset). Using
+                    // modify to take the same exclusive lock
+                    // the daemon takes.
+                    let _ = crate::workflow::run::modify("wf_concurrent", |run| {
+                        run.events_offset = run.events_offset.saturating_add(1);
+                    });
+                    let _ = run_clone;
+                    Ok::<_, (ErrorCode, String)>(json!({}))
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+
+            // Final state must parse and have a coherent shape.
+            let final_run =
+                crate::workflow::run::load_one("wf_concurrent").expect("parseable");
+            assert_eq!(final_run.run_id, "wf_concurrent");
+            // Iteration is at least 1 (the seed). Some
+            // transitions may have raced and only one wins per
+            // RMW, so the exact final value is non-deterministic.
+            assert!(final_run.iteration >= 1);
+            // history has at least the initial entry; some
+            // number of additional entries from successful
+            // transitions.
+            assert!(final_run.history.len() >= 1);
+            // The first entry is always the initial worker.
+            assert_eq!(final_run.history[0].role, "worker");
+        });
+    }
+
+    // ============================================================
+    // 10d-2c-1 review round-1 tests (F1, F3)
+    // ============================================================
+
+    /// F1: a rejected Session-caller `workflow_transition` MUST
+    /// NOT leave an event on disk. Pre-fix the event was written
+    /// before auth ran, so a non-participant could forge prompt
+    /// delivery via the TUI's source=daemon tail branch.
+    #[test]
+    fn workflow_transition_rejected_session_writes_no_event() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_no_leak", "worker");
+            // Register an imposter session: matching workflow_role
+            // but a DIFFERENT run_id. Auth must reject.
+            {
+                let mut s = state.lock().unwrap();
+                s.tui_sessions.insert(
+                    "ts-imposter".to_string(),
+                    crate::state::TuiSessionSnapshot {
+                        uid: "ts-imposter".to_string(),
+                        task_id: None,
+                        label: Some("worker".into()),
+                        session_type: Some("claude-code".into()),
+                        hidden: false,
+                        workflow_run_id: Some("wf_different".into()),
+                        workflow_role: Some("worker".into()),
+                    },
+                );
+            }
+            let err = workflow_transition(
+                &state,
+                &Caller::session("ts-imposter"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "forged",
+                    "run_id": "wf_no_leak",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("non-participant must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            // The events.jsonl file must NOT exist (or, if it
+            // exists from some prior write, must contain no
+            // entries for this rejected call).
+            let path = crate::workflow::run::events_path("wf_no_leak");
+            let (events, _) = crate::workflow::events::read_new("wf_no_leak", 0);
+            assert!(
+                events.is_empty(),
+                "rejected call must NOT leave an event on disk (path: {:?}, count: {})",
+                path,
+                events.len(),
+            );
+        });
+    }
+
+    /// F3: transition to an unknown role → `Conflict`. State.json
+    /// unchanged. events.jsonl unchanged.
+    #[test]
+    fn workflow_transition_unknown_target_role_conflict() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_unknown_role", "worker");
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "typo-role",
+                    "prompt": "x",
+                    "run_id": "wf_unknown_role",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("unknown role must reject");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            assert!(err.1.contains("typo-role"), "msg names target: {}", err.1);
+            // Valid roles enumerated in the message.
+            assert!(
+                err.1.contains("worker") && err.1.contains("reviewer"),
+                "msg should list valid roles: {}",
+                err.1,
+            );
+            let post = crate::workflow::run::load_one("wf_unknown_role").unwrap();
+            assert_eq!(post.active_role.as_deref(), Some("worker"));
+            assert_eq!(post.iteration, 1);
+            let (events, _) = crate::workflow::events::read_new("wf_unknown_role", 0);
+            assert!(events.is_empty(), "no event written for unknown-role reject");
+        });
+    }
+
+    /// F3: transition on a Done run → `Conflict`. State.json
+    /// unchanged; events.jsonl unchanged.
+    #[test]
+    fn workflow_transition_on_done_run_conflict() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_done_state", "worker");
+            // Mark the run Done first.
+            let _ = crate::workflow::run::modify("wf_done_state", |run| {
+                run.status = crate::workflow::run::RunStatus::Done;
+                run.active_role = None;
+                run.done_reason = Some("test setup".into());
+            });
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "x",
+                    "run_id": "wf_done_state",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("transition on Done must reject");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            assert!(err.1.contains("not Running"), "msg cites status: {}", err.1);
+            let (events, _) = crate::workflow::events::read_new("wf_done_state", 0);
+            assert!(events.is_empty(), "no event written for Done-state reject");
+        });
+    }
+
+    /// F3: transition on a Paused run → `Conflict`.
+    #[test]
+    fn workflow_transition_on_paused_run_conflict() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_paused", "worker");
+            let _ = crate::workflow::run::modify("wf_paused", |run| {
+                run.status = crate::workflow::run::RunStatus::Paused;
+            });
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "x",
+                    "run_id": "wf_paused",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("paused must reject");
+            assert_eq!(err.0, ErrorCode::Conflict);
+        });
+    }
+
+    /// F3 (workflow_done): done on already-Done run → Conflict.
+    #[test]
+    /// Round-6 (F2 rollback): workflow_done on an already-Done
+    /// run returns Conflict (round-5's idempotency
+    /// short-circuit is REMOVED — rollback replaces it). If the
+    /// daemon sees `status == Done` on entry, it's because some
+    /// other process set it; that's a Conflict, not an
+    /// idempotent retry. The round-6 caller-retry recovery path
+    /// is via the rollback: a failed call rolls back to
+    /// Running, and the next call re-runs the full RMW.
+    #[test]
+    fn workflow_done_on_done_run_returns_conflict() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_double_done", "manager");
+            let _ = crate::workflow::run::modify("wf_double_done", |run| {
+                run.status = crate::workflow::run::RunStatus::Done;
+                run.active_role = None;
+                run.done_reason = Some("first done".into());
+            });
+            let err = workflow_done(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "reason": "second",
+                    "run_id": "wf_double_done",
+                    "role": "manager",
+                }),
+            )
+            .expect_err("second done must reject");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            // done_reason preserved (closure short-circuits at
+            // the status check before mutation).
+            let post =
+                crate::workflow::run::load_one("wf_double_done").unwrap();
+            assert_eq!(post.done_reason.as_deref(), Some("first done"));
+        });
+    }
+
+    /// F2 (round 3): malformed run_ids cannot reach the
+    /// filesystem. Each entry point (load_one, save, modify,
+    /// try_modify, events::append_event) validates the run_id
+    /// before any path is constructed.
+    #[test]
+    fn workflow_transition_rejects_path_traversal_run_ids() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Seed a real run with a normal id so the test
+            // shows the malformed call CANNOT touch it.
+            seed_workflow_run("wf_normal", "worker");
+
+            let bad_ids = [
+                "../etc/passwd",
+                "foo/../bar",
+                "../../wf_normal",
+                ".",
+                "..",
+                "",
+                "with\0null",
+                "wf with space",
+                // 200-char overflow
+                &"x".repeat(200),
+            ];
+            for bad in bad_ids {
+                let result = workflow_transition(
+                    &state,
+                    &Caller::operator("op-test"),
+                    &json!({
+                        "to": "reviewer",
+                        "prompt": "p",
+                        "run_id": bad,
+                        "role": "worker",
+                    }),
+                );
+                assert!(
+                    result.is_err(),
+                    "malformed run_id {:?} must reject",
+                    bad,
+                );
+                let err = result.unwrap_err();
+                // run_id="" hits the explicit InvalidParams
+                // check in the handler before reaching
+                // try_modify; other malformed shapes hit
+                // try_modify's validator which surfaces as
+                // InvalidParams too.
+                assert_eq!(
+                    err.0,
+                    ErrorCode::InvalidParams,
+                    "malformed run_id {:?} must error as InvalidParams (got {:?}: {})",
+                    bad,
+                    err.0,
+                    err.1,
+                );
+            }
+
+            // Cross-validation: the seeded normal run is
+            // untouched.
+            let normal = crate::workflow::run::load_one("wf_normal").unwrap();
+            assert_eq!(normal.active_role.as_deref(), Some("worker"));
+            assert_eq!(normal.iteration, 1);
+        });
+    }
+
+    /// F2 (round 3): `run::load_one` / `save` / `modify` /
+    /// `try_modify` all share one validator. Calling any of
+    /// them with a malformed run_id surfaces InvalidInput
+    /// before path construction. Pin the contract.
+    #[test]
+    fn run_helpers_reject_malformed_run_ids() {
+        use crate::workflow::run;
+        let _tmp = with_temp_home(|| {
+            for bad in ["..", "foo/bar", "", "with\0", &"x".repeat(200)] {
+                // load_one returns None on validation fail (it
+                // returns Option, not Result).
+                assert!(run::load_one(bad).is_none(),
+                    "load_one({:?}) must return None", bad);
+
+                // modify returns Err.
+                let r = run::modify(bad, |_| {});
+                assert!(r.is_err(), "modify({:?}) must reject", bad);
+
+                // try_modify returns Persist(Io(InvalidInput)).
+                let outcome: run::TryModifyOutcome<()> =
+                    run::try_modify(bad, |_| Ok(()));
+                assert!(
+                    matches!(
+                        outcome,
+                        run::TryModifyOutcome::Persist(
+                            run::PersistError::Io(ref e)
+                        ) if e.kind() == std::io::ErrorKind::InvalidInput,
+                    ),
+                    "try_modify({:?}) must surface InvalidInput",
+                    bad,
+                );
+            }
+        });
+    }
+
+    /// F1 (workflow_done): rejected workflow_done writes no event.
+    #[test]
+    fn workflow_done_rejected_writes_no_event() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_done_no_leak", "manager");
+            {
+                let mut s = state.lock().unwrap();
+                s.tui_sessions.insert(
+                    "ts-imposter".to_string(),
+                    crate::state::TuiSessionSnapshot {
+                        uid: "ts-imposter".to_string(),
+                        task_id: None,
+                        label: Some("manager".into()),
+                        session_type: Some("claude-code".into()),
+                        hidden: false,
+                        workflow_run_id: Some("wf_other_run".into()),
+                        workflow_role: Some("manager".into()),
+                    },
+                );
+            }
+            let err = workflow_done(
+                &state,
+                &Caller::session("ts-imposter"),
+                &json!({
+                    "reason": "x",
+                    "run_id": "wf_done_no_leak",
+                    "role": "manager",
+                }),
+            )
+            .expect_err("non-participant must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            let (events, _) =
+                crate::workflow::events::read_new("wf_done_no_leak", 0);
+            assert!(events.is_empty());
+        });
+    }
+
+    /// Round-6 (F2 rollback): on persistent `append_event`
+    /// failure, state.json is ROLLED BACK to the pre-mutation
+    /// snapshot. Caller's external retry sees the original
+    /// state (active_role still matches caller's bound role) and
+    /// can re-issue cleanly. Pre-fix (round-5) state stayed
+    /// advanced and the retry hit Unauthorized because
+    /// `active_role` had moved past the caller's role.
+    #[test]
+    /// 10d-2c-1 review round-12 (F1) — named acceptance test.
+    /// During the event-write retry window the TUI can write
+    /// concurrent updates to the same run (sync_role_session_ids,
+    /// role_baselines, events_offset). The rollback path must
+    /// restore ONLY daemon-owned fields (active_role, iteration)
+    /// — pre-r12 the wholesale `*r = snap` clobbered the TUI's
+    /// concurrent updates.
+    ///
+    /// Simulates the race by manually applying a TUI-style
+    /// update between the daemon's try_modify (which captures
+    /// the snapshot) and the rollback. The TUI update is to
+    /// `role_sessions[reviewer].current_session_id` — TUI
+    /// territory per the round-6 ownership split.
+    #[test]
+    fn workflow_transition_rollback_preserves_concurrent_tui_role_sessions_update() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r12_concurrent", "worker");
+
+            // Pre-mutation snapshot for assertions.
+            let pre = crate::workflow::run::load_one("wf_r12_concurrent")
+                .expect("pre load");
+            assert_eq!(pre.active_role.as_deref(), Some("worker"));
+            assert_eq!(pre.iteration, 1);
+
+            // Block event write with EISDIR → daemon mutation
+            // succeeds, event-write retries, then rolls back.
+            let dir = crate::workflow::run::run_dir("wf_r12_concurrent");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path =
+                crate::workflow::run::events_path("wf_r12_concurrent");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            // Spawn a thread that polls state.json and, once it
+            // sees the daemon's mutation land (active_role
+            // flipped to "reviewer"), applies a TUI-style
+            // role_sessions update via `run::modify`. This
+            // races against the rollback that will restore
+            // active_role to "worker"; the assertion below
+            // verifies the role_sessions update survives.
+            let bg = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(400);
+                loop {
+                    if std::time::Instant::now() > deadline {
+                        return false;
+                    }
+                    let Some(run) = crate::workflow::run::load_one("wf_r12_concurrent")
+                    else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    if run.active_role.as_deref() == Some("reviewer") {
+                        // Daemon mutation has landed. Apply the
+                        // TUI-style update.
+                        let result = crate::workflow::run::modify(
+                            "wf_r12_concurrent",
+                            |r| {
+                                if let Some(b) = r.role_sessions.get_mut("reviewer") {
+                                    b.current_session_id = Some("ts-tui-update".into());
+                                }
+                            },
+                        );
+                        return result.is_ok();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+
+            // Daemon call: try_modify advances state, retries
+            // event_write (each fails ~50/100/200ms), then
+            // rolls back active_role + iteration.
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_r12_concurrent",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("event write must fail after retries");
+            assert_eq!(err.0, ErrorCode::Internal);
+
+            let bg_applied = bg.join().expect("bg joined");
+            assert!(
+                bg_applied,
+                "background TUI update must have landed during \
+                 the retry window",
+            );
+
+            // Daemon-owned fields rolled back.
+            let post = crate::workflow::run::load_one("wf_r12_concurrent")
+                .expect("post load");
+            assert_eq!(
+                post.active_role,
+                pre.active_role,
+                "round-12 F1: active_role rolled back to pre-mutation; \
+                 got {:?}",
+                post.active_role,
+            );
+            assert_eq!(
+                post.iteration, pre.iteration,
+                "iteration rolled back",
+            );
+            // TUI-owned field PRESERVED. Pre-r12 the wholesale
+            // `*r = snap` would have clobbered this back to
+            // None.
+            assert_eq!(
+                post.role_sessions
+                    .get("reviewer")
+                    .and_then(|b| b.current_session_id.clone())
+                    .as_deref(),
+                Some("ts-tui-update"),
+                "round-12 F1: TUI-owned role_sessions update must \
+                 survive rollback (pre-fix it was clobbered by the \
+                 wholesale snapshot restore)",
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-13 — named acceptance test.
+    /// Pre-r13 the rollback restored `active_role` +
+    /// `iteration` but left the active history entry's
+    /// `deactivated_at` set by `close_active_role`. Post-rollback
+    /// the run had `active_role = worker` but worker's history
+    /// entry showed `deactivated_at: Some(...)` — an inconsistent
+    /// state that `close_active_role`'s idempotency prevented
+    /// caller retries from repairing. R13 restores
+    /// `deactivated_at` + `last_message` on the matching (role,
+    /// iteration) entry.
+    #[test]
+    fn workflow_transition_rollback_restores_active_history_deactivation() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r13_history_restore", "worker");
+
+            // Sanity: seed shape has one initial worker history
+            // entry with `deactivated_at: None`.
+            let pre = crate::workflow::run::load_one("wf_r13_history_restore")
+                .expect("pre load");
+            assert_eq!(pre.history.len(), 1);
+            assert_eq!(pre.history[0].role, "worker");
+            assert!(pre.history[0].deactivated_at.is_none());
+            assert!(pre.history[0].last_message.is_none());
+
+            // Block event-append → mutation succeeds (close +
+            // iteration++ + active_role flip), retries exhaust,
+            // rollback fires.
+            let dir = crate::workflow::run::run_dir("wf_r13_history_restore");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path =
+                crate::workflow::run::events_path("wf_r13_history_restore");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_r13_history_restore",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("event write must fail after retries");
+            assert_eq!(err.0, ErrorCode::Internal);
+
+            // Round-13 assertion: active history entry's
+            // deactivated_at/last_message restored to pre-
+            // mutation (None/None). Pre-r13 deactivated_at
+            // was Some(...) — the `close_active_role` side
+            // effect that the wholesale-snapshot rollback used
+            // to undo but the round-12 field-targeted rollback
+            // missed.
+            let post = crate::workflow::run::load_one("wf_r13_history_restore")
+                .expect("post load");
+            assert_eq!(post.active_role.as_deref(), Some("worker"));
+            assert_eq!(post.history.len(), 1);
+            assert_eq!(post.history[0].role, "worker");
+            assert!(
+                post.history[0].deactivated_at.is_none(),
+                "round-13: worker history entry's deactivated_at must \
+                 be rolled back to None; got {:?}",
+                post.history[0].deactivated_at,
+            );
+            assert!(
+                post.history[0].last_message.is_none(),
+                "round-13: worker history entry's last_message must be \
+                 rolled back to None; got {:?}",
+                post.history[0].last_message,
+            );
+
+            // Drive a successful retry (heal disk, re-call).
+            // Asserts no leftover deactivation issue blocks
+            // forward progress.
+            std::fs::remove_dir(&events_path).expect("remove dir");
+            let resp = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_r13_history_restore",
+                    "role": "worker",
+                }),
+            )
+            .expect("retry must succeed after r13 clean rollback");
+            assert_eq!(resp["ok"], json!(true));
+            let final_ = crate::workflow::run::load_one("wf_r13_history_restore")
+                .expect("final load");
+            assert_eq!(final_.active_role.as_deref(), Some("reviewer"));
+            // The retry's close_active_role now correctly
+            // deactivates the worker entry (it was None
+            // post-rollback, not stale Some).
+            assert!(
+                final_.history[0].deactivated_at.is_some(),
+                "after successful retry, worker entry is properly \
+                 deactivated; pre-r13 the idempotent close_active_role \
+                 would have left it untouched because deactivated_at \
+                 was already Some from the failed first call",
+            );
+        });
+    }
+
+    #[test]
+    fn workflow_transition_persistent_event_failure_rolls_back_state_returns_internal() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_evfail_r6", "worker");
+            // Capture pre-call state for the post-call rollback
+            // assertion. Includes iteration, active_role.
+            let pre = crate::workflow::run::load_one("wf_evfail_r6").unwrap();
+            let dir = crate::workflow::run::run_dir("wf_evfail_r6");
+            std::fs::create_dir_all(&dir).unwrap();
+            // Block append_event with EISDIR — persistent.
+            let events_path =
+                crate::workflow::run::events_path("wf_evfail_r6");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            let start = std::time::Instant::now();
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_evfail_r6",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("event write must fail after retries");
+            let elapsed = start.elapsed();
+            assert_eq!(err.0, ErrorCode::Internal);
+            assert!(
+                err.1.contains("failed to append event"),
+                "error msg surfaces event-write failure: {}",
+                err.1,
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(300),
+                "retry backoff must elapse before final Err; \
+                 elapsed={:?}",
+                elapsed,
+            );
+
+            // Round-6 behavior: state.json ROLLED BACK to
+            // pre-mutation snapshot.
+            let post = crate::workflow::run::load_one("wf_evfail_r6").unwrap();
+            assert_eq!(
+                post.active_role,
+                pre.active_role,
+                "round-6: state rolled back to pre-mutation \
+                 active_role={:?}; observed post={:?}",
+                pre.active_role,
+                post.active_role,
+            );
+            assert_eq!(
+                post.iteration, pre.iteration,
+                "round-6: iteration rolled back to pre-mutation \
+                 value {}; observed post={}",
+                pre.iteration, post.iteration,
+            );
+            // No event on disk.
+            let (events, _) =
+                crate::workflow::events::read_new("wf_evfail_r6", 0);
+            assert!(events.is_empty(), "no events after rollback");
+        });
+    }
+
+    /// Round-6 (F2 rollback): caller's external retry after a
+    /// rollback succeeds cleanly. Since state was rolled back to
+    /// pre-mutation, the second call re-runs full RMW from
+    /// scratch — single mutation + single event end state.
+    #[test]
+    fn workflow_transition_caller_retry_after_rollback_succeeds_cleanly() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_retry_r6", "worker");
+            let dir = crate::workflow::run::run_dir("wf_retry_r6");
+            std::fs::create_dir_all(&dir).unwrap();
+
+            // Stage 1: block event write → rollback fires.
+            let events_path =
+                crate::workflow::run::events_path("wf_retry_r6");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_retry_r6",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("first call: event write fails");
+            assert_eq!(err.0, ErrorCode::Internal);
+            // Rolled back.
+            let mid = crate::workflow::run::load_one("wf_retry_r6").unwrap();
+            assert_eq!(mid.active_role.as_deref(), Some("worker"));
+            assert_eq!(mid.iteration, 1);
+
+            // Stage 2: heal disk + retry.
+            std::fs::remove_dir(&events_path).expect("remove dir");
+            let ok = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_retry_r6",
+                    "role": "worker",
+                }),
+            )
+            .expect("retry must succeed after rollback");
+            assert_eq!(ok["ok"], json!(true));
+
+            // Single end-state mutation: active_role advanced
+            // ONCE; iteration bumped ONCE; single event.
+            let post = crate::workflow::run::load_one("wf_retry_r6").unwrap();
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+            assert_eq!(
+                post.iteration, 2,
+                "iteration bumped exactly once (the retry); \
+                 no double-mutation"
+            );
+            let (events, _) =
+                crate::workflow::events::read_new("wf_retry_r6", 0);
+            assert_eq!(events.len(), 1, "exactly one event after the retry");
+        });
+    }
+
+    /// Round-5 (F2): transient `append_event` failure (block,
+    /// then unblock) recovers within the retry budget. We model
+    /// the transient by removing the blocker via a background
+    /// thread between attempts.
+    #[test]
+    fn workflow_transition_transient_event_failure_recovers_via_retry() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_tx_r5", "worker");
+            let dir = crate::workflow::run::run_dir("wf_tx_r5");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path = crate::workflow::run::events_path("wf_tx_r5");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            // Background thread: clears the blocker after first
+            // backoff completes. First retry should then succeed.
+            let evp = events_path.clone();
+            let _bg = std::thread::spawn(move || {
+                // 70ms — after the 50ms first backoff but
+                // before the 100ms second backoff completes.
+                std::thread::sleep(std::time::Duration::from_millis(70));
+                let _ = std::fs::remove_dir(&evp);
+            });
+
+            let resp = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_tx_r5",
+                    "role": "worker",
+                }),
+            )
+            .expect("transient failure must recover via retry");
+            assert_eq!(resp["ok"], json!(true));
+
+            // State advanced (would have advanced regardless;
+            // here the event ALSO lands within the retry budget).
+            let post = crate::workflow::run::load_one("wf_tx_r5").unwrap();
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+            let (events, _) = crate::workflow::events::read_new("wf_tx_r5", 0);
+            assert_eq!(events.len(), 1, "event landed via retry");
+        });
+    }
+
+    #[test]
+    /// 10d-2c-1 review round-5 (F1): a session spawned with
+    /// `workflow_run_id` / `workflow_role` in `StartSessionParams`
+    /// passes the daemon-side auth check on `workflow_transition`.
+    /// Pre-fix the daemon-owned session's workflow fields were
+    /// hard-coded to None in `lookup_session_any`, so a daemon-
+    /// attached agent could never participate in a workflow.
+    #[test]
+    fn daemon_attached_workflow_participant_passes_workflow_transition_auth() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r5_spawn", "worker");
+            // Insert a daemon-owned session WITH workflow context
+            // at spawn time. Bypass the real PendingSession::spawn
+            // by injecting a session directly into state.sessions
+            // via the SpawnParams + spawn pair the auth tests use.
+            let mut p = crate::session::SpawnParams::new(
+                "ts-daemon-worker",
+                "test-daemon-worker",
+                "/bin/sleep",
+            );
+            p.args = vec!["3".to_string()];
+            p.workspace_id = "ws-test".to_string();
+            p.workflow_run_id = Some("wf_r5_spawn".to_string());
+            p.workflow_role = Some("worker".to_string());
+            let pending =
+                crate::session::PendingSession::spawn(p).expect("spawn ok");
+            let session = pending.arm_reaper(None).expect("arm ok");
+            {
+                let mut s = state.lock().unwrap();
+                s.sessions.insert("ts-daemon-worker".to_string(), session);
+            }
+
+            // Active role on the seeded run is "worker"; caller
+            // is bound to "worker". Auth must allow.
+            let resp = workflow_transition(
+                &state,
+                &Caller::session("ts-daemon-worker"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "go",
+                    "run_id": "wf_r5_spawn",
+                    "role": "worker",
+                }),
+            )
+            .expect("daemon-attached workflow participant must pass auth");
+            assert_eq!(resp["ok"], json!(true));
+        });
+    }
+
+    /// F1 round-5 (negative): a daemon-attached session with NO
+    /// workflow context still gets Unauthorized — auth must not
+    /// widen to "any daemon-owned session in the right
+    /// workspace." Defense against a non-participant daemon
+    /// session forging a transition.
+    #[test]
+    fn daemon_attached_without_workflow_context_gets_unauthorized() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r5_no_ctx", "worker");
+            // No workflow_run_id/workflow_role on the spawn —
+            // matches the regular A-n / A-s spawn shape.
+            let mut p = crate::session::SpawnParams::new(
+                "ts-daemon-nonparticipant",
+                "test-daemon-nonparticipant",
+                "/bin/sleep",
+            );
+            p.args = vec!["3".to_string()];
+            p.workspace_id = "ws-test".to_string();
+            let pending =
+                crate::session::PendingSession::spawn(p).expect("spawn ok");
+            let session = pending.arm_reaper(None).expect("arm ok");
+            {
+                let mut s = state.lock().unwrap();
+                s.sessions.insert("ts-daemon-nonparticipant".to_string(), session);
+            }
+
+            let err = workflow_transition(
+                &state,
+                &Caller::session("ts-daemon-nonparticipant"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "forged",
+                    "run_id": "wf_r5_no_ctx",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("non-participant daemon session must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+        });
+    }
+
+    /// F1 round-5: `session.set_workflow_context` updates a
+    /// daemon-owned session's workflow context, after which the
+    /// auth check passes. This is the after-the-fact tagging
+    /// path used by `launch_workflow` for Existing-slot bindings
+    /// on daemon-attached sessions (the typical worker shape).
+    #[test]
+    fn set_workflow_context_then_workflow_transition_passes_auth() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r5_setctx", "worker");
+            // Spawn WITHOUT workflow context (simulates an
+            // already-spawned A-s daemon session pre-launch).
+            let mut p = crate::session::SpawnParams::new(
+                "ts-existing",
+                "test-existing",
+                "/bin/sleep",
+            );
+            p.args = vec!["3".to_string()];
+            p.workspace_id = "ws-test".to_string();
+            let pending =
+                crate::session::PendingSession::spawn(p).expect("spawn ok");
+            let session = pending.arm_reaper(None).expect("arm ok");
+            {
+                let mut s = state.lock().unwrap();
+                s.sessions.insert("ts-existing".to_string(), session);
+            }
+
+            // Pre-set: auth fails.
+            let pre = workflow_transition(
+                &state,
+                &Caller::session("ts-existing"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_r5_setctx",
+                    "role": "worker",
+                }),
+            );
+            assert!(pre.is_err(), "pre-set must reject");
+            assert_eq!(pre.unwrap_err().0, ErrorCode::Unauthorized);
+
+            // Apply set_workflow_context.
+            let ok = set_workflow_context(
+                &state,
+                &json!({
+                    "uid": "ts-existing",
+                    "workflow_run_id": "wf_r5_setctx",
+                    "workflow_role": "worker",
+                }),
+            )
+            .expect("set_workflow_context ok");
+            assert_eq!(ok["ok"], json!(true));
+            assert_eq!(ok["daemon_owned"], json!(true));
+
+            // Post-set: auth passes.
+            let post = workflow_transition(
+                &state,
+                &Caller::session("ts-existing"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_r5_setctx",
+                    "role": "worker",
+                }),
+            )
+            .expect("post-set must pass auth");
+            assert_eq!(post["ok"], json!(true));
+        });
+    }
+
+    /// F1 round-5: `set_workflow_context` on an unknown uid
+    /// returns success with `daemon_owned: false` — TUI calls
+    /// this helper for every workflow participant; a TUI-local
+    /// session legitimately isn't in `state.sessions`.
+    #[test]
+    fn set_workflow_context_returns_daemon_owned_false_for_unknown_uid() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let resp = set_workflow_context(
+                &state,
+                &json!({
+                    "uid": "ts-not-in-daemon",
+                    "workflow_run_id": "wf_x",
+                    "workflow_role": "worker",
+                }),
+            )
+            .expect("unknown uid no-ops");
+            assert_eq!(resp["daemon_owned"], json!(false));
+        });
+    }
+
+    /// F1 round-5: half-tagged updates are rejected. Caller-bug
+    /// defense — silently storing a session with run_id set but
+    /// role None (or vice versa) would surface later as a
+    /// confusing Unauthorized.
+    #[test]
+    fn set_workflow_context_rejects_half_tagged() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = set_workflow_context(
+                &state,
+                &json!({
+                    "uid": "any",
+                    "workflow_run_id": "wf",
+                    "workflow_role": null,
+                }),
+            )
+            .expect_err("half-tagged must reject");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    /// Round-6 (F2): `workflow_done` analog of the rollback +
+    /// caller-retry test. After a state-advanced/event-missing
+    /// failure, state rolls back to Running; retry re-runs the
+    /// full mutation; the retry's `reason` IS the one that
+    /// lands (since the first call rolled back, the second call
+    /// is the only committed mutation).
+    #[test]
+    fn workflow_done_caller_retry_after_rollback_succeeds_with_retry_reason() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_done_retry_r6", "manager");
+            let dir = crate::workflow::run::run_dir("wf_done_retry_r6");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path =
+                crate::workflow::run::events_path("wf_done_retry_r6");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            // Stage 1: blocked event write; rollback fires.
+            let err = workflow_done(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "reason": "first",
+                    "run_id": "wf_done_retry_r6",
+                    "role": "manager",
+                }),
+            )
+            .expect_err("first call: event write must fail");
+            assert_eq!(err.0, ErrorCode::Internal);
+            // Rolled back to Running, no done_reason.
+            let mid =
+                crate::workflow::run::load_one("wf_done_retry_r6").unwrap();
+            assert!(
+                matches!(mid.status, crate::workflow::run::RunStatus::Running),
+                "round-6: status rolled back to Running, got {:?}",
+                mid.status,
+            );
+            assert!(
+                mid.done_reason.is_none(),
+                "round-6: done_reason rolled back to None, got {:?}",
+                mid.done_reason,
+            );
+
+            // Stage 2: heal disk, retry with NEW reason.
+            std::fs::remove_dir(&events_path).expect("remove dir");
+            let ok = workflow_done(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "reason": "second",
+                    "run_id": "wf_done_retry_r6",
+                    "role": "manager",
+                }),
+            )
+            .expect("retry must succeed after rollback");
+            assert_eq!(ok["ok"], json!(true));
+
+            let post =
+                crate::workflow::run::load_one("wf_done_retry_r6").unwrap();
+            // Retry's reason is the one that committed (because
+            // the first call rolled back).
+            assert_eq!(
+                post.done_reason.as_deref(),
+                Some("second"),
+                "round-6: retry reason commits (first rolled back)",
+            );
+            let (events, _) =
+                crate::workflow::events::read_new("wf_done_retry_r6", 0);
+            assert_eq!(events.len(), 1, "exactly one event after the retry");
         });
     }
 }

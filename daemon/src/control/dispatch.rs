@@ -225,6 +225,14 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_set_transcript_path(state, req))
         }
 
+        // 10d-2c-1 review round-5 (F1): after-the-fact tagging
+        // of an already-spawned daemon session with workflow
+        // context. Operator-only — a Session caller doing this
+        // could declare itself a participant of any run.
+        "session.set_workflow_context" => {
+            DispatchOutcome::Done(dispatch_set_workflow_context(state, req))
+        }
+
         // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
         // to the planning API. Both Operator and Session callers
         // allowed (any agent can propose; project owner reviews
@@ -402,7 +410,7 @@ fn dispatch_workflow_transition(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    match methods::workflow_transition(state, &req.params) {
+    match methods::workflow_transition(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -414,7 +422,7 @@ fn dispatch_workflow_done(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    match methods::workflow_done(state, &req.params) {
+    match methods::workflow_done(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -439,6 +447,32 @@ fn dispatch_set_transcript_path(
         );
     }
     match methods::set_transcript_path(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.set_workflow_context` — TUI pushes workflow context
+/// onto an already-spawned daemon session (round-5 F1). Operator-
+/// only: a Session caller could otherwise grant itself
+/// participation in an arbitrary workflow run and forge
+/// transitions. See `methods::set_workflow_context` for the
+/// shape + idempotency contract.
+fn dispatch_set_workflow_context(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if matches!(req.caller, Caller::Session(_)) {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "session.set_workflow_context is Operator-callable only — \
+             a Session caller setting this could declare itself a \
+             participant of an arbitrary workflow and forge \
+             workflow_transition / workflow_done calls",
+        );
+    }
+    match methods::set_workflow_context(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -6151,6 +6185,63 @@ mod tests {
         tmp
     }
 
+    /// 10d-2c-1 helper: seed a minimal-but-valid `state.json` on
+    /// disk so the daemon's load-modify-write under flock has
+    /// something to load. Seeds feedback-shaped roles (worker,
+    /// reviewer, manager) so any transition between them passes
+    /// the round-1 F3 target-role validation.
+    fn seed_workflow_run_dispatch(run_id: &str, initial_role: &str) {
+        use std::collections::BTreeMap;
+        let mut role_sessions = BTreeMap::new();
+        for role in ["worker", "reviewer", "manager"] {
+            role_sessions.insert(
+                role.to_string(),
+                crate::workflow::run::RoleBinding {
+                    session_label: role.to_string(),
+                    current_session_id: None,
+                },
+            );
+        }
+        let run = crate::workflow::run::WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".to_string(),
+            "/tmp/seed-task-key".to_string(),
+            role_sessions,
+            initial_role.to_string(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        crate::workflow::run::save(&run).expect("seed save ok");
+    }
+
+    /// 10d-2c-1 review round-1 helper: register a Session-caller
+    /// uid in `state.tui_sessions` so the auth check in
+    /// `workflow_transition` / `workflow_done` sees it as a
+    /// workflow participant. Used by dispatch tests that call as
+    /// Session caller. Mirrors what the TUI's 10d-1
+    /// `tui.update_sessions_snapshot` push would land at runtime.
+    fn register_session_as_participant(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        run_id: &str,
+        role: &str,
+    ) {
+        let mut s = state.lock().unwrap();
+        s.tui_sessions.insert(
+            uid.to_string(),
+            crate::state::TuiSessionSnapshot {
+                uid: uid.to_string(),
+                task_id: None,
+                label: Some(role.to_string()),
+                session_type: Some("claude-code".to_string()),
+                hidden: false,
+                workflow_run_id: Some(run_id.to_string()),
+                workflow_role: Some(role.to_string()),
+            },
+        );
+    }
+
     /// 10d-2b: dispatch arm for `workflow_transition` accepts a
     /// Session caller and writes the event. This is the
     /// daemon-spawned-agent path (Session caller arises from
@@ -6159,6 +6250,17 @@ mod tests {
     fn dispatch_workflow_transition_session_caller_writes_event() {
         let _tmp = with_temp_home_dispatch(|| {
             let state = make_state();
+            seed_workflow_run_dispatch("wf_dispatch_session", "worker");
+            // 10d-2c-1 review round-1 P1 #3: Session caller must
+            // be registered as the active-role's participant via
+            // the TUI's tui_sessions snapshot. Without this, the
+            // auth check rejects with Unauthorized.
+            register_session_as_participant(
+                &state,
+                "ts-session-1",
+                "wf_dispatch_session",
+                "worker",
+            );
             let req = session_request(
                 "workflow_transition",
                 serde_json::json!({
@@ -6192,6 +6294,7 @@ mod tests {
     fn dispatch_workflow_transition_operator_caller_writes_event() {
         let _tmp = with_temp_home_dispatch(|| {
             let state = make_state();
+            seed_workflow_run_dispatch("wf_dispatch_op", "worker");
             let req = operator_request(
                 "workflow_transition",
                 serde_json::json!({
@@ -6215,6 +6318,13 @@ mod tests {
     fn dispatch_workflow_done_session_caller_writes_event() {
         let _tmp = with_temp_home_dispatch(|| {
             let state = make_state();
+            seed_workflow_run_dispatch("wf_done_dispatch", "manager");
+            register_session_as_participant(
+                &state,
+                "ts-manager-1",
+                "wf_done_dispatch",
+                "manager",
+            );
             let req = session_request(
                 "workflow_done",
                 serde_json::json!({
@@ -6254,6 +6364,155 @@ mod tests {
             assert!(!resp.ok, "missing required field must error");
             let err = resp.error.expect("error");
             assert_eq!(err.code, ErrorCode::InvalidParams);
+        });
+    }
+
+    /// 10d-2c-1 review round-1 P1 #3: a Session caller from a
+    /// non-participant uid is rejected with `Unauthorized`. The
+    /// state.json is NOT mutated. Error message names the
+    /// run_id but does NOT leak the active role.
+    #[test]
+    fn dispatch_workflow_transition_non_participant_session_unauthorized() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            seed_workflow_run_dispatch("wf_unauth", "worker");
+            // Register the caller as a participant of a
+            // DIFFERENT run — same uid would still fail because
+            // the run_id mismatches.
+            register_session_as_participant(
+                &state,
+                "ts-imposter",
+                "wf_different_run",
+                "worker",
+            );
+            let pre = crate::workflow::run::load_one("wf_unauth").expect("seed");
+            let pre_active = pre.active_role.clone();
+            let pre_iteration = pre.iteration;
+
+            let req = session_request(
+                "workflow_transition",
+                serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_unauth",
+                    "role": "worker",
+                }),
+                "ts-imposter",
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(!resp.ok);
+            let err = resp.error.expect("error");
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert!(
+                err.message.contains("wf_unauth"),
+                "msg names run_id: {}",
+                err.message,
+            );
+            assert!(
+                !err.message.contains("worker") && !err.message.contains("reviewer"),
+                "msg must NOT leak active role: {}",
+                err.message,
+            );
+
+            // State.json unchanged.
+            let post = crate::workflow::run::load_one("wf_unauth").expect("present");
+            assert_eq!(post.active_role, pre_active);
+            assert_eq!(post.iteration, pre_iteration);
+        });
+    }
+
+    /// 10d-2c-1 review round-1 P1 #3: a Session caller from the
+    /// CORRECT participant uid succeeds. Pin the positive case
+    /// so we don't accidentally false-negative authorized
+    /// callers.
+    #[test]
+    fn dispatch_workflow_transition_correct_participant_session_succeeds() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            seed_workflow_run_dispatch("wf_auth_ok", "worker");
+            register_session_as_participant(
+                &state,
+                "ts-worker",
+                "wf_auth_ok",
+                "worker",
+            );
+            let req = session_request(
+                "workflow_transition",
+                serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "go",
+                    "run_id": "wf_auth_ok",
+                    "role": "worker",
+                }),
+                "ts-worker",
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(resp.ok, "matching participant must succeed: {:?}", resp.error);
+            let post = crate::workflow::run::load_one("wf_auth_ok").expect("present");
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+        });
+    }
+
+    /// 10d-2c-1 review round-1 P1 #1/#2: daemon-source events
+    /// land in events.jsonl with `source: "daemon"` so the TUI
+    /// tail observer knows the state mutation is already done
+    /// and shouldn't be re-applied. Pin the on-wire shape.
+    #[test]
+    fn dispatch_workflow_transition_sets_source_daemon() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            seed_workflow_run_dispatch("wf_source_tag", "worker");
+            let req = operator_request(
+                "workflow_transition",
+                serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "run_id": "wf_source_tag",
+                    "role": "worker",
+                }),
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(resp.ok);
+
+            let (events, _) =
+                crate::workflow::events::read_new("wf_source_tag", 0);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].source, "daemon",
+                "daemon-routed events MUST carry source='daemon'",
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-1 P1 #3: same auth shape for
+    /// `workflow_done` — non-participant rejected, state
+    /// unchanged.
+    #[test]
+    fn dispatch_workflow_done_non_participant_session_unauthorized() {
+        let _tmp = with_temp_home_dispatch(|| {
+            let state = make_state();
+            seed_workflow_run_dispatch("wf_done_unauth", "manager");
+            register_session_as_participant(
+                &state,
+                "ts-imposter",
+                "wf_other_run",
+                "manager",
+            );
+            let req = session_request(
+                "workflow_done",
+                serde_json::json!({
+                    "reason": "x",
+                    "run_id": "wf_done_unauth",
+                    "role": "manager",
+                }),
+                "ts-imposter",
+            );
+            let resp = dispatch_request(&state, &req).into_response();
+            assert!(!resp.ok);
+            assert_eq!(resp.error.unwrap().code, ErrorCode::Unauthorized);
+            let post =
+                crate::workflow::run::load_one("wf_done_unauth").expect("present");
+            assert!(matches!(post.status, crate::workflow::run::RunStatus::Running));
         });
     }
 }

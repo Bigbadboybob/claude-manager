@@ -48,6 +48,15 @@ def _append_event(tool: str, args: dict) -> dict:
         "role": role,
         "tool": tool,
         "args": args,
+        # 10d-2c-1 review round-1 (P1 #1/#2): tag events written
+        # through the file-write path (TUI-local SpawnTarget) so
+        # the TUI tail observer knows state has NOT been mutated
+        # by the daemon — it must still call
+        # fire_transition / finish_run locally to apply the state
+        # change. Daemon-routed events get `source: "daemon"`
+        # (set by daemon's workflow_transition / workflow_done
+        # handlers).
+        "source": "tui-mcp",
     }
     # Append atomically: open with O_APPEND, write one line.
     events_path = run_dir / "events.jsonl"

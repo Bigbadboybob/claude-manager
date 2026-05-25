@@ -241,6 +241,85 @@ impl WorkflowRun {
             .map(|h| h.assistant_count_at_start)
     }
 
+    /// 10d-2c-1 review round-1 Option A: append a history entry
+    /// for the currently-active role using the caller-supplied
+    /// `assistant_count_at_start`. The TUI tail observer calls
+    /// this after observing a daemon-source dynamic event — the
+    /// daemon's mutation set `active_role` + bumped `iteration`
+    /// + closed the outgoing role, but DEFERRED the history
+    /// append because only the TUI has transcript-tail
+    /// visibility for `assistant_count_at_start`. Without that
+    /// deferred patch, the on_idle gate would fire prematurely
+    /// (start_count=0 means "any prior assistant turn looks new").
+    ///
+    /// Returns `true` if an entry was appended, `false` if no-op
+    /// (active_role is None, OR a matching entry already exists
+    /// for the current iteration — idempotency guard against the
+    /// TUI tail observing the same daemon event twice across a
+    /// crash-recovery re-read).
+    /// 10d-2c-1 review round-14: history entry's role comes
+    /// from the EVENT (the daemon-routed Decision threads in
+    /// the event's `to` field as `target_role`), NOT from the
+    /// run's current `active_role`. Pre-r14 the function read
+    /// `self.active_role` — if multiple daemon transitions
+    /// queued before TUI processed any of them, every queued
+    /// event would see the LATEST `active_role` on state.json
+    /// and append history entries for the wrong role (or
+    /// silently drop when active_role was None, e.g. after a
+    /// daemon `workflow_done`).
+    ///
+    /// 10d-2c-1 review round-15: history entry's `iteration`
+    /// also comes from the EVENT (via the daemon's
+    /// post-mutation capture). Pre-r15 the function used
+    /// `self.iteration` — same multi-event-queue race surfaced
+    /// the LATEST iteration on every queued event's history
+    /// entry. `event_iteration == 0` is the pre-r15 backward-
+    /// compat sentinel; caller falls back to `self.iteration`
+    /// in that case.
+    ///
+    /// `target_role` is the role being activated by this
+    /// specific event — `workflow_transition`'s `to` param.
+    /// `workflow_done` events don't call this; the run-done
+    /// state is captured via `status: Done`, not via a
+    /// history entry.
+    pub fn append_history_entry_for_event_target_role(
+        &mut self,
+        target_role: &str,
+        event_iteration: u32,
+        trigger: TriggerKind,
+        assistant_count_at_start: usize,
+    ) -> bool {
+        // Round-15: prefer the event's iteration. Fall back
+        // to `self.iteration` for pre-r15 on-disk events
+        // (where the field deserialized to 0 via serde
+        // default).
+        let entry_iteration = if event_iteration > 0 {
+            event_iteration
+        } else {
+            self.iteration
+        };
+        if let Some(last) = self.history.last() {
+            if last.role == target_role && last.iteration == entry_iteration {
+                return false;
+            }
+        }
+        let session_id = self
+            .role_sessions
+            .get(target_role)
+            .and_then(|b| b.current_session_id.clone());
+        self.history.push(HistoryEntry {
+            iteration: entry_iteration,
+            role: target_role.to_string(),
+            session_id,
+            last_message: None,
+            activated_at: now_unix(),
+            deactivated_at: None,
+            trigger,
+            assistant_count_at_start,
+        });
+        true
+    }
+
     pub fn mark_done(&mut self, reason: String) {
         self.close_active_role(None);
         self.active_role = None;
@@ -326,10 +405,70 @@ impl std::fmt::Display for PersistError {
     }
 }
 
+/// 10d-2c-1 review round-3 (F2): containment-safe `run_id`
+/// validation. Reject anything that could escape the
+/// `~/.cm/workflow-runs/` directory via path-traversal (`/`,
+/// `..`, `.`) or otherwise confuse the filesystem (null bytes,
+/// empty, oversize). The codebase produces run_ids in two
+/// shapes today — `wf_<base36>` from `run::new_run_id` and hex
+/// UUIDs from MCP's `uuid.uuid4().hex` — both fit the
+/// conservative `[A-Za-z0-9_-]` allowlist used here.
+///
+/// EVERY filesystem-touching entry point in this module
+/// (`save`, `load_one`, `modify`, `try_modify`) and in
+/// `events::WorkflowEventsWriter::append_event` validates via
+/// this single helper, so a future caller that constructs a
+/// path from an untrusted run_id can't bypass validation. The
+/// helper is also called defensively by daemon handlers
+/// (`workflow_transition`, `workflow_done`) at the top — same
+/// fail-loudly invariant, two layers deep.
+pub fn validate_run_id(id: &str) -> io::Result<()> {
+    const MAX_LEN: usize = 128;
+    if id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "run_id is empty",
+        ));
+    }
+    if id.len() > MAX_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("run_id too long: {} > {}", id.len(), MAX_LEN),
+        ));
+    }
+    if id == "." || id == ".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("run_id is a path-traversal token: {:?}", id),
+        ));
+    }
+    for c in id.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("disallowed character in run_id {:?}: {:?}", id, c),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Save atomically: write to state.json.tmp then rename.
+///
+/// 10d-2c-1: write happens under an exclusive `flock(2)` on
+/// a dedicated lock file (`state.json.lock`) so concurrent
+/// readers/writers across processes (TUI's `tick()` persisting
+/// `events_offset` vs. daemon's `workflow_transition` mutating
+/// state) serialize cleanly. The lock is on a SEPARATE file
+/// from `state.json` itself because the atomic rename used here
+/// would unlink the original — invalidating any flock held on
+/// it. The `.lock` file is a sentinel; only its inode matters.
 pub fn save(run: &WorkflowRun) -> Result<(), PersistError> {
+    // F2: validate BEFORE any path construction.
+    validate_run_id(&run.run_id)?;
     let dir = run_dir(&run.run_id);
     fs::create_dir_all(&dir)?;
+    let _guard = LockGuard::exclusive(&dir)?;
     let tmp = dir.join("state.json.tmp");
     let final_path = dir.join("state.json");
     let json = serde_json::to_string_pretty(run)?;
@@ -342,10 +481,168 @@ pub fn save(run: &WorkflowRun) -> Result<(), PersistError> {
 /// missing or can't be parsed. Used by the MCP read tools to surface
 /// runs that have been pruned from `app.workflow_runs` (e.g. after
 /// `stop_workflow_run`) but whose state.json is intact on disk.
+///
+/// 10d-2c-1: read happens under a shared `flock(2)` on
+/// `state.json.lock` so a concurrent `save` doesn't tear our
+/// view. (Atomic rename in `save` already makes torn reads
+/// impossible at the byte level, but the shared lock is
+/// defense-in-depth for the read-modify-write window that
+/// [`modify`] uses.)
 pub fn load_one(run_id: &str) -> Option<WorkflowRun> {
-    let path = run_dir(run_id).join("state.json");
+    // F2: validate BEFORE any path construction.
+    validate_run_id(run_id).ok()?;
+    let dir = run_dir(run_id);
+    let _guard = LockGuard::shared(&dir).ok()?;
+    let path = dir.join("state.json");
     let contents = fs::read_to_string(&path).ok()?;
     serde_json::from_str::<WorkflowRun>(&contents).ok()
+}
+
+/// 10d-2c-1: atomic load-modify-write under exclusive
+/// `flock(2)`. The closure receives a `&mut WorkflowRun`
+/// loaded from disk; on closure return, the run is saved back
+/// under the SAME lock the load took. This is the right shape
+/// for the daemon's `workflow_transition` /
+/// `workflow_done` handlers — they need to mutate state
+/// without racing the TUI's concurrent saves (e.g. of
+/// `events_offset`).
+///
+/// Returns the post-mutation `WorkflowRun` on success.
+pub fn modify<F>(run_id: &str, mutate: F) -> Result<WorkflowRun, PersistError>
+where
+    F: FnOnce(&mut WorkflowRun),
+{
+    // F2: validate BEFORE any path construction.
+    validate_run_id(run_id)?;
+    let dir = run_dir(run_id);
+    fs::create_dir_all(&dir)?;
+    let _guard = LockGuard::exclusive(&dir)?;
+    let path = dir.join("state.json");
+    let contents = fs::read_to_string(&path)?;
+    let mut run: WorkflowRun = serde_json::from_str(&contents)?;
+    mutate(&mut run);
+    let tmp = dir.join("state.json.tmp");
+    let json = serde_json::to_string_pretty(&run)?;
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)?;
+    Ok(run)
+}
+
+/// 10d-2c-1 review round-1 (P1 #3): fallible variant of
+/// [`modify`]. Closure returns `Result<(), E>`; on `Err(e)`,
+/// the save is skipped and the original (unmutated) `Err(e)`
+/// surfaces to the caller. Used by `workflow_transition` /
+/// `workflow_done` for the **inside-flock auth check**: the
+/// closure runs under the exclusive lock, sees the
+/// authoritative `run.active_role`, and either applies the
+/// state mutation or aborts with an auth-error tuple — no
+/// TOCTOU between the auth decision and the mutation.
+pub enum TryModifyOutcome<E> {
+    /// Closure ran to `Ok(())`; mutation saved.
+    Ok(WorkflowRun),
+    /// Closure returned `Err(e)`; mutation rolled back (no
+    /// save).
+    Aborted(E),
+    /// Filesystem error during load / save / lock.
+    Persist(PersistError),
+}
+
+pub fn try_modify<F, E>(run_id: &str, mutate: F) -> TryModifyOutcome<E>
+where
+    F: FnOnce(&mut WorkflowRun) -> Result<(), E>,
+{
+    // F2: validate BEFORE any path construction. A malformed
+    // run_id surfaces as `Persist(InvalidInput)` — handlers
+    // translate to InvalidParams.
+    if let Err(e) = validate_run_id(run_id) {
+        return TryModifyOutcome::Persist(PersistError::Io(e));
+    }
+    let dir = run_dir(run_id);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return TryModifyOutcome::Persist(PersistError::Io(e));
+    }
+    let _guard = match LockGuard::exclusive(&dir) {
+        Ok(g) => g,
+        Err(e) => return TryModifyOutcome::Persist(PersistError::Io(e)),
+    };
+    let path = dir.join("state.json");
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return TryModifyOutcome::Persist(PersistError::Io(e)),
+    };
+    let mut run: WorkflowRun = match serde_json::from_str(&contents) {
+        Ok(r) => r,
+        Err(e) => return TryModifyOutcome::Persist(PersistError::Json(e)),
+    };
+    if let Err(e) = mutate(&mut run) {
+        return TryModifyOutcome::Aborted(e);
+    }
+    let tmp = dir.join("state.json.tmp");
+    let json = match serde_json::to_string_pretty(&run) {
+        Ok(s) => s,
+        Err(e) => return TryModifyOutcome::Persist(PersistError::Json(e)),
+    };
+    if let Err(e) = fs::write(&tmp, json) {
+        return TryModifyOutcome::Persist(PersistError::Io(e));
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        return TryModifyOutcome::Persist(PersistError::Io(e));
+    }
+    TryModifyOutcome::Ok(run)
+}
+
+/// RAII guard around `flock(2)` on `<run_dir>/state.json.lock`.
+/// Created via [`LockGuard::exclusive`] / [`LockGuard::shared`];
+/// drop releases the lock. The lock file is created if missing.
+///
+/// Why a sentinel `.lock` file instead of locking `state.json`
+/// directly: `save` uses atomic rename, which unlinks the
+/// original file — invalidating any open fd's lock on it. The
+/// sentinel survives renames.
+struct LockGuard {
+    _file: fs::File,
+}
+
+impl LockGuard {
+    fn exclusive(dir: &std::path::Path) -> Result<Self, std::io::Error> {
+        Self::acquire(dir, libc::LOCK_EX)
+    }
+
+    fn shared(dir: &std::path::Path) -> Result<Self, std::io::Error> {
+        Self::acquire(dir, libc::LOCK_SH)
+    }
+
+    fn acquire(dir: &std::path::Path, op: libc::c_int) -> Result<Self, std::io::Error> {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = dir.join("state.json.lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        // `flock` blocks until the requested mode is available.
+        // Phase-1 workflows have low contention (per-run mutex
+        // upstream serializes daemon-side calls; TUI's `tick()`
+        // is single-threaded), so blocking is fine.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(LockGuard { _file: file })
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // Best-effort unlock; on close `flock` is released by the
+        // kernel anyway, so an explicit LOCK_UN is belt-and-
+        // suspenders for the case where the fd lives in a
+        // FileGuard wrapper that doesn't close it on drop. The
+        // `_file` field of this struct DOES drop here.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Load all persisted runs. Invalid/unreadable state.json files are skipped.

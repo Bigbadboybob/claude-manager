@@ -450,6 +450,19 @@ pub struct SpawnParams {
     pub memory_cap_soft_bytes: Option<u64>,
     pub memory_cap_hard_bytes: Option<u64>,
     pub cgroup_prefix: Option<PathBuf>,
+    /// 10d-2c-1 review round-5 (F1): workflow run id this session
+    /// is a participant of, when the spawn happens with workflow
+    /// context already known. `None` for non-workflow spawns.
+    /// Surfaced via `lookup_session_any` so the auth check in
+    /// `workflow_transition` / `workflow_done` recognizes daemon-
+    /// attached workflow participants. After-the-fact tagging
+    /// (workflow launched on an already-spawned daemon session)
+    /// uses the `session.set_workflow_context` RPC; same field,
+    /// different write path.
+    pub workflow_run_id: Option<String>,
+    /// Role name this session is bound to within the workflow run.
+    /// See [`workflow_run_id`](Self::workflow_run_id).
+    pub workflow_role: Option<String>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -537,6 +550,9 @@ impl SpawnParams {
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
+            // 10d-2c-1 review round-5 (F1): non-workflow default.
+            workflow_run_id: None,
+            workflow_role: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -824,6 +840,29 @@ pub struct DaemonSession {
     pub memory_cap_soft_bytes: Option<u64>,
     pub memory_cap_hard_bytes: Option<u64>,
     pub cgroup_prefix: Option<PathBuf>,
+    /// 10d-2c-1 review round-5 (F1): workflow context for the
+    /// auth check on `workflow_transition` / `workflow_done`.
+    /// Populated at spawn from
+    /// `StartSessionParams.workflow_run_id` / `.workflow_role`
+    /// when the workflow is known up front, OR via the
+    /// `session.set_workflow_context` RPC after-the-fact when
+    /// the TUI launches a workflow on an already-spawned
+    /// daemon-attached session (the Existing-slot path in
+    /// `controller::launch_workflow`).
+    ///
+    /// `None` for non-workflow sessions — the auth check then
+    /// rejects them, which is correct: a daemon-attached
+    /// session not bound to a workflow has no business forging
+    /// transitions.
+    ///
+    /// **Authority** for daemon-attached sessions lives HERE,
+    /// not in `tui_sessions`. The round-3 filter excluded
+    /// daemon-attached sessions from the TUI's pushed snapshot
+    /// to avoid duplication; this field is the canonical source
+    /// for daemon-owned sessions' workflow context. See
+    /// `state::lookup_session_any`.
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
     /// Sub-2b-1 review-r#2 #2: transcript generation counter.
     /// Initialized to 0; incremented by `session.set_transcript_path`
     /// when the incoming path differs from `transcript_path`
@@ -1010,6 +1049,10 @@ struct PendingSessionInner {
     memory_cap_soft_bytes: Option<u64>,
     memory_cap_hard_bytes: Option<u64>,
     cgroup_prefix: Option<PathBuf>,
+    /// 10d-2c-1 review round-5 (F1): carried through from
+    /// SpawnParams onto the final DaemonSession.
+    workflow_run_id: Option<String>,
+    workflow_role: Option<String>,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
     /// from `PendingSession::spawn` → `arm_reaper` →
     /// `DaemonSession`. The fanout already holds an Arc clone
@@ -1264,6 +1307,10 @@ impl PendingSession {
                 memory_cap_soft_bytes: params.memory_cap_soft_bytes,
                 memory_cap_hard_bytes: params.memory_cap_hard_bytes,
                 cgroup_prefix: params.cgroup_prefix,
+                // 10d-2c-1 review round-5 (F1): workflow context
+                // carried through to the final DaemonSession.
+                workflow_run_id: params.workflow_run_id,
+                workflow_role: params.workflow_role,
                 last_activity_at,
                 title: params.title,
                 fanout,
@@ -1316,6 +1363,8 @@ impl PendingSession {
             memory_cap_soft_bytes,
             memory_cap_hard_bytes,
             cgroup_prefix,
+            workflow_run_id,
+            workflow_role,
             last_activity_at,
             title,
             fanout,
@@ -1391,6 +1440,11 @@ impl PendingSession {
             memory_cap_soft_bytes,
             memory_cap_hard_bytes,
             cgroup_prefix,
+            // 10d-2c-1 review round-5 (F1): workflow context lands
+            // on the final DaemonSession; auth via
+            // `lookup_session_any` reads it from here.
+            workflow_run_id,
+            workflow_role,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
             // path-change. Subscribed-from-spawn callers
