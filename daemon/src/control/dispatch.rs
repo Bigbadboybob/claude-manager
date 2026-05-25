@@ -262,6 +262,17 @@ pub fn dispatch_request(
         }
         "workflow_done" => DispatchOutcome::Done(dispatch_workflow_done(state, req)),
 
+        // 10d-2c-3a: read-only workflow query methods relocated
+        // from TUI socket. Session-callable AND Operator-
+        // callable; Operator bypasses auth, Session callers
+        // pass through the descendant-task scope filter.
+        "get_workflow_state" => {
+            DispatchOutcome::Done(dispatch_get_workflow_state(state, req))
+        }
+        "list_workflows" => {
+            DispatchOutcome::Done(dispatch_list_workflows(state, req))
+        }
+
         // Sub-2b-3: `mcp_start_session` — Python MCP tool's
         // minimal-shape entry point. Daemon resolves
         // workspace_id / working_dir / argv from caller context
@@ -431,6 +442,33 @@ fn dispatch_workflow_done(
     req: &Request,
 ) -> Response {
     match methods::workflow_done(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// 10d-2c-3a: `get_workflow_state` — read-only workflow query.
+/// Both Operator and Session callers; Operator bypasses auth,
+/// Session callers must be in the run's bound-task descendant
+/// scope (matches TUI's `workflow_run_authorized`).
+fn dispatch_get_workflow_state(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::get_workflow_state(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// 10d-2c-3a: `list_workflows` — read-only workflow query with
+/// optional `task_id` scope. Same caller policy as
+/// `get_workflow_state`.
+fn dispatch_list_workflows(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::list_workflows(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

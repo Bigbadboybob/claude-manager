@@ -2140,6 +2140,383 @@ pub fn workflow_update_definitions(
 }
 
 // ============================================================
+// 10d-2c-3a: list_workflows + get_workflow_state
+// ============================================================
+//
+// Relocates the two READ-ONLY workflow query methods to daemon
+// dispatch. Pre-3a these routed to the TUI socket; agents
+// querying workflow state had to roundtrip through the TUI
+// process (no value-add — the TUI just read disk and applied
+// the same auth check).
+//
+// Daemon-side reads disk directly via
+// `workflow::run::load_all()` / `load_one()`. The TUI's
+// pre-3a "in-memory app.workflow_runs first, disk fallback"
+// pattern was a TUI reactive-UI optimization; the daemon
+// doesn't have an equivalent reactive cache (the
+// `state.workflow_runs` map is non-authoritative — the
+// 2c-2-2-b round-2 reviewer-fix made the poller read disk
+// for the same reason).
+//
+// **Intentional divergence from TUI** (documented for the
+// audit trail):
+//
+// 1. Daemon reads disk only; no in-memory short-circuit.
+//    TUI's optimization was App-bound; daemon's authoritative
+//    state lives on disk.
+//
+// 2. Daemon's `lookup_session_any` does NOT fall through to
+//    tombstones. TUI's `caller_ctx_or_tombstone` accepts
+//    recently-closed sessions. Tombstones live in the TUI's
+//    manifest; the daemon doesn't have a view of them.
+//    Pre-existing daemon behavior — matches the existing
+//    `workflow_transition` handler's caller-not-found
+//    rejection. An agent calling these methods after their
+//    session is tombstoned gets `NotFound` daemon-side instead
+//    of `Allow + tombstone-flag` TUI-side. Acceptable: the
+//    TUI's tombstone fallback was for race windows that don't
+//    occur for daemon-routed callers in normal flow.
+//
+// 3. For Operator callers, daemon skips the auth check
+//    (Operator is trusted by convention — same as every
+//    other daemon-side method).
+
+#[derive(serde::Deserialize, Default)]
+pub struct GetWorkflowStateParams {
+    pub run_id: String,
+}
+
+pub fn get_workflow_state(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: GetWorkflowStateParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    if p.run_id.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "get_workflow_state: 'run_id' is required".into(),
+        ));
+    }
+    // 10d-2c-3a review-r1: auth-ordering. Resolve caller FIRST,
+    // load run SECOND, authorize THIRD. Pre-fix the run-load
+    // happened before caller resolution, which:
+    //   (1) leaked run-existence to probers with bogus
+    //       session_uids via differential error messages
+    //       ("caller session not found" vs "workflow run X
+    //       not found").
+    //   (2) wasted disk + flock work on auth-failure paths.
+    //
+    // Also: for Session callers, "run doesn't exist" and "run
+    // exists but caller has no access" return the SAME error
+    // code (Unauthorized) so a probe can't distinguish run
+    // existence by error code. Operator callers see the
+    // legitimate NotFound (they're trusted).
+    let caller_view: Option<crate::state::SessionViewAny> = match caller {
+        Caller::Session(uid) => {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match state.lookup_session_any(&uid.session_uid) {
+                Some(v) => Some(v),
+                None => {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        "caller session not authorized".into(),
+                    ));
+                }
+            }
+        }
+        Caller::Operator(_) => None,
+    };
+    let run = match crate::workflow::run::load_one(&p.run_id) {
+        Some(r) => r,
+        None => {
+            return match caller {
+                Caller::Operator(_) => Err((
+                    ErrorCode::NotFound,
+                    format!("workflow run {} not found", p.run_id),
+                )),
+                Caller::Session(_) => Err((
+                    ErrorCode::Unauthorized,
+                    "workflow run is outside caller's scope".into(),
+                )),
+            };
+        }
+    };
+    if let Some(cv) = caller_view {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if !workflow_run_authorized_daemon(&cv, &state, &run) {
+            return Err((
+                ErrorCode::Unauthorized,
+                "workflow run is outside caller's scope".into(),
+            ));
+        }
+    }
+    Ok(serialize_workflow_run_full(&run))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ListWorkflowsParams {
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+pub fn list_workflows(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: ListWorkflowsParams = if params.is_null() {
+        ListWorkflowsParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?
+    };
+    // 10d-2c-3a review-r1: for Session callers, look up
+    // CallerCtx FIRST. Unknown session_uid returns
+    // Unauthorized, NOT NotFound — same as
+    // `get_workflow_state`. Returning NotFound here would
+    // let a prober distinguish "your uid is gibberish" from
+    // "no workflows visible to you" (both should be
+    // indistinguishable at the auth boundary).
+    let caller_view: Option<crate::state::SessionViewAny> =
+        if let Caller::Session(uid) = caller {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match state.lookup_session_any(&uid.session_uid) {
+                Some(v) => Some(v),
+                None => {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        "caller session not authorized".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+    // task_id scope filter — Session callers must be authorized
+    // for the requested scope. Operators skip this check.
+    if let (Some(req), Some(cv)) = (p.task_id.as_deref(), caller_view.as_ref()) {
+        match cv.task_id.as_deref() {
+            None => {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!("taskless caller cannot scope to task {}", req),
+                ));
+            }
+            Some(own) => {
+                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if !crate::control::auth::task_is_self_or_descendant_of(
+                    &state.task_tree,
+                    req,
+                    own,
+                ) {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "task {} is not the caller's task or a descendant",
+                            req
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let runs = crate::workflow::run::load_all();
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let mut out: Vec<Value> = Vec::new();
+    for run in &runs {
+        if !list_workflows_visible_daemon(
+            caller_view.as_ref(),
+            &state,
+            run,
+            p.task_id.as_deref(),
+        ) {
+            continue;
+        }
+        out.push(serialize_workflow_run_summary(run));
+    }
+    Ok(Value::Array(out))
+}
+
+/// Combined scope+auth filter for `list_workflows` entries.
+/// Operator-equivalent: `caller_view = None` always visible.
+fn list_workflows_visible_daemon(
+    caller_view: Option<&crate::state::SessionViewAny>,
+    state: &DaemonState,
+    run: &crate::workflow::run::WorkflowRun,
+    explicit_scope: Option<&str>,
+) -> bool {
+    let Some(cv) = caller_view else {
+        // Operator caller: see all (no scope filter unless
+        // explicit_scope passed, which was already validated
+        // above).
+        return match explicit_scope {
+            Some(req) => {
+                let resolved_tid = resolve_run_task_id(state, run);
+                match resolved_tid {
+                    Some(rid) => crate::control::auth::task_is_self_or_descendant_of(
+                        &state.task_tree,
+                        &rid,
+                        req,
+                    ),
+                    None => false,
+                }
+            }
+            None => true,
+        };
+    };
+    let Some(own) = cv.task_id.as_deref() else {
+        // Taskless Session caller: can't see any workflow runs
+        // (matches TUI's gate).
+        return false;
+    };
+    let resolved_tid = resolve_run_task_id(state, run);
+    let Some(rid) = resolved_tid else {
+        return false;
+    };
+    if !crate::control::auth::task_is_self_or_descendant_of(
+        &state.task_tree,
+        &rid,
+        own,
+    ) {
+        return false;
+    }
+    // If explicit_scope is set, the run's task must also be
+    // self-or-descendant of that scope.
+    if let Some(req) = explicit_scope {
+        return crate::control::auth::task_is_self_or_descendant_of(
+            &state.task_tree,
+            &rid,
+            req,
+        );
+    }
+    true
+}
+
+/// Auth check for `get_workflow_state` — same shape as TUI's
+/// `workflow_run_authorized`. Operator bypass is handled at the
+/// call site (we only call this for Session callers).
+fn workflow_run_authorized_daemon(
+    caller: &crate::state::SessionViewAny,
+    state: &DaemonState,
+    run: &crate::workflow::run::WorkflowRun,
+) -> bool {
+    let Some(own) = caller.task_id.as_deref() else {
+        return false;
+    };
+    let Some(rid) = resolve_run_task_id(state, run) else {
+        return false;
+    };
+    crate::control::auth::task_is_self_or_descendant_of(
+        &state.task_tree,
+        &rid,
+        own,
+    )
+}
+
+/// Resolve a workflow run's task_id, with the same priority
+/// order as TUI's `workflow_run_authorized`:
+///   1. `run.task_id` (set by MCP `start_workflow_run`).
+///   2. Reverse-walk `state.task_workspaces` (task_id → ws_id)
+///      to find a task bound to `run.task_key` (ws_id). Only
+///      accept if EXACTLY ONE candidate — avoids leaking
+///      across task boundaries in a workspace that hosts
+///      multiple tasks.
+fn resolve_run_task_id(
+    state: &DaemonState,
+    run: &crate::workflow::run::WorkflowRun,
+) -> Option<String> {
+    if let Some(rid) = run.task_id.as_deref() {
+        return Some(rid.to_string());
+    }
+    let candidates: Vec<&str> = state
+        .task_workspaces
+        .iter()
+        .filter(|(_, ws)| ws.as_str() == run.task_key.as_str())
+        .map(|(tid, _)| tid.as_str())
+        .collect();
+    if candidates.len() != 1 {
+        return None;
+    }
+    Some(candidates[0].to_string())
+}
+
+fn run_status_str_daemon(status: &crate::workflow::run::RunStatus) -> &'static str {
+    use crate::workflow::run::RunStatus;
+    match status {
+        RunStatus::Running => "running",
+        RunStatus::Paused => "paused",
+        RunStatus::Done => "done",
+        RunStatus::Detached => "detached",
+    }
+}
+
+fn serialize_workflow_run_summary(run: &crate::workflow::run::WorkflowRun) -> Value {
+    json!({
+        "run_id": run.run_id,
+        "name": run.workflow_name,
+        "task_id": run.task_id,
+        "workspace_id": run.task_key,
+        "active_role": run.active_role,
+        "iteration": run.iteration,
+        "paused": run.paused,
+        "status": run_status_str_daemon(&run.status),
+        "started_at": run.started_at,
+        "done_reason": run.done_reason,
+    })
+}
+
+fn serialize_workflow_run_full(run: &crate::workflow::run::WorkflowRun) -> Value {
+    let history: Vec<Value> = run
+        .history
+        .iter()
+        .map(|h| {
+            json!({
+                "iteration": h.iteration,
+                "role": h.role,
+                "transcript_id": h.session_id,
+                "last_message": h.last_message,
+                "activated_at": h.activated_at,
+                "deactivated_at": h.deactivated_at,
+                "trigger": serde_json::to_value(&h.trigger)
+                    .unwrap_or(Value::Null),
+                "assistant_count_at_start": h.assistant_count_at_start,
+            })
+        })
+        .collect();
+    let role_sessions: serde_json::Map<String, Value> = run
+        .role_sessions
+        .iter()
+        .map(|(role, binding)| {
+            (
+                role.clone(),
+                json!({
+                    "session_label": binding.session_label,
+                    "current_transcript_id": binding.current_session_id,
+                }),
+            )
+        })
+        .collect();
+    json!({
+        "run_id": run.run_id,
+        "name": run.workflow_name,
+        "task_id": run.task_id,
+        "workspace_id": run.task_key,
+        "active_role": run.active_role,
+        "iteration": run.iteration,
+        "paused": run.paused,
+        "status": run_status_str_daemon(&run.status),
+        "started_at": run.started_at,
+        "done_reason": run.done_reason,
+        "goal": run.goal,
+        "history": history,
+        "role_sessions": Value::Object(role_sessions),
+    })
+}
+
+// ============================================================
 // propose_task (sub-2b-2)
 // ============================================================
 //
@@ -7646,6 +8023,362 @@ mod tests {
                  history entry; pre-fix it would be None. Got: {:?}",
                 worker_entry.last_message,
             );
+        });
+    }
+
+    // ============================================================
+    // 10d-2c-3a — list_workflows + get_workflow_state
+    // ============================================================
+
+    /// Smoke test: `list_workflows` with no params, Operator
+    /// caller, reads disk via `load_all()`. Pre-3a this method
+    /// routed to TUI; post-3a daemon answers directly.
+    #[test]
+    fn list_workflows_operator_no_filter_returns_all_active_runs() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_lw_op_a", "worker");
+            seed_workflow_run("wf_lw_op_b", "worker");
+            let result = list_workflows(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({}),
+            )
+            .expect("ok");
+            let arr = result.as_array().expect("array");
+            // Filter to the specific runs we seeded so other
+            // tests' on-disk runs don't pollute the count under
+            // workspace parallelism (env_lock serializes the
+            // HOME setup, so this is safe).
+            let mut seen: Vec<&str> = arr
+                .iter()
+                .filter_map(|v| v["run_id"].as_str())
+                .filter(|id| id.starts_with("wf_lw_op_"))
+                .collect();
+            seen.sort();
+            assert_eq!(seen, vec!["wf_lw_op_a", "wf_lw_op_b"]);
+            // Each entry has the summary shape.
+            for v in arr.iter().filter(|v| {
+                v["run_id"]
+                    .as_str()
+                    .map(|s| s.starts_with("wf_lw_op_"))
+                    .unwrap_or(false)
+            }) {
+                assert_eq!(v["name"], "feedback");
+                assert_eq!(v["active_role"], "worker");
+                assert_eq!(v["status"], "running");
+                // Full shape's history field MUST be absent in
+                // summary.
+                assert!(
+                    v.get("history").is_none(),
+                    "summary should not include history; got {:?}",
+                    v,
+                );
+            }
+        });
+    }
+
+    /// `get_workflow_state` with Operator caller returns the
+    /// full shape (history + role_sessions). Reads disk via
+    /// `load_one()`.
+    #[test]
+    fn get_workflow_state_operator_returns_full_shape() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_gws_op", "worker");
+            let result = get_workflow_state(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_gws_op"}),
+            )
+            .expect("ok");
+            assert_eq!(result["run_id"], "wf_gws_op");
+            assert_eq!(result["name"], "feedback");
+            assert_eq!(result["active_role"], "worker");
+            assert!(result.get("history").is_some(), "full shape includes history");
+            assert!(
+                result.get("role_sessions").is_some(),
+                "full shape includes role_sessions",
+            );
+            // The seed has one initial history entry.
+            let hist = result["history"].as_array().expect("history array");
+            assert_eq!(hist.len(), 1);
+            assert_eq!(hist[0]["role"], "worker");
+        });
+    }
+
+    /// `get_workflow_state` for a missing run returns NotFound
+    /// to OPERATOR callers (trusted; can legitimately
+    /// distinguish missing-run from auth-fail). Session callers
+    /// get Unauthorized for the same input — see the
+    /// auth-ordering test below.
+    #[test]
+    fn get_workflow_state_missing_run_returns_not_found_for_operator() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = get_workflow_state(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf-does-not-exist"}),
+            )
+            .expect_err("must be NotFound");
+            assert_eq!(err.0, ErrorCode::NotFound);
+        });
+    }
+
+    /// 10d-2c-3a review-r1: auth-ordering / no-info-leak.
+    /// Session caller with bogus session_uid AND Session caller
+    /// with valid uid + nonexistent run both return Unauthorized
+    /// (NOT NotFound). A probe with a bogus uid can't
+    /// distinguish "your uid is invalid" from "the run doesn't
+    /// exist" or "the run exists but you can't see it" —
+    /// preventing existence-probing via differential errors.
+    #[test]
+    fn get_workflow_state_no_info_leak_for_session_callers() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // No run on disk for this test.
+
+            // (a) Bogus session_uid + nonexistent run → Unauthorized.
+            let err_bogus_uid = get_workflow_state(
+                &state,
+                &Caller::session("ts-bogus"),
+                &json!({"run_id": "wf-nope"}),
+            )
+            .expect_err("bogus uid must reject");
+            assert_eq!(
+                err_bogus_uid.0,
+                ErrorCode::Unauthorized,
+                "bogus session uid: must be Unauthorized (not NotFound) \
+                 — pre-fix returned NotFound which leaked nothing yet \
+                 BUT changed code from the next case below.",
+            );
+
+            // (b) Valid session_uid + nonexistent run → Unauthorized.
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-real",
+                    "x",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws".to_string();
+                sp.task_id = Some("task-a".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-real".to_string(), ds);
+                s.task_tree.insert("task-a".to_string(), None);
+            }
+            let err_real_uid = get_workflow_state(
+                &state,
+                &Caller::session("ts-real"),
+                &json!({"run_id": "wf-nope"}),
+            )
+            .expect_err("valid uid + missing run must reject");
+            assert_eq!(
+                err_real_uid.0,
+                ErrorCode::Unauthorized,
+                "valid uid + missing run must be Unauthorized \
+                 (not NotFound) so a probe can't differentiate \
+                 from case (c) below.",
+            );
+
+            // (c) Valid session_uid + run exists but caller has
+            // no access → Unauthorized (covered by the existing
+            // descendant-scope test; included here as a parity
+            // assertion that ALL THREE cases use the same code).
+            seed_workflow_run("wf_other_task", "worker");
+            crate::workflow::run::modify("wf_other_task", |r| {
+                r.task_id = Some("task-b".to_string());
+            })
+            .expect("set run.task_id");
+            // task-b not in task_tree; auth fails.
+            let err_no_access = get_workflow_state(
+                &state,
+                &Caller::session("ts-real"),
+                &json!({"run_id": "wf_other_task"}),
+            )
+            .expect_err("no-access must reject");
+            assert_eq!(
+                err_no_access.0,
+                ErrorCode::Unauthorized,
+                "valid uid + run exists + no access must match \
+                 cases (a) and (b) — single Unauthorized code \
+                 across all three to prevent existence probes.",
+            );
+
+            // All three error codes match: indistinguishable to
+            // a Session-caller probe.
+            assert_eq!(err_bogus_uid.0, err_real_uid.0);
+            assert_eq!(err_real_uid.0, err_no_access.0);
+        });
+    }
+
+    /// `list_workflows` companion: bogus session_uid →
+    /// Unauthorized (was NotFound pre-fix).
+    #[test]
+    fn list_workflows_bogus_session_uid_returns_unauthorized() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = list_workflows(
+                &state,
+                &Caller::session("ts-bogus"),
+                &json!({}),
+            )
+            .expect_err("bogus uid must reject");
+            assert_eq!(
+                err.0,
+                ErrorCode::Unauthorized,
+                "bogus session uid must be Unauthorized for \
+                 list_workflows (not NotFound). Same boundary \
+                 hygiene as get_workflow_state.",
+            );
+        });
+    }
+
+    /// `get_workflow_state` with empty run_id is InvalidParams
+    /// (matches `workflow_transition` shape).
+    #[test]
+    fn get_workflow_state_empty_run_id_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = get_workflow_state(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": ""}),
+            )
+            .expect_err("must be InvalidParams");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    /// Session caller without `task_id` (taskless) cannot see
+    /// workflow runs (matches TUI's gate via
+    /// `workflow_run_authorized`'s `caller.task_id.as_deref()`
+    /// None branch).
+    #[test]
+    fn get_workflow_state_taskless_session_caller_unauthorized() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_gws_taskless", "worker");
+            // Set up a Session caller with task_id=None.
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-taskless",
+                    "x",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws-tl".to_string();
+                // NB: task_id NOT set.
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-taskless".to_string(), ds);
+            }
+            let err = get_workflow_state(
+                &state,
+                &Caller::session("ts-taskless"),
+                &json!({"run_id": "wf_gws_taskless"}),
+            )
+            .expect_err("taskless must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+        });
+    }
+
+    /// Session caller scoped to a specific `task_id` for
+    /// `list_workflows` — when caller is in scope, see runs;
+    /// when out of scope, Unauthorized at the params level.
+    #[test]
+    fn list_workflows_session_caller_scope_rejection() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Caller bound to task-A.
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-a",
+                    "x",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws-a".to_string();
+                sp.task_id = Some("task-a".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-a".to_string(), ds);
+                // task tree: task-a is top-level.
+                s.task_tree.insert("task-a".to_string(), None);
+                s.task_tree.insert("task-b".to_string(), None);
+            }
+            // Requesting task-b's scope when caller is bound to
+            // task-a → Unauthorized.
+            let err = list_workflows(
+                &state,
+                &Caller::session("ts-a"),
+                &json!({"task_id": "task-b"}),
+            )
+            .expect_err("cross-scope must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            // Caller's own scope is fine (returns empty list since
+            // we haven't seeded any runs).
+            let ok = list_workflows(
+                &state,
+                &Caller::session("ts-a"),
+                &json!({"task_id": "task-a"}),
+            )
+            .expect("self-scope ok");
+            assert!(ok.is_array());
+        });
+    }
+
+    /// Auth filter: run with `task_id` set; Session caller
+    /// authorized for that task sees the run; unrelated Session
+    /// caller does not. Mirrors TUI's `workflow_run_authorized`
+    /// behavior for the run.task_id-set path.
+    #[test]
+    fn get_workflow_state_session_caller_descendant_scope_visible_only_to_owner() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Two callers: ts-a bound to task-a, ts-b to task-b.
+            {
+                let mut s = state.lock().unwrap();
+                for (uid, tid) in [("ts-a", "task-a"), ("ts-b", "task-b")] {
+                    let mut sp = crate::session::SpawnParams::new(
+                        uid,
+                        "x",
+                        "/bin/sleep",
+                    );
+                    sp.args = vec!["60".to_string()];
+                    sp.workspace_id = "ws".to_string();
+                    sp.task_id = Some(tid.to_string());
+                    let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                    s.sessions.insert(uid.to_string(), ds);
+                }
+                s.task_tree.insert("task-a".to_string(), None);
+                s.task_tree.insert("task-b".to_string(), None);
+            }
+            // Seed a run; set its task_id to task-a.
+            seed_workflow_run("wf_gws_owned", "worker");
+            crate::workflow::run::modify("wf_gws_owned", |r| {
+                r.task_id = Some("task-a".to_string());
+            })
+            .expect("set run.task_id");
+
+            // Owner sees it.
+            let ok = get_workflow_state(
+                &state,
+                &Caller::session("ts-a"),
+                &json!({"run_id": "wf_gws_owned"}),
+            )
+            .expect("owner ok");
+            assert_eq!(ok["run_id"], "wf_gws_owned");
+            // Outsider doesn't.
+            let err = get_workflow_state(
+                &state,
+                &Caller::session("ts-b"),
+                &json!({"run_id": "wf_gws_owned"}),
+            )
+            .expect_err("outsider rejected");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
         });
     }
 

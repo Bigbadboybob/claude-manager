@@ -474,8 +474,10 @@ class PerMethodRoutingTests(unittest.TestCase):
         - 10d-2b moved `workflow_transition` / `workflow_done` to
           DAEMON_METHODS (now route to daemon — see the
           companion test below).
-        - `create_subtask`, `get_workflow_state` remain TUI-routed
-          until later 10d sub-slices."""
+        - 10d-2c-3a moved `get_workflow_state` / `list_workflows`
+          to DAEMON_METHODS (read-only relocation).
+        - `create_subtask` remains TUI-routed until later
+          10d sub-slices."""
         from mcp_server import control_client
 
         with TemporaryDirectory() as tmp:
@@ -488,10 +490,7 @@ class PerMethodRoutingTests(unittest.TestCase):
                 },
                 clear=True,
             ):
-                for tui_method in (
-                    "create_subtask",
-                    "get_workflow_state",
-                ):
+                for tui_method in ("create_subtask",):
                     with self.subTest(method=tui_method):
                         path = control_client.resolve_socket_for_method(tui_method)
                         self.assertEqual(
@@ -500,6 +499,37 @@ class PerMethodRoutingTests(unittest.TestCase):
                             f"{tui_method!r} must route to CM_TUI_SOCKET — "
                             "this is the sub-2c fix for workflow methods "
                             "reachable from daemon-spawned agents",
+                        )
+
+    def test_workflow_read_methods_route_to_daemon_after_10d_2c_3a(self):
+        """10d-2c-3a: `get_workflow_state` / `list_workflows` are
+        now in DAEMON_METHODS and route to the daemon socket
+        when pinned. Daemon reads disk directly via
+        `workflow::run::load_all()` / `load_one()` — no in-memory
+        cache (TUI's reactive-cache pattern was an App-bound
+        optimization)."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "/tmp/d.sock",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                for daemon_method in ("get_workflow_state", "list_workflows"):
+                    with self.subTest(method=daemon_method):
+                        path = control_client.resolve_socket_for_method(
+                            daemon_method,
+                        )
+                        self.assertEqual(
+                            str(path),
+                            "/tmp/d.sock",
+                            f"{daemon_method!r} must route to CM_DAEMON_SOCKET "
+                            "(in DAEMON_METHODS since 10d-2c-3a)",
                         )
 
     def test_workflow_methods_route_to_daemon_after_10d_2b(self):

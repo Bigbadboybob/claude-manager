@@ -116,6 +116,12 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # 2c-2-2 daemon-resident workflow driver. Included here for
     # dispatch-surface alignment; not Python-routable.
     "workflow.update_definitions",
+    # 10d-2c-3a: read-only workflow query methods, relocated
+    # from TUI socket to daemon dispatch. Both Operator and
+    # Session-callable; daemon reads disk directly (no in-memory
+    # cache) — simpler than the TUI's reactive-cache shape.
+    "get_workflow_state",
+    "list_workflows",
 })
 
 
