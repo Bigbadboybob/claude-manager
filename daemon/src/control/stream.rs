@@ -2335,4 +2335,302 @@ mod tests {
              must remain in the broadcaster slot list",
         );
     }
+
+    // ---- 10g: reconnect ring-buffer replay (Phase 1 named --------
+    //          acceptance: TUI restart preserves session output).
+
+    /// Drive an attach-stream over a `UnixStream::pair()` for an
+    /// already-registered session. Returns `(client_half,
+    /// handle_attach_stream_thread)`. The caller drops the client
+    /// half to terminate the attach; the thread handle is joined to
+    /// confirm clean shutdown.
+    ///
+    /// Shared by both the single-reconnect (T-reconnect) and
+    /// multi-reconnect (T-reconnect-multi) tests so the wire-level
+    /// setup is identical to production.
+    fn spawn_attach_stream(
+        state: &Arc<Mutex<DaemonState>>,
+        session_uid: &str,
+        request_id: &str,
+    ) -> (UnixStream, std::thread::JoinHandle<()>) {
+        let (client, mut server) =
+            UnixStream::pair().expect("socket pair");
+        let state_clone = state.clone();
+        let session_uid = session_uid.to_string();
+        let request_id = request_id.to_string();
+        let handle = std::thread::spawn(move || {
+            let attach_handle =
+                build_handle(&state_clone, &session_uid, &request_id);
+            handle_attach_stream(&mut server, state_clone, attach_handle);
+        });
+        (client, handle)
+    }
+
+    /// Read the FIRST `StreamKind::Data` frame on the wire and
+    /// return its base64-decoded payload bytes. Panics on
+    /// deadline or unexpected stream errors — both modes indicate
+    /// a contract violation the test must surface.
+    ///
+    /// Non-Data frames (heartbeats, control) are skipped silently
+    /// so the helper pins the "first PTY-byte frame" not "first
+    /// frame of any kind". The named acceptance contract is:
+    /// **the first Data frame after `attach.open` IS the
+    /// `PtyByteFanout::subscribe()` replay chunk**. Anything
+    /// looser (accumulating across frames, allowing the test to
+    /// pass on a late live duplicate) lets a broken replay
+    /// implementation slip through if `/bin/cat`'s PTY echo
+    /// happens to emit a matching byte sequence after the
+    /// reconnect (the reviewer's r1 finding).
+    fn read_first_data_frame_bytes(
+        client: &mut UnixStream,
+        deadline: std::time::Instant,
+    ) -> Vec<u8> {
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "did not receive first Data frame within deadline; \
+                     pre-r1 the test would have accepted a later live \
+                     frame, masking a broken replay impl",
+                );
+            }
+            let _ = client.set_read_timeout(Some(remaining));
+            let frame = match wire::read_stream_frame(client) {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    panic!(
+                        "EOF before first Data frame — the daemon \
+                         closed the attach stream without delivering \
+                         the replay (contract violation)",
+                    );
+                }
+                Err(e) => {
+                    panic!("read_stream_frame failed: {}", e);
+                }
+            };
+            match frame.kind {
+                StreamKind::Data => {
+                    let Some(b64) = frame
+                        .payload
+                        .get("bytes")
+                        .and_then(|v| v.as_str())
+                    else {
+                        panic!(
+                            "first Data frame missing `bytes` payload: \
+                             {:?}",
+                            frame.payload,
+                        );
+                    };
+                    return BASE64.decode(b64).expect(
+                        "first Data frame's bytes must be valid base64",
+                    );
+                }
+                // Heartbeat and other future control frames don't
+                // count — skip and keep reading for the first
+                // payload-carrying frame.
+                _ => continue,
+            }
+        }
+    }
+
+    /// T-reconnect (10g, Phase 1 named acceptance gate) — daemon
+    /// retains the session's PTY output across TUI restart.
+    /// Production sequence: TUI spawns session → bytes accumulate
+    /// in the daemon's ring buffer → TUI dies → fresh TUI dials
+    /// `attach.open` → the SECOND attach.open's first Data frame
+    /// carries the pre-disconnect bytes as the ring-buffer replay.
+    ///
+    /// Test maps this 1:1 onto the in-process surface: a real
+    /// `/bin/echo` PTY behind `DaemonSession::spawn`, both
+    /// attaches driven through `handle_attach_stream` over
+    /// `UnixStream::pair()`. The second client reads the first
+    /// frame off the wire and asserts the replay payload contains
+    /// the pre-disconnect substring.
+    ///
+    /// **r2 seed choice — `/bin/echo` over `/bin/cat` + Input
+    /// frame**: a PTY-backed `/bin/cat` emits the canary TWICE per
+    /// input (kernel line-discipline echo + cat's own stdout). The
+    /// reviewer's r1 finding was that even with a tightened
+    /// first-frame assertion, a broken-replay impl could still
+    /// pass if the SECOND chunk arrives as a live broadcast on
+    /// the reconnected attach. `/bin/echo` exits after one write
+    /// and never reads stdin, so the kernel's line-discipline
+    /// echo path never fires — the fanout receives exactly one
+    /// canary chunk, eliminating the dual-emit race at the
+    /// source.
+    #[test]
+    fn attach_stream_replay_survives_disconnect_reconnect() {
+        let mut params = SpawnParams::new(
+            "ts-reconnect",
+            "echo-reconnect",
+            "/bin/echo",
+        );
+        params.args = vec!["hello-pre-disconnect".to_string()];
+        let session = DaemonSession::spawn(params).expect("spawn echo");
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("ts-reconnect".into(), session);
+
+        // First attach: confirm bytes are in the ring buffer by
+        // observing them on attach1's wire BEFORE we drop.
+        // `/bin/echo` writes the canary once and exits; the
+        // daemon's reader thread pushes a single chunk to the
+        // fanout. attach1 might subscribe before OR after the
+        // push lands — either way its first Data frame contains
+        // the canary (live broadcast or replay-of-already-filled-
+        // buffer).
+        let (mut client1, handle1) =
+            spawn_attach_stream(&state, "ts-reconnect", "req-attach-1");
+
+        let deadline1 =
+            std::time::Instant::now() + Duration::from_secs(3);
+        let acc1 =
+            read_first_data_frame_bytes(&mut client1, deadline1);
+        let acc1_text = String::from_utf8_lossy(&acc1);
+        assert!(
+            acc1_text.contains("hello-pre-disconnect"),
+            "first attach's first Data frame must contain the \
+             canary; got {:?}",
+            acc1_text,
+        );
+
+        // Drop the first attach. The daemon's handle_attach_stream
+        // observes the client EOF and exits; the DaemonSession
+        // stays alive in state.sessions — that's the property
+        // we're testing.
+        drop(client1);
+        let _ = handle1.join();
+
+        // The session must still be registered (no stale-reap on
+        // attach disconnect — only fanout-close / child-exit reap,
+        // and even the latter only triggers the registry-cleanup
+        // callback when one was wired, which the convenience-form
+        // spawn used by this test does not).
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key("ts-reconnect"),
+            "session must survive attach disconnect; daemon's \
+             whole reason to exist is this property",
+        );
+
+        // Second attach: drive through the production wire path.
+        // The FIRST Data frame on the new pair MUST be the
+        // ring-buffer replay chunk — `PtyByteFanout::subscribe`'s
+        // contract sends the buffer as one chunk before any
+        // subsequent push. After `handle_attach_stream` wraps
+        // that chunk, the very first Data frame on the wire IS
+        // the replay (r1 finding: pre-fix the test accepted a
+        // later live duplicate; r2 fix: seed source emits exactly
+        // once so no live duplicate exists to mask the contract).
+        let (mut client2, handle2) =
+            spawn_attach_stream(&state, "ts-reconnect", "req-attach-2");
+
+        let deadline2 =
+            std::time::Instant::now() + Duration::from_secs(3);
+        let replay_bytes =
+            read_first_data_frame_bytes(&mut client2, deadline2);
+        let replay_text = String::from_utf8_lossy(&replay_bytes);
+        assert!(
+            replay_text.contains("hello-pre-disconnect"),
+            "FIRST Data frame on the reconnected attach MUST be \
+             the ring-buffer replay containing the pre-disconnect \
+             bytes — this is the named acceptance criterion for \
+             Phase 1. Got {:?}",
+            replay_text,
+        );
+
+        // Cleanup. echo exited long ago; removing the registry
+        // entry drops the DaemonSession.
+        drop(client2);
+        let _ = handle2.join();
+        state.lock().unwrap().sessions.remove("ts-reconnect");
+    }
+
+    /// T-reconnect-multi (10g) — replay survives multiple
+    /// sequential reconnects, not just the first one. Pins the
+    /// invariant that the ring buffer isn't "consume-once": each
+    /// fresh subscriber sees the same replay independently.
+    /// Three cycles in this test; the property holds for arbitrary
+    /// N at the data-structure level (per the existing
+    /// `subscribers_after_push_get_replay_not_future_only` unit
+    /// test), here we cover the wire-level path through
+    /// `handle_attach_stream` for confidence the cumulative wire
+    /// state doesn't drift across cycles.
+    #[test]
+    fn attach_stream_replay_survives_multiple_disconnect_reconnect() {
+        // r2: see T-reconnect's seed-choice doc — `/bin/echo` is
+        // single-emit (no PTY echo dual-chunk).
+        let mut params = SpawnParams::new(
+            "ts-reconnect-multi",
+            "echo-reconnect-multi",
+            "/bin/echo",
+        );
+        params.args = vec!["canary-multi-reconnect".to_string()];
+        let session = DaemonSession::spawn(params).expect("spawn echo");
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("ts-reconnect-multi".into(), session);
+
+        // Seed sync: confirm the canary landed in the buffer
+        // before we start reconnect cycles.
+        let (mut seed_client, seed_handle) =
+            spawn_attach_stream(&state, "ts-reconnect-multi", "req-seed");
+        let seed_deadline =
+            std::time::Instant::now() + Duration::from_secs(3);
+        let seed_bytes =
+            read_first_data_frame_bytes(&mut seed_client, seed_deadline);
+        let seed_text = String::from_utf8_lossy(&seed_bytes);
+        assert!(
+            seed_text.contains("canary-multi-reconnect"),
+            "seed attach's first Data frame must contain the \
+             canary; got {:?}",
+            seed_text,
+        );
+        drop(seed_client);
+        let _ = seed_handle.join();
+
+        // Three sequential reconnects via the production wire.
+        // Each one's FIRST Data frame MUST be the replay chunk
+        // containing the canary. Pins ring-buffer-isn't-
+        // consume-once at the wire level across N cycles.
+        for cycle in 0..3 {
+            let req_id = format!("req-cycle-{}", cycle);
+            let (mut client, handle) = spawn_attach_stream(
+                &state,
+                "ts-reconnect-multi",
+                &req_id,
+            );
+            let deadline =
+                std::time::Instant::now() + Duration::from_secs(3);
+            let replay_bytes =
+                read_first_data_frame_bytes(&mut client, deadline);
+            let replay_text = String::from_utf8_lossy(&replay_bytes);
+            assert!(
+                replay_text.contains("canary-multi-reconnect"),
+                "cycle {}: FIRST Data frame MUST be the ring-buffer \
+                 replay containing the canary; got {:?}",
+                cycle,
+                replay_text,
+            );
+            drop(client);
+            let _ = handle.join();
+        }
+
+        // Cleanup.
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .remove("ts-reconnect-multi");
+    }
 }
