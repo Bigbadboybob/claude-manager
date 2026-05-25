@@ -532,6 +532,33 @@ class PerMethodRoutingTests(unittest.TestCase):
                             "(in DAEMON_METHODS since 10d-2c-3a)",
                         )
 
+    def test_stop_workflow_routes_to_daemon_after_10d_3(self):
+        """10d-3: `stop_workflow` relocated from TUI to daemon
+        dispatch. Daemon's handler mutates state.json via the
+        shared `apply_stop_workflow_status` helper (terminal-
+        state guard preserves Done). TUI A-o flow uses the
+        same helper directly — both paths produce byte-identical
+        state mutations."""
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "/tmp/d.sock",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                path = control_client.resolve_socket_for_method("stop_workflow")
+                self.assertEqual(
+                    str(path),
+                    "/tmp/d.sock",
+                    "stop_workflow must route to CM_DAEMON_SOCKET "
+                    "(in DAEMON_METHODS since 10d-3)",
+                )
+
     def test_workflow_methods_route_to_daemon_after_10d_2b(self):
         """10d-2b: `workflow_transition` / `workflow_done` are
         now in DAEMON_METHODS and route to the daemon socket

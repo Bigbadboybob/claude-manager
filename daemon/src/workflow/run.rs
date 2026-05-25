@@ -348,7 +348,32 @@ impl WorkflowRun {
     pub fn mark_detached(&mut self) {
         self.status = RunStatus::Detached;
     }
+}
 
+/// 10d-3: shared canonical mutation for stop_workflow.
+/// Relocated from `tui/src/app.rs::apply_stop_workflow_status`
+/// (10d-2c-1 round-9) so the daemon's `stop_workflow` handler
+/// and the TUI's A-o flow apply the IDENTICAL state.json
+/// mutation — pinned by the fire-output parity test.
+///
+/// Terminal-state guard preserves `Done`: a run that completed
+/// naturally via `workflow_done` keeps its `Done` status and
+/// `done_reason`. Without the guard, a UI stop on a completed
+/// run would overwrite `Done` with `Detached`, erasing the
+/// distinction between successful completion and operator
+/// abort.
+pub fn apply_stop_workflow_status(r: &mut WorkflowRun) {
+    if matches!(r.status, RunStatus::Done) {
+        return;
+    }
+    r.mark_detached();
+}
+
+// The rest of `impl WorkflowRun` continues below.
+// `apply_stop_workflow_status` (free function above) splits the
+// impl block — Rust allows multiple `impl` blocks for the same
+// type, so this is legal even though it looks unusual.
+impl WorkflowRun {
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
         self.status = if paused { RunStatus::Paused } else { RunStatus::Running };

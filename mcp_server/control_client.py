@@ -122,6 +122,13 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # cache) — simpler than the TUI's reactive-cache shape.
     "get_workflow_state",
     "list_workflows",
+    # 10d-3: stop_workflow daemon-routed. Mutates run.status to
+    # Detached via the shared `apply_stop_workflow_status`
+    # helper (terminal-state guard preserves Done). TUI A-o flow
+    # writes state.json directly via the same canonical helper;
+    # both paths produce byte-identical mutations (fire-output
+    # parity test pins this).
+    "stop_workflow",
 })
 
 

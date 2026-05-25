@@ -272,6 +272,16 @@ pub fn dispatch_request(
         "list_workflows" => {
             DispatchOutcome::Done(dispatch_list_workflows(state, req))
         }
+        // 10d-3: stop_workflow relocated from TUI socket.
+        // Operator + Session callers; same auth shape as
+        // get_workflow_state / list_workflows. Mutates state.json
+        // via `apply_stop_workflow_status` (shared canonical
+        // helper). TUI A-o flow continues to write directly via
+        // the same helper — both paths produce byte-identical
+        // mutations (pinned by the fire-output parity test).
+        "stop_workflow" => {
+            DispatchOutcome::Done(dispatch_stop_workflow(state, req))
+        }
 
         // Sub-2b-3: `mcp_start_session` — Python MCP tool's
         // minimal-shape entry point. Daemon resolves
@@ -469,6 +479,20 @@ fn dispatch_list_workflows(
     req: &Request,
 ) -> Response {
     match methods::list_workflows(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// 10d-3: `stop_workflow` — mark a workflow run Detached on disk
+/// (or no-op for Done). Operator + Session callers; auth-ordering
+/// matches `get_workflow_state` (caller resolution → load →
+/// authorize). Idempotent: stop-on-Detached is a benign no-op.
+fn dispatch_stop_workflow(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::stop_workflow(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

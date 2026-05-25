@@ -2340,6 +2340,114 @@ pub fn list_workflows(
     Ok(Value::Array(out))
 }
 
+// ============================================================
+// 10d-3: stop_workflow
+// ============================================================
+//
+// Relocates the operator-side stop_workflow MCP method to
+// daemon dispatch. Pre-3 this routed to the TUI socket; the
+// TUI process owned the state.json mutation. Daemon-side
+// canonicalizes the state machine write (the strict-controller
+// reading: daemon owns running-state mutations).
+//
+// Scope decision (greenlit option B): ONLY `stop_workflow`
+// relocates in 10d-3. `start_workflow` stays TUI-routed
+// because its launch path interleaves session spawning + initial
+// prompt delivery — the latter needs 3b's daemon-side prompt
+// delivery before a clean relocation. Both deferred.
+//
+// **TUI's A-o (UI stop) flow continues to write state.json
+// directly** via `workflow::run::modify(apply_stop_workflow_status)`.
+// Both paths use the SAME `apply_stop_workflow_status` (now in
+// `daemon/src/workflow/run.rs`); the parity is canonical by
+// construction. Routing A-o through daemon RPC would add a
+// roundtrip with no functional benefit for a UI button.
+
+#[derive(serde::Deserialize, Default)]
+pub struct StopWorkflowParams {
+    pub run_id: String,
+}
+
+pub fn stop_workflow(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: StopWorkflowParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    if p.run_id.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "stop_workflow: 'run_id' is required".into(),
+        ));
+    }
+    // 10d-2c-3a review-r1 lesson: caller resolution FIRST,
+    // load SECOND, authorize THIRD. Session callers get
+    // Unauthorized (not NotFound) for both "bogus uid" and
+    // "valid uid + nonexistent run" to prevent existence
+    // probes via differential error codes. Operator callers
+    // see legitimate NotFound (they're trusted).
+    let caller_view: Option<crate::state::SessionViewAny> = match caller {
+        Caller::Session(uid) => {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match state.lookup_session_any(&uid.session_uid) {
+                Some(v) => Some(v),
+                None => {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        "caller session not authorized".into(),
+                    ));
+                }
+            }
+        }
+        Caller::Operator(_) => None,
+    };
+    let run = match crate::workflow::run::load_one(&p.run_id) {
+        Some(r) => r,
+        None => {
+            return match caller {
+                Caller::Operator(_) => Err((
+                    ErrorCode::NotFound,
+                    format!("workflow run {} not found", p.run_id),
+                )),
+                Caller::Session(_) => Err((
+                    ErrorCode::Unauthorized,
+                    "workflow run is outside caller's scope".into(),
+                )),
+            };
+        }
+    };
+    if let Some(cv) = caller_view {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if !workflow_run_authorized_daemon(&cv, &state, &run) {
+            return Err((
+                ErrorCode::Unauthorized,
+                "workflow run is outside caller's scope".into(),
+            ));
+        }
+    }
+    // Apply the canonical mutation via `run::modify` (flock-
+    // protected). Same function the TUI A-o flow uses; the
+    // fire-output parity test pins this.
+    //
+    // The terminal-state guard inside
+    // `apply_stop_workflow_status` is what makes second-stop
+    // idempotent: Detached → no transition needed (mark_detached
+    // is a no-op write of the same value); Done → guard
+    // returns early.
+    crate::workflow::run::modify(
+        &p.run_id,
+        crate::workflow::run::apply_stop_workflow_status,
+    )
+    .map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("stop_workflow modify failed: {}", e),
+        )
+    })?;
+    Ok(json!({"ok": true}))
+}
+
 /// Combined scope+auth filter for `list_workflows` entries.
 /// Operator-equivalent: `caller_view = None` always visible.
 fn list_workflows_visible_daemon(
@@ -8805,6 +8913,397 @@ mod tests {
                     t.deactivated_at.is_some(),
                     d.deactivated_at.is_some(),
                     "history[{}].deactivated_at shape drift (Some/None)",
+                    i,
+                );
+            }
+        });
+    }
+
+    // ============================================================
+    // 10d-3 — stop_workflow tests
+    // ============================================================
+
+    /// T1: Operator caller flips a Running run to Detached on
+    /// disk via daemon's stop_workflow handler.
+    #[test]
+    fn stop_workflow_operator_running_to_detached() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_running", "worker");
+            let result = stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_running"}),
+            )
+            .expect("ok");
+            assert_eq!(result["ok"], true);
+            let post = crate::workflow::run::load_one("wf_sw_running")
+                .expect("load post");
+            assert!(matches!(
+                post.status,
+                crate::workflow::run::RunStatus::Detached
+            ));
+        });
+    }
+
+    /// T3: terminal-state guard — stop on a Done run is a no-op.
+    /// Preserves the `Done` status + `done_reason`. Mirrors
+    /// 10d-2c-1 round-9's TUI-side guard.
+    #[test]
+    fn stop_workflow_on_done_run_is_noop_preserves_done_reason() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_done", "worker");
+            // Mark the run Done with a reason.
+            crate::workflow::run::modify("wf_sw_done", |r| {
+                r.status = crate::workflow::run::RunStatus::Done;
+                r.active_role = None;
+                r.done_reason = Some("approved".into());
+            })
+            .expect("set Done");
+
+            let result = stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_done"}),
+            )
+            .expect("ok");
+            assert_eq!(result["ok"], true);
+
+            let post = crate::workflow::run::load_one("wf_sw_done")
+                .expect("load post");
+            assert!(matches!(
+                post.status,
+                crate::workflow::run::RunStatus::Done
+            ));
+            assert_eq!(post.done_reason.as_deref(), Some("approved"));
+        });
+    }
+
+    /// T4: idempotent — second stop on Detached returns ok and
+    /// is a no-op (Detached → Detached is benign).
+    #[test]
+    fn stop_workflow_on_detached_run_is_idempotent() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_idem", "worker");
+            // First stop: Running → Detached.
+            stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_idem"}),
+            )
+            .expect("first stop ok");
+            // Second stop: still Detached, no error.
+            stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_idem"}),
+            )
+            .expect("second stop ok (idempotent)");
+            let post = crate::workflow::run::load_one("wf_sw_idem")
+                .expect("load post");
+            assert!(matches!(
+                post.status,
+                crate::workflow::run::RunStatus::Detached
+            ));
+        });
+    }
+
+    /// Missing-run returns NotFound for Operator, Unauthorized
+    /// for Session (no-info-leak invariant from 10d-2c-3a).
+    #[test]
+    fn stop_workflow_missing_run_operator_vs_session_error_codes() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err_op = stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf-missing"}),
+            )
+            .expect_err("operator missing");
+            assert_eq!(err_op.0, ErrorCode::NotFound);
+
+            // Session caller with valid uid + nonexistent run:
+            // Unauthorized (matches the get_workflow_state
+            // no-info-leak invariant).
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-real-sw",
+                    "x",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws".to_string();
+                sp.task_id = Some("task-a".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-real-sw".to_string(), ds);
+                s.task_tree.insert("task-a".to_string(), None);
+            }
+            let err_session = stop_workflow(
+                &state,
+                &Caller::session("ts-real-sw"),
+                &json!({"run_id": "wf-missing"}),
+            )
+            .expect_err("session missing");
+            assert_eq!(err_session.0, ErrorCode::Unauthorized);
+        });
+    }
+
+    /// T5: auth-ordering / no-info-leak — bogus session_uid →
+    /// Unauthorized for stop_workflow (matches get_workflow_state
+    /// shape).
+    #[test]
+    fn stop_workflow_bogus_session_uid_returns_unauthorized() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = stop_workflow(
+                &state,
+                &Caller::session("ts-bogus"),
+                &json!({"run_id": "wf-whatever"}),
+            )
+            .expect_err("must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+        });
+    }
+
+    /// T2: Session caller cross-scope rejection. Caller bound to
+    /// task-a; run bound to task-b → Unauthorized.
+    #[test]
+    fn stop_workflow_session_caller_cross_scope_rejected() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_xs", "worker");
+            crate::workflow::run::modify("wf_sw_xs", |r| {
+                r.task_id = Some("task-b".to_string());
+            })
+            .expect("set run.task_id");
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-a-xs",
+                    "x",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws".to_string();
+                sp.task_id = Some("task-a".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-a-xs".to_string(), ds);
+                s.task_tree.insert("task-a".to_string(), None);
+                s.task_tree.insert("task-b".to_string(), None);
+            }
+            let err = stop_workflow(
+                &state,
+                &Caller::session("ts-a-xs"),
+                &json!({"run_id": "wf_sw_xs"}),
+            )
+            .expect_err("cross-scope must reject");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            // State unchanged.
+            let post = crate::workflow::run::load_one("wf_sw_xs")
+                .expect("load post");
+            assert!(matches!(
+                post.status,
+                crate::workflow::run::RunStatus::Running
+            ));
+        });
+    }
+
+    /// T6: race ordering A — `stop_workflow` wins flock first;
+    /// concurrent `workflow_transition` then sees status =
+    /// Detached and returns Conflict via the existing
+    /// terminal-state guard (10d-2c-1 round-9).
+    #[test]
+    fn stop_workflow_then_transition_returns_conflict() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_race_a", "worker");
+            // Stop wins.
+            stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_race_a"}),
+            )
+            .expect("stop ok");
+            // Transition loses — run is now Detached.
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "",
+                    "role": "worker",
+                    "run_id": "wf_sw_race_a",
+                }),
+            )
+            .expect_err("transition on Detached must conflict");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            // No event emitted.
+            let (events, _) =
+                crate::workflow::events::read_new("wf_sw_race_a", 0);
+            assert!(
+                events.is_empty(),
+                "no event written — transition rejected pre-mutation",
+            );
+        });
+    }
+
+    /// T6 symmetric: race ordering B — `workflow_transition` wins
+    /// flock first; concurrent `stop_workflow` then sees the
+    /// post-transition state (status still Running, active_role
+    /// advanced) and successfully transitions Running → Detached.
+    /// Both writes succeed in sequence — flock+try_modify
+    /// serializes cleanly.
+    #[test]
+    fn transition_then_stop_workflow_both_succeed() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_race_b", "worker");
+            // Transition wins.
+            workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "",
+                    "role": "worker",
+                    "run_id": "wf_sw_race_b",
+                }),
+            )
+            .expect("transition ok");
+            // Stop succeeds on the now-active-role=reviewer run.
+            stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_race_b"}),
+            )
+            .expect("stop ok");
+            let post = crate::workflow::run::load_one("wf_sw_race_b")
+                .expect("load post");
+            assert!(matches!(
+                post.status,
+                crate::workflow::run::RunStatus::Detached
+            ));
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+        });
+    }
+
+    /// T7: poller skips Detached runs. After stop, the daemon's
+    /// `cm-workflow-poller` filters via `run.is_active()` which
+    /// excludes Detached. No fire happens for the stopped run.
+    #[test]
+    fn poller_skips_detached_runs_after_stop() {
+        use std::sync::Arc as StdArc;
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_sw_poller_detached", "worker");
+            stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_poller_detached"}),
+            )
+            .expect("stop ok");
+
+            // The poller's `collect_snapshots` walks
+            // load_all().filter(is_active()). Detached runs are
+            // filtered out — assert by calling poll_once() with
+            // apply disabled and checking decisions.
+            let poller =
+                crate::workflow::poller::WorkflowPoller::new(StdArc::clone(&state));
+            poller.set_disable_apply_for_test(true);
+            let decisions = poller.poll_once();
+            // Our specific run must not appear in decisions.
+            let saw_our_run = decisions.iter().any(|d| match d {
+                crate::workflow::poller::Decision::Skip { run_id, .. }
+                | crate::workflow::poller::Decision::ActivateStatic {
+                    run_id,
+                    ..
+                } => run_id == "wf_sw_poller_detached",
+            });
+            assert!(
+                !saw_our_run,
+                "poller must not surface a Detached run in decisions. \
+                 Got: {:?}",
+                decisions,
+            );
+        });
+    }
+
+    /// Fire-output parity: TUI-path stop AND daemon-path stop
+    /// produce byte-identical state.json mutations.
+    ///
+    /// Both paths call `apply_stop_workflow_status` via
+    /// `run::modify`. The function is the SAME canonical helper
+    /// (relocated to `daemon/src/workflow/run.rs` in 10d-3) so
+    /// parity is canonical by construction. This test pins
+    /// against a future regression where one path diverges
+    /// (e.g., adds a side effect on the WorkflowRun struct).
+    #[test]
+    fn fire_output_parity_stop_workflow_state_matches_between_paths() {
+        let _tmp = with_temp_home(|| {
+            // Seed two identical runs.
+            seed_workflow_run("wf_sw_parity_tui", "worker");
+            seed_workflow_run("wf_sw_parity_dae", "worker");
+
+            // TUI-path: direct call to apply_stop_workflow_status
+            // via run::modify (mirrors `App::stop_workflow_run`'s
+            // closure).
+            crate::workflow::run::modify(
+                "wf_sw_parity_tui",
+                crate::workflow::run::apply_stop_workflow_status,
+            )
+            .expect("tui-path");
+
+            // Daemon-path: workflow_transition handler — wait,
+            // that's a different handler. Use the stop_workflow
+            // handler instead.
+            let state = make_state_arc();
+            stop_workflow(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({"run_id": "wf_sw_parity_dae"}),
+            )
+            .expect("daemon-path");
+
+            // Compare. Modulo run_id + started_at, the relevant
+            // fields must match.
+            let tui = crate::workflow::run::load_one("wf_sw_parity_tui")
+                .expect("load tui");
+            let dae = crate::workflow::run::load_one("wf_sw_parity_dae")
+                .expect("load dae");
+            assert_eq!(
+                tui.status, dae.status,
+                "status drift (both paths must set Detached)",
+            );
+            assert_eq!(
+                tui.active_role, dae.active_role,
+                "active_role drift",
+            );
+            assert_eq!(
+                tui.iteration, dae.iteration,
+                "iteration drift",
+            );
+            assert_eq!(
+                tui.paused, dae.paused,
+                "paused drift",
+            );
+            assert_eq!(
+                tui.history.len(),
+                dae.history.len(),
+                "history length drift",
+            );
+            // Stop doesn't touch history; both should still have
+            // just the initial seed entry. Pin role + last_message
+            // for completeness.
+            for (i, (t, d)) in
+                tui.history.iter().zip(dae.history.iter()).enumerate()
+            {
+                assert_eq!(t.role, d.role, "history[{}].role drift", i);
+                assert_eq!(
+                    t.last_message, d.last_message,
+                    "history[{}].last_message drift",
                     i,
                 );
             }

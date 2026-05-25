@@ -5229,4 +5229,232 @@ mod tests {
             }
         });
     }
+
+    /// 10d-3 r1 round-2: the ordering invariant in
+    /// [`crate::app::App::tick_workflows`] — controller tick MUST
+    /// run BEFORE [`crate::app::drop_inactive_runs_from_in_mem`].
+    /// Pre-r2 the helper ran first, which was eager for Done
+    /// runs: the controller never got a chance to consume the
+    /// `workflow_done` event before the in-mem run was dropped,
+    /// so `events_offset` stayed at 0 and the daemon's
+    /// `workflow_done` was silently lost.
+    ///
+    /// Scenario mirrors the daemon's stop-after-workflow_done
+    /// flow:
+    ///
+    /// 1. Seed `state.json` with a Running run + a worker session.
+    /// 2. Append a daemon-source `workflow_done` event to
+    ///    `events.jsonl`.
+    /// 3. (Daemon) mutate `state.json` status → Done (post-event
+    ///    capture; daemon's MCP `workflow_done` handler does this).
+    /// 4. Run controller tick — drains the event, advances
+    ///    `events_offset` past the workflow_done line.
+    /// 5. Run `drop_inactive_runs_from_in_mem` — sees on-disk Done,
+    ///    drops the in-mem run.
+    ///
+    /// Assertions: post-tick on-disk `events_offset > 0` AND
+    /// in-mem `workflow_runs` ends up empty.
+    #[test]
+    fn tick_drains_workflow_done_event_before_reconcile_removes_run() {
+        with_temp_home(|| {
+            let run_id = "wf_r2_ordering_done";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon-source workflow_done event.
+            let ev = workflow::events::Event {
+                id: "evt-r2-done".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "approved"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append wf_done");
+
+            // Daemon flipped status to Done already. We capture
+            // the post-event byte offset BEFORE the tick — it's
+            // what the controller will advance to.
+            let (with_offsets, _) =
+                workflow::events::read_new_with_offsets(run_id, 0);
+            assert_eq!(with_offsets.len(), 1, "exactly one event seeded");
+            let post_event_offset = with_offsets[0].1;
+            assert!(post_event_offset > 0, "post-event offset must be nonzero");
+
+            workflow::run::modify(run_id, |r| {
+                r.status = workflow::run::RunStatus::Done;
+                r.done_reason = Some("approved".to_string());
+            })
+            .expect("daemon flips Done");
+
+            // In-mem state: still Running (TUI hasn't reloaded
+            // yet). This mirrors the realistic tick scenario.
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let workspace = workspace_with(vec![worker], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let dummy = dummy_cap_state();
+
+            // Phase 1 of tick_workflows — controller tick.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.tick();
+            }
+
+            // Post-controller, pre-reconcile assertions.
+            let post_tick = workflow::run::load_one(run_id).expect("post-tick load");
+            assert_eq!(
+                post_tick.events_offset, post_event_offset,
+                "controller MUST advance events_offset past the \
+                 workflow_done line BEFORE reconcile drops the run; \
+                 a pre-tick reconcile would empty workflow_runs \
+                 first and the event would be silently lost",
+            );
+            assert!(
+                !runs.is_empty(),
+                "in-mem run still present post-controller \
+                 (reconcile hasn't run yet)",
+            );
+
+            // Phase 2 of tick_workflows — reconcile.
+            let dropped = crate::app::drop_inactive_runs_from_in_mem(
+                &mut runs,
+                &mut workspaces,
+            );
+
+            assert_eq!(dropped, 1, "exactly the Done run dropped");
+            assert!(
+                runs.is_empty(),
+                "post-reconcile workflow_runs MUST be empty: Done \
+                 run dropped from in-mem after on-disk Done observed",
+            );
+            // Worker session's workflow tags are also cleared.
+            let worker_post = &workspaces[0].sessions[0];
+            assert!(
+                worker_post.workflow_run_id.is_none(),
+                "worker session workflow_run_id cleared by reconcile",
+            );
+            assert!(
+                worker_post.workflow_role.is_none(),
+                "worker session workflow_role cleared by reconcile",
+            );
+            assert!(
+                !worker_post.hidden,
+                "worker session unhidden after reconcile",
+            );
+        });
+    }
+
+    /// 10d-3 r1 round-2 regression test for the Detached path
+    /// (no event written): the daemon-routed
+    /// `stop_workflow` flips `status = Detached` on disk WITHOUT
+    /// writing an event. Reconcile must still clean up the in-mem
+    /// tracking even though the controller tick has nothing to
+    /// process.
+    ///
+    /// This is the original F1 case from round-1; pinning it here
+    /// guards against the ordering swap accidentally relying on a
+    /// "controller drained something" side effect.
+    #[test]
+    fn tick_reconciles_detached_run_with_no_event_written() {
+        with_temp_home(|| {
+            let run_id = "wf_r2_ordering_detached";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon flipped status to Detached, no event written.
+            workflow::run::modify(run_id, |r| {
+                r.mark_detached();
+            })
+            .expect("daemon flips Detached");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let workspace = workspace_with(vec![worker], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let dummy = dummy_cap_state();
+
+            // Phase 1 — controller tick: no events.jsonl content,
+            // so no decisions, no on-disk mutation, no in-mem
+            // update. events_offset stays at 0.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.tick();
+            }
+
+            let post_tick = workflow::run::load_one(run_id).expect("post-tick load");
+            assert_eq!(
+                post_tick.events_offset, 0,
+                "no events written → events_offset stays at 0",
+            );
+            assert!(
+                matches!(
+                    post_tick.status,
+                    workflow::run::RunStatus::Detached
+                ),
+                "status remains Detached (set by daemon's stop_workflow)",
+            );
+
+            // Phase 2 — reconcile: drops the Detached run.
+            let dropped = crate::app::drop_inactive_runs_from_in_mem(
+                &mut runs,
+                &mut workspaces,
+            );
+            assert_eq!(dropped, 1, "Detached run dropped");
+            assert!(
+                runs.is_empty(),
+                "post-reconcile workflow_runs empty for Detached path",
+            );
+        });
+    }
 }

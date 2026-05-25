@@ -244,35 +244,14 @@ fn apply_history_rotation_to_run(run: &mut WorkflowRun, role: &str, new_sid: &st
     }
 }
 
-/// 10d-2c-1 review round-9: field-level mutator for
-/// `stop_workflow_run`'s `workflow::run::modify` closure.
-/// Lifted to a free function so the terminal-state guard can be
-/// tested in isolation (no full `App` setup needed).
-///
-/// Semantics:
-///   - `Done` → no-op. UI stop shortcut on a session whose
-///     workflow has already completed naturally must not
-///     overwrite the `Done` status. The MCP `stop_workflow`
-///     path has had this guard since Phase 7
-///     (`tui/src/control/methods.rs::stop_workflow`); round-9
-///     brings the UI path into line.
-///   - Anything else (Running, Paused, Detached) → mark Detached.
-///     Detached is the post-stop state; stopping a Detached run
-///     again is a benign re-detach.
-///
-/// Surfaces when: startup loads only active runs into
-/// `self.workflow_runs`, but restored sessions still carry
-/// `workflow_run_id` pointing at a completed Done workflow.
-/// Operator presses the stop shortcut on that session — pre-r9
-/// `state.json.status` flipped `Done` → `Detached` on disk,
-/// erasing the distinction between successful completion and
-/// operator abort.
-pub(crate) fn apply_stop_workflow_status(r: &mut WorkflowRun) {
-    if matches!(r.status, workflow::RunStatus::Done) {
-        return;
-    }
-    r.mark_detached();
-}
+// 10d-3: `apply_stop_workflow_status` relocated to
+// `daemon/src/workflow/run.rs` as the shared canonical mutation
+// used by BOTH the TUI A-o flow and the daemon's `stop_workflow`
+// handler. Re-exported through `crate::workflow::run` (see
+// `tui/src/workflow/mod.rs`'s blanket re-export). The function's
+// terminal-state guard semantics are identical — round-9's
+// behavior is preserved end-to-end.
+pub(crate) use crate::workflow::run::apply_stop_workflow_status;
 
 /// Marker that an Enter keystroke is queued to fire at or after `fire_at`. The
 /// actual bytes are computed from the current terminal mode at submit time.
@@ -3310,6 +3289,21 @@ impl App {
             .filter_map(|w| w.worktree_path.clone())
             .collect();
 
+        // 10d-3 R3 recovery (round-2 ordering fix): compute the
+        // active-runs set BEFORE the spawn loop so we can untag
+        // stale `workflow_run_id` / `workflow_role` on manifest
+        // entries IN-PLACE before `spawn_restored_session` reads
+        // them into the agent's MCP env. Pre-r2 the reconciliation
+        // ran after spawn, so a restored agent had stale
+        // `CM_WORKFLOW_RUN_ID` / `CM_ROLE` env vars pointing at a
+        // now-Detached run. The pre-r2 reconciliation step (below
+        // the spawn loop) is replaced by this in-place cleanup.
+        let active_run_ids: std::collections::HashSet<String> = self
+            .workflow_runs
+            .iter()
+            .map(|r| r.run_id.clone())
+            .collect();
+
         // Rebuild self.workspaces from the manifest. Closed workspaces are
         // loaded with empty sessions (their PTY state is gone anyway).
         for (_, mw) in manifest.workspaces.iter() {
@@ -3368,8 +3362,18 @@ impl App {
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
+                    // 10d-3 R3 in-place untag: if this session's
+                    // workflow_run_id references a non-active
+                    // run (Detached/Done), clone the entry and
+                    // clear the tags before spawning. Without
+                    // this the spawned agent inherits stale
+                    // `CM_WORKFLOW_RUN_ID` / `CM_ROLE` in its
+                    // MCP env (set by `mcp_config::WorkflowMeta`
+                    // at spawn time).
+                    let cleaned = untag_stale_workflow(entry, &active_run_ids);
+                    let entry_to_spawn = cleaned.as_ref().unwrap_or(entry);
                     let ts = Self::spawn_restored_session(
-                        entry,
+                        entry_to_spawn,
                         &ws,
                         (cols, rows),
                         &self.config,
@@ -3383,6 +3387,15 @@ impl App {
             }
             self.workspaces.push(ws);
         }
+
+        // (10d-3 R3 recovery moved to in-place pre-spawn untag
+        // above; see the `active_run_ids` block + `cleaned_entry`
+        // Cow. Pre-r2 the untag ran HERE — after the spawn loop —
+        // which meant `spawn_restored_session` had already fed
+        // stale `workflow_run_id` / `workflow_role` into the
+        // agent's MCP env via `WorkflowMeta`. Now the cleaning
+        // happens on the `ManifestEntry` clone passed into spawn,
+        // so the MCP env never sees a stale tag.)
 
         // Apply task bindings onto any existing TaskEntries (from the API
         // fetch). Tasks that aren't in self.tasks yet (task still backlog
@@ -10305,7 +10318,31 @@ impl App {
     /// thin dispatcher: build the controller's reference bag, run it,
     /// apply the resulting actions.
     pub fn tick_workflows(&mut self) {
+        // Run the controller FIRST so daemon-written events
+        // (workflow_done, workflow_transition) are consumed and
+        // their effects (events_offset advance, history append)
+        // are persisted to state.json before reconcile drops the
+        // run.
+        //
+        // 10d-3 r1 round-2 ordering fix: an earlier draft ran
+        // reconcile pre-tick on the theory that "controller
+        // shouldn't tick on corpses." That was eager for Done
+        // runs — the controller needs to consume the
+        // `workflow_done` event from events.jsonl and advance
+        // events_offset before cleanup removes the run; otherwise
+        // the daemon's workflow_done is silently dropped on the
+        // floor. The controller already filters non-Running runs
+        // in its own decision logic, so the "wasted tick on a
+        // Detached run" cost is one disk read + a status check —
+        // negligible compared to losing events.
+        //
+        // Detached / missing runs: no event to drain — cleanup
+        //   simply removes them.
+        // Done runs: controller drains workflow_done → state.json
+        //   reflects offset advance → reconcile then removes the
+        //   in-mem run.
         self.run_workflow_controller(|ctx| ctx.tick());
+        self.reconcile_stopped_workflow_runs();
     }
 
     /// Mark the focused session's workflow run as paused. No-op if the focused
@@ -10381,25 +10418,48 @@ impl App {
         // [`apply_stop_workflow_status`] preserves `Done` so the
         // UI stop shortcut never overwrites a naturally-completed
         // run — matches the MCP `stop_workflow`'s guard predicate
-        // (`tui/src/control/methods.rs::stop_workflow`).
-        let updated = workflow::run::modify(run_id, apply_stop_workflow_status);
-        if let Ok(updated) = updated {
-            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-                *slot = updated;
-            }
-        }
-        for ws in &mut self.workspaces {
-            for ts in &mut ws.sessions {
-                if ts.workflow_run_id.as_deref() == Some(run_id) {
-                    ts.workflow_run_id = None;
-                    ts.workflow_role = None;
-                    ts.hidden = false;
-                }
-            }
-        }
-        self.workflow_runs.retain(|r| r.run_id != run_id);
-        self.save_session_manifest();
+        // (`daemon/src/control/methods.rs::stop_workflow`).
+        let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+        self.apply_local_workflow_stop_cleanup(run_id);
         self.set_status_msg("Workflow stopped");
+    }
+
+    /// 10d-3 r1 F1: shared local-cleanup helper used by both the
+    /// A-o handler (`stop_workflow_run`) and the tick-level
+    /// detector that notices a daemon-initiated `stop_workflow`
+    /// (e.g. an MCP caller dropping a run while the TUI is open).
+    ///
+    /// Walks `self.workspaces`, clears `workflow_run_id` /
+    /// `workflow_role` and unsets `hidden` on every session
+    /// pointing at `run_id`, drops the run from
+    /// `self.workflow_runs`, and persists the manifest. Does NOT
+    /// write `state.json` — the caller decides whether to invoke
+    /// `workflow::run::modify` first (UI path does) or whether the
+    /// daemon already flipped status (tick path does).
+    pub(crate) fn apply_local_workflow_stop_cleanup(&mut self, run_id: &str) {
+        drop_run_from_in_mem(&mut self.workflow_runs, &mut self.workspaces, run_id);
+        self.save_session_manifest();
+    }
+
+    /// 10d-3 r1 F1: tick-level reconciliation of TUI workflow
+    /// state against the daemon's authoritative `state.json`.
+    /// Called from the periodic tick. For each run in
+    /// `self.workflow_runs`, peek at disk; if its on-disk status
+    /// is no longer "active" (Detached or Done), run the local
+    /// cleanup helper so the sidebar matches the daemon view
+    /// without requiring the user to press `A-o`.
+    ///
+    /// Without this, a session whose run the daemon stopped via
+    /// MCP `stop_workflow` would keep showing as a workflow
+    /// participant until TUI restart, even though the agent's
+    /// next workflow_transition would (correctly) be rejected as
+    /// "run not active".
+    pub(crate) fn reconcile_stopped_workflow_runs(&mut self) {
+        let dropped =
+            drop_inactive_runs_from_in_mem(&mut self.workflow_runs, &mut self.workspaces);
+        if dropped > 0 {
+            self.save_session_manifest();
+        }
     }
 
     fn open_workflow_history(&mut self) {
@@ -10439,6 +10499,91 @@ impl App {
 // ═══════════════════════════════════════════════════════════════════════════
 //                         Workflow modal rendering
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// 10d-3 r2 F1: untag every session pointing at `run_id` (clear
+/// `workflow_run_id` + `workflow_role`, unhide), then drop the
+/// run from `workflow_runs`. Pure: takes `&mut` to the two
+/// collections, no `App` required. Used by
+/// [`App::apply_local_workflow_stop_cleanup`] and (in tests) by
+/// the tick-ordering pin.
+pub(crate) fn drop_run_from_in_mem(
+    workflow_runs: &mut Vec<WorkflowRun>,
+    workspaces: &mut Vec<Workspace>,
+    run_id: &str,
+) {
+    for ws in workspaces.iter_mut() {
+        for ts in &mut ws.sessions {
+            if ts.workflow_run_id.as_deref() == Some(run_id) {
+                ts.workflow_run_id = None;
+                ts.workflow_role = None;
+                ts.hidden = false;
+            }
+        }
+    }
+    workflow_runs.retain(|r| r.run_id != run_id);
+}
+
+/// 10d-3 r2: for each tracked run, peek `state.json` on disk; if
+/// the on-disk status is no longer active (Detached / Done) or
+/// the run file is gone, drop the run from `workflow_runs` and
+/// untag sessions. Returns the number of runs dropped so callers
+/// can decide whether to persist the manifest.
+///
+/// Pure helper — exists outside `App` so the round-2 tick-ordering
+/// test can exercise the exact post-controller-tick predicate
+/// without constructing an `App`. The ordering invariant lives in
+/// [`App::tick_workflows`]: controller tick runs FIRST so
+/// daemon-written `workflow_done` events get drained (events_offset
+/// advance + history append) before this function removes the run.
+pub(crate) fn drop_inactive_runs_from_in_mem(
+    workflow_runs: &mut Vec<WorkflowRun>,
+    workspaces: &mut Vec<Workspace>,
+) -> usize {
+    let tracked: Vec<String> = workflow_runs.iter().map(|r| r.run_id.clone()).collect();
+    let mut dropped = 0usize;
+    for run_id in &tracked {
+        // `load_one` returns `None` if the run file is missing or
+        // unreadable. Treat missing as "not active" — a tracked
+        // run whose file is gone is also stale.
+        let still_active = workflow::run::load_one(run_id)
+            .map(|r| r.is_active())
+            .unwrap_or(false);
+        if !still_active {
+            drop_run_from_in_mem(workflow_runs, workspaces, run_id);
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// 10d-3 r1 F2: untag predicate used by `restore_sessions` before
+/// the spawn loop. Returns `Some(cleaned_entry)` if the entry's
+/// `workflow_run_id` is set AND not in `active_run_ids` — i.e. a
+/// stale tag from a Detached/Done run that the manifest never got
+/// to clean up. Returns `None` when the entry's tag is already
+/// absent or still active; callers should pass the original
+/// reference through to `spawn_restored_session` in that case.
+///
+/// Extracted as a free function so the test below pins the
+/// predicate without constructing a full `App`. The behavior is
+/// load-bearing — pre-r2 the untag ran AFTER spawn, so the spawned
+/// agent inherited stale `CM_WORKFLOW_RUN_ID` / `CM_ROLE` env vars
+/// pointing at a now-Detached run.
+pub(crate) fn untag_stale_workflow(
+    entry: &ManifestEntry,
+    active_run_ids: &std::collections::HashSet<String>,
+) -> Option<ManifestEntry> {
+    match entry.workflow_run_id.as_deref() {
+        Some(rid) if !active_run_ids.contains(rid) => {
+            let mut e = entry.clone();
+            e.workflow_run_id = None;
+            e.workflow_role = None;
+            e.hidden = false;
+            Some(e)
+        }
+        _ => None,
+    }
+}
 
 /// Title for the workflow picker dialog. Includes a count when any workflow
 /// files failed to load, so the user has a hint that some entries are missing
@@ -11354,6 +11499,190 @@ mod stop_workflow_terminal_guard_tests {
                 matches!(post.status, RunStatus::Detached),
                 "Paused must transition to Detached on stop; got {:?}",
                 post.status,
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod stop_workflow_local_cleanup_tests {
+    //! 10d-3 r1 F1+F2 tests: pin the extracted local-cleanup
+    //! helper (`untag_stale_workflow`) used by `restore_sessions`'
+    //! pre-spawn untag, and pin the on-disk predicate that the
+    //! tick-level reconciler relies on. Both fixes target the same
+    //! drift: a `workflow_run_id` on a `ManifestEntry` or
+    //! `TerminalSession` outliving the `WorkflowRun` it references.
+    use super::*;
+    use crate::workflow::run::RunStatus;
+
+    fn with_temp_home<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+        f();
+        if let Some(o) = orig {
+            unsafe { std::env::set_var("HOME", o); }
+        } else {
+            unsafe { std::env::remove_var("HOME"); }
+        }
+        tmp
+    }
+
+    fn seed_run(run_id: &str, status: RunStatus) {
+        let mut run = WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".to_string(),
+            "task-key".to_string(),
+            std::collections::BTreeMap::new(),
+            "worker".to_string(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+        );
+        run.status = status;
+        workflow::run::save(&run).expect("seed save");
+    }
+
+    fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
+        ManifestEntry {
+            uid: "sess-u1".to_string(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "worker-test".to_string(),
+            session_type: "claude-code".to_string(),
+            transcript_id: None,
+            hidden: run_id.is_some(),
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: run_id.map(str::to_string),
+            workflow_role: run_id.map(|_| "worker".to_string()),
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+        }
+    }
+
+    /// F2 predicate test: when `workflow_run_id` references a run
+    /// that's NOT in the active set, the entry must be cloned and
+    /// returned with the workflow tags cleared. This is the
+    /// pre-spawn untag that prevents `spawn_restored_session` from
+    /// reading a stale `CM_WORKFLOW_RUN_ID` into the agent's MCP
+    /// env.
+    #[test]
+    fn untag_stale_workflow_clears_when_run_not_active() {
+        let entry = entry_with_workflow(Some("wf_stale_42"));
+        let mut active = std::collections::HashSet::new();
+        active.insert("wf_some_other".to_string());
+
+        let cleaned = untag_stale_workflow(&entry, &active)
+            .expect("stale tag must produce cleaned entry");
+
+        assert!(cleaned.workflow_run_id.is_none(), "run_id must be cleared");
+        assert!(cleaned.workflow_role.is_none(), "role must be cleared");
+        assert!(!cleaned.hidden, "hidden must reset to false");
+        // Original is untouched — Cow semantics.
+        assert_eq!(entry.workflow_run_id.as_deref(), Some("wf_stale_42"));
+    }
+
+    /// F2 negative: when the `workflow_run_id` IS in the active
+    /// set, the helper must return `None` so the spawn loop reuses
+    /// the original entry. Confirms we don't churn the manifest
+    /// for live workflow participants.
+    #[test]
+    fn untag_stale_workflow_noop_when_run_active() {
+        let entry = entry_with_workflow(Some("wf_live_99"));
+        let mut active = std::collections::HashSet::new();
+        active.insert("wf_live_99".to_string());
+
+        let cleaned = untag_stale_workflow(&entry, &active);
+        assert!(cleaned.is_none(), "live run must not be untagged");
+    }
+
+    /// F2 negative: an entry that has no workflow tag must be
+    /// passed through. Guards against the predicate firing on
+    /// non-participant sessions.
+    #[test]
+    fn untag_stale_workflow_noop_when_no_tag() {
+        let entry = entry_with_workflow(None);
+        let active = std::collections::HashSet::new();
+
+        let cleaned = untag_stale_workflow(&entry, &active);
+        assert!(cleaned.is_none(), "untagged entry must be passed through");
+    }
+
+    /// F1 round-trip: a run flipped to `Detached` on disk no
+    /// longer satisfies `is_active()`, so the tick-level
+    /// reconciler will treat it as stale and run cleanup. Pins
+    /// the predicate that `reconcile_stopped_workflow_runs`
+    /// queries, matching the daemon-side `stop_workflow`'s effect.
+    #[test]
+    fn reconcile_predicate_treats_detached_as_inactive() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_f1_detached";
+            seed_run(run_id, RunStatus::Detached);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                !post.is_active(),
+                "Detached must NOT satisfy is_active(); got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// F1 round-trip: `Done` runs (natural completion via
+    /// `workflow_done`) are also non-active. The tick path treats
+    /// them the same as Detached — both warrant local cleanup so
+    /// the sidebar doesn't keep a dangling tag.
+    #[test]
+    fn reconcile_predicate_treats_done_as_inactive() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_f1_done";
+            seed_run(run_id, RunStatus::Done);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                !post.is_active(),
+                "Done must NOT satisfy is_active(); got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// F1 control: `Running` (and `Paused`) remain active. The
+    /// tick path must NOT untag a run that's still in flight.
+    #[test]
+    fn reconcile_predicate_treats_running_as_active() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_f1_running";
+            seed_run(run_id, RunStatus::Running);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                post.is_active(),
+                "Running must satisfy is_active(); got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// F1 round-trip: a missing run on disk is treated as
+    /// inactive. The tick predicate uses
+    /// `load_one(...).unwrap_or(false)`, so a deleted/never-saved
+    /// run file does not panic — the tracked-but-missing entry is
+    /// cleaned up.
+    #[test]
+    fn reconcile_predicate_treats_missing_as_inactive() {
+        let _tmp = with_temp_home(|| {
+            // No seed: run was never saved.
+            let still_active = workflow::run::load_one("wf_f1_missing")
+                .map(|r| r.is_active())
+                .unwrap_or(false);
+            assert!(
+                !still_active,
+                "missing run must NOT satisfy is_active()"
             );
         });
     }
