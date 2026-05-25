@@ -794,6 +794,55 @@ impl LastExitProbe {
         };
         (code, memory_cap_kill)
     }
+
+    /// 10e-a: build the typed [`crate::manifest::LastExit`] record
+    /// for this session at the moment of exit. Consumed by the
+    /// reaper-cleanup callback (`on_exit` in
+    /// `crate::control::methods::start_session`) to populate
+    /// `state.workspaces[ws].sessions[*].last_exit` AND to broadcast
+    /// `ManifestDiff::Exited` to live `manifest.watch` subscribers.
+    ///
+    /// Combines:
+    /// - Kernel exit code from the cached `KernelExitStatus` (the
+    ///   reaper has set this before invoking `on_exit`).
+    /// - Kill-log probe at `kills_dir` past `kills_baseline` via
+    ///   [`crate::reaper::build_last_exit_since`] when a kills dir
+    ///   is configured (i.e. cap was requested at spawn).
+    /// - `exited_at` provided by the caller (typically
+    ///   `SystemTime::now()` as seconds since epoch) — kept as a
+    ///   parameter so tests can pin a deterministic value.
+    ///
+    /// When `kills_dir` is `None` (no cap requested), returns a
+    /// `LastExit` with `memory_cap_kill: false` and
+    /// `kills_file_offset: None`. The kernel `code` still flows
+    /// through. This is the "clean exit, no cap" shape.
+    pub fn build_last_exit(&self, exited_at: f64) -> crate::manifest::LastExit {
+        let kernel = self
+            .kernel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let code = kernel.as_ref().and_then(|k| k.code);
+        let signal = kernel.as_ref().and_then(|k| k.signal);
+        let operator = self.operator_kill_requested();
+        match &self.kills_dir {
+            Some(dir) => crate::reaper::build_last_exit_since(
+                dir,
+                &self.uid,
+                self.kills_baseline,
+                code,
+                signal,
+                operator,
+                exited_at,
+            ),
+            None => crate::manifest::LastExit {
+                code,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at,
+            },
+        }
+    }
 }
 
 pub struct DaemonSession {

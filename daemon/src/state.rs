@@ -407,6 +407,26 @@ pub struct DaemonState {
     /// rewrite the workflow's transition map, defeating the
     /// daemon's static-idle gate.
     pub workflow_definitions: HashMap<String, crate::workflow::toml_schema::Workflow>,
+
+    /// 10e-a: in-memory broadcaster for `manifest.watch` subscribers.
+    /// The reaper's `on_exit` callback (see
+    /// `crate::control::methods::start_session`) populates
+    /// `state.workspaces[ws_id].sessions[*].last_exit` for a daemon-
+    /// spawned session that exits, then `broadcast`s a
+    /// `ManifestDiff::Exited` here. The matching `manifest.watch` RPC
+    /// handler (10e-b) will dial subscribers from this broadcaster.
+    ///
+    /// `Arc` so the broadcaster outlives any one subscriber and so
+    /// the on_exit callback can read it while holding the state lock
+    /// without forcing a clone of the entire `DaemonState`.
+    ///
+    /// No backing replay buffer: subscribers see live diffs PLUS the
+    /// initial snapshot that the RPC handler will compose from a
+    /// `state.workspaces` walk. Matches `PtyByteFanout`'s broadcaster
+    /// shape minus the ring buffer (manifest diffs are infrequent
+    /// enough that a ring buffer would only add lifecycle complexity
+    /// without buying replay).
+    pub manifest_watcher: Arc<crate::manifest::ManifestWatcher>,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -474,6 +494,7 @@ impl Default for DaemonState {
             tui_sessions_pushed: false,
             workflow_runs: HashMap::new(),
             workflow_definitions: HashMap::new(),
+            manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),
         }
     }
 }

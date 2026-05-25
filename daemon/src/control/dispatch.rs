@@ -998,17 +998,44 @@ mod tests {
     /// workspace_id matches the pre-#10d default).
     fn state_with_session_in_workspace(uid: &str, workspace_id: &str) -> Arc<Mutex<DaemonState>> {
         let state = make_state();
+        add_session_with_reaper_cleanup(&state, uid, workspace_id, "claude-code");
+        state
+    }
+
+    /// 10e-a r1 F2: install the same `handle_session_exit`
+    /// reaper-cleanup callback that production `start_session`
+    /// installs. Without this, test sessions never get removed
+    /// from the registry on exit (the reaper has no on_exit
+    /// callback), which masks the post-r1 async-removal
+    /// behavior the dispatcher's `kill_session` tests now
+    /// depend on.
+    fn add_session_with_reaper_cleanup(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        workspace_id: &str,
+        session_type: &str,
+    ) {
         let mut params =
             crate::session::SpawnParams::new(uid, "test", "/bin/sleep");
         params.args = vec!["30".into()];
         params.workspace_id = workspace_id.to_string();
-        let session =
-            crate::session::DaemonSession::spawn(params).expect("spawn /bin/sleep");
-        {
-            let mut s = state.lock().unwrap();
-            s.sessions.insert(uid.into(), session);
-        }
-        state
+        params.session_type = session_type.to_string();
+        let pending = crate::session::PendingSession::spawn(params)
+            .expect("phase 1 spawn /bin/sleep");
+        let state_for_cleanup = Arc::clone(state);
+        let uid_for_cleanup = uid.to_string();
+        let on_exit: Box<
+            dyn FnOnce(&crate::session::DaemonExitStatus) + Send + 'static,
+        > = Box::new(move |_status| {
+            let mut s = state_for_cleanup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            crate::control::methods::handle_session_exit(&mut s, &uid_for_cleanup);
+        });
+        let session = pending
+            .arm_reaper(Some(on_exit))
+            .expect("phase 2 arm_reaper");
+        state.lock().unwrap().sessions.insert(uid.into(), session);
     }
 
     /// Insert a second session into an existing state — used by
@@ -1031,15 +1058,7 @@ mod tests {
         workspace_id: &str,
         session_type: &str,
     ) {
-        let mut params =
-            crate::session::SpawnParams::new(uid, "test", "/bin/sleep");
-        params.args = vec!["30".into()];
-        params.workspace_id = workspace_id.to_string();
-        params.session_type = session_type.to_string();
-        let session =
-            crate::session::DaemonSession::spawn(params).expect("spawn /bin/sleep");
-        let mut s = state.lock().unwrap();
-        s.sessions.insert(uid.into(), session);
+        add_session_with_reaper_cleanup(state, uid, workspace_id, session_type);
     }
 
     #[test]
@@ -1409,10 +1428,13 @@ mod tests {
     }
 
     /// Sub-2a: Session-caller `kill_session` of a sibling
-    /// in the same workspace (taskless caller) passes auth and
-    /// the target is removed.
+    /// in the same workspace (taskless caller) passes auth.
+    /// Post-10e-a-r1-F2 the registry removal happens
+    /// asynchronously via the reaper-cleanup callback (so the
+    /// manifest.watch exit-diff path fires). Polls bounded
+    /// window for the removal.
     #[test]
-    fn kill_session_session_caller_taskless_same_workspace_removes_target() {
+    fn kill_session_session_caller_taskless_same_workspace_signals_and_reaper_removes() {
         let state = state_with_session_in_workspace("ts-caller", "ws-shared");
         add_session(&state, "ts-victim", "ws-shared");
         let resp = dispatch_request(
@@ -1424,9 +1446,20 @@ mod tests {
             ),
         ).into_response();
         assert!(resp.ok, "same-workspace kill must succeed: {:?}", resp.error);
-        let s = state.lock().unwrap();
-        assert!(!s.sessions.contains_key("ts-victim"));
-        assert!(s.sessions.contains_key("ts-caller"));
+        // Reaper-cleanup callback removes target asynchronously.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let gone = !state.lock().unwrap().sessions.contains_key("ts-victim");
+            if gone {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("ts-victim still in registry 3s after kill_session");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(state.lock().unwrap().sessions.contains_key("ts-caller"));
     }
 
     /// Sub-2a: Session-caller `kill_session` of a target in a
@@ -1451,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_session_operator_removes_live_session_via_dispatcher() {
+    fn kill_session_operator_signals_live_session_via_dispatcher_and_reaper_removes() {
         let state = state_with_session("ts-live");
         assert!(state.lock().unwrap().sessions.contains_key("ts-live"));
 
@@ -1463,10 +1496,20 @@ mod tests {
             ),
         ).into_response();
         assert!(resp.ok, "kill must succeed: {:?}", resp.error);
-        assert!(
-            !state.lock().unwrap().sessions.contains_key("ts-live"),
-            "dispatcher arm routes through methods::kill_session and removes the entry",
-        );
+        // 10e-a r1 F2: removal is async via reaper-cleanup
+        // callback (pre-r1 was inline in the handler).
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let gone = !state.lock().unwrap().sessions.contains_key("ts-live");
+            if gone {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("ts-live still in registry 3s after kill_session");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

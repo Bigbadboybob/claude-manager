@@ -845,6 +845,21 @@ pub(crate) fn start_session_with_spawn_fn(
     // insert (callback blocks on the lock we hold), or (b) run
     // never until our insert is visible (reaper thread hasn't
     // been spawned yet at that point).
+    //
+    // 10e-a addition (BEFORE the existing `state.sessions.remove`):
+    // capture the session's `workspace_id` + `LastExitProbe`, build
+    // the typed `LastExit` via the probe's helper, mutate the
+    // matching `ManifestEntry.last_exit` in
+    // `state.workspaces[ws_id].sessions` if the entry is present
+    // (it is when the TUI's load_manifest_from_disk has fed us a
+    // snapshot containing this uid; absent when the daemon spawned
+    // a session into a workspace the manifest hasn't tracked yet —
+    // the diff still fires, just with no on-disk landing zone), and
+    // broadcast `ManifestDiff::Exited` to live `manifest.watch`
+    // subscribers. All three steps run under the same lock as the
+    // existing remove so concurrent kills serialize and subscribers
+    // see exit diffs in lifecycle-event order (per the §5 R1
+    // mitigation in the 10e plan).
     let state_for_cleanup = Arc::clone(state_arc);
     let uid_for_cleanup = session_uid.clone();
     let on_exit: Box<dyn FnOnce(&DaemonExitStatus) + Send + 'static> =
@@ -852,7 +867,7 @@ pub(crate) fn start_session_with_spawn_fn(
             let mut s = state_for_cleanup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.sessions.remove(&uid_for_cleanup);
+            handle_session_exit(&mut s, &uid_for_cleanup);
         });
 
     // === Phase 2: arm reaper + insert, atomic under the lock. ===
@@ -936,6 +951,60 @@ pub(crate) fn start_session_with_spawn_fn(
         response["cgroup_path"] = Value::String(cg);
     }
     Ok(response)
+}
+
+/// 10e-a: handle a session exit by populating the matching
+/// `ManifestEntry.last_exit` in the daemon's manifest snapshot and
+/// broadcasting `ManifestDiff::Exited` to live `manifest.watch`
+/// subscribers. Called from `start_session`'s reaper-cleanup
+/// callback while the state lock is held. Removes the session from
+/// `state.sessions` as the final step.
+///
+/// The mutation order is load-bearing for the 10e plan's §5 race
+/// surfaces:
+///   - R1 (concurrent kills): all three sub-steps (LastExit build,
+///     manifest mutation, broadcast) run under the same lock that
+///     guards `state.sessions.remove`, so subscribers see exit
+///     diffs in lifecycle-event order — the lock IS the ordering
+///     point.
+///   - R5 (untracked-uid diff): when `state.workspaces[ws_id]`
+///     doesn't have a `ManifestEntry` for this uid (the daemon
+///     spawned a session into a workspace the TUI's manifest never
+///     tracked), the entry mutation no-ops but the diff still
+///     fires. Subscribers that don't know the uid will themselves
+///     no-op — see the TUI consumer in 10e-c.
+///
+/// `exited_at` is captured at call time via `now_unix_f64()`. The
+/// reaper has already populated `LastExitProbe.kernel` before
+/// invoking the on_exit closure (see
+/// `session.rs::arm_reaper`), so `build_last_exit` reads a
+/// populated kernel slot.
+pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
+    let exited_at = now_unix_f64();
+    let (workspace_id_opt, last_exit_opt) = match state.sessions.get(uid) {
+        Some(sess) => {
+            let le = sess.last_exit.build_last_exit(exited_at);
+            (Some(sess.workspace_id.clone()), Some(le))
+        }
+        None => (None, None),
+    };
+    if let (Some(ws_id), Some(last_exit)) =
+        (workspace_id_opt.as_ref(), last_exit_opt.as_ref())
+    {
+        if let Some(mw) = state.workspaces.get_mut(ws_id) {
+            if let Some(entry) = mw.sessions.iter_mut().find(|e| e.uid == uid) {
+                entry.last_exit = Some(last_exit.clone());
+            }
+        }
+    }
+    if let Some(last_exit) = last_exit_opt {
+        let watcher = Arc::clone(&state.manifest_watcher);
+        watcher.broadcast(crate::manifest::ManifestDiff::Exited {
+            uid: uid.to_string(),
+            last_exit,
+        });
+    }
+    state.sessions.remove(uid);
 }
 
 /// Sanity-check for a TUI-supplied session uid. Slice 10c-e-3b-fix:
@@ -1194,9 +1263,9 @@ pub fn kill_session(
         .map_err(|e| (ErrorCode::InvalidParams, format!("kill_session params: {}", e)))?;
 
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    // Sub-2a Finding #2 TOCTOU fix: auth + remove happen in one
+    // Sub-2a Finding #2 TOCTOU fix: auth + lookup happen in one
     // critical section so a non-descendant target can't slip in
-    // (or out) between authorize-time and remove-time.
+    // (or out) between authorize-time and signal-time.
     if let Some(cuid) = caller_uid {
         let decision = crate::control::auth::check_session_caller(
             &state,
@@ -1205,8 +1274,26 @@ pub fn kill_session(
         );
         return_auth_error_if_denied(decision, cuid, &p.session_uid)?;
     }
-    let removed = state.sessions.remove(&p.session_uid);
-    let removed = match removed {
+    // 10e-a r1 F2: do NOT remove the session from the registry
+    // here. Pre-r1 we removed-then-Drop'd, which fired SIGKILL
+    // via the dropped session's pidfd — but the reaper's on_exit
+    // callback then ran against an already-absent uid, so
+    // `handle_session_exit` couldn't find the session, couldn't
+    // populate `last_exit`, and couldn't broadcast
+    // `ManifestDiff::Exited`. Operator-killed sessions emitted no
+    // manifest exit diff — the UI saw nothing for A-w.
+    //
+    // Post-r1: keep the session in the registry, mark the
+    // operator-kill flag on the probe, and send SIGKILL via the
+    // session's pidfd directly. The reaper's `wait_for_child`
+    // sees the exit, fires on_exit, on_exit acquires the state
+    // lock (blocking on us until we return from this handler),
+    // and `handle_session_exit` finds the session, builds
+    // `LastExit`, mutates the manifest entry, broadcasts the
+    // diff, and finally removes from `state.sessions`. Now
+    // operator-kill and cap-kill share the same exit-diff path —
+    // the UI sees a `ManifestDiff::Exited` frame for both.
+    let session = match state.sessions.get_mut(&p.session_uid) {
         Some(s) => s,
         None => {
             return Err((
@@ -1221,18 +1308,11 @@ pub fn kill_session(
     // and joined with `kill_status` + signal in `is_cap_kill`
     // so a transient `protected`/`no_pids` record past baseline
     // doesn't render as a cap kill on a user-initiated A-w.
-    //
-    // The Arc'd `last_exit` outlives `DaemonSession` (the
-    // attach-stream's End-frame consumer holds an
-    // `Arc<LastExitProbe>` clone), so setting the flag here is
-    // observable from the End-frame path even after `removed`
-    // drops below.
-    removed.last_exit.mark_operator_kill_requested();
-    // Drop on the moved-out `DaemonSession` runs at scope-end of
-    // this match arm — SIGKILL via pidfd, reaper observes exit.
-    // The reaper's on_exit callback will try to lock the state and
-    // remove the (now-absent) uid; that's a harmless no-op.
-    drop(removed);
+    session.last_exit.mark_operator_kill_requested();
+    // SIGKILL via pidfd. Errors are best-effort: ESRCH means the
+    // child already exited (race with the watcher / natural
+    // exit) — reaper will still see the exit and fire on_exit.
+    let _ = session.kill();
 
     Ok(json!({ "ok": true }))
 }
@@ -5325,6 +5405,581 @@ mod tests {
         );
     }
 
+    // --- 10e-a: on_exit populates manifest entry's last_exit +
+    //     broadcasts ManifestDiff::Exited -----------------------------
+
+    /// T1 — when a daemon-spawned session exits, the reaper's
+    /// `on_exit` callback (via `handle_session_exit`) populates the
+    /// matching `ManifestEntry.last_exit` in the daemon's manifest
+    /// snapshot. Exercises the full production wire: real
+    /// `PendingSession::spawn(/bin/false)` + lock-held arm_reaper +
+    /// insert, then waits for the reaper-cleanup callback to fire.
+    ///
+    /// `/bin/false` exits with code 1 and no signal; with no
+    /// kills_dir configured, `LastExit.memory_cap_kill` is false
+    /// and `kills_file_offset` is None. The kernel `code` flows
+    /// through from `wait_for_child`.
+    #[test]
+    fn on_exit_populates_manifest_last_exit_for_fast_exit_child() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-10e-a-t1", &dir);
+        let uid = fresh_test_uid();
+
+        // Seed the manifest entry the on_exit will mutate. Mirrors
+        // what `state.load_manifest_from_disk` does at daemon
+        // startup when the TUI's tui-sessions.json carries this
+        // session.
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
+                crate::manifest::ManifestEntry {
+                    uid: uid.clone(),
+                    managed_by_uid: None,
+                    generation: 0,
+                    label: "fast-exit".to_string(),
+                    session_type: "claude-code".to_string(),
+                    transcript_id: None,
+                    hidden: false,
+                    idle_timeout_secs: 0,
+                    burst_threshold: 0,
+                    workflow_run_id: None,
+                    workflow_role: None,
+                    task_id: None,
+                    notify_on_idle: false,
+                    seeded_from_snapshot: None,
+                    last_exit: None,
+                },
+            );
+        }
+
+        // PendingSession::spawn(/bin/false) — same pattern as
+        // `fast_exit_child_never_leaks_dead_registry_entry`.
+        let mut spawn_params =
+            crate::session::SpawnParams::new(&uid, "fast-exit", "/bin/false");
+        spawn_params.working_dir = Some(dir.path().to_path_buf());
+        spawn_params.workspace_id = "ws-10e-a-t1".to_string();
+        let pending = crate::session::PendingSession::spawn(spawn_params)
+            .expect("phase 1 spawn ok");
+
+        // on_exit closure forwards to the extracted helper — same
+        // shape as production `start_session`'s on_exit.
+        let state_for_cleanup = Arc::clone(&state);
+        let uid_for_cleanup = uid.clone();
+        let on_exit: Box<dyn FnOnce(&DaemonExitStatus) + Send + 'static> =
+            Box::new(move |_status: &DaemonExitStatus| {
+                let mut s = state_for_cleanup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                handle_session_exit(&mut s, &uid_for_cleanup);
+            });
+
+        // Lock-held arm + insert (race-closing pattern).
+        {
+            let mut s = state.lock().unwrap();
+            let session = pending
+                .arm_reaper(Some(on_exit))
+                .expect("phase 2 arm ok");
+            s.sessions.insert(uid.clone(), session);
+        }
+
+        // Wait for the reaper-cleanup callback to fire — same
+        // bounded-deadline polling as the fast-exit test.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let cleaned = !state.lock().unwrap().sessions.contains_key(&uid);
+            if cleaned {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("session not cleaned up after 3s — on_exit didn't fire");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Assertion: manifest entry's last_exit populated.
+        let s = state.lock().unwrap();
+        let entry = s.workspaces["ws-10e-a-t1"]
+            .sessions
+            .iter()
+            .find(|e| e.uid == uid)
+            .expect("manifest entry still present");
+        let last_exit = entry
+            .last_exit
+            .as_ref()
+            .expect("last_exit must be Some after on_exit");
+        assert_eq!(
+            last_exit.code,
+            Some(1),
+            "/bin/false exits with code 1; on_exit must capture it. \
+             Got code={:?}",
+            last_exit.code,
+        );
+        assert!(
+            !last_exit.memory_cap_kill,
+            "no kills_dir configured → memory_cap_kill must be false",
+        );
+        assert!(
+            last_exit.kills_file_offset.is_none(),
+            "no kills_dir → kills_file_offset must be None",
+        );
+        assert!(
+            last_exit.exited_at > 0.0,
+            "exited_at must be a real wall-clock timestamp",
+        );
+    }
+
+    /// T2 — companion to T1: subscribers to
+    /// `state.manifest_watcher` receive a `ManifestDiff::Exited`
+    /// frame with a payload matching the manifest entry's
+    /// `last_exit`. Same fast-exit pattern; subscriber attached
+    /// BEFORE the spawn.
+    #[test]
+    fn on_exit_broadcasts_session_exit_diff_to_manifest_watch_subscribers() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-10e-a-t2", &dir);
+        let uid = fresh_test_uid();
+
+        // Subscribe BEFORE the spawn so we don't miss the diff.
+        // No initial-snapshot replay in this primitive (per
+        // `ManifestWatcher` doc) — subscribers see live broadcasts
+        // only.
+        let rx = {
+            let s = state.lock().unwrap();
+            s.manifest_watcher.subscribe()
+        };
+
+        // Same fast-exit spawn pattern as T1; no manifest entry
+        // seeded — T2 only cares about the diff, not the on-disk
+        // mutation (which T1 pins). The plan §5 R5 case: even
+        // without a matching ManifestEntry the diff still fires.
+        let mut spawn_params =
+            crate::session::SpawnParams::new(&uid, "fast-exit", "/bin/false");
+        spawn_params.working_dir = Some(dir.path().to_path_buf());
+        spawn_params.workspace_id = "ws-10e-a-t2".to_string();
+        let pending = crate::session::PendingSession::spawn(spawn_params)
+            .expect("phase 1 spawn ok");
+
+        let state_for_cleanup = Arc::clone(&state);
+        let uid_for_cleanup = uid.clone();
+        let on_exit: Box<dyn FnOnce(&DaemonExitStatus) + Send + 'static> =
+            Box::new(move |_status: &DaemonExitStatus| {
+                let mut s = state_for_cleanup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                handle_session_exit(&mut s, &uid_for_cleanup);
+            });
+
+        {
+            let mut s = state.lock().unwrap();
+            let session = pending
+                .arm_reaper(Some(on_exit))
+                .expect("phase 2 arm ok");
+            s.sessions.insert(uid.clone(), session);
+        }
+
+        // Wait for the diff. recv_timeout is the synchronization
+        // point; no need for the polling-cleanup loop because the
+        // broadcast happens before the `state.sessions.remove`
+        // inside `handle_session_exit`.
+        let diff = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("subscriber must receive Exited diff within 3s");
+        match diff {
+            crate::manifest::ManifestDiff::Exited {
+                uid: diff_uid,
+                last_exit,
+            } => {
+                assert_eq!(
+                    diff_uid, uid,
+                    "diff uid must match the spawned session's uid",
+                );
+                assert_eq!(
+                    last_exit.code,
+                    Some(1),
+                    "broadcast last_exit.code must match the kernel exit",
+                );
+                assert!(
+                    !last_exit.memory_cap_kill,
+                    "no kills_dir → memory_cap_kill false in broadcast too",
+                );
+            }
+            other => panic!(
+                "expected ManifestDiff::Exited, got {:?}",
+                other
+            ),
+        }
+
+        // Clean shutdown: wait for the reaper-cleanup callback to
+        // finish so the test's TempDir Drop doesn't race with the
+        // child's exit reaping.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while state.lock().unwrap().sessions.contains_key(&uid) {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// T1-cap — the named acceptance criterion's PRIMARY flag:
+    /// when the cgroup-OOM watcher kills a process under memory
+    /// cap pressure, the reaper's `on_exit` callback must populate
+    /// `ManifestEntry.last_exit.memory_cap_kill = true`. End-to-end
+    /// through the REAL production path: `handle_breach` writes
+    /// the kill_log record + signals → reaper's `waitpid` returns
+    /// → `on_exit` runs `handle_session_exit` → manifest mutation
+    /// + diff broadcast.
+    ///
+    /// 10e-a r1 F1 fix: pre-r1 this test simulated the watcher by
+    /// calling `write_kill_log_to` BEFORE `libc::kill`, which
+    /// accidentally matched production's ORIGINAL order
+    /// (kill-then-write) inverted — the test passed for the wrong
+    /// reason. Post-r1 the watcher's production order IS
+    /// write-then-kill (see `session_watch::handle_breach`), so
+    /// this test now drives `handle_breach` directly. Any
+    /// regression in the watcher's write-before-kill invariant
+    /// surfaces here as a race-flaky `memory_cap_kill: false`.
+    ///
+    /// Test mechanics:
+    /// 1. Configure `kills_dir` + cgroup tempdir; capture baseline.
+    /// 2. Spawn `/bin/sleep 30` with `kills_dir` plumbed through.
+    /// 3. Seed `cgroup.procs` with the spawned child's PID — this
+    ///    is what makes the watcher pick it as the breach victim.
+    /// 4. Call `handle_breach` (the production watcher's per-tick
+    ///    handler). It writes `KilledByUs` to kill_log BEFORE
+    ///    sending SIGTERM/grace/SIGKILL.
+    /// 5. Wait for the reaper-cleanup callback; assert
+    ///    `memory_cap_kill == true`, `kills_file_offset.is_some()`,
+    ///    AND `ManifestDiff::Exited` broadcast received with the
+    ///    same flag.
+    #[test]
+    fn on_exit_flags_memory_cap_kill_via_handle_breach_production_path() {
+        let dir = TempDir::new().unwrap();
+        let kills_dir = dir.path().join("memory_kills");
+        let cgroup_dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-10e-a-cap", &dir);
+        let uid = fresh_test_uid();
+
+        // Pre-spawn baseline. The watcher records past this
+        // offset are "from this spawn"; everything before is
+        // stale from a prior incarnation under the same uid.
+        let baseline = crate::reaper::capture_baseline_for_spawn(&kills_dir, &uid)
+            .expect("baseline capture");
+        assert_eq!(baseline, 0, "fresh uid → baseline 0 (empty file)");
+
+        // Seed the manifest entry the on_exit will mutate.
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
+                crate::manifest::ManifestEntry {
+                    uid: uid.clone(),
+                    managed_by_uid: None,
+                    generation: 0,
+                    label: "cap-kill-victim".to_string(),
+                    session_type: "claude-code".to_string(),
+                    transcript_id: None,
+                    hidden: false,
+                    idle_timeout_secs: 0,
+                    burst_threshold: 0,
+                    workflow_run_id: None,
+                    workflow_role: None,
+                    task_id: None,
+                    notify_on_idle: false,
+                    seeded_from_snapshot: None,
+                    last_exit: None,
+                },
+            );
+        }
+
+        // Subscribe BEFORE the spawn so we catch the broadcast.
+        let rx = {
+            let s = state.lock().unwrap();
+            s.manifest_watcher.subscribe()
+        };
+
+        // /bin/sleep 30 — gives us a stable child the watcher
+        // can target. The cap watcher in production picks the
+        // highest-RSS unprotected PID from the cgroup; here we
+        // seed exactly the spawned child's PID so it's the
+        // unambiguous target.
+        let mut spawn_params = crate::session::SpawnParams::new(
+            &uid,
+            "cap-victim",
+            "/bin/sleep",
+        );
+        spawn_params.args = vec!["30".to_string()];
+        spawn_params.working_dir = Some(dir.path().to_path_buf());
+        spawn_params.workspace_id = "ws-10e-a-cap".to_string();
+        spawn_params.kills_dir = Some(kills_dir.clone());
+        let pending = crate::session::PendingSession::spawn(spawn_params)
+            .expect("phase 1 spawn ok");
+
+        let state_for_cleanup = Arc::clone(&state);
+        let uid_for_cleanup = uid.clone();
+        let on_exit: Box<dyn FnOnce(&DaemonExitStatus) + Send + 'static> =
+            Box::new(move |_status: &DaemonExitStatus| {
+                let mut s = state_for_cleanup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                handle_session_exit(&mut s, &uid_for_cleanup);
+            });
+
+        // Lock-held arm + insert. Capture the pid so we can
+        // seed cgroup.procs.
+        let pid = {
+            let mut s = state.lock().unwrap();
+            let session = pending
+                .arm_reaper(Some(on_exit))
+                .expect("phase 2 arm ok");
+            let pid = session.pid;
+            s.sessions.insert(uid.clone(), session);
+            pid
+        };
+
+        // Seed the fake cgroup with the child's PID. The
+        // watcher's `handle_breach` reads this file to identify
+        // its target. Empty `protected` set → the child is fair
+        // game.
+        std::fs::write(
+            cgroup_dir.path().join("cgroup.procs"),
+            format!("{}\n", pid).as_bytes(),
+        )
+        .expect("seed cgroup.procs");
+
+        // Drive the production watcher path — `handle_breach`
+        // writes the `KilledByUs` record (10e-a r1 F1 ordering
+        // fix: BEFORE signals) and dispatches SIGTERM+grace+SIGKILL
+        // via the pidfd helpers. NO manual write_kill_log_to or
+        // libc::kill — this is the byte-identical production
+        // sequence.
+        crate::session_watch::handle_breach(
+            &uid,
+            cgroup_dir.path(),
+            &std::collections::HashSet::new(),
+            64 * 1024 * 1024,
+            128 * 1024 * 1024,
+            &kills_dir,
+        );
+
+        // Wait for cleanup.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let cleaned = !state.lock().unwrap().sessions.contains_key(&uid);
+            if cleaned {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("session not cleaned up after 5s — on_exit didn't fire");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Manifest entry assertions.
+        {
+            let s = state.lock().unwrap();
+            let entry = s.workspaces["ws-10e-a-cap"]
+                .sessions
+                .iter()
+                .find(|e| e.uid == uid)
+                .expect("manifest entry still present");
+            let last_exit = entry
+                .last_exit
+                .as_ref()
+                .expect("last_exit must be Some after on_exit");
+            assert!(
+                last_exit.memory_cap_kill,
+                "killed_by_us record past baseline + SIGKILL exit MUST \
+                 flip memory_cap_kill to true; got false (last_exit={:?})",
+                last_exit,
+            );
+            assert!(
+                last_exit.kills_file_offset.is_some(),
+                "kills_file_offset MUST point at the injected record \
+                 (so future scrubbers can locate full kill details). \
+                 Got None.",
+            );
+            // Code is None for signal-kill exits (WIFSIGNALED).
+            assert_eq!(
+                last_exit.code, None,
+                "SIGKILL is a signal-kill → exit code is None",
+            );
+        }
+
+        // Broadcast assertion — same payload, no drift between
+        // the manifest mutation and the diff frame.
+        let diff = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("subscriber must receive Exited diff");
+        match diff {
+            crate::manifest::ManifestDiff::Exited {
+                uid: diff_uid,
+                last_exit,
+            } => {
+                assert_eq!(diff_uid, uid);
+                assert!(
+                    last_exit.memory_cap_kill,
+                    "broadcast last_exit.memory_cap_kill MUST also be \
+                     true (no drift between manifest mutation and \
+                     diff payload)",
+                );
+                assert!(last_exit.kills_file_offset.is_some());
+            }
+            other => panic!("expected Exited, got {:?}", other),
+        }
+    }
+
+    /// 10e-a r1 F2 — operator-kill via `kill_session` RPC now
+    /// flows through the reaper's `handle_session_exit` callback,
+    /// which means the manifest snapshot's `last_exit` gets
+    /// populated AND `ManifestDiff::Exited` fires for
+    /// `manifest.watch` subscribers — same path as cap-kill.
+    /// Pre-r1 the handler removed-then-Drop'd, so on_exit ran
+    /// against an absent uid and emitted no diff; operator-killed
+    /// sessions silently bypassed the manifest.watch broadcast.
+    ///
+    /// Test mechanics:
+    /// 1. Insert a daemon-spawned `/bin/sleep` via `insert_session`
+    ///    (the helper now installs the on_exit reaper-cleanup
+    ///    callback that production `start_session` installs).
+    /// 2. Seed the manifest entry so the on_exit mutation has a
+    ///    landing zone.
+    /// 3. Subscribe to `manifest_watcher` BEFORE the kill.
+    /// 4. Call `kill_session` (the RPC handler).
+    /// 5. Wait for the reaper-cleanup callback to fire; assert:
+    ///    - manifest entry's `last_exit` populated with
+    ///      `signal == Some(SIGKILL)`, `code == None`,
+    ///      `memory_cap_kill == false` (operator override flips
+    ///      the cap classification off per round-7 `is_cap_kill`).
+    ///    - subscriber received the `ManifestDiff::Exited` frame.
+    #[test]
+    fn kill_session_rpc_populates_manifest_last_exit_and_broadcasts_diff() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-10e-a-opkill", &dir);
+        let uid = fresh_test_uid();
+        insert_session(&state, &uid, "ws-10e-a-opkill");
+
+        // Seed the manifest entry — same shape as T1-clean.
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
+                crate::manifest::ManifestEntry {
+                    uid: uid.clone(),
+                    managed_by_uid: None,
+                    generation: 0,
+                    label: "operator-kill-victim".to_string(),
+                    session_type: "claude-code".to_string(),
+                    transcript_id: None,
+                    hidden: false,
+                    idle_timeout_secs: 0,
+                    burst_threshold: 0,
+                    workflow_run_id: None,
+                    workflow_role: None,
+                    task_id: None,
+                    notify_on_idle: false,
+                    seeded_from_snapshot: None,
+                    last_exit: None,
+                },
+            );
+        }
+
+        // Subscribe BEFORE the kill.
+        let rx = {
+            let s = state.lock().unwrap();
+            s.manifest_watcher.subscribe()
+        };
+
+        // Operator kill via the RPC handler. Operator caller
+        // (None) bypasses session-caller auth.
+        let params = json!({ "session_uid": &uid });
+        let result = kill_session(&state, &params, None).expect("kill ok");
+        assert_eq!(result["ok"], true);
+
+        // Wait for the reaper-cleanup callback.
+        poll_until_session_removed(&state, &uid);
+
+        // Manifest entry's last_exit populated.
+        {
+            let s = state.lock().unwrap();
+            let entry = s.workspaces["ws-10e-a-opkill"]
+                .sessions
+                .iter()
+                .find(|e| e.uid == uid)
+                .expect("manifest entry still present");
+            let last_exit = entry
+                .last_exit
+                .as_ref()
+                .expect("last_exit populated by reaper's on_exit");
+            assert!(
+                !last_exit.memory_cap_kill,
+                "operator-kill MUST NOT flip memory_cap_kill (per \
+                 round-7 is_cap_kill: operator_kill_requested=true \
+                 disqualifies cap attribution). Got memory_cap_kill=true",
+            );
+            assert_eq!(
+                last_exit.code, None,
+                "SIGKILL → signal-kill exit → code is None",
+            );
+        }
+
+        // Broadcast assertion.
+        let diff = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("subscriber MUST receive Exited diff on operator kill");
+        match diff {
+            crate::manifest::ManifestDiff::Exited {
+                uid: diff_uid,
+                last_exit,
+            } => {
+                assert_eq!(diff_uid, uid);
+                assert!(
+                    !last_exit.memory_cap_kill,
+                    "broadcast last_exit.memory_cap_kill must agree \
+                     with manifest entry (no drift)",
+                );
+            }
+            other => panic!("expected Exited, got {:?}", other),
+        }
+    }
+
+    /// T3 — `handle_session_exit` no-ops cleanly when called for
+    /// a uid that isn't in `state.sessions`. Pins the R5 path
+    /// (untracked-uid call) without needing a real spawn. Subscriber
+    /// receives nothing; manifest snapshot stays untouched.
+    #[test]
+    fn handle_session_exit_noops_when_uid_not_in_sessions() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-10e-a-t3", &dir);
+        let uid = fresh_test_uid();
+
+        let rx = {
+            let s = state.lock().unwrap();
+            s.manifest_watcher.subscribe()
+        };
+
+        // Call the helper directly with a uid that has no
+        // matching `DaemonSession` in `state.sessions`. Production
+        // ordering ensures this can't happen (the on_exit closure
+        // runs against a uid the registry contained at insert
+        // time), but defense-in-depth.
+        {
+            let mut s = state.lock().unwrap();
+            handle_session_exit(&mut s, &uid);
+        }
+
+        // No diff broadcast.
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(e) => panic!("unexpected receiver error: {:?}", e),
+            Ok(diff) => panic!(
+                "expected NO diff for unknown uid, got {:?}",
+                diff
+            ),
+        }
+    }
+
     // --- initial PTY size plumbing (slice-10c-e-2 review-3 fix) ----------
 
     #[test]
@@ -5582,7 +6237,14 @@ mod tests {
     // ===========================================================
 
     #[test]
-    fn kill_session_removes_from_registry_and_terminates_child() {
+    fn kill_session_signals_target_and_reaper_callback_removes_from_registry() {
+        // 10e-a r1 F2: kill_session returns Ok immediately after
+        // signaling via pidfd. The reaper's on_exit callback
+        // (running `handle_session_exit`) does the actual removal
+        // — that path also populates `last_exit` and broadcasts
+        // `ManifestDiff::Exited` for the manifest.watch consumer.
+        // Pre-r1 the handler removed-then-Drop'd, which bypassed
+        // the on_exit consumer.
         let dir = TempDir::new().unwrap();
         let state = state_with_workspace("ws-kill", &dir);
         let uid = spawn_bash(&state, "ws-kill");
@@ -5591,14 +6253,10 @@ mod tests {
         let params = json!({ "session_uid": &uid });
         let result = kill_session(&state, &params, None).expect("kill ok");
         assert_eq!(result["ok"], true);
-        assert!(
-            !state.lock().unwrap().sessions.contains_key(&uid),
-            "kill_session must remove the entry from the registry",
-        );
-        // The Drop-driven kill via pidfd sent SIGKILL; the reaper
-        // observes the exit and the on_exit callback's remove is a
-        // no-op (already removed). Nothing to verify beyond the
-        // registry being empty.
+
+        // Removal is now asynchronous via the reaper-cleanup
+        // callback. Poll within a bounded window.
+        poll_until_session_removed(&state, &uid);
     }
 
     #[test]
@@ -5780,12 +6438,60 @@ mod tests {
         uid: &str,
         workspace_id: &str,
     ) {
-        let mut p = crate::session::SpawnParams::new(uid, format!("test-{}", uid), "/bin/sleep");
+        // 10e-a r1 F2: install the same on_exit reaper-cleanup
+        // callback that production `start_session` installs.
+        // Without it the reaper just consumes the kernel exit
+        // and the session lingers in `state.sessions` forever
+        // — which masks the post-r1 async-removal behavior
+        // `kill_session` now depends on.
+        let mut p =
+            crate::session::SpawnParams::new(uid, format!("test-{}", uid), "/bin/sleep");
         p.args = vec!["30".to_string()];
         p.workspace_id = workspace_id.to_string();
-        let session = crate::session::DaemonSession::spawn(p).expect("spawn /bin/sleep");
-        let mut s = state.lock().unwrap();
-        s.sessions.insert(uid.to_string(), session);
+        let pending = crate::session::PendingSession::spawn(p)
+            .expect("phase 1 spawn /bin/sleep");
+        let state_for_cleanup = Arc::clone(state);
+        let uid_for_cleanup = uid.to_string();
+        let on_exit: Box<dyn FnOnce(&DaemonExitStatus) + Send + 'static> =
+            Box::new(move |_status| {
+                let mut s = state_for_cleanup
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                handle_session_exit(&mut s, &uid_for_cleanup);
+            });
+        let session = pending
+            .arm_reaper(Some(on_exit))
+            .expect("phase 2 arm_reaper");
+        state.lock().unwrap().sessions.insert(uid.to_string(), session);
+    }
+
+    /// 10e-a r1 F2: post-fix `kill_session` returns Ok before the
+    /// reaper-cleanup callback removes the session from the
+    /// registry. Tests that previously asserted immediate removal
+    /// now poll within a bounded window. Default 3s matches
+    /// `fast_exit_child_never_leaks_dead_registry_entry`'s
+    /// established polling pattern.
+    fn poll_until_session_removed(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+    ) {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let gone = !state.lock().unwrap().sessions.contains_key(uid);
+            if gone {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "session '{}' still in registry 3s after kill_session — \
+                     reaper-cleanup callback didn't fire (post-r1 F2 the \
+                     reaper is the removal trigger, not kill_session itself)",
+                    uid,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Auth-fail on `kill_session` must NOT remove the target. The
@@ -5880,34 +6586,50 @@ mod tests {
     /// Allow. Pairs with the deny tests above to bracket the
     /// "auth gates the act" invariant.
     #[test]
-    fn kill_session_auth_allow_removes_target() {
+    fn kill_session_auth_allow_signals_target_and_reaper_removes() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         insert_session(&state, "ts-caller", "ws-shared");
         insert_session(&state, "ts-victim", "ws-shared");
         let params = json!({ "session_uid": "ts-victim" });
         let result = kill_session(&state, &params, Some("ts-caller")).expect("must allow");
         assert_eq!(result["ok"], true);
-        let s = state.lock().unwrap();
-        assert!(!s.sessions.contains_key("ts-victim"));
-        assert!(s.sessions.contains_key("ts-caller"));
-        drop(s);
+        // 10e-a r1 F2: removal is asynchronous via the reaper-
+        // cleanup callback. Pre-r1 the handler removed inline.
+        poll_until_session_removed(&state, "ts-victim");
+        // Caller wasn't touched.
+        assert!(state.lock().unwrap().sessions.contains_key("ts-caller"));
         kill_all_sessions(&state);
     }
 
     /// Race-style: two threads call `kill_session` on the SAME
-    /// target. Exactly one should observe NotFound (the loser).
-    /// Pre-fix the two threads could race between the
-    /// authorize-lock and the remove-lock, and both could pass
-    /// auth before either removed (the loser would then see
-    /// NotFound when it tried to remove, which it does — but
-    /// the *auth pass* on a now-dead target was the leakage).
-    /// Post-fix, auth+remove are atomic: the loser's auth check
-    /// observes the post-remove state and surfaces NotFound at
-    /// auth time. This test simply verifies the wire outcome
-    /// (one Ok, one NotFound) regardless of the path; ordering
-    /// is non-deterministic but the cardinality is the invariant.
+    /// target. Post-10e-a-r1-F2 the registry is mutated by the
+    /// reaper-cleanup callback (asynchronously), not by
+    /// `kill_session` itself. The auth+lookup are still atomic
+    /// under one lock, so both threads' auth checks observe a
+    /// consistent state — but BOTH can succeed if both lock
+    /// before the reaper fires (the typical case: kernel signal
+    /// delivery + waitpid + on_exit-lock-attempt is microseconds,
+    /// while the second thread acquires the state lock as soon as
+    /// the first releases). The signal is idempotent (second
+    /// call returns ESRCH silently OK via pidfd_send_signal).
+    ///
+    /// Accepted wire outcomes:
+    ///   - (Ok, Ok) — both threads ran before reaper fired.
+    ///     The session is still in the registry when both
+    ///     return; reaper removes it shortly after.
+    ///   - (Ok, NotFound) — the reaper-cleanup callback fired
+    ///     between the two threads' lock acquisitions, so the
+    ///     second thread's lookup found the session already
+    ///     gone. The auth+lookup remain TOCTOU-clean: the second
+    ///     thread's `state.sessions.get_mut(target)` returns
+    ///     None → `NotFound` with no signal sent.
+    ///
+    /// Pre-r1 only the second outcome was possible (because
+    /// kill_session removed inline). Post-r1 both are valid; the
+    /// invariant the test pins is "no double-kill leak AND target
+    /// ends up removed."
     #[test]
-    fn concurrent_kill_session_yields_exactly_one_ok() {
+    fn concurrent_kill_session_yields_consistent_outcomes() {
         use std::sync::Barrier;
         let state = Arc::new(Mutex::new(DaemonState::new()));
         insert_session(&state, "ts-caller-a", "ws-shared");
@@ -5941,12 +6663,26 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, Err((ErrorCode::NotFound, _))))
             .count();
-        assert_eq!(oks, 1, "exactly one thread must succeed");
-        assert_eq!(not_founds, 1, "the other must see NotFound");
-        // Target gone from registry.
-        let s = state.lock().unwrap();
-        assert!(!s.sessions.contains_key("ts-victim"));
-        drop(s);
+        let unauthorizeds = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err((ErrorCode::Unauthorized, _))))
+            .count();
+        assert_eq!(
+            oks + not_founds,
+            2,
+            "both threads must terminate as Ok-or-NotFound (no \
+             Internal / Unauthorized / Conflict allowed); got \
+             oks={} not_founds={} unauthorizeds={}",
+            oks, not_founds, unauthorizeds,
+        );
+        assert!(
+            oks >= 1,
+            "at least one thread must succeed (the one that locked \
+             first; the second may also succeed if the reaper \
+             hadn't fired yet, or NotFound if it had)",
+        );
+        // Target eventually gone from registry (reaper cleanup).
+        poll_until_session_removed(&state, "ts-victim");
         kill_all_sessions(&state);
     }
 

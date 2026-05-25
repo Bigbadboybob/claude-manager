@@ -579,7 +579,19 @@ fn run_watcher(
     }
 }
 
-fn handle_breach(
+/// Watcher's per-breach handler: identify the highest-RSS
+/// unprotected PID in the cgroup, snapshot its identity for
+/// forensics, write a `killed_by_us` record to the kill log
+/// (10e-a r1 F1: BEFORE the signals — see comment inside),
+/// then issue SIGTERM/grace/SIGKILL via the pidfd helpers.
+///
+/// `pub(crate)` so the 10e-a integration tests in
+/// `crate::control::methods::tests` can drive the production
+/// path end-to-end — the cap-kill scenario needs a real watcher
+/// invocation against a known cgroup membership so the
+/// write-before-kill ordering is exercised exactly as production
+/// would.
+pub(crate) fn handle_breach(
     session_uid: &str,
     cgroup_path: &Path,
     protected: &HashSet<u32>,
@@ -701,18 +713,38 @@ fn handle_breach(
     let argc = argv.len();
     let sha = argv_sha256_prefix(&argv);
 
-    let term_ok = kill::send_signal(&target, libc::SIGTERM);
-    std::thread::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
-    let kill_ok = kill::send_signal(&target, libc::SIGKILL);
-    kill::close(target);
-
-    let status = if term_ok || kill_ok {
-        KillStatus::KilledByUs
-    } else {
-        // Both signals returned ESRCH — target exited between
-        // open and signal. Record `already_dead`.
-        KillStatus::AlreadyDead
-    };
+    // 10e-a r1 F1: write the `KilledByUs` record BEFORE issuing
+    // signals. This closes the watcher-vs-reaper race that the
+    // manifest.watch exit-diff broadcast surfaced. Pre-r1 the
+    // order was signals-then-write; the reaper's `on_exit`
+    // callback (running on the per-session reaper thread) fires
+    // when `waitpid` returns, which can race ahead of this
+    // function's `write_kill_log_to` call. The on_exit path
+    // reads the kill log to classify `memory_cap_kill`, so a
+    // missed record → wrong `false` broadcast → no toast.
+    //
+    // The attach-stream path (round-7 lazy classification)
+    // avoided this naturally because End-frame consume time is
+    // well past the watcher's write. The manifest.watch diff is
+    // eager (broadcast at on_exit time), so we need the writer
+    // to commit BEFORE the kill instead.
+    //
+    // Tradeoff: if both SIGTERM/SIGKILL ESRCH (target died
+    // independently between open and signal — voluntary clean
+    // exit or kernel OOM-kill beat us), the record says
+    // "killed_by_us" but no signal from us actually landed.
+    // Acceptable per the round-1 plan: the record means
+    // "watcher committed to cap-kill at this breach baseline,"
+    // which is the semantic the user wants. A clean voluntary
+    // exit by a process at hard memory cap is vanishingly rare;
+    // a kernel OOM-kill IS a cap kill (just a different
+    // killer), so attribution stays correct in spirit.
+    //
+    // No post-signal write: the pre-write is canonical. The
+    // priority-table in `kill_status_priority` would pick
+    // `killed_by_us` over a later `already_dead` anyway, so a
+    // second write would just bloat the file without changing
+    // the consumer's classification.
     write_kill_log_to(
         kills_dir,
         session_uid,
@@ -724,8 +756,17 @@ fn handle_breach(
         rss_kb,
         soft_cap_bytes,
         hard_cap_bytes,
-        status,
+        KillStatus::KilledByUs,
     );
+
+    // Issue the signals. Outcomes are ignored — the pre-write
+    // above is the canonical record. SIGTERM-grace-SIGKILL
+    // sequence stays as-is for any process that handles SIGTERM
+    // (the cooperative shutdown path).
+    let _term_ok = kill::send_signal(&target, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
+    let _kill_ok = kill::send_signal(&target, libc::SIGKILL);
+    kill::close(target);
 }
 
 #[cfg(test)]
