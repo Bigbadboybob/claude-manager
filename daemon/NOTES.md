@@ -1,6 +1,39 @@
 # `app.rs` rewire — slicing plan
 
-Phase-1 work to date has landed every daemon-side primitive the design doc names: protocol types, scaffold, worktree relocation, attach-ticket allocator, workflow-submodule relocation, PtyByteFanout, term_shim FSM, LastExit schema, ManifestWatcher, reaper with per-spawn baseline, detached daemon spawn, opt-in env + auto-launch, and now the pure-function `session.attach` / `attach.open` handlers. What remains is the load-bearing slice: rewiring `tui/src/app.rs` to drive sessions through RPC. This doc sketches which fields move where and a committable slice sequence.
+**PHASE 1 SHIPPED.** All named acceptance criteria in
+`doc/persistent-host-daemon.md` are verified end-to-end on this branch.
+The load-bearing reconnect / ring-buffer property is pinned by the two
+tests in `daemon/src/control/stream.rs::tests`
+(`attach_stream_replay_survives_disconnect_reconnect` +
+`attach_stream_replay_survives_multiple_disconnect_reconnect`, slice
+10g) — both mutation-verified against `PtyByteFanout::subscribe`'s
+replay path.
+
+Phase 1 final shape: 28 commits, 75 files (+60,246 / -4,029 LOC),
++701 tests added across cm-daemon / claude-manager-tui / Python
+mcp_server. Design doc `doc/persistent-host-daemon.md` was authored
+once and **not modified** during the slice arc (Q4 stability
+directive — the doc text is the historical record of the rollout
+strategy, including the now-removed `CM_USE_DAEMON_SOCKET` opt-in
+that slice 10f flipped to mandatory).
+
+Phase-1 deliverables — every daemon-side primitive the design doc
+names: protocol types, scaffold, worktree relocation, attach-ticket
+allocator, workflow-submodule relocation, PtyByteFanout, term_shim
+FSM, LastExit schema, ManifestWatcher, reaper with per-spawn
+baseline, detached daemon spawn, full app.rs RPC rewire (10c-e),
+daemon-side MCP surface (10d-mcp-surface), workflow controller
+relocation (10d-workflow-controller), manifest ownership flip
+(10e), default flip to daemon-mandatory (10f), and the reconnect
+ring-buffer replay test (10g). Plus the pure-function
+`session.attach` / `attach.open` handlers, daemon-side memory-cap
+watcher with per-spawn kill-log baseline, and the per-method
+control-socket routing that lets workflow methods continue talking
+to the TUI socket while session/PTY methods route to the daemon.
+
+The original "what remains is the load-bearing slice" framing is
+preserved below as the design history — what FOLLOWS the framing is
+the actual committable plan that landed.
 
 ## Field-level inventory
 
@@ -40,7 +73,7 @@ Phase-1 work to date has landed every daemon-side primitive the design doc names
 
 Each slice leaves the tree compiling and the default user-visible path (TUI bound to `tui.sock`, daemon optional) working. The opt-in gate `CM_USE_DAEMON_SOCKET=1` graduates from "exercise the daemon scaffold" through each slice until the final flip makes it the default.
 
-### Slice 10a — Daemon-side App-state shell
+### Slice 10a — Daemon-side App-state shell (SHIPPED)
 
 Subdivided into two commits when it turned out (a) ManifestEntry/Workspace/SessionTombstone relocation touches ~50 sites across `app.rs`, `control/methods.rs`, `agent/`, and `workflow/controller.rs`, and (b) the placeholder-dispatcher work is independently testable. Same overall goal.
 
@@ -58,7 +91,7 @@ Subdivided into two commits when it turned out (a) ManifestEntry/Workspace/Sessi
 
 **Working-set check:** TUI ignores the daemon. Default path unchanged. `cargo test --workspace` green after each sub-slice.
 
-### Slice 10b — Move `control/methods.rs` to daemon
+### Slice 10b — Move `control/methods.rs` to daemon (SHIPPED)
 
 - Relocate `methods.rs` from `tui/src/control/` to `daemon/src/control/methods.rs`. Methods take `&mut DaemonState` instead of `&mut App`.
 - TUI keeps `control/server.rs` + `control/queue.rs` for now — its socket still services MCP agents.
@@ -68,7 +101,7 @@ Subdivided into two commits when it turned out (a) ManifestEntry/Workspace/Sessi
 
 **Working-set check:** with opt-in off, default MCP path unchanged. With opt-in on, MCP works against the daemon. Either way the tree is green.
 
-### Slice 10c — Session-spawn split
+### Slice 10c — Session-spawn split (SHIPPED across 10c-{a,b,c,d,e-1,e-2,e-3a,e-3b,e-3c} + ~7 review-fix rounds)
 
 The slice the reviewer flagged as the hardest one to keep working-set-green. Sub-divided aggressively below; each sub-slice leaves the tree compiling and the default `A-n`/`A-s` flow unchanged. The opt-in (`CM_USE_DAEMON_SOCKET=1`) gradually unlocks daemon-side session handling.
 
@@ -198,7 +231,7 @@ Standing rejections from the 10d-2a review cycle.
 
   (Reviewer surfaced this in rounds 28, 30, 31 of 10d-2a review. Each time deferred via this entry. Future reviewer passes on `/tmp/.cm` hardening — or on any other class enumerated above — get the same deferral; worker should reference this entry by name in the deflection reply and proceed.)
 
-### Slice 10d-memory-cap-relocation — Cgroup-OOM watcher relocation
+### Slice 10d-memory-cap-relocation — Cgroup-OOM watcher relocation (SHIPPED)
 
 > **Note**: Promoted to its own slice during 10c-e-3b-fix2 review. The plumbing for memory-cap End-frame attribution (`SpawnParams.kills_dir` populated when `memory_cap_bytes` is set, daemon-side cgroup_path round-trip on the `start_session` response) lands in 10c-e-3b-fix2. The *producer* of kill-log records — the cgroup-OOM watcher — relocates here. Sequenced before mcp-surface because the memory_cap_kill named acceptance criterion is foundational.
 
@@ -238,7 +271,7 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
 
 **Slice 10d watcher-fix #7: SIGKILL-specific signal check.** Pre-fix `is_cap_kill` flipped the `protected`/`no_pids`/`already_dead` rows on ANY signal exit (`exit_signal.is_some()`). But the kernel's `MemoryMax` enforcement sends SIGKILL specifically; SIGTERM/SIGINT/SIGHUP/SIGABRT are user-driven (service-manager `systemctl stop`, Ctrl-C in a detached agent, manual `kill -TERM`, panic via abort, …). A transient soft-limit breach record followed by a non-SIGKILL signal would render as cap-kill. Post-fix the comparison is `exit_signal == Some(libc::SIGKILL)` — uses the libc constant rather than a hardcoded 9 for platform-correctness. Operator A-w fires SIGKILL via pidfd_send_signal (slice 10c-b), so the operator-override case still applies via #5a's `if operator_kill_requested { return false; }` early return. Tests: `is_cap_kill_protected_plus_sigkill_exit_is_true` (renamed from `_signal_exit_is_true`, the `Some(15)` SIGTERM assertion removed since SIGTERM no longer flips); new `is_cap_kill_protected_plus_sigkill_is_true` (libc constant pin), `is_cap_kill_protected_plus_sigterm_is_false` (named acceptance), `is_cap_kill_protected_plus_non_sigkill_signal_is_false` (sweep across SIGINT/SIGHUP/SIGQUIT/SIGABRT/SIGPIPE/SIGUSR1/SIGUSR2), `is_cap_kill_protected_plus_sigkill_with_operator_is_false` (operator override still wins), `build_last_exit_protected_plus_sigterm_is_not_cap_kill` (reaper integration); LastExitProbe-level `capped_session_protected_record_plus_sigterm_is_not_cap_kill`, `capped_session_protected_record_plus_sigint_is_not_cap_kill`, `capped_session_protected_record_plus_sigabrt_is_not_cap_kill`, `capped_session_protected_record_plus_sigkill_is_cap_kill`.
 
-### Slice 10d-mcp-surface — Daemon-side MCP tool surface
+### Slice 10d-mcp-surface — Daemon-side MCP tool surface (SHIPPED across sub-1 / sub-2a / sub-2b-{1,2,3} / sub-2c + ~15 review rounds)
 
 > **Note**: Originally folded into 10c-e. Separated during 10c-e-3 review when it became clear the surface is large (Session-caller descendant-task-tree validation, `propose_task`, workflow tools, subtask tools, kill/list/start_session-for-agents, …) and the smoke can validate PTY mechanics without it.
 
@@ -354,9 +387,9 @@ Tests: renamed `is_cap_kill_killed_by_us_supersedes_operator_flag` → `is_cap_k
 
 **Out of scope for all of sub-2:** the workflow controller relocation itself (`tui/src/workflow/controller.rs` → daemon) is `10d-workflow-controller`. Manifest ownership flip is 10e. Default socket flip is 10f.
 
-### Slice 10d-workflow-controller — Workflow controller relocation
+### Slice 10d-workflow-controller — Workflow controller relocation (SHIPPED across 10d-1 / 10d-2 / 10d-3 + ~15 review rounds for 10d-2c-1 alone)
 
-#### 10d-1 — TUI → daemon session-snapshot push (scaffolding) — COMPLETE pending review
+#### 10d-1 — TUI → daemon session-snapshot push (scaffolding) — SHIPPED
 
 Wire shape: `tui.update_sessions_snapshot` (Operator-only) carrying a full-replace snapshot of `{uid, task_id, label, type, hidden, workflow_run_id, workflow_role}` per TUI session. Lands in `DaemonState.tui_sessions: HashMap<String, TuiSessionSnapshot>`, with `tui_sessions_pushed: bool` distinguishing "deliberately empty" from "never pushed". Helper `lookup_session_any` returns `SessionViewAny { uid, daemon_owned, task_id, workspace_id, workflow_run_id, workflow_role }` checking `state.sessions` first, then `state.tui_sessions`. No callers yet — 10d-2 wires the workflow-method auth consumer.
 
@@ -390,7 +423,7 @@ Tests (4 new, all green 5x):
 
 
 
-### Slice 10e — Manifest ownership flip
+### Slice 10e — Manifest ownership flip (SHIPPED across 10e-a / 10e-b / 10e-c / 10e-d)
 
 - Daemon becomes the only writer of `~/.cm/tui-sessions.json`. TUI's `save_session_manifest` becomes a no-op (or a debug-assert) when opt-in is on.
 - TUI populates its in-memory mirror exclusively via `manifest.watch`. The slice-9 `ManifestWatcher` broadcaster wires to actual diffs.
@@ -399,7 +432,7 @@ Tests (4 new, all green 5x):
 
 **Working-set check:** opt-in off, TUI owns manifest as today. Opt-in on, daemon owns it; TUI follows.
 
-### Slice 14 — Reconnect / ring-buffer replay integration test
+### Slice 14 / 10g — Reconnect / ring-buffer replay integration test (SHIPPED as the final-slice commit)
 
 > **Note on test flake-class** (carried forward from 10c-e-3b-fix2 review). The daemon's real-PTY-spawn tests
 > (`cm_tui_session_id_env_is_injected_for_child`, `exited_session_is_removed_from_registry_within_bound`,
@@ -429,22 +462,159 @@ Tests (4 new, all green 5x):
 
 **Working-set check:** daemon is always-on, hard-required. The historical legacy single-process path is gone.
 
-### Reconnect/ring-buffer test (NEXT)
+## Phase 1 ship log — actual vs. estimated
 
-The named acceptance criterion's final gate: end-to-end kill-TUI-mid-session → restart → observe replay through the daemon. Not yet shipped.
+Per-slice estimates pre-flight vs. what landed (commits beyond
+the named slice are review-fix rounds rolled into the same slice's
+arc):
 
-## Estimated commit count
+| Slice | Estimate | Actual |
+|---|---|---|
+| 10a | 2–3 | 2 (10a-shell + 10a-types) |
+| 10b | 3–4 | 1 (mechanically large but landed cleanly) |
+| 10c | 5–8 | 13 (subdivisions + 7 review-fix rounds for 10c-e-2 alone) |
+| 10d-memory-cap | 2–3 | 1 |
+| 10d-mcp-surface | 3–5 | 10 (sub-1 / sub-2a / sub-2b-{1,2,3} / sub-2c + ~15 review rounds) |
+| 10d-workflow-controller | 1–2 | 7 (10d-2c-1 ran 15 rounds across rollback / iteration / atomicity) |
+| 10e | 1–2 | 4 (10e-a / 10e-b / 10e-c / 10e-d) |
+| 10f | 2 | 1 |
+| 10g (reconnect) | — (named acceptance, no estimate) | 1 |
+| **Total Phase-1 slice commits** | **~15–20** | **40** |
+| Plus design doc + sub-plan + housekeeping | — | (balance to 28 commits on this branch — the design doc, sub-plans, async wait_for_*, lowercase compare, etc. predate slice 10a) |
 
-- Slice 10a: 2–3 commits (state struct + cm-core crate split + workspace plumbing).
-- Slice 10b: 3–4 commits (methods relocation is mechanical but `App`→`DaemonState` is a lot of references; split by method group).
-- Slice 10c: 5–8 commits, actual count higher (10c-{a,b,c,d,e-1,e-2,e-3a,e-3b,e-3b-fix,e-3b-fix2,e-3c} plus review-fix commits per slice).
-- Slice 10d-memory-cap-relocation: 2–3 commits (watcher relocation + cap-kill end-to-end test).
-- Slice 10d-mcp-surface: 3–5 commits (Session-caller dispatch + per-tool relocations + auth check).
-- Slice 10d-workflow-controller: 1–2 commits.
-- Slice 10e: 1–2 commits.
-- Slice 10f: 1 commit (the actual flip) + 1 commit (cleanup).
+The actual count is 2× the estimate. The compounding factor was
+review-fix rounds, mostly concentrated in 10c-e-2 (7 rounds) and
+10d-2c-1 (15 rounds). The 10d-2c-1 multi-round arc surfaced most
+of the meta-lessons captured below — that pain was the cost of
+learning the rollback-vs-retry-vs-event-ordering invariants the
+hard way.
 
-Total: roughly 15–20 commits with the 10c subdivision + 10d split. Each leaves the tree green. The opt-in stays the integration safety net through 10a–10e; 10f removes it.
+## Phase 2 candidates
+
+Cross-slice follow-ups surfaced during Phase 1, consolidated here
+for the next planning pass. Most have inline references back to
+the slice where they surfaced; the in-line "Future work" / "Known
+costs" sections below carry the original detailed context.
+
+1. **10e-d M4 — attach-drain wiring lacks unit-test coverage**.
+   `drain_terminal_events`'s `try_emit_cap_kill_toast` call is
+   inspection-verified only; a PTY integration test would close
+   the coverage gap. Single-line wiring; risk is low but the
+   contract is load-bearing.
+
+2. **10f Q1 — mid-session daemon-crash recovery policy**. Today:
+   `manifest.watch` reconnect loop (1s → 30s exp backoff) handles
+   transient crashes; RPC errors surface via existing status
+   paths. Open question: TUI auto-relaunch of the daemon on N
+   consecutive ECONNREFUSED. Conservative default in Phase 1.
+
+3. **`tui/src/control/server.rs` + `queue.rs` removal**. Workflow-
+   side socket lives here; per-method routing (sub-2c) keeps both
+   sockets active. Track as cleanup once the workflow controller
+   itself relocates daemon-side (Phase 2's natural follow-up to
+   10d-workflow-controller).
+
+4. **Socket-close cancellation for `mcp_start_session` slot wait**
+   (sub-2b-3 review-9). Bounded 20s wait is sufficient for
+   acceptance; the cleaner shape (abort wait on client socket
+   close) needs async runtime or a peer-poll thread.
+
+5. **TUI crash-cleanup bound for `tui_sessions`** (10d-1 round-3).
+   Daemon retains the last-pushed TUI sessions snapshot until the
+   restarted TUI's first push replaces it. Stale-snapshot window
+   on TUI crash. Durable fix: daemon-side connection-lifecycle
+   awareness for the TUI's RPC connection.
+
+6. **`DAEMON_METHODS` set split** (10d-1 round-4). Today the
+   frozenset serves both Python routing AND dispatch-alignment
+   testing. Cleaner shape: `SESSION_CALLABLE_METHODS` (Python
+   routes) ∪ `OPERATOR_ONLY_METHODS` (TUI-pushed). Inline comment
+   on the entry flags intent.
+
+7. **Workflow `events.jsonl` torn-record durability above
+   `PIPE_BUF`** (10d-2a round-6). Phase 1 payloads <1KB; realistic
+   exposure zero. A durable fix (truncate-to-last-good-offset on
+   daemon restart, or fsync-per-record with LSN) is a dedicated
+   slice.
+
+8. **PTY-test isolation slice** — consolidates known flake-class
+   issues:
+   - `read_session_output_with_cursor_returns_only_new_bytes`
+   - `workflow_transition_rollback_preserves_concurrent_tui_role_sessions_update`
+   - `client_session_write_200kib_arrives_at_daemon_pty_without_drops`
+   All pass on `--test-threads=1` / isolated; fail on workspace
+   parallelism. Same root cause class.
+
+9. **Symlink-traversal hardening** (10d-2a round-27). Beyond the
+   current stack (`O_NOFOLLOW`, parent-dir hardening, ancestor-
+   symlink rejection), further hardening (`openat`-per-component,
+   canonicalize-and-compare, `fs::Dir` handle threading) is
+   deferred to a dedicated security audit slice.
+
+10. **Per-worktree spawn+detect serialization replacement**
+    (sub-2b-3 review-4). Today's per-worktree mutex is correct
+    but coarse. A content-association approach (spawn-tag env var
+    echoed into the first transcript line, match-by-tag) removes
+    serialization where latency matters.
+
+## Phase 1 meta-lessons
+
+Recurring patterns that surfaced through the slice arc. Future
+slices applying these should converge faster than this one did.
+
+1. **Surface decisions pre-coding.** Every slice that opened with
+   a 6-item audit (handler-read + ownership + wire shape +
+   atomicity + race surfaces + invariants) caught problems at
+   plan-time rather than r1/r2 review. Slices that skipped the
+   audit hit avoidable review rounds. The discipline is cheap;
+   skipping it isn't.
+
+2. **Per-test audit log on cleanup slices.** 10f's "kept-
+   converted, deleted, net-new" table for the opt-in test sweep
+   documented each touched test's fate. Prevents "test currently
+   disabled" rot AND surfaces over-aggressive deletions before
+   they ship.
+
+3. **Mutation-verify discipline.** Every gate that mattered got
+   "remove the gate, observe the test fail with the expected
+   message, revert." Surfaced real coverage gaps (10e-d M4 not
+   testable by unit suite, 10g r1 first-frame contract, 10g r2
+   single-emit-seed contract) AND validated that passing tests
+   pass for the right reason — not just because the structure
+   happens to align.
+
+4. **Honest reporting of inspection-only verification.** When a
+   test can't reach a code path (10e-d M4 — `drain_terminal_events`
+   needs a real PTY the unit suite doesn't have), document the
+   gap explicitly rather than claim coverage. Tracked as a Phase 2
+   item, not handwaved.
+
+5. **First-principles test contract pinning.** 10g rounds 1 and 2
+   were both "test currently passes but for the wrong reason"
+   findings. The reviewer's first finding tightened the assertion
+   (drain-until-substring → first-frame-only); the second
+   eliminated a PTY-echo dual-emit at the source. The contract is
+   the production invariant, not whatever the test happens to
+   observe.
+
+6. **"Global mutation IS the test-isolation hazard"** (10e-b r3).
+   When parallel tests flake on a shared atomic / env-var / static
+   the right answer is usually "make the state per-handle (or
+   structural) instead of global," not "lock more." Lock-based
+   fixes accumulate; structural fixes don't.
+
+7. **"Don't do throwaway work — defer to the slice that owns it."**
+   sub-2c could have added a daemon→TUI session-push direction,
+   but that direction reverses in 10d. The fix's shape is what
+   10d owns; building-then-discarding is pure churn. Multiple
+   slices applied this principle to defer fixes to their natural
+   slice.
+
+8. **Reviewer Q&A pattern.** Surface open questions upfront with
+   defaults, get explicit confirm/refine. Slices that did this
+   (10e-d, 10f, 10g) avoided design-rework rounds. Slices that
+   started coding without the Q&A often hit "the design should
+   have been X, not Y" review rounds.
 
 ## Future work
 
