@@ -2844,9 +2844,13 @@ impl App {
         };
         let config = crate::client_session::ClientSessionConfig {
             daemon_socket: &daemon_socket,
-            // The token_id is just a label on the Caller::Operator
-            // payload. The daemon accepts any non-empty string.
-            operator_token_id: "tui-operator",
+            // Shared secret presented to the daemon's operator
+            // auth (see `cm_daemon::control::operator`). Loaded at
+            // TUI startup by `daemon_launch::load_or_create_operator_token`
+            // and persisted to `~/.cm/operator-token`; the daemon
+            // reads the same value from its `CM_OPERATOR_TOKEN`
+            // spawn env.
+            operator_token_id: crate::daemon_launch::operator_token(),
             // Slice 10c-e-3b-fix: TUI is source of truth for uid.
             // The same uid is already baked into the MCP config
             // (CM_TUI_SESSION_ID env block written above by
@@ -7075,7 +7079,7 @@ impl App {
             let daemon_socket = cm_daemon::default_socket_path();
             if let Err(e) = crate::client_session::rpc_kill_session(
                 &daemon_socket,
-                "tui-operator",
+                crate::daemon_launch::operator_token(),
                 uid,
             ) {
                 eprintln!(
@@ -7132,7 +7136,7 @@ impl App {
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_set_transcript_path(
             &daemon_socket,
-            "tui-operator",
+            crate::daemon_launch::operator_token(),
             daemon_uid,
             &path_str,
         ) {
@@ -7176,7 +7180,7 @@ impl App {
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_set_workflow_context(
             &daemon_socket,
-            "tui-operator",
+            crate::daemon_launch::operator_token(),
             daemon_uid,
             run_id,
             role,
@@ -7252,7 +7256,7 @@ impl App {
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
             &daemon_socket,
-            "tui-operator",
+            crate::daemon_launch::operator_token(),
             &sessions,
         ) {
             eprintln!(
@@ -7306,7 +7310,7 @@ impl App {
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
             &daemon_socket,
-            "tui-operator",
+            crate::daemon_launch::operator_token(),
             &[],
         ) {
             eprintln!(
@@ -7333,7 +7337,7 @@ impl App {
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
             &daemon_socket,
-            "tui-operator",
+            crate::daemon_launch::operator_token(),
             &self.workflows,
         ) {
             eprintln!(
@@ -7378,7 +7382,7 @@ impl App {
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_task_update_tree(
             &daemon_socket,
-            "tui-operator",
+            crate::daemon_launch::operator_token(),
             &tasks,
             &workspaces,
         ) {

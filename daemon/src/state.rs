@@ -341,6 +341,17 @@ pub struct DaemonState {
     /// task in `task_tree` with no `task_workspaces` entry is
     /// in backlog — no workspace yet).
     pub task_workspaces: HashMap<String, String>,
+    /// Mirrors [`tui_sessions_pushed`] for `task_tree`. `false`
+    /// until the TUI sends its first `task.update_tree` snapshot
+    /// (even an empty one), `true` thereafter. Lets
+    /// `auth::check_session_caller` distinguish "tree was pushed
+    /// and has no descendant relationship" (true `OutOfScope`) from
+    /// "tree hasn't been pushed yet" (retryable). Without the
+    /// distinction, a Session-caller RPC that arrives in the
+    /// startup window before the TUI's first push gets
+    /// `Unauthorized` for what would normally be a valid
+    /// descendant-task call once the snapshot lands.
+    pub task_tree_pushed: bool,
     /// Sub-2b-3 review-5 #1: per-worktree FIFO spawn queues.
     /// `Arc`-shared so the spawn-main path can clone the
     /// queue out of the state lock and enqueue without
@@ -489,6 +500,7 @@ impl Default for DaemonState {
             attach_addr: String::new(),
             task_tree: HashMap::new(),
             task_workspaces: HashMap::new(),
+            task_tree_pushed: false,
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
             tui_sessions: HashMap::new(),
             tui_sessions_pushed: false,

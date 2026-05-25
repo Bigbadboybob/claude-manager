@@ -81,6 +81,14 @@ pub enum AuthDecision {
     /// Both live, but target is outside caller's scope (different
     /// workspace and not self). Wire-level: `Unauthorized`.
     OutOfScope,
+    /// Tasked-caller path failed because `state.task_tree` is
+    /// empty AND the TUI hasn't pushed yet (`task_tree_pushed ==
+    /// false`). This is the startup-window race — the daemon has
+    /// no way to evaluate descendant-task auth until the first
+    /// `task.update_tree` arrives. Wire-level: `Conflict` so the
+    /// caller knows it's retry-after-state-change rather than a
+    /// permanent denial.
+    TaskTreeNotYetSynced,
 }
 
 impl AuthDecision {
@@ -193,6 +201,22 @@ pub fn check_session_caller(
                         caller_task,
                     ) {
                         AuthDecision::Allow
+                    } else if state.task_tree.is_empty()
+                        && !state.task_tree_pushed
+                        && target_task != caller_task
+                    {
+                        // The walk failed and we genuinely don't
+                        // know whether the target is a descendant
+                        // — the TUI snapshot hasn't landed yet.
+                        // Surface as retryable rather than a
+                        // definitive denial. (If the tree is
+                        // non-empty OR was deliberately pushed as
+                        // empty, the answer is a confident "no"
+                        // and OutOfScope is correct.) Self-task
+                        // short-circuits in
+                        // `task_is_self_or_descendant_of` so we
+                        // only reach here for cross-task targets.
+                        AuthDecision::TaskTreeNotYetSynced
                     } else {
                         AuthDecision::OutOfScope
                     }
@@ -399,9 +423,19 @@ mod tests {
         );
     }
 
-    /// Empty task_tree with tasked caller → only self-task
-    /// targets pass. Pre-snapshot behavior: safer-than-TUI
-    /// default until `task.update_tree` lands.
+    /// Empty task_tree + tasked caller: same-task target is
+    /// always Allow (self-or-self short-circuit), cross-task target
+    /// depends on whether the TUI has pushed yet.
+    ///
+    /// Startup-window race (`!task_tree_pushed`): cross-task →
+    /// `TaskTreeNotYetSynced` so the agent retries instead of
+    /// seeing a permanent denial for what would normally be a
+    /// valid descendant call.
+    ///
+    /// Steady-state empty tree (`task_tree_pushed = true`, e.g.
+    /// TUI pushed `tasks: []`): cross-task → `OutOfScope`. The
+    /// TUI is saying "no tasks exist" and the daemon should treat
+    /// that as a confident denial.
     #[test]
     fn tasked_caller_empty_task_tree_only_allows_same_task() {
         let a = make_session_tasked("ts-a", "ws-1", Some("task-shared"));
@@ -413,12 +447,29 @@ mod tests {
             AuthDecision::Allow,
             "same task_id is the only descendant relationship the empty tree can prove",
         );
-        // Different tasks, empty tree → no Allow path.
+        // Different tasks, empty tree, NOT pushed (startup window)
+        // → TaskTreeNotYetSynced, the retryable error.
         let c = make_session_tasked("ts-c", "ws-1", Some("task-different"));
         let mut state2 = state_with(vec![
             make_session_tasked("ts-a", "ws-1", Some("task-shared")),
             c,
         ]);
+        assert!(!state2.task_tree_pushed);
+        assert_eq!(
+            check_session_caller(&state2, "ts-a", "ts-c"),
+            AuthDecision::TaskTreeNotYetSynced,
+            "before the TUI's first task.update_tree push, cross-task auth \
+             can't be evaluated yet — return a retryable Conflict-class error",
+        );
+        // Different tasks, empty tree, pushed (TUI says no tasks)
+        // → OutOfScope, a confident denial.
+        state2.task_tree_pushed = true;
+        assert_eq!(
+            check_session_caller(&state2, "ts-a", "ts-c"),
+            AuthDecision::OutOfScope,
+            "after the TUI's push of an empty tree, cross-task auth is a \
+             definitive denial (the TUI is saying no tasks exist)",
+        );
         // Empty tree — no parent_task_id info.
         assert_eq!(state2.task_tree.len(), 0);
         assert_eq!(

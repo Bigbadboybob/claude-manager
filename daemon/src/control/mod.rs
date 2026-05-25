@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod dispatch;
 pub mod methods;
+pub mod operator;
 pub mod protocol;
 pub mod stream;
 pub mod wire;

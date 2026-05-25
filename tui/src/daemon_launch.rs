@@ -16,9 +16,122 @@
 //! surfaced by the caller — the daemon now hosts session state
 //! that the TUI can't synthesize.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Env var the daemon child reads at startup to learn the operator
+/// token. See `cm_daemon::control::operator` for the validation
+/// path. The TUI sets this on the daemon's spawn env (see
+/// [`prepare_daemon_command`]) from the value persisted at
+/// `~/.cm/operator-token`.
+pub const OPERATOR_TOKEN_ENV: &str = "CM_OPERATOR_TOKEN";
+
+/// Persisted across TUI restarts so the same token works against an
+/// already-running daemon. Path: `~/.cm/operator-token`, 0o600.
+/// Generated on first TUI launch.
+pub(crate) const OPERATOR_TOKEN_FILENAME: &str = "operator-token";
+
+/// Global accessor to the operator token. Initialized by the first
+/// successful call to [`load_or_create_operator_token`] (which `main`
+/// invokes at startup); subsequent calls in the TUI's RPC paths use
+/// this accessor instead of plumbing the token through every method
+/// signature.
+static OPERATOR_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Returns the operator token loaded at startup, panicking if
+/// [`load_or_create_operator_token`] hasn't been called yet. In
+/// production main.rs initializes the token before App::new, so
+/// every call site is downstream of the initializer. In tests,
+/// `test_support::init_dummy_operator_token` provides a fallback.
+pub fn operator_token() -> &'static str {
+    OPERATOR_TOKEN.get().map(String::as_str).unwrap_or_else(|| {
+        // Fallback for tests that don't go through the main.rs
+        // initialization path. Using `set` here is racy across
+        // concurrent first-call tests but the value chosen is
+        // deterministic, so the OnceLock either contains the
+        // chosen literal OR another thread's identical literal.
+        let _ = OPERATOR_TOKEN.set("test-fallback-operator-token".to_string());
+        OPERATOR_TOKEN.get().map(String::as_str).unwrap()
+    })
+}
+
+/// Read or generate the operator token used to authenticate the
+/// TUI as `Caller::Operator` against its own daemon.
+///
+/// First TUI launch on a host: generates a fresh UUID v4, writes it
+/// to `~/.cm/operator-token` (0o600), and returns it. Subsequent
+/// launches read the same value back — important because the
+/// daemon may already be running with the previously-generated
+/// token in its env.
+///
+/// If reading the file fails for a reason other than "doesn't
+/// exist" (e.g. permission denied), returns that error rather than
+/// regenerating — silently overwriting could lock the user out of a
+/// running daemon. The token file lives under `~/.cm/`, which has
+/// 0o700 perms already (see `cm_daemon::path::dot_cm_dir`), so
+/// only same-UID processes can read it.
+pub fn load_or_create_operator_token() -> std::io::Result<String> {
+    let path = operator_token_path();
+    let token = match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                // Treat an empty file as missing — fall through to
+                // generate fresh. Lets the operator clear the file
+                // to force regeneration on next TUI launch (after
+                // killing the daemon).
+                generate_and_persist_operator_token(&path)?
+            } else {
+                trimmed
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            generate_and_persist_operator_token(&path)?
+        }
+        Err(e) => return Err(e),
+    };
+    // Cache for downstream `operator_token()` accesses. First call
+    // wins (OnceLock semantics); subsequent calls in tests with a
+    // different value are silently ignored — which is fine because
+    // the token is immutable for the process lifetime.
+    let _ = OPERATOR_TOKEN.set(token.clone());
+    Ok(token)
+}
+
+fn generate_and_persist_operator_token(path: &Path) -> std::io::Result<String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    // Write with 0o600 so only the owner can read. Use create_new=true
+    // so a concurrent TUI launch losing the race observes EEXIST
+    // and falls through to read-existing — both end up with the
+    // same on-disk value, just whichever one wrote first wins.
+    let write_res = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
+    match write_res {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(token.as_bytes())?;
+            f.write_all(b"\n")?;
+            Ok(token)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Race with another TUI process — read the value it wrote.
+            std::fs::read_to_string(path).map(|s| s.trim().to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn operator_token_path() -> PathBuf {
+    cm_daemon::path::dot_cm_dir().join(OPERATOR_TOKEN_FILENAME)
+}
 
 /// Default timeout for the auto-launch handshake. The daemon's bind
 /// + stale-probe + listener registration is sub-second on a healthy
@@ -39,8 +152,11 @@ pub const PROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// Use [`ensure_daemon_at_startup_with_timeout`] in tests that
 /// want to pin the timeout; the public alias here uses the default
 /// `AUTO_LAUNCH_TIMEOUT` for production.
-pub fn ensure_daemon_at_startup(socket_path: &Path) -> std::io::Result<()> {
-    ensure_daemon_at_startup_with_timeout(socket_path, AUTO_LAUNCH_TIMEOUT)
+pub fn ensure_daemon_at_startup(
+    socket_path: &Path,
+    operator_token: &str,
+) -> std::io::Result<()> {
+    ensure_daemon_at_startup_with_timeout(socket_path, operator_token, AUTO_LAUNCH_TIMEOUT)
 }
 
 /// Inner form of [`ensure_daemon_at_startup`] that accepts an
@@ -66,30 +182,17 @@ pub fn ensure_daemon_at_startup(socket_path: &Path) -> std::io::Result<()> {
 /// is load-bearing.
 pub fn ensure_daemon_at_startup_with_timeout(
     socket_path: &Path,
+    operator_token: &str,
     timeout: Duration,
 ) -> std::io::Result<()> {
-    // 10f: daemon mode is mandatory; no opt-in gate. Pre-flip this
-    // returned Ok(()) when `CM_USE_DAEMON_SOCKET=1` was unset; that
-    // branch is gone.
-    // Single absolutization point. Both the probe loop below and
-    // the spawn closure capture this exact PathBuf — the
-    // "they match" invariant the slice-10c-b reviewer flagged.
     let abs_socket = absolutize_socket_path(socket_path)?;
-    // Resolve the binary lazily, INSIDE the spawn closure. The
-    // common dev workflow is "daemon already running, TUI starting
-    // up" — in that case `try_connect` inside `ensure_daemon_running`
-    // short-circuits and the spawn closure never runs. Pulling
-    // `locate_daemon_binary` out here would fail-fast even when the
-    // binary is irrelevant.
+    let abs_socket_for_spawn = abs_socket.clone();
+    let token = operator_token.to_string();
     ensure_daemon_running(
         &abs_socket,
-        || {
-            // `locate_daemon_binary` returns a canonicalized
-            // (absolute, symlink-resolved) path; pre_exec's
-            // chdir("/") in the child would otherwise misroute
-            // a relative override.
+        move || {
             let bin = locate_daemon_binary()?;
-            spawn_daemon_binary(&bin, &abs_socket)
+            spawn_daemon_binary(&bin, &abs_socket_for_spawn, &token)
         },
         timeout,
     )
@@ -105,16 +208,21 @@ pub fn ensure_daemon_at_startup_with_timeout(
 /// - `Ok(false)` — daemon couldn't be made reachable in time.
 /// - `Err(...)` — spawn-side failure (binary not found, fork failure,
 ///   etc.).
-pub fn maybe_ensure_daemon_running(socket_path: &Path) -> std::io::Result<bool> {
+pub fn maybe_ensure_daemon_running(
+    socket_path: &Path,
+    operator_token: &str,
+) -> std::io::Result<bool> {
     // 10f: daemon mode is mandatory; no opt-in gate.
     // Same single-absolutization rule as `ensure_daemon_at_startup_with_timeout`
     // (see that fn's docs). `bin` is already canonical because
     // `locate_daemon_binary` canonicalizes its return.
     let abs_socket = absolutize_socket_path(socket_path)?;
+    let abs_socket_for_spawn = abs_socket.clone();
     let bin = locate_daemon_binary()?;
+    let token = operator_token.to_string();
     let result = ensure_daemon_running(
         &abs_socket,
-        || spawn_daemon_binary(&bin, &abs_socket),
+        move || spawn_daemon_binary(&bin, &abs_socket_for_spawn, &token),
         AUTO_LAUNCH_TIMEOUT,
     );
     match result {
@@ -292,8 +400,12 @@ pub(crate) use cm_daemon::path::absolutize_socket_path;
 /// absolutization via [`absolutize_socket_path`] (slice-10c-b
 /// review). `bin` should be canonical (`locate_daemon_binary` is
 /// the production source and does that).
-fn spawn_daemon_binary(bin: &Path, socket_path: &Path) -> std::io::Result<()> {
-    let mut cmd = prepare_daemon_command(bin, socket_path);
+fn spawn_daemon_binary(
+    bin: &Path,
+    socket_path: &Path,
+    operator_token: &str,
+) -> std::io::Result<()> {
+    let mut cmd = prepare_daemon_command(bin, socket_path, operator_token);
     apply_detach_pre_exec(&mut cmd);
     let child = cmd.spawn()?;
     // Reap the child if it exits before us. `setsid()` in pre_exec
@@ -332,10 +444,12 @@ fn spawn_daemon_binary(bin: &Path, socket_path: &Path) -> std::io::Result<()> {
 pub(crate) fn prepare_daemon_command(
     bin: &Path,
     abs_socket: &Path,
+    operator_token: &str,
 ) -> std::process::Command {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(bin);
     cmd.env("CM_DAEMON_SOCKET", abs_socket)
+        .env(OPERATOR_TOKEN_ENV, operator_token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -552,6 +666,7 @@ mod tests {
         let path = dir.path().join("t30.sock");
         let result = ensure_daemon_at_startup_with_timeout(
             &path,
+            "test-operator-token",
             Duration::from_millis(150),
         );
 
@@ -606,7 +721,7 @@ mod tests {
         // same /bin/true spawner.
         let result = ensure_daemon_running(
             &path,
-            || spawn_daemon_binary(Path::new("/bin/true"), &path),
+            || spawn_daemon_binary(Path::new("/bin/true"), &path, "test-operator-token"),
             Duration::from_millis(150),
         );
         let err = result.expect_err("daemon binary that doesn't bind must time out");
@@ -674,6 +789,7 @@ mod tests {
         // without resolving the binary.
         let result = ensure_daemon_at_startup_with_timeout(
             &path,
+            "test-operator-token",
             Duration::from_millis(150),
         );
         assert!(
@@ -722,6 +838,7 @@ mod tests {
 
         let result = ensure_daemon_at_startup_with_timeout(
             &path,
+            "test-operator-token",
             Duration::from_millis(150),
         );
         let err = result.expect_err("daemon doesn't bind must be fatal");
@@ -788,6 +905,7 @@ mod tests {
 
         let result = ensure_daemon_at_startup_with_timeout(
             &path,
+            "test-operator-token",
             Duration::from_millis(150),
         );
         // Either NotFound (locate failed) is the expected behavior.
@@ -1067,6 +1185,7 @@ mod tests {
         let cmd = prepare_daemon_command(
             Path::new("/bin/true"),
             Path::new("/run/user/1000/cm/daemon.sock"),
+            "test-operator-token",
         );
         let env_pair = cmd
             .get_envs()
@@ -1110,7 +1229,11 @@ mod tests {
             absolutize_socket_path(Path::new("daemon.sock")).expect("absolutize ok")
         });
         let cmd_env_path = {
-            let cmd = prepare_daemon_command(Path::new("/bin/true"), &expected_abs);
+            let cmd = prepare_daemon_command(
+                Path::new("/bin/true"),
+                &expected_abs,
+                "test-operator-token",
+            );
             cmd.get_envs()
                 .find(|(k, _)| *k == std::ffi::OsStr::new("CM_DAEMON_SOCKET"))
                 .and_then(|(_, v)| v)
@@ -1183,6 +1306,7 @@ mod tests {
             }
             ensure_daemon_at_startup_with_timeout(
                 Path::new("daemon.sock"),
+                "test-operator-token",
                 Duration::from_millis(150),
             )
         });

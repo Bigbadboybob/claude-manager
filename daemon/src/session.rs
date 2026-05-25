@@ -1190,6 +1190,16 @@ impl PendingSession {
         for (k, v) in &params.env {
             cmd.env(k, v);
         }
+        // Defense-in-depth for the operator-token plumbing
+        // (`cm_daemon::control::operator`): a daemon-spawned agent
+        // must NOT inherit the daemon's `CM_OPERATOR_TOKEN`,
+        // otherwise it could forge `Caller::Operator` and bypass
+        // descendant-scoped Session-caller auth. portable-pty's
+        // `CommandBuilder::new` is not documented as env-clearing
+        // by default, so explicitly override the var with an empty
+        // value (which the daemon treats as "unset" — see
+        // `operator::init_from_env`'s `.filter(!is_empty)`).
+        cmd.env("CM_OPERATOR_TOKEN", "");
         if let Some(wd) = &params.working_dir {
             cmd.cwd(wd);
         }

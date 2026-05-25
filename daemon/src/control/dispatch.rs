@@ -77,9 +77,39 @@ use crate::attach::{
     self, AttachOpenParams, AttachOpenResponse, SessionAttachParams, SessionAttachResponse,
 };
 use crate::control::methods;
+use crate::control::operator;
 use crate::control::protocol::{Caller, ErrorCode, Request, Response};
 use crate::session::SharedLastExit;
 use crate::state::DaemonState;
+
+/// Gate for Operator-only methods. Rejects Session callers with
+/// `session_message` (method-specific explanation of why this RPC is
+/// Operator-only) and rejects Operator callers with a wrong / missing
+/// token using a generic "bad operator token" message. Returns `Err`
+/// to short-circuit the dispatch arm; `Ok(())` to proceed.
+///
+/// Why two messages: the Session-caller rejection is a deliberate
+/// diagnostic for agents that wandered onto an Operator-only method.
+/// The operator-token mismatch is a defensive check against forged
+/// `Caller::Operator` frames (a same-UID local process could otherwise
+/// trivially bypass the Session-caller gate). See `operator.rs` for
+/// the threat-model + backward-compat semantics.
+fn require_operator(
+    req: &Request,
+    session_message: &'static str,
+) -> Result<(), Response> {
+    if matches!(req.caller, Caller::Session(_)) {
+        return Err(Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            session_message,
+        ));
+    }
+    if let Err(msg) = operator::validate_operator(&req.caller) {
+        return Err(Response::err(req.id.clone(), ErrorCode::Unauthorized, msg));
+    }
+    Ok(())
+}
 
 /// Handle that an [`DispatchOutcome::AttachStream`] carries
 /// alongside the OK response. `handle_connection` passes it into
@@ -384,12 +414,11 @@ pub fn dispatch_request(
 /// would have caused agents to get `InvalidParams` errors even
 /// when auth passed (Finding #3).
 fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "start_session is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth + wire-shape alignment with the Python MCP tool",
-        );
+    if let Err(resp) = require_operator(
+        req,
+        "start_session is Operator-callable only through slice 10d-mcp-surface-1; Session-caller path re-enables in sub-2 after task-subtree auth + wire-shape alignment with the Python MCP tool",
+    ) {
+        return resp;
     }
     match methods::start_session(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -569,15 +598,14 @@ fn dispatch_set_transcript_path(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "session.set_transcript_path is Operator-callable only — \
-             the TUI owns transcript-path discovery; a Session caller \
-             setting this would let an agent redirect the Python MCP \
-             `read_session_output` tool to an attacker-chosen file",
-        );
+    if let Err(resp) = require_operator(
+        req,
+        "session.set_transcript_path is Operator-callable only — \
+         the TUI owns transcript-path discovery; a Session caller \
+         setting this would let an agent redirect the Python MCP \
+         `read_session_output` tool to an attacker-chosen file",
+    ) {
+        return resp;
     }
     match methods::set_transcript_path(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -595,15 +623,14 @@ fn dispatch_set_workflow_context(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "session.set_workflow_context is Operator-callable only — \
-             a Session caller setting this could declare itself a \
-             participant of an arbitrary workflow and forge \
-             workflow_transition / workflow_done calls",
-        );
+    if let Err(resp) = require_operator(
+        req,
+        "session.set_workflow_context is Operator-callable only — \
+         a Session caller setting this could declare itself a \
+         participant of an arbitrary workflow and forge \
+         workflow_transition / workflow_done calls",
+    ) {
+        return resp;
     }
     match methods::set_workflow_context(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -617,13 +644,12 @@ fn dispatch_task_update_tree(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "task.update_tree is Operator-callable only — a Session caller \
-             rewriting the task tree could escape their own auth scope",
-        );
+    if let Err(resp) = require_operator(
+        req,
+        "task.update_tree is Operator-callable only — a Session caller \
+         rewriting the task tree could escape their own auth scope",
+    ) {
+        return resp;
     }
     match methods::task_update_tree(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -640,15 +666,14 @@ fn dispatch_tui_update_sessions_snapshot(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "tui.update_sessions_snapshot is Operator-callable only — a \
-             Session caller rewriting the TUI session map could grant \
-             itself visibility into another task's sessions when the \
-             10d-2 workflow-method auth consumer reads from this map",
-        );
+    if let Err(resp) = require_operator(
+        req,
+        "tui.update_sessions_snapshot is Operator-callable only — a \
+         Session caller rewriting the TUI session map could grant \
+         itself visibility into another task's sessions when the \
+         10d-2 workflow-method auth consumer reads from this map",
+    ) {
+        return resp;
     }
     match methods::tui_update_sessions_snapshot(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -665,15 +690,14 @@ fn dispatch_workflow_update_definitions(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    if matches!(req.caller, Caller::Session(_)) {
-        return Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "workflow.update_definitions is Operator-callable only — a \
-             Session caller (i.e. an agent) rewriting the workflow's \
-             transition table could redirect the daemon's on_idle gate \
-             and defeat the workflow author's intent",
-        );
+    if let Err(resp) = require_operator(
+        req,
+        "workflow.update_definitions is Operator-callable only — a \
+         Session caller (i.e. an agent) rewriting the workflow's \
+         transition table could redirect the daemon's on_idle gate \
+         and defeat the workflow author's intent",
+    ) {
+        return resp;
     }
     match methods::workflow_update_definitions(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
@@ -835,14 +859,13 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
 /// 10e plan §3 wire shape.
 fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOutcome {
     // Operator-only at the dispatch boundary. Same shape as
-    // `start_session`'s guard (dispatch.rs around L324).
-    if matches!(req.caller, Caller::Session(_)) {
-        return DispatchOutcome::Done(Response::err(
-            req.id.clone(),
-            ErrorCode::Unauthorized,
-            "manifest.watch is Operator-only (no Session-caller use case)"
-                .to_string(),
-        ));
+    // `start_session`'s guard; the helper handles both the
+    // Session-caller rejection and operator-token validation.
+    if let Err(resp) = require_operator(
+        req,
+        "manifest.watch is Operator-only (no Session-caller use case)",
+    ) {
+        return DispatchOutcome::Done(resp);
     }
 
     // Subscribe FIRST. After this call returns, any
@@ -2104,7 +2127,13 @@ mod tests {
             let session = crate::session::DaemonSession::spawn(sp).unwrap();
             state.lock().unwrap().sessions.insert("ts-child".into(), session);
         }
-        // Before pushing the tree, parent → child is OutOfScope.
+        // Before pushing the tree, parent → child cannot be
+        // authorized yet — the daemon has no descendant info to
+        // walk. Pre-startup-race-fix this returned Unauthorized
+        // (a confident denial), which was misleading because
+        // the answer would change once the TUI's task.update_tree
+        // landed. Post-fix it surfaces as a retryable `Conflict`
+        // with a "task tree not yet synced" message.
         let before = dispatch_request(
             &state,
             &session_request(
@@ -2114,7 +2143,7 @@ mod tests {
             ),
         ).into_response();
         assert!(!before.ok);
-        assert_eq!(before.error.unwrap().code, ErrorCode::Unauthorized);
+        assert_eq!(before.error.unwrap().code, ErrorCode::Conflict);
         // TUI pushes the task tree.
         let push = dispatch_request(
             &state,

@@ -97,9 +97,11 @@ pub enum ManifestEvent {
     Diff(ManifestDiff),
 }
 
-/// Hardcoded operator-caller token used for all TUI→daemon RPCs.
-/// Matches `app.rs`'s existing convention (line ~2789 of app.rs).
-const OPERATOR_TOKEN_ID: &str = "tui-operator";
+// Operator-caller token is loaded at TUI startup and shared with the
+// daemon via `CM_OPERATOR_TOKEN`. We resolve it lazily through
+// `crate::daemon_launch::operator_token()` so this module doesn't
+// take a dependency on App and the worker thread can read the
+// already-cached value.
 
 /// Reconnect backoff base (first dial-failure sleep before retry).
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -252,7 +254,7 @@ fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
                 .unwrap_or(0),
         ),
         caller: Caller::Operator(CallerOperator {
-            token_id: OPERATOR_TOKEN_ID.to_string(),
+            token_id: crate::daemon_launch::operator_token().to_string(),
         }),
         method: "manifest.watch".to_string(),
         params: serde_json::json!({}),
@@ -489,7 +491,10 @@ mod tests {
         assert_eq!(req.method, "manifest.watch");
         match req.caller {
             Caller::Operator(op) => {
-                assert_eq!(op.token_id, OPERATOR_TOKEN_ID);
+                // Operator token is whatever load_or_create_operator_token
+                // returns in the test process — non-empty is sufficient
+                // for this assertion's purpose (testing the wire path).
+                assert!(!op.token_id.is_empty(), "operator token must be set");
             }
             other => panic!("expected Operator caller, got {:?}", other),
         }

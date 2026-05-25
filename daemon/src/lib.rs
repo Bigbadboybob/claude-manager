@@ -293,6 +293,12 @@ fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
 /// request, and receive a structured response. End-to-end test in
 /// `daemon/tests/accept_loop.rs` confirms that.
 pub fn run() -> anyhow::Result<()> {
+    // Operator-token validation reads $CM_OPERATOR_TOKEN from env
+    // exactly once at startup. If unset, validation is disabled and
+    // the helper logs a one-time warning. The TUI sets this when
+    // launching the daemon (see tui/src/daemon_launch.rs).
+    control::operator::init_from_env();
+
     let path = default_socket_path();
     let listener = bind_socket(&path).map_err(|e| {
         anyhow::anyhow!("failed to bind cm-daemon socket at {}: {}", path.display(), e)

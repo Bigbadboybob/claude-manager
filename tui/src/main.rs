@@ -54,7 +54,27 @@ fn main() -> anyhow::Result<()> {
     // to a dead socket and lose session ownership. Loud failure on
     // startup is the only safe shape.
     let daemon_socket = cm_daemon::default_socket_path();
-    if let Err(e) = daemon_launch::ensure_daemon_at_startup(&daemon_socket) {
+    // Load (or generate-and-persist) the operator token BEFORE
+    // spawning the daemon. The daemon reads the same value from
+    // `CM_OPERATOR_TOKEN` in its spawn env and uses it to authenticate
+    // every `Caller::Operator` RPC. See
+    // `tui/src/daemon_launch.rs::load_or_create_operator_token`.
+    let operator_token = match daemon_launch::load_or_create_operator_token() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "cm-tui: failed to load/create ~/.cm/operator-token: {}",
+                e,
+            );
+            eprintln!(
+                "cm-tui: the operator token is the shared secret the TUI presents to its own \
+                 daemon. Without it, every daemon RPC will be unauthorized. Fix: ensure \
+                 ~/.cm is owned by you and writable."
+            );
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = daemon_launch::ensure_daemon_at_startup(&daemon_socket, &operator_token) {
         eprintln!(
             "cm-tui: failed to launch cm-daemon at {}: {}",
             daemon_socket.display(),

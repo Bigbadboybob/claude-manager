@@ -1092,6 +1092,16 @@ fn return_auth_error_if_denied(
                 caller_uid, target_uid
             ),
         )),
+        AuthDecision::TaskTreeNotYetSynced => Err((
+            ErrorCode::Conflict,
+            format!(
+                "Session caller '{}' targeting '{}' cannot be authorized yet — \
+                 the TUI's task-tree snapshot hasn't reached the daemon. \
+                 This is the startup-window race; retry the RPC after a brief \
+                 delay (the TUI pushes the snapshot during its own startup).",
+                caller_uid, target_uid
+            ),
+        )),
     }
 }
 
@@ -2070,6 +2080,10 @@ pub fn task_update_tree(
     let p: TaskUpdateTreeParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("task.update_tree params: {}", e)))?;
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    // Flag the first push so `auth::check_session_caller` can
+    // distinguish "tree pushed and target genuinely out of scope"
+    // from "tree hasn't been pushed yet" — see `DaemonState::task_tree_pushed`.
+    state.task_tree_pushed = true;
     // Replace, not merge. The TUI sends the full tree on every
     // update; partial updates aren't a thing (see module doc).
     state.task_tree.clear();
