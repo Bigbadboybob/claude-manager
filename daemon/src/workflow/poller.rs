@@ -2362,6 +2362,558 @@ mod tests {
         );
     }
 
+    /// 10d-2c-2-2-c T3 extension — `active_role` flipped to `None`
+    /// mid-tick (e.g. workflow_done landed between snapshot and
+    /// apply). Daemon's `expected_from` check sees active_role
+    /// is None, but expected is "worker" → mismatch → Conflict.
+    /// No event written, no state mutation by the poller.
+    #[test]
+    fn poll_once_stale_active_role_none_rejected_by_expected_from() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-t3-none");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-t3-none");
+        crate::workflow::run::modify("r-t3-none", |r| {
+            r.role_sessions.insert(
+                "reviewer".to_string(),
+                RoleBinding {
+                    session_label: "reviewer".to_string(),
+                    current_session_id: Some("sid-r".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+        })
+        .expect("add reviewer binding");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let make_role = |p: &str| Role {
+                engine: Engine::ClaudeCode,
+                context: Context::Persistent,
+                activation_prompt: Some(p.to_string()),
+                subsequent_activation_prompt: None,
+                needs_mcp: false,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), make_role("w"));
+            roles.insert("reviewer".to_string(), make_role("r"));
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-w-t3-none",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-t3-none".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-w-t3-none".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-t3-none", "worker", "ts-w-t3-none");
+
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        // Hook: simulate workflow_done landing — clear
+        // active_role on disk between snapshot and apply.
+        poller.set_pre_apply_hook_for_test(|_s: &mut DaemonState| {
+            crate::workflow::run::modify("r-t3-none", |r| {
+                r.active_role = None;
+            })
+            .expect("clear active_role");
+        });
+
+        let _ = poller.poll_once();
+        let post = crate::workflow::run::load_one("r-t3-none")
+            .expect("post load");
+        assert!(
+            post.active_role.is_none(),
+            "active_role stays None (hook's value); apply was \
+             rejected pre-mutation. Got: {:?}",
+            post.active_role,
+        );
+        // Iteration unchanged from seed (1).
+        assert_eq!(
+            post.iteration, 1,
+            "iteration must not advance — apply rejected by \
+             expected_from mismatch",
+        );
+        // No event written.
+        let (events, _) =
+            crate::workflow::events::read_new("r-t3-none", 0);
+        assert!(
+            events.is_empty(),
+            "no event written — apply rejected. Got: {:?}",
+            events,
+        );
+    }
+
+    /// 10d-2c-2-2-c T3 extension — `active_role` flipped to a
+    /// DIFFERENT role (concurrent dynamic transition mid-tick).
+    /// Same Conflict shape as the None case. Belt-and-suspenders
+    /// with the existing F2 stale test, which uses "reviewer";
+    /// this test pins the more general invariant for any
+    /// not-equal-to-expected value.
+    #[test]
+    fn poll_once_stale_active_role_other_role_rejected() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-t3-other");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-t3-other");
+        crate::workflow::run::modify("r-t3-other", |r| {
+            r.role_sessions.insert(
+                "reviewer".to_string(),
+                RoleBinding {
+                    session_label: "reviewer".to_string(),
+                    current_session_id: Some("sid-r".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            r.role_sessions.insert(
+                "manager".to_string(),
+                RoleBinding {
+                    session_label: "manager".to_string(),
+                    current_session_id: Some("sid-m".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+        })
+        .expect("add bindings");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let make_role = |p: &str| Role {
+                engine: Engine::ClaudeCode,
+                context: Context::Persistent,
+                activation_prompt: Some(p.to_string()),
+                subsequent_activation_prompt: None,
+                needs_mcp: false,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), make_role("w"));
+            roles.insert("reviewer".to_string(), make_role("r"));
+            roles.insert("manager".to_string(), make_role("m"));
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                        "manager".to_string(),
+                    ],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-w-t3-other",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-t3-other".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-w-t3-other".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-t3-other", "worker", "ts-w-t3-other");
+
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        // Hook: simulate a concurrent dynamic transition that
+        // flips active_role to "manager" (a different role than
+        // expected="worker" AND different from target="reviewer").
+        poller.set_pre_apply_hook_for_test(|_s: &mut DaemonState| {
+            crate::workflow::run::modify("r-t3-other", |r| {
+                r.active_role = Some("manager".to_string());
+            })
+            .expect("flip active_role to manager");
+        });
+
+        let _ = poller.poll_once();
+        let post = crate::workflow::run::load_one("r-t3-other")
+            .expect("post load");
+        assert_eq!(
+            post.active_role.as_deref(),
+            Some("manager"),
+            "active_role stays at hook's value (manager); apply \
+             rejected by expected_from='worker' mismatch.",
+        );
+        // Iteration unchanged from seed.
+        assert_eq!(
+            post.iteration, 1,
+            "iteration must not advance — handler returned Conflict",
+        );
+    }
+
+    /// 10d-2c-2-2-c R12 — Workflow definition replaced mid-poll
+    /// (between snapshot and apply). The poller's snapshot
+    /// computed a `Decision::ActivateStatic` based on the OLD
+    /// definition; before apply, the TUI re-pushes a new
+    /// definition with a DIFFERENT `on_idle` target. The apply
+    /// path calls `workflow_transition` with the target_role
+    /// from the snapshot-time decision — that target is passed
+    /// as an explicit param, NOT re-derived from the definition
+    /// at apply time. Result: the snapshot-time decision
+    /// commits; new definition takes effect next tick.
+    ///
+    /// This is the "definition reload doesn't retroactively
+    /// invalidate in-flight decisions" invariant. The
+    /// alternative (re-validate target against new definition)
+    /// would mean a definition push could fail in-flight fires
+    /// silently, which is worse.
+    ///
+    /// Companion to F2's stale-snapshot test (which DID reject
+    /// because the run's `active_role` itself changed, not just
+    /// the workflow definition).
+    #[test]
+    fn poll_once_workflow_definition_replaced_mid_apply_commits_snapshot_decision() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        // Setup mirrors T1's: idle worker → reviewer.
+        let wt = _tmp_home.path().join("wt-r12");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-r12-defswap");
+        // Add reviewer + manager bindings to the on-disk run so
+        // the handler's target-role validation passes regardless
+        // of which definition is active. (Cache-only mutation
+        // here would be wiped by the handler's `try_modify`
+        // reload from disk.)
+        crate::workflow::run::modify("r-r12-defswap", |r| {
+            r.role_sessions.insert(
+                "reviewer".to_string(),
+                RoleBinding {
+                    session_label: "reviewer".to_string(),
+                    current_session_id: Some("sid-reviewer".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            r.role_sessions.insert(
+                "manager".to_string(),
+                RoleBinding {
+                    session_label: "manager".to_string(),
+                    current_session_id: Some("sid-manager".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+        })
+        .expect("add reviewer + manager role bindings");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let make_role = |prompt: &str| Role {
+                engine: Engine::ClaudeCode,
+                context: Context::Persistent,
+                activation_prompt: Some(prompt.to_string()),
+                subsequent_activation_prompt: None,
+                needs_mcp: false,
+            };
+            let mut old_roles = BTreeMap::new();
+            old_roles.insert("worker".to_string(), make_role("w"));
+            old_roles.insert("reviewer".to_string(), make_role("r"));
+            old_roles.insert("manager".to_string(), make_role("m"));
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles: old_roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                        "manager".to_string(),
+                    ],
+                    // OLD transition: worker → reviewer.
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker-r12",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-r12-defswap".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker-r12".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-r12-defswap", "worker", "ts-worker-r12");
+
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        // Pre-apply hook: swap definition to "worker → manager"
+        // (different target than the snapshot-time computation
+        // chose). Snapshot-time decision targeted "reviewer";
+        // the apply path passes "reviewer" as a param.
+        poller.set_pre_apply_hook_for_test(|s: &mut DaemonState| {
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let make_role = |prompt: &str| Role {
+                engine: Engine::ClaudeCode,
+                context: Context::Persistent,
+                activation_prompt: Some(prompt.to_string()),
+                subsequent_activation_prompt: None,
+                needs_mcp: false,
+            };
+            let mut new_roles = BTreeMap::new();
+            new_roles.insert("worker".to_string(), make_role("w"));
+            new_roles.insert("reviewer".to_string(), make_role("r"));
+            new_roles.insert("manager".to_string(), make_role("m"));
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles: new_roles,
+                    role_order: vec![
+                        "worker".to_string(),
+                        "reviewer".to_string(),
+                        "manager".to_string(),
+                    ],
+                    // NEW transition: worker → manager.
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "manager".to_string(),
+                    }],
+                },
+            );
+        });
+
+        // Apply ENABLED: the handler runs and commits the
+        // snapshot-time decision.
+        let _ = poller.poll_once();
+        let post = crate::workflow::run::load_one("r-r12-defswap")
+            .expect("post-poll load");
+        assert_eq!(
+            post.active_role.as_deref(),
+            Some("reviewer"),
+            "snapshot-time decision (target=reviewer) must commit; \
+             definition swap to worker→manager takes effect next \
+             tick. Got active_role={:?}",
+            post.active_role,
+        );
+        assert_eq!(
+            post.iteration, 2,
+            "iteration advances by 1 from snapshot-time commit",
+        );
+    }
+
+    /// 10d-2c-2-2-c R12 outcome (b) — Identical definition
+    /// re-push mid-apply (no actual change). Apply commits
+    /// normally; the re-push is benign.
+    #[test]
+    fn poll_once_identical_definition_repush_mid_apply_commits_cleanly() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-r12b");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-r12b-noop");
+        crate::workflow::run::modify("r-r12b-noop", |r| {
+            r.role_sessions.insert(
+                "reviewer".to_string(),
+                RoleBinding {
+                    session_label: "reviewer".to_string(),
+                    current_session_id: Some("sid-r".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+        })
+        .expect("add reviewer binding");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let make_role = |prompt: &str| Role {
+                engine: Engine::ClaudeCode,
+                context: Context::Persistent,
+                activation_prompt: Some(prompt.to_string()),
+                subsequent_activation_prompt: None,
+                needs_mcp: false,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), make_role("w"));
+            roles.insert("reviewer".to_string(), make_role("r"));
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker-r12b",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-r12b-noop".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker-r12b".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-r12b-noop", "worker", "ts-worker-r12b");
+
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        // Hook: re-push the SAME definition. No-op semantically.
+        poller.set_pre_apply_hook_for_test(|s: &mut DaemonState| {
+            use crate::workflow::toml_schema::{
+                Context, Role, Transition, TriggerOn, Workflow,
+            };
+            let make_role = |prompt: &str| Role {
+                engine: Engine::ClaudeCode,
+                context: Context::Persistent,
+                activation_prompt: Some(prompt.to_string()),
+                subsequent_activation_prompt: None,
+                needs_mcp: false,
+            };
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), make_role("w"));
+            roles.insert("reviewer".to_string(), make_role("r"));
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles,
+                    role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                    transitions: vec![Transition {
+                        from: "worker".to_string(),
+                        on: TriggerOn::Idle,
+                        to: "reviewer".to_string(),
+                    }],
+                },
+            );
+        });
+
+        let _ = poller.poll_once();
+        let post = crate::workflow::run::load_one("r-r12b-noop")
+            .expect("post-poll load");
+        assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+        assert_eq!(post.iteration, 2);
+    }
+
     /// F4 — Empty rendered prompt does NOT skip the transition;
     /// daemon fires anyway with `args.prompt = ""`. The TUI tail's
     /// existing empty-prompt handling skips just the PTY write.

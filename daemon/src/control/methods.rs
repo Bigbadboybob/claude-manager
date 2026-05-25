@@ -7648,4 +7648,433 @@ mod tests {
             );
         });
     }
+
+    // ============================================================
+    // 10d-2c-2-2-c R13 — concurrent daemon-poller + MCP
+    // workflow_transition. Both orderings tested explicitly.
+    // ============================================================
+
+    /// R13 case A — daemon's `workflow_transition` (Operator,
+    /// expected_from + trigger=static_idle) fires FIRST and wins.
+    /// MCP's Session-caller call fires second and sees
+    /// post-mutation state where `active_role` no longer
+    /// matches the caller's bound `workflow_role` → Unauthorized.
+    ///
+    /// Sequential calls suffice — the flock is acquired/released
+    /// between calls, but the OUTCOME (second call sees state
+    /// mutated by first call) is the same. The point of R13 is
+    /// the precondition asymmetry: daemon uses `expected_from`
+    /// (R4 explicit param); MCP uses Session-caller auth (R1
+    /// implicit gate). Both must reject the loser.
+    #[test]
+    fn workflow_transition_r13_daemon_first_mcp_unauthorized() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r13_a", "worker");
+            // MCP agent's bound session: workflow_run_id +
+            // workflow_role = worker. After daemon's mutation
+            // (active_role → reviewer), the MCP auth check
+            // (active_role == caller's bound role) fails.
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-mcp-worker",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "/tmp/seed-task-key".to_string();
+                sp.workflow_run_id = Some("wf_r13_a".to_string());
+                sp.workflow_role = Some("worker".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-mcp-worker".to_string(), ds);
+            }
+
+            // Daemon-poller-shape call (Operator, expected_from,
+            // trigger=static_idle). Wins.
+            workflow_transition(
+                &state,
+                &Caller::operator("daemon-poller"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "",
+                    "role": "worker",
+                    "run_id": "wf_r13_a",
+                    "expected_from": "worker",
+                    "trigger": "static_idle",
+                }),
+            )
+            .expect("daemon fire wins");
+
+            // MCP-shape call (Session caller, no
+            // expected_from/trigger). Loses with Unauthorized
+            // because the caller's bound role (worker) no longer
+            // matches active_role (reviewer).
+            let err = workflow_transition(
+                &state,
+                &Caller::session("ts-mcp-worker"),
+                &json!({
+                    "to": "manager",
+                    "prompt": "p",
+                    "role": "worker",
+                    "run_id": "wf_r13_a",
+                }),
+            )
+            .expect_err("MCP must lose");
+            assert_eq!(
+                err.0,
+                ErrorCode::Unauthorized,
+                "MCP's auth check fails: caller's bound role \
+                 (worker) != post-mutation active_role (reviewer). \
+                 Got: {:?}",
+                err,
+            );
+
+            // Final state: daemon's transition committed.
+            let post = crate::workflow::run::load_one("wf_r13_a")
+                .expect("load");
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+            // Exactly one event written (daemon's).
+            let (events, _) =
+                crate::workflow::events::read_new("wf_r13_a", 0);
+            assert_eq!(
+                events.len(),
+                1,
+                "exactly one event — daemon's. Got: {:?}",
+                events,
+            );
+            assert_eq!(events[0].source, "daemon");
+        });
+    }
+
+    /// R13 case B — MCP's Session-caller `workflow_transition`
+    /// fires FIRST and wins. Daemon's call fires second; its
+    /// `expected_from: "worker"` param no longer matches the
+    /// post-mutation `active_role` → Conflict.
+    ///
+    /// Asymmetry note: the daemon-poller path uses the R4
+    /// explicit `expected_from` param to reject. The MCP path
+    /// uses the R1 implicit Session-caller auth check. Different
+    /// code paths, both must reject the loser. This test pins
+    /// the daemon-loses ordering.
+    #[test]
+    fn workflow_transition_r13_mcp_first_daemon_conflict() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_r13_b", "worker");
+            {
+                let mut s = state.lock().unwrap();
+                let mut sp = crate::session::SpawnParams::new(
+                    "ts-mcp-worker-b",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "/tmp/seed-task-key".to_string();
+                sp.workflow_run_id = Some("wf_r13_b".to_string());
+                sp.workflow_role = Some("worker".to_string());
+                let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+                s.sessions.insert("ts-mcp-worker-b".to_string(), ds);
+            }
+
+            // MCP-shape call (Session caller, no expected_from).
+            // Wins.
+            workflow_transition(
+                &state,
+                &Caller::session("ts-mcp-worker-b"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "p",
+                    "role": "worker",
+                    "run_id": "wf_r13_b",
+                }),
+            )
+            .expect("MCP fire wins");
+
+            // Daemon-poller-shape call (Operator, expected_from
+            // still "worker"). Loses with Conflict because
+            // active_role is now "reviewer".
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("daemon-poller"),
+                &json!({
+                    "to": "manager",
+                    "prompt": "",
+                    "role": "worker",
+                    "run_id": "wf_r13_b",
+                    "expected_from": "worker",
+                    "trigger": "static_idle",
+                }),
+            )
+            .expect_err("daemon must lose");
+            assert_eq!(
+                err.0,
+                ErrorCode::Conflict,
+                "daemon's expected_from='worker' mismatches \
+                 post-mutation active_role='reviewer'. Got: {:?}",
+                err,
+            );
+
+            let post = crate::workflow::run::load_one("wf_r13_b")
+                .expect("load");
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+            let (events, _) =
+                crate::workflow::events::read_new("wf_r13_b", 0);
+            assert_eq!(
+                events.len(),
+                1,
+                "exactly one event — MCP's. Got: {:?}",
+                events,
+            );
+            // MCP-routed event uses source="daemon" too (since
+            // workflow_transition handler always sets that for
+            // daemon-handled events); the discriminator is the
+            // absence of `args.trigger`.
+            assert_eq!(events[0].source, "daemon");
+            assert!(
+                events[0].args.get("trigger").is_none(),
+                "MCP caller's trigger param filtered (R3 F1); \
+                 event must lack args.trigger. Got: {:?}",
+                events[0].args,
+            );
+        });
+    }
+
+    // ============================================================
+    // 10d-2c-2-2-c fire-output parity — state.json byte-comparison
+    // between TUI-direct path and daemon-poller path.
+    // ============================================================
+
+    /// Parity invariant: drive a TUI-direct static fire AND a
+    /// daemon-poller static fire with identical inputs, then
+    /// assert the resulting state.json mutations are
+    /// field-equivalent modulo:
+    ///   - timestamps (`history[].activated_at` / `deactivated_at`)
+    ///   - assistant_count snapshot timing (both should be the
+    ///     same value, but check independently)
+    ///
+    /// For the daemon-poller path, we ALSO simulate the TUI
+    /// tail's `append_history_entry_for_event_target_role` since
+    /// daemon-only fire stops at "active_role advanced + outgoing
+    /// closed"; the new history entry for the target role is
+    /// appended by the TUI tail when it consumes the event.
+    /// Without that simulation, the post-states would diverge by
+    /// construction (one less history entry on daemon path).
+    ///
+    /// Reviewer flagged this as the highest-value drift guard.
+    /// If a future change introduces real divergence, this
+    /// test catches it within a single tick of one workflow.
+    #[test]
+    fn fire_output_parity_state_json_matches_between_paths() {
+        let _tmp = with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-fp");
+            std::fs::create_dir_all(&wt).unwrap();
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).unwrap();
+            // Identical transcript for both runs.
+            std::fs::write(
+                proj.join("sid-fp.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"parity message"}]}}"##,
+            )
+            .unwrap();
+
+            // Seed two runs with identical initial state.
+            seed_workflow_run("wf_parity_tui", "worker");
+            seed_workflow_run("wf_parity_dae", "worker");
+            for run_id in ["wf_parity_tui", "wf_parity_dae"] {
+                crate::workflow::run::modify(run_id, |r| {
+                    if let Some(b) = r.role_sessions.get_mut("worker") {
+                        b.current_session_id = Some("sid-fp".to_string());
+                    }
+                })
+                .expect("bind worker sid");
+            }
+
+            // Workspace + daemon session registered so
+            // `capture_outgoing_last_message` can find them.
+            // Same session_uid for both runs so the daemon-path
+            // can find one — but the workflow_run_id tag
+            // disambiguates which run's call captures.
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-fp".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-fp".to_string(), ws);
+                // One session for TUI path's capture lookup.
+                let mut sp_t = crate::session::SpawnParams::new(
+                    "ts-w-fp-tui",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp_t.args = vec!["60".to_string()];
+                sp_t.workspace_id = "ws-fp".to_string();
+                sp_t.workflow_run_id = Some("wf_parity_tui".to_string());
+                sp_t.workflow_role = Some("worker".to_string());
+                let ds_t = crate::session::DaemonSession::spawn(sp_t).expect("spawn");
+                s.sessions.insert("ts-w-fp-tui".to_string(), ds_t);
+                // Separate session for daemon path.
+                let mut sp_d = crate::session::SpawnParams::new(
+                    "ts-w-fp-dae",
+                    "worker",
+                    "/bin/sleep",
+                );
+                sp_d.args = vec!["60".to_string()];
+                sp_d.workspace_id = "ws-fp".to_string();
+                sp_d.workflow_run_id = Some("wf_parity_dae".to_string());
+                sp_d.workflow_role = Some("worker".to_string());
+                let ds_d = crate::session::DaemonSession::spawn(sp_d).expect("spawn");
+                s.sessions.insert("ts-w-fp-dae".to_string(), ds_d);
+            }
+
+            // ============================================
+            // TUI-direct path: in-process equivalent of
+            // `fire_transition` — close + activate.
+            // ============================================
+            let captured = crate::workflow::transcript::last_message(
+                &crate::workflow::toml_schema::Engine::ClaudeCode,
+                &wt,
+                "sid-fp",
+            );
+            // Mirror what TUI's `fire_transition` does inside
+            // its `run::modify` closure.
+            crate::workflow::run::modify("wf_parity_tui", |r| {
+                r.close_active_role(captured.clone());
+                r.activate_role(
+                    "reviewer".to_string(),
+                    crate::workflow::run::TriggerKind::StaticIdle {
+                        from_role: "worker".to_string(),
+                    },
+                    /* start_count */ 1, // post-baseline count
+                );
+            })
+            .expect("tui fire");
+
+            // ============================================
+            // Daemon-poller path: workflow_transition + tail
+            // simulation.
+            // ============================================
+            workflow_transition(
+                &state,
+                &Caller::operator("daemon-poller"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "",
+                    "role": "worker",
+                    "run_id": "wf_parity_dae",
+                    "expected_from": "worker",
+                    "trigger": "static_idle",
+                }),
+            )
+            .expect("daemon fire");
+            // Simulate the TUI tail consuming the event +
+            // appending the target role's history entry. Reads
+            // the daemon's emitted event for the post-mutation
+            // iteration value (`event.iteration`).
+            let (events, _) =
+                crate::workflow::events::read_new("wf_parity_dae", 0);
+            assert_eq!(events.len(), 1, "exactly one daemon event");
+            let ev_iter = events[0].iteration;
+            crate::workflow::run::modify("wf_parity_dae", |r| {
+                r.append_history_entry_for_event_target_role(
+                    "reviewer",
+                    ev_iter,
+                    crate::workflow::run::TriggerKind::StaticIdle {
+                        from_role: "worker".to_string(),
+                    },
+                    /* start_count */ 1,
+                );
+            })
+            .expect("tail-append");
+
+            // ============================================
+            // Compare states.
+            // ============================================
+            let tui = crate::workflow::run::load_one("wf_parity_tui")
+                .expect("load tui");
+            let dae = crate::workflow::run::load_one("wf_parity_dae")
+                .expect("load daemon");
+
+            assert_eq!(
+                tui.active_role, dae.active_role,
+                "active_role must match",
+            );
+            assert_eq!(
+                tui.iteration, dae.iteration,
+                "iteration must match",
+            );
+            assert_eq!(
+                tui.history.len(),
+                dae.history.len(),
+                "history length must match (initial + worker-closed + reviewer-active = 3 ... actually 2 since `WorkflowRun::new`'s seed entry is for the initial role and stays closed). Got tui={}, dae={}",
+                tui.history.len(),
+                dae.history.len(),
+            );
+            // Field-by-field comparison of each history entry,
+            // modulo timestamps.
+            for (i, (t, d)) in
+                tui.history.iter().zip(dae.history.iter()).enumerate()
+            {
+                assert_eq!(
+                    t.role, d.role,
+                    "history[{}].role drift",
+                    i,
+                );
+                assert_eq!(
+                    t.iteration, d.iteration,
+                    "history[{}].iteration drift",
+                    i,
+                );
+                assert_eq!(
+                    t.session_id, d.session_id,
+                    "history[{}].session_id drift",
+                    i,
+                );
+                assert_eq!(
+                    t.last_message, d.last_message,
+                    "history[{}].last_message DRIFT — this is the \
+                     parity-test high-value assertion. TUI and \
+                     daemon paths must capture the same last \
+                     message for the closing role.",
+                    i,
+                );
+                assert_eq!(
+                    t.assistant_count_at_start,
+                    d.assistant_count_at_start,
+                    "history[{}].assistant_count_at_start drift",
+                    i,
+                );
+                // Trigger comparison: serialize to JSON value
+                // so the comparison is structure-aware (matches
+                // the on-wire shape pinned by
+                // `serialize_trigger_wire_shape`).
+                let t_trig =
+                    serde_json::to_value(&t.trigger).expect("ser tui trigger");
+                let d_trig =
+                    serde_json::to_value(&d.trigger).expect("ser dae trigger");
+                assert_eq!(
+                    t_trig, d_trig,
+                    "history[{}].trigger drift (post-R3 fix both \
+                     paths should produce StaticIdle{{from_role}})",
+                    i,
+                );
+                // deactivated_at: closed entries (history[0], the
+                // worker entry) should be Some on both; active
+                // entries (history[1], the reviewer) should be
+                // None on both. Exact timestamps differ across
+                // paths so we only check the Some/None shape.
+                assert_eq!(
+                    t.deactivated_at.is_some(),
+                    d.deactivated_at.is_some(),
+                    "history[{}].deactivated_at shape drift (Some/None)",
+                    i,
+                );
+            }
+        });
+    }
 }
