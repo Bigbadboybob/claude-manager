@@ -340,6 +340,29 @@ pub fn run() -> anyhow::Result<()> {
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
 
+    // 10d-2c-2-2-a: spawn the workflow on_idle poller. 2c-2-2-a's
+    // gate is hard-coded to "TUI owns" so this is a no-op behavior
+    // change — the loop runs and produces decisions but every
+    // decision is `Skip{TuiOwns}`. 2c-2-2-b flips the gate.
+    //
+    // Failure to spawn the poller thread is logged-and-continued,
+    // not fatal: the daemon's core dispatch path doesn't depend on
+    // polling, and TUI-driven static `on_idle` still works for
+    // opt-in-off sessions. Matches the `spawn_watcher` pattern
+    // (slice 10d-memory-cap-relocation): transient resource
+    // pressure during startup shouldn't crash the daemon.
+    let poller = std::sync::Arc::new(
+        workflow::poller::WorkflowPoller::new(std::sync::Arc::clone(&state)),
+    );
+    if let Err(e) = poller.start() {
+        eprintln!(
+            "cm-daemon: workflow poller thread spawn failed: {}; \
+             daemon continuing without workflow polling (TUI-driven \
+             static on_idle still works for opt-in-off sessions)",
+            e,
+        );
+    }
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
@@ -363,6 +386,12 @@ pub fn run() -> anyhow::Result<()> {
     // Best-effort cleanup. If the daemon was killed hard, the inode
     // stays and the next start's stale-socket probe handles it.
     let _ = std::fs::remove_file(&path);
+    // 10d-2c-2-2-a: signal the poller to exit. The accept loop has
+    // already broken (listener dropped or EBADF on shutdown), so
+    // dispatch-side threads will wind down on their own; the
+    // poller is the one long-running auxiliary that needs an
+    // explicit signal.
+    poller.shutdown();
     Ok(())
 }
 
