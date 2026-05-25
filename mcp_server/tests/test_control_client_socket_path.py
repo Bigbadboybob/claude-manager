@@ -86,58 +86,30 @@ class DefaultSocketPathTests(unittest.TestCase):
                     Path(tmp) / ".cm" / "tui.sock",
                 )
 
-    def test_opt_in_uses_daemon_sock_when_it_exists(self):
-        # CM_USE_DAEMON_SOCKET=1 is the developer opt-in for the
-        # daemon-preferred resolution. Resolves to daemon.sock when
-        # the file is present.
+    # 10f: deleted `test_opt_in_uses_daemon_sock_when_it_exists` —
+    # the opt-in resolution branch is gone (daemon-mandatory model;
+    # routing is decided by explicit env vars set by build_env).
+
+    def test_opt_in_env_var_silently_ignored_after_flip(self):
+        # 10f: `CM_USE_DAEMON_SOCKET` is now a silent no-op. With
+        # neither CM_DAEMON_SOCKET nor CM_TUI_SOCKET set, the
+        # resolver falls through to `~/.cm/tui.sock` regardless of
+        # the env var's value. This pins the post-flip ignore
+        # contract.
         with TemporaryDirectory() as tmp:
             cm_dir = Path(tmp) / ".cm"
             cm_dir.mkdir()
             (cm_dir / "daemon.sock").touch()
-            with mock.patch.dict(
-                "os.environ",
-                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
-                clear=True,
-            ):
-                self.assertEqual(
-                    default_socket_path(),
-                    cm_dir / "daemon.sock",
-                )
-
-    def test_opt_in_falls_through_to_tui_sock_when_daemon_sock_missing(self):
-        # Opt-in still falls back to tui.sock when the daemon socket
-        # isn't on disk — guards against breaking the path when the
-        # daemon isn't running.
-        with TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                "os.environ",
-                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
-                clear=True,
-            ):
-                self.assertEqual(
-                    default_socket_path(),
-                    Path(tmp) / ".cm" / "tui.sock",
-                )
-
-    def test_opt_in_value_must_be_literal_1(self):
-        # Avoid false positives from CM_USE_DAEMON_SOCKET=true /
-        # CM_USE_DAEMON_SOCKET=yes / "" — the contract is the
-        # literal "1" to keep the opt-in explicit during the
-        # transition. Stricter than typical boolean envs.
-        with TemporaryDirectory() as tmp:
-            cm_dir = Path(tmp) / ".cm"
-            cm_dir.mkdir()
-            (cm_dir / "daemon.sock").touch()
-            for misleading in ("true", "yes", "0", "", "TRUE"):
+            for env_val in ("1", "true", "yes", "0", "", "TRUE"):
                 with mock.patch.dict(
                     "os.environ",
-                    {"HOME": tmp, "CM_USE_DAEMON_SOCKET": misleading},
+                    {"HOME": tmp, "CM_USE_DAEMON_SOCKET": env_val},
                     clear=True,
                 ):
                     self.assertEqual(
                         default_socket_path(),
                         cm_dir / "tui.sock",
-                        f"CM_USE_DAEMON_SOCKET={misleading!r} must not opt in",
+                        f"CM_USE_DAEMON_SOCKET={env_val!r} must be ignored post-flip",
                     )
 
     def test_missing_home_falls_back_to_tmp(self):

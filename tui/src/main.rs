@@ -47,25 +47,30 @@ use config::Config;
 fn main() -> anyhow::Result<()> {
     let config = Config::load();
 
-    // Daemon auto-launch is gated on `CM_USE_DAEMON_SOCKET=1` (slice 11
-    // + slice 13 of doc/persistent-host-daemon.md). With the opt-in
-    // off (the current default), this is a no-op and the clean-home
-    // path is byte-identical to today. With the opt-in on, the daemon
-    // MUST come up — `mcp_config::build_env` also branches off the
-    // same flag and injects `CM_DAEMON_SOCKET` into spawned MCP
-    // agents, so a soft fallback would pin every agent to a dead
-    // socket. Loud opt-in, loud failure: log and exit non-zero so the
-    // user can see the problem and fix it instead of debugging
-    // confusing MCP errors downstream.
+    // 10f default-flip: daemon mode is now mandatory. The TUI cannot
+    // operate without the daemon — `mcp_config::build_env` injects
+    // `CM_DAEMON_SOCKET` into every spawned MCP agent, and session
+    // state lives on the daemon. A soft fallback would pin agents
+    // to a dead socket and lose session ownership. Loud failure on
+    // startup is the only safe shape.
     let daemon_socket = cm_daemon::default_socket_path();
     if let Err(e) = daemon_launch::ensure_daemon_at_startup(&daemon_socket) {
         eprintln!(
-            "cm-tui: CM_USE_DAEMON_SOCKET=1 set but cm-daemon could not be launched at {}: {}",
+            "cm-tui: failed to launch cm-daemon at {}: {}",
             daemon_socket.display(),
             e,
         );
         eprintln!(
-            "cm-tui: refusing to start with a broken daemon path. Either unset CM_USE_DAEMON_SOCKET or fix the daemon (build with `cargo build -p cm-daemon`, set CM_DAEMON_BINARY, check ~/.cm permissions)."
+            "cm-tui: cannot start without the daemon. Fixes:"
+        );
+        eprintln!(
+            "  - Build the daemon: `cargo build -p cm-daemon`"
+        );
+        eprintln!(
+            "  - Override the binary path: `CM_DAEMON_BINARY=/path/to/cm-daemon cm-tui`"
+        );
+        eprintln!(
+            "  - Check permissions on ~/.cm/ (the daemon binds the socket there)"
         );
         std::process::exit(1);
     }

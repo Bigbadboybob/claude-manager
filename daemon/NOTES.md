@@ -418,14 +418,20 @@ Tests (4 new, all green 5x):
 > - The reconnect test's "TUI restart picks up the existing daemon session" assertion is the load-bearing
 >   one. Bound it on `state.sessions.contains_key(&uid)` polling rather than wall-clock sleeps.
 
-### Slice 10f — Default flip + cleanup
+### Slice 10f — Default flip + cleanup (SHIPPED)
 
-- Default socket flips to `~/.cm/daemon.sock` in both `mcp_config.rs::build_env` and `control_client.py::default_socket_path`. The legacy `tui.sock` resolution becomes the fallback for one release. Regression test added at slice 13 catches any premature flip.
-- Remove `tui/src/control/server.rs` + `queue.rs`. The TUI no longer hosts a socket.
-- Remove `CM_USE_DAEMON_SOCKET` (now unconditional behavior). Mark the env var as no-op-with-warning for one release.
-- Reconnect/ring-buffer integration test (slice 14) runs end-to-end: kill TUI mid-session, restart, observe replay through the daemon. Named acceptance criterion green.
+- Daemon mode is now mandatory. `CM_USE_DAEMON_SOCKET=1` is a silent no-op.
+- 9 Rust opt-in gate sites removed (`tui/src/main.rs`, `daemon_launch.rs` ×2, `manifest_watch.rs` ×1, `app.rs` ×7). `opt_in_enabled()` function deleted.
+- Python `resolve_socket_route()` opt-in branch removed; routing now keyed entirely off explicit `CM_DAEMON_SOCKET` / `CM_TUI_SOCKET` env vars set by `build_env`.
+- TUI `main.rs` startup error message tightened: lists `cargo build -p cm-daemon`, `CM_DAEMON_BINARY` override, and `~/.cm/` permission checks as fixes.
+- 7 Rust tests + 4 Python tests deleted (premise contradictory under daemon-mandatory); 5 tests renamed/repurposed; 2 net-new (`daemon_auto_launch_unconditional_post_flip`, `should_spawn_is_unconditional_post_flip`).
+- `tui/src/control/server.rs` + `queue.rs` removal deferred to a follow-up (still hosts the workflow-side socket; the per-method routing convention from sub-2c means both sockets stay active for now).
 
-**Working-set check:** new default is the daemon path. Old MCP clients that hardcode `tui.sock` still work via the legacy fallback. Tests cover both.
+**Working-set check:** daemon is always-on, hard-required. The historical legacy single-process path is gone.
+
+### Reconnect/ring-buffer test (NEXT)
+
+The named acceptance criterion's final gate: end-to-end kill-TUI-mid-session → restart → observe replay through the daemon. Not yet shipped.
 
 ## Estimated commit count
 

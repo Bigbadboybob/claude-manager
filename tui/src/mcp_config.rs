@@ -34,37 +34,36 @@ pub struct WorkflowMeta<'a> {
 
 /// Which spawn path is generating this MCP config — slice 10c-e-3a.
 ///
-/// Phase 1 has a transitional period where some spawn paths are
-/// daemon-side (`A-n` / `A-s` user sessions under
-/// `CM_USE_DAEMON_SOCKET=1`) and others are still TUI-local
-/// (workflow participant respawns, attach-active, every path under
-/// opt-in-off). The MCP server inside the spawned process must
-/// route its callbacks to the socket that *actually owns* the
-/// session — a workflow role calling `workflow_transition` against
-/// the daemon (which has no workflow state) would surface as
-/// `UnknownMethod`, not a clean abort.
+/// Some spawn paths are daemon-side (A-n/A-s user sessions of
+/// daemon-eligible engines: `claude`, `codex`) and others are
+/// TUI-local (workflow participant respawns, attach-active,
+/// ad-hoc bash, gcloud). The MCP server inside the spawned
+/// process must route its callbacks to the socket that *actually
+/// owns* the session — a workflow role calling
+/// `workflow_transition` against the daemon (which has no
+/// workflow state) would surface as `UnknownMethod`, not a clean
+/// abort.
 ///
-/// Pre-10c-e-3a the env routing was keyed off `CM_USE_DAEMON_SOCKET`
-/// globally — flipping the opt-in flipped MCP routing for *every*
-/// spawn even though only some are daemon-side. That conflates "the
-/// daemon exists" with "this particular spawn is daemon-side."
-/// Per-spawn routing is the structural fix.
+/// Pre-10c-e-3a the env routing was keyed off a global flag,
+/// conflating "the daemon exists" with "this particular spawn is
+/// daemon-side." Per-spawn routing is the structural fix.
 ///
-/// Each call site explicitly declares which it's spawning. The
-/// opt-in flag still gates whether a path *may* choose
-/// [`SpawnTarget::Daemon`] (via `daemon_launch::opt_in_enabled`),
-/// but the parameter is what `build_env` consumes.
+/// Each call site explicitly declares which it's spawning, and
+/// `build_env` consumes that parameter to populate the right
+/// socket pins. 10f: with daemon-mandatory, the choice is purely
+/// per-session — eligible engines target `Daemon`, others stay
+/// `TuiLocal`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpawnTarget {
-    /// The spawned process is a TUI-local PTY (the default for
-    /// every spawn that hasn't migrated to the daemon yet —
-    /// workflow respawns, attach-active, ad-hoc bash, the entire
-    /// opt-off path). Its MCP server child resolves to
-    /// `~/.cm/tui.sock`.
+    /// The spawned process is a TUI-local PTY (workflow respawns,
+    /// attach-active sessions, ad-hoc bash, gcloud — anything
+    /// outside the daemon-eligible engine set). Its MCP server
+    /// child resolves to `~/.cm/tui.sock`.
     TuiLocal,
-    /// The spawned process is a daemon-owned PTY (10c-e-3 opt-in
-    /// path: `A-n` / `A-s` under `CM_USE_DAEMON_SOCKET=1`). Its
-    /// MCP server child resolves to `~/.cm/daemon.sock`.
+    /// The spawned process is a daemon-owned PTY (A-n / A-s for
+    /// `claude` / `codex` session types — 10f flipped these to
+    /// always route through the daemon). Its MCP server child
+    /// resolves to `~/.cm/daemon.sock`.
     Daemon,
 }
 
@@ -148,10 +147,8 @@ fn build_env(
             env.insert("CM_TUI_SOCKET".into(), tui_sock_abs);
             // Authoritative empty: overrides any inherited
             // `CM_DAEMON_SOCKET` (a developer might have exported
-            // it from earlier daemon-path testing, OR the TUI was
-            // launched with `CM_USE_DAEMON_SOCKET=1` and inherited
-            // env contains the daemon path — neither should leak
-            // to a TUI-local spawn). Without this the resolver
+            // it from earlier daemon-path testing — should not
+            // leak to a TUI-local spawn). Without this the resolver
             // could silently route past the TUI pin.
             env.insert("CM_DAEMON_SOCKET".into(), String::new());
         }
@@ -330,35 +327,10 @@ fn escape_toml(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Save+restore guard for `CM_USE_DAEMON_SOCKET` so a test that
-    /// flips it can't leak into adjacent tests sharing the env lock.
-    struct DaemonOptInGuard {
-        prev: Option<std::ffi::OsString>,
-    }
-    impl DaemonOptInGuard {
-        fn off() -> Self {
-            let prev = std::env::var_os("CM_USE_DAEMON_SOCKET");
-            // SAFETY: process-global env; serialized via `home_lock`
-            // in the caller. Restored in Drop.
-            unsafe { std::env::remove_var("CM_USE_DAEMON_SOCKET"); }
-            Self { prev }
-        }
-        fn on() -> Self {
-            let prev = std::env::var_os("CM_USE_DAEMON_SOCKET");
-            unsafe { std::env::set_var("CM_USE_DAEMON_SOCKET", "1"); }
-            Self { prev }
-        }
-    }
-    impl Drop for DaemonOptInGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
-                    None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
-                }
-            }
-        }
-    }
+    // 10f: deleted `DaemonOptInGuard` — the
+    // `CM_USE_DAEMON_SOCKET` env var no longer affects routing
+    // (build_env decides per `SpawnTarget`, not per env). Tests
+    // below no longer set/restore the var.
 
     /// Save+restore guard for an arbitrary env var, so a test that
     /// pollutes the process env going in can't leak that pollution
@@ -395,7 +367,6 @@ mod tests {
         // on the TUI socket even if the agent inherited a
         // CM_DAEMON_SOCKET value from somewhere upstream.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
         let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
         assert_eq!(env.get("CM_TUI_SESSION_ID").map(String::as_str), Some("uid-x"));
 
@@ -425,7 +396,6 @@ mod tests {
         // routes per-method via DAEMON_METHODS; both env vars
         // must carry real paths.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
         let env = build_env(SpawnTarget::Daemon, "uid-x", None);
 
         let daemon_sock = env.get("CM_DAEMON_SOCKET").expect("CM_DAEMON_SOCKET present");
@@ -457,7 +427,6 @@ mod tests {
         // TUI-local ones. With per-spawn SpawnTarget, the opt-in
         // env no longer affects this decision.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::on(); // opt-in ON
         let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
 
         let tui_sock = env
@@ -489,7 +458,6 @@ mod tests {
         // routing is what build_env consumes. This makes the
         // SpawnTarget the single source of truth.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off(); // opt-in OFF
         let env = build_env(SpawnTarget::Daemon, "uid-x", None);
 
         let daemon_sock = env
@@ -526,7 +494,6 @@ mod tests {
         // through the env-merge that Claude/Codex does when
         // spawning the MCP child.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
         let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "/leaked/daemon.sock");
         // Sanity check that our pollution is actually in the
         // process env (i.e. the test fixture is exercising the
@@ -570,7 +537,6 @@ mod tests {
         // The agent's resolver will see both and route
         // per-method.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::on();
         let env = build_env(SpawnTarget::Daemon, "uid-x", None);
         assert!(
             env.get("CM_DAEMON_SOCKET").map(|v| !v.is_empty()).unwrap_or(false),
@@ -585,7 +551,6 @@ mod tests {
     #[test]
     fn build_env_includes_workflow_when_present() {
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
         let env = build_env(
             SpawnTarget::TuiLocal,
             "uid-x",
@@ -680,7 +645,6 @@ mod tests {
     #[test]
     fn build_env_absolutizes_relative_daemon_socket_under_daemon_target() {
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::on();
         // Relative override — set via env so default_socket_path
         // picks it up. The test must observe an absolute result.
         let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "rel/cm/daemon.sock");
@@ -722,7 +686,6 @@ mod tests {
         // `crate::control::server::default_socket_path` which
         // reads `CM_TUI_SOCKET`.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
         let _polluted = EnvVarGuard::set("CM_TUI_SOCKET", "rel/cm/tui.sock");
 
         let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
@@ -761,7 +724,6 @@ mod tests {
         // Argv must be element-wise identical regardless of
         // SpawnTarget for both unresumed and resumed shapes.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
 
         for sid in [None, Some("01234567-89ab-cdef-0123-456789abcdef")] {
             let (local_prog, local_args) = build_args(
@@ -799,7 +761,6 @@ mod tests {
         // env `-c` value is where the routing pin lives and is
         // expected to differ.
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::off();
 
         let (local_prog, local_args) = build_args(
             SpawnTarget::TuiLocal,
@@ -892,7 +853,6 @@ mod tests {
         // (the helper's contract is passthrough, but build_env's
         // wrapper could plausibly drift).
         let _lock = crate::test_support::home_lock();
-        let _opt = DaemonOptInGuard::on();
         let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "/abs/cm/daemon.sock");
 
         let env = build_env(SpawnTarget::Daemon, "uid-x", None);

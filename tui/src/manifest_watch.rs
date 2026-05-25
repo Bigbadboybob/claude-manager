@@ -24,10 +24,10 @@
 //!          frame, keep reading.
 //!
 //! Lifecycle:
-//!   - Spawned at `App::new` ONLY when daemon mode is opt-in via
-//!     `CM_USE_DAEMON_SOCKET=1` (see [`should_spawn`]). Without
-//!     opt-in, no consumer thread runs and the App's
-//!     `manifest_watch_rx` is `None`.
+//!   - Spawned at `App::new` unconditionally — 10f flipped the
+//!     daemon-mode default and the consumer now always runs in
+//!     production. [`should_spawn`] is retained as the seam tests
+//!     use to skip the consumer in synthetic-App constructions.
 //!   - Owns a reconnect loop with exponential backoff (1s → 30s).
 //!     Daemon restart, socket-not-yet-bound, transient network
 //!     blips: the consumer retries with bounded backoff. On
@@ -126,26 +126,28 @@ pub struct ManifestWatchConsumer {
     pub _thread: JoinHandle<()>,
 }
 
-/// Decide whether to spawn the consumer. The TUI works without a
-/// daemon (legacy single-process mode); spawning a consumer that
-/// tight-loops trying to dial a non-existent socket would burn
-/// CPU + clutter logs. Gate on the opt-in flag.
+/// Decide whether to spawn the consumer. 10f default-flip: the
+/// daemon is mandatory, so the consumer always spawns. Kept as a
+/// helper (rather than being inlined) for test-suite clarity and
+/// because the field types in `maybe_spawn_for_app`'s return
+/// remain `Option` — the helper still answers a meaningful
+/// question even if today's answer is constant.
 ///
 /// `daemon_socket_exists` is NOT required at decision time —
 /// daemon-launch can race with the consumer's first dial. The
 /// reconnect loop handles "socket appears shortly after spawn"
 /// gracefully via the backoff retry.
 pub fn should_spawn() -> bool {
-    crate::daemon_launch::opt_in_enabled()
+    true
 }
 
-/// App-side helper: resolve the daemon socket + opt-in flag,
-/// spawn the consumer if both conditions hold, return
-/// `(Some(rx), Some(thread))` or `(None, None)`. Called once
-/// from `App::new`.
+/// App-side helper: spawn the consumer and return the channel +
+/// thread handle. 10f: post-default-flip the consumer always
+/// runs, so the `Option` is always `Some(...)`. Kept as
+/// `Option<...>` to preserve the test seam used by code that
+/// constructs an App without a live daemon.
 ///
-/// Folded behind one helper so `App::new`'s constructor stays
-/// readable — the daemon-mode-vs-legacy decision lives here.
+/// Called once from `App::new`.
 pub fn maybe_spawn_for_app() -> (
     Option<mpsc::Receiver<ManifestEvent>>,
     Option<JoinHandle<()>>,
@@ -925,5 +927,43 @@ mod tests {
             }
             other => panic!("expected Snapshot event, got {:?}", other),
         }
+    }
+
+    /// T32 (10f) — `should_spawn` no longer consults the opt-in
+    /// env var; the consumer always spawns in production. Pin
+    /// the post-flip contract by scrubbing the env var and
+    /// asserting `should_spawn() == true`.
+    #[test]
+    fn should_spawn_is_unconditional_post_flip() {
+        // We use an env-var save/restore guard but the actual
+        // env state doesn't matter — should_spawn is constant.
+        // Asserting both states pins the post-flip invariant.
+        let prev = std::env::var_os("CM_USE_DAEMON_SOCKET");
+        // SAFETY: process env mutation. Tests in this file don't
+        // share the env lock with daemon_launch.rs; should_spawn
+        // post-flip is env-independent, so this scope is safe.
+        unsafe {
+            std::env::remove_var("CM_USE_DAEMON_SOCKET");
+        }
+        let scrubbed = should_spawn();
+        unsafe {
+            std::env::set_var("CM_USE_DAEMON_SOCKET", "1");
+        }
+        let with_optin = should_spawn();
+        // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CM_USE_DAEMON_SOCKET", v),
+                None => std::env::remove_var("CM_USE_DAEMON_SOCKET"),
+            }
+        }
+        assert!(
+            scrubbed,
+            "should_spawn must return true without opt-in env (post-flip)",
+        );
+        assert!(
+            with_optin,
+            "should_spawn must return true with opt-in env (no-op env var)",
+        );
     }
 }

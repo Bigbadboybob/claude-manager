@@ -2746,12 +2746,12 @@ impl App {
         workflow_run_id: Option<&str>,
         workflow_role: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
-        if !crate::daemon_launch::opt_in_enabled() {
-            return None;
-        }
-        // Map TUI session_type to engine + program builder.
-        // gcloud and other ad-hoc shells aren't daemon-eligible —
-        // fall through to local.
+        // 10f: daemon-eligibility is now driven solely by
+        // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
+        // gate sat here; with the daemon always-on it served no
+        // purpose. Map TUI session_type to engine + program
+        // builder. gcloud and other ad-hoc shells aren't daemon-
+        // eligible — fall through to local.
         let argv_result = match session_type {
             "claude" => crate::mcp_config::build_args(
                 crate::mcp_config::SpawnTarget::Daemon,
@@ -7116,9 +7116,8 @@ impl App {
         let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
             return;
         };
-        if !crate::daemon_launch::opt_in_enabled() {
-            return;
-        }
+        // 10f: daemon-mandatory; no opt-in gate. `daemon_session_uid`
+        // being Some already implies a daemon-spawned session.
         // Resolve path via the engine-specific agent module
         // (the TUI's source of truth for Claude/Codex conventions).
         let Some(wt) = ws.worktree_path.as_deref() else {
@@ -7172,9 +7171,8 @@ impl App {
         let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
             return;
         };
-        if !crate::daemon_launch::opt_in_enabled() {
-            return;
-        }
+        // 10f: daemon-mandatory; `daemon_session_uid` being Some
+        // already implies a daemon-spawned session.
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_set_workflow_context(
             &daemon_socket,
@@ -7221,9 +7219,7 @@ impl App {
     /// `state.tui_sessions`; without that push wired here, 10d-2
     /// would have nothing to read.
     pub(crate) fn push_tui_sessions_to_daemon(&self) {
-        if !crate::daemon_launch::opt_in_enabled() {
-            return;
-        }
+        // 10f: daemon-mandatory; always push.
         // Flatten App.workspaces[*].sessions[*] into one vec —
         // but filter OUT daemon-attached sessions
         // (`session.daemon_session_uid.is_some()`). Those already
@@ -7306,9 +7302,7 @@ impl App {
     /// replaces the stale snapshot. A durable fix requires
     /// daemon-side connection-lifecycle awareness; defer.
     pub(crate) fn clear_tui_sessions_on_daemon(&self) {
-        if !crate::daemon_launch::opt_in_enabled() {
-            return;
-        }
+        // 10f: daemon-mandatory; always clear.
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
             &daemon_socket,
@@ -7335,9 +7329,7 @@ impl App {
     /// startup push is sufficient; the upcoming 2c-2-2 daemon
     /// driver reads from `DaemonState.workflow_definitions`.
     pub(crate) fn push_workflow_definitions_to_daemon(&self) {
-        if !crate::daemon_launch::opt_in_enabled() {
-            return;
-        }
+        // 10f: daemon-mandatory; always push.
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
             &daemon_socket,
@@ -7354,9 +7346,7 @@ impl App {
     }
 
     pub(crate) fn push_task_tree_to_daemon(&self) {
-        if !crate::daemon_launch::opt_in_enabled() {
-            return;
-        }
+        // 10f: daemon-mandatory; always push.
         // Sub-2b-3 review-2 #1: push `workspace_id` per task AND
         // a workspaces map carrying `worktree_path`. Lets the
         // daemon's `mcp_start_session` resolve a descendant

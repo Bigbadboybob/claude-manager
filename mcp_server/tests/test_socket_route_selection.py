@@ -54,13 +54,17 @@ class ResolveSocketRouteTests(unittest.TestCase):
             "CM_TUI_SOCKET signals TUI target",
         )
 
-    def test_use_daemon_opt_in_with_daemon_sock_present(self):
-        """`CM_USE_DAEMON_SOCKET=1` with `~/.cm/daemon.sock` present
-        → chose_daemon=True. Pre-fix, the OPT-IN flag would route the
-        SOCKET to the daemon but `server.py`'s method selection
-        ignored it, so the call dialed daemon with the wrong wire
-        shape. This is the test that exercises the unified
-        decision."""
+    # 10f: deleted `test_use_daemon_opt_in_with_daemon_sock_present`
+    # — the opt-in resolver branch is gone. Routing is now decided
+    # entirely by explicit env vars set by `build_env`. The
+    # always-on equivalent (explicit CM_DAEMON_SOCKET → daemon
+    # route) is covered by other tests in this class.
+
+    def test_env_var_silently_ignored_falls_through_to_tui_sock(self):
+        """10f: `CM_USE_DAEMON_SOCKET` is a silent no-op. With
+        neither CM_DAEMON_SOCKET nor CM_TUI_SOCKET set, every
+        value falls through to `tui.sock`. Repurposed from the
+        prior `test_use_daemon_opt_in_without_daemon_sock_falls_back`."""
         with TemporaryDirectory() as tmp:
             cm_dir = Path(tmp) / ".cm"
             cm_dir.mkdir()
@@ -71,29 +75,13 @@ class ResolveSocketRouteTests(unittest.TestCase):
                 clear=True,
             ):
                 route = resolve_socket_route()
-            self.assertEqual(route.path, cm_dir / "daemon.sock")
-            self.assertTrue(
-                route.chose_daemon,
-                "opt-in + present daemon.sock must signal daemon route — "
-                "the divergence this slice fixes is the method selector "
-                "ignoring this path",
-            )
-
-    def test_use_daemon_opt_in_without_daemon_sock_falls_back(self):
-        """`CM_USE_DAEMON_SOCKET=1` without daemon.sock on disk → falls
-        back to `tui.sock`, chose_daemon=False. The flag is an
-        OPT-IN, not a force — if the daemon binary isn't running and
-        the socket isn't there, the resolver shouldn't send traffic
-        nowhere."""
-        with TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                "os.environ",
-                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
-                clear=True,
-            ):
-                route = resolve_socket_route()
             self.assertEqual(route.path, Path(tmp) / ".cm" / "tui.sock")
-            self.assertFalse(route.chose_daemon)
+            self.assertFalse(
+                route.chose_daemon,
+                "post-10f the env var has NO effect on routing; "
+                "daemon.sock on disk is irrelevant without an explicit "
+                "CM_DAEMON_SOCKET pin",
+            )
 
     def test_no_env_fallback(self):
         """No env vars → tui.sock, chose_daemon=False."""
@@ -372,40 +360,11 @@ class StartSessionPassesResolvedSocketToCallTests(unittest.TestCase):
             "the dial are bound to one resolution",
         )
 
-    def test_start_session_under_opt_in_flag_passes_daemon_path(self):
-        """Under `CM_USE_DAEMON_SOCKET=1` (round-13 opt-in,
-        no explicit CM_DAEMON_SOCKET), the resolved path is
-        `~/.cm/daemon.sock`. server.start_session must pass
-        THAT path to call() — pre-fix the path was missing
-        and `call()` re-resolved (which would also pick the
-        opt-in path, but the binding wasn't there)."""
-        from mcp_server import control_client
-
-        captured: dict = {}
-
-        def fake_call(method, params, *args, socket_path=None, **kw):
-            captured["method"] = method
-            captured["socket_path"] = socket_path
-            return {"session_uid": "ts-fake"}
-
-        with TemporaryDirectory() as tmp:
-            cm_dir = Path(tmp) / ".cm"
-            cm_dir.mkdir()
-            (cm_dir / "daemon.sock").touch()
-            with mock.patch.dict(
-                "os.environ",
-                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
-                clear=True,
-            ), mock.patch.object(control_client, "call", side_effect=fake_call):
-                from mcp_server import server as mcp_server
-
-                mcp_server.start_session(type="bash", label="test")
-        self.assertEqual(captured.get("method"), "mcp_start_session")
-        self.assertEqual(
-            captured.get("socket_path"),
-            cm_dir / "daemon.sock",
-            "opt-in flag must pass `~/.cm/daemon.sock` through to call()",
-        )
+    # 10f: deleted `test_start_session_under_opt_in_flag_passes_daemon_path`
+    # — its premise (opt-in flag routes start_session to daemon
+    # without an explicit CM_DAEMON_SOCKET) is gone. The
+    # explicit-env-var equivalent is covered by the
+    # CM_DAEMON_SOCKET-pinned tests above in this class.
 
     def test_start_session_tui_local_passes_tui_path(self):
         """TUI-spawn (no daemon pin, no opt-in): method is
@@ -703,39 +662,11 @@ class OptInFlagRoutingTests(unittest.TestCase):
     Each test below pins one of the reviewer-named cases.
     """
 
-    def test_opt_in_flag_routes_daemon_methods_to_daemon_socket(self):
-        """`CM_USE_DAEMON_SOCKET=1` + daemon.sock present
-        (no explicit CM_DAEMON_SOCKET): every method in
-        DAEMON_METHODS that an agent would call routes to
-        the daemon socket."""
-        from mcp_server import control_client
-
-        with TemporaryDirectory() as tmp:
-            cm_dir = Path(tmp) / ".cm"
-            cm_dir.mkdir()
-            (cm_dir / "daemon.sock").touch()
-            with mock.patch.dict(
-                "os.environ",
-                {"HOME": tmp, "CM_USE_DAEMON_SOCKET": "1"},
-                clear=True,
-            ):
-                for method in (
-                    "ping",
-                    "mcp_start_session",
-                    "propose_task",
-                    "list_sessions",
-                    "send_input",
-                    "read_session_output",
-                    "kill_session",
-                ):
-                    with self.subTest(method=method):
-                        path = control_client.resolve_socket_for_method(method)
-                        self.assertEqual(
-                            path,
-                            cm_dir / "daemon.sock",
-                            f"opt-in flag must route {method!r} to daemon "
-                            "socket (regression of round-13 opt-in path)",
-                        )
+    # 10f: deleted `test_opt_in_flag_routes_daemon_methods_to_daemon_socket`
+    # — its premise (opt-in flag routes DAEMON_METHODS to daemon
+    # without an explicit CM_DAEMON_SOCKET) is gone post-flip.
+    # Equivalent always-on routing is covered by the
+    # `CM_DAEMON_SOCKET`-pinned tests in this class.
 
     def test_opt_in_flag_routes_tui_methods_to_tui_socket(self):
         """`CM_USE_DAEMON_SOCKET=1`: TUI-only methods like

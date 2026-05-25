@@ -143,18 +143,19 @@ def resolve_socket_route() -> SocketRoute:
     """Resolve the control-socket path AND whether the daemon was
     selected as the target.
 
-    Resolution order (matches `default_socket_path()`'s legacy
-    sequence, with `chose_daemon` set as appropriate at each
-    branch):
+    Resolution order:
 
       1. `$CM_DAEMON_SOCKET` env var. Explicit daemon pin.
-         Injected by the TUI when it spawned this agent with
-         `CM_USE_DAEMON_SOCKET=1`. `chose_daemon=True`.
+         Injected by the TUI when it spawned this agent.
+         `chose_daemon=True`.
       2. `$CM_TUI_SOCKET` env var. Explicit TUI pin.
          `chose_daemon=False`.
-      3. `CM_USE_DAEMON_SOCKET=1` opt-in: if `~/.cm/daemon.sock`
-         exists, route to the daemon. `chose_daemon=True`.
-      4. Fallback to `~/.cm/tui.sock`. `chose_daemon=False`.
+      3. Fallback to `~/.cm/tui.sock`. `chose_daemon=False`.
+
+    10f default-flip: the historical `CM_USE_DAEMON_SOCKET=1`
+    opt-in branch is removed. The env var is now a silent
+    no-op — routing depends entirely on the explicit socket
+    env vars injected by `build_env` at TUI spawn time.
 
     Returns the resolved route unconditionally — connectivity
     is the caller's problem; this function just resolves where
@@ -167,10 +168,6 @@ def resolve_socket_route() -> SocketRoute:
     if tui_env:
         return SocketRoute(Path(tui_env), chose_daemon=False)
     home = Path(os.environ.get("HOME", "/tmp"))
-    if os.environ.get("CM_USE_DAEMON_SOCKET", "").strip() == "1":
-        daemon_sock = home / ".cm" / "daemon.sock"
-        if daemon_sock.exists():
-            return SocketRoute(daemon_sock, chose_daemon=True)
     return SocketRoute(home / ".cm" / "tui.sock", chose_daemon=False)
 
 
@@ -189,12 +186,9 @@ def daemon_socket_pinned() -> bool:
     between daemon-shape and TUI-shape method names (e.g.
     `mcp_start_session` vs `start_session`).
 
-    Sub-2c review-1: delegates to `resolve_socket_route()` so
-    the opt-in `CM_USE_DAEMON_SOCKET=1` path is honored. Pre-fix
-    this checked `CM_DAEMON_SOCKET` directly and missed the
-    opt-in route — `mcp_start_session` / `propose_task` /
-    `list_sessions` would fall through to the TUI socket under
-    the opt-in flag, breaking the round-13 work.
+    10f default-flip: daemon-pinned ≡ `$CM_DAEMON_SOCKET` env
+    var was set (and non-empty) by the spawning TUI. The
+    historical opt-in env var has no effect here.
     """
     return resolve_socket_route().chose_daemon
 
