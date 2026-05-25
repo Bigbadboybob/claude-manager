@@ -1065,21 +1065,13 @@ fn is_valid_session_type(session_type: &str) -> bool {
 /// pre-fix dispatcher's separate-lock pattern had); these
 /// methods short-circuit on the decision before extracting any
 /// per-session handle.
-fn return_auth_error_if_denied(
-    decision: crate::control::auth::AuthDecision,
-    caller_uid: &str,
-    target_uid: &str,
-) -> MethodResult {
-    return_auth_error_if_denied_with_state(decision, caller_uid, target_uid, None)
-}
-
-/// Variant that also consults `state.tui_sessions` so a target uid
-/// missing from `state.sessions` but present in the TUI's snapshot
-/// returns a clearer "TUI-owned, can't be proxied" error instead of
-/// the generic NotFound. Used by `send_input` / `kill_session` /
-/// `read_session_output` where the distinction matters for
-/// diagnostics; pure-Operator helpers can still go through the
-/// state-less wrapper above.
+/// Map an `AuthDecision` to a wire `MethodResult`. Also consults
+/// `state.tui_sessions` so a target uid missing from
+/// `state.sessions` but present in the TUI's snapshot returns a
+/// clearer "TUI-owned, can't be proxied" error instead of the
+/// generic NotFound. `state` is `Option<&DaemonState>` so callers
+/// that genuinely have no state to consult (currently none) can
+/// pass `None`.
 fn return_auth_error_if_denied_with_state(
     decision: crate::control::auth::AuthDecision,
     caller_uid: &str,

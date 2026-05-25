@@ -198,40 +198,6 @@ pub fn ensure_daemon_at_startup_with_timeout(
     )
 }
 
-/// Soft wrapper kept for tests and any future caller that wants
-/// the lossy "Ok(true)/Ok(false)/Err" shape. Production callers
-/// should use [`ensure_daemon_at_startup`] — its semantics align
-/// with the daemon-mandatory "do it or fail loudly" contract.
-///
-/// Returns:
-/// - `Ok(true)` — daemon is reachable.
-/// - `Ok(false)` — daemon couldn't be made reachable in time.
-/// - `Err(...)` — spawn-side failure (binary not found, fork failure,
-///   etc.).
-pub fn maybe_ensure_daemon_running(
-    socket_path: &Path,
-    operator_token: &str,
-) -> std::io::Result<bool> {
-    // 10f: daemon mode is mandatory; no opt-in gate.
-    // Same single-absolutization rule as `ensure_daemon_at_startup_with_timeout`
-    // (see that fn's docs). `bin` is already canonical because
-    // `locate_daemon_binary` canonicalizes its return.
-    let abs_socket = absolutize_socket_path(socket_path)?;
-    let abs_socket_for_spawn = abs_socket.clone();
-    let bin = locate_daemon_binary()?;
-    let token = operator_token.to_string();
-    let result = ensure_daemon_running(
-        &abs_socket,
-        move || spawn_daemon_binary(&bin, &abs_socket_for_spawn, &token),
-        AUTO_LAUNCH_TIMEOUT,
-    );
-    match result {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
 /// Core auto-launch logic, parameterized over the spawner so tests
 /// can inject a cooperating (or non-cooperating) one. Production
 /// callers go through [`maybe_ensure_daemon_running`] with the

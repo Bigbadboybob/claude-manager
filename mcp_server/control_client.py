@@ -12,14 +12,20 @@ Caller identity (`CM_TUI_SESSION_ID`) and the socket path
 process environment — these are injected by the TUI when it spawns the
 agent that hosts this MCP server.
 
-**Phase-1 transitional note** (doc/persistent-host-daemon.md): the
-default is *still* `~/.cm/tui.sock` because the daemon scaffold
-currently closes incoming connections — it doesn't yet dispatch MCP
-RPCs. The default flips to `~/.cm/daemon.sock` once daemon-side
-dispatch lands (the deferred half of slice 4). Set
-`CM_USE_DAEMON_SOCKET=1` to opt into the daemon-socket-preferred
-resolution during integration work; this lets developers exercise the
-new path without breaking everyone else's MCP calls.
+**Routing model post slice 10f** (default-flip):
+
+Each MCP method is statically classified into one of two routing
+sets defined below — `DAEMON_METHODS` (session lifecycle, MCP RPC
+surface) goes to `~/.cm/daemon.sock`; everything else (workflow
+controller, planning, subtask CRUD) stays on `~/.cm/tui.sock`. The
+per-method routing is independent of any single env var; see
+`SocketRoute` and `resolve_socket_for_method` below.
+
+The historical `CM_USE_DAEMON_SOCKET=1` opt-in flag is honored as
+a forwards-compatible override for `default_socket_path()` (the
+fallback path when no per-method routing applies), but no
+production code path relies on it any more — the per-method
+routing above is authoritative.
 """
 
 from __future__ import annotations
