@@ -110,6 +110,12 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Operator-only push from TUI; included for dispatch-surface
     # alignment, not Python-routable.
     "tui.update_sessions_snapshot",
+    # 10d-2c-2-1: operator-only push from TUI of the
+    # workflow-definitions map (loaded from `workflows/*.toml`).
+    # Sets up `DaemonState.workflow_definitions` for the upcoming
+    # 2c-2-2 daemon-resident workflow driver. Included here for
+    # dispatch-surface alignment; not Python-routable.
+    "workflow.update_definitions",
 })
 
 

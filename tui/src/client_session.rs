@@ -863,6 +863,33 @@ pub struct TuiSessionSnapshotPush<'a> {
     pub workflow_role: Option<&'a str>,
 }
 
+/// 10d-2c-2-1: push the full workflow-definitions map to the
+/// daemon (replace-not-merge). Operator-only. The daemon stores
+/// the map on `DaemonState.workflow_definitions`; the upcoming
+/// daemon-resident workflow driver (2c-2-2) reads from there
+/// instead of TUI-resident `App.workflows`.
+///
+/// Called from `App::push_workflow_definitions_to_daemon` once
+/// at TUI startup (after the TOML load). The map is small and
+/// rarely changes — replace-not-merge mirrors
+/// `tui.update_sessions_snapshot` semantics.
+pub fn rpc_workflow_update_definitions(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    workflows: &std::collections::HashMap<
+        String,
+        cm_daemon::workflow::toml_schema::Workflow,
+    >,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "workflow.update_definitions".into(),
+        params: serde_json::json!({ "workflows": workflows }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
 pub fn rpc_task_update_tree(
     daemon_socket: &Path,
     operator_token_id: &str,

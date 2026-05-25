@@ -203,6 +203,14 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_tui_update_sessions_snapshot(state, req))
         }
 
+        // 10d-2c-2-1: TUI-pushed workflow TOML definitions
+        // cached for the upcoming on_idle driver (2c-2-2).
+        // Operator-only — a Session caller could otherwise
+        // rewrite the workflow's transition table mid-run.
+        "workflow.update_definitions" => {
+            DispatchOutcome::Done(dispatch_workflow_update_definitions(state, req))
+        }
+
         // Sub-2b-1: `resolve_authorized_session` — the Python
         // MCP `read_session_output` tool's first leg of its
         // composed pattern. Returns `{state, engine,
@@ -518,6 +526,31 @@ fn dispatch_tui_update_sessions_snapshot(
         );
     }
     match methods::tui_update_sessions_snapshot(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `workflow.update_definitions` — TUI-pushed workflow TOML
+/// definitions (10d-2c-2-1). Operator-only — a Session caller
+/// could otherwise rewrite the transition table for the
+/// workflow it's a participant of and redirect the static-idle
+/// gate, defeating the workflow author's intent.
+fn dispatch_workflow_update_definitions(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if matches!(req.caller, Caller::Session(_)) {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "workflow.update_definitions is Operator-callable only — a \
+             Session caller (i.e. an agent) rewriting the workflow's \
+             transition table could redirect the daemon's on_idle gate \
+             and defeat the workflow author's intent",
+        );
+    }
+    match methods::workflow_update_definitions(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

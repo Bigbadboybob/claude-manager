@@ -297,6 +297,33 @@ pub fn role_turn_complete(
     }
 }
 
+/// 10d-2c-2-1: combined gate predicate. True iff the role has
+/// produced a complete assistant turn at or after `baseline`.
+/// Mirrors the TUI [`crate::agent::Agent::assistant_turn_completed_since`]
+/// default impl — same predicate, just exposed daemon-side so
+/// the upcoming on_idle driver (2c-2-2) can run the gate without
+/// going through the TUI's Agent trait (the TUI's
+/// `Agent::is_idle` already delegates to [`role_turn_complete`],
+/// and `Agent::count_assistant_turns` already delegates to
+/// [`count_messages`]; this helper just composes them into the
+/// single check the gate needs).
+///
+/// Raw [`role_turn_complete`] alone is NOT a valid workflow
+/// gate — it would fire on stale assistant turns produced
+/// before the freshly delivered activation prompt. The
+/// `count > baseline` half is what scopes the predicate to
+/// "new turn since this activation."
+pub fn assistant_turn_completed_since(
+    engine: &Engine,
+    worktree_path: &Path,
+    session_id: &str,
+    baseline: usize,
+) -> bool {
+    count_messages(engine, worktree_path, session_id, MessageKind::Assistant)
+        > baseline
+        && role_turn_complete(engine, worktree_path, session_id)
+}
+
 fn claude_turn_complete(worktree_path: &Path, session_id: &str) -> bool {
     let Some(path) = claude_transcript_path(worktree_path, session_id) else {
         return false;

@@ -391,6 +391,22 @@ pub struct DaemonState {
     /// the two — see `daemon::workflow::run` for the wire
     /// shape.
     pub workflow_runs: HashMap<String, crate::workflow::run::WorkflowRun>,
+
+    /// 10d-2c-2-1: TUI-pushed workflow TOML definitions (
+    /// `~/.cm/workflows/*.toml`, loaded TUI-side at startup).
+    /// Daemon needs them for the upcoming on_idle driver
+    /// (2c-2-2): looking up `static_transition_on_idle` for the
+    /// active role + reading the target role's
+    /// `activation_prompt` template + the role's `engine` /
+    /// `context` knobs.
+    ///
+    /// Replace-not-merge semantics: each call to
+    /// `workflow.update_definitions` clears and re-populates.
+    /// Same shape as `task_tree` and `tui_sessions`. Operator-
+    /// only on the wire — Session-callable would let an agent
+    /// rewrite the workflow's transition map, defeating the
+    /// daemon's static-idle gate.
+    pub workflow_definitions: HashMap<String, crate::workflow::toml_schema::Workflow>,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -457,6 +473,7 @@ impl Default for DaemonState {
             tui_sessions: HashMap::new(),
             tui_sessions_pushed: false,
             workflow_runs: HashMap::new(),
+            workflow_definitions: HashMap::new(),
         }
     }
 }

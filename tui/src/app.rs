@@ -6988,6 +6988,14 @@ impl App {
     pub(crate) fn push_state_to_daemon(&self) {
         self.push_task_tree_to_daemon();
         self.push_tui_sessions_to_daemon();
+        // 10d-2c-2-1: workflow definitions are static after TOML
+        // load, but bundling the push here is the simplest way to
+        // ensure they reach the daemon at least once during the
+        // normal startup chain (App::new → first mutation →
+        // push_state). The re-push cost is a small JSON object
+        // over a local UDS — cheaper than wiring a one-shot at
+        // startup-complete.
+        self.push_workflow_definitions_to_daemon();
     }
 
     /// 10d-1 graceful-shutdown clear: push an explicit empty
@@ -7020,6 +7028,35 @@ impl App {
                 "cm-tui: tui.update_sessions_snapshot (shutdown clear) failed: {} \
                  (daemon will retain stale tui_sessions rows until next TUI restart's \
                  first push — see NOTES.md 'TUI crash-cleanup bound')",
+                e,
+            );
+        }
+    }
+
+    /// 10d-2c-2-1: push the in-memory workflow-definitions map
+    /// (loaded from `workflows/*.toml`) to the daemon. Opt-in
+    /// gated on `CM_USE_DAEMON_SOCKET` — same gate as the other
+    /// daemon-side pushes. Errors are logged-and-continued so a
+    /// daemon hiccup doesn't kill TUI startup.
+    ///
+    /// Called once at `App::new`, immediately after the TOML load.
+    /// Workflow definitions are static after launch, so a single
+    /// startup push is sufficient; the upcoming 2c-2-2 daemon
+    /// driver reads from `DaemonState.workflow_definitions`.
+    pub(crate) fn push_workflow_definitions_to_daemon(&self) {
+        if !crate::daemon_launch::opt_in_enabled() {
+            return;
+        }
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
+            &daemon_socket,
+            "tui-operator",
+            &self.workflows,
+        ) {
+            eprintln!(
+                "cm-tui: workflow.update_definitions failed: {} \
+                 (daemon-side workflow driver will be uninitialized until \
+                  next push — feature still gated by 2c-2-2)",
                 e,
             );
         }

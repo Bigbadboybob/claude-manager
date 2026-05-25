@@ -2090,6 +2090,56 @@ pub fn tui_update_sessions_snapshot(
 }
 
 // ============================================================
+// workflow.update_definitions (10d-2c-2-1)
+// ============================================================
+//
+// TUI-pushed workflow TOML definitions. Daemon's upcoming
+// on_idle driver (2c-2-2) needs them to look up
+// `static_transition_on_idle` for the active role, the target
+// role's `activation_prompt` template, and per-role engine /
+// context knobs. Pushed at TUI startup (right after
+// `workflow::toml_schema::load_all(workflows_dir)`) and on any
+// later reload.
+//
+// Replace-not-merge — same shape as `task.update_tree` and
+// `tui.update_sessions_snapshot`. Operator-only on the wire:
+// a Session caller (i.e. an agent) could otherwise rewrite the
+// transition table for the workflow it's a participant of and
+// redirect the static-idle gate, breaking the workflow author's
+// intent.
+
+#[derive(Deserialize)]
+struct WorkflowUpdateDefinitionsParams {
+    /// Map keyed by workflow name (`Workflow::name`). Replace
+    /// semantics: the daemon's current map is cleared and
+    /// repopulated.
+    workflows: std::collections::HashMap<
+        String,
+        crate::workflow::toml_schema::Workflow,
+    >,
+}
+
+pub fn workflow_update_definitions(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: WorkflowUpdateDefinitionsParams = serde_json::from_value(params.clone())
+        .map_err(|e| (
+            ErrorCode::InvalidParams,
+            format!("workflow.update_definitions params: {}", e),
+        ))?;
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    state.workflow_definitions.clear();
+    for (name, wf) in p.workflows {
+        state.workflow_definitions.insert(name, wf);
+    }
+    Ok(json!({
+        "ok": true,
+        "workflow_count": state.workflow_definitions.len(),
+    }))
+}
+
+// ============================================================
 // propose_task (sub-2b-2)
 // ============================================================
 //
@@ -6927,6 +6977,246 @@ mod tests {
             let (events, _) =
                 crate::workflow::events::read_new("wf_done_retry_r6", 0);
             assert_eq!(events.len(), 1, "exactly one event after the retry");
+        });
+    }
+
+    // ------------------------------------------------------------
+    // 10d-2c-2-1: workflow.update_definitions
+    // ------------------------------------------------------------
+
+    /// Sanity: pushing a non-empty map populates
+    /// `state.workflow_definitions` keyed by `Workflow::name`.
+    /// Replace semantics — a second push overwrites the first.
+    #[test]
+    fn workflow_update_definitions_populates_and_replaces() {
+        use crate::workflow::toml_schema::{
+            Context, Engine, Role, Workflow,
+        };
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Pre-state: empty.
+            {
+                let s = state.lock().unwrap();
+                assert!(s.workflow_definitions.is_empty());
+            }
+
+            // First push: one workflow "feedback".
+            let mut roles_a = BTreeMap::new();
+            roles_a.insert(
+                "worker".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("a".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            let wf_a = Workflow {
+                name: "feedback".to_string(),
+                description: String::new(),
+                roles: roles_a,
+                role_order: vec!["worker".to_string()],
+                transitions: vec![],
+            };
+            let mut map_a = std::collections::HashMap::new();
+            map_a.insert("feedback".to_string(), wf_a);
+
+            let resp = workflow_update_definitions(
+                &state,
+                &json!({"workflows": map_a}),
+            )
+            .expect("first push ok");
+            assert_eq!(resp["ok"], json!(true));
+            assert_eq!(resp["workflow_count"], json!(1));
+            {
+                let s = state.lock().unwrap();
+                let wf = s.workflow_definitions.get("feedback").expect("present");
+                assert_eq!(wf.role_order, vec!["worker".to_string()]);
+                assert!(wf.roles.contains_key("worker"));
+            }
+
+            // Second push: replace with a DIFFERENT workflow
+            // ("audit"). Original "feedback" must be gone —
+            // replace-not-merge.
+            let mut roles_b = BTreeMap::new();
+            roles_b.insert(
+                "auditor".to_string(),
+                Role {
+                    engine: Engine::Codex,
+                    context: Context::Fresh,
+                    activation_prompt: Some("b".to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                },
+            );
+            let wf_b = Workflow {
+                name: "audit".to_string(),
+                description: String::new(),
+                roles: roles_b,
+                role_order: vec!["auditor".to_string()],
+                transitions: vec![],
+            };
+            let mut map_b = std::collections::HashMap::new();
+            map_b.insert("audit".to_string(), wf_b);
+
+            let resp2 = workflow_update_definitions(
+                &state,
+                &json!({"workflows": map_b}),
+            )
+            .expect("second push ok");
+            assert_eq!(resp2["workflow_count"], json!(1));
+            {
+                let s = state.lock().unwrap();
+                assert!(
+                    !s.workflow_definitions.contains_key("feedback"),
+                    "first push's workflow must be gone after replace",
+                );
+                assert!(s.workflow_definitions.contains_key("audit"));
+            }
+        });
+    }
+
+    /// Empty map push is meaningful — clears prior state. Mirrors
+    /// `task.update_tree` / `tui.update_sessions_snapshot` semantics.
+    #[test]
+    fn workflow_update_definitions_empty_push_clears() {
+        use crate::workflow::toml_schema::{
+            Context, Engine, Role, Workflow,
+        };
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Seed one entry.
+            {
+                let mut s = state.lock().unwrap();
+                let mut roles = BTreeMap::new();
+                roles.insert(
+                    "worker".to_string(),
+                    Role {
+                        engine: Engine::ClaudeCode,
+                        context: Context::Persistent,
+                        activation_prompt: None,
+                        subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                    },
+                );
+                s.workflow_definitions.insert(
+                    "feedback".to_string(),
+                    Workflow {
+                        name: "feedback".to_string(),
+                        description: String::new(),
+                        roles,
+                        role_order: vec!["worker".to_string()],
+                        transitions: vec![],
+                    },
+                );
+            }
+            let resp = workflow_update_definitions(
+                &state,
+                &json!({"workflows": std::collections::HashMap::<
+                    String,
+                    crate::workflow::toml_schema::Workflow,
+                >::new()}),
+            )
+            .expect("empty push ok");
+            assert_eq!(resp["workflow_count"], json!(0));
+            let s = state.lock().unwrap();
+            assert!(s.workflow_definitions.is_empty());
+        });
+    }
+
+    /// Malformed params surface as InvalidParams.
+    #[test]
+    fn workflow_update_definitions_malformed_params_rejected() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = workflow_update_definitions(
+                &state,
+                &json!({"not_workflows": "wrong shape"}),
+            )
+            .expect_err("malformed params must reject");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    // ------------------------------------------------------------
+    // 10d-2c-2-1: transcript::assistant_turn_completed_since
+    // ------------------------------------------------------------
+    //
+    // The combined-gate helper isn't itself a daemon handler, but
+    // pin its semantics here so the upcoming 2c-2-2 polling
+    // driver can rely on the contract. The full count_messages
+    // / role_turn_complete pieces have their own tests in
+    // `daemon/src/workflow/transcript.rs::tests` (10d-2a era);
+    // these new tests focus on the COMBINATION.
+
+    #[test]
+    fn assistant_turn_completed_since_requires_both_count_advance_and_idle() {
+        use crate::workflow::toml_schema::Engine;
+        let _tmp = with_temp_home(|| {
+            // Write a transcript with one COMPLETE assistant
+            // turn (stop_reason: end_turn). baseline = 0 should
+            // fire; baseline = 1 should NOT fire (count == baseline).
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = std::path::PathBuf::from("/tmp/r2c1-wt");
+            let encoded = "-tmp-r2c1-wt";
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).unwrap();
+            let complete = r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##;
+            std::fs::write(proj.join("sid-c1.jsonl"), complete).unwrap();
+
+            assert!(
+                crate::workflow::transcript::assistant_turn_completed_since(
+                    &Engine::ClaudeCode,
+                    &wt,
+                    "sid-c1",
+                    0,
+                ),
+                "count=1 > baseline=0 AND idle → fires",
+            );
+            assert!(
+                !crate::workflow::transcript::assistant_turn_completed_since(
+                    &Engine::ClaudeCode,
+                    &wt,
+                    "sid-c1",
+                    1,
+                ),
+                "count=1 == baseline=1 → no advance → doesn't fire",
+            );
+        });
+    }
+
+    #[test]
+    fn assistant_turn_completed_since_blocks_on_mid_stream_pending_tool_use() {
+        use crate::workflow::toml_schema::Engine;
+        let _tmp = with_temp_home(|| {
+            // Transcript with one assistant turn whose
+            // stop_reason is tool_use (mid-stream, not complete).
+            // count advances past baseline=0 BUT role_turn_complete
+            // returns false → gate stays shut. Pre-r2c2-2's
+            // upcoming on_idle driver MUST not fire here.
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = std::path::PathBuf::from("/tmp/r2c1-mid");
+            let encoded = "-tmp-r2c1-mid";
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).unwrap();
+            let pending = r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"x","input":{}}]}}"##;
+            std::fs::write(proj.join("sid-mid.jsonl"), pending).unwrap();
+
+            assert!(
+                !crate::workflow::transcript::assistant_turn_completed_since(
+                    &Engine::ClaudeCode,
+                    &wt,
+                    "sid-mid",
+                    0,
+                ),
+                "count=1 > baseline=0 BUT not idle (tool_use \
+                 pending) → gate must stay shut",
+            );
         });
     }
 }
