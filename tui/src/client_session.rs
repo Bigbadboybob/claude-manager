@@ -1038,6 +1038,29 @@ mod tests {
                                         handle,
                                     );
                                 }
+                                // 10e-b: manifest.watch streaming.
+                                // Same shape as AttachStream — write
+                                // the OK response, then enter the
+                                // manifest-stream loop. Required for
+                                // exhaustiveness once 10e-c wires
+                                // TUI-side consumer.
+                                cm_daemon::control::dispatch::DispatchOutcome::ManifestWatchStream {
+                                    response,
+                                    handle,
+                                } => {
+                                    if cm_daemon::control::wire::write_response(
+                                        &mut stream,
+                                        &response,
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    cm_daemon::control::stream::handle_manifest_watch_stream(
+                                        &mut stream,
+                                        handle,
+                                    );
+                                }
                             }
                         });
                     }

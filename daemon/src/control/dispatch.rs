@@ -118,6 +118,14 @@ pub enum DispatchOutcome {
         response: Response,
         handle: AttachStreamHandle,
     },
+    /// 10e-b: `manifest.watch` returns this so `handle_connection`
+    /// can write the immediate `{"subscribed": true}` response,
+    /// then enter the manifest-stream loop (initial snapshot
+    /// frame + diff frames until the client disconnects).
+    ManifestWatchStream {
+        response: Response,
+        handle: ManifestWatchHandle,
+    },
 }
 
 impl DispatchOutcome {
@@ -127,6 +135,7 @@ impl DispatchOutcome {
         match self {
             DispatchOutcome::Done(r) => r,
             DispatchOutcome::AttachStream { response, .. } => response,
+            DispatchOutcome::ManifestWatchStream { response, .. } => response,
         }
     }
 
@@ -137,8 +146,54 @@ impl DispatchOutcome {
         match self {
             DispatchOutcome::Done(r) => r,
             DispatchOutcome::AttachStream { response, .. } => response,
+            DispatchOutcome::ManifestWatchStream { response, .. } => response,
         }
     }
+}
+
+/// 10e-b: handle bundle for `manifest.watch` streaming. The dispatcher
+/// reads the initial snapshot under the state lock + subscribes to
+/// the broadcaster, and returns this struct so the stream consumer
+/// can drive the per-connection loop without re-locking.
+///
+/// Subscribe-then-snapshot under the state lock is the §4 atomicity
+/// fix in the 10e-b plan: any diff broadcast that fires between our
+/// lock release and the first frame write lands in `diff_rx` — no
+/// gap, no replay buffer needed.
+pub struct ManifestWatchHandle {
+    /// Captured at subscribe time. Sent as the first stream frame
+    /// (`StreamKind::ManifestSnapshot`) before any
+    /// `ManifestDiff` frames.
+    pub initial_snapshot: serde_json::Value,
+    /// Bounded receiver from
+    /// [`crate::manifest::ManifestWatcher::subscribe`]. Capacity
+    /// is `MANIFEST_WATCH_BUFFER` (32). Drop on slow consumer is
+    /// handled by `try_send` in the broadcaster (`Full` →
+    /// remove from map).
+    pub diff_rx: mpsc::Receiver<crate::manifest::ManifestDiff>,
+    /// 10e-b r2 RAII fix: subscription guard. When this handle
+    /// is dropped (handler returns, panics, or aborts), the
+    /// guard's Drop reaps the subscriber slot from the
+    /// broadcaster's map immediately — no reliance on a future
+    /// broadcast's try_send-error path. Closes the
+    /// idle-disconnect slot-accumulation surfaced in round 2:
+    /// repeated connect/disconnect cycles during quiet periods
+    /// now have a bounded slot count (at most one live
+    /// subscriber per active stream).
+    pub guard: crate::manifest::SubscriptionGuard,
+    /// 10e-b r3 test-isolation fix: heartbeat interval is now
+    /// per-handle rather than process-global. The dispatcher
+    /// populates this with the production default; tests
+    /// construct the handle directly with a short value
+    /// (~50µs) so the idle-disconnect path exercises quickly.
+    /// Was previously a `static AtomicU64` overridden via a
+    /// test helper — that pattern flaked under parallel test
+    /// execution (one test's restore-to-default raced another
+    /// test's read of the override).
+    pub heartbeat_interval: std::time::Duration,
+    /// Echoed back on every outbound stream frame. Matches the
+    /// `manifest.watch` request id so the client can demux.
+    pub request_id: String,
 }
 
 /// Route `req` to the appropriate method handler. Returns
@@ -174,6 +229,14 @@ pub fn dispatch_request(
         "attach.open" => {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             dispatch_attach_open(&mut s, req)
+        }
+        // 10e-b: `manifest.watch` is a single-step streaming RPC.
+        // Operator-only at the dispatch boundary; subscribe-then-
+        // snapshot happens under the state lock so no broadcast
+        // can land in the gap between the two operations.
+        "manifest.watch" => {
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            dispatch_manifest_watch(&mut s, req)
         }
 
         // Session-mutation methods (slice 10c-d). Each manages its
@@ -754,6 +817,66 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
         request_id: req.id.clone(),
     };
     DispatchOutcome::AttachStream { response, handle }
+}
+
+/// 10e-b: `manifest.watch` dispatch arm. Operator-only.
+/// Subscribe-then-snapshot under the state lock — the lock is
+/// already held by `dispatch_request`'s arm call site. Order is
+/// load-bearing (10e-b plan §4): subscribing FIRST ensures any
+/// broadcast that fires after we release the lock lands in our
+/// receiver. Snapshot reads `state.workspaces` + `state.bindings`
+/// AFTER subscribe so a concurrent producer (which would also
+/// need the state lock to mutate, then call `manifest_watcher.broadcast`)
+/// can't slip a diff into a gap.
+///
+/// Auth: `Caller::Session` is rejected with `Unauthorized` —
+/// agents have no use case for manifest.watch, and the file carries
+/// sessions outside any agent's scope. Operator-only matches the
+/// 10e plan §3 wire shape.
+fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOutcome {
+    // Operator-only at the dispatch boundary. Same shape as
+    // `start_session`'s guard (dispatch.rs around L324).
+    if matches!(req.caller, Caller::Session(_)) {
+        return DispatchOutcome::Done(Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "manifest.watch is Operator-only (no Session-caller use case)"
+                .to_string(),
+        ));
+    }
+
+    // Subscribe FIRST. After this call returns, any
+    // `state.manifest_watcher.broadcast(...)` enqueues into our
+    // `diff_rx`. Under the state lock so no broadcast can race.
+    // 10e-b r2: returns both the receiver and a RAII guard. The
+    // guard reaps the subscriber slot on drop — packaged into
+    // `ManifestWatchHandle` so its lifetime tracks the handler's
+    // lifetime exactly.
+    let (diff_rx, guard) = state.manifest_watcher.subscribe();
+
+    // Snapshot `workspaces` + `bindings`. Clones are cheap relative
+    // to the lock duration we'd save with a typed serialize-from-
+    // ref (workspaces is dozens of entries in normal use). Build
+    // the JSON payload structure the client will deserialize.
+    let snapshot_payload = serde_json::json!({
+        "workspaces": state.workspaces,
+        "bindings": state.bindings,
+    });
+
+    let response = Response::ok(
+        req.id.clone(),
+        serde_json::json!({ "subscribed": true }),
+    );
+    let handle = ManifestWatchHandle {
+        initial_snapshot: snapshot_payload,
+        diff_rx,
+        guard,
+        heartbeat_interval: std::time::Duration::from_micros(
+            crate::control::stream::DEFAULT_MANIFEST_WATCH_HEARTBEAT_MICROS,
+        ),
+        request_id: req.id.clone(),
+    };
+    DispatchOutcome::ManifestWatchStream { response, handle }
 }
 
 /// `send_input` — write bytes to a session's PTY. Session-caller

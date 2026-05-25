@@ -167,6 +167,166 @@ pub fn handle_attach_stream(
     }
 }
 
+/// 10e-b r1: production heartbeat interval for `manifest.watch`
+/// streams. The handler issues a `StreamKind::Heartbeat` frame on
+/// every `recv_timeout` boundary; the write attempt's success or
+/// failure is the liveness probe — a disconnected client surfaces
+/// as `BrokenPipe` on the next heartbeat and the handler exits,
+/// freeing the subscriber slot.
+///
+/// 15s bounds the dead-handler-accumulation window to roughly
+/// (interval + RTT) per disconnected client. Smaller values
+/// detect faster at the cost of constant socket traffic for idle
+/// streams; 15s is the same order as cgroup-OOM polling and feels
+/// like a reasonable default.
+///
+/// 10e-b r3 (test-isolation fix): the interval is now a
+/// PER-HANDLE field on `ManifestWatchHandle::heartbeat_interval`,
+/// not a process-global atomic. Tests construct the handle
+/// directly with a short value to exercise the idle-disconnect
+/// detection path quickly; production uses this constant via the
+/// dispatcher. Avoids the test-flake surface from concurrent
+/// override/restore of a shared atomic.
+pub const DEFAULT_MANIFEST_WATCH_HEARTBEAT_MICROS: u64 = 15_000_000;
+
+/// 10e-b: stream handler for `manifest.watch`. One-way (daemon →
+/// client), so simpler than `handle_attach_stream` (no inbound
+/// thread, no Input/Resize dispatch).
+///
+/// Loop:
+///   - Write initial `ManifestSnapshot` frame.
+///   - `recv_timeout(MANIFEST_WATCH_HEARTBEAT_MICROS)` on `diff_rx`:
+///     - `Ok(diff)` → write `ManifestDiff` frame; on write error
+///       (BrokenPipe), exit.
+///     - `Err(Timeout)` → write a `Heartbeat` frame; on write
+///       error, exit. This is the 10e-b r1 idle-disconnect fix —
+///       quiet streams previously left a parked handler thread
+///       per disconnected client.
+///     - `Err(Disconnected)` → broadcaster reaped our sender
+///       (daemon shutdown or slow-subscriber retain). Exit.
+///
+/// On exit, the receiver drops at end-of-scope and the
+/// broadcaster's next `try_send` returns `Disconnected` →
+/// `retain` reaps the SyncSender. No explicit unsubscribe API.
+///
+/// Heartbeat detection bound: ~`MANIFEST_WATCH_HEARTBEAT_MICROS`
+/// after client disconnect, the handler exits AND the next
+/// broadcast or heartbeat reap removes its slot.
+pub fn handle_manifest_watch_stream(
+    stream: &mut UnixStream,
+    handle: crate::control::dispatch::ManifestWatchHandle,
+) {
+    let crate::control::dispatch::ManifestWatchHandle {
+        initial_snapshot,
+        diff_rx,
+        // 10e-b r2: hold the guard until end-of-scope. Its Drop
+        // reaps the subscriber slot from the broadcaster's map.
+        // `_guard` binds so the value isn't dropped early (a
+        // bare `_` discard would Drop immediately).
+        guard: _guard,
+        // 10e-b r3: per-handle interval (was process-global
+        // atomic). The handler reads it once and uses for every
+        // `recv_timeout` iteration.
+        heartbeat_interval,
+        request_id,
+    } = handle;
+
+    // Manifest stream is long-lived. Clear the read timeout the
+    // RPC path may have set so an idle subscriber doesn't drop.
+    let _ = stream.set_read_timeout(None);
+
+    // Frame 1: initial snapshot. Sent before any diff frames so
+    // the consumer has a baseline to apply diffs onto.
+    let snapshot_frame = StreamFrame::manifest_snapshot(
+        request_id.clone(),
+        initial_snapshot,
+    );
+    if let Err(e) = wire::write_stream_frame(stream, &snapshot_frame) {
+        eprintln!(
+            "cm-daemon: manifest.watch initial snapshot write failed: {} \
+             (client likely disconnected before we got started)",
+            e,
+        );
+        return;
+    }
+
+    // Frame loop with heartbeat-on-timeout. Each iteration either
+    // delivers a real diff OR a heartbeat; both probe the socket
+    // for client liveness. Quiet streams get a heartbeat every
+    // `heartbeat_interval`, so a disconnected client surfaces
+    // within roughly one interval.
+    loop {
+        match diff_rx.recv_timeout(heartbeat_interval) {
+            Ok(diff) => {
+                // Variant-tagged JSON serialization
+                // (Serialize/Deserialize on ManifestDiff lands the
+                // enum on the wire as e.g. `{"Exited": {...}}`).
+                let payload = match serde_json::to_value(&diff) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Should be impossible — ManifestDiff is
+                        // a closed enum of serde-friendly types.
+                        // Log loudly so a future variant addition
+                        // that breaks serialize surfaces here.
+                        eprintln!(
+                            "cm-daemon: manifest.watch diff serialize \
+                             failed: {} (variant {:?}) — dropping \
+                             subscriber",
+                            e, diff,
+                        );
+                        return;
+                    }
+                };
+                let frame =
+                    StreamFrame::manifest_diff(request_id.clone(), payload);
+                if let Err(e) = wire::write_stream_frame(stream, &frame) {
+                    // Typical case: BrokenPipe from client
+                    // disconnect. Exit cleanly; our receiver drops
+                    // at end-of-scope and the broadcaster will
+                    // reap our SyncSender on the next broadcast
+                    // via `try_send → Err(Disconnected)`.
+                    eprintln!(
+                        "cm-daemon: manifest.watch diff write \
+                         error: {} (client disconnected)",
+                        e,
+                    );
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // 10e-b r1 idle-disconnect fix: probe the socket
+                // via a heartbeat frame on every quiet interval.
+                // If the client has gone away, the write fails
+                // BrokenPipe → exit → receiver dropped → next
+                // broadcast (or heartbeat scan) reaps the slot.
+                //
+                // Heartbeat carries no payload; the client
+                // interprets it as a no-op. Production interval
+                // is `DEFAULT_MANIFEST_WATCH_HEARTBEAT_MICROS`
+                // (15s); tests pass their own interval into the
+                // `ManifestWatchHandle::heartbeat_interval`
+                // field (10e-b r3 — per-handle, not global).
+                let frame = StreamFrame::heartbeat(request_id.clone());
+                if let Err(e) = wire::write_stream_frame(stream, &frame) {
+                    eprintln!(
+                        "cm-daemon: manifest.watch heartbeat write \
+                         error: {} (idle client disconnected)",
+                        e,
+                    );
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Broadcaster reaped our sender (daemon shutdown,
+                // or `retain` removed us because a prior try_send
+                // hit our channel's capacity — slow-subscriber
+                // drop per 10e-b §5 R2). No more diffs incoming.
+                return;
+            }
+        }
+    }
+}
+
 /// Outbound thread body: drain the fanout, encode each chunk as a
 /// `Data` frame, write to the socket. Exit on:
 ///   - `Disconnected` from the fanout (child exited / session
@@ -1492,5 +1652,687 @@ mod tests {
         assert_eq!(payload["memory_cap_kill"], false);
         drop(client);
         let _ = handle.join();
+    }
+
+    // =================================================================
+    // 10e-b: manifest.watch streaming tests (T3-T9 from the plan)
+    // =================================================================
+    //
+    // These tests exercise `handle_manifest_watch_stream` end-to-end
+    // through `UnixStream::pair`. The handler is driven on one end,
+    // the test reads frames from the other. No real cgroup-OOM needed
+    // — we drive `state.manifest_watcher.broadcast(...)` directly to
+    // simulate what `handle_session_exit` does in production.
+
+    /// Helper: read one StreamFrame from a UnixStream with a bounded
+    /// timeout. Panics if the read times out or fails.
+    fn read_one_frame(stream: &mut UnixStream) -> StreamFrame {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        match wire::read_stream_frame(stream) {
+            Ok(Some(f)) => f,
+            Ok(None) => panic!("EOF before frame received"),
+            Err(e) => panic!("read_stream_frame failed: {}", e),
+        }
+    }
+
+    /// Build a `ManifestWatchHandle` synthetically — subscribes to
+    /// `state.manifest_watcher` and captures the current snapshot.
+    /// Mirrors what `dispatch_manifest_watch` does in production
+    /// (under the state lock).
+    ///
+    /// 10e-b r3: takes an explicit `heartbeat_interval` so tests
+    /// drive the handler's recv_timeout cadence directly. Pre-r3
+    /// this lived in a process-global atomic overridden via a
+    /// test helper — that pattern flaked under parallel test
+    /// execution.
+    fn build_manifest_watch_handle(
+        state: &Arc<Mutex<DaemonState>>,
+        request_id: &str,
+        heartbeat_interval: Duration,
+    ) -> crate::control::dispatch::ManifestWatchHandle {
+        let s = state.lock().unwrap();
+        // 10e-b r2: subscribe returns (rx, guard). Guard is
+        // packaged into the handle so the test exercises the
+        // same RAII lifecycle production uses.
+        let (diff_rx, guard) = s.manifest_watcher.subscribe();
+        let initial_snapshot = serde_json::json!({
+            "workspaces": &s.workspaces,
+            "bindings": &s.bindings,
+        });
+        crate::control::dispatch::ManifestWatchHandle {
+            initial_snapshot,
+            diff_rx,
+            guard,
+            heartbeat_interval,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// T3 — subscribe via `handle_manifest_watch_stream` →
+    /// `ManifestSnapshot` frame arrives first → broadcaster fires
+    /// a `ManifestDiff::Exited` → next frame matches that diff.
+    #[test]
+    fn manifest_watch_sends_snapshot_then_streams_diffs() {
+        // 10e-b r3: per-handle heartbeat interval — short value
+        // so the post-drop cleanup wakes the handler quickly via
+        // a heartbeat write that hits BrokenPipe. (No
+        // process-global mutation; concurrent tests don't race.)
+        let test_heartbeat = Duration::from_micros(50_000);
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        // Seed a workspace so the snapshot has identifiable
+        // content (something to differentiate from an empty
+        // initial state).
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.insert(
+                "ws-t3".into(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-t3".into(),
+                    name: "test".into(),
+                    sessions: Vec::new(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let (mut client, mut server) =
+            UnixStream::pair().expect("socket pair");
+        let handle =
+            build_manifest_watch_handle(&state, "req-t3", test_heartbeat);
+        let state_clone = state.clone();
+        let join = std::thread::spawn(move || {
+            handle_manifest_watch_stream(&mut server, handle);
+            // Hold state_clone for the thread's lifetime so the
+            // broadcaster stays alive.
+            drop(state_clone);
+        });
+
+        // Frame 1: snapshot.
+        let frame = read_one_frame(&mut client);
+        assert_eq!(frame.kind, StreamKind::ManifestSnapshot);
+        assert_eq!(frame.id, "req-t3");
+        let workspaces = &frame.payload["workspaces"];
+        assert!(
+            workspaces.get("ws-t3").is_some(),
+            "snapshot frame must include seeded workspace; got payload {}",
+            frame.payload,
+        );
+
+        // Fire a broadcast — simulates `handle_session_exit`'s call.
+        state
+            .lock()
+            .unwrap()
+            .manifest_watcher
+            .broadcast(crate::manifest::ManifestDiff::Exited {
+                uid: "ts-t3-victim".into(),
+                last_exit: crate::manifest::LastExit {
+                    code: Some(1),
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at: 1.0,
+                },
+            });
+
+        // Frame 2: the diff.
+        let frame = read_one_frame(&mut client);
+        assert_eq!(frame.kind, StreamKind::ManifestDiff);
+        assert_eq!(frame.id, "req-t3");
+        // ManifestDiff is variant-tagged. The Exited variant should
+        // be present in the payload.
+        assert!(
+            frame.payload["Exited"]["uid"] == "ts-t3-victim",
+            "diff frame must carry the broadcast payload; got {}",
+            frame.payload,
+        );
+        assert_eq!(frame.payload["Exited"]["last_exit"]["code"], 1);
+
+        // Cleanup: drop the client. With the 10e-b r1 heartbeat
+        // fix + r3 per-handle interval, the handler's
+        // `recv_timeout` hits its (test-shortened) interval
+        // shortly, writes a heartbeat, sees BrokenPipe, and
+        // exits. No global restore needed — the interval lived
+        // only in this handle.
+        drop(client);
+        let _ = join.join();
+    }
+
+    /// T4 — a slow subscriber whose channel fills gets dropped by
+    /// the broadcaster's `try_send → retain`. Drives MANIFEST_WATCH_BUFFER+1
+    /// broadcasts without the subscriber draining, then verifies the
+    /// subscriber was reaped from the slot list AND the broadcaster
+    /// didn't hang.
+    ///
+    /// Tests at the broadcaster level (not via the streaming RPC)
+    /// because the RPC's read-side would drain the channel; we want
+    /// to exercise the bounded-channel drop directly.
+    #[test]
+    fn manifest_watch_drops_slow_subscriber_on_full_channel() {
+        let watcher = crate::manifest::ManifestWatcher::new();
+        // 10e-b r2: hold both rx (so it doesn't drop and reap via
+        // guard's Disconnected detection in unsubscribe) AND
+        // guard. The slow-subscriber drop we test here is the
+        // broadcaster's try_send→Full path, NOT the guard-drop
+        // path (which T11 pins separately).
+        let (_rx, _guard) = watcher.subscribe();
+
+        // Broadcast MANIFEST_WATCH_BUFFER + 1 diffs without reading.
+        // The first 32 fill the channel; the 33rd causes
+        // `try_send → Err(Full)` → broadcast removes the subscriber.
+        for i in 0..(crate::manifest::MANIFEST_WATCH_BUFFER + 1) {
+            watcher.broadcast(crate::manifest::ManifestDiff::Tombstoned {
+                uid: format!("ts-slow-{}", i),
+                exited_at: i as f64,
+            });
+        }
+
+        // After overrun, subscriber list is empty (slow one dropped).
+        assert_eq!(
+            watcher.subscriber_slot_count(),
+            0,
+            "slow subscriber MUST be dropped after broadcaster's \
+             try_send returns Full",
+        );
+    }
+
+    /// T5 — concurrent broadcasts serialize through the broadcaster's
+    /// internal mutex. Two threads broadcasting interleave; the
+    /// subscriber sees all diffs (no loss, bounded order at the
+    /// per-broadcast level — `Mutex<Vec<SyncSender>>` is FIFO per
+    /// acquisition).
+    #[test]
+    fn manifest_watch_concurrent_broadcasts_all_delivered() {
+        let watcher = Arc::new(crate::manifest::ManifestWatcher::new());
+        // 10e-b r2: hold guard so the subscription persists
+        // through the threaded broadcasts.
+        let (rx, _guard) = watcher.subscribe();
+
+        let w1 = Arc::clone(&watcher);
+        let w2 = Arc::clone(&watcher);
+        let t1 = std::thread::spawn(move || {
+            for i in 0..5 {
+                w1.broadcast(crate::manifest::ManifestDiff::Tombstoned {
+                    uid: format!("t1-{}", i),
+                    exited_at: i as f64,
+                });
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..5 {
+                w2.broadcast(crate::manifest::ManifestDiff::Tombstoned {
+                    uid: format!("t2-{}", i),
+                    exited_at: 100.0 + i as f64,
+                });
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // Drain. Both threads' 5 diffs each should arrive.
+        let mut count_t1 = 0;
+        let mut count_t2 = 0;
+        for _ in 0..10 {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(crate::manifest::ManifestDiff::Tombstoned {
+                    uid, ..
+                }) => {
+                    if uid.starts_with("t1-") {
+                        count_t1 += 1;
+                    } else if uid.starts_with("t2-") {
+                        count_t2 += 1;
+                    }
+                }
+                Ok(_) => panic!("unexpected diff variant"),
+                Err(e) => panic!("missing diff after {} t1 + {} t2: {:?}",
+                    count_t1, count_t2, e),
+            }
+        }
+        assert_eq!(count_t1, 5);
+        assert_eq!(count_t2, 5);
+    }
+
+    /// T6 — subscribe → broadcast diff-A → drop subscriber →
+    /// broadcast diff-B (no live subscribers) → subscribe fresh →
+    /// new subscriber MUST NOT see diff-A or diff-B (no replay).
+    /// The snapshot read separately by the dispatcher is canonical;
+    /// resubscribe doesn't surface historical diffs.
+    #[test]
+    fn manifest_watch_reconnect_does_not_replay_historical_diffs() {
+        let watcher = crate::manifest::ManifestWatcher::new();
+
+        // First subscription. Hold the guard alongside the
+        // receiver — both drop together below.
+        let (rx1, guard1) = watcher.subscribe();
+        watcher.broadcast(crate::manifest::ManifestDiff::Tombstoned {
+            uid: "ts-A".into(),
+            exited_at: 1.0,
+        });
+        // First subscriber receives diff-A.
+        let diff_a = rx1.recv_timeout(Duration::from_millis(500)).unwrap();
+        assert!(matches!(
+            diff_a,
+            crate::manifest::ManifestDiff::Tombstoned { ref uid, .. } if uid == "ts-A",
+        ));
+
+        // Drop first subscriber AND its guard. 10e-b r2: guard's
+        // Drop reaps the slot immediately — no need to wait for
+        // a follow-up broadcast.
+        drop(rx1);
+        drop(guard1);
+        assert_eq!(
+            watcher.subscriber_slot_count(),
+            0,
+            "10e-b r2: guard Drop reaps slot immediately, no \
+             follow-up broadcast required",
+        );
+
+        // Diff-B fires with no live subscribers.
+        watcher.broadcast(crate::manifest::ManifestDiff::Tombstoned {
+            uid: "ts-B".into(),
+            exited_at: 2.0,
+        });
+
+        // Fresh subscribe. Must NOT see diff-A or diff-B (no
+        // replay buffer — that's the §3 design choice; consumer
+        // resyncs via dispatcher-side snapshot reads, not via
+        // broadcaster replay).
+        let (rx2, _guard2) = watcher.subscribe();
+        match rx2.recv_timeout(Duration::from_millis(200)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!(
+                "fresh subscriber MUST NOT replay historical diffs; got {:?}",
+                other,
+            ),
+        }
+    }
+
+    /// T7 — Operator-only auth: a Session caller is rejected with
+    /// `Unauthorized` AND no subscription is created on the
+    /// broadcaster.
+    #[test]
+    fn manifest_watch_session_caller_rejected_no_subscription_leak() {
+        use crate::control::protocol::{Caller, CallerSession, Request};
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let initial_slots = state
+            .lock()
+            .unwrap()
+            .manifest_watcher
+            .subscriber_slot_count();
+
+        // Build a manifest.watch request with a Session caller.
+        let req = Request {
+            id: "req-t7".into(),
+            caller: Caller::Session(CallerSession {
+                session_uid: "ts-some-agent".into(),
+            }),
+            method: "manifest.watch".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let response = outcome.into_response();
+        assert!(
+            !response.ok,
+            "Session-caller manifest.watch MUST be rejected",
+        );
+        assert_eq!(
+            response.error.as_ref().expect("error body").code,
+            crate::control::protocol::ErrorCode::Unauthorized,
+        );
+
+        // No subscription leaked.
+        let post_slots = state
+            .lock()
+            .unwrap()
+            .manifest_watcher
+            .subscriber_slot_count();
+        assert_eq!(
+            post_slots, initial_slots,
+            "rejected Session caller MUST NOT leak a subscriber slot",
+        );
+    }
+
+    /// T8 — no-gap guarantee for the dispatcher's
+    /// subscribe-and-snapshot critical section. The dispatcher
+    /// holds `DaemonState` lock across BOTH operations
+    /// (subscribe + snapshot read), so no broadcast can interleave
+    /// — broadcasts are themselves gated by the state lock
+    /// (called from `handle_session_exit` which holds it). The
+    /// receiver returned in the handle is wired to the
+    /// broadcaster, so every broadcast that fires AFTER the
+    /// dispatcher releases the lock arrives in `diff_rx`.
+    ///
+    /// On the subscribe-then-snapshot ordering specifically:
+    /// because both ops happen under a single lock acquisition,
+    /// the in-source order is observationally equivalent under
+    /// current implementation. The order is documented as a
+    /// structural defense for any future refactor that splits the
+    /// lock acquisition — subscribing FIRST would still preserve
+    /// the no-gap invariant in that case (a snapshot-read-only
+    /// gap can drop a diff; a subscribe-only gap can't, because
+    /// subscribers see only diffs fired AFTER subscribe).
+    ///
+    /// What this test pins runtime: the receiver returned by the
+    /// dispatcher actually receives broadcasts. A future refactor
+    /// that subscribed-then-shadowed-the-receiver, or returned
+    /// a stale receiver, would fail this assertion.
+    #[test]
+    fn manifest_watch_handle_receives_broadcasts_after_dispatcher_lock_release() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let req = Request {
+            id: "req-t8".into(),
+            caller: Caller::Operator(CallerOperator {
+                token_id: "t".into(),
+            }),
+            method: "manifest.watch".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let handle = match outcome {
+            crate::control::dispatch::DispatchOutcome::ManifestWatchStream {
+                handle,
+                ..
+            } => handle,
+            other => panic!(
+                "expected ManifestWatchStream, got {:?}",
+                std::mem::discriminant(&other),
+            ),
+        };
+
+        // Now the state lock is released. Broadcast a diff.
+        // Our receiver MUST observe it because we subscribed
+        // (line `state.manifest_watcher.subscribe()` inside
+        // `dispatch_manifest_watch`) before the lock release.
+        state
+            .lock()
+            .unwrap()
+            .manifest_watcher
+            .broadcast(crate::manifest::ManifestDiff::Tombstoned {
+                uid: "ts-t8-post-release".into(),
+                exited_at: 42.0,
+            });
+
+        let diff = handle
+            .diff_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("subscribe-before-snapshot MUST deliver \
+                     post-release broadcasts to the receiver");
+        match diff {
+            crate::manifest::ManifestDiff::Tombstoned { uid, .. } => {
+                assert_eq!(uid, "ts-t8-post-release");
+            }
+            other => panic!("unexpected diff variant: {:?}", other),
+        }
+    }
+
+    /// T11 (10e-b r2) — dispatcher-level RAII guard reap: when
+    /// `dispatch_manifest_watch` returns a handle and that
+    /// handle is dropped (handler exit, panic, or
+    /// abandoned-before-spawn), the broadcaster's subscriber
+    /// slot is reaped IMMEDIATELY via the guard's Drop. No
+    /// follow-up broadcast required.
+    ///
+    /// Pre-r2 a TUI that disconnected during a quiet period
+    /// would leave the SyncSender in the broadcaster's vec until
+    /// the next real broadcast triggered `try_send → Err →
+    /// retain`. Repeated cycles accumulated dead slots.
+    #[test]
+    fn manifest_watch_handle_drop_immediately_reaps_subscriber_slot() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let req = Request {
+            id: "req-t11".into(),
+            caller: Caller::Operator(CallerOperator {
+                token_id: "t".into(),
+            }),
+            method: "manifest.watch".into(),
+            params: serde_json::json!({}),
+        };
+
+        // Pre-subscribe slot count.
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
+            0,
+        );
+
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let handle = match outcome {
+            crate::control::dispatch::DispatchOutcome::ManifestWatchStream {
+                handle,
+                ..
+            } => handle,
+            _ => panic!("expected ManifestWatchStream"),
+        };
+        // Mid-handle: slot is present.
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
+            1,
+            "subscribe inserted a slot",
+        );
+
+        // Drop the handle WITHOUT spawning a handler — simulates
+        // the failure mode where dispatch returned but the
+        // stream consumer dropped the handle (e.g., write of
+        // initial response failed in handle_connection).
+        drop(handle);
+
+        // Post-drop: slot MUST be reaped immediately via guard.
+        // Pre-r2 the slot would persist until the next broadcast.
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
+            0,
+            "10e-b r2: ManifestWatchHandle drop MUST immediately \
+             reap the subscriber slot via the held guard",
+        );
+    }
+
+    /// T12 (10e-b r2) — repeated connect/disconnect cycles via
+    /// the dispatcher path don't accumulate slots. Bounds the
+    /// idle-daemon slot count regardless of broadcast rate.
+    #[test]
+    fn manifest_watch_repeated_dispatch_cycles_do_not_accumulate_slots() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        for i in 0..100 {
+            let req = Request {
+                id: format!("req-t12-{}", i),
+                caller: Caller::Operator(CallerOperator {
+                    token_id: "t".into(),
+                }),
+                method: "manifest.watch".into(),
+                params: serde_json::json!({}),
+            };
+            let outcome =
+                crate::control::dispatch::dispatch_request(&state, &req);
+            // Take the handle and drop it — same lifecycle as a
+            // TUI that subscribed then immediately disconnected.
+            if let crate::control::dispatch::DispatchOutcome::ManifestWatchStream {
+                handle,
+                ..
+            } = outcome
+            {
+                drop(handle);
+            } else {
+                panic!("iter {}: expected ManifestWatchStream", i);
+            }
+        }
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
+            0,
+            "100 dispatch+drop cycles MUST leave zero slots; \
+             pre-r2 this would have left 100 orphan SyncSenders \
+             in the broadcaster's vec until the next real \
+             broadcast triggered retain",
+        );
+    }
+
+    /// T10 (10e-b r1) — idle-disconnect detection via heartbeat.
+    /// Pre-r1 a client that disconnected during a quiet period
+    /// (no diff broadcasts firing) left the handler parked on
+    /// `recv()` indefinitely; the dead subscriber + parked thread
+    /// would accumulate until the next real broadcast.
+    /// Post-r1 the handler uses `recv_timeout` with a heartbeat
+    /// write on each timeout — the write attempt itself probes
+    /// liveness. A disconnected client surfaces as `BrokenPipe`
+    /// on the next heartbeat, within roughly one
+    /// `MANIFEST_WATCH_HEARTBEAT_MICROS` interval.
+    ///
+    /// Test uses a 50ms heartbeat passed per-handle so the
+    /// assertion runs in <1s rather than the 15s production
+    /// interval. 10e-b r3 (per-handle field) — no process-global
+    /// state, no concurrent-test isolation hazard.
+    #[test]
+    fn manifest_watch_idle_disconnect_detected_within_heartbeat_interval() {
+        let test_heartbeat = Duration::from_micros(50_000); // 50ms
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let (client, mut server) =
+            UnixStream::pair().expect("socket pair");
+        let handle =
+            build_manifest_watch_handle(&state, "req-t10", test_heartbeat);
+        let join = std::thread::spawn(move || {
+            handle_manifest_watch_stream(&mut server, handle);
+        });
+
+        // Wait for the handler to start up and write the initial
+        // snapshot — confirms the subscription is wired before we
+        // drop the client.
+        let mut client = client;
+        let _snapshot = read_one_frame(&mut client);
+
+        // Drop the client. With NO broadcasts firing, the handler
+        // sits on `recv_timeout(50ms)`. On the next timeout it
+        // writes a heartbeat → BrokenPipe → exits. 10e-b r2's
+        // RAII guard reaps the subscriber slot at the same
+        // moment (handle drop on handler return).
+        drop(client);
+
+        // Wait for the handler to detect disconnect + exit. Bound
+        // generously (heartbeat interval × 10 + 200ms slack for
+        // scheduling jitter) — typical detection is one
+        // heartbeat interval after disconnect.
+        let deadline = std::time::Instant::now()
+            + test_heartbeat * 10
+            + Duration::from_millis(200);
+        loop {
+            if join.is_finished() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "handler did NOT exit within {} ms (interval {} µs × 10 + slack); \
+                     pre-r1 it would have stayed parked forever — heartbeat \
+                     fix didn't fire",
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis(),
+                    test_heartbeat.as_micros(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = join.join();
+
+        // 10e-b r2: subscriber slot is reaped immediately via
+        // the guard's Drop on handler exit. No broadcast needed
+        // to trigger reaping (T11 pins this directly; here we
+        // assert it's the case for the disconnect path too).
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
+            0,
+            "post-heartbeat-disconnect, broadcaster's slot list \
+             must be empty — guard Drop reaped on handler exit",
+        );
+    }
+
+    /// T9 — disconnect cleanup: when the client drops the socket,
+    /// the daemon's next broadcast attempt either fails with
+    /// BrokenPipe (handler exits, receiver dropped) OR the
+    /// broadcaster's next `try_send` returns `Disconnected` and
+    /// `retain` reaps the slot. Either path leaves `subscriber_slot_count`
+    /// at zero.
+    #[test]
+    fn manifest_watch_disconnect_drops_subscriber_on_next_broadcast() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+
+        let (client, mut server) =
+            UnixStream::pair().expect("socket pair");
+        // 10e-b r3: short heartbeat so the handler wakes
+        // quickly. T9's path is broadcast-driven cleanup (the
+        // broadcasts in the loop below wake the handler before
+        // any heartbeat would), but a short interval keeps the
+        // test fast even if scheduling delays the broadcasts.
+        let handle = build_manifest_watch_handle(
+            &state,
+            "req-t9",
+            Duration::from_micros(50_000),
+        );
+        let join = std::thread::spawn(move || {
+            handle_manifest_watch_stream(&mut server, handle);
+        });
+
+        // Read the initial snapshot frame so we know the handler
+        // has started up before we drop the client.
+        let mut client = client;
+        let _snapshot = read_one_frame(&mut client);
+
+        // Drop the client. The next broadcast will fail to deliver.
+        drop(client);
+
+        // Broadcast — write error inside the handler → return →
+        // receiver dropped. We can't observe ordering precisely
+        // (the broadcast happens, the handler MAY have already
+        // exited, the SyncSender lives until our broadcast
+        // attempt). Drive a second broadcast to definitively
+        // reap any lingering slot.
+        for i in 0..3 {
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .broadcast(crate::manifest::ManifestDiff::Tombstoned {
+                    uid: format!("ts-t9-{}", i),
+                    exited_at: i as f64,
+                });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = join.join();
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .manifest_watcher
+                .subscriber_slot_count(),
+            0,
+            "after client disconnect + broadcasts, no subscribers \
+             must remain in the broadcaster slot list",
+        );
     }
 }

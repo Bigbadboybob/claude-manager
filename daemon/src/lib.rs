@@ -495,6 +495,19 @@ fn handle_connection_with_timeouts(
             }
             control::stream::handle_attach_stream(stream, state, handle);
         }
+        // 10e-b: manifest.watch streaming. Same shape as
+        // AttachStream — write the OK response, then transition
+        // the connection to the manifest-stream loop.
+        control::dispatch::DispatchOutcome::ManifestWatchStream { response, handle } => {
+            if let Err(e) = control::wire::write_response(stream, &response) {
+                eprintln!(
+                    "cm-daemon: manifest.watch OK write failed: {} (dropping subscription)",
+                    e
+                );
+                return;
+            }
+            control::stream::handle_manifest_watch_stream(stream, handle);
+        }
     }
 }
 

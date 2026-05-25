@@ -425,6 +425,25 @@ impl<R: Read> Read for StreamReader<R> {
                         ),
                     ));
                 }
+                // 10e-b: `ManifestSnapshot` and `ManifestDiff`
+                // belong to the `manifest.watch` stream, NOT the
+                // PTY-attach stream this `term_shim` decodes.
+                // Reaching this arm means the wrong stream is
+                // wired to this reader — surface as malformed.
+                // 10e-b r1: `Heartbeat` likewise — manifest.watch
+                // sends them on idle, but PTY attach never does.
+                StreamKind::ManifestSnapshot
+                | StreamKind::ManifestDiff
+                | StreamKind::Heartbeat => {
+                    self.eof = true;
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "client received manifest-watch kind {:?} on PTY-attach stream",
+                            frame.kind
+                        ),
+                    ));
+                }
             }
         }
     }

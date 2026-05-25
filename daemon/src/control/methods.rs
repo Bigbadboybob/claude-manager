@@ -5544,7 +5544,7 @@ mod tests {
         // No initial-snapshot replay in this primitive (per
         // `ManifestWatcher` doc) — subscribers see live broadcasts
         // only.
-        let rx = {
+        let (rx, _guard) = {
             let s = state.lock().unwrap();
             s.manifest_watcher.subscribe()
         };
@@ -5694,7 +5694,7 @@ mod tests {
         }
 
         // Subscribe BEFORE the spawn so we catch the broadcast.
-        let rx = {
+        let (rx, _guard) = {
             let s = state.lock().unwrap();
             s.manifest_watcher.subscribe()
         };
@@ -5886,7 +5886,7 @@ mod tests {
         }
 
         // Subscribe BEFORE the kill.
-        let rx = {
+        let (rx, _guard) = {
             let s = state.lock().unwrap();
             s.manifest_watcher.subscribe()
         };
@@ -5954,7 +5954,7 @@ mod tests {
         let state = state_with_workspace("ws-10e-a-t3", &dir);
         let uid = fresh_test_uid();
 
-        let rx = {
+        let (rx, _guard) = {
             let s = state.lock().unwrap();
             s.manifest_watcher.subscribe()
         };

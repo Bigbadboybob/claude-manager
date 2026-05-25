@@ -129,6 +129,13 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # both paths produce byte-identical mutations (fire-output
     # parity test pins this).
     "stop_workflow",
+    # 10e-b: manifest.watch — TUI subscribes to daemon-side
+    # manifest diffs (ManifestSnapshot frame followed by
+    # ManifestDiff stream frames). Operator-only at the dispatch
+    # boundary (no Session-caller use case). Included here for
+    # dispatch-surface alignment; not Python-routable — the MCP
+    # server has no manifest-stream tool.
+    "manifest.watch",
 })
 
 

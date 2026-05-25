@@ -228,6 +228,27 @@ pub enum StreamKind {
     /// Server → client: abnormal stream termination. The daemon
     /// sends this and closes; the client treats the stream as dead.
     Error,
+    /// Server → client: first frame on a `manifest.watch` stream.
+    /// Payload `{"workspaces": {...}, "bindings": {...}}` — the
+    /// canonical snapshot of `state.workspaces` + `state.bindings`
+    /// at subscribe time. Sent exactly once, before any
+    /// [`StreamKind::ManifestDiff`] frames. Slice 10e-b.
+    ManifestSnapshot,
+    /// Server → client: a [`crate::manifest::ManifestDiff`] frame
+    /// on a `manifest.watch` stream. Payload is the serialized
+    /// diff (variant-tagged JSON, e.g.
+    /// `{"Exited": {"uid": "...", "last_exit": {...}}}`).
+    /// Repeats one frame per broadcast until the client
+    /// disconnects. Slice 10e-b.
+    ManifestDiff,
+    /// Server → client: liveness probe on a long-lived stream
+    /// (manifest.watch) during quiet periods. Payload is empty.
+    /// The client treats it as a no-op; the daemon uses the
+    /// write attempt's success/failure to detect idle-client
+    /// disconnect — without it, a TUI that died during a quiet
+    /// period would leak a handler thread + subscriber slot
+    /// until the next real broadcast. Slice 10e-b r1 fix.
+    Heartbeat,
 }
 
 impl StreamFrame {
@@ -252,6 +273,40 @@ impl StreamFrame {
             id: id.into(),
             kind: StreamKind::Error,
             payload: serde_json::json!({ "message": message.into() }),
+        }
+    }
+
+    /// 10e-b: build the initial `ManifestSnapshot` frame for a
+    /// `manifest.watch` stream. Payload structure matches what the
+    /// TUI consumer in 10e-c will deserialize.
+    pub fn manifest_snapshot(id: impl Into<String>, payload: Value) -> Self {
+        StreamFrame {
+            id: id.into(),
+            kind: StreamKind::ManifestSnapshot,
+            payload,
+        }
+    }
+
+    /// 10e-b: build a `ManifestDiff` frame for a `manifest.watch`
+    /// stream. Payload is the variant-tagged JSON of
+    /// [`crate::manifest::ManifestDiff`].
+    pub fn manifest_diff(id: impl Into<String>, payload: Value) -> Self {
+        StreamFrame {
+            id: id.into(),
+            kind: StreamKind::ManifestDiff,
+            payload,
+        }
+    }
+
+    /// 10e-b r1: build a heartbeat frame for a `manifest.watch`
+    /// stream. Empty payload; the client ignores it. The
+    /// daemon's write-attempt success/failure is the actual
+    /// liveness probe.
+    pub fn heartbeat(id: impl Into<String>) -> Self {
+        StreamFrame {
+            id: id.into(),
+            kind: StreamKind::Heartbeat,
+            payload: serde_json::Value::Null,
         }
     }
 }
