@@ -166,7 +166,6 @@ enum PlanInputMode {
     Normal,
     Editing,
     Searching { query: String },
-<<<<<<< Updated upstream
     /// Top-level task creation (`A-n`) leaves `parent_task_id = None`.
     /// Subtask creation (`A-S`) sets it to the focused task's id; the
     /// resulting `CreateTask` action threads it through so the API row
@@ -181,9 +180,6 @@ enum PlanInputMode {
     NewHeader { text: String },
     EditingHeader { text: String },
     BulkArchiveConfirm { project_idx: usize, count: usize },
-=======
-    NewTask { title: String },
->>>>>>> Stashed changes
     NewProject { name: String, repo_url: String, field: NewProjectField },
     ProjectPicker { selected: usize },
     /// Before LaunchConfirm: pick either "new workspace" or an existing one.
@@ -1453,7 +1449,6 @@ impl PlanningView {
                     KeyCode::Char('c') | KeyCode::Char('C') => { self.remove_column(); return PlanAction::Consumed; }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         self.input_mode = PlanInputMode::NewProject { name: String::new(), repo_url: String::new(), field: NewProjectField::Name };
-<<<<<<< Updated upstream
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
@@ -1506,8 +1501,6 @@ impl PlanningView {
                         if !self.show_archived {
                             self.snap_cursor_to_selectable(1);
                         }
-=======
->>>>>>> Stashed changes
                         return PlanAction::Consumed;
                     }
                     _ => {}
@@ -2590,7 +2583,6 @@ impl PlanningView {
         let path = projects_dir().join(name);
         if std::fs::create_dir_all(path.join("tasks")).is_err() { return; }
         let _ = std::fs::write(path.join("repo_url"), repo_url);
-<<<<<<< Updated upstream
         let project = PlanProject {
             name: name.to_string(),
             path,
@@ -2603,11 +2595,6 @@ impl PlanningView {
         self.recompute_conflicts();
         self.clamp_cursor();
         self.needs_redraw = true;
-=======
-        self.projects = discover_projects();
-        self.initialized = false;
-        self.reload_all();
->>>>>>> Stashed changes
     }
 
     pub fn drain_editor_events(&mut self) -> Option<PlanAction> {
@@ -2658,16 +2645,12 @@ impl PlanningView {
 
         match &self.input_mode {
             PlanInputMode::Searching { query } => self.draw_search_overlay(frame, area, query),
-<<<<<<< Updated upstream
             PlanInputMode::NewTask { title, parent_name, .. } => {
                 self.draw_new_task_overlay(frame, area, title, parent_name.as_deref())
             }
             PlanInputMode::NewHeader { text } => self.draw_new_header_overlay(frame, area, text, false),
             PlanInputMode::EditingHeader { text } => self.draw_new_header_overlay(frame, area, text, true),
             PlanInputMode::BulkArchiveConfirm { project_idx, count } => self.draw_bulk_archive_confirm(frame, area, *project_idx, *count),
-=======
-            PlanInputMode::NewTask { title } => self.draw_new_task_overlay(frame, area, title),
->>>>>>> Stashed changes
             PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
             PlanInputMode::WorkspacePicker { project_idx, task_idx, selected } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected),
