@@ -28,9 +28,20 @@ def _workflow_run_dir() -> Path:
     """
     run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
     if not run_id:
+        session_uid = os.environ.get("CM_TUI_SESSION_ID", "").strip() or "<unknown>"
+        cfg_hint = (
+            f"~/.cm/mcp/{session_uid}/claude.json"
+            if session_uid != "<unknown>"
+            else "the session's per-session MCP config under ~/.cm/mcp/<session_uid>/claude.json"
+        )
         raise RuntimeError(
             "CM_WORKFLOW_RUN_ID is not set — workflow tools are only usable "
-            "inside a workflow-participant session."
+            "inside a workflow-participant session. If you are running inside "
+            f"a workflow role (session UID {session_uid}) and seeing this, the "
+            f"per-session MCP config is missing the workflow env block. Check "
+            f"{cfg_hint} — the env block should include CM_WORKFLOW_RUN_ID and "
+            "CM_ROLE. Fixing the file alone is not enough; the agent process "
+            "must be respawned for the MCP subprocess to pick up the new env."
         )
     base = Path(os.path.expanduser("~/.cm/workflow-runs")) / run_id
     base.mkdir(parents=True, exist_ok=True)

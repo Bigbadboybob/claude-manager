@@ -703,6 +703,15 @@ where
 /// `workflow_transition` / `workflow_done`. The user-launched session was
 /// started without `--mcp-config`; this is what gives it the workflow tools.
 ///
+/// `session_id` is optional: when present, the new agent is started with
+/// `--resume <sid>` and its transcript binding is preserved. When absent
+/// (e.g. an idle pane that hasn't produced a transcript yet), we still
+/// respawn so the new agent picks up the workflow env — it just starts
+/// fresh, and the watcher binds whatever sid the new agent writes. Without
+/// this respawn the agent's MCP subprocess never sees `CM_WORKFLOW_RUN_ID`,
+/// and every `workflow_transition` / `workflow_done` / `workflow_reject_finding`
+/// call from this role fails for the lifetime of the run.
+///
 /// Returns `None` on success, `Some(message)` on any failure (caller decides
 /// whether to surface to the status bar). On failure the existing `Session`
 /// is left untouched — we only swap if `Session::new` succeeds.
@@ -719,26 +728,30 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     cap_status: &crate::memory_cap::MemoryCapAvailability,
     kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
 ) -> Option<String> {
-    let (sid, wt) = match (session_id, worktree) {
-        (Some(sid), Some(wt)) => (sid, wt),
-        _ => {
+    let wt = match worktree {
+        Some(wt) => wt,
+        None => {
             return Some(format!(
-                "Skipping reload of {}: session_id not detected — workflow MCP tools unavailable",
+                "Skipping reload of {}: worktree unknown — workflow MCP tools unavailable",
                 role
             ));
         }
     };
     let workflow_meta = crate::mcp_config::WorkflowMeta { run_id, role };
-    let codex_resume_baseline = if matches!(engine, workflow::toml_schema::Engine::Codex) {
-        Some(App::list_codex_sessions(wt))
-    } else {
-        None
+    // Snapshot pre-spawn transcript files so the watcher can identify the
+    // new one. For Codex this matters even with `--resume` because resume
+    // writes a fresh rollout id; for Claude it's only needed when we're
+    // spawning without `--resume` (no sid yet). Cheap to compute either
+    // way.
+    let pre_spawn_files = match engine {
+        workflow::toml_schema::Engine::ClaudeCode => App::list_jsonl_files(wt),
+        workflow::toml_schema::Engine::Codex => App::list_codex_sessions(wt),
     };
     let (program, args) = match crate::mcp_config::build_args(
         engine,
         &ts.uid,
         Some(workflow_meta),
-        Some(sid),
+        session_id,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -771,12 +784,21 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         }
     };
     // Swap the Session: dropping the old one closes its PTY which reaps the
-    // old agent process. Claude resumes in-place; modern Codex writes a new
-    // rollout id for `codex resume <sid>`, so keep the old sid bound until the
-    // detector sees the post-resume file and rebinds the role.
+    // old agent process. With a sid we keep it bound (Claude resumes
+    // in-place; Codex writes a new rollout id but the detector rebinds
+    // once the post-resume file appears). Without a sid the new agent
+    // starts fresh — the detector will bind whatever transcript it writes.
     ts.session = new_sess;
-    ts.transcript_id = Some(sid.to_string());
-    ts.pending_jsonl_files = codex_resume_baseline;
+    if session_id.is_some() {
+        ts.transcript_id = session_id.map(|s| s.to_string());
+        ts.pending_jsonl_files = match engine {
+            workflow::toml_schema::Engine::ClaudeCode => None,
+            workflow::toml_schema::Engine::Codex => Some(pre_spawn_files),
+        };
+    } else {
+        ts.transcript_id = None;
+        ts.pending_jsonl_files = Some(pre_spawn_files);
+    }
     ts.pending_prompt = None;
     ts.pending_clear = None;
     ts.pending_enter = None;
