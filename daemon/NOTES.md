@@ -489,12 +489,15 @@ of the meta-lessons captured below — that pain was the cost of
 learning the rollback-vs-retry-vs-event-ordering invariants the
 hard way.
 
-## Phase 2 candidates
+## Phase 1 follow-ups (deferred)
 
 Cross-slice follow-ups surfaced during Phase 1, consolidated here
-for the next planning pass. Most have inline references back to
-the slice where they surfaced; the in-line "Future work" / "Known
-costs" sections below carry the original detailed context.
+for the next planning pass. Distinct from **design-doc Phase 2**
+(see "Phase 2: Workflow events over RPC" below) — these are
+Phase-1-introduced gaps, not the next-phase roadmap. Most have
+inline references back to the slice where they surfaced; the
+in-line "Future work" / "Known costs" sections below carry the
+original detailed context.
 
 1. **10e-d M4 — attach-drain wiring lacks unit-test coverage**.
    `drain_terminal_events`'s `try_emit_cap_kill_toast` call is
@@ -615,6 +618,230 @@ slices applying these should converge faster than this one did.
    (10e-d, 10f, 10g) avoided design-rework rounds. Slices that
    started coding without the Q&A often hit "the design should
    have been X, not Y" review rounds.
+
+## Phase 2: Workflow events over RPC
+
+**Goal** (from `doc/persistent-host-daemon.md` §"Phase 2:
+Workflow events over RPC"): drop the TUI's file-tail of
+`events.jsonl`. Workflow state + events flow exclusively through
+`events.subscribe` (streaming RPC) and `workflow.get_state` (RPC).
+After this lands, the TUI doesn't touch the daemon's filesystem
+for any runtime data — precondition for Phase 3 (multi-host).
+
+The design doc's Phase 2 description stands; this section pins
+the implementation specifics + slice sequence that the doc
+intentionally leaves open.
+
+### Design ambiguities resolved (defaults baked into the slice plan)
+
+The design doc leaves three implementation choices open. Defaults
+below mirror Phase 1's `manifest.watch` (10e) precedent for
+consistency:
+
+1. **`events.subscribe(filter)` — no filter param.** Daemon
+   broadcasts every event; TUI subscribes to all and filters
+   client-side by `run_id` when rendering a specific run.
+   Matches `manifest.watch`'s no-filter design. Cheaper than
+   per-subscriber filter state; events.jsonl traffic is low
+   (a feedback workflow generates <100 events end-to-end).
+
+2. **`workflow.get_state` — full `WorkflowRun` snapshot.**
+   Daemon serializes the existing `cm_daemon::workflow::run::WorkflowRun`
+   struct verbatim, including `history`, `events_offset`,
+   `rejected_findings`, `role_baselines`, etc. Cheaper than
+   designing a slim snapshot type; gives the TUI everything it
+   currently reads from disk in one call.
+
+3. **Reconnect/replay — snapshot-then-live frame model, no
+   replay buffer.** Mirrors `manifest.watch`'s 10e-b shape:
+   on subscribe, daemon sends one `WorkflowStateSnapshot` frame
+   per active run (`workflow.get_state` payload), then live
+   `WorkflowEvent` frames for subsequent events. Fresh subscribers
+   get current state via the snapshot, future state via the
+   live stream. No separate ring-buffer needed.
+
+### Slice sequence
+
+Each slice leaves the tree green. The architecture closely
+mirrors 10e (manifest.watch), so most slices have a Phase 1
+analog and should compress vs. their 10e counterparts.
+
+#### Slice 11a — Daemon-side broadcaster on `events::read_new`
+
+Mirror of 10e-b's `ManifestWatcher`. Add a broadcaster wrapper
+around the existing `daemon/src/workflow/events.rs::read_new`
+loop in the daemon's poller. Each tick's parsed `Event` goes
+to both the existing in-daemon dispatch AND a fan-out broadcast
+to all subscribers (`sync_channel(N)` + `try_send` + `retain`
+for slow-subscriber drop, same shape as `ManifestWatcher`).
+
+- New type: `WorkflowEventWatcher` in `daemon/src/workflow/`
+  with `subscribe()` returning `(Receiver<WorkflowEvent>, SubscriptionGuard)`.
+- Wire into `daemon/src/state.rs::DaemonState`.
+- The poller's existing tick callbacks invoke
+  `state.workflow_event_watcher.broadcast(event)` after the
+  in-daemon dispatch settles.
+
+**Acceptance**: T1 — one subscriber sees every event the poller
+processes, in order. T2 — slow subscriber is dropped without
+blocking the broadcast. T3 — concurrent broadcasts all delivered.
+T4 — RAII guard drops slot on receiver drop.
+
+**Dependencies**: Phase 1 (already shipped).
+
+#### Slice 11b — `events.subscribe` RPC + streaming consumer
+
+Mirror of 10e-b's `dispatch_manifest_watch` + `handle_manifest_watch_stream`.
+
+- New `StreamKind` variants: `WorkflowEventStateSnapshot`
+  (initial frame per active run), `WorkflowEvent` (live diff
+  frame), and a `WorkflowEventEnd`-equivalent on disconnect.
+- New dispatch arm `dispatch_events_subscribe` (Operator-only,
+  empty params).
+- `daemon/src/control/stream.rs::handle_events_subscribe_stream`
+  — on subscribe, iterate `state.workflow_runs`, emit one
+  `WorkflowEventStateSnapshot` per active run, then drive
+  the live channel. Heartbeat ticks for idle-disconnect
+  detection (same 30s default as `manifest.watch`).
+- Wire the dispatcher's outcome handler in `daemon/src/lib.rs`.
+
+**Acceptance**: T5-T10 mirror 10e-b's tests — snapshot-then-live,
+slow subscriber drop, concurrent broadcasts, reconnect,
+Session-caller rejected, heartbeat idle-disconnect, RAII guard,
+no accumulation across many reconnects.
+
+**Dependencies**: 11a.
+
+#### Slice 11c — `workflow.get_state(run_id)` RPC
+
+Cold-read snapshot for TUI attach paths that need state without
+subscribing to the stream (e.g. workflow history view on `A-y`).
+
+- New dispatch arm `dispatch_workflow_get_state` (Operator-only,
+  params `{run_id: String}`).
+- Returns full `WorkflowRun` serialized as JSON.
+- Error cases: `NotFound` for unknown `run_id`.
+
+**Acceptance**: T11 — happy path returns expected snapshot.
+T12 — unknown run_id → NotFound. T13 — Session caller rejected.
+
+**Dependencies**: 11a structurally; can land in parallel with 11b.
+
+#### Slice 11d — TUI consumer module + App integration
+
+Mirror of 10e-c's `manifest_watch.rs` + `drain_manifest_watch_events`.
+
+- New `tui/src/workflow_watch.rs` module:
+  - `WorkflowEventConsumer` with reconnect loop (1s → 30s exp
+    backoff).
+  - `WorkflowEvent` event-channel enum: `Snapshot(WorkflowRun)`,
+    `Event(WorkflowEvent)`.
+  - `should_spawn` + `maybe_spawn_for_app()` matching
+    manifest_watch's shape.
+- `App.workflow_watch_rx: Option<Receiver<WorkflowWatchEvent>>`
+  field; spawn at `App::new`.
+- `App::drain_workflow_watch_events` in main-loop tick, applies
+  events to `App.workflow_runs` via existing controller paths.
+  Conservative-merge on snapshot (mirror 10e-c r1 F1's pattern):
+  daemon's snapshot is authoritative for fields the TUI hasn't
+  observed yet (history beyond local `events_offset`); local
+  in-memory state wins for fields the TUI has already applied.
+
+**Acceptance**: T14-T20 — consumer spawns, snapshot arrives,
+diff events apply, reconnect-resilience, channel-disconnect
+exits outer loop.
+
+**Dependencies**: 11b + 11c (the consumer needs both RPCs).
+
+#### Slice 11e — Delete TUI file-tail
+
+The reveal slice. Switch the TUI's workflow-view code path
+from file-tail (`tui/src/workflow/events.rs::read_new` reads,
+direct `~/.cm/workflow-runs/<id>/state.json` reads) to the
+RPC-driven path landed in 11d.
+
+- Audit and delete file-read sites in TUI:
+  - `workflow::events::read_new` callers in `tui/src/workflow/controller.rs`.
+  - Any direct `state.json` reads.
+- Workflow controller's tick draws events from
+  `workflow_watch_rx` instead of file-tailing.
+- Daemon still WRITES `events.jsonl` for durability (the design
+  doc explicitly preserves this — single producer, two
+  consumers: file durability + RPC broadcast).
+
+**Acceptance** (design-doc named):
+- Grep proves TUI no longer references
+  `tui/src/workflow/events.rs::read_new` or any path under
+  `~/.cm/workflow-runs/` for reads.
+- Manual smoke: feedback-mode workflow worker → reviewer →
+  manager → done with `A-y` history correct.
+- `events.jsonl` durability unchanged (compare a feedback run
+  before/after; same records).
+
+**Dependencies**: 11d.
+
+#### Slice 11f — Reconnect acceptance test
+
+Named acceptance gate for Phase 2 (per design doc):
+> "Killing the TUI mid-workflow and reattaching shows the
+> current active role and recent transitions (via
+> `workflow.get_state` + last N events from the daemon's
+> broadcast buffer)."
+
+In-process integration test in `daemon/src/control/stream.rs::tests`
+mirroring 10g's pattern:
+1. Spawn daemon-side workflow run with a few transitions.
+2. Subscribe attach1; observe snapshot + diff frames; drop.
+3. Subscribe attach2 (fresh wire); assert FIRST frame is
+   `WorkflowEventStateSnapshot` containing the post-transition
+   `WorkflowRun` (history reflects all transitions made before
+   the disconnect).
+
+Mutation-verify by dropping the snapshot-send in
+`handle_events_subscribe_stream` and confirming the test fails
+with the same shape of contract-violation error 10g surfaces.
+
+**Acceptance**: T21 (named); T22 mirror of 10g's multi-reconnect
+(3 cycles, each first-frame is the snapshot).
+
+**Dependencies**: 11b + 11d + 11e (full path must be live).
+
+### Phase 1 follow-ups absorbed vs. deferred
+
+Of the 10 "Phase 1 follow-ups" items above:
+- **Absorbed into Phase 2**: none directly. They're parallel
+  axes. 11e's file-tail deletion does NOT subsume #3
+  (`tui/src/control/server.rs` removal) — that's the workflow
+  control SOCKET, distinct from the events file-tail.
+- **Still deferred**: all 10. Phase 2 is workflow-events-RPC
+  scoped; the carry-overs remain valid as future-slice
+  candidates.
+
+### Estimated commit count
+
+- 11a: 1 commit (broadcaster + tests).
+- 11b: 1-2 commits (RPC + streaming consumer + 6 tests).
+- 11c: 1 commit (get_state RPC + 3 tests).
+- 11d: 1-2 commits (TUI consumer + App integration + 7 tests).
+- 11e: 1-2 commits (file-tail deletion + workflow-view path flip).
+- 11f: 1 commit (reconnect acceptance test).
+
+Total estimate: 6-9 commits. Phase 1's 10e analog ran ~7
+commits (10e-a/b/c/d + r1 review rounds), so Phase 2's
+6-9-commit estimate has Phase 1's review-multiplier built in.
+Review-fix rounds expand the count if they surface real
+findings — which is the point of the feedback workflow.
+
+### What this Phase 2 plan is NOT
+
+- A spec for `events.subscribe`'s wire-level JSON shape — that
+  lives in the slice 11b PR.
+- A decision on Phase 3 multi-host transport. Phase 2 closes
+  the file-system dependency that blocks Phase 3 but doesn't
+  start Phase 3.
+- A revision to `doc/persistent-host-daemon.md`. The design
+  doc stands; ambiguity resolutions captured above are
+  implementation defaults, not doc updates.
 
 ## Future work
 
