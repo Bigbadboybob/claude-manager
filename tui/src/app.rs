@@ -2595,6 +2595,21 @@ pub struct App {
     /// 11d: thread handle for the events.subscribe consumer.
     /// Same lifecycle convention as `_manifest_watch_thread`.
     pub _workflow_watch_thread: Option<std::thread::JoinHandle<()>>,
+    /// 11g-1: per-run buffer for events delivered via
+    /// `workflow_watch_rx`. `drain_workflow_watch_events` pushes
+    /// each incoming `WorkflowWatchEvent::Event` into the
+    /// deque keyed by `event.run_id` (creating the entry on
+    /// first event for a run). The controller's tick will
+    /// consume from this in 11g-2; in 11g-1 the buffer
+    /// populates alongside the file-tail call so the two paths
+    /// can be parity-checked. Per-run ordering matches the
+    /// daemon's broadcast order, which matches the
+    /// `events.jsonl` append order (broadcast fires post-fsync
+    /// inside `WorkflowEventsWriter::append_event_and_broadcast`).
+    pub pending_workflow_events: HashMap<
+        String,
+        std::collections::VecDeque<cm_daemon::workflow::events::Event>,
+    >,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
     /// side-channels — the attach-stream End frame (immediate,
@@ -2749,6 +2764,7 @@ impl App {
             _manifest_watch_thread,
             workflow_watch_rx,
             _workflow_watch_thread,
+            pending_workflow_events: HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
         }
     }
@@ -6037,22 +6053,61 @@ impl App {
                 crate::workflow_watch::WorkflowWatchEvent::Snapshot(run) => {
                     self.apply_workflow_watch_snapshot(run);
                 }
-                crate::workflow_watch::WorkflowWatchEvent::Event(_event) => {
-                    // 11d wires the receiver + per-tick drain.
-                    // Slice 11e replaces the file-tail path in the
-                    // workflow controller with a consumer of
-                    // these events; this branch becomes the
-                    // single dispatch site at that point.
-                    //
-                    // 11d intentionally no-ops the event arm to
-                    // keep the file-tail path authoritative
-                    // through this slice — the channel still
-                    // flows so 11d's tests can pin reception
-                    // shape without affecting today's behavior.
+                crate::workflow_watch::WorkflowWatchEvent::Event(event) => {
+                    // 11g-1: push the channel event into the per-run
+                    // buffer. File-tail in the controller's tick
+                    // remains the production source of truth through
+                    // 11g-1; the buffer populates in parallel so
+                    // 11g-2 can flip the controller to consume from
+                    // it. Per-run deque preserves the daemon's
+                    // broadcast order (= events.jsonl append order
+                    // by Option B post-fsync ordering).
+                    self.pending_workflow_events
+                        .entry(event.run_id.clone())
+                        .or_default()
+                        .push_back(event);
                     self.needs_redraw = true;
                 }
             }
         }
+    }
+
+    /// 11g-1: drain the per-run pending-events buffer for
+    /// `run_id`, returning the events in FIFO order. Empty Vec
+    /// when no events are pending for the run (or the run has
+    /// never had any). Callers (controller's tick in 11g-2) get
+    /// ownership of the events; the buffer entry is left empty
+    /// but present (cheaper than re-inserting on the next push).
+    ///
+    /// Front-push helper for 11g-2 retry-on-failure: a failed
+    /// decision can re-push the source event at the front via
+    /// `requeue_pending_workflow_event_front` so the next tick
+    /// re-processes it.
+    pub fn take_pending_workflow_events(
+        &mut self,
+        run_id: &str,
+    ) -> Vec<cm_daemon::workflow::events::Event> {
+        match self.pending_workflow_events.get_mut(run_id) {
+            Some(deque) => deque.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 11g-1: push an event back at the FRONT of the per-run
+    /// buffer. Used by the 11g-2 retry path: a failed decision
+    /// re-pushes its source event so the next tick retries the
+    /// same event under the existing `failed_runs` gating.
+    /// Same retry semantics as today's "leave events_offset
+    /// un-advanced" pattern.
+    pub fn requeue_pending_workflow_event_front(
+        &mut self,
+        run_id: &str,
+        event: cm_daemon::workflow::events::Event,
+    ) {
+        self.pending_workflow_events
+            .entry(run_id.to_string())
+            .or_default()
+            .push_front(event);
     }
 
     /// 11d: apply a snapshot frame from `events.subscribe`. The
@@ -13920,6 +13975,244 @@ mod rotation_binding_tests {
             found.as_deref(),
             Some("new-sid"),
             "must pick the newer transcript (timestamp >= rotation)",
+        );
+    }
+}
+
+/// 11g-1: tests for the per-run pending-events buffer that
+/// `drain_workflow_watch_events` populates and that 11g-2's
+/// controller flip will consume from. File-tail in the
+/// controller's tick remains the production source of truth
+/// in 11g-1; these tests pin the buffer's behavior in
+/// isolation so 11g-2 can flip the consumer with confidence.
+#[cfg(test)]
+mod pending_workflow_events_tests {
+    use super::*;
+
+    fn build_app_for_buffer_tests() -> App {
+        // Mirror `build_app_with_session`'s home_lock + tempdir
+        // dance — App::new reads ~/.cm/ and spawns daemon-watch
+        // threads; isolating $HOME prevents cross-test bleed.
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        if let Some(h) = orig_home {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        // Leak the tempdir so the consumer threads (already
+        // spawned with the test HOME in their env) don't error
+        // on later ~/.cm accesses.
+        std::mem::forget(tmp);
+        app
+    }
+
+    fn make_event(id: &str, run_id: &str) -> cm_daemon::workflow::events::Event {
+        cm_daemon::workflow::events::Event {
+            id: id.into(),
+            ts: 0.0,
+            run_id: run_id.into(),
+            role: "worker".into(),
+            tool: "workflow_transition".into(),
+            args: serde_json::json!({"to": "reviewer", "prompt": ""}),
+            source: "daemon".into(),
+            from_role: None,
+            iteration: 0,
+        }
+    }
+
+    /// T_g1a — App::new produces an empty pending-events buffer.
+    /// Pins the initial state so a fresh App doesn't carry
+    /// stale entries across restarts.
+    #[test]
+    fn pending_workflow_events_starts_empty() {
+        let app = build_app_for_buffer_tests();
+        assert!(
+            app.pending_workflow_events.is_empty(),
+            "App::new must produce an empty buffer; got {:?}",
+            app.pending_workflow_events.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// T_g1b — `take_pending_workflow_events` drains in FIFO
+    /// order. Per-run deque preserves the daemon's broadcast
+    /// order, which matches `events.jsonl` append order.
+    /// Multiple pushes for one run, single drain, exact
+    /// ordering pinned.
+    #[test]
+    fn take_pending_workflow_events_drains_in_fifo_order() {
+        let mut app = build_app_for_buffer_tests();
+        let run_id = "wf_g1b";
+        // Push directly into the buffer (drain-path coverage
+        // is T_g1f below; this isolates the helper).
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-1", run_id));
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-2", run_id));
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-3", run_id));
+
+        let drained = app.take_pending_workflow_events(run_id);
+        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ev-1", "ev-2", "ev-3"],
+            "FIFO drain must preserve push order",
+        );
+        // Buffer entry empty post-drain (deque left present
+        // but empty per the helper's contract).
+        assert_eq!(
+            app.pending_workflow_events
+                .get(run_id)
+                .map(|d| d.len())
+                .unwrap_or(99),
+            0,
+            "drain leaves the deque empty",
+        );
+        // Second drain returns empty (no replay).
+        assert!(app.take_pending_workflow_events(run_id).is_empty());
+    }
+
+    /// T_g1c — `take_pending_workflow_events` for an unknown
+    /// run_id returns an empty Vec (no panic, no spurious
+    /// entry created).
+    #[test]
+    fn take_pending_workflow_events_unknown_run_returns_empty() {
+        let mut app = build_app_for_buffer_tests();
+        let drained = app.take_pending_workflow_events("wf_nope");
+        assert!(drained.is_empty());
+        assert!(
+            !app.pending_workflow_events.contains_key("wf_nope"),
+            "take must not create a spurious entry for an unknown run",
+        );
+    }
+
+    /// T_g1d — `requeue_pending_workflow_event_front` places
+    /// the event at the FRONT of the deque (LIFO with respect
+    /// to the existing tail). Used by 11g-2's retry path: a
+    /// failed decision pushes its source event back so the
+    /// next tick retries the same event.
+    #[test]
+    fn requeue_pending_workflow_event_front_inserts_at_head() {
+        let mut app = build_app_for_buffer_tests();
+        let run_id = "wf_g1d";
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-tail", run_id));
+        app.requeue_pending_workflow_event_front(
+            run_id,
+            make_event("ev-head", run_id),
+        );
+        let drained = app.take_pending_workflow_events(run_id);
+        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ev-head", "ev-tail"],
+            "requeue must place at the front — next take returns it first",
+        );
+    }
+
+    /// T_g1e — multi-run isolation. Events for run-A and run-B
+    /// land in separate per-run deques; draining run-A does
+    /// not affect run-B's pending events.
+    #[test]
+    fn take_pending_workflow_events_isolates_per_run() {
+        let mut app = build_app_for_buffer_tests();
+        app.pending_workflow_events
+            .entry("wf-A".into())
+            .or_default()
+            .push_back(make_event("a-1", "wf-A"));
+        app.pending_workflow_events
+            .entry("wf-A".into())
+            .or_default()
+            .push_back(make_event("a-2", "wf-A"));
+        app.pending_workflow_events
+            .entry("wf-B".into())
+            .or_default()
+            .push_back(make_event("b-1", "wf-B"));
+
+        let a = app.take_pending_workflow_events("wf-A");
+        assert_eq!(
+            a.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["a-1", "a-2"],
+        );
+        // B untouched.
+        let b = app.take_pending_workflow_events("wf-B");
+        assert_eq!(
+            b.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["b-1"],
+        );
+    }
+
+    /// T_g1f — end-to-end: `drain_workflow_watch_events` push
+    /// path. Substitute `app.workflow_watch_rx` with a synthetic
+    /// channel, send Events through it, call drain, assert the
+    /// per-run buffer contains them in the order sent. Pins the
+    /// drain Event arm's push behavior; the in-isolation drain
+    /// helpers above (T_g1b/T_g1d) cover the take/requeue
+    /// halves.
+    ///
+    /// Mutation-verifiable: remove the `push_back` call in the
+    /// drain's Event arm and this test fails (buffer stays
+    /// empty after drain).
+    #[test]
+    fn drain_workflow_watch_events_pushes_into_per_run_buffer() {
+        let mut app = build_app_for_buffer_tests();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            crate::workflow_watch::WorkflowWatchEvent,
+        >();
+        // Replace the real receiver. Drop the production one
+        // (its consumer thread keeps running but feeds nothing).
+        app.workflow_watch_rx = Some(rx);
+
+        let run_id = "wf_g1f";
+        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+            make_event("ev-1", run_id),
+        ))
+        .expect("send 1");
+        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+            make_event("ev-2", run_id),
+        ))
+        .expect("send 2");
+        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+            make_event("ev-3", run_id),
+        ))
+        .expect("send 3");
+
+        app.drain_workflow_watch_events();
+
+        let drained = app.take_pending_workflow_events(run_id);
+        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ev-1", "ev-2", "ev-3"],
+            "drain must populate the per-run buffer in send order",
+        );
+        assert!(
+            app.needs_redraw,
+            "drain must set needs_redraw on each Event",
         );
     }
 }

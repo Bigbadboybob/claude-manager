@@ -887,6 +887,282 @@ with the same shape of contract-violation error 10g surfaces.
 
 **Dependencies**: 11b + 11d + 11e (full path must be live).
 
+#### Slice 11g — Retire events_offset, delete TUI file-tail (the actual reveal)
+
+11e's prerequisites shipped (broadcaster hook moved into
+`WorkflowEventsWriter::append_event_and_broadcast`,
+`workflow_reject_finding` daemon-routed) but the file-tail
+deletion that 11e was named for did NOT — the TUI's controller
+still reads events via `workflow::events::read_new_with_offsets`
+at `tui/src/workflow/controller.rs:1000` in production. The
+11d channel (`App.workflow_watch_rx`) exists, but its `Event`
+arm in `drain_workflow_watch_events` is a `needs_redraw = true`
+stub: events flow over the wire and are discarded TUI-side.
+
+**Why option (b) — retire `events_offset`.** The decision
+pipeline's per-event file-offset bookkeeping (`Decision`
+variants carrying `new_offset`, `events_offset` advancing on
+success, re-reading on failure) exists ONLY to support
+file-tail replay across TUI restarts. Post-Phase-2 the
+durable view is the daemon's `state.json` + the
+`events.subscribe` snapshot — both already authoritative
+across TUI death. Keeping `events_offset` as a TUI bookmark
+on top of that is dead weight; the channel IS the bookmark
+(per-tick deque per run). Option (a) — populate
+`events_offset` from `workflow.get_state`'s history — would
+keep the pipeline shape but is structurally redundant; (b)
+deletes the redundancy.
+
+**Pre-coding audit (6 items):**
+
+1. **Handler audit.** Single production caller of
+   `read_new_with_offsets`:
+   `controller.rs:1000`. ~10 test usages live in the same
+   file (3278, 3325, 3329, 3400, 3492, 3725, 5396). The
+   production call feeds the `events_with_offsets` Vec that
+   the per-event match (Transition/Done/RejectFinding/
+   Unknown) walks. Each event arm pushes a `Decision` with
+   `new_offset = *post_event_offset`. The decision-
+   processing loop applies decisions sequentially; on
+   `Decision::Failed` for a run, subsequent decisions for
+   that run skip via `failed_runs.insert(run_id)`.
+
+2. **Ownership boundaries.** Daemon owns events.jsonl
+   (single writer via `append_event_and_broadcast`) and
+   state.json (mutates under flock from
+   `workflow_transition` / `workflow_done` /
+   `workflow_reject_finding` / poller's static-idle).
+   Post-11g the TUI owns: in-memory `App.workflow_runs`
+   continuations (activation prompt scheduling, session
+   spawn/respawn). The TUI no longer writes events.jsonl
+   or `events_offset` on state.json.
+
+3. **Wire shape.** Unchanged. `events.subscribe` already
+   delivers one snapshot frame per active run + one
+   `WorkflowEvent` per broadcast. The TUI just stops
+   ignoring them.
+
+4. **Atomicity guarantees.** Event broadcast happens AFTER
+   `state.json` fsync (Option B post-write ordering); the
+   snapshot read happens under the daemon's
+   `state.workflow_event_watcher.subscribe()` lock so no
+   broadcast can fall between snapshot and the first live
+   frame. Subscriber sees: every event in the snapshot's
+   history + every event broadcast AFTER subscribe. No
+   gap, no replay.
+
+5. **Race surfaces.** (i) Daemon writes event N to
+   events.jsonl, broadcasts; TUI processes N from channel
+   AND is also still file-tailing the same file → double-
+   apply. Resolution: file-tail deletion is atomic with
+   wiring the channel into the controller; no intermediate
+   state where both run. (ii) `workflow_runs` mutation
+   from `drain_workflow_watch_events` (main thread, per
+   tick) races nothing — App is single-threaded outside
+   the channel-producer threads. (iii) `apply_workflow_
+   watch_snapshot` from 11d already has conservative-merge;
+   on App::new the run is loaded from disk first, the
+   snapshot arrives shortly after, and the
+   already-present-by-run-id guard prevents double-insert.
+
+6. **Test invariants.** Three categories: (a) controller
+   decision pipeline tests that currently drive events via
+   `read_new_with_offsets` — port to Event injection via a
+   test-only channel push helper, or delete if they test
+   dead bookkeeping; (b) controller behavior tests (static-
+   idle gate, fresh-context reset, dynamic prompt delivery)
+   — these don't care about the source, port to channel
+   path; (c) the new T-acceptance: process N events from
+   channel → produces N decisions in the same order, no
+   re-application across ticks.
+
+**Design ambiguities (need confirmation before coding):**
+
+- **A1: Per-run event buffer location.** Recommend:
+  `App.pending_workflow_events: HashMap<String, VecDeque<Event>>`,
+  populated by `drain_workflow_watch_events`, drained by the
+  controller's tick. Mirrors `App.workflow_watch_rx`'s
+  per-tick drain shape. Alternative: pass the channel
+  receiver directly into the controller's ctx — but that
+  exposes the consumer-thread lifetime to the controller
+  which is otherwise channel-agnostic. Lean: HashMap on
+  App.
+
+- **A2: TuiLocal `_append_event` deprecation.** The Python
+  MCP tools (`workflow_transition`, `workflow_done`,
+  `workflow_reject_finding`) all have a
+  `daemon_socket_pinned()` branch with an `else` that
+  writes events.jsonl directly via `_append_event`. The
+  daemon has been mandatory since 10f (default-flip);
+  TuiLocal is vestigial. Recommend: in this slice, delete
+  the else branches in `mcp_server/server.py` AND the
+  `_append_event` helper, AND drop the `controller.rs`
+  `daemon_routed` source-tag branching (every event is now
+  daemon-source). Alternative: keep TuiLocal alive and
+  route it through a TUI-local channel push so the
+  controller stays source-agnostic — but that's a parallel
+  wire path for a code path no one uses. Lean: delete
+  TuiLocal.
+
+- **A3: Failed-decision retry shape.** Today: failed
+  decision leaves `events_offset` unchanged → file-tail re-
+  reads on next tick. Channel events can't be re-broadcast
+  (FIFO, consumed once). Recommend: leave the failed event
+  at the head of the per-run `VecDeque` — controller pops
+  on successful apply, leaves on failure. Same `failed_runs`
+  short-circuit; same single-event-per-run-per-tick
+  semantics. Alternative: on failure, refetch via
+  `workflow.get_state` and resync — heavy, and the failure
+  is usually transient (session not yet idle, prompt
+  delivery raced respawn). Lean: in-place retry via deque.
+
+- **A4: `WorkflowRun.events_offset` field on the struct.**
+  Recommend: KEEP the field with `#[serde(default)]` (state.
+  json files in the wild carry it; Daemon's `try_modify` /
+  `modify` would clobber otherwise), stop reading and stop
+  writing it from TUI code. Field becomes effectively dead
+  weight. Cleanup-delete in a Phase 3 follow-up after a
+  release cycle gives existing on-disk files time to
+  migrate. Alternative: delete now — requires a migration
+  pass that's not worth the risk for a non-load-bearing
+  field. Lean: keep field, retire usage.
+
+**Implementation outline (sequencing):**
+
+1. Add `App.pending_workflow_events: HashMap<String,
+   VecDeque<Event>>`. Change
+   `drain_workflow_watch_events`' `Event` arm to push into
+   the appropriate per-run deque (creating the entry on
+   first event). Apply snapshot arm unchanged.
+
+2. Add a controller-side helper
+   `WorkflowControllerCtx::take_pending_events(run_id)`
+   that drains the per-run deque into a Vec for this tick's
+   processing. Drains under the same iteration order as
+   today's `events_with_offsets`.
+
+3. Rewrite `controller.rs:1000` block: replace
+   `read_new_with_offsets` with `take_pending_events`. Drop
+   the `final_consumed_offset` Skip-for-malformed-lines
+   branch (no malformed lines — channel only carries
+   deserialized `Event`s). Per-event match arms stay the
+   same SHAPE but no longer set `new_offset` on decisions
+   (or set to 0; effective-no-op).
+
+4. Decisions: change `Decision::*::new_offset` to
+   either drop the field or hard-code 0. Recommend drop —
+   smaller surface, easier to grep "field gone, callers
+   updated." The decision-processing loop's `events_offset`
+   write becomes a no-op (skip the field update entirely).
+
+5. Failure path: when a Decision returns Failed, the controller
+   re-pushes the source event at the FRONT of the per-run deque
+   so the next tick retries it. `failed_runs` short-circuit
+   still skips subsequent events on the same run this tick.
+
+6. TuiLocal cleanup (per A2): delete the else branches in
+   `mcp_server/server.py` for `workflow_transition`,
+   `workflow_done`, `workflow_reject_finding`. Delete the
+   `_append_event` helper. Update
+   `mcp_server/tests/test_workflow_tool_fallback.py`
+   accordingly (or delete the file if the whole point was
+   the fallback path).
+
+7. Delete `daemon_routed` branching in `controller.rs`'s
+   per-event arms (Transition, Done, RejectFinding). Every
+   event is now daemon-source. Reload-from-disk in the
+   RejectFinding arm stays — daemon mutated state.json
+   before broadcasting, TUI in-memory needs to mirror.
+
+8. Delete the production-call helpers in
+   `tui/src/workflow/events.rs`: `read_new`,
+   `read_new_with_offsets`. Keep the `Event` and `EventKind`
+   types (they ARE the wire shape via serde).
+
+9. Test suite cleanup:
+   - Delete tests that exercised the file-tail offset
+     bookkeeping that no longer exists.
+   - Port the test scaffolding pattern from
+     `tick_advances_offset_past_unknown_event_and_consumes_later_events`
+     and friends to push synthetic Events into
+     `pending_workflow_events` directly.
+   - Update
+     `tick_advances_offset_past_reject_finding_event` and
+     `malformed_event_line_does_not_wedge_offset` —
+     the former becomes a wedge-on-empty-decisions check;
+     the latter is no longer reachable and gets deleted.
+
+**Acceptance (design-doc named):**
+
+- **A_grep**: `grep -r "read_new\|read_new_with_offsets"
+  tui/src/` returns ONLY test-utility usage (or zero
+  matches if all ported). `grep -r
+  "~/.cm/workflow-runs/.*state.json" tui/src/` returns
+  zero matches outside `workflow::run::load_*` (which is
+  re-exported from `cm_daemon` and stays load-bearing for
+  App::new's initial population).
+
+- **A_smoke (manual)**: feedback-mode workflow runs
+  worker → reviewer → manager → done. `A-y` history
+  shows all transitions correctly. Reviewer fresh-
+  context reset works. Manager calls
+  `workflow_reject_finding`; reviewer's next activation
+  prompt includes the rejected finding.
+
+- **A_durability**: `events.jsonl` byte-compare before/
+  after a feedback run — same records, same shape, same
+  order. The TUI's read-side change must not perturb
+  the daemon's write-side.
+
+- **T31** — drain pushes channel events into the per-run
+  deque (single-run, multiple events, correct order).
+
+- **T32** — controller's tick drains the per-run deque
+  and produces the expected `Decision`s in deque order.
+
+- **T33** — failed decision re-pushes the source event
+  at deque-head; next tick re-processes it; the second
+  attempt succeeds → exactly one apply.
+
+- **T34 (mutation-verify the entire deletion)**: remove
+  the channel-drive path in the controller and confirm
+  that workflow processing stops entirely (no decisions
+  produced for any run). This pins that the new path is
+  load-bearing, not redundant alongside file-tail.
+
+- **T35** — re-run T21/T22 from 11f against the
+  end-to-end TUI path (not just the daemon-side helper).
+  Spin up a real `App`, drive a workflow run, kill the
+  TUI, restart, assert `A-y` history matches pre-kill.
+
+**Dependencies**: 11b + 11c + 11d + 11e prereqs all live.
+No daemon-side changes expected (snapshot + broadcast wire
+unchanged from 11b). TUI-side surgery only, plus the
+Python TuiLocal deletion.
+
+**Risk and roll-back posture.** The deletion is
+non-mechanical because the decision pipeline's
+offset machinery is woven through every event arm and the
+decision-processing loop. Recommend landing in two
+sub-slices to keep blast radius bounded:
+
+- **11g-1 (mechanical)**: add `pending_workflow_events`
+  + drain push + controller drain helper. Keep file-tail
+  PRODUCTION call alive. Channel events arrive, populate
+  deque, but the controller still consumes from
+  `read_new_with_offsets`. Verify channel-vs-file
+  ordering parity via a test (events arrive in both
+  paths; pin same order). No user-visible behavior change.
+
+- **11g-2 (the reveal)**: flip
+  `controller.rs:1000` to consume from
+  `pending_workflow_events` instead of
+  `read_new_with_offsets`. Delete file-tail callers,
+  TuiLocal branches, `daemon_routed` branching. The
+  feature-flag-shaped roll-back is "revert the 11g-2 PR
+  alone" which leaves 11g-1 plumbing in place and
+  re-enables file-tail.
+
 ### Phase 1 follow-ups absorbed vs. deferred
 
 Of the 10 "Phase 1 follow-ups" items above:
