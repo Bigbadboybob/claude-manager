@@ -4,8 +4,6 @@ import asyncio
 import json
 import os
 import sys
-import time
-import uuid
 from pathlib import Path
 
 # Add project root to path so cli.planning_client is importable
@@ -20,50 +18,17 @@ from mcp_server.transcripts import codex as transcripts_codex
 
 mcp = FastMCP("claude-manager")
 
-
-def _workflow_run_dir() -> Path:
-    """Return the directory for the current workflow run, creating it if needed.
-
-    Raises RuntimeError if CM_WORKFLOW_RUN_ID is not set (tool called outside a workflow).
-    """
-    run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
-    if not run_id:
-        raise RuntimeError(
-            "CM_WORKFLOW_RUN_ID is not set — workflow tools are only usable "
-            "inside a workflow-participant session."
-        )
-    base = Path(os.path.expanduser("~/.cm/workflow-runs")) / run_id
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def _append_event(tool: str, args: dict) -> dict:
-    """Append an MCP tool-call event to the active workflow run's events.jsonl."""
-    role = os.environ.get("CM_ROLE", "").strip() or "unknown"
-    run_dir = _workflow_run_dir()
-    event = {
-        "id": uuid.uuid4().hex,
-        "ts": time.time(),
-        "run_id": os.environ["CM_WORKFLOW_RUN_ID"],
-        "role": role,
-        "tool": tool,
-        "args": args,
-        # 10d-2c-1 review round-1 (P1 #1/#2): tag events written
-        # through the file-write path (TUI-local SpawnTarget) so
-        # the TUI tail observer knows state has NOT been mutated
-        # by the daemon — it must still call
-        # fire_transition / finish_run locally to apply the state
-        # change. Daemon-routed events get `source: "daemon"`
-        # (set by daemon's workflow_transition / workflow_done
-        # handlers).
-        "source": "tui-mcp",
-    }
-    # Append atomically: open with O_APPEND, write one line.
-    events_path = run_dir / "events.jsonl"
-    with events_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event) + "\n")
-        f.flush()
-    return event
+# 11g-2 (A2): the `_append_event` direct file-write helper and the
+# `_workflow_run_dir` accessor have been retired. Pre-11g-2 the
+# workflow tools fell back to writing `events.jsonl` directly when
+# the daemon socket wasn't pinned (the TuiLocal SpawnTarget path).
+# Since 10f the daemon has been mandatory and TUI launches always
+# pin `CM_DAEMON_SOCKET`, making the fallback unreachable.
+#
+# Post-11g-2 the TUI's controller no longer reads events.jsonl at
+# all (channel-only path via `events.subscribe`), so a stranded
+# file-only write would be invisible to the controller. Removing
+# the fallback closes the failure mode entirely.
 
 
 _BRIEF_FIELDS = (
@@ -946,6 +911,25 @@ def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
     )
 
 
+def _require_workflow_env() -> tuple[str, str]:
+    """Return (run_id, role) from env, or raise if not in a workflow session.
+
+    Both `workflow_transition` and `workflow_done` (and 11e-onward
+    `workflow_reject_finding`) need the same env-driven context; this
+    helper deduplicates the lookup + the RuntimeError message.
+    """
+    run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
+    if not run_id:
+        raise RuntimeError(
+            "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
+            "usable inside a workflow-participant session. If you "
+            "intended to call this from outside a workflow, that's not "
+            "supported; ask the orchestrator to launch a workflow first."
+        )
+    role = os.environ.get("CM_ROLE", "").strip() or "unknown"
+    return run_id, role
+
+
 @mcp.tool()
 def workflow_transition(to: str, prompt: str) -> str:
     """Hand control to another role in the current workflow.
@@ -957,38 +941,18 @@ def workflow_transition(to: str, prompt: str) -> str:
         to: Name of the role to transition to (must be declared in the workflow).
         prompt: The message to send to that role when it activates.
     """
-    # 10d-2b: flip from `_append_event` (direct file write) to
-    # `control_client.call` ONLY when a daemon is pinned. Under
-    # TUI-local spawn (SpawnTarget::TuiLocal), the agent's env
-    # has `CM_DAEMON_SOCKET=""` and no daemon serves
-    # workflow_transition — the per-method resolver would fall
-    # back to the TUI socket, but the TUI dispatcher has no
-    # handler for these methods, so the call would round-trip
-    # `UnknownMethod`. The `daemon_socket_pinned()` signal here
-    # matches the resolver's `chose_daemon` decision exactly
-    # (both read the same env shape), so file-write and
-    # daemon-routed paths can never drift.
-    if control_client.daemon_socket_pinned():
-        run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
-        if not run_id:
-            raise RuntimeError(
-                "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
-                "usable inside a workflow-participant session. If you "
-                "intended to call this from outside a workflow, that's not "
-                "supported; ask the orchestrator to launch a workflow first."
-            )
-        role = os.environ.get("CM_ROLE", "").strip() or "unknown"
-        result = control_client.call(
-            "workflow_transition",
-            {"to": to, "prompt": prompt, "run_id": run_id, "role": role},
-        )
-        return f"Queued transition to '{to}' (event {result['event_id']})."
-    else:
-        # TUI-local fallback: preserve pre-10d-2b behavior so
-        # A-f-launched workflow participants keep working. The
-        # TUI's controller tails events.jsonl exactly as today.
-        event = _append_event("workflow_transition", {"to": to, "prompt": prompt})
-        return f"Queued transition to '{to}' (event {event['id']})."
+    # 11g-2 (A2): routes unconditionally through the daemon. Pre-11g-2
+    # an `else` branch wrote events.jsonl directly via `_append_event`
+    # for TUI-local spawns; daemon-mandatory since 10f makes that
+    # path unreachable, and the controller's channel-only consumption
+    # (post-11g-2-a) would render any stranded file-only write
+    # invisible. See the module-head comment for the rationale.
+    run_id, role = _require_workflow_env()
+    result = control_client.call(
+        "workflow_transition",
+        {"to": to, "prompt": prompt, "run_id": run_id, "role": role},
+    )
+    return f"Queued transition to '{to}' (event {result['event_id']})."
 
 
 @mcp.tool()
@@ -1002,26 +966,14 @@ def workflow_done(reason: str) -> str:
     Args:
         reason: Short explanation of why the workflow is complete.
     """
-    # 10d-2b: see `workflow_transition` above — same daemon-vs-
-    # TUI-local branching rationale.
-    if control_client.daemon_socket_pinned():
-        run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
-        if not run_id:
-            raise RuntimeError(
-                "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
-                "usable inside a workflow-participant session. If you "
-                "intended to call this from outside a workflow, that's not "
-                "supported; ask the orchestrator to launch a workflow first."
-            )
-        role = os.environ.get("CM_ROLE", "").strip() or "unknown"
-        result = control_client.call(
-            "workflow_done",
-            {"reason": reason, "run_id": run_id, "role": role},
-        )
-        return f"Workflow marked done (event {result['event_id']})."
-    else:
-        event = _append_event("workflow_done", {"reason": reason})
-        return f"Workflow marked done (event {event['id']})."
+    # 11g-2 (A2): see `workflow_transition` above — same daemon-only
+    # routing.
+    run_id, role = _require_workflow_env()
+    result = control_client.call(
+        "workflow_done",
+        {"reason": reason, "run_id": run_id, "role": role},
+    )
+    return f"Workflow marked done (event {result['event_id']})."
 
 
 @mcp.tool()
@@ -1049,27 +1001,16 @@ def workflow_reject_finding(text: str) -> str:
             optionally). Free-text; surfaced to the reviewer verbatim as a
             bullet point.
     """
-    # 11e: flip from `_append_event` (direct file write) to
-    # daemon-routed when a daemon is pinned. Same shape as
-    # `workflow_transition` / `workflow_done`. The TUI-local
-    # fallback preserves pre-11e behavior so A-f-launched
-    # workflow participants still work.
-    if control_client.daemon_socket_pinned():
-        run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
-        if not run_id:
-            raise RuntimeError(
-                "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
-                "usable inside a workflow-participant session."
-            )
-        role = os.environ.get("CM_ROLE", "").strip() or "unknown"
-        result = control_client.call(
-            "workflow_reject_finding",
-            {"text": text, "run_id": run_id, "role": role},
-        )
-        return f"Recorded rejection (event {result['event_id']})."
-    else:
-        event = _append_event("workflow_reject_finding", {"text": text})
-        return f"Recorded rejection (event {event['id']})."
+    # 11g-2 (A2): routes unconditionally through the daemon. Same
+    # rationale as `workflow_transition` / `workflow_done` above —
+    # TUI-local fallback was removed once the daemon became
+    # mandatory and the controller stopped reading events.jsonl.
+    run_id, role = _require_workflow_env()
+    result = control_client.call(
+        "workflow_reject_finding",
+        {"text": text, "run_id": run_id, "role": role},
+    )
+    return f"Recorded rejection (event {result['event_id']})."
 
 
 if __name__ == "__main__":
