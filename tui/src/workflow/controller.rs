@@ -50,6 +50,50 @@ pub struct WorkflowControllerCtx<'a> {
     /// Sender clone for memory-kill events. Cloned again into each
     /// per-session watcher thread spawned by `spawn_agent_session`.
     pub kill_tx: &'a std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
+    /// 11g-2: per-run buffer of channel-delivered events. Drained
+    /// by `tick()` per run via [`take_pending_events`]; failed
+    /// decisions re-push the source event at the front via
+    /// [`requeue_pending_event_front`] so the next tick retries.
+    /// Replaces the pre-11g-2 file-tail (`read_new_with_offsets`)
+    /// path — `events.subscribe` broadcasts AFTER fsync, so the
+    /// channel ordering equals `events.jsonl` append order and
+    /// no file-read is needed.
+    pub pending_workflow_events: &'a mut HashMap<
+        String,
+        std::collections::VecDeque<workflow::events::Event>,
+    >,
+}
+
+impl<'a> WorkflowControllerCtx<'a> {
+    /// 11g-2: drain the per-run pending-events buffer in FIFO
+    /// order. Mirror of `App::take_pending_workflow_events` for
+    /// the controller's borrow scope. Returns an empty Vec when
+    /// no events are pending.
+    pub(crate) fn take_pending_events(
+        &mut self,
+        run_id: &str,
+    ) -> Vec<workflow::events::Event> {
+        match self.pending_workflow_events.get_mut(run_id) {
+            Some(deque) => deque.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 11g-2: front-push retry. A failed decision (apply errored,
+    /// session missing, etc.) re-pushes the source event so the
+    /// next tick re-processes it. Same retry semantics the
+    /// pre-11g-2 "leave events_offset un-advanced" pattern
+    /// provided via file-tail; the deque IS the bookmark now.
+    pub(crate) fn requeue_pending_event_front(
+        &mut self,
+        run_id: &str,
+        event: workflow::events::Event,
+    ) {
+        self.pending_workflow_events
+            .entry(run_id.to_string())
+            .or_default()
+            .push_front(event);
+    }
 }
 
 /// App-level side effect requested by the controller. The dispatcher
@@ -919,6 +963,18 @@ impl<'a> WorkflowControllerCtx<'a> {
             },
         }
         let mut decisions: Vec<Decision> = Vec::new();
+        // 11g-2: per-tick snapshot of drained events per run. On
+        // any decision-failure for run X at position K, the
+        // failure path re-pushes events_by_run[X][K..] back at
+        // the front of the per-run deque (`failed_runs` then
+        // short-circuits remaining decisions for X this tick).
+        // Mirrors the file-tail era's "offset stays put → next
+        // tick re-reads from there" semantics without needing
+        // events_offset on disk.
+        let mut events_by_run: HashMap<
+            String,
+            Vec<workflow::events::Event>,
+        > = HashMap::new();
 
         // Snapshot run states.
         let run_snapshots: Vec<(usize, String, u64, Option<String>, bool)> = self
@@ -974,57 +1030,40 @@ impl<'a> WorkflowControllerCtx<'a> {
                 );
             }
 
-            // 10d-2c-1 review round-10: read events with PER-EVENT
-            // post-offsets (each event paired with the byte
-            // offset immediately after its line). Each Decision
-            // carries its OWN post-offset rather than the
-            // batch-final value. The decision-processing loop
-            // advances `events_offset` per successful event AND
-            // stops processing this run's batch on the first
-            // failure — keeping the failed event re-readable on
-            // the next tick.
+            // 11g-2 reveal: events come from the per-run
+            // pending-events buffer (populated by `App::
+            // drain_workflow_watch_events` from the daemon's
+            // `events.subscribe` broadcast) instead of file-tail.
+            // Per-event offset bookkeeping is gone — Option B's
+            // post-fsync broadcast ordering means the channel
+            // IS the bookmark; events_offset on disk stays at
+            // whatever state.json had (frozen post-11g-2,
+            // serde-default 0 for fresh runs). Field retired
+            // per A4 in the slice plan.
             //
-            // Pre-round-10 every event in a batch carried the
-            // batch-final offset. A mid-batch Failed event was
-            // permanently skipped: earlier successes (or later
-            // successes after the Failed continue) had already
-            // advanced past it, OR were about to.
+            // Paused runs short-circuit BEFORE draining so events
+            // stay in the deque for the unpause tick. Matches
+            // pre-11g-2 file-tail semantics (offset not advanced
+            // while paused → same events re-read after unpause).
             //
-            // Pre-round-10 the in-memory `events_offset` was
-            // also set to batch-final immediately after
-            // `read_new`. Round-10 drops that early-assign;
-            // in-memory advances per successful decision via the
-            // existing `*slot = updated_run` post-modify
-            // re-sync.
-            let (events_with_offsets, final_consumed_offset) =
-                workflow::events::read_new_with_offsets(&run_id, offset);
-
+            // The malformed-line Skip branch is gone too: channel
+            // events are pre-deserialized by the consumer; a
+            // wire-deserialize failure logs + drops the frame and
+            // never reaches this loop. State.json torn-record
+            // hazards remain a daemon-side concern (writer's
+            // fsync-on-append + leading-newline defense).
             if paused {
                 continue;
             }
+            let events: Vec<workflow::events::Event> =
+                self.take_pending_events(&run_id);
+            let _ = offset; // events_offset retired; kept in run_snapshots
+                            // for serde back-compat of state.json reads.
+            // Snapshot for the retry path. Cheap clone — Event's
+            // String fields are short.
+            events_by_run.insert(run_id.clone(), events.clone());
 
-            // 10d-2c-1 review round-12 (F2): if bytes were
-            // consumed (malformed lines) but no events
-            // surfaced, push a Skip so the decision loop
-            // advances events_offset past the malformed lines.
-            // Pre-r12 a malformed line in events.jsonl wedged
-            // offset at 0 forever: `events_with_offsets`
-            // empty → no decisions pushed → the static-idle
-            // branch ran but doesn't advance offset.
-            if events_with_offsets.is_empty()
-                && final_consumed_offset > offset
-            {
-                decisions.push(Decision::Skip {
-                    run_id: run_id.clone(),
-                    new_offset: final_consumed_offset,
-                    reason: format!(
-                        "malformed line(s) consumed (offset {} → {})",
-                        offset, final_consumed_offset,
-                    ),
-                });
-            }
-
-            for (ev, post_event_offset) in &events_with_offsets {
+            for ev in &events {
                 let daemon_routed = ev.source == "daemon";
                 match ev.kind() {
                     workflow::events::EventKind::Transition { to, prompt } => {
@@ -1082,7 +1121,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 prompt,
                                 event_id: ev.id.clone(),
                                 daemon_routed,
-                                new_offset: *post_event_offset,
+                                new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                                 event_iteration: ev.iteration,
                                 trigger,
                             });
@@ -1096,7 +1135,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                             // the run doesn't wedge.
                             decisions.push(Decision::Skip {
                                 run_id: run_id.clone(),
-                                new_offset: *post_event_offset,
+                                new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                                 reason: format!(
                                     "Transition event {} has no derivable \
                                      from_role (event.from_role=None, \
@@ -1111,7 +1150,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                             run_id: run_id.clone(),
                             reason,
                             daemon_routed,
-                            new_offset: *post_event_offset,
+                            new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                             event_iteration: ev.iteration,
                         });
                     }
@@ -1129,7 +1168,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                         // gating, same as any other decision).
                         decisions.push(Decision::Skip {
                             run_id: run_id.clone(),
-                            new_offset: *post_event_offset,
+                            new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                             reason: format!(
                                 "Unknown event kind (tool={:?}, id={})",
                                 ev.tool, ev.id,
@@ -1197,7 +1236,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                         // advance past the event.
                         decisions.push(Decision::Skip {
                             run_id: run_id.clone(),
-                            new_offset: *post_event_offset,
+                            new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                             reason: format!(
                                 "reject_finding applied in-place (id={}, daemon_routed={})",
                                 ev.id, daemon_routed,
@@ -1208,7 +1247,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             }
 
             // If no dynamic event fired, check for static idle transition.
-            if events_with_offsets.is_empty() {
+            if events.is_empty() {
                 let Some(active) = active_role.as_deref() else { continue };
                 let wf = self
                     .workflows
@@ -1318,6 +1357,14 @@ impl<'a> WorkflowControllerCtx<'a> {
         // a failure in run X doesn't affect run Y.
         let mut failed_runs: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // 11g-2: per-run count of successfully-processed decisions
+        // this tick. Increments on each successful Decision. On
+        // failure for run X, the unprocessed tail
+        // (`events_by_run[X][events_processed_by_run[X]..]`) is
+        // re-pushed at the deque-front in reverse order so the
+        // next tick re-processes in original order.
+        let mut events_processed_by_run: HashMap<String, usize> =
+            HashMap::new();
 
         for d in decisions {
             // Extract the run_id without consuming the decision.
@@ -1433,16 +1480,37 @@ impl<'a> WorkflowControllerCtx<'a> {
                                         to, reason,
                                     ),
                                 );
+                                // 11g-2: re-push the unprocessed
+                                // tail of THIS tick's drained events
+                                // back at the deque-front so the
+                                // next tick retries in original
+                                // order. Replaces the file-tail era's
+                                // "leave events_offset un-advanced"
+                                // semantics; the deque IS the
+                                // bookmark now.
+                                let processed = *events_processed_by_run
+                                    .get(&run_id)
+                                    .unwrap_or(&0);
+                                if let Some(drained) =
+                                    events_by_run.get(&run_id)
+                                {
+                                    for ev in drained[processed..]
+                                        .iter()
+                                        .rev()
+                                    {
+                                        self.requeue_pending_event_front(
+                                            &run_id,
+                                            ev.clone(),
+                                        );
+                                    }
+                                }
                                 // 10d-2c-1 review round-10: register
                                 // this run as failed so any
                                 // later decisions in this tick's
                                 // batch (events 2+ for the same
-                                // run) are skipped. Pre-round-10
-                                // a successful later event would
-                                // have advanced `events_offset`
-                                // past this failed event,
-                                // permanently dropping its
-                                // delivery.
+                                // run) are skipped — their source
+                                // events were re-pushed above so
+                                // the next tick re-processes them.
                                 failed_runs.insert(run_id);
                                 continue;
                             }
@@ -1493,7 +1561,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 event_id: event_id.clone(),
                             }
                         };
-                        let captured_offset = new_offset;
+                        let _ = new_offset; // 11g-2: events_offset retired (A4)
                         let captured_reset = reset_mutations;
                         // 10d-2c-1 review round-14: pass the event's
                         // target role (`to`) explicitly into the
@@ -1533,7 +1601,9 @@ impl<'a> WorkflowControllerCtx<'a> {
                                     // alongside compute_role_assistant_count.
                                     0,
                                 );
-                                r.events_offset = captured_offset;
+                                // 11g-2: events_offset write retired (A4).
+                                // History append is the load-bearing mutation
+                                // inside this closure.
                             })
                         {
                             if let Some(slot) = self
@@ -1568,25 +1638,33 @@ impl<'a> WorkflowControllerCtx<'a> {
                             Some(new_offset),
                         );
                     }
+                    // 11g-2: mark this event consumed for the retry-tail
+                    // accounting. Reached on both daemon-routed and
+                    // TUI-local success paths (failure returns above
+                    // via `continue` after re-pushing the tail).
+                    *events_processed_by_run
+                        .entry(run_id.clone())
+                        .or_insert(0) += 1;
                 }
                 Decision::Done { run_id, reason, daemon_routed, new_offset, event_iteration: _ } => {
+                    let _ = new_offset; // 11g-2: events_offset retired (A4)
                     if daemon_routed {
-                        // F1 (round 3): use the Decision-threaded
-                        // `new_offset` directly. The closure
-                        // explicitly assigns so a stale on-disk
-                        // events_offset is overwritten.
-                        let captured_offset = new_offset;
-                        if let Ok(updated_run) =
-                            workflow::run::modify(&run_id, move |r| {
-                                r.events_offset = captured_offset;
-                            })
+                        // 11g-2: the daemon's `workflow_done` already
+                        // mutated state.json (status=Done, active_role=None,
+                        // done_reason=...) under flock before broadcasting.
+                        // Pre-11g-2 this arm did a modify just to write
+                        // events_offset; post-A4 that's a no-op. Re-load
+                        // from disk so in-memory mirrors the daemon's
+                        // mutation (matches the RejectFinding arm pattern).
+                        if let Some(reloaded) =
+                            workflow::run::load_one(&run_id)
                         {
                             if let Some(slot) = self
                                 .workflow_runs
                                 .iter_mut()
                                 .find(|r| r.run_id == run_id)
                             {
-                                *slot = updated_run;
+                                *slot = reloaded;
                             }
                         }
                     } else {
@@ -1600,35 +1678,34 @@ impl<'a> WorkflowControllerCtx<'a> {
                             Some(new_offset),
                         );
                     }
+                    // 11g-2: mark consumed.
+                    *events_processed_by_run
+                        .entry(run_id.clone())
+                        .or_insert(0) += 1;
                 }
                 Decision::Skip { run_id, new_offset, reason } => {
-                    // 10d-2c-1 review round-11 (F1): advance
-                    // events_offset past an unprocessable event
-                    // (Unknown kind, from_role-less Transition,
-                    // etc.) so the run doesn't wedge. Logged
-                    // loudly so operators can correlate against
-                    // events.jsonl.
+                    // 11g-2: events_offset retired (A4). Skip is now
+                    // log-only — the event was already drained from
+                    // the per-run deque by `take_pending_events`, so
+                    // there's no "advance past" semantics to apply.
+                    // The decision exists for log-trail parity with
+                    // the file-tail era (operators can grep
+                    // `skip-but-advance` to find apply-in-place
+                    // events like RejectFinding).
+                    let _ = new_offset;
                     log_tick(
                         &run_id,
                         &format!(
-                            "skip-but-advance: events_offset → {} ({})",
-                            new_offset, reason,
+                            "skip-but-advance (now log-only): {}",
+                            reason,
                         ),
                     );
-                    let captured_offset = new_offset;
-                    if let Ok(updated_run) =
-                        workflow::run::modify(&run_id, move |r| {
-                            r.events_offset = captured_offset;
-                        })
-                    {
-                        if let Some(slot) = self
-                            .workflow_runs
-                            .iter_mut()
-                            .find(|r| r.run_id == run_id)
-                        {
-                            *slot = updated_run;
-                        }
-                    }
+                    // 11g-2: mark consumed (Skip arises from a
+                    // drained event — e.g. RejectFinding's
+                    // apply-in-place push or an Unknown event).
+                    *events_processed_by_run
+                        .entry(run_id.clone())
+                        .or_insert(0) += 1;
                 }
             }
         }
@@ -2584,6 +2661,36 @@ mod tests {
         kill_tx: std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
         // Held to keep the channel alive for the duration of the test.
         _kill_rx: std::sync::mpsc::Receiver<crate::session_watch::MemoryKillEvent>,
+        /// 11g-2: the channel-driven pending-events buffer the
+        /// controller drains from. Tests that don't push channel
+        /// events leave this empty; tests that DO push synthetic
+        /// events populate it before the tick.
+        pending_events: HashMap<
+            String,
+            std::collections::VecDeque<workflow::events::Event>,
+        >,
+    }
+
+    /// 11g-2 helper: push channel-delivered events into the
+    /// per-run pending deque. Tests that pre-11g-2 wrote events
+    /// to disk via `WorkflowEventsWriter::append_event` now push
+    /// directly into the controller's input buffer instead.
+    /// Events.jsonl writes can still happen alongside (the
+    /// daemon's broadcaster does both atomically) but no test
+    /// here exercises the daemon's broadcast path; we feed the
+    /// controller directly.
+    fn push_pending_events(
+        dummy: &mut DummyCapState,
+        run_id: &str,
+        events: impl IntoIterator<Item = workflow::events::Event>,
+    ) {
+        let deque = dummy
+            .pending_events
+            .entry(run_id.to_string())
+            .or_default();
+        for ev in events {
+            deque.push_back(ev);
+        }
     }
 
     fn dummy_cap_state() -> DummyCapState {
@@ -2601,6 +2708,7 @@ mod tests {
             },
             kill_tx,
             _kill_rx: kill_rx,
+            pending_events: HashMap::new(),
         }
     }
 
@@ -2755,7 +2863,7 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), wf);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -2765,6 +2873,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
@@ -2856,7 +2965,8 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), wf);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
             let mut runs = vec![run];
             {
                 let mut ctx = WorkflowControllerCtx {
@@ -2867,6 +2977,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
@@ -3232,7 +3343,14 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            // 11g-2: push the daemon-source events into the channel
+            // buffer — the controller no longer reads events.jsonl.
+            push_pending_events(
+                &mut dummy,
+                run_id,
+                [ev1.clone(), ev2.clone(), ev3.clone()],
+            );
             // Hmm — the run is Done in state.json, but the TUI's
             // tick filters by `is_active()`. Need to re-load the
             // in-memory run to match the disk state? Let me check
@@ -3252,6 +3370,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
@@ -3311,169 +3430,33 @@ mod tests {
             // at all. The assertions above pin the right-role
             // contract directly.
 
-            // Verify events_offset advanced past all events.
-            let (_, final_consumed) =
-                workflow::events::read_new_with_offsets(run_id, 0);
-            assert_eq!(
-                post.events_offset, final_consumed,
-                "events_offset advances past all three events",
-            );
+            // 11g-2: events_offset advance assertion retired (A4).
+            // The history-role assertions above are the
+            // load-bearing contract.
         });
     }
 
-    /// 10d-2c-1 review round-12 (F2) — named acceptance test.
-    /// Malformed line in events.jsonl. Pre-r12
-    /// `read_new_with_offsets` consumed the bytes internally
-    /// but returned only successfully-parsed events; the
-    /// caller had no way to learn about the consumed bytes
-    /// and `events_offset` wedged at 0. Post-r12 the function
-    /// returns `(events, final_consumed_offset)`; the TUI tail
-    /// pushes a `Decision::Skip` to advance offset past the
-    /// malformed line.
-    ///
-    /// The test writes a malformed JSON line, drives a tick,
-    /// asserts events_offset advances past it. Then writes a
-    /// valid event after it, drives another tick, asserts the
-    /// valid event is processed (offset advances further).
-    #[test]
-    fn malformed_event_line_does_not_wedge_offset() {
-        with_temp_home(|| {
-            let run_id = "wf_r12_malformed";
-            let run = make_run(run_id, "feedback", "worker");
-            workflow::run::save(&run).expect("seed save");
-
-            // Pre-create the run dir and write a malformed line
-            // directly (the writer's `append_event` would reject
-            // invalid Event shapes; we need a raw fs::write to
-            // simulate an external/buggy writer leaving bad
-            // JSON behind).
-            let dir = workflow::run::run_dir(run_id);
-            std::fs::create_dir_all(&dir).unwrap();
-            let events_path = workflow::run::events_path(run_id);
-            std::fs::write(
-                &events_path,
-                b"{this is not valid json}\n",
-            )
-            .expect("write malformed");
-            let bad_line_len = std::fs::metadata(&events_path)
-                .expect("metadata")
-                .len();
-            assert!(bad_line_len > 0);
-
-            // Sanity check: `read_new_with_offsets` returns
-            // empty events AND the consumed-bytes offset past
-            // the malformed line.
-            let (with_offsets, final_consumed) =
-                workflow::events::read_new_with_offsets(run_id, 0);
-            assert!(
-                with_offsets.is_empty(),
-                "malformed line is not surfaced as an event",
-            );
-            assert_eq!(
-                final_consumed, bad_line_len,
-                "final_consumed_offset advances past the malformed \
-                 (newline-terminated) line",
-            );
-
-            let mut runs = vec![run];
-            let worker = stub_session("worker", "claude", run_id, "worker", None);
-            let workspace = workspace_with(vec![worker], None);
-            let mut workspaces = vec![workspace];
-
-            let mut roles = BTreeMap::new();
-            roles.insert(
-                "worker".to_string(),
-                role_with(Engine::ClaudeCode, Context::Persistent),
-            );
-            let workflow_def = make_workflow(
-                "feedback",
-                roles,
-                vec!["worker".to_string()],
-                vec![],
-            );
-            let mut workflows = HashMap::new();
-            workflows.insert("feedback".to_string(), workflow_def);
-
-            let dummy = dummy_cap_state();
-
-            // First tick: malformed line consumed → Skip
-            // decision dispatched → events_offset advances on
-            // disk past the bad line.
-            {
-                let mut ctx = WorkflowControllerCtx {
-                    workflow_runs: &mut runs,
-                    workspaces: &mut workspaces,
-                    workflows: &workflows,
-                    last_term_size: (80, 24),
-                    config: &dummy.config,
-                    cap_status: &dummy.cap_status,
-                    kill_tx: &dummy.kill_tx,
-                };
-                let _ = ctx.tick();
-            }
-            let post1 = workflow::run::load_one(run_id).expect("post1 load");
-            assert_eq!(
-                post1.events_offset, bad_line_len,
-                "round-12 F2: events_offset advances past the malformed \
-                 line; pre-fix it wedged at 0",
-            );
-
-            // Now write a VALID event past the malformed line.
-            // Use the writer (round-12 leaves writes as-is).
-            let ev = workflow::events::Event {
-                id: "evt-r12-after-malformed".to_string(),
-                ts: 1.0,
-                run_id: run_id.to_string(),
-                role: "worker".to_string(),
-                tool: "workflow_done".to_string(),
-                args: serde_json::json!({"reason": "ok"}),
-                source: "daemon".to_string(),
-                from_role: None,
-                iteration: 0,
-            };
-            workflow::events::WorkflowEventsWriter::append_event(&ev)
-                .expect("append valid");
-
-            let (with_offsets2, _) =
-                workflow::events::read_new_with_offsets(run_id, post1.events_offset);
-            assert_eq!(
-                with_offsets2.len(),
-                1,
-                "valid event after malformed line readable",
-            );
-            let post_valid = with_offsets2[0].1;
-
-            // Second tick: valid event processed →
-            // events_offset advances to post_valid.
-            {
-                let mut ctx = WorkflowControllerCtx {
-                    workflow_runs: &mut runs,
-                    workspaces: &mut workspaces,
-                    workflows: &workflows,
-                    last_term_size: (80, 24),
-                    config: &dummy.config,
-                    cap_status: &dummy.cap_status,
-                    kill_tx: &dummy.kill_tx,
-                };
-                let _ = ctx.tick();
-            }
-            let post2 = workflow::run::load_one(run_id).expect("post2 load");
-            assert_eq!(
-                post2.events_offset, post_valid,
-                "valid event after malformed line gets processed; \
-                 offset advances further",
-            );
-        });
-    }
+    // 11g-2: `malformed_event_line_does_not_wedge_offset` retired.
+    // The file-tail malformed-line concern is gone with the file-tail
+    // itself. Channel events are pre-deserialized by
+    // `workflow_watch::drive_stream`; a malformed wire frame is logged
+    // and dropped there, never reaching the controller. There's
+    // nothing left for the controller to defend against.
 
     /// 10d-2c-1 review round-11 (F1) — named acceptance test.
-    /// Three events: Unknown (unrecognized tool), workflow_transition
-    /// (deliverable), workflow_done. All three must be consumed and
-    /// `events_offset` must advance past all of them. Pre-round-11
-    /// the Unknown branch was an empty arm `{}` — offset stayed at
-    /// pre-Unknown, the same Unknown event was re-read every tick,
-    /// AND the static-idle check was skipped because
-    /// `events_with_offsets` was non-empty. Run wedged.
+    /// 11g-2 port: three events (Unknown, Transition, Done)
+    /// pushed via the channel. All three must be consumed in
+    /// one tick — the Unknown arm produces a `Decision::Skip`
+    /// (log-only post-11g-2) and the static-idle wedge is
+    /// avoided because the deque is drained. Pre-r11
+    /// `EventKind::Unknown` was an empty arm and the run
+    /// wedged on the file-tail bookmark; post-r11 a Skip
+    /// decision unblocked the loop. The wedge concern was
+    /// originally about file-tail offset; post-11g-2 the
+    /// wedge concern is about the static-idle gate being
+    /// blocked by non-empty `events`. This test pins that the
+    /// drain consumes all three events (no leftover in the
+    /// deque) and the run reached terminal state.
     #[test]
     fn tick_advances_offset_past_unknown_event_and_consumes_later_events() {
         with_temp_home(|| {
@@ -3481,7 +3464,6 @@ mod tests {
             let run = make_run(run_id, "feedback", "worker");
             workflow::run::save(&run).expect("seed save");
 
-            // Event 1: unknown tool — EventKind::Unknown.
             let ev_unknown = workflow::events::Event {
                 id: "evt-r11-unknown".to_string(),
                 ts: 1.0,
@@ -3493,10 +3475,6 @@ mod tests {
                 from_role: None,
                 iteration: 0,
             };
-            workflow::events::WorkflowEventsWriter::append_event(&ev_unknown)
-                .expect("append unknown");
-
-            // Event 2: workflow_transition worker → reviewer.
             let ev_trans = workflow::events::Event {
                 id: "evt-r11-trans".to_string(),
                 ts: 2.0,
@@ -3508,10 +3486,6 @@ mod tests {
                 from_role: Some("worker".to_string()),
                 iteration: 0,
             };
-            workflow::events::WorkflowEventsWriter::append_event(&ev_trans)
-                .expect("append trans");
-
-            // Event 3: workflow_done.
             let ev_done = workflow::events::Event {
                 id: "evt-r11-done".to_string(),
                 ts: 3.0,
@@ -3523,13 +3497,6 @@ mod tests {
                 from_role: None,
                 iteration: 0,
             };
-            workflow::events::WorkflowEventsWriter::append_event(&ev_done)
-                .expect("append done");
-
-            let (with_offsets, _final) =
-                workflow::events::read_new_with_offsets(run_id, 0);
-            assert_eq!(with_offsets.len(), 3);
-            let post_all = with_offsets[2].1;
 
             let mut runs = vec![run];
             let worker = stub_session("worker", "claude", run_id, "worker", None);
@@ -3555,7 +3522,12 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(
+                &mut dummy,
+                run_id,
+                [ev_unknown, ev_trans, ev_done],
+            );
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -3565,17 +3537,25 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
 
-            // All three events consumed → events_offset at end.
-            let post = workflow::run::load_one(run_id).expect("post load");
-            assert_eq!(
-                post.events_offset, post_all,
-                "round-11 F1: events_offset must advance past all 3 \
-                 events (Unknown skip + Transition + Done); pre-fix \
-                 the Unknown event wedged offset at 0",
+            // All three events drained: per-run deque is empty
+            // (or absent). Pre-r11 the Unknown event would have
+            // remained because no decision was pushed for it,
+            // and post-11g-2 a non-drained Unknown would block
+            // the static-idle gate.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "all three events must be consumed in one tick; \
+                 deque still contains: {:?}",
+                dummy.pending_events.get(run_id),
             );
         });
     }
@@ -3610,10 +3590,6 @@ mod tests {
             let run = make_run(run_id, "feedback", "worker");
             workflow::run::save(&run).expect("seed save");
 
-            // Daemon-source reject_finding event — the controller's
-            // RejectFinding arm picks the daemon_routed branch
-            // (reload-from-disk). Single event in the batch so
-            // ONLY a successful Skip advances the offset.
             let ev_reject = workflow::events::Event {
                 id: "evt-11e-reject-1".to_string(),
                 ts: 1.0,
@@ -3625,13 +3601,6 @@ mod tests {
                 from_role: None,
                 iteration: 0,
             };
-            workflow::events::WorkflowEventsWriter::append_event(&ev_reject)
-                .expect("append reject");
-
-            let (with_offsets1, _) =
-                workflow::events::read_new_with_offsets(run_id, 0);
-            assert_eq!(with_offsets1.len(), 1);
-            let post_reject = with_offsets1[0].1;
 
             let mut runs = vec![run];
             let worker = stub_session("worker", "claude", run_id, "worker", None);
@@ -3666,10 +3635,14 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev_reject.clone()]);
 
-            // First tick: reject_finding alone in the batch.
-            // Without the new Skip push, offset stays at 0 → wedge.
+            // First tick: sole reject_finding event. Post-11g-2
+            // the controller's drain consumes it; pre-11e the
+            // RejectFinding arm pushed no Decision and the deque
+            // wasn't drained (file-tail era's "events_offset
+            // stays at 0" analog).
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -3679,24 +3652,26 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
 
-            let post1 = workflow::run::load_one(run_id).expect("post1 load");
-            assert_eq!(
-                post1.events_offset, post_reject,
-                "11e fix: events_offset MUST advance past a sole \
-                 reject_finding event; pre-fix it wedged at 0 \
-                 because the RejectFinding arm pushed no Decision",
+            // Post-tick: deque drained. Pre-11e the RejectFinding
+            // arm produced no decision so the controller would
+            // have wedged.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "reject_finding event must be drained from the deque",
             );
 
-            // Append a downstream event past the reject. If the
-            // first tick had wedged at offset=0, the second tick
-            // would re-read the reject AND the new event; the
-            // controller would AGAIN fail to advance offset (same
-            // wedge). Post-fix the second tick sees only the new
-            // event and advances offset past it.
+            // Push a downstream event. If the controller's drain
+            // wedged, this would just accumulate. Post-flip the
+            // next tick consumes it cleanly.
             let ev_done = workflow::events::Event {
                 id: "evt-11e-done".to_string(),
                 ts: 2.0,
@@ -3708,18 +3683,7 @@ mod tests {
                 from_role: None,
                 iteration: 0,
             };
-            workflow::events::WorkflowEventsWriter::append_event(&ev_done)
-                .expect("append done");
-            let (with_offsets2, _) =
-                workflow::events::read_new_with_offsets(run_id, post1.events_offset);
-            assert_eq!(
-                with_offsets2.len(),
-                1,
-                "second read must surface ONLY the new event \
-                 (the reject was consumed in tick 1)",
-            );
-            let post_done = with_offsets2[0].1;
-
+            push_pending_events(&mut dummy, run_id, [ev_done]);
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -3729,15 +3693,19 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
-            let post2 = workflow::run::load_one(run_id).expect("post2 load");
-            assert_eq!(
-                post2.events_offset, post_done,
-                "downstream event after reject_finding is processed \
-                 on the next tick — proves the reject_finding \
-                 didn't wedge the controller",
+            // workflow_done arm reloads from disk; if we got here
+            // without a wedge the test passes.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "downstream event must also drain",
             );
         });
     }
@@ -3803,7 +3771,8 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -3813,6 +3782,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
@@ -3920,15 +3890,6 @@ mod tests {
             workflow::events::WorkflowEventsWriter::append_event(&ev3)
                 .expect("append ev3");
 
-            // Capture the per-event offsets via `read_new_with_offsets`.
-            let (with_offsets, _final) =
-                workflow::events::read_new_with_offsets(run_id, 0);
-            assert_eq!(with_offsets.len(), 3, "all 3 events readable");
-            let post_ev1 = with_offsets[0].1;
-            let post_ev2 = with_offsets[1].1;
-            let post_ev3 = with_offsets[2].1;
-            assert!(post_ev1 < post_ev2 && post_ev2 < post_ev3);
-
             let mut runs = vec![run];
             // Workspace: worker + reviewer present, manager
             // INTENTIONALLY missing — event 3's workflow_done
@@ -3970,12 +3931,19 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(
+                &mut dummy,
+                run_id,
+                [ev1.clone(), ev2.clone(), ev3.clone()],
+            );
 
-            // First tick: event 1 succeeds (per-event offset
-            // advance to post_ev1); event 2 fails (manager
-            // missing) → run registered in `failed_runs`; event
-            // 3 skipped (stop-at-first-failure).
+            // First tick: event 1 succeeds; event 2 fails
+            // (manager missing) → run registered in `failed_runs`;
+            // event 3 skipped (stop-at-first-failure). 11g-2
+            // retry-via-requeue: events 2 and 3 are re-pushed at
+            // the deque-front so the next tick re-processes
+            // them.
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -3985,28 +3953,30 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
 
-            // Disk assertion: events_offset is at post_ev1 (the
-            // position right after event 1, just before the
-            // failed event 2). Pre-round-10 the batch-final
-            // offset (post_ev3) would have been written here
-            // because the successful event 1 advanced past the
-            // failed event 2; the workflow would have stalled
-            // with no retry on next tick.
+            // Deque holds events 2 and 3 (re-pushed via the
+            // failure tail). Pre-r10 the batch's later events
+            // were silently dropped after a mid-batch failure;
+            // post-11g-2 they survive in the deque for retry.
+            {
+                let deque = dummy.pending_events.get(run_id).expect("deque");
+                assert_eq!(
+                    deque.len(),
+                    2,
+                    "events 2 and 3 must remain in the deque (failed event \
+                     + its skipped successors); got {:?}",
+                    deque.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                );
+                assert_eq!(deque[0].id, "evt-r10-2");
+                assert_eq!(deque[1].id, "evt-r10-3");
+            }
+            // Status MUST still be Running (event 3 was skipped,
+            // so the run hasn't been marked Done yet).
             let post1 = workflow::run::load_one(run_id).expect("post1 load");
-            assert_eq!(
-                post1.events_offset, post_ev1,
-                "round-10: events_offset must stop at post-event-1 \
-                 (just before the failed event 2); \
-                 got {} expected {}",
-                post1.events_offset, post_ev1,
-            );
-            // Status MUST still be Running (workflow_done's
-            // event 3 was skipped, so the run hasn't been
-            // marked Done yet).
             assert!(
                 matches!(post1.status, RunStatus::Running),
                 "event 3 (workflow_done) must be skipped due to event 2's \
@@ -4015,8 +3985,8 @@ mod tests {
             );
 
             // Second tick (still no manager): event 2 fails
-            // again, event 3 still skipped. Offset stays at
-            // post_ev1.
+            // again, event 3 still skipped. Deque membership
+            // unchanged.
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -4026,19 +3996,18 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
-            let post1b = workflow::run::load_one(run_id).expect("post1b load");
-            assert_eq!(
-                post1b.events_offset, post_ev1,
-                "events_offset stays at post-event-1 across repeated \
-                 ticks while the failure persists",
-            );
+            {
+                let deque = dummy.pending_events.get(run_id).expect("deque");
+                assert_eq!(deque.len(), 2, "deque membership stable across retries");
+            }
 
             // Third tick: add the manager session. Now event 2
-            // succeeds → offset advances to post_ev2. Event 3
-            // (workflow_done) also succeeds → offset to post_ev3.
+            // succeeds → consumed. Event 3 (workflow_done) also
+            // succeeds → consumed. Deque drains.
             let manager = stub_session("manager", "claude", run_id, "manager", None);
             workspaces[0].sessions.push(manager);
             {
@@ -4050,23 +4019,19 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
-            let post2 = workflow::run::load_one(run_id).expect("post2 load");
-            assert_eq!(
-                post2.events_offset, post_ev3,
-                "after recovery, events_offset advances past all 3 events",
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "after recovery, deque drains; got {:?}",
+                dummy.pending_events.get(run_id),
             );
-            // Note: daemon-routed `workflow_done` does NOT
-            // mutate status on the TUI side — the daemon's
-            // handler is expected to have written `status =
-            // Done` before the event landed on disk. In this
-            // hand-crafted test we didn't simulate that, so
-            // status stays Running. Round-10's invariant is
-            // strictly about `events_offset` advance semantics;
-            // status correctness is a separate code path
-            // covered by the daemon-side workflow_done tests.
         });
     }
 
@@ -4132,10 +4097,12 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
 
             // First tick: target session missing → delivery
-            // fails → offset stays at 0.
+            // fails → 11g-2 retry path re-pushes the event to
+            // the deque-front for next-tick retry.
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -4145,24 +4112,27 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
+            // 11g-2: event re-pushed at deque-front for retry.
+            {
+                let deque = dummy.pending_events.get(run_id).expect("deque");
+                assert_eq!(
+                    deque.len(),
+                    1,
+                    "failed event must be requeued for retry; got {:?}",
+                    deque.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                );
+                assert_eq!(deque[0].id, "evt-r8-missing");
+            }
             let post1 = workflow::run::load_one(run_id).expect("post1 load");
-            assert_eq!(
-                post1.events_offset, 0,
-                "round-8: failed delivery must NOT advance events_offset; \
-                 got {} (pre-fix value would have advanced)",
-                post1.events_offset,
-            );
-            // make_run's WorkflowRun::new seeded an initial
-            // history entry; no NEW entry should be appended
-            // because delivery failed.
             let history_after_failed = post1.history.len();
 
             // Second tick: add the missing reviewer session.
-            // Delivery succeeds → offset advances + history
-            // entry lands.
+            // Delivery succeeds → event drained, history entry
+            // lands.
             let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
             workspaces[0].sessions.push(reviewer);
             {
@@ -4174,17 +4144,19 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
-            let post2 = workflow::run::load_one(run_id).expect("post2 load");
             assert!(
-                post2.events_offset > 0,
-                "round-8: after target session is added, retry must \
-                 advance events_offset",
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "after recovery, deque must drain",
             );
-            // A new history entry now lands (initial seed entry +
-            // the round-8 retry's append).
+            let post2 = workflow::run::load_one(run_id).expect("post2 load");
             assert_eq!(
                 post2.history.len(),
                 history_after_failed + 1,
@@ -4196,11 +4168,15 @@ mod tests {
 
     /// 10d-2c-1 review round-8 — companion test: pin the
     /// legitimate "Delivered { reset: None }" path. Persistent
-    /// role, no fresh-reset, delivery succeeds → offset DOES
-    /// advance. Guards against over-correcting r8 (treating
-    /// every None-reset case as failure).
+    /// role, no fresh-reset, delivery succeeds → history entry
+    /// lands. Guards against over-correcting r8 (treating every
+    /// None-reset case as failure).
+    ///
+    /// 11g-2 port: channel-driven; events_offset assertion
+    /// retired (A4). History append remains the meaningful
+    /// signal that delivery succeeded.
     #[test]
-    fn daemon_routed_tick_persistent_role_no_reset_does_advance_offset() {
+    fn daemon_routed_tick_persistent_role_no_reset_appends_history() {
         with_temp_home(|| {
             let run_id = "wf_r8_persistent_advance";
             let mut run = make_run(run_id, "feedback", "worker");
@@ -4219,8 +4195,6 @@ mod tests {
                 from_role: Some("worker".to_string()),
                 iteration: 0,
             };
-            workflow::events::WorkflowEventsWriter::append_event(&ev)
-                .expect("append");
 
             let mut runs = vec![run];
             let worker = stub_session("worker", "claude", run_id, "worker", None);
@@ -4233,8 +4207,6 @@ mod tests {
                 "worker".to_string(),
                 role_with(Engine::ClaudeCode, Context::Persistent),
             );
-            // Persistent — no fresh reset → reset_mutations
-            // None. Delivery still succeeds.
             roles.insert(
                 "reviewer".to_string(),
                 role_with(Engine::ClaudeCode, Context::Persistent),
@@ -4248,7 +4220,8 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev]);
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -4258,17 +4231,11 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
             let post = workflow::run::load_one(run_id).expect("post load");
-            assert!(
-                post.events_offset > 0,
-                "Delivered {{ reset: None }} (persistent role) must \
-                 still advance events_offset",
-            );
-            // make_run's initial history entry + one appended by
-            // the daemon-routed delivery.
             assert_eq!(
                 post.history.len(),
                 2,
@@ -4341,7 +4308,8 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -4351,6 +4319,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
@@ -4374,125 +4343,11 @@ mod tests {
         });
     }
 
-    /// 10d-2c-1 review round-7 (F1): TuiLocal `workflow_transition`
-    /// (file-write, not daemon-routed) advances `events_offset`
-    /// on disk AND in-memory atomically. Pre-fix
-    /// `fire_transition`'s modify clobbered in-memory with the
-    /// disk-loaded OLD events_offset and the outer modify wrote
-    /// disk = NEW without refreshing in-memory; next tick read
-    /// the same event again and double-fired the transition.
-    /// Mirror of `daemon_routed_tick_advances_events_offset_on_disk`
-    /// for the TuiLocal path.
-    #[test]
-    fn tui_local_tick_advances_events_offset_on_disk() {
-        with_temp_home(|| {
-            let run_id = "wf_tui_offset_pin";
-            let run = make_run(run_id, "feedback", "worker");
-            workflow::run::save(&run).expect("seed save");
-
-            // Write a TuiLocal-source event (source != "daemon").
-            let ev = workflow::events::Event {
-                id: "evt-tui-pin-1".to_string(),
-                ts: 1.0,
-                run_id: run_id.to_string(),
-                role: "worker".to_string(),
-                tool: "workflow_transition".to_string(),
-                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
-                source: "tui-mcp".to_string(),
-                from_role: None,
-                iteration: 0,
-            };
-            workflow::events::WorkflowEventsWriter::append_event(&ev)
-                .expect("append tui-mcp event");
-
-            let pre = workflow::run::load_one(run_id).expect("loaded");
-            assert_eq!(pre.events_offset, 0, "pre-tick offset is 0");
-
-            let mut runs = vec![run];
-            // Both roles need real session slots so
-            // `locate_workflow_session` + `fire_transition`
-            // don't early-return.
-            let worker = stub_session("worker", "claude", run_id, "worker", None);
-            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
-            let workspace = workspace_with(vec![worker, reviewer], None);
-            let mut workspaces = vec![workspace];
-
-            let mut roles = BTreeMap::new();
-            roles.insert(
-                "worker".to_string(),
-                role_with(Engine::ClaudeCode, Context::Persistent),
-            );
-            roles.insert(
-                "reviewer".to_string(),
-                role_with(Engine::ClaudeCode, Context::Persistent),
-            );
-            let workflow_def = make_workflow(
-                "feedback",
-                roles,
-                vec!["worker".to_string(), "reviewer".to_string()],
-                vec![],
-            );
-            let mut workflows = HashMap::new();
-            workflows.insert("feedback".to_string(), workflow_def);
-
-            let dummy = dummy_cap_state();
-            {
-                let mut ctx = WorkflowControllerCtx {
-                    workflow_runs: &mut runs,
-                    workspaces: &mut workspaces,
-                    workflows: &workflows,
-                    last_term_size: (80, 24),
-                    config: &dummy.config,
-                    cap_status: &dummy.cap_status,
-                    kill_tx: &dummy.kill_tx,
-                };
-                let _ = ctx.tick();
-            }
-
-            // On-disk: events_offset advanced.
-            let post = workflow::run::load_one(run_id).expect("post load");
-            assert!(
-                post.events_offset > 0,
-                "round-7: TuiLocal tick must advance events_offset on \
-                 disk; still at {} (pre-fix value)",
-                post.events_offset,
-            );
-
-            // In-memory: events_offset must match disk (the
-            // round-7 fix's load-bearing assertion). Pre-fix,
-            // in-memory was OLD (reset by fire_transition's
-            // modify reload) and disk was NEW.
-            assert_eq!(
-                runs[0].events_offset, post.events_offset,
-                "in-memory events_offset must match on-disk; \
-                 mismatch lets the next tick re-read the same event"
-            );
-
-            // Second tick: no new events on disk → no
-            // duplicate history entry.
-            let history_len_before_second = runs[0].history.len();
-            {
-                let mut ctx = WorkflowControllerCtx {
-                    workflow_runs: &mut runs,
-                    workspaces: &mut workspaces,
-                    workflows: &workflows,
-                    last_term_size: (80, 24),
-                    config: &dummy.config,
-                    cap_status: &dummy.cap_status,
-                    kill_tx: &dummy.kill_tx,
-                };
-                let _ = ctx.tick();
-            }
-            let post2 = workflow::run::load_one(run_id).expect("post2 load");
-            assert_eq!(
-                post2.history.len(),
-                history_len_before_second,
-                "history must not grow on the second tick — the \
-                 first tick's event_offset advance should have \
-                 made it a no-op",
-            );
-        });
-    }
+    // 11g-2: `tui_local_tick_advances_events_offset_on_disk` retired.
+    // The TuiLocal path is itself slated for deletion per A2 (daemon
+    // mandatory since 10f makes the `_append_event` Python branch
+    // vestigial). The test's other concern, events_offset advancing,
+    // is retired per A4.
 
     /// 10d-2c-1 review round-6 (F1) — named acceptance test.
     /// Simulate the bug shape: daemon advances state.json
@@ -4544,7 +4399,7 @@ mod tests {
 
             let mut runs = vec![run];
             let workflows: HashMap<String, Workflow> = HashMap::new();
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -4554,6 +4409,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 ctx.sync_role_session_ids();
             }
@@ -4602,7 +4458,7 @@ mod tests {
             let mut workspaces: Vec<Workspace> = Vec::new();
             let workflows: HashMap<String, Workflow> = HashMap::new();
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -4611,6 +4467,7 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             let mut actions = Vec::new();
             ctx.finish_run(run_id, "completed by test".into(), &mut actions, None);
@@ -4675,7 +4532,7 @@ mod tests {
             let mut workspaces = vec![workspace];
 
             let workflows: HashMap<String, Workflow> = HashMap::new();
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -4684,6 +4541,7 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             let mut actions = Vec::new();
             // 10d-2c-1 review round-4 (F1): `reset_fresh_session`
@@ -4772,7 +4630,7 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -4781,6 +4639,7 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             let actions = ctx.tick();
 
@@ -4796,134 +4655,15 @@ mod tests {
     // 10d-2c-1 review round-3 tests (F1, F3)
     // ============================================================
 
-    /// F1 (round 3): a daemon-routed dynamic transition must
-    /// advance `events_offset` on disk so the event isn't
-    /// re-processed on next tick. This bug survived two rounds
-    /// because no test pinned it.
-    ///
-    /// Scenario: seed a run with events_offset=0. Append a
-    /// daemon-source `workflow_transition` event to events.jsonl
-    /// (simulating what the daemon's `workflow_transition`
-    /// handler would write after its mutation). Manually apply
-    /// the daemon's state mutation to state.json. Then drive
-    /// `tick()` on a `WorkflowControllerCtx`. After tick
-    /// returns, re-load state.json on a fresh handle (the bug:
-    /// previously the offset was still 0) and assert
-    /// `events_offset > 0`. Run a second `tick()` on the same
-    /// controller and assert no new events are read (no second
-    /// activation prompt delivered).
-    #[test]
-    fn daemon_routed_tick_advances_events_offset_on_disk() {
-        with_temp_home(|| {
-            let run_id = "wf_offset_pin";
-            let mut run = make_run(run_id, "feedback", "worker");
-            // Simulate the daemon's state mutation: outgoing
-            // worker closed, active_role flipped to reviewer,
-            // iteration bumped. (Matches what the daemon's
-            // `workflow_transition` handler did under flock.)
-            run.close_active_role(None);
-            run.iteration += 1;
-            run.active_role = Some("reviewer".to_string());
-            workflow::run::save(&run).expect("seed save");
-            // Also: write the daemon-source event to events.jsonl
-            // so the tail observer picks it up.
-            let ev = workflow::events::Event {
-                id: "evt-pin-1".to_string(),
-                ts: 1.0,
-                run_id: run_id.to_string(),
-                role: "worker".to_string(),
-                tool: "workflow_transition".to_string(),
-                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
-                source: "daemon".to_string(),
-                from_role: None,
-                iteration: 0,
-            };
-            workflow::events::WorkflowEventsWriter::append_event(&ev)
-                .expect("append daemon event");
-
-            // Confirm pre-tick state.json has events_offset=0.
-            let pre = workflow::run::load_one(run_id).expect("loaded");
-            assert_eq!(pre.events_offset, 0, "pre-tick offset is 0");
-
-            let mut runs = vec![run];
-            let worker = stub_session("worker", "claude", run_id, "worker", None);
-            // Workflow has a reviewer slot too; bind a session
-            // with workflow tags so `locate_workflow_session`
-            // finds it (avoids early-return in
-            // deliver_dynamic_activation_prompt).
-            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
-            let workspace = workspace_with(vec![worker, reviewer], None);
-            let mut workspaces = vec![workspace];
-
-            let mut roles = BTreeMap::new();
-            roles.insert(
-                "worker".to_string(),
-                role_with(Engine::ClaudeCode, Context::Persistent),
-            );
-            roles.insert(
-                "reviewer".to_string(),
-                role_with(Engine::ClaudeCode, Context::Persistent),
-            );
-            let workflow_def = make_workflow(
-                "feedback",
-                roles,
-                vec!["worker".to_string(), "reviewer".to_string()],
-                vec![],
-            );
-            let mut workflows = HashMap::new();
-            workflows.insert("feedback".to_string(), workflow_def);
-
-            let dummy = dummy_cap_state();
-            {
-                let mut ctx = WorkflowControllerCtx {
-                    workflow_runs: &mut runs,
-                    workspaces: &mut workspaces,
-                    workflows: &workflows,
-                    last_term_size: (80, 24),
-                    config: &dummy.config,
-                    cap_status: &dummy.cap_status,
-                    kill_tx: &dummy.kill_tx,
-                };
-                let _ = ctx.tick();
-            }
-
-            // The key assertion: on a fresh load from disk, the
-            // events_offset has advanced past the event we wrote.
-            let post = workflow::run::load_one(run_id).expect("post load");
-            assert!(
-                post.events_offset > 0,
-                "events_offset must advance on disk after a daemon-routed tick; \
-                 still at {} (pre-fix value)",
-                post.events_offset,
-            );
-
-            // Second tick: the event must NOT be re-processed.
-            // We detect re-processing by checking that the
-            // history doesn't gain a SECOND reviewer entry
-            // (append_history_entry_for_active_role's idempotency
-            // guard prevents this, but the offset-advance is the
-            // primary defense).
-            let history_len_before_second = post.history.len();
-            {
-                let mut ctx = WorkflowControllerCtx {
-                    workflow_runs: &mut runs,
-                    workspaces: &mut workspaces,
-                    workflows: &workflows,
-                    last_term_size: (80, 24),
-                    config: &dummy.config,
-                    cap_status: &dummy.cap_status,
-                    kill_tx: &dummy.kill_tx,
-                };
-                let _ = ctx.tick();
-            }
-            let post2 = workflow::run::load_one(run_id).expect("post2 load");
-            assert_eq!(
-                post2.history.len(),
-                history_len_before_second,
-                "history must not grow on a tick that processed no new events",
-            );
-        });
-    }
+    // 11g-2: `daemon_routed_tick_advances_events_offset_on_disk`
+    // retired. The test exclusively pinned events_offset advance
+    // on disk after a daemon-routed tick, which is A4's retired
+    // behavior. The "event re-processed?" companion assertion is
+    // now structural (the per-run deque is drained on first read;
+    // there's no re-replay surface to defend against). Coverage
+    // for daemon-routed history append survives via
+    // `daemon_routed_tick_persistent_role_no_reset_appends_history`
+    // and the per-event-target-role family of tests above.
 
     /// 10d-2c-1 review round-4 (F1): daemon-routed dynamic
     /// transition to a `Context::Fresh` role must persist
@@ -5007,7 +4747,8 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
             {
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
@@ -5017,6 +4758,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
@@ -5129,7 +4871,7 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -5138,6 +4880,7 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             // Direct-call the deliver-only helper with the
             // shape it would see for a daemon-routed second
@@ -5294,7 +5037,7 @@ mod tests {
             let goal = "build feature X — verbatim {{ not_a_template }}";
 
             {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -5303,6 +5046,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.launch_workflow(
                     0,
@@ -5317,7 +5061,7 @@ mod tests {
             // Now deliver the initial prompt — same code path the MCP
             // launch (`start_workflow_run`) uses.
             {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -5326,6 +5070,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.deliver_initial_workflow_prompt(&run_id, "worker", 0);
             }
@@ -5357,7 +5102,7 @@ mod tests {
             workflows.insert("feedback".to_string(), launch_test_workflow());
 
             let actions = {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -5366,6 +5111,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -5455,7 +5201,7 @@ mod tests {
             );
 
             {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -5464,6 +5210,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.launch_workflow(0, "feedback", launch_test_slots(), None);
             }
@@ -5505,7 +5252,7 @@ mod tests {
             workflows.insert("feedback".to_string(), launch_test_workflow());
 
             let _ = {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -5514,6 +5261,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -5589,15 +5337,6 @@ mod tests {
             workflow::events::WorkflowEventsWriter::append_event(&ev)
                 .expect("append wf_done");
 
-            // Daemon flipped status to Done already. We capture
-            // the post-event byte offset BEFORE the tick — it's
-            // what the controller will advance to.
-            let (with_offsets, _) =
-                workflow::events::read_new_with_offsets(run_id, 0);
-            assert_eq!(with_offsets.len(), 1, "exactly one event seeded");
-            let post_event_offset = with_offsets[0].1;
-            assert!(post_event_offset > 0, "post-event offset must be nonzero");
-
             workflow::run::modify(run_id, |r| {
                 r.status = workflow::run::RunStatus::Done;
                 r.done_reason = Some("approved".to_string());
@@ -5625,7 +5364,8 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
 
             // Phase 1 of tick_workflows — controller tick.
             {
@@ -5637,18 +5377,25 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }
 
-            // Post-controller, pre-reconcile assertions.
-            let post_tick = workflow::run::load_one(run_id).expect("post-tick load");
-            assert_eq!(
-                post_tick.events_offset, post_event_offset,
-                "controller MUST advance events_offset past the \
-                 workflow_done line BEFORE reconcile drops the run; \
-                 a pre-tick reconcile would empty workflow_runs \
-                 first and the event would be silently lost",
+            // 11g-2: controller MUST drain the workflow_done event
+            // from the deque BEFORE reconcile drops the run.
+            // Pre-fix a pre-tick reconcile would empty
+            // workflow_runs first and the event would be silently
+            // lost. Now: drained → empty deque → reconcile drops
+            // a Done run cleanly.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "controller MUST drain the workflow_done event from \
+                 the deque before reconcile drops the run",
             );
             assert!(
                 !runs.is_empty(),
@@ -5727,7 +5474,7 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
 
             // Phase 1 — controller tick: no events.jsonl content,
             // so no decisions, no on-disk mutation, no in-mem
@@ -5741,6 +5488,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.tick();
             }

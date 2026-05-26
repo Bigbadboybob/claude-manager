@@ -11175,6 +11175,7 @@ impl App {
                 config: &self.config,
                 cap_status: &self.memory_cap_status,
                 kill_tx: &self.memory_kill_tx,
+                pending_workflow_events: &mut self.pending_workflow_events,
             };
             f(&mut ctx)
         };
