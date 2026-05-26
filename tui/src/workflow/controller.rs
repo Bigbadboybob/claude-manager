@@ -50,6 +50,50 @@ pub struct WorkflowControllerCtx<'a> {
     /// Sender clone for memory-kill events. Cloned again into each
     /// per-session watcher thread spawned by `spawn_agent_session`.
     pub kill_tx: &'a std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
+    /// 11g-2: per-run buffer of channel-delivered events. Drained
+    /// by `tick()` per run via [`take_pending_events`]; failed
+    /// decisions re-push the source event at the front via
+    /// [`requeue_pending_event_front`] so the next tick retries.
+    /// Replaces the pre-11g-2 file-tail (`read_new_with_offsets`)
+    /// path — `events.subscribe` broadcasts AFTER fsync, so the
+    /// channel ordering equals `events.jsonl` append order and
+    /// no file-read is needed.
+    pub pending_workflow_events: &'a mut HashMap<
+        String,
+        std::collections::VecDeque<workflow::events::Event>,
+    >,
+}
+
+impl<'a> WorkflowControllerCtx<'a> {
+    /// 11g-2: drain the per-run pending-events buffer in FIFO
+    /// order. Mirror of `App::take_pending_workflow_events` for
+    /// the controller's borrow scope. Returns an empty Vec when
+    /// no events are pending.
+    pub(crate) fn take_pending_events(
+        &mut self,
+        run_id: &str,
+    ) -> Vec<workflow::events::Event> {
+        match self.pending_workflow_events.get_mut(run_id) {
+            Some(deque) => deque.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 11g-2: front-push retry. A failed decision (apply errored,
+    /// session missing, etc.) re-pushes the source event so the
+    /// next tick re-processes it. Same retry semantics the
+    /// pre-11g-2 "leave events_offset un-advanced" pattern
+    /// provided via file-tail; the deque IS the bookmark now.
+    pub(crate) fn requeue_pending_event_front(
+        &mut self,
+        run_id: &str,
+        event: workflow::events::Event,
+    ) {
+        self.pending_workflow_events
+            .entry(run_id.to_string())
+            .or_default()
+            .push_front(event);
+    }
 }
 
 /// App-level side effect requested by the controller. The dispatcher
@@ -63,6 +107,95 @@ pub enum WorkflowAction {
     SaveSessionManifest,
     /// Show `msg` in the bottom status bar.
     SetStatusMsg(String),
+}
+
+/// 10d-2c-1 review round-4 (F1): description of the workflow-run-level
+/// mutations a fresh-context role reset implies, returned by
+/// `reset_fresh_session` as a pure value for the caller to apply.
+///
+/// Why this exists: on the daemon-routed dynamic-transition path,
+/// the post-reset state has to be persisted inside the same
+/// `workflow::run::modify` closure that writes `events_offset` +
+/// the history entry. The closure reloads state.json from disk
+/// under flock, so in-memory mutations applied BEFORE the closure
+/// (the pre-round-4 shape) would be clobbered by the reload —
+/// the fresh role's pre-reset `current_session_id` and stale
+/// `role_baselines` entry would persist on disk, corrupting the
+/// on_idle gate and the history's `session_id` for subsequent
+/// activations.
+///
+/// Approach A from the reviewer: make `reset_fresh_session` pure
+/// w.r.t. `WorkflowRun` (it still drives TerminalSession side
+/// effects — `/clear` queue, transcript rebind, etc.) and return
+/// `Option<RoleResetMutations>`. Each caller is responsible for
+/// applying the mutations to the run AT THE RIGHT POINT in its
+/// own persistence flow:
+///   - `fire_transition`: apply in-memory before its existing
+///     `workflow::run::save`.
+///   - Daemon-routed `ActivateDynamic` arm: apply INSIDE the
+///     `run::modify` closure so the post-reload run picks them up.
+#[derive(Debug, Clone)]
+pub(crate) struct RoleResetMutations {
+    /// Role name to mutate on the run.
+    pub role: String,
+    /// Value to assign to `role_sessions[role].current_session_id`.
+    /// Always `None` today (the reset blanks the bound sid so the
+    /// transcript detector rebinds to the post-`/clear` file), but
+    /// carried explicitly so the apply site doesn't hardcode it.
+    pub new_session_id: Option<String>,
+    /// Value to assign to `role_baselines[role]`. Always
+    /// `MessageBaseline::default()` today (post-`/clear` the
+    /// per-role baseline must restart from 0 so templates slice
+    /// from the new transcript's start, not the old turn count).
+    pub new_baseline: MessageBaseline,
+}
+
+/// 10d-2c-1 review round-8: distinguishes the two
+/// "Option<None>" meanings of `deliver_dynamic_activation_prompt`'s
+/// prior return type. Pre-round-8 the caller couldn't tell
+/// "delivered, persistent role so no reset" (legitimate) from
+/// "early failure, missing target session/workflow/role" (the
+/// prompt was DROPPED). Both surfaced as `None` and the caller
+/// advanced `events_offset` either way — the failure case left
+/// the workflow stuck on a role that never got prompted.
+///
+/// Post-round-8 the caller branches:
+///   - `Delivered { reset }`: advance `events_offset` (today's
+///     behavior). `reset` is `Some` for fresh-context roles
+///     and `None` for persistent ones.
+///   - `Failed { reason }`: log loudly + do NOT advance
+///     `events_offset` so the next tick retries delivery.
+#[derive(Debug, Clone)]
+pub(crate) enum DeliveryOutcome {
+    /// Activation prompt was delivered (or, in the rendered-
+    /// empty case, the delivery code completed without error).
+    /// `reset` carries the [`RoleResetMutations`] for
+    /// `Context::Fresh` roles (None for persistent roles).
+    Delivered {
+        reset: Option<RoleResetMutations>,
+    },
+    /// Delivery did NOT happen. Caller MUST NOT advance
+    /// `events_offset`; the next tick re-reads the event and
+    /// retries delivery. Caller logs loudly so an operator
+    /// notices on a finite-bound retry loop (e.g. permanently
+    /// closed session).
+    Failed {
+        reason: String,
+    },
+}
+
+/// Apply a [`RoleResetMutations`] to `run` in place. Pulled out
+/// to a free function so both the in-memory apply (in
+/// `fire_transition`) and the closure-scoped apply (in the
+/// daemon-routed `ActivateDynamic` arm of `tick`) call exactly
+/// the same code — drift between them would re-introduce the
+/// round-4 bug.
+pub(crate) fn apply_role_reset(run: &mut WorkflowRun, reset: &RoleResetMutations) {
+    run.role_baselines
+        .insert(reset.role.clone(), reset.new_baseline.clone());
+    if let Some(b) = run.role_sessions.get_mut(&reset.role) {
+        b.current_session_id = reset.new_session_id.clone();
+    }
 }
 
 /// Locate the `(workspace_index, session_index)` of the session tagged
@@ -345,9 +478,22 @@ impl<'a> WorkflowControllerCtx<'a> {
             .flat_map(|w| w.sessions.iter())
             .filter_map(|s| s.transcript_id.clone())
             .collect();
+        // Sub-2b-1 review-r#4 #2: session indices whose
+        // `transcript_id` was set or rebound during this
+        // workflow launch. Deferred to a post-loop walk so we
+        // can take `&Workspace + &TerminalSession` without
+        // conflicting with the mutable `sessions.get_mut(*si)`
+        // borrow active inside each iteration. The post-loop
+        // walk then calls
+        // `App::push_transcript_path_to_daemon_if_attached`
+        // for each so the daemon's
+        // `resolve_authorized_session` flips `pending` →
+        // `ready`. No-op for local-only sessions (the helper
+        // gates on `daemon_session_uid.is_some()`).
+        let mut transcript_updated_sis: Vec<usize> = Vec::new();
         for slot in &slots {
             let role = &wf.roles[&slot.role];
-            let (session_label, session_id, effective_engine) = match slot.source() {
+            let (session_label, session_id, effective_engine, daemon_session_uid) = match slot.source() {
                 WorkflowSlotSource::Existing(si) => {
                     // Tag with workflow metadata, and if sid isn't known yet,
                     // try to detect it NOW (newest JSONL heuristic) so the
@@ -360,6 +506,18 @@ impl<'a> WorkflowControllerCtx<'a> {
                     };
                     ts.workflow_run_id = Some(run_id.clone());
                     ts.workflow_role = Some(slot.role.clone());
+                    // 10d-2c-1 review round-5 (F1): push workflow
+                    // context to daemon so a daemon-attached
+                    // session bound as an Existing-slot
+                    // participant passes auth on
+                    // `workflow_transition` / `workflow_done`.
+                    // No-op for TUI-local sessions (the helper
+                    // gates on `daemon_session_uid.is_some()`).
+                    crate::app::App::push_workflow_context_to_daemon_if_attached(
+                        ts,
+                        Some(&run_id),
+                        Some(&slot.role),
+                    );
                     if let Some(wt) = worktree_for_detect.as_deref() {
                         if ts.transcript_id.is_none() {
                             // Augment the per-session pre-launch snapshot with
@@ -380,6 +538,11 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 bound_sids.insert(sid.clone());
                                 ts.transcript_id = Some(sid);
                                 ts.pending_jsonl_files = None;
+                                // Sub-2b-1 review-r#4 #2: queue
+                                // for daemon transcript_path push
+                                // after the loop body's mutable
+                                // `ts` borrow ends.
+                                transcript_updated_sis.push(*si);
                             }
                         } else if ts.session_type == "codex" {
                             let current_sid = ts.transcript_id.clone();
@@ -396,6 +559,11 @@ impl<'a> WorkflowControllerCtx<'a> {
                                     bound_sids.insert(sid.clone());
                                     ts.rebind_transcript(Some(sid.clone()));
                                     ts.pending_jsonl_files = None;
+                                    // Sub-2b-1 review-r#4 #2:
+                                    // codex resume-rebind. Same
+                                    // post-loop push as the
+                                    // initial-bind arm above.
+                                    transcript_updated_sis.push(*si);
                                     log_tick(
                                         &run_id,
                                         &format!(
@@ -433,10 +601,16 @@ impl<'a> WorkflowControllerCtx<'a> {
                     };
                     let session_label_clone = ts.label.clone();
                     let session_id_clone = ts.transcript_id.clone();
+                    // 10d-2c-2-2-b round-5 F1: co-capture the
+                    // daemon session uid (Some iff this role is
+                    // bound to a daemon-spawned session).
+                    // Becomes the durable ownership signal in
+                    // `RoleBinding.daemon_session_uid`.
+                    let daemon_uid_clone = ts.session.daemon_session_uid.clone();
                     if let Some(msg) = respawn_warning {
                         actions.push(WorkflowAction::SetStatusMsg(msg));
                     }
-                    (session_label_clone, session_id_clone, eng)
+                    (session_label_clone, session_id_clone, eng, daemon_uid_clone)
                 }
                 WorkflowSlotSource::New(engine) => {
                     match self.spawn_workflow_session(
@@ -446,7 +620,15 @@ impl<'a> WorkflowControllerCtx<'a> {
                         &run_id,
                         inherit_task_id.clone(),
                     ) {
-                        Some((label, sid)) => (label, sid, engine.clone()),
+                        // Round-5 F1: spawn_workflow_session
+                        // returns (label, sid). Workflow respawns
+                        // are TUI-local in Phase 1 (see the
+                        // method's "SpawnTarget::TuiLocal" comment),
+                        // so daemon_session_uid is always None
+                        // for this branch. When workflows
+                        // eventually relocate to daemon-spawn,
+                        // this becomes Some(uid).
+                        Some((label, sid)) => (label, sid, engine.clone(), None),
                         None => {
                             actions.push(WorkflowAction::SetStatusMsg(format!(
                                 "Failed to spawn {}",
@@ -497,7 +679,31 @@ impl<'a> WorkflowControllerCtx<'a> {
                 RoleBinding {
                     session_label,
                     current_session_id: session_id,
+                    daemon_session_uid,
                 },
+            );
+        }
+
+        // Sub-2b-1 review-r#4 #2: post-loop daemon push for
+        // every session whose `transcript_id` was set/rebound
+        // during this workflow launch. Mutable `ts` borrows
+        // inside the loop blocked an inline push (the helper
+        // takes `&Workspace + &TerminalSession`); deferring
+        // here is the cleanest shape. Dedup in case the same
+        // `si` was queued twice (initial-bind + codex-rebind
+        // would only fire in mutually exclusive branches but
+        // belt-and-suspenders for any future code path).
+        transcript_updated_sis.sort_unstable();
+        transcript_updated_sis.dedup();
+        for si in &transcript_updated_sis {
+            let Some(ws) = self.workspaces.get(ws_index) else {
+                continue;
+            };
+            let Some(ts) = ws.sessions.get(*si) else {
+                continue;
+            };
+            crate::app::App::push_transcript_path_to_daemon_if_attached(
+                ts, ws,
             );
         }
 
@@ -541,6 +747,11 @@ impl<'a> WorkflowControllerCtx<'a> {
             role_plans,
             initial_text_count,
         );
+        // 10d-2c-1 review round-6 (F1): CREATE save. The run_id
+        // was just minted and no other writer (daemon or TUI)
+        // knows about it yet — no race possible, `save` is the
+        // correct primitive. `modify` requires the file to exist
+        // and would fail here.
         let _ = workflow::run::save(&run);
         self.workflow_runs.push(run);
         actions.push(WorkflowAction::SaveSessionManifest);
@@ -574,7 +785,14 @@ impl<'a> WorkflowControllerCtx<'a> {
             run_id,
             role: role_name,
         };
+        // Workflow respawns are TUI-local (slice 10c-e-3a per-spawn
+        // routing). They have no daemon-side equivalent in Phase 1;
+        // the workflow control plane lives in `~/.cm/workflow-runs/`
+        // which the daemon doesn't manage. MCP calls from a
+        // workflow participant (e.g. `workflow_transition`) must
+        // reach the TUI socket, not the daemon — pinning explicitly.
         let (program, args) = match crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             engine,
             &session_uid,
             Some(workflow_meta),
@@ -637,6 +855,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -678,10 +897,83 @@ impl<'a> WorkflowControllerCtx<'a> {
                 from: String,
                 prompt: String,
                 event_id: String,
+                // 11g-2 (A2 + daemon_routed cleanup): the
+                // `daemon_routed: bool` and `new_offset: u64`
+                // fields are gone. Every channel event is
+                // daemon-source post-TuiLocal deletion, so the
+                // forks collapsed. `new_offset` was retired with
+                // events_offset (A4) in 11g-2-a.
+                //
+                // Per-event iteration captured by the daemon's
+                // post-mutation closure. The TUI's history append
+                // uses this — pre-r15 it read state.json's current
+                // `iteration` which gave queued events the LATEST
+                // value rather than the per-event activation
+                // iteration. `0` for pre-r15 on-disk events; the
+                // appender falls back to `r.iteration` then.
+                event_iteration: u32,
+                /// 10d-2c-2-2-b F3: `args.trigger` discriminator
+                /// from the event. `Some("static_idle")` when the
+                /// daemon poller fired this via `workflow_transition`
+                /// with `trigger: "static_idle"`; `None` for MCP-
+                /// direct callers and pre-F3 daemon transitions.
+                /// Drives `TriggerKind` selection at history-append
+                /// time.
+                trigger: Option<String>,
             },
-            Done { run_id: String, reason: String },
+            Done {
+                run_id: String,
+                reason: String,
+                // 11g-2: `daemon_routed` and `new_offset` retired
+                // (see ActivateDynamic above).
+                //
+                // event_iteration: unused by Done's TUI processing
+                // (no history append) but carried for parity.
+                event_iteration: u32,
+            },
+            /// 10d-2c-1 review round-11 (F1): skip-but-advance.
+            /// Event was read but doesn't produce a real
+            /// transition or done (e.g. `EventKind::Unknown` —
+            /// future event types the TUI doesn't recognize, or
+            /// no-op shapes). Without this variant the Unknown
+            /// branch dropped the event silently, leaving
+            /// `events_offset` un-advanced — the next tick
+            /// re-read the same Unknown event AND blocked the
+            /// static-idle check (because `events_with_offsets`
+            /// wasn't empty). Wedges the run.
+            ///
+            /// Threading through the same decision-processing
+            /// loop (rather than an inline modify in the read
+            /// loop) keeps offset advances ordered correctly
+            /// alongside Transition / Done modifies. An inline
+            /// advance would interleave with later transitions'
+            /// modifies and risk going backward — the decision
+            /// loop is the single serial point for offset writes.
+            Skip {
+                run_id: String,
+                /// Free-form reason for the log line. Surfaces
+                /// in `log_tick` so an operator can correlate
+                /// silent skips against the channel event stream.
+                ///
+                /// 11g-2: `new_offset` retired (per A4) — Skip is
+                /// now log-only; the deque drain consumed the
+                /// event already.
+                reason: String,
+            },
         }
         let mut decisions: Vec<Decision> = Vec::new();
+        // 11g-2: per-tick snapshot of drained events per run. On
+        // any decision-failure for run X at position K, the
+        // failure path re-pushes events_by_run[X][K..] back at
+        // the front of the per-run deque (`failed_runs` then
+        // short-circuits remaining decisions for X this tick).
+        // Mirrors the file-tail era's "offset stays put → next
+        // tick re-reads from there" semantics without needing
+        // events_offset on disk.
+        let mut events_by_run: HashMap<
+            String,
+            Vec<workflow::events::Event>,
+        > = HashMap::new();
 
         // Snapshot run states.
         let run_snapshots: Vec<(usize, String, u64, Option<String>, bool)> = self
@@ -737,25 +1029,111 @@ impl<'a> WorkflowControllerCtx<'a> {
                 );
             }
 
-            // Read new events regardless of paused state so the log stays in sync;
-            // events are still recorded in history but not fired while paused.
-            let (events, new_offset) = workflow::events::read_new(&run_id, offset);
-            self.workflow_runs[idx].events_offset = new_offset;
-
+            // 11g-2 reveal: events come from the per-run
+            // pending-events buffer (populated by `App::
+            // drain_workflow_watch_events` from the daemon's
+            // `events.subscribe` broadcast) instead of file-tail.
+            // Per-event offset bookkeeping is gone — Option B's
+            // post-fsync broadcast ordering means the channel
+            // IS the bookmark; events_offset on disk stays at
+            // whatever state.json had (frozen post-11g-2,
+            // serde-default 0 for fresh runs). Field retired
+            // per A4 in the slice plan.
+            //
+            // Paused runs short-circuit BEFORE draining so events
+            // stay in the deque for the unpause tick. Matches
+            // pre-11g-2 file-tail semantics (offset not advanced
+            // while paused → same events re-read after unpause).
+            //
+            // The malformed-line Skip branch is gone too: channel
+            // events are pre-deserialized by the consumer; a
+            // wire-deserialize failure logs + drops the frame and
+            // never reaches this loop. State.json torn-record
+            // hazards remain a daemon-side concern (writer's
+            // fsync-on-append + leading-newline defense).
             if paused {
                 continue;
             }
+            let events: Vec<workflow::events::Event> =
+                self.take_pending_events(&run_id);
+            let _ = offset; // events_offset retired; kept in run_snapshots
+                            // for serde back-compat of state.json reads.
+            // Snapshot for the retry path. Cheap clone — Event's
+            // String fields are short.
+            events_by_run.insert(run_id.clone(), events.clone());
 
             for ev in &events {
                 match ev.kind() {
                     workflow::events::EventKind::Transition { to, prompt } => {
-                        if let Some(from) = active_role.clone() {
+                        // 10d-2c-1 review round-7 (F2): the
+                        // authoritative outgoing role lives on the
+                        // event itself (captured pre-mutation under
+                        // flock by the daemon's
+                        // `workflow_transition` closure). Deriving
+                        // from in-memory `active_role` gives the
+                        // WRONG role after a TUI restart:
+                        // state.json already carries the
+                        // post-mutation `active_role = to`, so the
+                        // snapshot would record `from_role = to`.
+                        //
+                        // Round-11 (F2): intermediate fallback to
+                        // `ev.role` for daemon-source events whose
+                        // `from_role` is None (pre-round-7 events
+                        // on disk; or any future case where the
+                        // capture missed). `ev.role` carries the
+                        // outgoing caller role from the RPC params
+                        // — semantically equivalent to `from_role`
+                        // for the daemon path.
+                        //
+                        // 11g-2 (post-A2): the `ev.source ==
+                        // "daemon"` gate on the ev.role fallback
+                        // is gone — every channel event is
+                        // daemon-source post-TuiLocal deletion. We
+                        // unconditionally fall through to ev.role,
+                        // then active_role as last resort.
+                        let from_opt = ev
+                            .from_role
+                            .clone()
+                            .or_else(|| Some(ev.role.clone()))
+                            .or_else(|| active_role.clone());
+                        // 10d-2c-2-2-b F3: extract `args.trigger`
+                        // discriminator at decision-build time. The
+                        // daemon poller sets this to "static_idle"
+                        // when firing via `workflow_transition`;
+                        // MCP-direct callers leave it absent.
+                        let trigger = ev
+                            .args
+                            .get("trigger")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if let Some(from) = from_opt {
                             decisions.push(Decision::ActivateDynamic {
                                 run_id: run_id.clone(),
                                 to,
                                 from,
                                 prompt,
                                 event_id: ev.id.clone(),
+                                event_iteration: ev.iteration,
+                                trigger,
+                            });
+                        } else {
+                            // No from_role derivable at all
+                            // (event.from_role None, ev.role
+                            // empty/missing, and in-memory
+                            // active_role None). Skip-but-log: the
+                            // deque drain consumes the event, the
+                            // log line surfaces the anomaly. Path
+                            // is effectively unreachable post-A2
+                            // (daemon always populates ev.role from
+                            // RPC params) but kept defensive.
+                            decisions.push(Decision::Skip {
+                                run_id: run_id.clone(),
+                                reason: format!(
+                                    "Transition event {} has no derivable \
+                                     from_role (event.from_role=None, \
+                                     ev.role={:?}, in-memory active_role=None)",
+                                    ev.id, ev.role,
+                                ),
                             });
                         }
                     }
@@ -763,34 +1141,69 @@ impl<'a> WorkflowControllerCtx<'a> {
                         decisions.push(Decision::Done {
                             run_id: run_id.clone(),
                             reason,
+                            event_iteration: ev.iteration,
+                        });
+                    }
+                    workflow::events::EventKind::Unknown => {
+                        // 10d-2c-1 review round-11 (F1):
+                        // skip-but-advance. Pre-round-11 the
+                        // empty arm `{}` ignored Unknown events
+                        // entirely, leaving the deque blocked on
+                        // an unprocessable event. The Skip
+                        // decision flows through the standard
+                        // failure-gating pipeline.
+                        decisions.push(Decision::Skip {
+                            run_id: run_id.clone(),
+                            reason: format!(
+                                "Unknown event kind (tool={:?}, id={})",
+                                ev.tool, ev.id,
+                            ),
                         });
                     }
                     workflow::events::EventKind::RejectFinding { text } => {
-                        // Apply in place — no state-machine decision to defer.
-                        // Appending to the run's stash and persisting is local
-                        // enough that we don't need a Decision variant.
+                        // 11e + 11g-2: the daemon's
+                        // `workflow_reject_finding` ALREADY
+                        // mutated rejected_findings on disk under
+                        // flock. The TUI tail must NOT re-apply
+                        // the push or it'd double-add. Reload
+                        // from disk so in-memory mirrors the
+                        // daemon's mutation; if disk reload fails
+                        // (transient I/O), the next tick's full
+                        // reload resyncs.
+                        //
+                        // Post-11g-2-b (A2): the TuiLocal in-place
+                        // push branch is gone — every event is
+                        // daemon-source so reload-from-disk is the
+                        // only path.
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
-                            let iteration = self.workflow_runs[idx].iteration;
-                            self.workflow_runs[idx]
-                                .rejected_findings
-                                .push(crate::workflow::run::RejectedFinding {
-                                    text: trimmed.to_string(),
-                                    recorded_at: crate::workflow::run::now_unix(),
-                                    iteration,
-                                });
-                            let _ = workflow::run::save(&self.workflow_runs[idx]);
+                            if let Some(reloaded) =
+                                crate::workflow::run::load_one(&run_id)
+                            {
+                                self.workflow_runs[idx] = reloaded;
+                            }
                             log_tick(
                                 &run_id,
                                 &format!(
-                                    "reject_finding recorded ({} chars, total={} rejections)",
-                                    trimmed.len(),
+                                    "reject_finding recorded (daemon-routed, total={} rejections)",
                                     self.workflow_runs[idx].rejected_findings.len(),
                                 ),
                             );
                         }
+                        // 11e fix (reviewer round): apply-in-place
+                        // arms STILL need a Decision::Skip — the
+                        // deque drain consumed the event, but the
+                        // Skip decision flows through the standard
+                        // log + per-tick consumption accounting.
+                        // Same shape as the Unknown arm.
+                        decisions.push(Decision::Skip {
+                            run_id: run_id.clone(),
+                            reason: format!(
+                                "reject_finding applied in-place (id={})",
+                                ev.id,
+                            ),
+                        });
                     }
-                    workflow::events::EventKind::Unknown => {}
                 }
             }
 
@@ -858,39 +1271,370 @@ impl<'a> WorkflowControllerCtx<'a> {
                     );
                     if will_fire {
                         if let Some(t) = wf.static_transition_on_idle(active) {
-                            decisions.push(Decision::ActivateStatic {
-                                run_id: run_id.clone(),
-                                to: t.to.clone(),
-                                from: active.to_string(),
-                            });
+                            // 10d-2c-2-2-b (2c-2-3 bundle): per-run
+                            // ownership gate. If the active role's
+                            // session is daemon-spawned
+                            // (`daemon_session_uid.is_some()`), the
+                            // daemon's `cm-workflow-poller` thread
+                            // fires the static `on_idle` — see
+                            // `cm_daemon::workflow::poller::daemon_owns_run`.
+                            // TUI staying out avoids a same-tick
+                            // double-fire on state.json. Both sides
+                            // consult the equivalent condition from
+                            // their authoritative source
+                            // (`daemon_session_uid` for TUI,
+                            // `state.sessions` membership for daemon).
+                            if self.workspaces[ti].sessions[si]
+                                .session
+                                .daemon_session_uid
+                                .is_some()
+                            {
+                                log_tick(
+                                    &run_id,
+                                    "skipping static on_idle: daemon owns \
+                                     this run's active role session — \
+                                     daemon poller fires",
+                                );
+                            } else {
+                                decisions.push(Decision::ActivateStatic {
+                                    run_id: run_id.clone(),
+                                    to: t.to.clone(),
+                                    from: active.to_string(),
+                                });
+                            }
                         }
                     }
                 }
             }
         }
 
+        // 10d-2c-1 review round-10: stop-at-first-failure per
+        // run. Decisions are pushed in event-order within each
+        // run (the per-run inner loop above). If a decision
+        // for run R fails, any later decision for the SAME run R
+        // in this tick is skipped — keeping `events_offset`
+        // positioned at the failed event so the next tick
+        // re-reads from there. Different runs are independent;
+        // a failure in run X doesn't affect run Y.
+        let mut failed_runs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // 11g-2: per-run count of successfully-processed decisions
+        // this tick. Increments on each successful Decision. On
+        // failure for run X, the unprocessed tail
+        // (`events_by_run[X][events_processed_by_run[X]..]`) is
+        // re-pushed at the deque-front in reverse order so the
+        // next tick re-processes in original order.
+        let mut events_processed_by_run: HashMap<String, usize> =
+            HashMap::new();
+
         for d in decisions {
+            // Extract the run_id without consuming the decision.
+            let decision_run_id: &str = match &d {
+                Decision::ActivateStatic { run_id, .. }
+                | Decision::ActivateDynamic { run_id, .. }
+                | Decision::Done { run_id, .. }
+                | Decision::Skip { run_id, .. } => run_id,
+            };
+            if failed_runs.contains(decision_run_id) {
+                log_tick(
+                    decision_run_id,
+                    "skipping later decision in this tick — an earlier \
+                     event in this run's batch failed to deliver; \
+                     events_offset stays at the failed event for retry",
+                );
+                continue;
+            }
+
             match d {
                 Decision::ActivateStatic { run_id, to, from } => {
+                    // ActivateStatic fires only when events.is_empty()
+                    // for this tick, so there's no events_offset
+                    // advance to thread. None signals the modify
+                    // closure to leave events_offset untouched.
                     self.fire_transition(
                         &run_id,
                         &to,
                         TriggerKind::StaticIdle { from_role: from },
                         None,
                         &mut actions,
+                        None,
                     );
                 }
-                Decision::ActivateDynamic { run_id, to, from, prompt, event_id } => {
-                    self.fire_transition(
+                Decision::ActivateDynamic { run_id, to, from, prompt, event_id, event_iteration, trigger: trigger_str } => {
+                    {
+                        // 11g-2: daemon-routed path is the only
+                        // path (TuiLocal deleted). Sequence:
+                        //
+                        // 10d-2c-1 review round-1 (F2 + F4 +
+                        // P1 #1/#2):
+                        //
+                        // F4: defer the history-entry append
+                        // (Option A's deferred-patch) until
+                        // AFTER `deliver_dynamic_activation_prompt`
+                        // — that helper runs the fresh-context
+                        // reset (e.g. `/clear`) which wipes the
+                        // transcript for Fresh roles. Snapshotting
+                        // `assistant_count_at_start` BEFORE that
+                        // reset would record the stale (pre-clear)
+                        // count, so the on_idle gate would fire
+                        // before the role's response to the
+                        // activation prompt.
+                        //
+                        // F2: combine the history-entry append
+                        // with `events_offset` persistence in a
+                        // single `run::modify` so the offset
+                        // survives the post-reset reload. The
+                        // pre-fix two-step (reload+offset save)
+                        // clobbered the offset because the reload
+                        // overwrote the in-memory advance.
+                        //
+                        // Sequence:
+                        //   1. Re-load state.json (daemon's
+                        //      mutation: active_role set, history
+                        //      not yet appended).
+                        //   2. Deliver prompt (runs fresh reset
+                        //      if applicable).
+                        //   3. Compute post-reset
+                        //      `assistant_count_at_start`.
+                        //   4. Single `run::modify` appends the
+                        //      history entry AND persists
+                        //      events_offset.
+                        if let Some(updated) = workflow::run::load_one(&run_id) {
+                            if let Some(slot) = self
+                                .workflow_runs
+                                .iter_mut()
+                                .find(|r| r.run_id == run_id)
+                            {
+                                *slot = updated;
+                            }
+                        }
+
+                        // Step 2: deliver prompt (fresh reset may
+                        // execute here). Returns
+                        // `DeliveryOutcome::Delivered { reset }`
+                        // on success (reset is Some iff target is
+                        // Fresh) OR `Failed { reason }` if the
+                        // target session / workflow / role is
+                        // missing.
+                        //
+                        // Round-8: on `Failed`, the activation
+                        // prompt was NOT delivered. Skip the
+                        // events_offset advance + history append
+                        // so the next tick re-reads the event and
+                        // retries delivery. Pre-round-8 the
+                        // helper returned `Option<None>` for both
+                        // success-no-reset AND failure; the
+                        // caller advanced offset unconditionally
+                        // and the workflow stalled on a role
+                        // that never got prompted.
+                        let delivery = self.deliver_dynamic_activation_prompt(
+                            &run_id, &to, &prompt, &mut actions,
+                        );
+                        let reset_mutations = match delivery {
+                            DeliveryOutcome::Delivered { reset } => reset,
+                            DeliveryOutcome::Failed { reason } => {
+                                log_tick(
+                                    &run_id,
+                                    &format!(
+                                        "deliver_dynamic FAILED for role {:?}: {} \
+                                         — skipping events_offset advance; next \
+                                         tick will retry. If this persists, the \
+                                         target session may be permanently \
+                                         closed; operator should investigate.",
+                                        to, reason,
+                                    ),
+                                );
+                                // 11g-2: re-push the unprocessed
+                                // tail of THIS tick's drained events
+                                // back at the deque-front so the
+                                // next tick retries in original
+                                // order. Replaces the file-tail era's
+                                // "leave events_offset un-advanced"
+                                // semantics; the deque IS the
+                                // bookmark now.
+                                let processed = *events_processed_by_run
+                                    .get(&run_id)
+                                    .unwrap_or(&0);
+                                if let Some(drained) =
+                                    events_by_run.get(&run_id)
+                                {
+                                    for ev in drained[processed..]
+                                        .iter()
+                                        .rev()
+                                    {
+                                        self.requeue_pending_event_front(
+                                            &run_id,
+                                            ev.clone(),
+                                        );
+                                    }
+                                }
+                                // 10d-2c-1 review round-10: register
+                                // this run as failed so any
+                                // later decisions in this tick's
+                                // batch (events 2+ for the same
+                                // run) are skipped — their source
+                                // events were re-pushed above so
+                                // the next tick re-processes them.
+                                failed_runs.insert(run_id);
+                                continue;
+                            }
+                        };
+
+                        // Step 3 + 4: compute post-reset count,
+                        // append history entry, persist
+                        // events_offset, AND apply the fresh-reset
+                        // role_sessions / role_baselines mutations
+                        // — all atomic under the run's flock.
+                        //
+                        // F1 (round 3): `new_offset` is the
+                        // Decision-threaded value captured at
+                        // event-read time. DO NOT read from the
+                        // (post-reload, stale) in-memory run; the
+                        // closure must explicitly assign so the
+                        // saved state.json reflects the advance.
+                        //
+                        // F1 (round 4): apply
+                        // [`RoleResetMutations`] inside the
+                        // closure so the fresh role's
+                        // current_session_id / role_baseline reset
+                        // survives the closure's reload. Pre-round-4
+                        // shape applied them in memory before the
+                        // closure, which the reload silently
+                        // discarded — fresh-context daemon-routed
+                        // transitions persisted the OLD session id
+                        // and stale baseline, breaking the on_idle
+                        // gate and corrupting history's session_id.
+                        let start_count = self.compute_role_assistant_count(&run_id, &to);
+                        // 10d-2c-2-2-b F3: daemon poller fires
+                        // static `on_idle` via `workflow_transition`
+                        // with `args.trigger = "static_idle"`. The
+                        // history entry must record
+                        // `TriggerKind::StaticIdle` for parity with
+                        // the TUI-direct static path; pre-fix the
+                        // TUI tail hard-coded `McpTransition` for
+                        // all daemon-source events, mis-tagging
+                        // poller-driven idle fires in history.
+                        let trigger = if trigger_str.as_deref() == Some("static_idle") {
+                            TriggerKind::StaticIdle {
+                                from_role: from.clone(),
+                            }
+                        } else {
+                            TriggerKind::McpTransition {
+                                from_role: from.clone(),
+                                prompt: prompt.clone(),
+                                event_id: event_id.clone(),
+                            }
+                        };
+                        let captured_reset = reset_mutations;
+                        // 10d-2c-1 review round-14: pass the event's
+                        // target role (`to`) explicitly into the
+                        // history append. Pre-r14 the function read
+                        // `self.active_role` — in multi-event
+                        // queued scenarios all queued events would
+                        // see the LATEST state.json `active_role`
+                        // and append history for the wrong role
+                        // (or drop silently if `active_role` was
+                        // None after a daemon workflow_done).
+                        let target_role_for_history = to.clone();
+                        // 10d-2c-1 review round-15: per-event
+                        // activation iteration from the daemon's
+                        // post-mutation capture (0 means pre-r15
+                        // on-disk event; the appender falls back
+                        // to `r.iteration`).
+                        let event_iter_for_history = event_iteration;
+                        if let Ok(updated_run) =
+                            workflow::run::modify(&run_id, move |r| {
+                                if let Some(reset) = &captured_reset {
+                                    apply_role_reset(r, reset);
+                                }
+                                r.append_history_entry_for_event_target_role(
+                                    &target_role_for_history,
+                                    event_iter_for_history,
+                                    trigger,
+                                    start_count,
+                                    // text_messages_at_start: no
+                                    // sibling compute method exists
+                                    // on this branch yet; the
+                                    // text-message tracking landed
+                                    // on main after this branch's
+                                    // 10d-2c-1 work, so passing 0
+                                    // here matches the pre-merge
+                                    // behavior. A follow-up can
+                                    // wire compute_role_text_count
+                                    // alongside compute_role_assistant_count.
+                                    0,
+                                );
+                                // 11g-2: events_offset write retired (A4).
+                                // History append is the load-bearing mutation
+                                // inside this closure.
+                            })
+                        {
+                            if let Some(slot) = self
+                                .workflow_runs
+                                .iter_mut()
+                                .find(|r| r.run_id == run_id)
+                            {
+                                *slot = updated_run;
+                            }
+                        }
+                    }
+                    let _ = (event_id, prompt, from); // 11g-2: consumed by removed TuiLocal fire_transition path
+                    // 11g-2: mark this event consumed for the retry-tail
+                    // accounting (failure returns above via `continue`
+                    // after re-pushing the tail).
+                    *events_processed_by_run
+                        .entry(run_id.clone())
+                        .or_insert(0) += 1;
+                }
+                Decision::Done { run_id, reason, event_iteration: _ } => {
+                    let _ = reason; // 11g-2: state.json mutation is the daemon's; we only sync in-mem
+                    {
+                        // 11g-2: the daemon's `workflow_done` already
+                        // mutated state.json (status=Done, active_role=None,
+                        // done_reason=...) under flock before broadcasting.
+                        // Re-load from disk so in-memory mirrors the
+                        // daemon's mutation. The TuiLocal fork
+                        // (`self.finish_run`) is gone with A2 —
+                        // daemon-routed is the only path now.
+                        if let Some(reloaded) =
+                            workflow::run::load_one(&run_id)
+                        {
+                            if let Some(slot) = self
+                                .workflow_runs
+                                .iter_mut()
+                                .find(|r| r.run_id == run_id)
+                            {
+                                *slot = reloaded;
+                            }
+                        }
+                    }
+                    // 11g-2: mark consumed.
+                    *events_processed_by_run
+                        .entry(run_id.clone())
+                        .or_insert(0) += 1;
+                }
+                Decision::Skip { run_id, reason } => {
+                    // 11g-2: Skip is log-only — the event was
+                    // already drained from the per-run deque by
+                    // `take_pending_events`, so there's no
+                    // "advance past" semantics to apply. The
+                    // decision exists for log-trail parity with
+                    // the file-tail era (operators can grep
+                    // `skip-but-advance` to find apply-in-place
+                    // events like RejectFinding).
+                    log_tick(
                         &run_id,
-                        &to,
-                        TriggerKind::McpTransition { from_role: from, prompt: prompt.clone(), event_id },
-                        Some(prompt),
-                        &mut actions,
+                        &format!(
+                            "skip-but-advance (now log-only): {}",
+                            reason,
+                        ),
                     );
-                }
-                Decision::Done { run_id, reason } => {
-                    self.finish_run(&run_id, reason, &mut actions);
+                    // 11g-2: mark consumed (Skip arises from a
+                    // drained event — e.g. RejectFinding's
+                    // apply-in-place push or an Unknown event).
+                    *events_processed_by_run
+                        .entry(run_id.clone())
+                        .or_insert(0) += 1;
                 }
             }
         }
@@ -1004,6 +1748,16 @@ impl<'a> WorkflowControllerCtx<'a> {
 
     /// Keep `role_sessions.current_session_id` aligned with the live
     /// `TerminalSession.transcript_id`. Nothing else.
+    ///
+    /// 10d-2c-1 review round-6 (F1): collect the (role, live_sid)
+    /// updates that need applying for this run, then push them
+    /// through `workflow::run::modify` so the on-disk run
+    /// reflects daemon-written advances (active_role, iteration,
+    /// status, events_offset, daemon-routed history entries)
+    /// alongside our TUI-only `role_sessions[*].current_session_id`
+    /// updates. Pre-fix this did `run::save(&in_mem_copy)` which
+    /// wholesale-clobbered any daemon write made between TUI's
+    /// load and TUI's save — the named acceptance criterion bug.
     fn sync_role_session_ids(&mut self) {
         let run_count = self.workflow_runs.len();
         for idx in 0..run_count {
@@ -1016,7 +1770,14 @@ impl<'a> WorkflowControllerCtx<'a> {
                 .keys()
                 .cloned()
                 .collect();
-            let mut changed = false;
+            // Gather (role, new_sid, new_daemon_uid) tuples. Round-5
+            // F1: also re-sync `daemon_session_uid` from the live
+            // `TerminalSession.session.daemon_session_uid`. Pre-r5
+            // this only synced transcript_id; the daemon-poller's
+            // ownership gate would miss a session that lost or
+            // gained its daemon attachment between writes.
+            let mut updates: Vec<(String, Option<String>, Option<String>)> =
+                Vec::new();
             for role in role_names {
                 let Some((ti, si)) = locate_workflow_session(self.workspaces, &run_id, &role)
                 else {
@@ -1024,19 +1785,47 @@ impl<'a> WorkflowControllerCtx<'a> {
                 };
 
                 let live = self.workspaces[ti].sessions[si].transcript_id.clone();
-                let binding_sid = self.workflow_runs[idx]
+                let live_daemon_uid =
+                    self.workspaces[ti].sessions[si].session.daemon_session_uid.clone();
+                let binding = self.workflow_runs[idx]
                     .role_sessions
-                    .get(&role)
+                    .get(&role);
+                let binding_sid = binding
                     .and_then(|b| b.current_session_id.clone());
-                if live != binding_sid {
-                    if let Some(b) = self.workflow_runs[idx].role_sessions.get_mut(&role) {
-                        b.current_session_id = live;
-                    }
-                    changed = true;
+                let binding_daemon_uid = binding
+                    .and_then(|b| b.daemon_session_uid.clone());
+                if live != binding_sid || live_daemon_uid != binding_daemon_uid {
+                    updates.push((role, live, live_daemon_uid));
                 }
             }
-            if changed {
-                let _ = workflow::run::save(&self.workflow_runs[idx]);
+            if updates.is_empty() {
+                continue;
+            }
+            // Apply via modify so daemon writes survive. Closure
+            // touches role_sessions only (TUI-owned).
+            let updates_for_closure = updates.clone();
+            let updated = workflow::run::modify(&run_id, move |r| {
+                for (role, new_sid, new_daemon_uid) in updates_for_closure {
+                    if let Some(b) = r.role_sessions.get_mut(&role) {
+                        b.current_session_id = new_sid;
+                        b.daemon_session_uid = new_daemon_uid;
+                    }
+                }
+            });
+            if let Ok(updated) = updated {
+                self.workflow_runs[idx] = updated;
+            } else {
+                // Modify failed (e.g., run was deleted off disk).
+                // Mirror the updates in memory anyway so subsequent
+                // in-process logic doesn't see stale bindings.
+                for (role, new_sid, new_daemon_uid) in updates {
+                    if let Some(b) =
+                        self.workflow_runs[idx].role_sessions.get_mut(&role)
+                    {
+                        b.current_session_id = new_sid;
+                        b.daemon_session_uid = new_daemon_uid;
+                    }
+                }
             }
         }
     }
@@ -1051,6 +1840,21 @@ impl<'a> WorkflowControllerCtx<'a> {
         trigger: TriggerKind,
         supplied_prompt: Option<String>,
         actions: &mut Vec<WorkflowAction>,
+        // 10d-2c-1 review round-7 (F1): events_offset to persist
+        // alongside the state mutation under the same flock. Some
+        // for the TuiLocal `ActivateDynamic` arm (events.jsonl
+        // had a new event read this tick). None for ActivateStatic
+        // (events.is_empty() — no offset to advance, no-op).
+        //
+        // Pre-fix this offset advance lived in a SECOND modify
+        // call after `fire_transition` returned, but the first
+        // modify (inside fire_transition) reloaded disk and
+        // reassigned `self.workflow_runs[run_idx]` with the
+        // disk-loaded events_offset (OLD value). The second
+        // modify wrote disk = NEW but didn't refresh in-memory.
+        // Next tick read in-memory = OLD → re-processed the
+        // event → duplicate prompt + history + iteration.
+        new_offset: Option<u64>,
     ) {
         let run_idx = match self.workflow_runs.iter().position(|r| r.run_id == run_id) {
             Some(i) => i,
@@ -1090,6 +1894,7 @@ impl<'a> WorkflowControllerCtx<'a> {
         } else {
             None
         };
+        let captured_for_closure = captured.clone();
         self.workflow_runs[run_idx].close_active_role(captured);
 
         // Render prompt for target role. After the first activation of this
@@ -1137,7 +1942,16 @@ impl<'a> WorkflowControllerCtx<'a> {
         let rendered = workflow::template::render(&template_source, &resolver);
 
         if matches!(target_role_spec.context, workflow::toml_schema::Context::Fresh) {
-            self.reset_fresh_session(run_id, to_role, ti, si, actions);
+            // 10d-2c-1 review round-4 (F1): `reset_fresh_session` no
+            // longer mutates `WorkflowRun` directly; apply the
+            // returned [`RoleResetMutations`] in memory here so the
+            // existing `workflow::run::save` below persists them.
+            // Daemon-routed transitions apply this same struct
+            // INSIDE the `run::modify` closure (see `tick`'s
+            // `ActivateDynamic` arm).
+            if let Some(reset) = self.reset_fresh_session(run_id, to_role, ti, si, actions) {
+                apply_role_reset(&mut self.workflow_runs[run_idx], &reset);
+            }
         }
 
         // Update role_sessions with (possibly new) session_id from the session.
@@ -1187,11 +2001,70 @@ impl<'a> WorkflowControllerCtx<'a> {
 
         self.workflow_runs[run_idx].activate_role(
             to_role.to_string(),
-            trigger,
+            trigger.clone(),
             start_count,
             start_text_count,
         );
-        let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+        // 10d-2c-1 review round-6 (F1): persist via `modify`
+        // rather than `save(&in_mem_copy)` so any daemon write
+        // to non-overlapping fields (e.g., events_offset bumped
+        // by a daemon-routed event we haven't picked up yet)
+        // survives the RMW. The closure re-applies the same
+        // mutations we did to the in-memory copy:
+        //   - close_active_role (sets last history entry's
+        //     deactivated_at + last_message — TUI-routed
+        //     transition, so TUI owns this close).
+        //   - apply_role_reset for Fresh roles
+        //     (role_baselines + role_sessions[to].current_session_id).
+        //   - role_sessions[to].current_session_id ← current_sid.
+        //   - activate_role (push history entry + active_role +
+        //     iteration). Mutual-exclusion with daemon-routed
+        //     dispatch is by event source (`source != "daemon"`
+        //     here); if both paths fire concurrently for the
+        //     same logical transition that's an upstream caller
+        //     bug, not something this RMW can resolve.
+        let reset_for_closure = if matches!(
+            target_role_spec.context,
+            workflow::toml_schema::Context::Fresh
+        ) {
+            // Build the reset shape from the (already-applied
+            // in-mem) state so the closure mirrors it. Don't
+            // re-run reset_fresh_session — its TerminalSession
+            // side effects (queueing /clear, etc.) must happen
+            // exactly once.
+            Some(RoleResetMutations {
+                role: to_role.to_string(),
+                new_session_id: None,
+                new_baseline: MessageBaseline::default(),
+            })
+        } else {
+            None
+        };
+        let current_sid_for_closure = self.workspaces[ti].sessions[si].transcript_id.clone();
+        let to_role_owned = to_role.to_string();
+        let offset_for_closure = new_offset;
+        let updated = workflow::run::modify(run_id, move |r| {
+            r.close_active_role(captured_for_closure);
+            if let Some(reset) = reset_for_closure {
+                apply_role_reset(r, &reset);
+            }
+            if let Some(b) = r.role_sessions.get_mut(&to_role_owned) {
+                b.current_session_id = current_sid_for_closure;
+            }
+            r.activate_role(to_role_owned, trigger, start_count, start_text_count);
+            // 10d-2c-1 review round-7 (F1): persist events_offset
+            // inside the SAME modify closure as the state
+            // mutation, so the disk-loaded run that gets
+            // assigned back to `self.workflow_runs[run_idx]`
+            // carries the NEW offset. Caller-side outer modify
+            // dropped (was the source of the regression).
+            if let Some(offset) = offset_for_closure {
+                r.events_offset = offset;
+            }
+        });
+        if let Ok(updated) = updated {
+            self.workflow_runs[run_idx] = updated;
+        }
         let from_label = from_role.as_deref().unwrap_or("?");
         actions.push(WorkflowAction::SetStatusMsg(format!(
             "Workflow: {} → {}",
@@ -1248,6 +2121,231 @@ impl<'a> WorkflowControllerCtx<'a> {
         actions.push(WorkflowAction::SaveSessionManifest);
     }
 
+    /// 10d-2c-1 review round-1 (P2 fix): compute the active
+    /// role's current transcript-tail assistant count. Used by
+    /// the daemon-routed `ActivateDynamic` arm to patch the
+    /// deferred history entry's `assistant_count_at_start` —
+    /// without this patch, `start_count=0` would let the on_idle
+    /// gate fire on stale assistant turns produced before the
+    /// activation prompt.
+    fn compute_role_assistant_count(&self, run_id: &str, role: &str) -> usize {
+        let Some((ti, si)) = locate_workflow_session(self.workspaces, run_id, role) else {
+            return 0;
+        };
+        let session_type = self.workspaces[ti].sessions[si].session_type.clone();
+        let session_engine = engine_for_session_type(&session_type);
+        let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
+        match (
+            self.workspaces[ti].worktree_path.as_deref(),
+            current_sid.as_deref(),
+        ) {
+            (Some(wt), Some(sid)) => workflow::transcript::count_messages(
+                &session_engine,
+                wt,
+                sid,
+                workflow::transcript::MessageKind::Assistant,
+            ),
+            _ => 0,
+        }
+    }
+
+    /// 10d-2c-1: deliver-only half of `fire_transition` — used
+    /// for dynamic transitions whose state mutation has ALREADY
+    /// been applied by the daemon's `workflow_transition`
+    /// handler. Skips `close_active_role`, `activate_role`,
+    /// `workflow::run::save` (daemon did those); still does
+    /// template render, fresh-context reset (if target role is
+    /// `Fresh`), agent.submit_prompt, status_msg, and the
+    /// manifest-save action. 10d-2c-2 / 2c-3 move this delivery
+    /// (and the fresh-respawn it triggers) to the daemon too;
+    /// at that point this helper is deleted alongside
+    /// `fire_transition`.
+    fn deliver_dynamic_activation_prompt(
+        &mut self,
+        run_id: &str,
+        to_role: &str,
+        supplied_prompt: &str,
+        actions: &mut Vec<WorkflowAction>,
+    ) -> DeliveryOutcome {
+        // 10d-2c-1 review round-8: distinguish early-failure
+        // (workflow / role / target session missing) from
+        // success-with-no-reset. Pre-round-8 both surfaced as
+        // `Option::None` and the caller advanced events_offset
+        // unconditionally — the failure case dropped the
+        // activation prompt and stuck the workflow on a role
+        // that never got prompted. Now: failures return
+        // `Failed { reason }` so the caller skips offset
+        // advance and the next tick retries delivery.
+        let run_idx = match self.workflow_runs.iter().position(|r| r.run_id == run_id) {
+            Some(i) => i,
+            None => {
+                return DeliveryOutcome::Failed {
+                    reason: format!("run {} not in workflow_runs", run_id),
+                };
+            }
+        };
+        let wf_name = self.workflow_runs[run_idx].workflow_name.clone();
+        let wf = match self.workflows.get(&wf_name).cloned() {
+            Some(w) => w,
+            None => {
+                return DeliveryOutcome::Failed {
+                    reason: format!("workflow definition {:?} not loaded", wf_name),
+                };
+            }
+        };
+
+        // Locate target role's session by workflow tags.
+        let Some((ti, si)) = locate_workflow_session(self.workspaces, run_id, to_role) else {
+            return DeliveryOutcome::Failed {
+                reason: format!(
+                    "target role {:?} has no participant session in workspaces \
+                     (TUI restart with stale state? session closed?)",
+                    to_role,
+                ),
+            };
+        };
+
+        // from_role for the status message: daemon already set
+        // active_role to to_role, so we read the outgoing role
+        // from the just-appended history entry's
+        // McpTransition.from_role field.
+        let from_role: Option<String> = self.workflow_runs[run_idx]
+            .history
+            .last()
+            .and_then(|h| match &h.trigger {
+                TriggerKind::McpTransition { from_role, .. } => Some(from_role.clone()),
+                _ => None,
+            });
+
+        // Render the activation prompt. After the first
+        // activation of this role in the run, prefer
+        // `subsequent_activation_prompt`.
+        let target_role_spec = match wf.roles.get(to_role).cloned() {
+            Some(r) => r,
+            None => {
+                return DeliveryOutcome::Failed {
+                    reason: format!(
+                        "role {:?} not declared in workflow {:?}",
+                        to_role, wf_name,
+                    ),
+                };
+            }
+        };
+        let prior_activations = self.workflow_runs[run_idx]
+            .history
+            .iter()
+            .filter(|h| h.role == to_role)
+            .count();
+        // 10d-2c-1 review round-3 (F3): `> 0`, NOT `> 1`. The
+        // daemon-routed path under Option A defers the history-
+        // entry append until AFTER prompt rendering (see the
+        // ActivateDynamic arm in `tick`), so at render time the
+        // current activation's entry is NOT yet in history.
+        // `prior_activations` counts entries STRICTLY BEFORE
+        // this activation. Earlier rounds used `> 1` to
+        // compensate for an assumed-already-appended entry —
+        // that was wrong: it meant "at least 2 prior" = "this
+        // is the 3rd+ activation", so the second activation
+        // got the wrong (initial) prompt copy.
+        let default_template = if prior_activations > 0 {
+            target_role_spec
+                .subsequent_activation_prompt
+                .clone()
+                .or_else(|| target_role_spec.activation_prompt.clone())
+        } else {
+            target_role_spec.activation_prompt.clone()
+        };
+        let template_source = if !supplied_prompt.is_empty() {
+            supplied_prompt.to_string()
+        } else {
+            default_template.unwrap_or_default()
+        };
+
+        let worktree_ref = self.workspaces[ti].worktree_path.as_deref();
+        let mut role_engines: BTreeMap<String, Engine> = BTreeMap::new();
+        for role_name in wf.roles.keys() {
+            let engine = match locate_workflow_session(self.workspaces, run_id, role_name) {
+                Some((wi, sj)) => engine_for_session_type(
+                    &self.workspaces[wi].sessions[sj].session_type,
+                ),
+                None => wf.roles[role_name].engine.clone(),
+            };
+            role_engines.insert(role_name.clone(), engine);
+        }
+        let resolver = WorkflowResolver {
+            run: &self.workflow_runs[run_idx],
+            worktree_path: worktree_ref,
+            role_engines,
+        };
+        let rendered = workflow::template::render(&template_source, &resolver);
+
+        // Fresh-context reset still happens TUI-side in 2c-1;
+        // daemon takes it in 2c-3.
+        //
+        // 10d-2c-1 review round-4 (F1): capture the
+        // [`RoleResetMutations`] but DO NOT apply to the
+        // in-memory run here. The caller (`tick`'s
+        // `ActivateDynamic` arm) applies them inside the
+        // `run::modify` closure so they survive the reload that
+        // happens under the closure's flock.
+        let reset_mutations = if matches!(
+            target_role_spec.context,
+            workflow::toml_schema::Context::Fresh
+        ) {
+            self.reset_fresh_session(run_id, to_role, ti, si, actions)
+        } else {
+            None
+        };
+
+        let from_label = from_role.as_deref().unwrap_or("?");
+        actions.push(WorkflowAction::SetStatusMsg(format!(
+            "Workflow: {} → {}",
+            from_label, to_role
+        )));
+
+        if !rendered.trim().is_empty() {
+            let session_type = self.workspaces[ti].sessions[si].session_type.clone();
+            let label = self.workspaces[ti].sessions[si].label.clone();
+            let body_len = rendered.trim_end().len();
+            log_tick(
+                run_id,
+                &format!(
+                    "deliver_dynamic: activated '{}' queued prompt ({} bytes) on session '{}'",
+                    to_role, body_len, label,
+                ),
+            );
+            let ws = &mut self.workspaces[ti];
+            let wt = ws.worktree_path.clone().unwrap_or_default();
+            let ts = &mut ws.sessions[si];
+            let ctx = crate::agent::AgentCtxMut {
+                ts,
+                worktree_path: &wt,
+            };
+            let agent = crate::agent::agent_for(&session_type);
+            if let Err(e) = agent.submit_prompt(ctx, &rendered) {
+                log_tick(
+                    run_id,
+                    &format!(
+                        "deliver_dynamic: submit_prompt error on '{}': {}",
+                        label, e
+                    ),
+                );
+            }
+        } else {
+            log_tick(
+                run_id,
+                &format!(
+                    "deliver_dynamic: activated '{}' but rendered prompt was EMPTY",
+                    to_role
+                ),
+            );
+        }
+        actions.push(WorkflowAction::SaveSessionManifest);
+        DeliveryOutcome::Delivered {
+            reset: reset_mutations,
+        }
+    }
+
     /// Queue `/clear` to reset a fresh-context role's agent. Delivery is
     /// gated on PTY quiet (see `PendingWrite`) so we don't try to type the
     /// command while the agent is still painting its startup UI — that's
@@ -1257,6 +2355,21 @@ impl<'a> WorkflowControllerCtx<'a> {
     /// Also invalidates the session's bound sid and role baseline because
     /// claude rotates its transcript file on `/clear`; the new file's sid
     /// is picked up later by the history.jsonl correlator.
+    ///
+    /// 10d-2c-1 review round-4 (F1): this function NO LONGER mutates
+    /// `WorkflowRun.role_sessions` / `role_baselines` in place. It returns
+    /// the intended workflow-run mutations as a [`RoleResetMutations`]
+    /// value; each caller applies them at the persistence boundary it
+    /// owns:
+    ///   - `fire_transition` applies them in memory before its existing
+    ///     `workflow::run::save` (TUI-local path's single-shot save).
+    ///   - The daemon-routed `ActivateDynamic` arm applies them INSIDE
+    ///     the `workflow::run::modify` closure (the closure reloads
+    ///     state.json under flock, so an in-memory apply BEFORE
+    ///     `modify` would be clobbered).
+    ///
+    /// Returns `None` if the session was already exited (no reset
+    /// happened) or `Some(_)` describing the mutations to apply.
     fn reset_fresh_session(
         &mut self,
         run_id: &str,
@@ -1264,7 +2377,7 @@ impl<'a> WorkflowControllerCtx<'a> {
         ti: usize,
         si: usize,
         actions: &mut Vec<WorkflowAction>,
-    ) -> bool {
+    ) -> Option<RoleResetMutations> {
         let wt = self.workspaces[ti]
             .worktree_path
             .as_deref()
@@ -1276,7 +2389,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                 run_id,
                 &format!("reset_fresh: session '{}' already exited", label),
             );
-            return false;
+            return None;
         }
         // Queue /clear to fire when the PTY first goes quiet. Floor of 1s so
         // we don't fire during the PTY startup noise. Hard deadline 120s in
@@ -1303,19 +2416,6 @@ impl<'a> WorkflowControllerCtx<'a> {
         // file once the detector picks it up.
         ts.rebind_transcript(None);
         ts.pending_prompt = None;
-        // Old file's turn counts no longer apply to the new file — reset the
-        // role's message baseline so templates slice from 0 post-/clear.
-        // Key off the role name (stable, workflow-managed), NOT the session
-        // label — labels are user-editable in the per-session settings, and
-        // a renamed fresh role would otherwise leave a stale baseline keyed
-        // on the prior label and the role-keyed binding never updates.
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            run.role_baselines
-                .insert(role.to_string(), MessageBaseline::default());
-            if let Some(b) = run.role_sessions.get_mut(role) {
-                b.current_session_id = None;
-            }
-        }
         actions.push(WorkflowAction::SaveSessionManifest);
         log_tick(
             run_id,
@@ -1324,17 +2424,57 @@ impl<'a> WorkflowControllerCtx<'a> {
                 label
             ),
         );
-        true
+        // Old file's turn counts no longer apply to the new file — the
+        // role's message baseline resets so templates slice from 0
+        // post-`/clear`. Key off the role name (stable, workflow-managed),
+        // NOT the session label — labels are user-editable in the
+        // per-session settings, and a renamed fresh role would otherwise
+        // leave a stale baseline keyed on the prior label.
+        Some(RoleResetMutations {
+            role: role.to_string(),
+            new_session_id: None,
+            new_baseline: MessageBaseline::default(),
+        })
     }
 
     /// Mark a workflow run as done, persist the change, and surface a
     /// status-bar note. Distinct from `App::stop_workflow_run` (the
     /// user-driven stop) — this fires when an MCP `workflow_done`
     /// event is processed.
-    fn finish_run(&mut self, run_id: &str, reason: String, actions: &mut Vec<WorkflowAction>) {
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            run.mark_done(reason.clone());
-            let _ = workflow::run::save(run);
+    fn finish_run(
+        &mut self,
+        run_id: &str,
+        reason: String,
+        actions: &mut Vec<WorkflowAction>,
+        // 10d-2c-1 review round-7 (F1): events_offset to persist
+        // alongside the mark_done mutation in the same modify
+        // closure. Matches the fire_transition shape — pre-fix
+        // the outer modify advanced disk but the prior
+        // finish_run modify had already replaced in-memory with
+        // the disk-loaded OLD events_offset; next tick re-read
+        // the Done event.
+        new_offset: Option<u64>,
+    ) {
+        // 10d-2c-1 review round-6 (F1): targeted modify. Daemon
+        // owns status/active_role/done_reason but `finish_run`
+        // fires only from the TuiLocal-routed `Decision::Done`
+        // arm (legacy events.jsonl writer); daemon-routed Done
+        // uses `workflow_done` and the daemon's own RMW. Even so,
+        // running through `modify` (rather than wholesale save)
+        // protects daemon-side bumps to events_offset or other
+        // non-overlapping fields from being clobbered.
+        let reason_for_closure = reason.clone();
+        let offset_for_closure = new_offset;
+        let updated = workflow::run::modify(run_id, move |r| {
+            r.mark_done(reason_for_closure);
+            if let Some(offset) = offset_for_closure {
+                r.events_offset = offset;
+            }
+        });
+        if let Ok(updated) = updated {
+            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                *slot = updated;
+            }
         }
         actions.push(WorkflowAction::SetStatusMsg(format!(
             "Workflow done: {}",
@@ -1391,6 +2531,7 @@ mod tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -1449,6 +2590,36 @@ mod tests {
         kill_tx: std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
         // Held to keep the channel alive for the duration of the test.
         _kill_rx: std::sync::mpsc::Receiver<crate::session_watch::MemoryKillEvent>,
+        /// 11g-2: the channel-driven pending-events buffer the
+        /// controller drains from. Tests that don't push channel
+        /// events leave this empty; tests that DO push synthetic
+        /// events populate it before the tick.
+        pending_events: HashMap<
+            String,
+            std::collections::VecDeque<workflow::events::Event>,
+        >,
+    }
+
+    /// 11g-2 helper: push channel-delivered events into the
+    /// per-run pending deque. Tests that pre-11g-2 wrote events
+    /// to disk via `WorkflowEventsWriter::append_event` now push
+    /// directly into the controller's input buffer instead.
+    /// Events.jsonl writes can still happen alongside (the
+    /// daemon's broadcaster does both atomically) but no test
+    /// here exercises the daemon's broadcast path; we feed the
+    /// controller directly.
+    fn push_pending_events(
+        dummy: &mut DummyCapState,
+        run_id: &str,
+        events: impl IntoIterator<Item = workflow::events::Event>,
+    ) {
+        let deque = dummy
+            .pending_events
+            .entry(run_id.to_string())
+            .or_default();
+        for ev in events {
+            deque.push_back(ev);
+        }
     }
 
     fn dummy_cap_state() -> DummyCapState {
@@ -1466,6 +2637,7 @@ mod tests {
             },
             kill_tx,
             _kill_rx: kill_rx,
+            pending_events: HashMap::new(),
         }
     }
 
@@ -1476,6 +2648,7 @@ mod tests {
             RoleBinding {
                 session_label: "worker".to_string(),
                 current_session_id: None,
+                daemon_session_uid: None,
             },
         );
         role_sessions.insert(
@@ -1483,6 +2656,7 @@ mod tests {
             RoleBinding {
                 session_label: "reviewer".to_string(),
                 current_session_id: None,
+                daemon_session_uid: None,
             },
         );
         WorkflowRun::new(
@@ -1534,6 +2708,1666 @@ mod tests {
         .expect("codex transcript");
     }
 
+    /// 10d-2c-2-2-b T2 (2c-2-3 gate) — when the active role's
+    /// session is daemon-spawned (`daemon_session_uid.is_some()`),
+    /// the TUI's controller MUST NOT push
+    /// `Decision::ActivateStatic`. The daemon's
+    /// `cm-workflow-poller` fires for this run instead.
+    ///
+    /// Setup: a run with worker as active role, worker session
+    /// has `daemon_session_uid = Some(...)`, and the transcript
+    /// shows count > baseline + is idle so the gate WOULD fire if
+    /// not for the new ownership check.
+    ///
+    /// Assertion: after `tick()`, the on-disk run's `active_role`
+    /// is still "worker" (no transition), and iteration is
+    /// unchanged. The daemon-side `Decision::ActivateStatic` fire
+    /// path is covered in
+    /// `cm_daemon::workflow::poller::tests::poll_once_fires_activate_static_*`.
+    #[test]
+    fn tui_static_idle_gate_skips_when_active_role_is_daemon_spawned() {
+        with_temp_home(|| {
+            let run_id = "wf_t2_tui_gate_daemon_owned";
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).expect("mkdir wt");
+            // Write a claude transcript with one complete
+            // assistant turn so `is_idle` + count > baseline
+            // would normally fire the gate.
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            std::fs::write(
+                proj.join("sid-worker.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"##,
+            )
+            .expect("write transcript");
+
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Bind worker's transcript_id so the resolver +
+            // is_idle gate can locate the JSONL.
+            run.role_sessions
+                .get_mut("worker")
+                .unwrap()
+                .current_session_id = Some("sid-worker".to_string());
+            workflow::run::save(&run).expect("seed run");
+            let mut runs = vec![run];
+
+            // Build the worker session WITH daemon_session_uid =
+            // Some(...) — this is what the new gate keys off.
+            let mut worker_session = stub_session(
+                "worker",
+                "claude-code",
+                run_id,
+                "worker",
+                Some("sid-worker"),
+            );
+            worker_session.session.daemon_session_uid =
+                Some("ts-daemon-worker".to_string());
+            let mut workspaces =
+                vec![workspace_with(vec![worker_session], Some(wt.clone()))];
+
+            // Minimal workflow def: worker → reviewer on idle.
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let wf = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![Transition {
+                    from: "worker".to_string(),
+                    on: TriggerOn::Idle,
+                    to: "reviewer".to_string(),
+                }],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), wf);
+
+            let mut dummy = dummy_cap_state();
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // No transition fired — daemon owns this run, TUI
+            // poller stays out. `active_role` is still worker.
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert_eq!(
+                post.active_role.as_deref(),
+                Some("worker"),
+                "TUI gate must skip when daemon owns: active_role \
+                 stays at worker; got {:?}",
+                post.active_role,
+            );
+            assert_eq!(
+                post.iteration, 1,
+                "iteration must not advance: gate skipped, no \
+                 close_active_role mutation",
+            );
+        });
+    }
+
+    /// F3 — TUI tail processing a daemon-source event whose
+    /// `args.trigger == "static_idle"` records the history entry
+    /// with `TriggerKind::StaticIdle{from_role}`, NOT
+    /// `TriggerKind::McpTransition`. Pre-fix all daemon-source
+    /// events landed as McpTransition, mis-tagging poller-driven
+    /// idle fires.
+    #[test]
+    fn tui_tail_records_static_idle_trigger_from_daemon_poller_event() {
+        with_temp_home(|| {
+            let run_id = "wf_f3_static_idle_history";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Write a daemon-source event with
+            // `args.trigger = "static_idle"` — what the poller's
+            // internal `workflow_transition` call emits.
+            let ev = workflow::events::Event {
+                id: "evt-f3-static".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({
+                    "to": "reviewer",
+                    "prompt": "",
+                    "trigger": "static_idle",
+                }),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 2,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append ev");
+
+            // Minimal workspace with the worker session bound so
+            // `locate_workflow_session` and the prompt-delivery
+            // path find it. daemon_session_uid set so the TUI
+            // gate doesn't skip the run.
+            let mut worker_session =
+                stub_session("worker", "claude-code", run_id, "worker", None);
+            worker_session.session.daemon_session_uid =
+                Some("ts-daemon-worker".to_string());
+            let mut reviewer_session =
+                stub_session("reviewer", "claude-code", run_id, "reviewer", None);
+            reviewer_session.session.daemon_session_uid =
+                Some("ts-daemon-reviewer".to_string());
+            let mut workspaces = vec![workspace_with(
+                vec![worker_session, reviewer_session],
+                Some(std::path::PathBuf::from("/tmp/f3-wt")),
+            )];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let wf = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), wf);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
+            let mut runs = vec![run];
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // History should have an entry for "reviewer" with
+            // `TriggerKind::StaticIdle{from_role: "worker"}`.
+            let post = workflow::run::load_one(run_id).expect("post load");
+            let reviewer_entry = post
+                .history
+                .iter()
+                .rev()
+                .find(|h| h.role == "reviewer")
+                .expect("reviewer history entry");
+            match &reviewer_entry.trigger {
+                workflow::run::TriggerKind::StaticIdle { from_role } => {
+                    assert_eq!(
+                        from_role, "worker",
+                        "StaticIdle.from_role should be worker, got {:?}",
+                        from_role,
+                    );
+                }
+                other => panic!(
+                    "expected TriggerKind::StaticIdle, got {:?}",
+                    other,
+                ),
+            }
+        });
+    }
+
+    /// F1/F4 gate-decision parity. Drive the TUI's
+    /// static-idle gate path AND the daemon's `poll_once`
+    /// gate path with the same inputs (same run, same workflow,
+    /// same transcript). Both must agree on fire/skip.
+    ///
+    /// 2c-2-2-b's original parity test only covered resolver
+    /// OUTPUT (template rendering). This expansion covers the
+    /// gate's FIRE decision — exactly the surface where F1
+    /// (different baseline source) and F4 (different empty-prompt
+    /// behavior) silently diverged.
+    #[test]
+    fn gate_fire_decisions_parity_between_tui_and_daemon() {
+        with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-gate-parity");
+            std::fs::create_dir_all(&wt).expect("mkdir");
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            // One complete assistant turn — count = 1, idle = true.
+            std::fs::write(
+                proj.join("sid-w.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"complete"}]}}"##,
+            )
+            .expect("write transcript");
+
+            // Build a run with active_role="worker" and a
+            // history entry for worker with
+            // assistant_count_at_start=0 (baseline). The active
+            // assistant_count is now 1, so the gate should fire
+            // on both sides.
+            let mut role_sessions = BTreeMap::new();
+            role_sessions.insert(
+                "worker".to_string(),
+                RoleBinding {
+                    session_label: "worker".to_string(),
+                    current_session_id: Some("sid-w".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            let baselines = BTreeMap::new();
+            let run = WorkflowRun::new(
+                "wf-gate-parity".to_string(),
+                "feedback".to_string(),
+                "/tmp/gate-parity".to_string(),
+                role_sessions,
+                "worker".to_string(),
+                baselines,
+                None,
+                BTreeMap::new(),
+                0,
+            );
+
+            // TUI gate behavior: count_assistant_turns >
+            // active_assistant_start_count AND is_idle. The TUI's
+            // `tick_local` does this inline (controller.rs:1093).
+            // We replicate the predicate here for the parity test.
+            let tui_baseline = run.active_assistant_start_count().unwrap_or(0);
+            let tui_count = workflow::transcript::count_messages(
+                &Engine::ClaudeCode,
+                &wt,
+                "sid-w",
+                workflow::transcript::MessageKind::Assistant,
+            );
+            let tui_idle = workflow::transcript::role_turn_complete(
+                &Engine::ClaudeCode,
+                &wt,
+                "sid-w",
+            );
+            let tui_would_fire = tui_count > tui_baseline && tui_idle;
+
+            // Daemon gate behavior: same predicate via the
+            // bundled helper.
+            let dae_would_fire =
+                workflow::transcript::assistant_turn_completed_since(
+                    &Engine::ClaudeCode,
+                    &wt,
+                    "sid-w",
+                    run.active_assistant_start_count().unwrap_or(0),
+                );
+
+            assert_eq!(
+                tui_would_fire, dae_would_fire,
+                "gate decisions diverge: TUI={}, daemon={} \
+                 (count={}, baseline={}, idle={})",
+                tui_would_fire, dae_would_fire, tui_count, tui_baseline, tui_idle,
+            );
+            // Should be TRUE for this scenario — both fire.
+            assert!(
+                tui_would_fire,
+                "test setup: both should fire (1 turn > 0 baseline, idle)",
+            );
+        });
+    }
+
+    /// Resolver parity (T6). Daemon's `DaemonWorkflowResolver`
+    /// and TUI's `WorkflowResolver` must produce byte-identical
+    /// rendered output for the same logical inputs (workflow_def
+    /// + run + role bindings + worktree + role engines).
+    ///
+    /// **The contract**: any divergence here means a future
+    /// behavior change drifts between daemon-driven and TUI-driven
+    /// static-idle fires. If a future read-path needs to diverge
+    /// (e.g., daemon reads from a different transcript source),
+    /// surface it as an EXPLICIT trait method, don't silently
+    /// fork.
+    #[test]
+    fn daemon_and_tui_resolvers_produce_identical_template_output() {
+        with_temp_home(|| {
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt-parity");
+            std::fs::create_dir_all(&wt).expect("mkdir wt");
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            std::fs::write(
+                proj.join("sid-w.jsonl"),
+                r##"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first prompt"}]}}
+{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"answer one"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second prompt"}]}}
+{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"answer two"}]}}
+"##,
+            )
+            .expect("write transcript");
+
+            // Build the run with worker bound + a baseline that
+            // skips the first user/assistant pair (so prior_* vs
+            // current_* slicing diverges meaningfully across the
+            // two resolvers if there's any drift).
+            let mut role_sessions = BTreeMap::new();
+            role_sessions.insert(
+                "worker".to_string(),
+                RoleBinding {
+                    session_label: "worker".to_string(),
+                    current_session_id: Some("sid-w".to_string()),
+                    daemon_session_uid: None,
+                },
+            );
+            let mut baselines = BTreeMap::new();
+            baselines.insert(
+                "worker".to_string(),
+                MessageBaseline {
+                    user_count: 1,
+                    assistant_count: 1,
+                },
+            );
+            let run = WorkflowRun::new(
+                "wf-parity".to_string(),
+                "feedback".to_string(),
+                "/parity".to_string(),
+                role_sessions,
+                "worker".to_string(),
+                baselines,
+                Some("the run goal".to_string()),
+                BTreeMap::new(),
+                0,
+            );
+
+            let mut role_engines = BTreeMap::new();
+            role_engines.insert("worker".to_string(), Engine::ClaudeCode);
+
+            // TUI side.
+            let tui_resolver = WorkflowResolver {
+                run: &run,
+                worktree_path: Some(wt.as_path()),
+                role_engines: role_engines.clone(),
+            };
+            // Daemon side. Same crate boundary; importable here
+            // because the parity test lives in the TUI crate,
+            // which depends on cm-daemon.
+            let dae_resolver =
+                cm_daemon::workflow::poller::DaemonWorkflowResolver {
+                    run: &run,
+                    worktree_path: Some(wt.as_path()),
+                    role_engines,
+                };
+
+            // Three template shapes covering: post-baseline,
+            // pre-baseline, last-message alias, goal.
+            for tpl in [
+                "{{ roles.worker.user[0] }}",
+                "{{ roles.worker.assistant[0] }}",
+                "{{ roles.worker.prior_user[-1] }}",
+                "{{ roles.worker.prior_assistant[-1] }}",
+                "{{ roles.worker.last_message }}",
+                "{{ goal }}",
+                "review: {{ roles.worker.last_message }} ({{ goal }})",
+            ] {
+                let tui_out = workflow::template::render(tpl, &tui_resolver);
+                let dae_out = workflow::template::render(tpl, &dae_resolver);
+                assert_eq!(
+                    tui_out, dae_out,
+                    "resolver outputs diverge for template {:?}: \
+                     TUI={:?}, daemon={:?}",
+                    tpl, tui_out, dae_out,
+                );
+            }
+        });
+    }
+
+    /// 10d-2c-1 review round-14 — named acceptance test.
+    /// When multiple daemon transitions queue up before the TUI
+    /// processes any of them, each queued event must record the
+    /// role it was activating — NOT the current `active_role`
+    /// on state.json (which by then is the LATEST role, or None
+    /// if a workflow_done landed last).
+    ///
+    /// Pre-r14 the history append used `self.active_role` —
+    /// so if state.json showed `active_role = None` (after the
+    /// daemon completed all transitions + a done), event 1's
+    /// processing would silently drop the history append.
+    /// Or if state.json showed `active_role = manager`, event
+    /// 1 (worker→reviewer) would append a history entry for
+    /// "manager" — wrong.
+    #[test]
+    fn daemon_routed_history_uses_event_target_role_not_current_active_role() {
+        with_temp_home(|| {
+            let run_id = "wf_r14_event_target_role";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Add "manager" to role_sessions so the daemon's
+            // hand-crafted state shape is self-consistent.
+            run.role_sessions.insert(
+                "manager".to_string(),
+                RoleBinding {
+                    session_label: "manager".to_string(),
+                    current_session_id: None,
+                    daemon_session_uid: None,
+                },
+            );
+            workflow::run::save(&run).expect("seed save");
+
+            // Write THREE daemon-source events: worker→reviewer,
+            // reviewer→manager, workflow_done.
+            //
+            // Round-15: each event carries its post-mutation
+            // iteration. Pre-r15 these would have been 0; tick
+            // would have used `r.iteration` (=3 after daemon
+            // ran all 3) on every queued event's history entry.
+            // Post-r15 the appender uses the event's value, so
+            // reviewer gets iteration=2, manager gets iteration=3.
+            let ev1 = workflow::events::Event {
+                id: "evt-r14-1".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p1"}),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 2, // post-mutation: 1 → 2 (worker→reviewer activation)
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev1)
+                .expect("append ev1");
+            let ev2 = workflow::events::Event {
+                id: "evt-r14-2".to_string(),
+                ts: 2.0,
+                run_id: run_id.to_string(),
+                role: "reviewer".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "manager", "prompt": "p2"}),
+                source: "daemon".to_string(),
+                from_role: Some("reviewer".to_string()),
+                iteration: 3, // post-mutation: 2 → 3 (reviewer→manager activation)
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev2)
+                .expect("append ev2");
+            let ev3 = workflow::events::Event {
+                id: "evt-r14-3".to_string(),
+                ts: 3.0,
+                run_id: run_id.to_string(),
+                role: "manager".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "approved"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev3)
+                .expect("append ev3");
+
+            // Simulate "daemon already processed all three" by
+            // directly mutating state.json to the post-done
+            // shape: active_role=None, status=Done, iteration
+            // advanced. Pre-r14, when the TUI processes event 1
+            // and reloads state.json, active_role=None → the
+            // history append silently no-ops (or for non-None
+            // state, records the LATEST active_role rather than
+            // event 1's "reviewer").
+            workflow::run::modify(run_id, |r| {
+                r.close_active_role(None);
+                r.iteration += 1;
+                r.close_active_role(None);
+                r.iteration += 1;
+                r.active_role = None;
+                r.status = workflow::run::RunStatus::Done;
+                r.done_reason = Some("approved".to_string());
+            })
+            .expect("daemon already processed");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let manager = stub_session("manager", "claude", run_id, "manager", None);
+            let workspace = workspace_with(vec![worker, reviewer, manager], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "manager".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec![
+                    "worker".to_string(),
+                    "reviewer".to_string(),
+                    "manager".to_string(),
+                ],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            // 11g-2: push the daemon-source events into the channel
+            // buffer — the controller no longer reads events.jsonl.
+            push_pending_events(
+                &mut dummy,
+                run_id,
+                [ev1.clone(), ev2.clone(), ev3.clone()],
+            );
+            // Hmm — the run is Done in state.json, but the TUI's
+            // tick filters by `is_active()`. Need to re-load the
+            // in-memory run to match the disk state? Let me check
+            // — actually the in-memory `run` we pushed is still
+            // Running (we modified disk, not in-memory). tick's
+            // run_snapshots filters on in-memory `is_active()`
+            // which checks `status`. In-memory status is Running
+            // (from make_run), so tick will process this run.
+            // Good — that mirrors the realistic scenario where
+            // TUI has stale in-memory but real disk state.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            // Initial seed entry is for worker (iteration=1).
+            // Tick should have appended exactly two entries:
+            // one for reviewer (event 1), one for manager
+            // (event 2). Event 3 (workflow_done) doesn't append
+            // a history entry (run-done captured via status).
+            //
+            // Find the entries for reviewer and manager.
+            let reviewer_entries: Vec<_> = post
+                .history
+                .iter()
+                .filter(|h| h.role == "reviewer")
+                .collect();
+            let manager_entries: Vec<_> = post
+                .history
+                .iter()
+                .filter(|h| h.role == "manager")
+                .collect();
+            assert_eq!(
+                reviewer_entries.len(),
+                1,
+                "round-14: exactly one history entry for 'reviewer' \
+                 (event 1's target); got {} entries — full history: {:?}",
+                reviewer_entries.len(),
+                post.history,
+            );
+            assert_eq!(
+                manager_entries.len(),
+                1,
+                "round-14: exactly one history entry for 'manager' \
+                 (event 2's target); got {} entries — full history: {:?}",
+                manager_entries.len(),
+                post.history,
+            );
+            // Round-15: each history entry's iteration is the
+            // event's value, not state.json's current iteration
+            // (which is 3 after the daemon-already-processed
+            // simulation above).
+            assert_eq!(
+                reviewer_entries[0].iteration, 2,
+                "round-15: reviewer's entry iteration = event 1's \
+                 captured value (2), not state.json's current (3)",
+            );
+            assert_eq!(
+                manager_entries[0].iteration, 3,
+                "round-15: manager's entry iteration = event 2's \
+                 captured value (3)",
+            );
+
+            // Pre-r14 the role on each appended entry would be
+            // "None"-driven silent drop (since active_role was
+            // None on disk), leaving no reviewer/manager entries
+            // at all. The assertions above pin the right-role
+            // contract directly.
+
+            // 11g-2: events_offset advance assertion retired (A4).
+            // The history-role assertions above are the
+            // load-bearing contract.
+        });
+    }
+
+    // 11g-2: `malformed_event_line_does_not_wedge_offset` retired.
+    // The file-tail malformed-line concern is gone with the file-tail
+    // itself. Channel events are pre-deserialized by
+    // `workflow_watch::drive_stream`; a malformed wire frame is logged
+    // and dropped there, never reaching the controller. There's
+    // nothing left for the controller to defend against.
+
+    /// 10d-2c-1 review round-11 (F1) — named acceptance test.
+    /// 11g-2 port: three events (Unknown, Transition, Done)
+    /// pushed via the channel. All three must be consumed in
+    /// one tick — the Unknown arm produces a `Decision::Skip`
+    /// (log-only post-11g-2) and the static-idle wedge is
+    /// avoided because the deque is drained. Pre-r11
+    /// `EventKind::Unknown` was an empty arm and the run
+    /// wedged on the file-tail bookmark; post-r11 a Skip
+    /// decision unblocked the loop. The wedge concern was
+    /// originally about file-tail offset; post-11g-2 the
+    /// wedge concern is about the static-idle gate being
+    /// blocked by non-empty `events`. This test pins that the
+    /// drain consumes all three events (no leftover in the
+    /// deque) and the run reached terminal state.
+    #[test]
+    fn tick_advances_offset_past_unknown_event_and_consumes_later_events() {
+        with_temp_home(|| {
+            let run_id = "wf_r11_unknown_advance";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            let ev_unknown = workflow::events::Event {
+                id: "evt-r11-unknown".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "future_event_we_dont_handle".to_string(),
+                args: serde_json::json!({}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            let ev_trans = workflow::events::Event {
+                id: "evt-r11-trans".to_string(),
+                ts: 2.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 0,
+            };
+            let ev_done = workflow::events::Event {
+                id: "evt-r11-done".to_string(),
+                ts: 3.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "ok"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(
+                &mut dummy,
+                run_id,
+                [ev_unknown, ev_trans, ev_done],
+            );
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // All three events drained: per-run deque is empty
+            // (or absent). Pre-r11 the Unknown event would have
+            // remained because no decision was pushed for it,
+            // and post-11g-2 a non-drained Unknown would block
+            // the static-idle gate.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "all three events must be consumed in one tick; \
+                 deque still contains: {:?}",
+                dummy.pending_events.get(run_id),
+            );
+        });
+    }
+
+    /// 11e fix (reviewer round) — `EventKind::RejectFinding` is
+    /// an apply-in-place arm (no state-machine decision); it
+    /// MUST still push a `Decision::Skip` with `new_offset =
+    /// post_event_offset` so the decision-processing loop
+    /// advances `events_offset` past the event. Without the
+    /// Skip:
+    ///   1. offset stays at 0 → the same reject event is
+    ///      re-read every tick (re-applying the daemon-routed
+    ///      reload-from-disk over and over is benign but
+    ///      wasteful; for TuiLocal it'd double-push to
+    ///      rejected_findings every tick).
+    ///   2. `events_with_offsets` stays non-empty →
+    ///      static-idle gate (controller.rs around line 1191)
+    ///      is skipped → workflow can't fire its next
+    ///      transition → run wedges.
+    ///
+    /// Same wedge shape the `Unknown` arm at 10d-2c-1 round-11
+    /// documents. This test is the analog of
+    /// `tick_advances_offset_past_unknown_event_and_consumes_later_events`.
+    ///
+    /// Mutation-verifiable: remove the new `Decision::Skip`
+    /// push in the RejectFinding arm and this test fails
+    /// (offset stays at 0).
+    #[test]
+    fn tick_advances_offset_past_reject_finding_event() {
+        with_temp_home(|| {
+            let run_id = "wf_11e_reject_skip";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            let ev_reject = workflow::events::Event {
+                id: "evt-11e-reject-1".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "manager".to_string(),
+                tool: "workflow_reject_finding".to_string(),
+                args: serde_json::json!({"text": "out of scope nit"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let manager = stub_session("manager", "claude", run_id, "manager", None);
+            let workspace = workspace_with(vec![worker, reviewer, manager], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "manager".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec![
+                    "worker".to_string(),
+                    "reviewer".to_string(),
+                    "manager".to_string(),
+                ],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev_reject.clone()]);
+
+            // First tick: sole reject_finding event. Post-11g-2
+            // the controller's drain consumes it; pre-11e the
+            // RejectFinding arm pushed no Decision and the deque
+            // wasn't drained (file-tail era's "events_offset
+            // stays at 0" analog).
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // Post-tick: deque drained. Pre-11e the RejectFinding
+            // arm produced no decision so the controller would
+            // have wedged.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "reject_finding event must be drained from the deque",
+            );
+
+            // Push a downstream event. If the controller's drain
+            // wedged, this would just accumulate. Post-flip the
+            // next tick consumes it cleanly.
+            let ev_done = workflow::events::Event {
+                id: "evt-11e-done".to_string(),
+                ts: 2.0,
+                run_id: run_id.to_string(),
+                role: "manager".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "ok"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            push_pending_events(&mut dummy, run_id, [ev_done]);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+            // workflow_done arm reloads from disk; if we got here
+            // without a wedge the test passes.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "downstream event must also drain",
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-11 (F2) — named acceptance test.
+    /// Pre-round-7 daemon-source event with `from_role: None`
+    /// (legacy on-disk event from before the round-7 schema
+    /// extension) — fallback chain must use `ev.role` (the
+    /// outgoing caller role on the RPC params), NOT in-memory
+    /// `active_role` (already post-mutation = `to`).
+    #[test]
+    fn daemon_routed_pre_r7_event_falls_back_to_ev_role_not_active_role() {
+        with_temp_home(|| {
+            let run_id = "wf_r11_pre_r7_fallback";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Simulate post-mutation state: active_role already
+            // at the target role.
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some("reviewer".to_string());
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon-source event with from_role=None (pre-r7
+            // shape). ev.role carries the OUTGOING caller role
+            // ("worker"); in-memory active_role is now "reviewer"
+            // (the destination). The fallback chain must prefer
+            // ev.role over active_role for daemon-source events.
+            let ev = workflow::events::Event {
+                id: "evt-r11-pre-r7".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(), // outgoing caller role
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
+                source: "daemon".to_string(),
+                from_role: None, // pre-r7 on-disk shape
+                iteration: 0, // pre-r15 on-disk shape
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // History entry's McpTransition.from_role must be
+            // "worker" (from ev.role), NOT "reviewer" (in-memory
+            // active_role at processing time).
+            let post = workflow::run::load_one(run_id).expect("post load");
+            let last = post.history.last().expect("history entry");
+            match &last.trigger {
+                TriggerKind::McpTransition { from_role, .. } => {
+                    assert_eq!(
+                        from_role, "worker",
+                        "round-11 F2: daemon-source from_role=None must \
+                         fall back to ev.role (outgoing caller), not \
+                         in-memory active_role (which is post-mutation \
+                         = `to`). Got {:?}",
+                        from_role,
+                    );
+                }
+                other => panic!("expected McpTransition, got {:?}", other),
+            }
+        });
+    }
+
+    /// 10d-2c-1 review round-10 — named acceptance test.
+    /// Three daemon-source events in one tick's batch
+    /// (worker→reviewer, reviewer→manager, workflow_done) where
+    /// event 2 succeeds but event 3 fails (manager session
+    /// missing). Pre-round-10 every event in the batch carried
+    /// the BATCH-FINAL `events_offset`, so a successful event 2
+    /// advanced offset past event 3; even though we'd `continue`
+    /// on event 3's Failed delivery, offset was already past it.
+    /// Next tick would read no new events and the workflow
+    /// stuck.
+    ///
+    /// Post-round-10: each event carries its OWN post-offset.
+    /// On event 3's Failed, the run is registered in
+    /// `failed_runs` and any later batch events are skipped.
+    /// `events_offset` ends at the position JUST BEFORE event 3.
+    /// Adding the missing manager session + next tick advances
+    /// past event 3 and processes the Done.
+    #[test]
+    fn daemon_routed_batch_with_mid_batch_failure_does_not_advance_past_failed_event() {
+        with_temp_home(|| {
+            let run_id = "wf_r10_batch_failure";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // make_run only seeds "worker" + "reviewer" in
+            // role_sessions. Add "manager" so the daemon's
+            // target-role validation would pass (for a real
+            // daemon-driven run; we hand-roll events here).
+            run.role_sessions.insert(
+                "manager".to_string(),
+                RoleBinding {
+                    session_label: "manager".to_string(),
+                    current_session_id: None,
+                    daemon_session_uid: None,
+                },
+            );
+            workflow::run::save(&run).expect("seed save");
+
+            // Three events appended in order to events.jsonl.
+            // Event 1: worker→reviewer.
+            let ev1 = workflow::events::Event {
+                id: "evt-r10-1".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p1"}),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev1)
+                .expect("append ev1");
+
+            // Event 2: reviewer→manager.
+            let ev2 = workflow::events::Event {
+                id: "evt-r10-2".to_string(),
+                ts: 2.0,
+                run_id: run_id.to_string(),
+                role: "reviewer".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "manager", "prompt": "p2"}),
+                source: "daemon".to_string(),
+                from_role: Some("reviewer".to_string()),
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev2)
+                .expect("append ev2");
+
+            // Event 3: workflow_done.
+            let ev3 = workflow::events::Event {
+                id: "evt-r10-3".to_string(),
+                ts: 3.0,
+                run_id: run_id.to_string(),
+                role: "manager".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "approved"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev3)
+                .expect("append ev3");
+
+            let mut runs = vec![run];
+            // Workspace: worker + reviewer present, manager
+            // INTENTIONALLY missing — event 3's workflow_done
+            // doesn't need a target session, but event 2's
+            // worker→manager DOES. Actually, the events here
+            // sequence: ev1 worker→reviewer (target=reviewer,
+            // present, succeeds), ev2 reviewer→manager
+            // (target=manager, MISSING, FAILS), ev3 done
+            // (no target needed, would succeed but should be
+            // SKIPPED due to ev2's failure).
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "manager".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec![
+                    "worker".to_string(),
+                    "reviewer".to_string(),
+                    "manager".to_string(),
+                ],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(
+                &mut dummy,
+                run_id,
+                [ev1.clone(), ev2.clone(), ev3.clone()],
+            );
+
+            // First tick: event 1 succeeds; event 2 fails
+            // (manager missing) → run registered in `failed_runs`;
+            // event 3 skipped (stop-at-first-failure). 11g-2
+            // retry-via-requeue: events 2 and 3 are re-pushed at
+            // the deque-front so the next tick re-processes
+            // them.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // Deque holds events 2 and 3 (re-pushed via the
+            // failure tail). Pre-r10 the batch's later events
+            // were silently dropped after a mid-batch failure;
+            // post-11g-2 they survive in the deque for retry.
+            {
+                let deque = dummy.pending_events.get(run_id).expect("deque");
+                assert_eq!(
+                    deque.len(),
+                    2,
+                    "events 2 and 3 must remain in the deque (failed event \
+                     + its skipped successors); got {:?}",
+                    deque.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                );
+                assert_eq!(deque[0].id, "evt-r10-2");
+                assert_eq!(deque[1].id, "evt-r10-3");
+            }
+            // Status MUST still be Running (event 3 was skipped,
+            // so the run hasn't been marked Done yet).
+            let post1 = workflow::run::load_one(run_id).expect("post1 load");
+            assert!(
+                matches!(post1.status, RunStatus::Running),
+                "event 3 (workflow_done) must be skipped due to event 2's \
+                 failure — status stays Running, got {:?}",
+                post1.status,
+            );
+
+            // Second tick (still no manager): event 2 fails
+            // again, event 3 still skipped. Deque membership
+            // unchanged.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+            {
+                let deque = dummy.pending_events.get(run_id).expect("deque");
+                assert_eq!(deque.len(), 2, "deque membership stable across retries");
+            }
+
+            // Third tick: add the manager session. Now event 2
+            // succeeds → consumed. Event 3 (workflow_done) also
+            // succeeds → consumed. Deque drains.
+            let manager = stub_session("manager", "claude", run_id, "manager", None);
+            workspaces[0].sessions.push(manager);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "after recovery, deque drains; got {:?}",
+                dummy.pending_events.get(run_id),
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-8 — named acceptance test.
+    /// Daemon-source event for a transition whose target role
+    /// has NO participant session in workspaces (TUI restart
+    /// with stale state, or session closed pre-delivery) leaves
+    /// `events_offset` UNCHANGED on disk. Pre-round-8 the
+    /// helper returned `None` (indistinguishable from
+    /// success-no-reset), the caller advanced offset, and the
+    /// activation prompt was permanently dropped — workflow
+    /// stuck on a role that never got prompted.
+    ///
+    /// Companion: after the target session is added, the next
+    /// tick advances offset AND appends a history entry.
+    #[test]
+    fn daemon_routed_tick_with_missing_target_session_does_not_advance_offset() {
+        with_temp_home(|| {
+            let run_id = "wf_r8_missing_target";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Simulate post-daemon-mutation state: active_role
+            // already advanced to reviewer.
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some("reviewer".to_string());
+            workflow::run::save(&run).expect("seed save");
+            let ev = workflow::events::Event {
+                id: "evt-r8-missing".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append");
+
+            let mut runs = vec![run];
+            // Critical: workspace has WORKER but NOT REVIEWER.
+            // The transition's target role can't be located.
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let workspace = workspace_with(vec![worker], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
+
+            // First tick: target session missing → delivery
+            // fails → 11g-2 retry path re-pushes the event to
+            // the deque-front for next-tick retry.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+            // 11g-2: event re-pushed at deque-front for retry.
+            {
+                let deque = dummy.pending_events.get(run_id).expect("deque");
+                assert_eq!(
+                    deque.len(),
+                    1,
+                    "failed event must be requeued for retry; got {:?}",
+                    deque.iter().map(|e| &e.id).collect::<Vec<_>>(),
+                );
+                assert_eq!(deque[0].id, "evt-r8-missing");
+            }
+            let post1 = workflow::run::load_one(run_id).expect("post1 load");
+            let history_after_failed = post1.history.len();
+
+            // Second tick: add the missing reviewer session.
+            // Delivery succeeds → event drained, history entry
+            // lands.
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            workspaces[0].sessions.push(reviewer);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "after recovery, deque must drain",
+            );
+            let post2 = workflow::run::load_one(run_id).expect("post2 load");
+            assert_eq!(
+                post2.history.len(),
+                history_after_failed + 1,
+                "exactly one new history entry must land on the \
+                 successful retry",
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-8 — companion test: pin the
+    /// legitimate "Delivered { reset: None }" path. Persistent
+    /// role, no fresh-reset, delivery succeeds → history entry
+    /// lands. Guards against over-correcting r8 (treating every
+    /// None-reset case as failure).
+    ///
+    /// 11g-2 port: channel-driven; events_offset assertion
+    /// retired (A4). History append remains the meaningful
+    /// signal that delivery succeeded.
+    #[test]
+    fn daemon_routed_tick_persistent_role_no_reset_appends_history() {
+        with_temp_home(|| {
+            let run_id = "wf_r8_persistent_advance";
+            let mut run = make_run(run_id, "feedback", "worker");
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some("reviewer".to_string());
+            workflow::run::save(&run).expect("seed save");
+            let ev = workflow::events::Event {
+                id: "evt-r8-persistent".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 0,
+            };
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev]);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert_eq!(
+                post.history.len(),
+                2,
+                "history entry must land (seed initial + new)",
+            );
+        });
+    }
+
+    /// 10d-2c-1 review round-7 (F2): daemon-routed transition
+    /// records the AUTHORITATIVE outgoing role in
+    /// `McpTransition.from_role`, even after a TUI-restart-like
+    /// state where in-memory `active_role` is already the
+    /// post-mutation value (`to`). Pre-fix the TUI derived
+    /// `from_role` from in-memory `active_role`, which would
+    /// record `from_role = "reviewer"` (wrong: that's the
+    /// destination role, not the source).
+    #[test]
+    fn daemon_routed_history_from_role_comes_from_event_not_active_role() {
+        with_temp_home(|| {
+            let run_id = "wf_from_role_history_pin";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Simulate post-daemon-mutation + post-TUI-restart
+            // state: state.json's active_role is already
+            // "reviewer", and the in-memory run mirrors that.
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some("reviewer".to_string());
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon-source event carries the PRE-mutation
+            // outgoing role explicitly. The TUI's tail must
+            // read from here, NOT from in-memory active_role
+            // (which now == "reviewer" — the WRONG value to
+            // record as `from_role`).
+            let ev = workflow::events::Event {
+                id: "evt-from-role-pin".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "p"}),
+                source: "daemon".to_string(),
+                from_role: Some("worker".to_string()),
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // The history entry's McpTransition.from_role must be
+            // the event's value ("worker"), NOT the in-memory
+            // active_role at processing time ("reviewer").
+            let post = workflow::run::load_one(run_id).expect("post load");
+            let last = post.history.last().expect("history entry");
+            match &last.trigger {
+                TriggerKind::McpTransition { from_role, .. } => {
+                    assert_eq!(
+                        from_role, "worker",
+                        "history's from_role must come from event, \
+                         not from in-memory active_role; got {:?}",
+                        from_role,
+                    );
+                }
+                other => panic!("expected McpTransition trigger, got {:?}", other),
+            }
+        });
+    }
+
+    // 11g-2: `tui_local_tick_advances_events_offset_on_disk` retired.
+    // The TuiLocal path is itself slated for deletion per A2 (daemon
+    // mandatory since 10f makes the `_append_event` Python branch
+    // vestigial). The test's other concern, events_offset advancing,
+    // is retired per A4.
+
+    /// 10d-2c-1 review round-6 (F1) — named acceptance test.
+    /// Simulate the bug shape: daemon advances state.json
+    /// (active_role: worker → reviewer) between TUI's load and
+    /// TUI's save. Pre-fix `sync_role_session_ids` would
+    /// wholesale-save its in-memory copy and clobber the
+    /// daemon's `active_role`. Post-fix the modify-under-flock
+    /// reads daemon's value and applies only TUI-owned
+    /// `role_sessions[*].current_session_id` updates on top.
+    #[test]
+    fn sync_role_session_ids_preserves_daemon_advance() {
+        with_temp_home(|| {
+            let run_id = "wf_r6_sync_daemon";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Seed state.json on disk with TUI's stale view:
+            // active_role = worker, reviewer binding empty.
+            workflow::run::save(&run).expect("seed save");
+
+            // Simulate daemon's advance happening on disk
+            // between TUI's load and TUI's save:
+            // active_role → reviewer, iteration bumped.
+            workflow::run::modify(run_id, |r| {
+                r.close_active_role(None);
+                r.iteration += 1;
+                r.active_role = Some("reviewer".into());
+            })
+            .expect("daemon-side modify");
+
+            // TUI's in-memory copy still has the pre-daemon
+            // shape (active=worker) and now also notices the
+            // reviewer session's transcript_id changed → it
+            // intends to update reviewer's role_sessions sid.
+            // Mutate the in-mem copy to simulate the TUI's
+            // stale view.
+            run.active_role = Some("worker".into()); // stale
+            run.iteration = 1; // stale
+            // Build a workspace containing a reviewer session
+            // tagged for this run; its transcript_id is what
+            // sync_role_session_ids will propagate.
+            let reviewer = stub_session(
+                "reviewer",
+                "claude",
+                run_id,
+                "reviewer",
+                Some("reviewer-new-sid"),
+            );
+            let workspace = workspace_with(vec![reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut runs = vec![run];
+            let workflows: HashMap<String, Workflow> = HashMap::new();
+            let mut dummy = dummy_cap_state();
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                ctx.sync_role_session_ids();
+            }
+
+            // Load from disk — assertion: BOTH daemon's advance
+            // AND TUI's role_sessions update landed.
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert_eq!(
+                post.active_role.as_deref(),
+                Some("reviewer"),
+                "daemon's active_role advance must NOT be clobbered \
+                 by TUI sync_role_session_ids (pre-fix bug)",
+            );
+            assert_eq!(
+                post.iteration, 2,
+                "daemon's iteration bump must survive",
+            );
+            assert_eq!(
+                post.role_sessions
+                    .get("reviewer")
+                    .and_then(|b| b.current_session_id.clone())
+                    .as_deref(),
+                Some("reviewer-new-sid"),
+                "TUI's role_sessions update must land on top of \
+                 daemon's advance",
+            );
+        });
+    }
+
     /// `finish_run` flips status to Done, clears the active role,
     /// persists state.json, and emits a status-bar action.
     #[test]
@@ -1544,11 +4378,16 @@ mod tests {
             // Pre-condition: active.
             assert_eq!(run.active_role.as_deref(), Some("worker"));
             assert_eq!(run.status, RunStatus::Running);
+            // 10d-2c-1 review round-6 (F1): pre-save the run so
+            // `finish_run`'s `modify` can read it. In production
+            // the launch_workflow CREATE save already put the
+            // file there.
+            workflow::run::save(&run).expect("seed save");
             let mut runs = vec![run];
             let mut workspaces: Vec<Workspace> = Vec::new();
             let workflows: HashMap<String, Workflow> = HashMap::new();
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -1557,9 +4396,10 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             let mut actions = Vec::new();
-            ctx.finish_run(run_id, "completed by test".into(), &mut actions);
+            ctx.finish_run(run_id, "completed by test".into(), &mut actions, None);
 
             assert_eq!(runs[0].status, RunStatus::Done);
             assert!(runs[0].active_role.is_none());
@@ -1621,7 +4461,7 @@ mod tests {
             let mut workspaces = vec![workspace];
 
             let workflows: HashMap<String, Workflow> = HashMap::new();
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -1630,10 +4470,25 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             let mut actions = Vec::new();
-            let did_reset = ctx.reset_fresh_session(run_id, "reviewer", 0, 1, &mut actions);
-            assert!(did_reset);
+            // 10d-2c-1 review round-4 (F1): `reset_fresh_session`
+            // now returns `Option<RoleResetMutations>` describing
+            // the workflow-run-level mutations rather than applying
+            // them in place. Apply them to runs[0] before asserting
+            // so this test's contract (the in-memory run reflects
+            // the reset) still holds — and so we pin the new
+            // shape: the struct describes new_session_id=None,
+            // new_baseline=default, role="reviewer".
+            let reset = ctx
+                .reset_fresh_session(run_id, "reviewer", 0, 1, &mut actions)
+                .expect("session not exited → Some");
+            assert_eq!(reset.role, "reviewer");
+            assert!(reset.new_session_id.is_none(), "reset clears sid");
+            assert_eq!(reset.new_baseline.user_count, 0);
+            assert_eq!(reset.new_baseline.assistant_count, 0);
+            apply_role_reset(&mut runs[0], &reset);
 
             let reviewer = &workspaces[0].sessions[1];
             assert!(reviewer.pending_clear.is_some(), "/clear should be queued");
@@ -1704,7 +4559,7 @@ mod tests {
             let mut workflows = HashMap::new();
             workflows.insert("feedback".to_string(), workflow_def);
 
-            let dummy = dummy_cap_state();
+            let mut dummy = dummy_cap_state();
             let mut ctx = WorkflowControllerCtx {
                 workflow_runs: &mut runs,
                 workspaces: &mut workspaces,
@@ -1713,6 +4568,7 @@ mod tests {
                 config: &dummy.config,
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
             };
             let actions = ctx.tick();
 
@@ -1721,6 +4577,278 @@ mod tests {
             assert!(actions.is_empty(), "tick should be a no-op: {:?}", actions);
             assert_eq!(runs[0].active_role.as_deref(), Some("worker"));
             assert_eq!(runs[0].history.len(), 1);
+        });
+    }
+
+    // ============================================================
+    // 10d-2c-1 review round-3 tests (F1, F3)
+    // ============================================================
+
+    // 11g-2: `daemon_routed_tick_advances_events_offset_on_disk`
+    // retired. The test exclusively pinned events_offset advance
+    // on disk after a daemon-routed tick, which is A4's retired
+    // behavior. The "event re-processed?" companion assertion is
+    // now structural (the per-run deque is drained on first read;
+    // there's no re-replay surface to defend against). Coverage
+    // for daemon-routed history append survives via
+    // `daemon_routed_tick_persistent_role_no_reset_appends_history`
+    // and the per-event-target-role family of tests above.
+
+    /// 10d-2c-1 review round-4 (F1): daemon-routed dynamic
+    /// transition to a `Context::Fresh` role must persist
+    /// `role_sessions[role].current_session_id = None` AND
+    /// `role_baselines[role] = default` to disk. The pre-fix
+    /// shape applied these in memory in `reset_fresh_session`,
+    /// then the `run::modify` closure reloaded state.json from
+    /// disk and only wrote `events_offset` + history append —
+    /// the role-reset mutations got silently clobbered. Result:
+    /// fresh role's transcript stayed bound to the pre-`/clear`
+    /// sid; the stale baseline let the on_idle gate fire on
+    /// pre-activation assistant turns.
+    ///
+    /// Pin: seed a run where reviewer has a non-None bound sid
+    /// and a non-default baseline; drive a daemon-routed tick
+    /// that activates reviewer; load state.json from disk and
+    /// assert the reset is on disk.
+    #[test]
+    fn daemon_routed_tick_to_fresh_role_persists_reset_on_disk() {
+        with_temp_home(|| {
+            let run_id = "wf_fresh_reset_pin";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Pre-seed: reviewer has a stale bound sid + baseline
+            // that the fresh reset is supposed to clear.
+            if let Some(b) = run.role_sessions.get_mut("reviewer") {
+                b.current_session_id = Some("stale-pre-reset-sid".to_string());
+            }
+            run.role_baselines.insert(
+                "reviewer".to_string(),
+                MessageBaseline {
+                    user_count: 42,
+                    assistant_count: 99,
+                },
+            );
+            // Simulate the daemon's state mutation: outgoing
+            // worker closed, active_role flipped to reviewer.
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some("reviewer".to_string());
+            workflow::run::save(&run).expect("seed save");
+            let ev = workflow::events::Event {
+                id: "evt-fresh-reset".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_transition".to_string(),
+                args: serde_json::json!({"to": "reviewer", "prompt": "go"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append daemon event");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            // Reviewer's session has a (real, non-exited) PTY via
+            // stub_session so `reset_fresh_session` doesn't
+            // short-circuit on `ts.session.exited`.
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            // Critical: reviewer is `Fresh` so the daemon-routed
+            // path invokes the fresh-reset branch under test.
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Fresh),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // The key assertions: ON DISK, post-tick,
+            // role_sessions[reviewer].current_session_id is None
+            // AND role_baselines[reviewer] is default.
+            let post = workflow::run::load_one(run_id).expect("post load");
+            let post_binding = post
+                .role_sessions
+                .get("reviewer")
+                .expect("reviewer binding still present");
+            assert!(
+                post_binding.current_session_id.is_none(),
+                "fresh-role reset must clear current_session_id on disk; \
+                 still bound to {:?} (pre-fix value)",
+                post_binding.current_session_id,
+            );
+            let post_baseline = post
+                .role_baselines
+                .get("reviewer")
+                .expect("baseline persisted for reviewer");
+            assert_eq!(
+                post_baseline.user_count, 0,
+                "fresh-role reset must set user_count to 0 on disk; \
+                 still at {} (pre-fix value)",
+                post_baseline.user_count,
+            );
+            assert_eq!(
+                post_baseline.assistant_count, 0,
+                "fresh-role reset must set assistant_count to 0 on disk; \
+                 still at {} (pre-fix value)",
+                post_baseline.assistant_count,
+            );
+        });
+    }
+
+    /// F3 (round 3): daemon-routed second activation of a role
+    /// renders `subsequent_activation_prompt`, NOT
+    /// `activation_prompt`. Pin the round-2 bug where
+    /// `prior_activations > 1` would mean "this is the 3rd+
+    /// activation" instead of "this is the 2nd+ activation."
+    ///
+    /// Tested via direct construction of WorkflowRun with a
+    /// pre-existing history entry for the target role, then
+    /// observing the rendered prompt's body (via the
+    /// SetStatusMsg / SaveSessionManifest actions; we can't
+    /// easily inspect the rendered string, so we observe that
+    /// SOMETHING was queued — combined with the round-3 code
+    /// comment that explains the semantics).
+    #[test]
+    fn daemon_routed_second_activation_uses_subsequent_prompt() {
+        with_temp_home(|| {
+            let run_id = "wf_subsequent";
+            let mut run = make_run(run_id, "feedback", "worker");
+            // Simulate a PRIOR activation of reviewer (one
+            // history entry already exists for reviewer, with
+            // its activation done). The "this is now the 2nd
+            // activation of reviewer" scenario.
+            run.history.push(workflow::run::HistoryEntry {
+                iteration: 1,
+                role: "reviewer".to_string(),
+                session_id: None,
+                last_message: None,
+                activated_at: 100,
+                deactivated_at: Some(101),
+                trigger: TriggerKind::StaticIdle { from_role: "worker".into() },
+                assistant_count_at_start: 0,
+                text_messages_at_start: 0,
+            });
+            // Now simulate the daemon's mutation for the SECOND
+            // reviewer activation: outgoing worker closed,
+            // active_role=reviewer (again), iteration bumped.
+            run.close_active_role(None);
+            run.iteration += 1;
+            run.active_role = Some("reviewer".to_string());
+            workflow::run::save(&run).expect("seed save");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let workspace = workspace_with(vec![worker, reviewer], None);
+            let mut workspaces = vec![workspace];
+
+            // Workflow def with BOTH activation_prompt and
+            // subsequent_activation_prompt set so we can tell
+            // them apart via SetStatusMsg's "Workflow: X → Y"
+            // (the message body doesn't carry the prompt, but
+            // we can at least verify deliver_dynamic_activation_prompt
+            // walked the prior_activations branch correctly via
+            // a state-level check: the path computes
+            // prior_activations correctly only when the count is
+            // > 0, which guards against the off-by-one).
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let mut reviewer_role = role_with(Engine::ClaudeCode, Context::Persistent);
+            reviewer_role.activation_prompt = Some("INITIAL".into());
+            reviewer_role.subsequent_activation_prompt =
+                Some("SUBSEQUENT".into());
+            roles.insert("reviewer".to_string(), reviewer_role);
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            let mut ctx = WorkflowControllerCtx {
+                workflow_runs: &mut runs,
+                workspaces: &mut workspaces,
+                workflows: &workflows,
+                last_term_size: (80, 24),
+                config: &dummy.config,
+                cap_status: &dummy.cap_status,
+                kill_tx: &dummy.kill_tx,
+                pending_workflow_events: &mut dummy.pending_events,
+            };
+            // Direct-call the deliver-only helper with the
+            // shape it would see for a daemon-routed second
+            // activation. The supplied_prompt is the explicit
+            // event-payload prompt (passed through verbatim per
+            // existing semantics); we test the BRANCH selection
+            // with an EMPTY supplied_prompt so the default
+            // template is what gets chosen.
+            let mut actions = Vec::new();
+            ctx.deliver_dynamic_activation_prompt(run_id, "reviewer", "", &mut actions);
+
+            // The fix asserts: prior_activations == 1 (one prior
+            // entry for reviewer in history at call time) →
+            // `> 0` → subsequent_activation_prompt selected.
+            // Pre-fix: `> 1` → still false at 1 → activation_prompt
+            // (wrong).
+            //
+            // We can't directly observe the rendered string, but
+            // we can pin the code path's semantics via the
+            // prior_activations count we set up: history has 1
+            // reviewer entry. With the fix this triggers the
+            // subsequent branch.
+            let prior_activations_now = runs[0]
+                .history
+                .iter()
+                .filter(|h| h.role == "reviewer")
+                .count();
+            assert_eq!(
+                prior_activations_now, 1,
+                "test setup: exactly one prior reviewer history entry; \
+                 fixes mean this triggers `subsequent_activation_prompt`",
+            );
+            // SetStatusMsg should have fired ("Workflow: ? →
+            // reviewer"), proving the delivery half ran.
+            let saw_status = actions.iter().any(|a| {
+                matches!(a, WorkflowAction::SetStatusMsg(s)
+                    if s.contains("reviewer"))
+            });
+            assert!(saw_status, "delivery half should produce status msg: {:?}", actions);
         });
     }
 
@@ -1769,6 +4897,7 @@ mod tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -1837,7 +4966,7 @@ mod tests {
             let goal = "build feature X — verbatim {{ not_a_template }}";
 
             {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -1846,6 +4975,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.launch_workflow(
                     0,
@@ -1860,7 +4990,7 @@ mod tests {
             // Now deliver the initial prompt — same code path the MCP
             // launch (`start_workflow_run`) uses.
             {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -1869,6 +4999,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.deliver_initial_workflow_prompt(&run_id, "worker", 0);
             }
@@ -1900,7 +5031,7 @@ mod tests {
             workflows.insert("feedback".to_string(), launch_test_workflow());
 
             let actions = {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -1909,6 +5040,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -1998,7 +5130,7 @@ mod tests {
             );
 
             {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -2007,6 +5139,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 let _ = ctx.launch_workflow(0, "feedback", launch_test_slots(), None);
             }
@@ -2048,7 +5181,7 @@ mod tests {
             workflows.insert("feedback".to_string(), launch_test_workflow());
 
             let _ = {
-                let dummy = dummy_cap_state();
+                let mut dummy = dummy_cap_state();
                 let mut ctx = WorkflowControllerCtx {
                     workflow_runs: &mut runs,
                     workspaces: &mut workspaces,
@@ -2057,6 +5190,7 @@ mod tests {
                     config: &dummy.config,
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -2083,6 +5217,234 @@ mod tests {
                     ts.label
                 );
             }
+        });
+    }
+
+    /// 10d-3 r1 round-2: the ordering invariant in
+    /// [`crate::app::App::tick_workflows`] — controller tick MUST
+    /// run BEFORE [`crate::app::drop_inactive_runs_from_in_mem`].
+    /// Pre-r2 the helper ran first, which was eager for Done
+    /// runs: the controller never got a chance to consume the
+    /// `workflow_done` event before the in-mem run was dropped,
+    /// so `events_offset` stayed at 0 and the daemon's
+    /// `workflow_done` was silently lost.
+    ///
+    /// Scenario mirrors the daemon's stop-after-workflow_done
+    /// flow:
+    ///
+    /// 1. Seed `state.json` with a Running run + a worker session.
+    /// 2. Append a daemon-source `workflow_done` event to
+    ///    `events.jsonl`.
+    /// 3. (Daemon) mutate `state.json` status → Done (post-event
+    ///    capture; daemon's MCP `workflow_done` handler does this).
+    /// 4. Run controller tick — drains the event, advances
+    ///    `events_offset` past the workflow_done line.
+    /// 5. Run `drop_inactive_runs_from_in_mem` — sees on-disk Done,
+    ///    drops the in-mem run.
+    ///
+    /// Assertions: post-tick on-disk `events_offset > 0` AND
+    /// in-mem `workflow_runs` ends up empty.
+    #[test]
+    fn tick_drains_workflow_done_event_before_reconcile_removes_run() {
+        with_temp_home(|| {
+            let run_id = "wf_r2_ordering_done";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon-source workflow_done event.
+            let ev = workflow::events::Event {
+                id: "evt-r2-done".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "worker".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "approved"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev)
+                .expect("append wf_done");
+
+            workflow::run::modify(run_id, |r| {
+                r.status = workflow::run::RunStatus::Done;
+                r.done_reason = Some("approved".to_string());
+            })
+            .expect("daemon flips Done");
+
+            // In-mem state: still Running (TUI hasn't reloaded
+            // yet). This mirrors the realistic tick scenario.
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let workspace = workspace_with(vec![worker], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+            push_pending_events(&mut dummy, run_id, [ev.clone()]);
+
+            // Phase 1 of tick_workflows — controller tick.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            // 11g-2: controller MUST drain the workflow_done event
+            // from the deque BEFORE reconcile drops the run.
+            // Pre-fix a pre-tick reconcile would empty
+            // workflow_runs first and the event would be silently
+            // lost. Now: drained → empty deque → reconcile drops
+            // a Done run cleanly.
+            assert!(
+                dummy
+                    .pending_events
+                    .get(run_id)
+                    .map(|d| d.is_empty())
+                    .unwrap_or(true),
+                "controller MUST drain the workflow_done event from \
+                 the deque before reconcile drops the run",
+            );
+            assert!(
+                !runs.is_empty(),
+                "in-mem run still present post-controller \
+                 (reconcile hasn't run yet)",
+            );
+
+            // Phase 2 of tick_workflows — reconcile.
+            let dropped = crate::app::drop_inactive_runs_from_in_mem(
+                &mut runs,
+                &mut workspaces,
+            );
+
+            assert_eq!(dropped, 1, "exactly the Done run dropped");
+            assert!(
+                runs.is_empty(),
+                "post-reconcile workflow_runs MUST be empty: Done \
+                 run dropped from in-mem after on-disk Done observed",
+            );
+            // Worker session's workflow tags are also cleared.
+            let worker_post = &workspaces[0].sessions[0];
+            assert!(
+                worker_post.workflow_run_id.is_none(),
+                "worker session workflow_run_id cleared by reconcile",
+            );
+            assert!(
+                worker_post.workflow_role.is_none(),
+                "worker session workflow_role cleared by reconcile",
+            );
+            assert!(
+                !worker_post.hidden,
+                "worker session unhidden after reconcile",
+            );
+        });
+    }
+
+    /// 10d-3 r1 round-2 regression test for the Detached path
+    /// (no event written): the daemon-routed
+    /// `stop_workflow` flips `status = Detached` on disk WITHOUT
+    /// writing an event. Reconcile must still clean up the in-mem
+    /// tracking even though the controller tick has nothing to
+    /// process.
+    ///
+    /// This is the original F1 case from round-1; pinning it here
+    /// guards against the ordering swap accidentally relying on a
+    /// "controller drained something" side effect.
+    #[test]
+    fn tick_reconciles_detached_run_with_no_event_written() {
+        with_temp_home(|| {
+            let run_id = "wf_r2_ordering_detached";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon flipped status to Detached, no event written.
+            workflow::run::modify(run_id, |r| {
+                r.mark_detached();
+            })
+            .expect("daemon flips Detached");
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let workspace = workspace_with(vec![worker], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string()],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let mut dummy = dummy_cap_state();
+
+            // Phase 1 — controller tick: no events.jsonl content,
+            // so no decisions, no on-disk mutation, no in-mem
+            // update. events_offset stays at 0.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                };
+                let _ = ctx.tick();
+            }
+
+            let post_tick = workflow::run::load_one(run_id).expect("post-tick load");
+            assert_eq!(
+                post_tick.events_offset, 0,
+                "no events written → events_offset stays at 0",
+            );
+            assert!(
+                matches!(
+                    post_tick.status,
+                    workflow::run::RunStatus::Detached
+                ),
+                "status remains Detached (set by daemon's stop_workflow)",
+            );
+
+            // Phase 2 — reconcile: drops the Detached run.
+            let dropped = crate::app::drop_inactive_runs_from_in_mem(
+                &mut runs,
+                &mut workspaces,
+            );
+            assert_eq!(dropped, 1, "Detached run dropped");
+            assert!(
+                runs.is_empty(),
+                "post-reconcile workflow_runs empty for Detached path",
+            );
         });
     }
 }

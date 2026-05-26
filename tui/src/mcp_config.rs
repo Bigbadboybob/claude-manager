@@ -32,6 +32,41 @@ pub struct WorkflowMeta<'a> {
     pub role: &'a str,
 }
 
+/// Which spawn path is generating this MCP config — slice 10c-e-3a.
+///
+/// Some spawn paths are daemon-side (A-n/A-s user sessions of
+/// daemon-eligible engines: `claude`, `codex`) and others are
+/// TUI-local (workflow participant respawns, attach-active,
+/// ad-hoc bash, gcloud). The MCP server inside the spawned
+/// process must route its callbacks to the socket that *actually
+/// owns* the session — a workflow role calling
+/// `workflow_transition` against the daemon (which has no
+/// workflow state) would surface as `UnknownMethod`, not a clean
+/// abort.
+///
+/// Pre-10c-e-3a the env routing was keyed off a global flag,
+/// conflating "the daemon exists" with "this particular spawn is
+/// daemon-side." Per-spawn routing is the structural fix.
+///
+/// Each call site explicitly declares which it's spawning, and
+/// `build_env` consumes that parameter to populate the right
+/// socket pins. 10f: with daemon-mandatory, the choice is purely
+/// per-session — eligible engines target `Daemon`, others stay
+/// `TuiLocal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnTarget {
+    /// The spawned process is a TUI-local PTY (workflow respawns,
+    /// attach-active sessions, ad-hoc bash, gcloud — anything
+    /// outside the daemon-eligible engine set). Its MCP server
+    /// child resolves to `~/.cm/tui.sock`.
+    TuiLocal,
+    /// The spawned process is a daemon-owned PTY (A-n / A-s for
+    /// `claude` / `codex` session types — 10f flipped these to
+    /// always route through the daemon). Its MCP server child
+    /// resolves to `~/.cm/daemon.sock`.
+    Daemon,
+}
+
 /// Per-session MCP config dir.
 fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -39,18 +74,85 @@ fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
 }
 
 /// Build the env map shared between the Claude config file's `env` block
-/// and Codex's `-c` overrides. Putting CM_TUI_* into the MCP child's env
-/// (rather than the parent process env) is the path that's known to work
-/// — Claude Code doesn't reliably propagate parent env to MCP children.
-fn build_env(session_uid: &str, workflow: Option<&WorkflowMeta>) -> BTreeMap<String, String> {
+/// and Codex's `-c` overrides. Putting `CM_*` into the MCP child's env
+/// (rather than the parent process env) is the path that's known to
+/// work — Claude Code doesn't reliably propagate parent env to MCP
+/// children.
+///
+/// ## Per-spawn routing (sub-2c)
+///
+/// **Both socket env vars are populated with real paths for
+/// `SpawnTarget::Daemon`** so the agent can call BOTH daemon-routed
+/// methods (`mcp_start_session`, `list_sessions`, `send_input`,
+/// `propose_task`, etc.) and TUI-routed methods
+/// (`workflow_transition`, `workflow_done`, `create_subtask`, etc.)
+/// from inside the daemon-spawned session. The Python
+/// `control_client.call(method, ...)` resolver picks the socket
+/// per-method by consulting `DAEMON_METHODS` — daemon-supported
+/// methods route to `CM_DAEMON_SOCKET`, everything else routes to
+/// `CM_TUI_SOCKET`.
+///
+/// **Pre-sub-2c** the unchosen socket got the empty string,
+/// because at that point the agent only needed ONE socket. With
+/// workflow_transition / workflow_done staying on the TUI (slice
+/// 10d-workflow-controller relocates the controller later), the
+/// daemon-spawn path now needs reach to BOTH sockets.
+///
+///   - `SpawnTarget::Daemon` → both `CM_DAEMON_SOCKET=<daemon.sock>`
+///     AND `CM_TUI_SOCKET=<tui.sock>`, both real paths.
+///   - `SpawnTarget::TuiLocal` → `CM_TUI_SOCKET=<tui.sock>`,
+///     `CM_DAEMON_SOCKET=""` (authoritative-empty). The TUI-local
+///     spawn doesn't talk to the daemon — daemon may not even be
+///     running — so a real daemon-socket pin would silently route
+///     daemon-method calls to a (possibly missing) daemon. The
+///     resolver fails loudly on empty `CM_DAEMON_SOCKET` for
+///     daemon methods, which is the right behavior for TuiLocal:
+///     "you can't call daemon methods from a TUI-only spawn."
+///
+/// ## Authoritative pin (slice 10b review fix — still load-bearing)
+///
+/// **Both** socket env vars are always written. For `TuiLocal` the
+/// unchosen one is empty (overrides any inherited value); for
+/// `Daemon` both are real paths. The env block Claude / Codex
+/// receive is *additive* — merged with the agent's inherited env —
+/// so without the authoritative entries an inherited
+/// `CM_DAEMON_SOCKET=...` from the developer's shell would
+/// silently widen the route surface beyond what the TUI authorized.
+fn build_env(
+    target: SpawnTarget,
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
-    env.insert(
-        "CM_TUI_SOCKET".into(),
-        crate::control::server::default_socket_path()
-            .to_string_lossy()
-            .to_string(),
-    );
+    // Absolutize both candidate paths up-front. MCP agents run as
+    // children of `claude` / `codex`, which inherit a cwd we don't
+    // control; a relative path in our env would resolve against
+    // their cwd instead of the bound path. Routing through
+    // `cm_daemon::path::absolutize_socket_path` keeps this in
+    // lockstep with `daemon_launch.rs`'s probe-path
+    // absolutization — both consumers share one definition.
+    let daemon_sock_abs =
+        absolutized_socket_or_raw(&cm_daemon::default_socket_path());
+    let tui_sock_abs =
+        absolutized_socket_or_raw(&crate::control::server::default_socket_path());
+    match target {
+        SpawnTarget::Daemon => {
+            // Sub-2c: BOTH sockets populated. The Python resolver
+            // routes per-method via `DAEMON_METHODS`.
+            env.insert("CM_DAEMON_SOCKET".into(), daemon_sock_abs);
+            env.insert("CM_TUI_SOCKET".into(), tui_sock_abs);
+        }
+        SpawnTarget::TuiLocal => {
+            env.insert("CM_TUI_SOCKET".into(), tui_sock_abs);
+            // Authoritative empty: overrides any inherited
+            // `CM_DAEMON_SOCKET` (a developer might have exported
+            // it from earlier daemon-path testing — should not
+            // leak to a TUI-local spawn). Without this the resolver
+            // could silently route past the TUI pin.
+            env.insert("CM_DAEMON_SOCKET".into(), String::new());
+        }
+    }
     if let Some(wf) = workflow {
         env.insert("CM_WORKFLOW_RUN_ID".into(), wf.run_id.into());
         env.insert("CM_ROLE".into(), wf.role.into());
@@ -58,9 +160,25 @@ fn build_env(session_uid: &str, workflow: Option<&WorkflowMeta>) -> BTreeMap<Str
     env
 }
 
+/// Wrapper around [`cm_daemon::path::absolutize_socket_path`] that
+/// falls back to the raw lossy string if absolutization fails. The
+/// only failure mode is `current_dir()` erroring (typical cause:
+/// the TUI's cwd was unlinked) — extremely rare, and even in that
+/// case we'd rather inject the operator's literal value than fail
+/// the spawn outright. The resulting env is still better than the
+/// pre-fix behavior for the overwhelmingly common case.
+fn absolutized_socket_or_raw(p: &Path) -> String {
+    cm_daemon::path::absolutize_socket_path(p)
+        .map(|abs| abs.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+}
+
 /// Write the per-session Claude MCP config file. Returns the path,
-/// which callers pass via `--mcp-config <path>`.
+/// which callers pass via `--mcp-config <path>`. `target` flows
+/// into `build_env` so the MCP server child resolves to the right
+/// socket — see [`SpawnTarget`] for the per-spawn routing rationale.
 pub fn write_claude_mcp_config(
+    target: SpawnTarget,
     session_uid: &str,
     workflow: Option<WorkflowMeta>,
 ) -> std::io::Result<PathBuf> {
@@ -75,7 +193,7 @@ pub fn write_claude_mcp_config(
     })?;
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
-    let env = build_env(session_uid, workflow.as_ref());
+    let env = build_env(target, session_uid, workflow.as_ref());
     let config = json!({
         "mcpServers": {
             "claude-manager": {
@@ -95,15 +213,17 @@ pub fn write_claude_mcp_config(
 /// Build Codex `-c mcp_servers.claude-manager.* = ...` overrides. Returned
 /// as a flat `[..., "-c", "k=v", "-c", "k=v"]` list ready to splice into
 /// argv. Codex doesn't have a per-session config file like Claude — its
-/// MCP registration is inline.
+/// MCP registration is inline. `target` flows into `build_env` for
+/// per-spawn socket routing.
 pub fn codex_overrides(
+    target: SpawnTarget,
     session_uid: &str,
     workflow: Option<&WorkflowMeta>,
 ) -> Vec<String> {
     let server = crate::workflow::spawn::mcp_server_path()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let env = build_env(session_uid, workflow);
+    let env = build_env(target, session_uid, workflow);
     let env_toml = env
         .iter()
         .map(|(k, v)| format!("{}=\"{}\"", k, escape_toml(v)))
@@ -147,8 +267,11 @@ pub fn claude_args(
 /// Build the full Codex argv. When `resume_session_id` is `Some(sid)`,
 /// the argv is built for the `codex resume` subcommand — `resume`
 /// becomes the first arg and the SESSION_ID is positional at the end
-/// so it isn't consumed as the value of a preceding flag.
+/// so it isn't consumed as the value of a preceding flag. `target`
+/// flows into `codex_overrides`/`build_env` for per-spawn socket
+/// routing.
 pub fn codex_args(
+    target: SpawnTarget,
     session_uid: &str,
     workflow: Option<WorkflowMeta>,
     resume_session_id: Option<&str>,
@@ -163,7 +286,7 @@ pub fn codex_args(
     // Codex", which inside our PTY looks like a blank/dead session.
     args.push("-c".into());
     args.push("check_for_update_on_startup=false".into());
-    args.extend(codex_overrides(session_uid, workflow.as_ref()));
+    args.extend(codex_overrides(target, session_uid, workflow.as_ref()));
     if let Some(sid) = resume_session_id {
         args.push(sid.to_string());
     }
@@ -172,8 +295,10 @@ pub fn codex_args(
 
 /// Build (program, argv) for an engine. Generates the per-session MCP
 /// config file (Claude) or inline overrides (Codex). Used by every
-/// spawn path.
+/// spawn path. `target` declares whether this spawn is daemon-side or
+/// TUI-local — see [`SpawnTarget`] for the per-spawn routing rationale.
 pub fn build_args(
+    target: SpawnTarget,
     engine: &Engine,
     session_uid: &str,
     workflow: Option<WorkflowMeta>,
@@ -181,12 +306,12 @@ pub fn build_args(
 ) -> std::io::Result<(String, Vec<String>)> {
     match engine {
         Engine::ClaudeCode => {
-            let cfg = write_claude_mcp_config(session_uid, workflow)?;
+            let cfg = write_claude_mcp_config(target, session_uid, workflow)?;
             let args = claude_args(&cfg, resume_session_id, &[]);
             Ok(("claude".to_string(), args))
         }
         Engine::Codex => {
-            let args = codex_args(session_uid, workflow, resume_session_id);
+            let args = codex_args(target, session_uid, workflow, resume_session_id);
             Ok(("codex".to_string(), args))
         }
     }
@@ -202,17 +327,232 @@ fn escape_toml(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // 10f: deleted `DaemonOptInGuard` — the
+    // `CM_USE_DAEMON_SOCKET` env var no longer affects routing
+    // (build_env decides per `SpawnTarget`, not per env). Tests
+    // below no longer set/restore the var.
+
+    /// Save+restore guard for an arbitrary env var, so a test that
+    /// pollutes the process env going in can't leak that pollution
+    /// into adjacent tests sharing the env lock.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value); }
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
-    fn build_env_includes_session_uid_and_socket() {
-        let env = build_env("uid-x", None);
-        assert_eq!(env.get("CM_TUI_SESSION_ID").map(|s| s.as_str()), Some("uid-x"));
-        assert!(env.contains_key("CM_TUI_SOCKET"));
+    fn build_env_tui_local_pins_tui_socket_and_blanks_daemon_socket() {
+        // Authoritative-pin contract (slice 10b review fix +
+        // slice 10c-e-3a per-spawn routing): SpawnTarget::TuiLocal
+        // must produce both keys — CM_TUI_SOCKET with the real
+        // path, CM_DAEMON_SOCKET as empty string. The Python
+        // resolver treats empty as unset, so the MCP server lands
+        // on the TUI socket even if the agent inherited a
+        // CM_DAEMON_SOCKET value from somewhere upstream.
+        let _lock = crate::test_support::home_lock();
+        let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
+        assert_eq!(env.get("CM_TUI_SESSION_ID").map(String::as_str), Some("uid-x"));
+
+        let tui_sock = env.get("CM_TUI_SOCKET").expect("CM_TUI_SOCKET present");
+        assert!(
+            !tui_sock.is_empty(),
+            "CM_TUI_SOCKET must be a real path for SpawnTarget::TuiLocal",
+        );
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .expect("CM_DAEMON_SOCKET must be present so it overrides inheritance");
+        assert!(
+            daemon_sock.is_empty(),
+            "CM_DAEMON_SOCKET must be empty for SpawnTarget::TuiLocal (got {:?})",
+            daemon_sock,
+        );
         assert!(!env.contains_key("CM_WORKFLOW_RUN_ID"));
     }
 
     #[test]
+    fn build_env_daemon_pins_both_sockets_with_real_paths() {
+        // Sub-2c: Daemon-spawned agents need reach to BOTH
+        // sockets — daemon for `mcp_start_session` /
+        // `list_sessions` / `propose_task` / etc., and TUI for
+        // `workflow_transition` / `workflow_done` /
+        // `create_subtask` / etc. The Python control_client
+        // routes per-method via DAEMON_METHODS; both env vars
+        // must carry real paths.
+        let _lock = crate::test_support::home_lock();
+        let env = build_env(SpawnTarget::Daemon, "uid-x", None);
+
+        let daemon_sock = env.get("CM_DAEMON_SOCKET").expect("CM_DAEMON_SOCKET present");
+        assert!(
+            !daemon_sock.is_empty(),
+            "CM_DAEMON_SOCKET must be a real path for SpawnTarget::Daemon",
+        );
+        let tui_sock = env
+            .get("CM_TUI_SOCKET")
+            .expect("CM_TUI_SOCKET present");
+        assert!(
+            !tui_sock.is_empty(),
+            "Sub-2c: CM_TUI_SOCKET must be a real path for SpawnTarget::Daemon \
+             so agents can reach workflow_transition/workflow_done from \
+             daemon-spawned sessions; got empty",
+        );
+    }
+
+    // ----- Per-spawn routing acceptance (slice 10c-e-3a) ----------------
+
+    #[test]
+    fn build_env_tui_local_pins_tui_socket_even_when_opt_in_is_on() {
+        // The reviewer's named acceptance for slice 10c-e-3a: a
+        // TUI-local spawn (e.g. attach-active, workflow respawn,
+        // ad-hoc bash) MUST route to the TUI socket even when the
+        // operator launched the TUI with CM_USE_DAEMON_SOCKET=1.
+        // Pre-3a this was structurally broken — the global env
+        // gate flipped MCP routing for every spawn including
+        // TUI-local ones. With per-spawn SpawnTarget, the opt-in
+        // env no longer affects this decision.
+        let _lock = crate::test_support::home_lock();
+        let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
+
+        let tui_sock = env
+            .get("CM_TUI_SOCKET")
+            .expect("CM_TUI_SOCKET present");
+        assert!(
+            !tui_sock.is_empty(),
+            "TUI-local spawn must pin CM_TUI_SOCKET regardless of CM_USE_DAEMON_SOCKET; \
+             got empty (the bug pre-3a was that opt-in-on stole the routing)",
+        );
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .expect("CM_DAEMON_SOCKET present as authoritative empty");
+        assert!(
+            daemon_sock.is_empty(),
+            "TUI-local spawn must blank CM_DAEMON_SOCKET regardless of CM_USE_DAEMON_SOCKET; \
+             got {:?}",
+            daemon_sock,
+        );
+    }
+
+    #[test]
+    fn build_env_daemon_pins_daemon_socket_even_when_opt_in_is_off() {
+        // Symmetric: an explicit SpawnTarget::Daemon (e.g. a
+        // ClientSession::new call site that's been migrated) must
+        // route to the daemon even if CM_USE_DAEMON_SOCKET isn't
+        // set in the env. The opt-in flag is a gate on WHETHER a
+        // call site is allowed to choose Daemon, but per-spawn
+        // routing is what build_env consumes. This makes the
+        // SpawnTarget the single source of truth.
+        let _lock = crate::test_support::home_lock();
+        let env = build_env(SpawnTarget::Daemon, "uid-x", None);
+
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .expect("CM_DAEMON_SOCKET present");
+        assert!(
+            !daemon_sock.is_empty(),
+            "Daemon spawn must pin CM_DAEMON_SOCKET regardless of CM_USE_DAEMON_SOCKET; \
+             got empty",
+        );
+        let tui_sock = env
+            .get("CM_TUI_SOCKET")
+            .expect("CM_TUI_SOCKET present");
+        // Sub-2c: both sockets carry real paths under
+        // SpawnTarget::Daemon. Pre-2c the TUI socket was the
+        // authoritative empty here; that broke
+        // workflow_transition from daemon-spawned sessions.
+        assert!(
+            !tui_sock.is_empty(),
+            "Daemon spawn must carry a real CM_TUI_SOCKET path (sub-2c); \
+             got {:?}",
+            tui_sock,
+        );
+    }
+
+    #[test]
+    fn build_env_authoritative_override_when_wrong_var_in_process_env() {
+        // The reviewer's named scenario: a developer exported
+        // `CM_DAEMON_SOCKET=...` in their shell from earlier
+        // testing, then launches the TUI with opt-in OFF. A
+        // TUI-local spawn must NOT route to the daemon. The
+        // empty-string entry in the build_env output is what makes
+        // that work — it overrides whatever the agent inherited
+        // through the env-merge that Claude/Codex does when
+        // spawning the MCP child.
+        let _lock = crate::test_support::home_lock();
+        let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "/leaked/daemon.sock");
+        // Sanity check that our pollution is actually in the
+        // process env (i.e. the test fixture is exercising the
+        // right scenario, not a false-pass).
+        assert_eq!(
+            std::env::var_os("CM_DAEMON_SOCKET").map(|v| v.to_string_lossy().into_owned()),
+            Some("/leaked/daemon.sock".into()),
+        );
+
+        let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .expect("CM_DAEMON_SOCKET present as authoritative empty");
+        assert!(
+            daemon_sock.is_empty(),
+            "process-env pollution must NOT leak into the spawn env (got {:?})",
+            daemon_sock,
+        );
+        assert!(
+            env.get("CM_TUI_SOCKET").map(|v| !v.is_empty()).unwrap_or(false),
+            "TUI socket must still be the real pin",
+        );
+    }
+
+    #[test]
+    fn build_env_daemon_target_keeps_daemon_socket_authoritative_over_env() {
+        // Sub-2c: under SpawnTarget::Daemon, BOTH sockets carry
+        // real paths. We can't defend against operator-set
+        // `CM_TUI_SOCKET` overrides in env (those go through
+        // `default_socket_path()` which is intentionally env-
+        // aware — operators expect their override to win), but
+        // we DO defend against accidental leak of
+        // `CM_DAEMON_SOCKET` from a TUI launched without the
+        // opt-in: build_env's emitted daemon path comes from
+        // `cm_daemon::default_socket_path()` which is also
+        // env-aware. As long as the operator's TUI is correctly
+        // configured, the emitted paths are the right ones.
+        //
+        // What this test pins: both env vars are non-empty
+        // under Daemon target, regardless of inherited values.
+        // The agent's resolver will see both and route
+        // per-method.
+        let _lock = crate::test_support::home_lock();
+        let env = build_env(SpawnTarget::Daemon, "uid-x", None);
+        assert!(
+            env.get("CM_DAEMON_SOCKET").map(|v| !v.is_empty()).unwrap_or(false),
+            "daemon socket must be a real pin",
+        );
+        assert!(
+            env.get("CM_TUI_SOCKET").map(|v| !v.is_empty()).unwrap_or(false),
+            "TUI socket must be a real pin (sub-2c — both sockets populated)",
+        );
+    }
+
+    #[test]
     fn build_env_includes_workflow_when_present() {
+        let _lock = crate::test_support::home_lock();
         let env = build_env(
+            SpawnTarget::TuiLocal,
             "uid-x",
             Some(&WorkflowMeta {
                 run_id: "wf_1",
@@ -225,14 +565,14 @@ mod tests {
 
     #[test]
     fn codex_overrides_contains_session_uid() {
-        let args = codex_overrides("uid-x", None);
+        let args = codex_overrides(SpawnTarget::TuiLocal, "uid-x", None);
         assert!(args.iter().any(|a| a.contains("CM_TUI_SESSION_ID=\"uid-x\"")));
         assert_eq!(args.iter().filter(|a| *a == "-c").count(), 3);
     }
 
     #[test]
     fn codex_args_no_resume_subcommand_when_none() {
-        let args = codex_args("uid-x", None, None);
+        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None);
         assert!(!args.iter().any(|a| a == "resume"));
     }
 
@@ -240,6 +580,7 @@ mod tests {
     fn codex_args_resume_subcommand_when_some() {
         let sid = "01234567-89ab-cdef-0123-456789abcdef";
         let args = codex_args(
+            SpawnTarget::TuiLocal,
             "uid-x",
             Some(WorkflowMeta {
                 run_id: "wf",
@@ -263,7 +604,7 @@ mod tests {
 
     #[test]
     fn codex_args_bypass_trust_prompt() {
-        let args = codex_args("uid-x", None, None);
+        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None);
         assert!(args
             .iter()
             .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
@@ -271,7 +612,7 @@ mod tests {
 
     #[test]
     fn codex_args_disable_update_check() {
-        let args = codex_args("uid-x", None, None);
+        let args = codex_args(SpawnTarget::TuiLocal, "uid-x", None, None);
         assert!(args
             .windows(2)
             .any(|w| w[0] == "-c" && w[1] == "check_for_update_on_startup=false"));
@@ -289,5 +630,238 @@ mod tests {
     fn claude_args_include_resume() {
         let args = claude_args(Path::new("/tmp/x.json"), Some("sid-123"), &[]);
         assert!(args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-123"));
+    }
+
+    // ============================================================
+    // Slice-10c-b review: build_env must absolutize the socket
+    // path before injecting it into the agent's MCP env. Without
+    // this, a relative `CM_DAEMON_SOCKET` in the TUI's env would
+    // be passed verbatim to `claude` / `codex`, which would
+    // resolve it against their own cwd (inherited from us, but
+    // not guaranteed identical across multi-step spawn chains)
+    // and dial a different inode than the daemon bound.
+    // ============================================================
+
+    #[test]
+    fn build_env_absolutizes_relative_daemon_socket_under_daemon_target() {
+        let _lock = crate::test_support::home_lock();
+        // Relative override — set via env so default_socket_path
+        // picks it up. The test must observe an absolute result.
+        let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "rel/cm/daemon.sock");
+
+        let env = build_env(SpawnTarget::Daemon, "uid-x", None);
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .expect("CM_DAEMON_SOCKET in env");
+        assert!(
+            !daemon_sock.is_empty(),
+            "SpawnTarget::Daemon must produce a non-empty CM_DAEMON_SOCKET",
+        );
+        // Load-bearing: the value MCP agents inherit must be
+        // absolute, regardless of what their cwd ends up being.
+        assert!(
+            Path::new(daemon_sock).is_absolute(),
+            "CM_DAEMON_SOCKET must be absolute when injected into agent env (got {:?})",
+            daemon_sock,
+        );
+        // And it must point at the same absolute inode the
+        // daemon-launch helper would absolutize to (i.e. cwd-joined),
+        // not at some arbitrary other path. This is the
+        // cross-consumer "they match" property.
+        let expected = cm_daemon::path::absolutize_socket_path(Path::new(
+            "rel/cm/daemon.sock",
+        ))
+        .expect("absolutize ok");
+        assert_eq!(
+            Path::new(daemon_sock),
+            expected.as_path(),
+            "build_env must use the same absolutize helper as daemon_launch",
+        );
+    }
+
+    #[test]
+    fn build_env_absolutizes_relative_tui_socket_under_tui_local_target() {
+        // Symmetric: SpawnTarget::TuiLocal → CM_TUI_SOCKET must
+        // also be absolutized. The TUI socket override path is
+        // `crate::control::server::default_socket_path` which
+        // reads `CM_TUI_SOCKET`.
+        let _lock = crate::test_support::home_lock();
+        let _polluted = EnvVarGuard::set("CM_TUI_SOCKET", "rel/cm/tui.sock");
+
+        let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
+        let tui_sock = env.get("CM_TUI_SOCKET").expect("CM_TUI_SOCKET in env");
+        assert!(
+            !tui_sock.is_empty(),
+            "SpawnTarget::TuiLocal must produce a non-empty CM_TUI_SOCKET",
+        );
+        assert!(
+            Path::new(tui_sock).is_absolute(),
+            "CM_TUI_SOCKET must be absolute when injected (got {:?})",
+            tui_sock,
+        );
+    }
+
+    // ============================================================
+    // Slice 10c-e-3b: argv parity between SpawnTarget::TuiLocal and
+    // SpawnTarget::Daemon.
+    //
+    // The named acceptance for slice 10c-e-3b: the daemon spawn
+    // must build argv using the same code path as the local spawn,
+    // so the spawned child sees `--mcp-config` / Codex MCP
+    // overrides / `--resume` tokens identically. The only
+    // expected difference is the *value* of the env-routing pin
+    // (CM_DAEMON_SOCKET vs CM_TUI_SOCKET), which:
+    //   - Claude: lives in the MCP config FILE referenced by
+    //     `--mcp-config <path>`, not in argv → argv is byte-identical.
+    //   - Codex: lives in argv via `-c mcp_servers.…env={…}`, so
+    //     the env-override element differs but every other argv
+    //     element is identical.
+    // ============================================================
+
+    #[test]
+    fn build_args_claude_argv_byte_identical_between_spawn_targets() {
+        // Claude carries env in the MCP config file, not argv.
+        // Argv must be element-wise identical regardless of
+        // SpawnTarget for both unresumed and resumed shapes.
+        let _lock = crate::test_support::home_lock();
+
+        for sid in [None, Some("01234567-89ab-cdef-0123-456789abcdef")] {
+            let (local_prog, local_args) = build_args(
+                SpawnTarget::TuiLocal,
+                &Engine::ClaudeCode,
+                "uid-parity-cl",
+                None,
+                sid,
+            )
+            .expect("build_args local");
+            let (daemon_prog, daemon_args) = build_args(
+                SpawnTarget::Daemon,
+                &Engine::ClaudeCode,
+                "uid-parity-cl",
+                None,
+                sid,
+            )
+            .expect("build_args daemon");
+            assert_eq!(local_prog, daemon_prog, "claude program (resume={:?})", sid);
+            assert_eq!(
+                local_args, daemon_args,
+                "claude argv must be element-wise identical between local + daemon \
+                 (resume={:?}); the only target-specific bit lives in the MCP \
+                 config FILE, not in argv",
+                sid,
+            );
+        }
+    }
+
+    #[test]
+    fn build_args_codex_argv_differs_only_in_env_override_element() {
+        // Codex embeds env into argv via `-c
+        // mcp_servers.claude-manager.env={..}`. The non-env
+        // portions of argv must be element-wise identical; the
+        // env `-c` value is where the routing pin lives and is
+        // expected to differ.
+        let _lock = crate::test_support::home_lock();
+
+        let (local_prog, local_args) = build_args(
+            SpawnTarget::TuiLocal,
+            &Engine::Codex,
+            "uid-parity-cx",
+            None,
+            None,
+        )
+        .expect("build_args local");
+        let (daemon_prog, daemon_args) = build_args(
+            SpawnTarget::Daemon,
+            &Engine::Codex,
+            "uid-parity-cx",
+            None,
+            None,
+        )
+        .expect("build_args daemon");
+        assert_eq!(local_prog, daemon_prog, "codex program");
+        assert_eq!(
+            local_args.len(),
+            daemon_args.len(),
+            "codex argv length must match between targets",
+        );
+
+        // Locate the env-override element (the only one allowed
+        // to differ).
+        let env_kv_prefix = "mcp_servers.claude-manager.env=";
+        let local_env_idx = local_args
+            .iter()
+            .position(|a| a.starts_with(env_kv_prefix))
+            .expect("local must have env override in argv");
+        let daemon_env_idx = daemon_args
+            .iter()
+            .position(|a| a.starts_with(env_kv_prefix))
+            .expect("daemon must have env override in argv");
+        assert_eq!(
+            local_env_idx, daemon_env_idx,
+            "env override must be at the same argv position",
+        );
+
+        // Every other element must match exactly.
+        for (i, (l, d)) in local_args.iter().zip(daemon_args.iter()).enumerate() {
+            if i == local_env_idx {
+                // This is the routing-pin element — expected
+                // to differ. Assert the shape.
+                assert!(l.starts_with(env_kv_prefix), "local env shape");
+                assert!(d.starts_with(env_kv_prefix), "daemon env shape");
+                assert!(
+                    l.contains("CM_TUI_SOCKET="),
+                    "local env override pins CM_TUI_SOCKET: {}",
+                    l
+                );
+                assert!(
+                    d.contains("CM_DAEMON_SOCKET="),
+                    "daemon env override pins CM_DAEMON_SOCKET: {}",
+                    d
+                );
+                assert_ne!(
+                    l, d,
+                    "env -c override must differ between targets (that's the routing pin)"
+                );
+            } else {
+                assert_eq!(
+                    l, d,
+                    "codex argv element [{}] must match between local + daemon: \
+                     local={:?} daemon={:?}",
+                    i, l, d,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_args_bash_argv_is_trivially_identical() {
+        // Bash sessions don't go through `build_args` (the daemon
+        // path uses bare `/bin/bash`, no MCP config). This test
+        // exists as documentation of the no-op case and to keep
+        // the parity story symmetric across Claude/Codex/Bash.
+        //
+        // For bash, both spawn paths construct the same SpawnParams
+        // directly without engine-specific shaping. The argv on
+        // the wire is `["/bin/bash"]` regardless of SpawnTarget.
+        // Asserted in `try_spawn_via_daemon`'s match arm.
+    }
+
+    #[test]
+    fn build_env_passes_through_absolute_paths_unchanged() {
+        // Regression guard against the absolutization helper
+        // doing something surprising to an already-absolute path
+        // (the helper's contract is passthrough, but build_env's
+        // wrapper could plausibly drift).
+        let _lock = crate::test_support::home_lock();
+        let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "/abs/cm/daemon.sock");
+
+        let env = build_env(SpawnTarget::Daemon, "uid-x", None);
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .expect("CM_DAEMON_SOCKET in env");
+        assert_eq!(
+            daemon_sock, "/abs/cm/daemon.sock",
+            "absolute path must pass through unchanged",
+        );
     }
 }

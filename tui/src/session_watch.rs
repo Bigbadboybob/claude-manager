@@ -283,17 +283,13 @@ fn write_kill_log_to(
     soft_cap_bytes: u64,
     hard_cap_bytes: u64,
 ) {
-    if std::fs::create_dir_all(dir).is_err() {
+    // Route through the shared helper in `cm_daemon::path` so
+    // the TUI's kill-log writer and the daemon's reaper can't
+    // drift on directory permissions (slice-10c-c review fix #2).
+    // Best-effort: if it errors, the kernel still killed the
+    // offender — we just lose a forensic record.
+    if cm_daemon::path::ensure_dot_cm_subdir(dir).is_err() {
         return;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(dir) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(dir, perms);
-        }
     }
 
     let path = dir.join(format!("{}.jsonl", session_uid));

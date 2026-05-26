@@ -45,9 +45,7 @@ fn ping_round_trip() {
     let mut stream = UnixStream::connect(&path).expect("connect");
     let req = Request {
         id: "test-1".into(),
-        caller: Caller {
-            session_uid: "u".into(),
-        },
+        caller: Caller::session("u"),
         method: "ping".into(),
         params: serde_json::json!({}),
     };

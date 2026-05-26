@@ -1,12 +1,8 @@
 """MCP server for Claude instances to propose tasks to the backlog."""
 
 import asyncio
-import json
 import os
 import sys
-import time
-import uuid
-from pathlib import Path
 
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -20,52 +16,21 @@ from mcp_server.transcripts import codex as transcripts_codex
 
 mcp = FastMCP("claude-manager")
 
-
-def _workflow_run_dir() -> Path:
-    """Return the directory for the current workflow run, creating it if needed.
-
-    Raises RuntimeError if CM_WORKFLOW_RUN_ID is not set (tool called outside a workflow).
-    """
-    run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
-    if not run_id:
-        session_uid = os.environ.get("CM_TUI_SESSION_ID", "").strip() or "<unknown>"
-        cfg_hint = (
-            f"~/.cm/mcp/{session_uid}/claude.json"
-            if session_uid != "<unknown>"
-            else "the session's per-session MCP config under ~/.cm/mcp/<session_uid>/claude.json"
-        )
-        raise RuntimeError(
-            "CM_WORKFLOW_RUN_ID is not set — workflow tools are only usable "
-            "inside a workflow-participant session. If you are running inside "
-            f"a workflow role (session UID {session_uid}) and seeing this, the "
-            f"per-session MCP config is missing the workflow env block. Check "
-            f"{cfg_hint} — the env block should include CM_WORKFLOW_RUN_ID and "
-            "CM_ROLE. Fixing the file alone is not enough; the agent process "
-            "must be respawned for the MCP subprocess to pick up the new env."
-        )
-    base = Path(os.path.expanduser("~/.cm/workflow-runs")) / run_id
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def _append_event(tool: str, args: dict) -> dict:
-    """Append an MCP tool-call event to the active workflow run's events.jsonl."""
-    role = os.environ.get("CM_ROLE", "").strip() or "unknown"
-    run_dir = _workflow_run_dir()
-    event = {
-        "id": uuid.uuid4().hex,
-        "ts": time.time(),
-        "run_id": os.environ["CM_WORKFLOW_RUN_ID"],
-        "role": role,
-        "tool": tool,
-        "args": args,
-    }
-    # Append atomically: open with O_APPEND, write one line.
-    events_path = run_dir / "events.jsonl"
-    with events_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event) + "\n")
-        f.flush()
-    return event
+# 11g-2 (A2): the `_append_event` direct file-write helper and the
+# `_workflow_run_dir` accessor have been retired. Pre-11g-2 the
+# workflow tools fell back to writing `events.jsonl` directly when
+# the daemon socket wasn't pinned (the TuiLocal SpawnTarget path).
+# Since 10f the daemon has been mandatory and TUI launches always
+# pin `CM_DAEMON_SOCKET`, making the fallback unreachable.
+#
+# Post-11g-2 the TUI's controller no longer reads events.jsonl at
+# all (channel-only path via `events.subscribe`), so a stranded
+# file-only write would be invisible to the controller. Removing
+# the fallback closes the failure mode entirely.
+#
+# `_require_workflow_env` (below) absorbed `_workflow_run_dir`'s
+# operator-friendly error message about the per-session MCP config
+# (folded in during the Phase 2 merge).
 
 
 _BRIEF_FIELDS = (
@@ -167,15 +132,55 @@ def propose_task(
     _check_parameter_confusion("description", description)
     _check_parameter_confusion("prompt", prompt)
     _check_parameter_confusion("name", name)
-    client = PlanningClient()
-    task = client.propose_task(
-        project=project,
-        name=name,
-        description=description,
-        prompt=prompt,
-        difficulty=difficulty,
-        depends=depends,
-    )
+    # Sub-2b-2 (10d-mcp-surface-2b-2): route through the daemon
+    # when CM_DAEMON_SOCKET is set. Daemon now owns the planning
+    # API talk (centralizes auth/audit/policy; survives TUI
+    # restarts). Falls back to the direct PlanningClient path
+    # when no daemon socket is configured — ad-hoc CLI usage,
+    # tests, agents not spawned through the TUI.
+    #
+    # Wire shape: daemon's propose_task expects `repo_url`
+    # explicitly (the daemon doesn't know the agent's cwd, so
+    # it can't auto-detect via `git remote get-url origin` the
+    # way the local PlanningClient does). We detect here and
+    # forward.
+    #
+    # Sub-2c review-2: single-decision binding (restoring the
+    # round-8 #2 fix). `resolve_socket_route()` is called ONCE
+    # and its `path` is passed through to `call(socket_path=)`,
+    # so the daemon-vs-PlanningClient branch decision AND the
+    # actual dial are bound to the same resolution.
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        from cli.planning_client import _detect_repo_url
+        repo_url = _detect_repo_url()
+        params = {
+            "project": project,
+            "name": name,
+            "description": description,
+            "prompt": prompt,
+            "repo_url": repo_url,
+        }
+        if difficulty is not None:
+            params["difficulty"] = difficulty
+        if depends:
+            params["depends"] = list(depends)
+        try:
+            task = control_client.call("propose_task", params, socket_path=route.path)
+        except control_client.ControlError as e:
+            # Surface the daemon's error message + code to the
+            # agent so it sees what the planning queue rejected.
+            return f"propose_task failed ({e.code}): {e.message}"
+    else:
+        client = PlanningClient()
+        task = client.propose_task(
+            project=project,
+            name=name,
+            description=description,
+            prompt=prompt,
+            difficulty=difficulty,
+            depends=depends,
+        )
     # Inline round-trip preview so the caller sees what actually landed
     # without an extra get_task. Truncated to keep the response readable.
     desc_preview = (description or "")[:140]
@@ -432,7 +437,22 @@ def start_session(
         params["prompt"] = prompt
     if task_id:
         params["task_id"] = task_id
-    return control_client.call("start_session", params)
+    # Sub-2c review-2: single-decision binding (restoring the
+    # round-8 #2 fix). `resolve_socket_route()` is called ONCE
+    # to get both the chosen path AND the route-chose-daemon
+    # bool. Method is picked from the bool; the SAME path is
+    # passed through to `call(socket_path=...)` so the dial
+    # uses exactly the resolution that informed the method
+    # choice.
+    #
+    # Pre-fix the method was picked from
+    # `daemon_socket_pinned()` and `call()` independently re-
+    # resolved — a daemon socket appearing or disappearing
+    # between the two resolutions would route the wrong
+    # method shape to the wrong server.
+    route = control_client.resolve_socket_route()
+    method = "mcp_start_session" if route.chose_daemon else "start_session"
+    return control_client.call(method, params, socket_path=route.path)
 
 
 @mcp.tool()
@@ -893,6 +913,41 @@ def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
     )
 
 
+def _require_workflow_env() -> tuple[str, str]:
+    """Return (run_id, role) from env, or raise if not in a workflow session.
+
+    Both `workflow_transition` and `workflow_done` (and 11e-onward
+    `workflow_reject_finding`) need the same env-driven context; this
+    helper deduplicates the lookup + the RuntimeError message.
+
+    Phase 2 merge: absorbed main's `772d8fe` operator hint about the
+    per-session MCP config. When a workflow role's env block is
+    missing CM_WORKFLOW_RUN_ID — the symptom of a stale config or
+    an un-respawned MCP subprocess — the error names the file to
+    fix and the respawn requirement.
+    """
+    run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
+    if not run_id:
+        session_uid = os.environ.get("CM_TUI_SESSION_ID", "").strip() or "<unknown>"
+        cfg_hint = (
+            f"~/.cm/mcp/{session_uid}/claude.json"
+            if session_uid != "<unknown>"
+            else "the session's per-session MCP config under ~/.cm/mcp/<session_uid>/claude.json"
+        )
+        raise RuntimeError(
+            "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
+            "usable inside a workflow-participant session. If you are "
+            f"running inside a workflow role (session UID {session_uid}) "
+            f"and seeing this, the per-session MCP config is missing the "
+            f"workflow env block. Check {cfg_hint} — the env block should "
+            "include CM_WORKFLOW_RUN_ID and CM_ROLE. Fixing the file alone "
+            "is not enough; the agent process must be respawned for the "
+            "MCP subprocess to pick up the new env."
+        )
+    role = os.environ.get("CM_ROLE", "").strip() or "unknown"
+    return run_id, role
+
+
 @mcp.tool()
 def workflow_transition(to: str, prompt: str) -> str:
     """Hand control to another role in the current workflow.
@@ -904,8 +959,18 @@ def workflow_transition(to: str, prompt: str) -> str:
         to: Name of the role to transition to (must be declared in the workflow).
         prompt: The message to send to that role when it activates.
     """
-    event = _append_event("workflow_transition", {"to": to, "prompt": prompt})
-    return f"Queued transition to '{to}' (event {event['id']})."
+    # 11g-2 (A2): routes unconditionally through the daemon. Pre-11g-2
+    # an `else` branch wrote events.jsonl directly via `_append_event`
+    # for TUI-local spawns; daemon-mandatory since 10f makes that
+    # path unreachable, and the controller's channel-only consumption
+    # (post-11g-2-a) would render any stranded file-only write
+    # invisible. See the module-head comment for the rationale.
+    run_id, role = _require_workflow_env()
+    result = control_client.call(
+        "workflow_transition",
+        {"to": to, "prompt": prompt, "run_id": run_id, "role": role},
+    )
+    return f"Queued transition to '{to}' (event {result['event_id']})."
 
 
 @mcp.tool()
@@ -919,8 +984,14 @@ def workflow_done(reason: str) -> str:
     Args:
         reason: Short explanation of why the workflow is complete.
     """
-    event = _append_event("workflow_done", {"reason": reason})
-    return f"Workflow marked done (event {event['id']})."
+    # 11g-2 (A2): see `workflow_transition` above — same daemon-only
+    # routing.
+    run_id, role = _require_workflow_env()
+    result = control_client.call(
+        "workflow_done",
+        {"reason": reason, "run_id": run_id, "role": role},
+    )
+    return f"Workflow marked done (event {result['event_id']})."
 
 
 @mcp.tool()
@@ -948,8 +1019,16 @@ def workflow_reject_finding(text: str) -> str:
             optionally). Free-text; surfaced to the reviewer verbatim as a
             bullet point.
     """
-    event = _append_event("workflow_reject_finding", {"text": text})
-    return f"Recorded rejection (event {event['id']})."
+    # 11g-2 (A2): routes unconditionally through the daemon. Same
+    # rationale as `workflow_transition` / `workflow_done` above —
+    # TUI-local fallback was removed once the daemon became
+    # mandatory and the controller stopped reading events.jsonl.
+    run_id, role = _require_workflow_env()
+    result = control_client.call(
+        "workflow_reject_finding",
+        {"text": text, "run_id": run_id, "role": role},
+    )
+    return f"Recorded rejection (event {result['event_id']})."
 
 
 if __name__ == "__main__":

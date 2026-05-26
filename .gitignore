@@ -6,3 +6,6 @@ uv.lock
 
 # Rust
 tui/target/
+# Workspace build dir created by the root Cargo.toml (slice 2 of the
+# persistent-host-daemon design doc moved tui to a workspace member).
+/target/

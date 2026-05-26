@@ -6,12 +6,13 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 ## Project overview
 
-- **`tui/`** — Rust TUI client. The main product. Owns local session lifecycle (PTY spawning via alacritty), workflow orchestration, planning board rendering, and API communication. Build with `cargo build` from `tui/`. Run the binary directly; no daemon needed for local use.
+- **`tui/`** — Rust TUI client. The user-facing entry point. Workflow orchestration, planning board rendering, API communication, and the attach-stream side of session I/O. Build with `cargo build --workspace` (the TUI binary lives in `tui/` and depends on `daemon/`).
+- **`daemon/`** — `cm-daemon`, the persistent host daemon. Owns session PTY lifecycle, manifest, manifest.watch broadcasts, workflow state, and the control-socket dispatcher. The TUI launches it automatically at startup if it isn't already running; mandatory since slice 10f (Phase 1's default flip).
 - **`workflows/`** — TOML definitions for multi-agent workflows (e.g. `feedback.toml`). Loaded at TUI startup; each defines roles, transitions, and activation prompts. See the Workflows section below.
 - **`mcp_server/`** — MCP server exposing tools that agents running inside the TUI can call:
   - `propose_task(...)` — push a task to the planning backlog.
   - `workflow_transition(to, prompt)` / `workflow_done(reason)` — workflow participants use these to hand off control or end a run. Events land in `~/.cm/workflow-runs/<id>/events.jsonl` and the TUI tails that file as its workflow control plane.
-  - `ping`, `list_sessions`, `start_session`, `send_input`, `read_session_output`, `kill_session` — agent orchestration over a Unix socket at `~/.cm/tui.sock`. Auth keys off `CM_TUI_SESSION_ID` injected when the TUI spawns the agent; descendant-only scope.
+  - `ping`, `list_sessions`, `mcp_start_session`, `send_input`, `read_session_output`, `kill_session` — agent orchestration. Routed per-method by the resolver: session/PTY-touching methods go to `~/.cm/daemon.sock` (the daemon owns the registry); workflow-touching methods stay on `~/.cm/tui.sock`. Auth keys off `CM_TUI_SESSION_ID` injected when the TUI spawns the agent; descendant-only scope.
   - `start_workflow`, `stop_workflow`, `get_workflow_state`, `list_workflows` — orchestrator-side workflow control. Caller is the orchestrator, NOT a participant.
   - `create_subtask`, `list_subtasks`, `mark_subtask_done` — subtasks fork off a parent task with `parent_task_id` set. `worktree_mode="branch"` creates a new worktree under `cm-sub/<slug-chain>-<short_id>`.
 

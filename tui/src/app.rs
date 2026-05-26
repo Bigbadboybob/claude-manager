@@ -21,7 +21,7 @@ use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::workflow::{self, toml_schema::Engine, Workflow, WorkflowRun};
-use crate::worktree;
+use cm_daemon::worktree;
 
 mod dirs {
     use std::path::PathBuf;
@@ -145,6 +145,17 @@ pub struct TerminalSession {
     /// "Seeded from: <name>". Persisted via `ManifestEntry`. See
     /// DESIGN_AGENT_MEMORIES.md.
     pub seeded_from_snapshot: Option<String>,
+    /// Read-through copy of `ManifestEntry.last_exit`. The daemon
+    /// owns this field (slice 9 of doc/persistent-host-daemon.md
+    /// adds it; slice 10 wires the producer). The TUI doesn't yet
+    /// inspect or write `last_exit` — it just loads it on startup
+    /// and writes it back unchanged on every manifest save, so the
+    /// daemon's `memory_cap_kill: true` flag survives across TUI
+    /// restarts and the detached-session cap-kill toast renders
+    /// correctly. Without this passthrough, every TUI save would
+    /// clobber the field to `None` and the named acceptance
+    /// criterion would fail.
+    pub preserved_last_exit: Option<cm_daemon::manifest::LastExit>,
 }
 
 impl TerminalSession {
@@ -204,6 +215,43 @@ fn note_workflow_transcript_binding(
 
     changed
 }
+
+/// 10d-2c-1 review round-6 (F1): apply the TUI-owned mutations
+/// for a `/clear`-or-`/compact`-driven history rotation to a
+/// `WorkflowRun`. Used by `apply_history_rotation` to keep the
+/// in-memory + on-disk shape in lockstep — same field-level
+/// updates applied via `workflow::run::modify` (so concurrent
+/// daemon writes to active_role / iteration / status survive)
+/// AND, if/when needed, against the in-memory slot via
+/// `slice::from_mut`.
+///
+/// Fields touched (TUI-owned):
+///   - `role_sessions[role].current_session_id` ← new sid.
+///   - `role_baselines[role]` ← `MessageBaseline::default()`.
+///   - Active role's last history entry, if it's for `role`:
+///     `assistant_count_at_start = 0`, `session_id = Some(new_sid)`.
+fn apply_history_rotation_to_run(run: &mut WorkflowRun, role: &str, new_sid: &str) {
+    if let Some(b) = run.role_sessions.get_mut(role) {
+        b.current_session_id = Some(new_sid.to_string());
+    }
+    run.role_baselines
+        .insert(role.to_string(), workflow::run::MessageBaseline::default());
+    if run.active_role.as_deref() == Some(role) {
+        if let Some(h) = run.history.last_mut() {
+            h.assistant_count_at_start = 0;
+            h.session_id = Some(new_sid.to_string());
+        }
+    }
+}
+
+// 10d-3: `apply_stop_workflow_status` relocated to
+// `daemon/src/workflow/run.rs` as the shared canonical mutation
+// used by BOTH the TUI A-o flow and the daemon's `stop_workflow`
+// handler. Re-exported through `crate::workflow::run` (see
+// `tui/src/workflow/mod.rs`'s blanket re-export). The function's
+// terminal-state guard semantics are identical — round-9's
+// behavior is preserved end-to-end.
+pub(crate) use crate::workflow::run::apply_stop_workflow_status;
 
 /// Marker that an Enter keystroke is queued to fire at or after `fire_at`. The
 /// actual bytes are computed from the current terminal mode at submit time.
@@ -272,139 +320,22 @@ const TICK_LOG_MAX_BYTES: u64 = 500 * 1024 * 1024;
 /// being a fresh keystroke.
 const ENTER_GAP: Duration = Duration::from_secs(10);
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct ManifestEntry {
-    /// Stable per-session UID generated at creation. Persisted (Phase 2a)
-    /// so MCP env's `CM_TUI_SESSION_ID` survives TUI restart and the
-    /// agent's tool calls keep authorizing. Backfill rule: missing on
-    /// load → generate fresh and re-save.
-    #[serde(default)]
-    uid: String,
-    /// UID of the agent session that spawned/owns this one. Used by
-    /// the descendant-only auth check in Phase 3 and by sidebar
-    /// "managed-by" markers later.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    managed_by_uid: Option<String>,
-    /// Bumps every time `transcript_id` rebinds. Persisted so a
-    /// pre-restart cursor against an old transcript correctly mismatches
-    /// the post-restart generation and resets to offset 0.
-    #[serde(default)]
-    generation: u64,
-    label: String,
-    session_type: String,
-    /// Current transcript file UUID. Older manifests stored this as
-    /// `session_id`; the alias keeps backfill correct across upgrade.
-    #[serde(alias = "session_id")]
-    transcript_id: Option<String>,
-    #[serde(default)]
-    hidden: bool,
-    #[serde(default)]
-    idle_timeout_secs: u16,
-    #[serde(default)]
-    burst_threshold: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    task_id: Option<String>,
-    #[serde(default)]
-    notify_on_idle: bool,
-    /// Name of the agent-memory snapshot this session was cloned from, if
-    /// any. Informational provenance only — used to surface "Seeded from:
-    /// <name>" in session info. See DESIGN_AGENT_MEMORIES.md.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    seeded_from_snapshot: Option<String>,
-}
-
-/// Persisted workspace metadata. Lives in `Manifest::workspaces` keyed by the
-/// workspace's stable id.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-struct ManifestWorkspace {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    is_closed: bool,
-    #[serde(default)]
-    is_cloud: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worktree_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    main_repo_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    repo_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_vm: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_zone: Option<String>,
-    #[serde(default)]
-    sessions: Vec<ManifestEntry>,
-    /// Recently-closed sessions kept around so `read_session_output` can
-    /// resolve a transcript path even after the session is gone. Pruned
-    /// on TUI startup; see `TOMBSTONE_RETENTION_SECS`.
-    #[serde(default)]
-    tombstones: Vec<SessionTombstone>,
-}
-
-/// Lightweight record of a session that's been closed. Holds only what
-/// the resolver and sidebar need; the live `TerminalSession` (which owns
-/// PTY resources) is dropped at close time. Keeping the full struct
-/// alive after exit would leak the PTY writer file descriptor.
-///
-/// **Self-contained**: every field needed to resolve `transcript_path`
-/// for an `exited`-state read is on the tombstone itself, not on the
-/// workspace. This matters because workspace state mutates after a
-/// session closes (e.g. `push_active` clears `worktree_path` when a
-/// local workspace gets uploaded to cloud). If resolution depended on
-/// the workspace's *current* `worktree_path`, those tombstones would
-/// silently stop resolving even though the on-disk transcript file
-/// still exists at the path captured at exit time.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-pub struct SessionTombstone {
-    pub uid: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_by_uid: Option<String>,
-    pub label: String,
-    /// "claude" / "codex" / "bash"
-    pub session_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    /// Last transcript file UUID this session was bound to. Used by the
-    /// resolver to compute a `transcript_path` for `state: "exited"`
-    /// reads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_transcript_id: Option<String>,
-    /// Worktree path captured at exit time. Snapshot, not a live
-    /// reference — survives subsequent mutations of the workspace's
-    /// `worktree_path`. Required to compute Claude Code transcript
-    /// paths (Codex's path scheme is per-user-and-date and ignores it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_path: Option<PathBuf>,
-    pub generation: u64,
-    /// Unix-timestamp seconds when the session exited. Used for the
-    /// retention prune.
-    pub exited_at: f64,
-}
-
-/// How long tombstones live before the startup prune drops them. 30 days
-/// is generous because the data is small and these are exactly the
-/// records an agent might want to look at later.
-const TOMBSTONE_RETENTION_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
-struct Manifest {
-    /// Workspaces keyed by stable workspace id.
-    #[serde(default)]
-    workspaces: HashMap<String, ManifestWorkspace>,
-    /// `task_id` → `workspace_id` bindings. A task present here is bound to
-    /// the referenced workspace.
-    #[serde(default)]
-    bindings: HashMap<String, String>,
-    #[serde(default)]
-    view: Option<String>,
-}
+// `ManifestEntry`, `ManifestWorkspace`, `SessionTombstone`, `Manifest`,
+// and `TOMBSTONE_RETENTION_SECS` live in the daemon crate (slice
+// 10a-types of doc/persistent-host-daemon.md). Module-level `use`
+// brings them into scope so existing bare references inside this
+// file (`ManifestEntry { ... }`, `SessionTombstone { ... }` etc.)
+// resolve unchanged.
+//
+// Deliberately NOT `pub use` — external modules that need these
+// types should import from `cm_daemon::manifest` directly so the
+// dependency path is explicit and the eventual slice-10e flip
+// (when manifest ownership moves daemon-side) doesn't have to
+// chase shim re-exports.
+use cm_daemon::manifest::{
+    Manifest, ManifestEntry, ManifestWorkspace, SessionTombstone,
+    TOMBSTONE_RETENTION_SECS,
+};
 
 /// An execution context: a worktree (local) or cloud worker (remote) plus
 /// the sessions running in it. Any number of `TaskEntry`s can point at a
@@ -549,6 +480,9 @@ fn make_simple_session_with_uid(
         created_at: Instant::now(),
         managed_by_uid: None,
         seeded_from_snapshot: None,
+        // Fresh sessions have no exit history; the daemon may
+        // populate this later through manifest.watch diffs.
+        preserved_last_exit: None,
     }
 }
 
@@ -748,6 +682,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         workflow::toml_schema::Engine::Codex => App::list_codex_sessions(wt),
     };
     let (program, args) = match crate::mcp_config::build_args(
+        crate::mcp_config::SpawnTarget::TuiLocal,
         engine,
         &ts.uid,
         Some(workflow_meta),
@@ -783,11 +718,18 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
             ));
         }
     };
-    // Swap the Session: dropping the old one closes its PTY which reaps the
-    // old agent process. With a sid we keep it bound (Claude resumes
-    // in-place; Codex writes a new rollout id but the detector rebinds
-    // once the post-resume file appears). Without a sid the new agent
-    // starts fresh — the detector will bind whatever transcript it writes.
+    // Swap the Session. For local-PTY sessions, dropping the old one closes
+    // its master fd which reaps the old agent process. For daemon-attached
+    // sessions, Drop is detach-only (slice 10c-e-3b-fix2) — we MUST issue an
+    // explicit kill RPC before the assignment, else the daemon's old child
+    // PTY keeps running while a new resumed agent starts in the same slot:
+    // duplicate live agents, transcript / worktree races. Same bug class as
+    // the operator A-w / workspace-teardown / task-close paths fixed in fix2
+    // and fix6 (`kill_daemon_session_if_attached` is the shared helper).
+    // Claude resumes in-place; modern Codex writes a new rollout id for
+    // `codex resume <sid>`, so keep the old sid bound until the detector
+    // sees the post-resume file and rebinds the role.
+    App::kill_daemon_session_if_attached(ts);
     ts.session = new_sess;
     if session_id.is_some() {
         ts.transcript_id = session_id.map(|s| s.to_string());
@@ -2640,6 +2582,68 @@ pub struct App {
     /// capped session's watcher thread.
     pub memory_kill_tx: std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
     pub memory_kill_rx: std::sync::mpsc::Receiver<crate::session_watch::MemoryKillEvent>,
+    /// 10e-c: TUI consumer for daemon's `manifest.watch` stream.
+    /// `Some` only when daemon mode is opt-in active
+    /// (`CM_USE_DAEMON_SOCKET=1`); the consumer thread dials the
+    /// daemon socket, subscribes, and forwards
+    /// `ManifestEvent`s (snapshot + diffs) through this receiver.
+    /// `None` in legacy single-process mode — no consumer
+    /// thread spawned.
+    ///
+    /// 10e-c r1 F1: events were `ManifestDiff` pre-r1 — r1
+    /// widened to `ManifestEvent` so the post-disconnect
+    /// snapshot reconciliation surfaces in the type system.
+    ///
+    /// Drained per tick by `drain_manifest_watch_events`. Each
+    /// event applies to `TerminalSession.preserved_last_exit`:
+    /// Diff(Exited) sets it unconditionally; Snapshot
+    /// conservatively only fills it when local is None
+    /// (avoids clobbering live broadcasts the TUI processed
+    /// pre-disconnect). Unknown uids are silent no-ops (R5).
+    pub manifest_watch_rx:
+        Option<std::sync::mpsc::Receiver<crate::manifest_watch::ManifestEvent>>,
+    /// 10e-c: thread handle for the manifest.watch consumer. Held
+    /// for the App's lifetime so it isn't auto-joined on Drop;
+    /// the thread is a "daemon" thread reaped by process exit.
+    /// `None` when consumer wasn't spawned.
+    pub _manifest_watch_thread: Option<std::thread::JoinHandle<()>>,
+    /// 11d: receiver from the `events.subscribe` consumer thread.
+    /// Drained per tick by [`App::drain_workflow_watch_events`].
+    /// Carries either a `Snapshot(WorkflowRun)` (one per active
+    /// run on (re)subscribe) or `Event(Event)` (live broadcast).
+    pub workflow_watch_rx:
+        Option<std::sync::mpsc::Receiver<crate::workflow_watch::WorkflowWatchEvent>>,
+    /// 11d: thread handle for the events.subscribe consumer.
+    /// Same lifecycle convention as `_manifest_watch_thread`.
+    pub _workflow_watch_thread: Option<std::thread::JoinHandle<()>>,
+    /// 11g-1: per-run buffer for events delivered via
+    /// `workflow_watch_rx`. `drain_workflow_watch_events` pushes
+    /// each incoming `WorkflowWatchEvent::Event` into the
+    /// deque keyed by `event.run_id` (creating the entry on
+    /// first event for a run). The controller's tick will
+    /// consume from this in 11g-2; in 11g-1 the buffer
+    /// populates alongside the file-tail call so the two paths
+    /// can be parity-checked. Per-run ordering matches the
+    /// daemon's broadcast order, which matches the
+    /// `events.jsonl` append order (broadcast fires post-fsync
+    /// inside `WorkflowEventsWriter::append_event_and_broadcast`).
+    pub pending_workflow_events: HashMap<
+        String,
+        std::collections::VecDeque<cm_daemon::workflow::events::Event>,
+    >,
+    /// 10e-d: per-process de-dup set for cap-kill toasts. A given
+    /// session's cap-kill event can reach the TUI through two
+    /// side-channels — the attach-stream End frame (immediate,
+    /// 10c-e-3b-fix4b) and the manifest.watch diff broadcast
+    /// (eventual, 10e-c). Both paths converge on the activity
+    /// feed via `try_emit_cap_kill_toast`, which checks this set
+    /// first and inserts on emit. The set survives for the
+    /// TUI process lifetime; uids generated by `new_session_uid`
+    /// are monotonic so production never reuses one. The
+    /// `clear_cap_kill_toast_state` helper releases an entry
+    /// (defensive: covers test-paths that reuse uids; not
+    /// required for production correctness).
+    pub cap_kill_toasted: std::collections::HashSet<String>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -2666,6 +2670,16 @@ pub struct ActivityEntry {
 /// orchestration while keeping the buffer cheap. The strip itself only
 /// renders the last few; the rest exist for a future scrollable view.
 const ACTIVITY_LOG_CAP: usize = 50;
+
+/// 10e-d: unified activity-feed summary for daemon-path
+/// cap-kills. Used by both the attach-stream End-frame path and
+/// the manifest.watch Exited-diff path so the user sees the same
+/// string whether they were attached at kill time or not. (The
+/// local-spawn path in `drain_memory_kill_events` keeps its
+/// richer PID/comm/RSS format — different concern, different
+/// surface.)
+pub(crate) const CAP_KILL_TOAST_MESSAGE: &str =
+    "killed by memory cap (daemon session)";
 
 impl App {
     pub fn new(config: Config) -> Self {
@@ -2721,6 +2735,20 @@ impl App {
         }
         let (memory_kill_tx, memory_kill_rx) = std::sync::mpsc::channel();
 
+        // 10e-c: spawn the manifest.watch consumer only when
+        // daemon mode is opt-in active. Without opt-in, the TUI
+        // runs in legacy single-process mode and there's no
+        // daemon to subscribe to; spawning a consumer that
+        // tight-loops trying to dial a non-existent socket would
+        // be wasted work + log noise.
+        let (manifest_watch_rx, _manifest_watch_thread) =
+            crate::manifest_watch::maybe_spawn_for_app();
+        // 11d: spawn the events.subscribe consumer alongside
+        // manifest_watch. Same reconnect-with-backoff shape;
+        // delivers WorkflowEvent broadcasts to the main loop.
+        let (workflow_watch_rx, _workflow_watch_thread) =
+            crate::workflow_watch::maybe_spawn_for_app();
+
         App {
             tasks: Vec::new(),
             workspaces: Vec::new(),
@@ -2753,6 +2781,12 @@ impl App {
             memory_cap_status,
             memory_kill_tx,
             memory_kill_rx,
+            manifest_watch_rx,
+            _manifest_watch_thread,
+            workflow_watch_rx,
+            _workflow_watch_thread,
+            pending_workflow_events: HashMap::new(),
+            cap_kill_toasted: std::collections::HashSet::new(),
         }
     }
 
@@ -2786,6 +2820,258 @@ impl App {
             &self.memory_cap_status,
             &self.memory_kill_tx,
         )
+    }
+
+    /// Slice 10c-e-3: opt-in daemon spawn branch.
+    ///
+    /// When `CM_USE_DAEMON_SOCKET=1`, route the spawn through the
+    /// daemon's RPC dance (`start_session` → `session.attach` →
+    /// dial → `attach.open`) and return a `Session` whose
+    /// `pty_writer` is `None` — `Session::write` falls back through
+    /// the EventLoop's input channel, which encodes keystrokes as
+    /// `StreamKind::Input` frames on the attach socket.
+    ///
+    /// Returns:
+    ///   - `Some(Ok(Session))` — daemon spawn succeeded; caller
+    ///     should use it directly (skip the local PTY path).
+    ///   - `Some(Err(e))` — opt-in was on but the daemon spawn
+    ///     failed. Caller surfaces the error — we DO NOT silently
+    ///     fall back to the local path, because that would mask
+    ///     daemon issues during the smoke test (the opt-in's
+    ///     purpose is to exercise the daemon path end-to-end).
+    ///   - `None` — opt-in is off OR the session_type isn't in the
+    ///     daemon's allowlist (e.g. `gcloud` SSH paths). Caller
+    ///     proceeds with the existing local spawn.
+    ///
+    /// ## Argv parity (slice 10c-e-3b)
+    ///
+    /// The daemon execs argv verbatim — no agent-specific
+    /// reconstruction. We build `argv` and `env` here using the
+    /// same `mcp_config::build_args(SpawnTarget::Daemon, ...)` that
+    /// the local `Session::new` path uses (with `SpawnTarget::TuiLocal`)
+    /// so the spawned child sees `--mcp-config` / Codex MCP
+    /// overrides / `--resume` tokens identically to a local spawn.
+    /// Memory cap wrapping (`wrap_with_systemd_run`) is applied
+    /// here too so the daemon-spawned PTY runs under the same
+    /// scope unit a local cap would produce.
+    ///
+    /// `session_type` is the TUI's own label (`"claude"` / `"codex"`
+    /// / `"bash"`).
+    pub fn try_spawn_via_daemon(
+        &self,
+        session_uid: &str,
+        workspace_id: &str,
+        worktree_path: &Path,
+        session_type: &str,
+        label: &str,
+        resume_session_id: Option<&str>,
+        cols: u16,
+        rows: u16,
+        // Sub-2a Finding #1: caller passes the task_id this
+        // session is being spawned under, so the daemon's
+        // DaemonSession.task_id is set at spawn time. None for
+        // genuinely taskless flows (A-n create_local_session).
+        task_id: Option<&str>,
+        // 10d-2c-1 review round-5 (F1): workflow context at
+        // spawn time, when the caller spawns a daemon-attached
+        // session that's already a workflow participant. `None`
+        // for the regular A-n / A-s paths; the workflow-launch
+        // on existing daemon-attached sessions uses
+        // `rpc_set_workflow_context` after the fact.
+        workflow_run_id: Option<&str>,
+        workflow_role: Option<&str>,
+    ) -> Option<anyhow::Result<Session>> {
+        // 10f: daemon-eligibility is now driven solely by
+        // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
+        // gate sat here; with the daemon always-on it served no
+        // purpose. Map TUI session_type to engine + program
+        // builder. gcloud and other ad-hoc shells aren't daemon-
+        // eligible — fall through to local.
+        let argv_result = match session_type {
+            "claude" => crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::Daemon,
+                &crate::workflow::toml_schema::Engine::ClaudeCode,
+                session_uid,
+                None,
+                resume_session_id,
+            ),
+            "codex" => crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::Daemon,
+                &crate::workflow::toml_schema::Engine::Codex,
+                session_uid,
+                None,
+                resume_session_id,
+            ),
+            "bash" => Ok(("/bin/bash".to_string(), Vec::new())),
+            _ => return None,
+        };
+        let (program, args) = match argv_result {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(Err(anyhow::anyhow!(
+                    "build_args(SpawnTarget::Daemon) for {} failed: {}",
+                    session_type,
+                    e
+                )));
+            }
+        };
+
+        // Memory cap wrap (slice 10c-e-3b parity). Same resolution
+        // the local `spawn_agent_session` path uses — preflight
+        // status × per-engine config bytes. When the cap is
+        // None, `wrap_with_systemd_run` is a passthrough.
+        let memory_cap = match (
+            &self.memory_cap_status,
+            self.config.memory_cap_for(session_type),
+        ) {
+            (
+                crate::memory_cap::MemoryCapAvailability::Available { cgroup_prefix },
+                Some((soft_bytes, hard_bytes)),
+            ) => Some(crate::memory_cap::MemoryCap {
+                soft_bytes,
+                hard_bytes,
+                session_uid: session_uid.to_string(),
+                cgroup_prefix: cgroup_prefix.clone(),
+            }),
+            _ => None,
+        };
+        let (final_program, final_args, cgroup_path) =
+            crate::session::wrap_with_systemd_run(&program, &args, &memory_cap);
+
+        // Compose final argv as Vec<String> for the wire.
+        let mut argv = Vec::with_capacity(final_args.len() + 1);
+        argv.push(final_program);
+        argv.extend(final_args);
+
+        // Daemon-spawned child's process env. Mirrors what the
+        // local `spawn_agent_session` injects (CM_TUI_SESSION_ID
+        // is the only one — the MCP routing pin lives in the MCP
+        // config file via `build_args` above, not in the parent
+        // process env). The daemon also defensively re-pins
+        // CM_TUI_SESSION_ID on its side; sending it here makes
+        // the wire shape self-contained.
+        let mut env: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
+
+        let daemon_socket = cm_daemon::default_socket_path();
+        // Memory-cap wire fields (slice 10c-e-3b-fix2). When
+        // `memory_cap` is Some, the soft byte count signals the
+        // daemon to populate `SpawnParams.kills_dir`, and the
+        // cgroup_path round-trips back so the TUI's `Session`
+        // sees the same predicted path the local-spawn helper
+        // produces.
+        let memory_cap_bytes = memory_cap.as_ref().map(|c| c.soft_bytes);
+        // Slice 10d-mcp-surface-1 fix #1: map TUI's session_type
+        // ("claude" / "codex" / "bash") to the canonical wire
+        // vocabulary the Python MCP tool dispatches on
+        // ("claude-code" / "codex" / "bash"). The branches above
+        // already gate to these three values; any other type
+        // would have early-returned None from this function.
+        let wire_session_type = match session_type {
+            "claude" => "claude-code",
+            "codex" => "codex",
+            "bash" => "bash",
+            // The branch above returns None for anything else,
+            // so this arm is unreachable in production; default
+            // defensively rather than panic.
+            other => other,
+        };
+        let config = crate::client_session::ClientSessionConfig {
+            daemon_socket: &daemon_socket,
+            // Shared secret presented to the daemon's operator
+            // auth (see `cm_daemon::control::operator`). Loaded at
+            // TUI startup by `daemon_launch::load_or_create_operator_token`
+            // and persisted to `~/.cm/operator-token`; the daemon
+            // reads the same value from its `CM_OPERATOR_TOKEN`
+            // spawn env.
+            operator_token_id: crate::daemon_launch::operator_token(),
+            // Slice 10c-e-3b-fix: TUI is source of truth for uid.
+            // The same uid is already baked into the MCP config
+            // (CM_TUI_SESSION_ID env block written above by
+            // build_args). The daemon validates format + checks
+            // collision but otherwise uses this verbatim.
+            uid: session_uid,
+            workspace_id,
+            label,
+            session_type: wire_session_type,
+            argv: &argv,
+            working_dir: worktree_path,
+            env,
+            cols,
+            rows,
+            memory_cap_bytes,
+            // Sub-2b-3 review-fix #1: send the hard cap byte
+            // count + cgroup_prefix so the daemon can re-wrap
+            // argv for descendant `mcp_start_session` spawns
+            // and the subtask inherits the cap. Pre-fix only
+            // the soft byte count flowed.
+            memory_cap_hard_bytes: memory_cap.as_ref().map(|c| c.hard_bytes),
+            cgroup_prefix: memory_cap.as_ref().map(|c| c.cgroup_prefix.as_path()),
+            cgroup_path: cgroup_path.as_deref(),
+            // Auto-register the workspace if the daemon doesn't
+            // know about it yet (pre-10e bridge). Always pass —
+            // the daemon ignores the hint when the workspace is
+            // already registered.
+            worktree_path: Some(worktree_path),
+            // Sub-2a Finding #1: thread task_id so the daemon
+            // records it on DaemonSession.task_id. Without it,
+            // every daemon-spawned session looks taskless and
+            // tasked agents fall into the same-workspace-allow
+            // branch — re-introducing the widening sub-2a closes.
+            task_id,
+            // Sub-2b-1: transcript_path is None at spawn time
+            // for fresh sessions; the TUI's existing post-spawn
+            // detector (`pending_jsonl_files`) discovers the
+            // path later. A follow-up will push it to the daemon
+            // via a `session.set_transcript_path` RPC. Until
+            // then daemon's `resolve_authorized_session` returns
+            // `pending` and the Python tool polls.
+            transcript_path: None,
+            // 10d-2c-1 review round-5 (F1): callers that spawn a
+            // workflow participant with workflow context already
+            // known pass these. A-n / A-s spawns from the regular
+            // sidebar paths pass `None`; the after-the-fact
+            // tagging path (workflow launched on this session
+            // later) uses `rpc_set_workflow_context` instead.
+            workflow_run_id,
+            workflow_role,
+        };
+        Some(crate::session::Session::new_attached(config))
+    }
+
+    /// 10e-d: idempotent cap-kill toast emission. Both the
+    /// attach-stream End-frame path (10c-e-3b-fix4b) and the
+    /// manifest.watch Exited-diff path (10e-c) converge here,
+    /// so a session that's daemon-attached at kill time gets a
+    /// single activity-feed entry regardless of which path
+    /// arrives first.
+    ///
+    /// De-dup is per-uid for the TUI process lifetime via
+    /// `cap_kill_toasted`. Production uids are monotonic
+    /// (`new_session_uid`), so the set entry stays valid for
+    /// the session's whole existence. `clear_cap_kill_toast_state`
+    /// is the defensive escape hatch for uid reuse (test paths).
+    ///
+    /// Returns `true` if a toast was actually emitted this call.
+    /// Useful for tests that pin the call-vs-suppress contract.
+    pub fn try_emit_cap_kill_toast(&mut self, uid: &str) -> bool {
+        if self.cap_kill_toasted.contains(uid) {
+            return false;
+        }
+        self.cap_kill_toasted.insert(uid.to_string());
+        self.log_activity(uid, CAP_KILL_TOAST_MESSAGE.to_string());
+        true
+    }
+
+    /// 10e-d: release the cap-kill de-dup entry for a uid so a
+    /// re-spawned session under the same uid can toast again.
+    /// In production `new_session_uid()` returns fresh monotonic
+    /// ids so this is a no-op; the helper exists for test-paths
+    /// that simulate the re-spawn case, and as a defensive hook
+    /// for spawn sites.
+    pub fn clear_cap_kill_toast_state(&mut self, uid: &str) {
+        self.cap_kill_toasted.remove(uid);
     }
 
     /// Append a Phase 6 activity-feed entry. `caller_uid` is resolved to
@@ -3095,6 +3381,15 @@ impl App {
                     task_id: ts.task_id.clone(),
                     notify_on_idle: ts.notify_on_idle,
                     seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
+                    // Read-modify-write the daemon-owned `last_exit`.
+                    // The TUI never inspects or mutates it — just
+                    // hands it back unchanged so the daemon's
+                    // `memory_cap_kill: true` flag survives every
+                    // TUI save. Without this, the named acceptance
+                    // criterion (detached cap-kill toast on
+                    // reattach) breaks the moment the TUI saves
+                    // after the daemon writes.
+                    last_exit: ts.preserved_last_exit.clone(),
                 })
                 .collect();
             workspaces.insert(
@@ -3145,6 +3440,21 @@ impl App {
                 );
             }
         }
+
+        // 10d-1: every session-list mutation site is required by
+        // the convention at the top of the helper section to
+        // call `save_session_manifest` before returning Ok (see
+        // the doc comment on the `start_session_for_new_task`
+        // family). That makes this the single canonical funnel
+        // for "session list / per-session fields changed";
+        // pushing the snapshot to the daemon here gives the
+        // 10d-2 auth consumer universal coverage without a
+        // call-site audit. Cost: one extra local UDS round-trip
+        // per save (opt-in gated; sub-ms vs. the disk write
+        // above). Failure surfaces via the helper's own
+        // `eprintln!` (round-11 invariant: don't silently
+        // swallow under opt-in).
+        self.push_tui_sessions_to_daemon();
     }
 
     /// Load session manifest from disk. On parse failure, the corrupt file is
@@ -3212,6 +3522,21 @@ impl App {
             .filter_map(|w| w.worktree_path.clone())
             .collect();
 
+        // 10d-3 R3 recovery (round-2 ordering fix): compute the
+        // active-runs set BEFORE the spawn loop so we can untag
+        // stale `workflow_run_id` / `workflow_role` on manifest
+        // entries IN-PLACE before `spawn_restored_session` reads
+        // them into the agent's MCP env. Pre-r2 the reconciliation
+        // ran after spawn, so a restored agent had stale
+        // `CM_WORKFLOW_RUN_ID` / `CM_ROLE` env vars pointing at a
+        // now-Detached run. The pre-r2 reconciliation step (below
+        // the spawn loop) is replaced by this in-place cleanup.
+        let active_run_ids: std::collections::HashSet<String> = self
+            .workflow_runs
+            .iter()
+            .map(|r| r.run_id.clone())
+            .collect();
+
         // Rebuild self.workspaces from the manifest. Closed workspaces are
         // loaded with empty sessions (their PTY state is gone anyway).
         for (_, mw) in manifest.workspaces.iter() {
@@ -3270,8 +3595,18 @@ impl App {
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
+                    // 10d-3 R3 in-place untag: if this session's
+                    // workflow_run_id references a non-active
+                    // run (Detached/Done), clone the entry and
+                    // clear the tags before spawning. Without
+                    // this the spawned agent inherits stale
+                    // `CM_WORKFLOW_RUN_ID` / `CM_ROLE` in its
+                    // MCP env (set by `mcp_config::WorkflowMeta`
+                    // at spawn time).
+                    let cleaned = untag_stale_workflow(entry, &active_run_ids);
+                    let entry_to_spawn = cleaned.as_ref().unwrap_or(entry);
                     let ts = Self::spawn_restored_session(
-                        entry,
+                        entry_to_spawn,
                         &ws,
                         (cols, rows),
                         &self.config,
@@ -3285,6 +3620,15 @@ impl App {
             }
             self.workspaces.push(ws);
         }
+
+        // (10d-3 R3 recovery moved to in-place pre-spawn untag
+        // above; see the `active_run_ids` block + `cleaned_entry`
+        // Cow. Pre-r2 the untag ran HERE — after the spawn loop —
+        // which meant `spawn_restored_session` had already fed
+        // stale `workflow_run_id` / `workflow_role` into the
+        // agent's MCP env via `WorkflowMeta`. Now the cleaning
+        // happens on the `ManifestEntry` clone passed into spawn,
+        // so the MCP env never sees a stale tag.)
 
         // Apply task bindings onto any existing TaskEntries (from the API
         // fetch). Tasks that aren't in self.tasks yet (task still backlog
@@ -3307,6 +3651,22 @@ impl App {
                 break;
             }
         }
+
+        // 10d-1 startup-ordering fix: `drain_backend_events` fires
+        // `reconcile_tasks` BEFORE this hydration runs on the first
+        // `TasksUpdated`, and that path's `push_state_to_daemon`
+        // call would otherwise send the daemon a full-replace
+        // snapshot of empty `tui_sessions` plus a workspaces map
+        // missing every restored entry — semantically a lie about
+        // TUI state, and once 10d-2 wires the workflow-method auth
+        // consumer to `tui_sessions`, every TUI-minted session
+        // restored from manifest would be rejected as "caller
+        // session not found" until some later mutation triggered a
+        // re-push. Push here so the populated state always lands.
+        // Idempotent: the second push fully replaces the first
+        // (full-replace semantics — see
+        // `rpc_tui_update_sessions_snapshot_full_replace`).
+        self.push_state_to_daemon();
     }
 
     /// Spawn a session from a ManifestEntry within a Workspace context.
@@ -3380,6 +3740,7 @@ impl App {
                 _ => None,
             };
             match crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &engine,
                 &session_uid_for_mcp,
                 workflow_meta,
@@ -3474,6 +3835,10 @@ impl App {
             created_at: Instant::now(),
             managed_by_uid: entry.managed_by_uid.clone(),
             seeded_from_snapshot: entry.seeded_from_snapshot.clone(),
+            // Preserve the daemon-written `last_exit` across the
+            // load. The TUI doesn't yet inspect it; this passthrough
+            // ensures the next save doesn't clobber it to None.
+            preserved_last_exit: entry.last_exit.clone(),
         })
     }
 
@@ -3872,6 +4237,7 @@ impl App {
                 "claude" => {
                     let resume = tomb.last_transcript_id.as_deref();
                     let (program, args) = match crate::mcp_config::build_args(
+                        crate::mcp_config::SpawnTarget::TuiLocal,
                         &workflow::toml_schema::Engine::ClaudeCode,
                         &session_uid,
                         None,
@@ -3901,6 +4267,7 @@ impl App {
                 "codex" => {
                     let resume = tomb.last_transcript_id.as_deref();
                     let (program, args) = match crate::mcp_config::build_args(
+                        crate::mcp_config::SpawnTarget::TuiLocal,
                         &workflow::toml_schema::Engine::Codex,
                         &session_uid,
                         None,
@@ -4080,6 +4447,7 @@ impl App {
             let task_id = tomb.task_id.clone();
 
             let (program, args) = match crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &workflow::toml_schema::Engine::ClaudeCode,
                 &uid,
                 None,
@@ -4668,6 +5036,13 @@ impl App {
             sid: String,
             workflow: Option<(String, String)>,
             old_sid: Option<String>,
+            /// Sub-2b-1 review #1: workspace + session index of
+            /// the bound session, so the post-binding-loop
+            /// daemon push can reach the immutable
+            /// `&Workspace`/`&TerminalSession` without
+            /// re-resolving via `ws_id`.
+            ws_index: usize,
+            session_index: usize,
         }
         let mut sid_detections: Vec<DetectedSid> = Vec::new();
         let mut manifest_needs_save = false;
@@ -4693,6 +5068,15 @@ impl App {
         // Collected here and applied after the loop because we cannot borrow
         // `&mut self.status_msg` while iterating `&mut self.workspaces`.
         let mut write_failure_notes: Vec<String> = Vec::new();
+        // 10e-d: cap-kill uids observed via the attach-stream
+        // End frame path. Collected here for the same borrow-shape
+        // reason as `write_failure_notes` — the de-dup +
+        // activity-feed mutation happens outside the workspaces
+        // loop via `try_emit_cap_kill_toast`, which also marks
+        // `cap_kill_toasted` so the matching manifest.watch
+        // broadcast (which arrives via a separate channel) is
+        // suppressed.
+        let mut cap_kill_notes: Vec<String> = Vec::new();
         for (wi, ws) in self.workspaces.iter_mut().enumerate() {
             for (si, ts) in ws.sessions.iter_mut().enumerate() {
                 let is_focused = focused_idx == Some((wi, si));
@@ -4701,6 +5085,33 @@ impl App {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
                             ts.session.exited = true;
                             visible_dirty = true;
+                            // Slice 10c-e-3b-fix4b (+ 10e-d
+                            // unification): daemon-attached
+                            // cap-kill toast. The reader half of
+                            // the attach stream latches
+                            // `memory_cap_kill` into this Arc
+                            // BEFORE delivering the exit event
+                            // (slice-10c-e-2 review-5 fix #2b
+                            // ordering), so by the time we observe
+                            // `Exit`/`ChildExit` here the flag is
+                            // already populated. Read-and-clear via
+                            // `swap(false, SeqCst)`; if true,
+                            // queue the uid for the post-loop
+                            // emit. The post-loop call to
+                            // `try_emit_cap_kill_toast` handles
+                            // BOTH activity-feed insertion AND the
+                            // cap_kill_toasted set-marking that
+                            // suppresses a duplicate toast when
+                            // the same uid's manifest.watch
+                            // broadcast arrives.
+                            if let Some(flag) =
+                                ts.session.daemon_memory_cap_kill.as_ref()
+                            {
+                                use std::sync::atomic::Ordering;
+                                if flag.swap(false, Ordering::SeqCst) {
+                                    cap_kill_notes.push(ts.uid.clone());
+                                }
+                            }
                         }
                         TermEvent::Title(title) => {
                             ts.session.title = title;
@@ -4980,10 +5391,31 @@ impl App {
                         sid,
                         workflow,
                         old_sid,
+                        // Sub-2b-1 review #1: carry (wi, si)
+                        // so the post-loop daemon push can
+                        // reach the immutable workspace+session
+                        // without re-resolving via ws_id.
+                        ws_index: wi,
+                        session_index: si,
                     });
                     manifest_needs_save = true;
                 }
             }
+        }
+
+        // Sub-2b-1 review #1: now that the mutable
+        // binding-loop scope has ended, push the resolved
+        // transcript_path to the daemon for each
+        // freshly-detected (or rebound) sid. Immutable borrow
+        // is now safe.
+        for detected in &sid_detections {
+            let Some(ws) = self.workspaces.get(detected.ws_index) else {
+                continue;
+            };
+            let Some(ts) = ws.sessions.get(detected.session_index) else {
+                continue;
+            };
+            Self::push_transcript_path_to_daemon_if_attached(ts, ws);
         }
 
         // Sync any newly detected session_ids to the DB. Resolve each ws_id
@@ -5011,8 +5443,34 @@ impl App {
                     detected.old_sid.as_deref(),
                     &detected.sid,
                 ) {
-                    if let Some(run) = self.workflow_runs.iter().find(|r| &r.run_id == run_id) {
-                        let _ = workflow::run::save(run);
+                    // 10d-2c-1 review round-6 (F1): apply the
+                    // same field-level mutations to the on-disk
+                    // run so a concurrent daemon write (active
+                    // role, iteration, status) survives the
+                    // RMW. TUI owns role_sessions /
+                    // role_baselines / current-active-role's
+                    // history.last() correlation — daemon owns
+                    // everything else.
+                    let new_sid = detected.sid.clone();
+                    let old_sid = detected.old_sid.clone();
+                    let role_owned = role.clone();
+                    let run_id_owned = run_id.clone();
+                    let run_id_for_closure = run_id_owned.clone();
+                    let updated = workflow::run::modify(&run_id_owned, move |r| {
+                        note_workflow_transcript_binding(
+                            std::slice::from_mut(r),
+                            &run_id_for_closure,
+                            &role_owned,
+                            old_sid.as_deref(),
+                            &new_sid,
+                        );
+                    });
+                    if let Ok(updated) = updated {
+                        if let Some(slot) =
+                            self.workflow_runs.iter_mut().find(|r| &r.run_id == run_id)
+                        {
+                            *slot = updated;
+                        }
                     }
                     if let Some(old_sid) = detected.old_sid.as_deref() {
                         log_tick(
@@ -5050,6 +5508,18 @@ impl App {
         // see *something*, not every individual failure.
         if let Some(note) = write_failure_notes.into_iter().next_back() {
             self.set_status_msg(&note);
+        }
+
+        // 10c-e-3b-fix4b + 10e-d: route attach-stream-detected
+        // cap-kills through `try_emit_cap_kill_toast`. The helper
+        // is idempotent and marks `cap_kill_toasted` so the
+        // matching manifest.watch broadcast (arriving via a
+        // different channel — see `apply_manifest_diff` /
+        // `apply_manifest_snapshot`) for the same uid produces
+        // exactly ONE activity-feed entry regardless of arrival
+        // order.
+        for uid in cap_kill_notes {
+            self.try_emit_cap_kill_toast(&uid);
         }
 
         // Poll `~/.claude/history.jsonl` for `/clear` and `/compact` events
@@ -5146,25 +5616,42 @@ impl App {
             // the old file applied to the new file).
             self.workspaces[r.wi].sessions[r.si]
                 .rebind_transcript(Some(r.new_sid.clone()));
+            // Sub-2b-1 review-r#2 #3: history rotation
+            // changes the transcript file on disk; daemon
+            // must learn the new path so its
+            // `resolve_authorized_session` continues returning
+            // the live file (and bumps its own `generation`
+            // for cursor invalidation).
+            if let Some(ws) = self.workspaces.get(r.wi) {
+                if let Some(ts) = ws.sessions.get(r.si) {
+                    Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                }
+            }
             // Workflow-specific bookkeeping only when the session is a
             // workflow participant — non-workflow rebinds just need the
             // transcript_id swap + generation bump above.
             if let Some((run_id, role)) = &r.workflow {
-                if let Some(run) =
-                    self.workflow_runs.iter_mut().find(|run| &run.run_id == run_id)
-                {
-                    if let Some(b) = run.role_sessions.get_mut(role) {
-                        b.current_session_id = Some(r.new_sid.clone());
+                // 10d-2c-1 review round-6 (F1): apply the TUI-owned
+                // mutations through `modify` so concurrent daemon
+                // writes (active_role / iteration / status /
+                // events_offset) on the same run survive the RMW.
+                // The closure is field-targeted: role_sessions[*],
+                // role_baselines, and the active role's history-
+                // last() correlation — all TUI territory. Daemon-
+                // owned fields are untouched.
+                let new_sid = r.new_sid.clone();
+                let role_owned = role.clone();
+                let updated = workflow::run::modify(run_id, move |run| {
+                    apply_history_rotation_to_run(run, &role_owned, &new_sid);
+                });
+                if let Ok(updated) = updated {
+                    if let Some(slot) = self
+                        .workflow_runs
+                        .iter_mut()
+                        .find(|run| &run.run_id == run_id)
+                    {
+                        *slot = updated;
                     }
-                    run.role_baselines
-                        .insert(role.clone(), workflow::run::MessageBaseline::default());
-                    if run.active_role.as_deref() == Some(role.as_str()) {
-                        if let Some(h) = run.history.last_mut() {
-                            h.assistant_count_at_start = 0;
-                            h.session_id = Some(r.new_sid.clone());
-                        }
-                    }
-                    let _ = workflow::run::save(run);
                     log_tick(
                         run_id,
                         &format!(
@@ -5300,11 +5787,26 @@ impl App {
     ) -> crate::control::protocol::Response {
         use crate::control::methods;
         use crate::control::protocol::{ErrorCode, Response};
-        let caller = req.caller.session_uid.as_str();
+        // Every method currently dispatched here is session-scoped (the
+        // pre-Phase-1 surface). Operator-only methods (session.attach,
+        // attach.open) land in a later slice and short-circuit before
+        // reaching this match; rejecting Operator callers here keeps the
+        // existing methods exactly as strict as they were when `Caller`
+        // was a flat struct.
+        let caller = match req.caller.session_uid() {
+            Some(uid) => uid,
+            None => {
+                return Response::err(
+                    req.id.clone(),
+                    ErrorCode::Unauthorized,
+                    "method requires a session-scoped caller",
+                );
+            }
+        };
         let result: methods::MethodResult = match req.method.as_str() {
             "ping" => Ok(serde_json::json!({
                 "pong": true,
-                "uid": req.caller.session_uid,
+                "uid": caller,
             })),
             "resolve_authorized_session" => {
                 methods::resolve_authorized_session(self, caller, &req.params)
@@ -5387,8 +5889,13 @@ impl App {
                 "codex" => workflow::toml_schema::Engine::Codex,
                 _ => workflow::toml_schema::Engine::ClaudeCode,
             };
-            let (program, args) =
-                crate::mcp_config::build_args(&engine, &session_uid, None, None)?;
+            let (program, args) = crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
+                &engine,
+                &session_uid,
+                None,
+                None,
+            )?;
             let pending = match engine {
                 workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
                 workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
@@ -5444,6 +5951,7 @@ impl App {
             created_at: Instant::now(),
             managed_by_uid: Some(caller_uid.to_string()),
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         };
         self.workspaces[ws_index].sessions.push(ts);
         self.save_session_manifest();
@@ -5493,6 +6001,292 @@ impl App {
                 } => (session_uid, format!("memory cap kill failed: {}", reason)),
             };
             self.log_activity(&caller, summary);
+        }
+    }
+
+    /// 10e-c: drain the manifest.watch consumer's channel and
+    /// apply each diff to in-memory TUI state. Called per tick
+    /// from the main loop. No-op when the consumer wasn't
+    /// spawned (legacy single-process mode — `manifest_watch_rx`
+    /// is `None`).
+    pub fn drain_manifest_watch_events(&mut self) {
+        // Collect first so we can `&mut self` apply without
+        // holding the immutable `Receiver` borrow across the
+        // mutating call. mpsc::Receiver doesn't lend itself to
+        // splitting borrows; the drain → buffer → apply shape
+        // is the canonical Rust workaround.
+        let mut events: Vec<crate::manifest_watch::ManifestEvent> = Vec::new();
+        if let Some(rx) = self.manifest_watch_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Consumer thread exited (App being
+                        // dropped, or the consumer hit its own
+                        // SendError exit path — though that
+                        // fires on OUR side dropping the rx, so
+                        // this branch is mostly "consumer died
+                        // for some reason"). Either way, no more
+                        // events incoming; stop draining.
+                        break;
+                    }
+                }
+            }
+        }
+        for ev in events {
+            match ev {
+                crate::manifest_watch::ManifestEvent::Diff(diff) => {
+                    self.apply_manifest_diff(diff);
+                }
+                crate::manifest_watch::ManifestEvent::Snapshot(payload) => {
+                    self.apply_manifest_snapshot(payload);
+                }
+            }
+        }
+    }
+
+    /// 11d: drain the events.subscribe consumer's channel.
+    /// Called per tick from the main loop. Snapshot frames apply
+    /// conservative-merge: the daemon's `WorkflowRun` becomes
+    /// authoritative for fields the TUI hasn't observed yet
+    /// (history past local `events_offset`); local in-memory
+    /// state wins for everything else (mirrors 10e-c r1 F1).
+    /// Event frames append to the run's history via the same
+    /// per-event tail logic the file-watcher path uses today —
+    /// in 11d they're forwarded raw to the workflow controller's
+    /// existing tail-observer entry point so 11e's file-tail
+    /// removal swaps the source without touching the apply
+    /// pipeline.
+    pub fn drain_workflow_watch_events(&mut self) {
+        let mut events: Vec<crate::workflow_watch::WorkflowWatchEvent> = Vec::new();
+        if let Some(rx) = self.workflow_watch_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        for ev in events {
+            match ev {
+                crate::workflow_watch::WorkflowWatchEvent::Snapshot(run) => {
+                    self.apply_workflow_watch_snapshot(run);
+                }
+                crate::workflow_watch::WorkflowWatchEvent::Event(event) => {
+                    // 11g-1: push the channel event into the per-run
+                    // buffer. File-tail in the controller's tick
+                    // remains the production source of truth through
+                    // 11g-1; the buffer populates in parallel so
+                    // 11g-2 can flip the controller to consume from
+                    // it. Per-run deque preserves the daemon's
+                    // broadcast order (= events.jsonl append order
+                    // by Option B post-fsync ordering).
+                    self.pending_workflow_events
+                        .entry(event.run_id.clone())
+                        .or_default()
+                        .push_back(event);
+                    self.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    /// 11g-1: drain the per-run pending-events buffer for
+    /// `run_id`, returning the events in FIFO order. Empty Vec
+    /// when no events are pending for the run (or the run has
+    /// never had any). Callers (controller's tick in 11g-2) get
+    /// ownership of the events; the buffer entry is left empty
+    /// but present (cheaper than re-inserting on the next push).
+    ///
+    /// Front-push helper for 11g-2 retry-on-failure: a failed
+    /// decision can re-push the source event at the front via
+    /// `requeue_pending_workflow_event_front` so the next tick
+    /// re-processes it.
+    pub fn take_pending_workflow_events(
+        &mut self,
+        run_id: &str,
+    ) -> Vec<cm_daemon::workflow::events::Event> {
+        match self.pending_workflow_events.get_mut(run_id) {
+            Some(deque) => deque.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 11g-1: push an event back at the FRONT of the per-run
+    /// buffer. Used by the 11g-2 retry path: a failed decision
+    /// re-pushes its source event so the next tick retries the
+    /// same event under the existing `failed_runs` gating.
+    /// Same retry semantics as today's "leave events_offset
+    /// un-advanced" pattern.
+    pub fn requeue_pending_workflow_event_front(
+        &mut self,
+        run_id: &str,
+        event: cm_daemon::workflow::events::Event,
+    ) {
+        self.pending_workflow_events
+            .entry(run_id.to_string())
+            .or_default()
+            .push_front(event);
+    }
+
+    /// 11d: apply a snapshot frame from `events.subscribe`. The
+    /// daemon's `WorkflowRun` is authoritative for the post-
+    /// (re)subscribe view; the TUI's local state-machine driver
+    /// (controller) holds in-memory continuations the daemon
+    /// doesn't see (e.g. activation-prompt scheduling). The
+    /// conservative-merge rule: ONLY insert when local has no
+    /// entry; do NOT overwrite when both sides have one — the
+    /// local entry has already absorbed live diffs that the
+    /// daemon's snapshot may not reflect yet. This mirrors
+    /// 10e-c r1 F1's conservative-merge for manifest snapshots.
+    pub(crate) fn apply_workflow_watch_snapshot(
+        &mut self,
+        run: cm_daemon::workflow::run::WorkflowRun,
+    ) {
+        let already_present = self
+            .workflow_runs
+            .iter()
+            .any(|r| r.run_id == run.run_id);
+        if !already_present {
+            self.workflow_runs.push(run);
+            self.needs_redraw = true;
+        }
+    }
+
+    /// 10e-c r1 F1: apply a post-(re)connect snapshot.
+    /// Conservative-merge per uid:
+    ///   - If the snapshot has `Some(last_exit)` AND the local
+    ///     session's `preserved_last_exit` is `None`, adopt the
+    ///     snapshot's value. This is the load-bearing case: a
+    ///     disconnect window during which the daemon broadcast
+    ///     `Exited` diffs we missed — the snapshot recovers them.
+    ///   - If the local is already `Some`, leave it. The TUI
+    ///     either processed the broadcast live OR loaded the
+    ///     value from disk at startup; either way it's already
+    ///     authoritative locally.
+    ///   - If the snapshot has `None` for a uid, no-op (no
+    ///     `Some → None` regression).
+    ///
+    /// R5 still applies: snapshot entries for uids the TUI
+    /// doesn't track are silently ignored (untagged-session
+    /// case — daemon's snapshot may reflect sessions in
+    /// workspaces this TUI hasn't loaded yet).
+    pub(crate) fn apply_manifest_snapshot(
+        &mut self,
+        snapshot: crate::manifest_watch::ManifestSnapshotPayload,
+    ) {
+        // 10e-d: collect uids we adopted with memory_cap_kill=true
+        // so we can fire toasts AFTER the workspaces-iteration
+        // is done — avoids the &mut self contention from calling
+        // try_emit_cap_kill_toast (which mutates activity_log)
+        // inside the iteration.
+        //
+        // Toast IFF the conservative-merge actually adopted. T28
+        // (local already Some) is naturally handled: the inner
+        // if-None branch doesn't fire so we don't push the uid.
+        // T27 (None → Some(cap=true)) lands here.
+        let mut adopted_cap_kills: Vec<String> = Vec::new();
+        for (uid, snap_last_exit) in snapshot.session_last_exits {
+            let Some(snap) = snap_last_exit else {
+                continue;
+            };
+            let cap_kill = snap.memory_cap_kill;
+            for ws in &mut self.workspaces {
+                for ts in &mut ws.sessions {
+                    if ts.uid == uid {
+                        if ts.preserved_last_exit.is_none() {
+                            ts.preserved_last_exit = Some(snap.clone());
+                            self.needs_redraw = true;
+                            if cap_kill {
+                                adopted_cap_kills.push(uid.clone());
+                            }
+                        }
+                        // Inner break: we found the matching
+                        // session in this workspace, no need to
+                        // keep walking it. Outer loop continues
+                        // to the next uid (a snapshot uid
+                        // appears in at most one workspace).
+                        break;
+                    }
+                }
+            }
+        }
+        for uid in adopted_cap_kills {
+            self.try_emit_cap_kill_toast(&uid);
+        }
+    }
+
+    /// 10e-c: apply a single `ManifestDiff` to in-memory state.
+    /// Extracted from `drain_manifest_watch_events` so tests can
+    /// drive the application logic without spinning up the
+    /// consumer thread + a fake daemon listener.
+    ///
+    /// 10e-c scope: only `Exited` is consumed. The other variants
+    /// (Added / Updated / Tombstoned) are no-ops — they're for
+    /// 10e-d / 10f to consume when broader manifest sync lands.
+    /// Unknown uids are silent no-ops (R5 from the 10e plan).
+    ///
+    /// 10e-d: when the diff's `last_exit.memory_cap_kill` is true,
+    /// dispatch the unified daemon-path cap-kill toast via
+    /// `try_emit_cap_kill_toast`. The helper is idempotent — a
+    /// duplicate `Exited` diff (network replay, snapshot+diff
+    /// overlap) emits once. The attach-stream path
+    /// (`drain_terminal_events`) shares the same `cap_kill_toasted`
+    /// set, so a session that was attached at kill time only
+    /// toasts once regardless of arrival order.
+    pub(crate) fn apply_manifest_diff(
+        &mut self,
+        diff: cm_daemon::manifest::ManifestDiff,
+    ) {
+        use cm_daemon::manifest::ManifestDiff;
+        match diff {
+            ManifestDiff::Exited { uid, last_exit } => {
+                let memory_cap_kill = last_exit.memory_cap_kill;
+                let mut found = false;
+                'outer: for ws in &mut self.workspaces {
+                    for ts in &mut ws.sessions {
+                        if ts.uid == uid {
+                            ts.preserved_last_exit = Some(last_exit);
+                            // Status may visibly change (cap-kill
+                            // toast surfacing in 10e-d below reads
+                            // memory_cap_kill on the diff). Mark
+                            // dirty so the next render picks up
+                            // any indicator changes.
+                            self.needs_redraw = true;
+                            found = true;
+                            // Break both loops via label so
+                            // `last_exit`'s move into the assignment
+                            // above happens exactly once (rustc
+                            // E0382 sees nested-break as a
+                            // potential double-move otherwise).
+                            break 'outer;
+                        }
+                    }
+                }
+                if found && memory_cap_kill {
+                    // 10e-d: route through the de-dup'd helper so
+                    // a daemon-attached session's matching attach-
+                    // stream toast (or vice versa) doesn't double-
+                    // fire. Out-of-loop call so &mut self isn't
+                    // contended by the workspaces iteration above.
+                    self.try_emit_cap_kill_toast(&uid);
+                }
+                // R5: untracked uid — `found` stays false; silent
+                // no-op. The diff referenced a session the TUI
+                // doesn't know about (e.g. a session the daemon
+                // spawned via MCP into a workspace this TUI
+                // hasn't loaded; future divergence cases). No
+                // panic, no log, no toast.
+            }
+            ManifestDiff::Added { .. }
+            | ManifestDiff::Updated { .. }
+            | ManifestDiff::Tombstoned { .. } => {
+                // 10e-c scope: only Exited carries the named-
+                // criterion field (memory_cap_kill). Other
+                // variants land in future slices' consumers.
+            }
         }
     }
 
@@ -5600,20 +6394,45 @@ impl App {
             ts.pending_jsonl_files = None;
             ts.last_delivery = None;
             if let (Some(run_id), Some(role)) = (run_id, role) {
-                if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-                    if let Some(b) = run.role_sessions.get_mut(&role) {
-                        b.current_session_id = Some(sid.clone());
+                // 10d-2c-1 review round-6 (F1): mutate-via-modify
+                // so a concurrent daemon write doesn't get
+                // overwritten. TUI-owned fields only:
+                // role_sessions[role].current_session_id, and
+                // the active role's last history entry's
+                // session_id correlation.
+                let sid_owned = sid.clone();
+                let role_owned = role.clone();
+                let updated = workflow::run::modify(&run_id, move |r| {
+                    if let Some(b) = r.role_sessions.get_mut(&role_owned) {
+                        b.current_session_id = Some(sid_owned.clone());
                     }
-                    if run.active_role.as_deref() == Some(role.as_str()) {
-                        if let Some(h) = run.history.last_mut() {
-                            h.session_id = Some(sid.clone());
+                    if r.active_role.as_deref() == Some(role_owned.as_str()) {
+                        if let Some(h) = r.history.last_mut() {
+                            h.session_id = Some(sid_owned.clone());
                         }
                     }
-                    let _ = workflow::run::save(run);
+                });
+                if let Ok(updated) = updated {
+                    if let Some(slot) =
+                        self.workflow_runs.iter_mut().find(|r| r.run_id == run_id)
+                    {
+                        *slot = updated;
+                    }
                     log_tick(
                         &run_id,
                         &format!("delivery-correlated: role={} sid={}", role, sid),
                     );
+                }
+            }
+            // Sub-2b-1 review #1: same as the discovery loop —
+            // push the resolved transcript_path to the daemon
+            // so its resolver flips pending → ready. Drop the
+            // mutable borrow on `ts` (assigned above), then
+            // re-borrow immutably via index.
+            let _ = ts;
+            if let Some(ws) = self.workspaces.get(wi) {
+                if let Some(ts) = ws.sessions.get(si) {
+                    Self::push_transcript_path_to_daemon_if_attached(ts, ws);
                 }
             }
         }
@@ -5880,6 +6699,13 @@ impl App {
             }
         }
         self.clamp_cursor();
+        // Sub-2a Finding #1: push the refreshed task tree to the
+        // daemon. Covers TasksUpdated (startup + every backend
+        // refresh), parent_task_id changes, and task add/remove
+        // diffs from the API. Per-site pushes elsewhere catch the
+        // local-only mutations that bypass this path
+        // (delete_task, launch_*, resume_locally).
+        self.push_state_to_daemon();
     }
 
     fn set_status_msg(&mut self, msg: &str) {
@@ -5964,8 +6790,17 @@ impl App {
                     branch,
                     autostart,
                     task_id,
+                    parent_task_id,
                 } => {
-                    self.launch_from_plan(&project, &slug, &prompt, branch.as_deref(), autostart, &task_id);
+                    self.launch_from_plan(
+                        &project,
+                        &slug,
+                        &prompt,
+                        branch.as_deref(),
+                        autostart,
+                        &task_id,
+                        parent_task_id.as_deref(),
+                    );
                     return true;
                 }
                 PlanAction::LaunchTaskIntoWorkspace {
@@ -5975,6 +6810,7 @@ impl App {
                     task_repo_url,
                     project,
                     prompt,
+                    parent_task_id,
                 } => {
                     self.launch_into_workspace(
                         &workspace_id,
@@ -5983,6 +6819,7 @@ impl App {
                         &task_repo_url,
                         &project,
                         &prompt,
+                        parent_task_id.as_deref(),
                     );
                     return true;
                 }
@@ -6004,6 +6841,7 @@ impl App {
                 }
                 PlanAction::Quit => {
                     self.save_session_manifest();
+                    self.clear_tui_sessions_on_daemon();
                     self.should_quit = true;
                     return true;
                 }
@@ -6061,6 +6899,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('q') => {
                         self.save_session_manifest();
+                        self.clear_tui_sessions_on_daemon();
                         self.should_quit = true;
                         return true;
                     }
@@ -6848,6 +7687,333 @@ impl App {
         Self::tombstone_session(ws, si);
     }
 
+    /// Operator-driven kill for a daemon-attached session — slice
+    /// 10c-e-3b-fix2. Drop on `Session` is detach-only by design
+    /// (see the Drop comment in `session.rs`); A-w / workspace
+    /// teardown / task close / bulk-cleanup paths are responsible
+    /// for issuing the explicit kill BEFORE removing the
+    /// `TerminalSession` from `ws.sessions`. Without this the
+    /// daemon's child PTY keeps running after the operator
+    /// thought they closed it.
+    ///
+    /// No-op for local-PTY sessions (`daemon_session_uid = None`)
+    /// — dropping the master fd handles those.
+    ///
+    /// Best-effort: an RPC failure logs to stderr and continues.
+    /// The daemon's reaper-cleanup callback removes the session
+    /// from its registry when the child eventually exits anyway,
+    /// so a missed RPC means a slow teardown (orphan child runs
+    /// until exit), not a permanent leak.
+    pub(crate) fn kill_daemon_session_if_attached(ts: &TerminalSession) {
+        if let Some(uid) = ts.session.daemon_session_uid.as_deref() {
+            let daemon_socket = cm_daemon::default_socket_path();
+            if let Err(e) = crate::client_session::rpc_kill_session(
+                &daemon_socket,
+                crate::daemon_launch::operator_token(),
+                uid,
+            ) {
+                eprintln!(
+                    "cm-tui: A-w kill_session({}) failed: {} \
+                     (orphan child will be reaped when it exits)",
+                    uid, e,
+                );
+            }
+        }
+    }
+
+    /// Sub-2b-1 (review #1): push the resolved transcript path
+    /// to the daemon when the TUI's detector binds (or rebinds)
+    /// `ts.transcript_id` for a daemon-attached session. Without
+    /// this, the daemon's `resolve_authorized_session` returns
+    /// `state: "pending"` forever — the wire would tell the
+    /// Python MCP `read_session_output` tool to poll, and the
+    /// tool would never see a transcript.
+    ///
+    /// **No-ops when**:
+    ///   - opt-in is off (no daemon to push to).
+    ///   - session is not daemon-attached (`daemon_session_uid`
+    ///     is `None` → the TUI's own `resolve_authorized_session`
+    ///     serves the resolver leg).
+    ///   - the agent module can't resolve a path (rare; e.g.
+    ///     transcript_id became invalid or the agent type has
+    ///     no transcript like bash).
+    ///
+    /// Called from every site that sets `ts.transcript_id` to
+    /// `Some`. Re-pushing on rebind (`/clear`, codex-resume) is
+    /// intentional — the daemon stores the latest value.
+    /// Best-effort: log on RPC error and continue (the next
+    /// rebind retries).
+    pub(crate) fn push_transcript_path_to_daemon_if_attached(
+        ts: &TerminalSession,
+        ws: &Workspace,
+    ) {
+        let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
+            return;
+        };
+        // 10f: daemon-mandatory; no opt-in gate. `daemon_session_uid`
+        // being Some already implies a daemon-spawned session.
+        // Resolve path via the engine-specific agent module
+        // (the TUI's source of truth for Claude/Codex conventions).
+        let Some(wt) = ws.worktree_path.as_deref() else {
+            return;
+        };
+        let agent = crate::agent::agent_for(&ts.session_type);
+        let ctx = crate::agent::AgentCtx { ts, worktree_path: wt };
+        let Some(path) = agent.transcript_path(ctx) else {
+            return;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_set_transcript_path(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            daemon_uid,
+            &path_str,
+        ) {
+            eprintln!(
+                "cm-tui: session.set_transcript_path({}, {}) failed: {} \
+                 (daemon's resolve_authorized_session will stay pending \
+                 until the next rebind retries)",
+                daemon_uid, path_str, e,
+            );
+        }
+    }
+
+    /// 10d-2c-1 review round-5 (F1): push workflow context onto
+    /// an already-spawned daemon-attached session so the daemon's
+    /// `DaemonSession.workflow_run_id` / `.workflow_role` mirrors
+    /// the TUI's `TerminalSession` tags after a `launch_workflow`
+    /// bind-existing-slot. Without this RPC,
+    /// `lookup_session_any` returns `(None, None)` for daemon-
+    /// owned workflow participants (round-3's `tui_sessions`
+    /// filter excluded them) and the auth check in
+    /// `workflow_transition` / `workflow_done` rejects them.
+    ///
+    /// **No-ops when**:
+    ///   - opt-in is off.
+    ///   - the session isn't daemon-attached (`daemon_session_uid`
+    ///     is `None` → TUI is authoritative; daemon doesn't know
+    ///     about it; tui_sessions snapshot carries the tags).
+    ///
+    /// Best-effort: log on RPC error and continue (next launch
+    /// retries, manual workflow stop/start clears stale state).
+    pub(crate) fn push_workflow_context_to_daemon_if_attached(
+        ts: &TerminalSession,
+        run_id: Option<&str>,
+        role: Option<&str>,
+    ) {
+        let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
+            return;
+        };
+        // 10f: daemon-mandatory; `daemon_session_uid` being Some
+        // already implies a daemon-spawned session.
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_set_workflow_context(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            daemon_uid,
+            run_id,
+            role,
+        ) {
+            eprintln!(
+                "cm-tui: session.set_workflow_context({}, {:?}, {:?}) failed: {} \
+                 (daemon-attached workflow participant will fail auth on \
+                 workflow_transition until next retry)",
+                daemon_uid, run_id, role, e,
+            );
+        }
+    }
+
+    /// Sub-2a Finding #1: full-replace task tree push to the
+    /// daemon. Called after every `self.tasks` mutation so the
+    /// daemon's `DaemonState.task_tree` stays current for the
+    /// Session-caller descendant-task auth walk.
+    ///
+    /// Gated on `CM_USE_DAEMON_SOCKET=1`. With opt-in off the
+    /// daemon isn't running and a connect attempt would just
+    /// log noise; skip the RPC entirely. With opt-in on the
+    /// daemon was launched at startup (see `main.rs:60`), so a
+    /// connect failure here is a real fault — log it and
+    /// continue (the next push will retry; auth meanwhile
+    /// falls back to the pre-push tree).
+    ///
+    /// Full-replace semantics: the daemon's `task_update_tree`
+    /// method clears + re-inserts on every call. Cheaper than
+    /// computing diffs in the TUI and avoids drift if a single
+    /// incremental push is lost.
+    /// 10d-1: push the TUI's session snapshot to the daemon so
+    /// the daemon recognizes TUI-minted sessions. Lands in
+    /// `daemon::state::DaemonState::tui_sessions` via
+    /// `tui.update_sessions_snapshot`. Full-replace semantics
+    /// (replace-not-merge), same shape as
+    /// [`push_task_tree_to_daemon`].
+    ///
+    /// **No auth consumer yet**: 10d-1 lands the push + storage.
+    /// The workflow-method auth consumer in 10d-2 reads from
+    /// `state.tui_sessions`; without that push wired here, 10d-2
+    /// would have nothing to read.
+    pub(crate) fn push_tui_sessions_to_daemon(&self) {
+        // 10f: daemon-mandatory; always push.
+        // Flatten App.workspaces[*].sessions[*] into one vec —
+        // but filter OUT daemon-attached sessions
+        // (`session.daemon_session_uid.is_some()`). Those already
+        // live in `state.sessions` on the daemon; appearing in
+        // `state.tui_sessions` too would double-register them and
+        // make `lookup_session_any`'s ordering load-bearing for
+        // correctness. Keeping the two maps non-overlapping by
+        // construction means the lookup can prefer either without
+        // ambiguity. Carries the auth-relevant fields per
+        // `daemon::state::TuiSessionSnapshot` shape — task_id
+        // (for descendant-task scoping), workflow_run_id /
+        // workflow_role (for workflow-method auth in 10d-2),
+        // label / type / hidden (forward-compat for a merged
+        // list_sessions view in a future slice).
+        let sessions: Vec<crate::client_session::TuiSessionSnapshotPush<'_>> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .filter(|ts| ts.session.daemon_session_uid.is_none())
+            .map(|ts| crate::client_session::TuiSessionSnapshotPush {
+                uid: ts.uid.as_str(),
+                task_id: ts.task_id.as_deref(),
+                label: Some(ts.label.as_str()),
+                session_type: Some(ts.session_type.as_str()),
+                hidden: ts.hidden,
+                workflow_run_id: ts.workflow_run_id.as_deref(),
+                workflow_role: ts.workflow_role.as_deref(),
+            })
+            .collect();
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            &sessions,
+        ) {
+            eprintln!(
+                "cm-tui: tui.update_sessions_snapshot failed: {} \
+                 (daemon's TUI-session view will lag until the next push — \
+                 workflow-method auth consumers in 10d-2 may surface as \
+                 'caller not found' for TUI-minted sessions)",
+                e,
+            );
+        }
+    }
+
+    /// 10d-1: unified state-snapshot push. Sites that mutate
+    /// EITHER the task tree OR the session list should call
+    /// this single helper. Pre-10d-1 those sites called
+    /// `push_task_tree_to_daemon` directly; replacing with
+    /// `push_state_to_daemon` means session-list mutations
+    /// (add, remove, hide, label, task rebind) automatically
+    /// keep the daemon's TUI-session view current.
+    pub(crate) fn push_state_to_daemon(&self) {
+        self.push_task_tree_to_daemon();
+        self.push_tui_sessions_to_daemon();
+        // 10d-2c-2-1: workflow definitions are static after TOML
+        // load, but bundling the push here is the simplest way to
+        // ensure they reach the daemon at least once during the
+        // normal startup chain (App::new → first mutation →
+        // push_state). The re-push cost is a small JSON object
+        // over a local UDS — cheaper than wiring a one-shot at
+        // startup-complete.
+        self.push_workflow_definitions_to_daemon();
+    }
+
+    /// 10d-1 graceful-shutdown clear (now a no-op, post-review
+    /// finding #14): pushing an empty snapshot at TUI shutdown
+    /// locked out any TUI-local workflow participant whose PTY
+    /// outlived the TUI (Session::Drop is detach-only — the
+    /// child PTY survives until `kill_session` or natural exit).
+    /// The orphan agent's MCP `workflow_transition` call then
+    /// hit daemon-side `lookup_session_any` with an empty
+    /// `tui_sessions` map and got Unauthorized mid-flight.
+    ///
+    /// The stale-rows concern that motivated the original clear
+    /// is bounded the same way the crash case always was: the
+    /// next TUI restart's first `reconcile_tasks` /
+    /// `restore_sessions` push REPLACES (not merges) the
+    /// snapshot. Any rows from the prior TUI session disappear
+    /// the moment the next TUI launches. Until then, the rows
+    /// are harmless to readers that gate on
+    /// `state.sessions.contains_key(uid)` first (the daemon's
+    /// dispatch paths do), and useful to the workflow-auth path
+    /// for orphaned participants that need to keep transitioning.
+    pub(crate) fn clear_tui_sessions_on_daemon(&self) {
+        // Intentional no-op. See doc comment.
+    }
+
+    /// 10d-2c-2-1: push the in-memory workflow-definitions map
+    /// (loaded from `workflows/*.toml`) to the daemon. Opt-in
+    /// gated on `CM_USE_DAEMON_SOCKET` — same gate as the other
+    /// daemon-side pushes. Errors are logged-and-continued so a
+    /// daemon hiccup doesn't kill TUI startup.
+    ///
+    /// Called once at `App::new`, immediately after the TOML load.
+    /// Workflow definitions are static after launch, so a single
+    /// startup push is sufficient; the upcoming 2c-2-2 daemon
+    /// driver reads from `DaemonState.workflow_definitions`.
+    pub(crate) fn push_workflow_definitions_to_daemon(&self) {
+        // 10f: daemon-mandatory; always push.
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            &self.workflows,
+        ) {
+            eprintln!(
+                "cm-tui: workflow.update_definitions failed: {} \
+                 (daemon-side workflow driver will be uninitialized until \
+                  next push — feature still gated by 2c-2-2)",
+                e,
+            );
+        }
+    }
+
+    pub(crate) fn push_task_tree_to_daemon(&self) {
+        // 10f: daemon-mandatory; always push.
+        // Sub-2b-3 review-2 #1: push `workspace_id` per task AND
+        // a workspaces map carrying `worktree_path`. Lets the
+        // daemon's `mcp_start_session` resolve a descendant
+        // task's workspace without needing a live anchor
+        // session in that workspace (the pre-fix resolver
+        // walked `state.sessions` for an existing tagged
+        // session — failed for first-spawn-into-fresh-subtask).
+        let tasks: Vec<(String, Option<String>, Option<String>)> = self
+            .tasks
+            .iter()
+            .filter_map(|t| {
+                t.task_id.as_ref().map(|id| {
+                    (id.clone(), t.parent_task_id.clone(), t.workspace_id.clone())
+                })
+            })
+            .collect();
+        let workspaces: Vec<(String, Option<String>)> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    w.id.clone(),
+                    w.worktree_path
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                )
+            })
+            .collect();
+        let daemon_socket = cm_daemon::default_socket_path();
+        if let Err(e) = crate::client_session::rpc_task_update_tree(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            &tasks,
+            &workspaces,
+        ) {
+            eprintln!(
+                "cm-tui: task.update_tree failed: {} \
+                 (daemon auth walks will use the pre-push tree until the next mutation)",
+                e,
+            );
+        }
+    }
+
     /// Bulk session removal that preserves the tombstone invariant.
     /// Walks `ws.sessions`, tombstones each entry where `should_drop`
     /// returns true, marks the PTY exited, and removes it. Use this
@@ -6873,6 +8039,11 @@ impl App {
         let mut i = 0;
         while i < ws.sessions.len() {
             if should_drop(&ws.sessions[i]) {
+                // Slice 10c-e-3b-fix2: operator-driven kill
+                // before drop. See `kill_daemon_session_if_attached`
+                // for rationale. Bulk-cleanup paths (task close,
+                // workspace teardown) flow through here too.
+                Self::kill_daemon_session_if_attached(&ws.sessions[i]);
                 Self::tombstone_session(ws, i);
                 ws.sessions[i].session.exited = true;
                 ws.sessions.remove(i);
@@ -6925,6 +8096,12 @@ impl App {
             Cursor::Session(wi, si) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
                     if si < ws.sessions.len() {
+                        // Slice 10c-e-3b-fix2: operator-driven
+                        // kill BEFORE drop. Daemon-attached
+                        // sessions need an explicit kill_session
+                        // RPC because Drop is detach-only by
+                        // design.
+                        Self::kill_daemon_session_if_attached(&ws.sessions[si]);
                         Self::tombstone_session(ws, si);
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
@@ -6941,6 +8118,9 @@ impl App {
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
                     if ws.sessions.len() == 1 {
+                        // Same operator-kill semantics as the
+                        // Session-cursor arm above.
+                        Self::kill_daemon_session_if_attached(&ws.sessions[0]);
                         Self::tombstone_session(ws, 0);
                         ws.sessions.remove(0);
                         self.cursor = Cursor::Workspace(wi);
@@ -7093,6 +8273,7 @@ impl App {
         let session_uid = new_session_uid();
         let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
         let (program, args) = match crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -7129,24 +8310,65 @@ impl App {
             Some(Self::list_jsonl_files(&worktree_path))
         };
 
-        let s = match self.spawn_agent_session(
-            "claude",
+        // Slice 10c-e-3: pre-generate the workspace id so the
+        // daemon spawn branch can auto-register it on
+        // `start_session`. The Workspace struct below picks this
+        // same id up — that's what makes the daemon's view of the
+        // workspace and the TUI's view share an identity.
+        let workspace_id_pre = new_workspace_id();
+
+        let s = match self.try_spawn_via_daemon(
             &session_uid,
-            &program,
-            &args,
+            &workspace_id_pre,
+            &worktree_path,
+            "claude",
+            "claude",
+            cloned_transcript_id.as_deref(),
             cols,
             rows,
-            Some(worktree_path.clone()),
-            Default::default(),
+            // A-n / create_local_session is taskless by design
+            // (the user creates the workspace before any task
+            // is bound). The session is taskless from the
+            // daemon's POV too — auth uses the taskless-caller
+            // same-workspace branch.
+            None,
+            // A-n / create_local_session is not a workflow
+            // participant at spawn time; if the user later
+            // launches a workflow on this session,
+            // `rpc_set_workflow_context` updates the daemon copy.
+            None,
+            None,
         ) {
-            Ok(s) => s,
-            Err(_) => {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 if let Some(c) = cloned.as_ref() {
                     Self::cleanup_failed_clone(c);
                 }
-                self.set_status_msg("Spawn failed");
+                self.set_status_msg(&format!(
+                    "Daemon spawn failed: {}",
+                    e
+                ));
                 return;
             }
+            None => match self.spawn_agent_session(
+                "claude",
+                &session_uid,
+                &program,
+                &args,
+                cols,
+                rows,
+                Some(worktree_path.clone()),
+                Default::default(),
+            ) {
+                Ok(s) => s,
+                Err(_) => {
+                    if let Some(c) = cloned.as_ref() {
+                        Self::cleanup_failed_clone(c);
+                    }
+                    self.set_status_msg("Spawn failed");
+                    return;
+                }
+            },
         };
 
         let ts = TerminalSession {
@@ -7173,9 +8395,10 @@ impl App {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: seed_from.map(str::to_string),
+            preserved_last_exit: None,
         };
         let ws = Workspace {
-            id: new_workspace_id(),
+            id: workspace_id_pre,
             name: label.to_string(),
             is_closed: false,
             is_cloud: false,
@@ -7190,8 +8413,28 @@ impl App {
         };
         let new_wi = self.workspaces.len();
         self.workspaces.push(ws);
+        // Sub-2b-1 review-r#2 #3: seeded sessions have a known
+        // transcript_id at construction time (the clone's id —
+        // see `cloned_transcript_id`). The discovery loop's
+        // `initial_bind` branch won't fire for them
+        // (transcript_id is already Some), so push the
+        // transcript_path here explicitly. No-op for local-only
+        // sessions (the push helper gates on
+        // `daemon_session_uid.is_some()`).
+        if let Some(ws) = self.workspaces.get(new_wi) {
+            if let Some(ts) = ws.sessions.get(0) {
+                Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+            }
+        }
         self.cursor = Cursor::Session(new_wi, 0);
         self.save_session_manifest();
+        // Sub-2b-3 review-5 #2: A-n added a new workspace with
+        // a fresh worktree_path. The daemon needs that mapping
+        // BEFORE a freshly-spawned agent calls mcp_start_session
+        // (descendant-task resolution looks up the workspace
+        // via state.workspaces). Without this push, the agent
+        // would race the next API-driven reconcile.
+        self.push_state_to_daemon();
         self.set_status_msg("Workspace created");
     }
 
@@ -7234,6 +8477,7 @@ impl App {
         } else if let Some(wt) = ws.worktree_path.clone() {
             let session_uid = new_session_uid();
             let (program, args) = crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &workflow::toml_schema::Engine::ClaudeCode,
                 &session_uid,
                 None,
@@ -7263,6 +8507,14 @@ impl App {
         };
 
         if let Some(ts) = ts {
+            // 10e-d: release any stale cap-kill de-dup entry for
+            // this uid before publishing the new session into the
+            // workspace. In production `new_session_uid` is
+            // monotonic so the set never holds this uid yet — this
+            // is defensive and exists for test paths that reuse
+            // uids (and to keep the spawn-path contract explicit:
+            // "fresh session → fresh toast window").
+            self.clear_cap_kill_toast_state(&ts.uid);
             let si = self.workspaces[wi].sessions.len();
             self.workspaces[wi].sessions.push(ts);
             self.cursor = Cursor::Session(wi, si);
@@ -7394,6 +8646,7 @@ impl App {
         // while the agent has none of the context.
         let build = |engine: Engine, fallback_prog: &str, fallback_args: Vec<String>| {
             crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
                 &engine,
                 &session_uid_pre,
                 None,
@@ -7407,58 +8660,100 @@ impl App {
                 }
             })
         };
-        let result = match session_type {
-            "claude" => match build(
-                Engine::ClaudeCode,
-                "claude",
-                vec!["--dangerously-skip-permissions".to_string()],
-            ) {
-                Ok((program, args)) => self.spawn_agent_session(
+        // Slice 10c-e-3: opt-in daemon spawn for A-s. Try the
+        // daemon path FIRST (when opt-in is on AND we have a
+        // worktree). On `None` (opt-in off or unsupported type),
+        // fall through to the existing local spawn unchanged.
+        let workspace_id = self.workspaces[ws_index].id.clone();
+        let daemon_attempt = match (wt.as_deref(), &session_type) {
+            (Some(wt_path), _) => self.try_spawn_via_daemon(
+                &session_uid_pre,
+                &workspace_id,
+                wt_path,
+                session_type,
+                session_type,
+                cloned_transcript_id.as_deref(),
+                cols,
+                rows,
+                // Sub-2a Finding #1: A-s spawns a session under
+                // an existing task — pass the task_id through
+                // so the daemon's DaemonSession.task_id is
+                // populated at spawn time, not left None.
+                task_id.as_deref(),
+                // A-s spawns a session under an existing task,
+                // but workflow membership is decided later (when
+                // the user runs A-f on it). No workflow context
+                // at spawn time.
+                None,
+                None,
+            ),
+            _ => None,
+        };
+        let result = match daemon_attempt {
+            Some(Ok(s)) => Ok(s),
+            Some(Err(e)) => {
+                if let Some(c) = cloned.as_ref() {
+                    Self::cleanup_failed_clone(c);
+                }
+                self.set_status_msg(&format!(
+                    "Daemon spawn failed: {}",
+                    e
+                ));
+                return;
+            }
+            None => match session_type {
+                "claude" => match build(
+                    Engine::ClaudeCode,
                     "claude",
-                    &session_uid_pre,
-                    &program,
-                    &args,
-                    cols,
-                    rows,
-                    wt,
-                    Default::default(),
-                ),
-                Err(e) => {
-                    if let Some(c) = cloned.as_ref() {
-                        Self::cleanup_failed_clone(c);
+                    vec!["--dangerously-skip-permissions".to_string()],
+                ) {
+                    Ok((program, args)) => self.spawn_agent_session(
+                        "claude",
+                        &session_uid_pre,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        wt,
+                        Default::default(),
+                    ),
+                    Err(e) => {
+                        if let Some(c) = cloned.as_ref() {
+                            Self::cleanup_failed_clone(c);
+                        }
+                        self.set_status_msg(&format!(
+                            "Seeded launch aborted (could not configure agent): {e}"
+                        ));
+                        return;
                     }
-                    self.set_status_msg(&format!(
-                        "Seeded launch aborted (could not configure agent): {e}"
-                    ));
-                    return;
-                }
-            },
-            "codex" => match build(
-                Engine::Codex,
-                "codex",
-                vec!["--yolo".to_string()],
-            ) {
-                Ok((program, args)) => self.spawn_agent_session(
+                },
+                "codex" => match build(
+                    Engine::Codex,
                     "codex",
-                    &session_uid_pre,
-                    &program,
-                    &args,
-                    cols,
-                    rows,
-                    wt,
-                    Default::default(),
-                ),
-                Err(e) => {
-                    if let Some(c) = cloned.as_ref() {
-                        Self::cleanup_failed_clone(c);
+                    vec!["--yolo".to_string()],
+                ) {
+                    Ok((program, args)) => self.spawn_agent_session(
+                        "codex",
+                        &session_uid_pre,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        wt,
+                        Default::default(),
+                    ),
+                    Err(e) => {
+                        if let Some(c) = cloned.as_ref() {
+                            Self::cleanup_failed_clone(c);
+                        }
+                        self.set_status_msg(&format!(
+                            "Seeded launch aborted (could not configure agent): {e}"
+                        ));
+                        return;
                     }
-                    self.set_status_msg(&format!(
-                        "Seeded launch aborted (could not configure agent): {e}"
-                    ));
-                    return;
-                }
+                },
+                _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
             },
-            _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
         };
         match result {
             Ok(s) => {
@@ -7484,6 +8779,21 @@ impl App {
                 }
                 let si = self.workspaces[ws_index].sessions.len();
                 self.workspaces[ws_index].sessions.push(ts);
+                // Sub-2b-1 review-r#2 #3: same as
+                // `create_local_session` — seeded Claude
+                // sessions know their transcript_id at
+                // construction (cloned id), so push to the
+                // daemon now. The discovery loop's
+                // `initial_bind` arm won't fire because
+                // transcript_id is already Some. Codex's id is
+                // a seed-file id; the discovery loop's
+                // codex_resume_rebind window catches that and
+                // pushes when the actual rollout file appears.
+                if let Some(ws) = self.workspaces.get(ws_index) {
+                    if let Some(ts) = ws.sessions.get(si) {
+                        Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                    }
+                }
                 self.cursor = Cursor::Session(ws_index, si);
                 self.save_session_manifest();
                 self.set_status_msg(&format!("Started {} session", session_type));
@@ -7514,6 +8824,7 @@ impl App {
         // tool call would fail auth as `not_found`.
         let session_uid = new_session_uid();
         let (program, args) = match crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -7616,6 +8927,9 @@ impl App {
                 let new_wi = self.workspaces.len() - 1;
                 self.cursor = Cursor::Session(new_wi, 0);
                 self.save_session_manifest();
+                // Sub-2a Finding #1: a resume_locally may have
+                // inserted a new TaskEntry above.
+                self.push_state_to_daemon();
                 self.set_status_msg("Resumed locally");
             }
             Err(e) => {
@@ -7721,6 +9035,8 @@ impl App {
             self.clamp_cursor();
             self.set_status_msg("Task deleted");
             self.save_session_manifest();
+            // Sub-2a Finding #1: task removal — refresh tree.
+            self.push_state_to_daemon();
             return;
         }
 
@@ -7775,8 +9091,19 @@ impl App {
             self.backend.delete_task(tid.clone());
         }
         self.tasks.retain(|t| !bound_task_ids.iter().any(|id| t.task_id.as_deref() == Some(id)));
+        // Slice 10c-e-3b-fix2: workspace teardown is the bulkiest
+        // operator-driven cleanup path. Issue daemon kill_session
+        // for every daemon-attached session in this workspace
+        // BEFORE the Workspace (and its Sessions) drop — Drop is
+        // detach-only by design.
+        for ts in &self.workspaces[wi].sessions {
+            Self::kill_daemon_session_if_attached(ts);
+        }
         self.workspaces.remove(wi);
         self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
+        // Sub-2a Finding #1: workspace delete removed all bound
+        // tasks from `self.tasks` — refresh tree.
+        self.push_state_to_daemon();
         self.set_status_msg("Deleted");
     }
 
@@ -7860,6 +9187,13 @@ impl App {
             task.is_cloud = true;
         }
         self.save_session_manifest();
+        // Sub-2b-3 review-5 #2: push the cleared worktree_path
+        // to the daemon. Without this, the daemon retains the
+        // stale local path until the next reconcile_tasks
+        // (which could be seconds later, or never if the API
+        // isn't refreshing), and a concurrent `mcp_start_session`
+        // would spawn into the deleted worktree.
+        self.push_state_to_daemon();
     }
 
     /// Pull the active cloud workspace to local (uses the first bound task).
@@ -7910,6 +9244,13 @@ impl App {
         start_branch: Option<&str>,
         _autostart: bool,
         task_id: &str,
+        // Sub-2a Finding #2: parent edge from the planning row,
+        // used to initialize the local TaskEntry stub before the
+        // first `push_task_tree_to_daemon` fires. Without it, the
+        // first push publishes the subtask as top-level and the
+        // daemon's auth walk can't authorize parent → subtask
+        // until the next reconcile patches it.
+        parent_task_id: Option<&str>,
     ) {
         let repo_url = match self.config.repos.get(project) {
             Some(url) => url.clone(),
@@ -7943,6 +9284,7 @@ impl App {
         // CM_TUI_SESSION_ID — the Phase 1 "MCP-everywhere" invariant.
         let session_uid = new_session_uid();
         let (program, args) = crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -8020,7 +9362,13 @@ impl App {
                     // and writes `project = NULL` to the API, which
                     // the planning refresh then filters out.
                     project: Some(project.to_string()),
-                    parent_task_id: None,
+                    // Sub-2a Finding #2: pin the parent edge from
+                    // the launch action so the first
+                    // `push_task_tree_to_daemon` publishes the
+                    // correct subtask edge — pre-fix this was
+                    // `None` and the daemon saw the subtask as
+                    // top-level until reconcile patched it.
+                    parent_task_id: parent_task_id.map(str::to_string),
                     worktree_mode: WorktreeMode::Inherit,
                     metadata: None,
                 });
@@ -8033,6 +9381,10 @@ impl App {
                 fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
                 self.backend.update_plan_task(task_id.to_string(), fields);
                 self.save_session_manifest();
+                // Sub-2a Finding #1: launch added a TaskEntry —
+                // refresh daemon's tree so any agent that spawns
+                // off this task immediately authorizes correctly.
+                self.push_state_to_daemon();
                 self.set_status_msg("Task launched");
             }
             Err(e) => {
@@ -8065,6 +9417,9 @@ impl App {
         task_repo_url: &str,
         project: &str,
         prompt: &str,
+        // Sub-2a Finding #2: parent edge from the planning row.
+        // See `launch_from_plan` for the full backstory.
+        parent_task_id: Option<&str>,
     ) {
         let Some(wi) = self.workspace_index_by_id(workspace_id) else {
             self.set_status_msg("Workspace no longer exists");
@@ -8082,6 +9437,7 @@ impl App {
         // any orchestration tool.
         let session_uid = new_session_uid();
         let (program, args) = crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::TuiLocal,
             &workflow::toml_schema::Engine::ClaudeCode,
             &session_uid,
             None,
@@ -8149,7 +9505,12 @@ impl App {
                         // project synchronously from the planning row so
                         // an early `create_subtask` inherits it.
                         project: Some(project.to_string()),
-                        parent_task_id: None,
+                        // Sub-2a Finding #2: pin the parent edge so the
+                        // first `push_task_tree_to_daemon` publishes the
+                        // correct subtask edge — pre-fix `None` here
+                        // showed the subtask as top-level on the daemon
+                        // until reconcile patched it.
+                        parent_task_id: parent_task_id.map(str::to_string),
                         worktree_mode: WorktreeMode::Inherit,
                         metadata: None,
                     });
@@ -8165,6 +9526,9 @@ impl App {
                 self.backend
                     .update_plan_task(task_id.to_string(), fields);
                 self.save_session_manifest();
+                // Sub-2a Finding #1: same as `launch_from_plan`,
+                // a launch may have inserted a new TaskEntry.
+                self.push_state_to_daemon();
                 self.set_status_msg("Task launched into workspace");
             }
             Err(e) => {
@@ -8311,6 +9675,12 @@ impl App {
         let final_ws_id = self.workspaces[final_wi].id.clone();
         self.cursor = Cursor::Workspace(final_wi);
         self.save_session_manifest();
+        // Sub-2b-3 review-5 #2: reopen may have provisioned a
+        // new workspace (the `None => { ... }` arm above
+        // pushes a fresh Workspace with worktree_path). Push
+        // so the daemon knows the path BEFORE the user can
+        // A-s an agent into it.
+        self.push_state_to_daemon();
         self.view_mode = ViewMode::Sessions;
         self.clamp_cursor();
         let tombstone_count = self.workspaces[final_wi].tombstones.len();
@@ -9770,7 +11140,18 @@ impl App {
                     }
                 }
             }
-            let _ = workflow::run::save(&self.workflow_runs[run_idx]);
+            // 10d-2c-1 review round-6 (F1): targeted modify so a
+            // race with a daemon-side transition mutation can't
+            // clobber the daemon's active_role / iteration
+            // advance. TUI is authoritative for task_id binding;
+            // daemon doesn't touch it.
+            let tid_owned = tid.to_string();
+            let updated = workflow::run::modify(&run_id, move |r| {
+                r.task_id = Some(tid_owned);
+            });
+            if let Ok(updated) = updated {
+                self.workflow_runs[run_idx] = updated;
+            }
             self.save_session_manifest();
         }
 
@@ -9815,6 +11196,7 @@ impl App {
                 config: &self.config,
                 cap_status: &self.memory_cap_status,
                 kill_tx: &self.memory_kill_tx,
+                pending_workflow_events: &mut self.pending_workflow_events,
             };
             f(&mut ctx)
         };
@@ -9858,7 +11240,31 @@ impl App {
     /// thin dispatcher: build the controller's reference bag, run it,
     /// apply the resulting actions.
     pub fn tick_workflows(&mut self) {
+        // Run the controller FIRST so daemon-written events
+        // (workflow_done, workflow_transition) are consumed and
+        // their effects (events_offset advance, history append)
+        // are persisted to state.json before reconcile drops the
+        // run.
+        //
+        // 10d-3 r1 round-2 ordering fix: an earlier draft ran
+        // reconcile pre-tick on the theory that "controller
+        // shouldn't tick on corpses." That was eager for Done
+        // runs — the controller needs to consume the
+        // `workflow_done` event from events.jsonl and advance
+        // events_offset before cleanup removes the run; otherwise
+        // the daemon's workflow_done is silently dropped on the
+        // floor. The controller already filters non-Running runs
+        // in its own decision logic, so the "wasted tick on a
+        // Detached run" cost is one disk read + a status check —
+        // negligible compared to losing events.
+        //
+        // Detached / missing runs: no event to drain — cleanup
+        //   simply removes them.
+        // Done runs: controller drains workflow_done → state.json
+        //   reflects offset advance → reconcile then removes the
+        //   in-mem run.
         self.run_workflow_controller(|ctx| ctx.tick());
+        self.reconcile_stopped_workflow_runs();
     }
 
     /// Mark the focused session's workflow run as paused. No-op if the focused
@@ -9872,12 +11278,21 @@ impl App {
             Some(id) => id,
             None => return,
         };
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            if matches!(run.status, workflow::RunStatus::Running) {
-                run.set_paused(true);
-                let _ = workflow::run::save(run);
-                self.set_status_msg("Workflow paused (A-u to resume)");
+        // 10d-2c-1 review round-6 (F1): targeted modify under
+        // flock — applies the pause field to whatever's on disk
+        // (including any daemon-written advance since our in-mem
+        // copy was loaded) and keeps the in-mem copy in sync via
+        // the returned run.
+        let updated = workflow::run::modify(&run_id, |r| {
+            if matches!(r.status, workflow::RunStatus::Running) {
+                r.set_paused(true);
             }
+        });
+        if let Ok(updated) = updated {
+            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                *slot = updated;
+            }
+            self.set_status_msg("Workflow paused (A-u to resume)");
         }
     }
 
@@ -9889,10 +11304,19 @@ impl App {
                 return;
             }
         };
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            if matches!(run.status, workflow::RunStatus::Paused) {
-                run.set_paused(false);
-                let _ = workflow::run::save(run);
+        // 10d-2c-1 review round-6 (F1): same shape as pause.
+        let mut was_paused = false;
+        let updated = workflow::run::modify(&run_id, |r| {
+            if matches!(r.status, workflow::RunStatus::Paused) {
+                r.set_paused(false);
+                was_paused = true;
+            }
+        });
+        if let Ok(updated) = updated {
+            if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
+                *slot = updated;
+            }
+            if was_paused {
                 self.set_status_msg(&format!("Resumed workflow {}", run_id));
             } else {
                 self.set_status_msg("Workflow is not paused");
@@ -9907,22 +11331,57 @@ impl App {
     /// behave like normal standalone sessions from here on. The sessions
     /// themselves stay open and their transcripts are preserved.
     pub(crate) fn stop_workflow_run(&mut self, run_id: &str) {
-        if let Some(run) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
-            run.mark_detached();
-            let _ = workflow::run::save(run);
-        }
-        for ws in &mut self.workspaces {
-            for ts in &mut ws.sessions {
-                if ts.workflow_run_id.as_deref() == Some(run_id) {
-                    ts.workflow_run_id = None;
-                    ts.workflow_role = None;
-                    ts.hidden = false;
-                }
-            }
-        }
-        self.workflow_runs.retain(|r| r.run_id != run_id);
-        self.save_session_manifest();
+        // 10d-2c-1 review round-6 (F1): targeted modify so a
+        // concurrent daemon write doesn't get clobbered. Detach
+        // is final; the field-level set still applies cleanly on
+        // top of whatever the daemon left.
+        //
+        // 10d-2c-1 review round-9: terminal-state guard.
+        // [`apply_stop_workflow_status`] preserves `Done` so the
+        // UI stop shortcut never overwrites a naturally-completed
+        // run — matches the MCP `stop_workflow`'s guard predicate
+        // (`daemon/src/control/methods.rs::stop_workflow`).
+        let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+        self.apply_local_workflow_stop_cleanup(run_id);
         self.set_status_msg("Workflow stopped");
+    }
+
+    /// 10d-3 r1 F1: shared local-cleanup helper used by both the
+    /// A-o handler (`stop_workflow_run`) and the tick-level
+    /// detector that notices a daemon-initiated `stop_workflow`
+    /// (e.g. an MCP caller dropping a run while the TUI is open).
+    ///
+    /// Walks `self.workspaces`, clears `workflow_run_id` /
+    /// `workflow_role` and unsets `hidden` on every session
+    /// pointing at `run_id`, drops the run from
+    /// `self.workflow_runs`, and persists the manifest. Does NOT
+    /// write `state.json` — the caller decides whether to invoke
+    /// `workflow::run::modify` first (UI path does) or whether the
+    /// daemon already flipped status (tick path does).
+    pub(crate) fn apply_local_workflow_stop_cleanup(&mut self, run_id: &str) {
+        drop_run_from_in_mem(&mut self.workflow_runs, &mut self.workspaces, run_id);
+        self.save_session_manifest();
+    }
+
+    /// 10d-3 r1 F1: tick-level reconciliation of TUI workflow
+    /// state against the daemon's authoritative `state.json`.
+    /// Called from the periodic tick. For each run in
+    /// `self.workflow_runs`, peek at disk; if its on-disk status
+    /// is no longer "active" (Detached or Done), run the local
+    /// cleanup helper so the sidebar matches the daemon view
+    /// without requiring the user to press `A-o`.
+    ///
+    /// Without this, a session whose run the daemon stopped via
+    /// MCP `stop_workflow` would keep showing as a workflow
+    /// participant until TUI restart, even though the agent's
+    /// next workflow_transition would (correctly) be rejected as
+    /// "run not active".
+    pub(crate) fn reconcile_stopped_workflow_runs(&mut self) {
+        let dropped =
+            drop_inactive_runs_from_in_mem(&mut self.workflow_runs, &mut self.workspaces);
+        if dropped > 0 {
+            self.save_session_manifest();
+        }
     }
 
     fn open_workflow_history(&mut self) {
@@ -9962,6 +11421,91 @@ impl App {
 // ═══════════════════════════════════════════════════════════════════════════
 //                         Workflow modal rendering
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// 10d-3 r2 F1: untag every session pointing at `run_id` (clear
+/// `workflow_run_id` + `workflow_role`, unhide), then drop the
+/// run from `workflow_runs`. Pure: takes `&mut` to the two
+/// collections, no `App` required. Used by
+/// [`App::apply_local_workflow_stop_cleanup`] and (in tests) by
+/// the tick-ordering pin.
+pub(crate) fn drop_run_from_in_mem(
+    workflow_runs: &mut Vec<WorkflowRun>,
+    workspaces: &mut Vec<Workspace>,
+    run_id: &str,
+) {
+    for ws in workspaces.iter_mut() {
+        for ts in &mut ws.sessions {
+            if ts.workflow_run_id.as_deref() == Some(run_id) {
+                ts.workflow_run_id = None;
+                ts.workflow_role = None;
+                ts.hidden = false;
+            }
+        }
+    }
+    workflow_runs.retain(|r| r.run_id != run_id);
+}
+
+/// 10d-3 r2: for each tracked run, peek `state.json` on disk; if
+/// the on-disk status is no longer active (Detached / Done) or
+/// the run file is gone, drop the run from `workflow_runs` and
+/// untag sessions. Returns the number of runs dropped so callers
+/// can decide whether to persist the manifest.
+///
+/// Pure helper — exists outside `App` so the round-2 tick-ordering
+/// test can exercise the exact post-controller-tick predicate
+/// without constructing an `App`. The ordering invariant lives in
+/// [`App::tick_workflows`]: controller tick runs FIRST so
+/// daemon-written `workflow_done` events get drained (events_offset
+/// advance + history append) before this function removes the run.
+pub(crate) fn drop_inactive_runs_from_in_mem(
+    workflow_runs: &mut Vec<WorkflowRun>,
+    workspaces: &mut Vec<Workspace>,
+) -> usize {
+    let tracked: Vec<String> = workflow_runs.iter().map(|r| r.run_id.clone()).collect();
+    let mut dropped = 0usize;
+    for run_id in &tracked {
+        // `load_one` returns `None` if the run file is missing or
+        // unreadable. Treat missing as "not active" — a tracked
+        // run whose file is gone is also stale.
+        let still_active = workflow::run::load_one(run_id)
+            .map(|r| r.is_active())
+            .unwrap_or(false);
+        if !still_active {
+            drop_run_from_in_mem(workflow_runs, workspaces, run_id);
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// 10d-3 r1 F2: untag predicate used by `restore_sessions` before
+/// the spawn loop. Returns `Some(cleaned_entry)` if the entry's
+/// `workflow_run_id` is set AND not in `active_run_ids` — i.e. a
+/// stale tag from a Detached/Done run that the manifest never got
+/// to clean up. Returns `None` when the entry's tag is already
+/// absent or still active; callers should pass the original
+/// reference through to `spawn_restored_session` in that case.
+///
+/// Extracted as a free function so the test below pins the
+/// predicate without constructing a full `App`. The behavior is
+/// load-bearing — pre-r2 the untag ran AFTER spawn, so the spawned
+/// agent inherited stale `CM_WORKFLOW_RUN_ID` / `CM_ROLE` env vars
+/// pointing at a now-Detached run.
+pub(crate) fn untag_stale_workflow(
+    entry: &ManifestEntry,
+    active_run_ids: &std::collections::HashSet<String>,
+) -> Option<ManifestEntry> {
+    match entry.workflow_run_id.as_deref() {
+        Some(rid) if !active_run_ids.contains(rid) => {
+            let mut e = entry.clone();
+            e.workflow_run_id = None;
+            e.workflow_role = None;
+            e.hidden = false;
+            Some(e)
+        }
+        _ => None,
+    }
+}
 
 /// Title for the workflow picker dialog. Includes a count when any workflow
 /// files failed to load, so the user has a hint that some entries are missing
@@ -10911,6 +12455,302 @@ fn copy_to_clipboard(text: &str) {
 }
 
 #[cfg(test)]
+mod stop_workflow_terminal_guard_tests {
+    //! 10d-2c-1 review round-9: pin the terminal-state guard in
+    //! `apply_stop_workflow_status`. UI stop shortcut must not
+    //! overwrite `Done` (naturally completed). Mirrors the MCP
+    //! `stop_workflow`'s guard predicate so the two paths agree.
+    use super::*;
+    use crate::workflow::run::RunStatus;
+
+    fn with_temp_home<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+        f();
+        if let Some(o) = orig {
+            unsafe { std::env::set_var("HOME", o); }
+        } else {
+            unsafe { std::env::remove_var("HOME"); }
+        }
+        tmp
+    }
+
+    fn seed_run(run_id: &str, status: RunStatus, done_reason: Option<&str>) {
+        let mut run = WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".to_string(),
+            "task-key".to_string(),
+            std::collections::BTreeMap::new(),
+            "worker".to_string(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+            0,
+        );
+        run.status = status;
+        run.done_reason = done_reason.map(str::to_string);
+        workflow::run::save(&run).expect("seed save");
+    }
+
+    /// Named acceptance test: state.json with `status: Done` +
+    /// `done_reason` survives a stop_workflow_run call. Pre-r9
+    /// the closure body unconditionally ran `mark_detached()`,
+    /// flipping `Done` → `Detached` and erasing the distinction
+    /// between successful completion and operator abort.
+    #[test]
+    fn stop_workflow_run_noops_on_terminal_done() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_r9_done_preserved";
+            seed_run(run_id, RunStatus::Done, Some("worker said done"));
+
+            // Drive the same modify-closure shape stop_workflow_run
+            // uses. We don't construct a full App; the fix lives
+            // entirely in `apply_stop_workflow_status`, so a
+            // focused state.json round-trip pins the behavior.
+            let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                matches!(post.status, RunStatus::Done),
+                "Done must NOT be overwritten by stop; got {:?}",
+                post.status,
+            );
+            assert_eq!(
+                post.done_reason.as_deref(),
+                Some("worker said done"),
+                "done_reason must NOT be cleared by stop",
+            );
+        });
+    }
+
+    /// Companion test: state.json with `status: Running` is
+    /// marked `Detached`. Guards against over-correcting r9
+    /// (e.g. treating every non-Detached as terminal).
+    #[test]
+    fn stop_workflow_run_marks_detached_on_running() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_r9_running_detaches";
+            seed_run(run_id, RunStatus::Running, None);
+
+            let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                matches!(post.status, RunStatus::Detached),
+                "Running must transition to Detached on stop; got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// Companion: Paused also transitions to Detached. Captures
+    /// the "anything-not-Done" branch.
+    #[test]
+    fn stop_workflow_run_marks_detached_on_paused() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_r9_paused_detaches";
+            seed_run(run_id, RunStatus::Paused, None);
+
+            let _ = workflow::run::modify(run_id, apply_stop_workflow_status);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                matches!(post.status, RunStatus::Detached),
+                "Paused must transition to Detached on stop; got {:?}",
+                post.status,
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod stop_workflow_local_cleanup_tests {
+    //! 10d-3 r1 F1+F2 tests: pin the extracted local-cleanup
+    //! helper (`untag_stale_workflow`) used by `restore_sessions`'
+    //! pre-spawn untag, and pin the on-disk predicate that the
+    //! tick-level reconciler relies on. Both fixes target the same
+    //! drift: a `workflow_run_id` on a `ManifestEntry` or
+    //! `TerminalSession` outliving the `WorkflowRun` it references.
+    use super::*;
+    use crate::workflow::run::RunStatus;
+
+    fn with_temp_home<F: FnOnce()>(f: F) -> tempfile::TempDir {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+        f();
+        if let Some(o) = orig {
+            unsafe { std::env::set_var("HOME", o); }
+        } else {
+            unsafe { std::env::remove_var("HOME"); }
+        }
+        tmp
+    }
+
+    fn seed_run(run_id: &str, status: RunStatus) {
+        let mut run = WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".to_string(),
+            "task-key".to_string(),
+            std::collections::BTreeMap::new(),
+            "worker".to_string(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+            0,
+        );
+        run.status = status;
+        workflow::run::save(&run).expect("seed save");
+    }
+
+    fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
+        ManifestEntry {
+            uid: "sess-u1".to_string(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "worker-test".to_string(),
+            session_type: "claude-code".to_string(),
+            transcript_id: None,
+            hidden: run_id.is_some(),
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: run_id.map(str::to_string),
+            workflow_role: run_id.map(|_| "worker".to_string()),
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+        }
+    }
+
+    /// F2 predicate test: when `workflow_run_id` references a run
+    /// that's NOT in the active set, the entry must be cloned and
+    /// returned with the workflow tags cleared. This is the
+    /// pre-spawn untag that prevents `spawn_restored_session` from
+    /// reading a stale `CM_WORKFLOW_RUN_ID` into the agent's MCP
+    /// env.
+    #[test]
+    fn untag_stale_workflow_clears_when_run_not_active() {
+        let entry = entry_with_workflow(Some("wf_stale_42"));
+        let mut active = std::collections::HashSet::new();
+        active.insert("wf_some_other".to_string());
+
+        let cleaned = untag_stale_workflow(&entry, &active)
+            .expect("stale tag must produce cleaned entry");
+
+        assert!(cleaned.workflow_run_id.is_none(), "run_id must be cleared");
+        assert!(cleaned.workflow_role.is_none(), "role must be cleared");
+        assert!(!cleaned.hidden, "hidden must reset to false");
+        // Original is untouched — Cow semantics.
+        assert_eq!(entry.workflow_run_id.as_deref(), Some("wf_stale_42"));
+    }
+
+    /// F2 negative: when the `workflow_run_id` IS in the active
+    /// set, the helper must return `None` so the spawn loop reuses
+    /// the original entry. Confirms we don't churn the manifest
+    /// for live workflow participants.
+    #[test]
+    fn untag_stale_workflow_noop_when_run_active() {
+        let entry = entry_with_workflow(Some("wf_live_99"));
+        let mut active = std::collections::HashSet::new();
+        active.insert("wf_live_99".to_string());
+
+        let cleaned = untag_stale_workflow(&entry, &active);
+        assert!(cleaned.is_none(), "live run must not be untagged");
+    }
+
+    /// F2 negative: an entry that has no workflow tag must be
+    /// passed through. Guards against the predicate firing on
+    /// non-participant sessions.
+    #[test]
+    fn untag_stale_workflow_noop_when_no_tag() {
+        let entry = entry_with_workflow(None);
+        let active = std::collections::HashSet::new();
+
+        let cleaned = untag_stale_workflow(&entry, &active);
+        assert!(cleaned.is_none(), "untagged entry must be passed through");
+    }
+
+    /// F1 round-trip: a run flipped to `Detached` on disk no
+    /// longer satisfies `is_active()`, so the tick-level
+    /// reconciler will treat it as stale and run cleanup. Pins
+    /// the predicate that `reconcile_stopped_workflow_runs`
+    /// queries, matching the daemon-side `stop_workflow`'s effect.
+    #[test]
+    fn reconcile_predicate_treats_detached_as_inactive() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_f1_detached";
+            seed_run(run_id, RunStatus::Detached);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                !post.is_active(),
+                "Detached must NOT satisfy is_active(); got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// F1 round-trip: `Done` runs (natural completion via
+    /// `workflow_done`) are also non-active. The tick path treats
+    /// them the same as Detached — both warrant local cleanup so
+    /// the sidebar doesn't keep a dangling tag.
+    #[test]
+    fn reconcile_predicate_treats_done_as_inactive() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_f1_done";
+            seed_run(run_id, RunStatus::Done);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                !post.is_active(),
+                "Done must NOT satisfy is_active(); got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// F1 control: `Running` (and `Paused`) remain active. The
+    /// tick path must NOT untag a run that's still in flight.
+    #[test]
+    fn reconcile_predicate_treats_running_as_active() {
+        let _tmp = with_temp_home(|| {
+            let run_id = "wf_f1_running";
+            seed_run(run_id, RunStatus::Running);
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            assert!(
+                post.is_active(),
+                "Running must satisfy is_active(); got {:?}",
+                post.status,
+            );
+        });
+    }
+
+    /// F1 round-trip: a missing run on disk is treated as
+    /// inactive. The tick predicate uses
+    /// `load_one(...).unwrap_or(false)`, so a deleted/never-saved
+    /// run file does not panic — the tracked-but-missing entry is
+    /// cleaned up.
+    #[test]
+    fn reconcile_predicate_treats_missing_as_inactive() {
+        let _tmp = with_temp_home(|| {
+            // No seed: run was never saved.
+            let still_active = workflow::run::load_one("wf_f1_missing")
+                .map(|r| r.is_active())
+                .unwrap_or(false);
+            assert!(
+                !still_active,
+                "missing run must NOT satisfy is_active()"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
 mod manifest_entry_seeded_from_tests {
     //! Lock in the persistence semantics of `ManifestEntry.seeded_from_snapshot`:
     //! the serde-default lets pre-existing manifests load cleanly, and the
@@ -10934,6 +12774,7 @@ mod manifest_entry_seeded_from_tests {
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: Some("reviewer-strict".into()),
+            last_exit: None,
         };
         let bytes = serde_json::to_vec(&entry).unwrap();
         let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
@@ -10975,11 +12816,718 @@ mod manifest_entry_seeded_from_tests {
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
+            last_exit: None,
         };
         let s = serde_json::to_string(&entry).unwrap();
         assert!(
             !s.contains("seeded_from_snapshot"),
             "None should be skipped, got: {s}"
+        );
+        // Same skip semantics for the Phase-1-added last_exit field.
+        assert!(
+            !s.contains("last_exit"),
+            "last_exit:None should be skipped, got: {s}"
+        );
+    }
+
+    #[test]
+    fn missing_last_exit_deserializes_as_none() {
+        // Phase-1 schema-change check: a manifest written by a
+        // pre-slice-9 binary has no `last_exit` field at all; serde
+        // default must accept it and produce `None`. This is the
+        // doc's named "manifests written by older binaries load
+        // cleanly" rollout requirement.
+        let json = r#"{
+            "uid": "ts-abc",
+            "generation": 0,
+            "label": "x",
+            "session_type": "claude",
+            "hidden": false,
+            "idle_timeout_secs": 0,
+            "burst_threshold": 0,
+            "notify_on_idle": false
+        }"#;
+        let entry: ManifestEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.last_exit.is_none());
+    }
+
+    #[test]
+    fn last_exit_round_trips_with_memory_cap_kill_flag() {
+        // The attached-session leg sources `memory_cap_kill` from
+        // the `term_shim::ChildEvent::Exited` exit frame; the
+        // detached leg sources it from this persisted field. Prove
+        // the round-trip preserves the flag so the toast renders
+        // correctly post-restart.
+        let entry = ManifestEntry {
+            uid: "ts-abc".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "x".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: Some(cm_daemon::manifest::LastExit {
+                code: Some(137),
+                memory_cap_kill: true,
+                kills_file_offset: Some(0),
+                exited_at: 1_700_000_000.0,
+            }),
+        };
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
+        let got = back.last_exit.expect("last_exit present after round-trip");
+        assert!(got.memory_cap_kill);
+        assert_eq!(got.code, Some(137));
+    }
+
+    /// Reviewer-named regression test: simulate the
+    /// `load → mutate unrelated field → save → reload` cycle the TUI
+    /// runs every time a user edits a session and saves. The
+    /// daemon-owned `last_exit` field MUST survive untouched. Pre-fix
+    /// behavior at `app.rs:3007` rebuilt the entry with
+    /// `last_exit: None` on every save, clobbering the daemon's
+    /// `memory_cap_kill: true` flag and silently breaking the
+    /// detached-session cap-kill toast — the named acceptance
+    /// criterion for slice 12.
+    ///
+    /// This test exercises the persistence/in-memory boundary by
+    /// roundtripping ManifestEntry through serde (the load step
+    /// internally to the TUI), copying the loaded `last_exit` into
+    /// the in-memory mirror (`TerminalSession.preserved_last_exit`,
+    /// which we represent here as a local variable since
+    /// constructing a full TerminalSession requires a real PTY),
+    /// mutating an unrelated field, rebuilding ManifestEntry with
+    /// `last_exit: preserved.clone()` (mirroring the post-fix
+    /// `app.rs:3007`), and re-serializing. The final field must
+    /// equal the original — any reversion to the clobber would
+    /// produce `None` here.
+    #[test]
+    fn last_exit_survives_load_mutate_save_reload_cycle() {
+        // Initial state, as a manifest written by the daemon.
+        let stored_exit = cm_daemon::manifest::LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(0),
+            exited_at: 1_700_000_000.0,
+        };
+        let initial = ManifestEntry {
+            uid: "ts-cap-killed".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "label-before".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: Some(stored_exit.clone()),
+        };
+        let on_disk = serde_json::to_string(&initial).unwrap();
+
+        // Load step: TUI reads the manifest. The Phase-1 fix
+        // hydrates `last_exit` into the in-memory mirror.
+        let loaded: ManifestEntry = serde_json::from_str(&on_disk).unwrap();
+        let preserved_last_exit = loaded.last_exit.clone();
+        assert_eq!(
+            preserved_last_exit,
+            Some(stored_exit.clone()),
+            "load step must hydrate last_exit",
+        );
+
+        // User mutates an unrelated TUI-owned field (rename via the
+        // SessionSettings dialog). The TUI updates its in-memory
+        // state and triggers a save.
+        let mut mutated_label = loaded.label.clone();
+        mutated_label.clear();
+        mutated_label.push_str("label-after");
+
+        // Save step: TUI rebuilds ManifestEntry from in-memory state.
+        // This mirrors the read-modify-write at `app.rs:3007` —
+        // `last_exit: preserved_last_exit.clone()` is the fix. With
+        // the pre-fix `last_exit: None`, the assertion at the end of
+        // this test would fail.
+        let rebuilt = ManifestEntry {
+            uid: loaded.uid.clone(),
+            managed_by_uid: loaded.managed_by_uid.clone(),
+            generation: loaded.generation,
+            label: mutated_label,
+            session_type: loaded.session_type.clone(),
+            transcript_id: loaded.transcript_id.clone(),
+            hidden: loaded.hidden,
+            idle_timeout_secs: loaded.idle_timeout_secs,
+            burst_threshold: loaded.burst_threshold,
+            workflow_run_id: loaded.workflow_run_id.clone(),
+            workflow_role: loaded.workflow_role.clone(),
+            task_id: loaded.task_id.clone(),
+            notify_on_idle: loaded.notify_on_idle,
+            seeded_from_snapshot: loaded.seeded_from_snapshot.clone(),
+            last_exit: preserved_last_exit.clone(),
+        };
+        let after_save = serde_json::to_string(&rebuilt).unwrap();
+
+        // Reload — what the next TUI start (or next manifest read)
+        // would see.
+        let after_reload: ManifestEntry =
+            serde_json::from_str(&after_save).unwrap();
+
+        // Field survives.
+        assert_eq!(
+            after_reload.last_exit,
+            Some(stored_exit),
+            "last_exit must survive the load→mutate→save→reload cycle",
+        );
+        // Mutation also survives (sanity).
+        assert_eq!(after_reload.label, "label-after");
+    }
+}
+
+/// 10e-c: tests for the `App::apply_manifest_diff` consumer-side
+/// application of daemon-broadcast `ManifestDiff`s. Exercises the
+/// integration point between the manifest.watch consumer thread
+/// (which sends `ManifestDiff`s through `manifest_watch_rx`) and
+/// the TUI's in-memory session state.
+///
+/// Constructing a full `App` for these tests is heavy (backend
+/// thread, control socket, preflight, etc.). Instead we build a
+/// minimal `App` shell via the same trick the existing
+/// `stop_workflow_local_cleanup_tests` module uses: focused
+/// field-level state + direct method invocation. The method is
+/// `pub(crate)` to enable this.
+#[cfg(test)]
+mod apply_manifest_diff_tests {
+    use super::*;
+    use cm_daemon::manifest::{LastExit, ManifestDiff};
+
+    /// Build a minimal `App` with a single workspace containing
+    /// one terminal session. The session's `preserved_last_exit`
+    /// starts as `None` (the default for a fresh session per
+    /// `make_simple_session_with_uid` line 480).
+    ///
+    /// The session's PTY is `/bin/true` because constructing a
+    /// `Session` requires a real PTY. The test only cares about
+    /// `preserved_last_exit`; the PTY exit doesn't matter (and
+    /// Drop SIGKILLs the child cleanly anyway).
+    fn build_app_with_session(uid: &str) -> App {
+        // Spawn a real PTY via /bin/true so Session::new succeeds.
+        // The session immediately exits; that's irrelevant for
+        // the preserved_last_exit assertion.
+        let session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            std::collections::HashMap::new(),
+            None,
+        )
+        .expect("test PTY");
+        let ts = make_simple_session_with_uid(
+            uid.to_string(),
+            "test-label",
+            "claude",
+            session,
+            None,
+        );
+        // Minimal Workspace.
+        let ws = Workspace {
+            id: "ws-test".into(),
+            name: "test-ws".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![ts],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        };
+
+        // Build App via the standard ctor THEN inject the
+        // workspace. App::new needs a Config; the test_support
+        // home_lock guards against $HOME mutations colliding
+        // with other tests (App::new reads ~/.cm/...).
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Restore HOME for the rest of the test process.
+        if let Some(h) = orig_home {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        // Inject our test workspace. Leak the tempdir so the
+        // backend thread (still alive) doesn't error on later
+        // ~/.cm accesses — App::new spawns it before we restored
+        // HOME, so it captured the tempdir path. Acceptable
+        // memory cost for a unit test.
+        std::mem::forget(tmp);
+        app.workspaces.push(ws);
+        app
+    }
+
+    /// T15 — `apply_manifest_diff` with `ManifestDiff::Exited`
+    /// updates `preserved_last_exit` on the matching session.
+    #[test]
+    fn apply_exited_diff_updates_preserved_last_exit_on_matching_session() {
+        let mut app = build_app_with_session("ts-t15");
+        // Pre-condition: preserved_last_exit is None.
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+
+        let diff = ManifestDiff::Exited {
+            uid: "ts-t15".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: true,
+                kills_file_offset: Some(42),
+                exited_at: 1.0,
+            },
+        };
+        app.apply_manifest_diff(diff);
+
+        let got = app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .as_ref()
+            .expect("apply must populate preserved_last_exit");
+        assert!(got.memory_cap_kill, "memory_cap_kill flag must transfer");
+        assert_eq!(got.kills_file_offset, Some(42));
+        assert!(
+            app.needs_redraw,
+            "needs_redraw must be set so the next render \
+             picks up status indicator changes",
+        );
+    }
+
+    /// T16 — `ManifestDiff::Exited` with an unknown uid is a
+    /// silent no-op (R5). No panic; no mutation to unrelated
+    /// sessions.
+    #[test]
+    fn apply_exited_diff_with_unknown_uid_is_silent_noop() {
+        let mut app = build_app_with_session("ts-t16-known");
+        app.needs_redraw = false; // reset
+
+        let diff = ManifestDiff::Exited {
+            uid: "ts-t16-stranger".into(),
+            last_exit: LastExit {
+                code: Some(1),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        };
+        app.apply_manifest_diff(diff);
+
+        // Unrelated session unchanged.
+        assert!(
+            app.workspaces[0].sessions[0]
+                .preserved_last_exit
+                .is_none(),
+            "unknown uid must NOT mutate unrelated sessions' \
+             preserved_last_exit",
+        );
+        // No redraw triggered by a no-op apply.
+        assert!(
+            !app.needs_redraw,
+            "unknown uid must NOT trigger a redraw",
+        );
+    }
+
+    /// T20-companion — non-Exited variants (`Added`, `Updated`,
+    /// `Tombstoned`) are no-ops in 10e-c. Pin to catch future
+    /// scope creep that would silently start consuming them
+    /// without explicit handling.
+    #[test]
+    fn apply_non_exited_variants_are_noop_in_10e_c() {
+        let mut app = build_app_with_session("ts-t20");
+        app.needs_redraw = false;
+
+        // Added: no preserved_last_exit mutation, no redraw.
+        app.apply_manifest_diff(ManifestDiff::Added {
+            uid: "ts-t20".into(),
+            entry: serde_json::Value::Null,
+        });
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+        assert!(!app.needs_redraw);
+
+        // Updated: same.
+        app.apply_manifest_diff(ManifestDiff::Updated {
+            uid: "ts-t20".into(),
+            entry: serde_json::Value::Null,
+        });
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+        assert!(!app.needs_redraw);
+
+        // Tombstoned: same.
+        app.apply_manifest_diff(ManifestDiff::Tombstoned {
+            uid: "ts-t20".into(),
+            exited_at: 1.0,
+        });
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+        assert!(!app.needs_redraw);
+    }
+
+    /// T22 (10e-c r1 F1) — `apply_manifest_snapshot` adopts the
+    /// daemon's last_exit when the local field is `None`, AND
+    /// triggers a redraw. This is the "stale-None clobber" fix:
+    /// pre-r1 the snapshot was ignored on reconnect, so a session
+    /// the daemon already knew about (with last_exit set) would
+    /// keep showing as live until something else updated it.
+    #[test]
+    fn apply_snapshot_adopts_last_exit_when_local_is_none() {
+        let mut app = build_app_with_session("ts-t22");
+        app.needs_redraw = false;
+        assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
+
+        let last_exit = LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(7),
+            exited_at: 1.0,
+        };
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            session_last_exits: vec![(
+                "ts-t22".into(),
+                Some(last_exit.clone()),
+            )],
+        };
+        app.apply_manifest_snapshot(payload);
+
+        let got = app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .as_ref()
+            .expect("snapshot must populate preserved_last_exit when local is None");
+        assert_eq!(got, &last_exit);
+        assert!(app.needs_redraw, "snapshot adoption must request redraw");
+    }
+
+    /// T23 (10e-c r1 F1) — conservative merge: when the local
+    /// `preserved_last_exit` is already `Some(...)`, the snapshot's
+    /// value must NOT overwrite it. Local information wins because
+    /// it's typically fresher than the daemon's startup snapshot.
+    #[test]
+    fn apply_snapshot_does_not_overwrite_existing_local_last_exit() {
+        let mut app = build_app_with_session("ts-t23");
+        let local_exit = LastExit {
+            code: Some(0),
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 2.0,
+        };
+        app.workspaces[0].sessions[0].preserved_last_exit = Some(local_exit.clone());
+        app.needs_redraw = false;
+
+        let snapshot_exit = LastExit {
+            code: Some(137),
+            memory_cap_kill: true,
+            kills_file_offset: Some(99),
+            exited_at: 1.0,
+        };
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            session_last_exits: vec![(
+                "ts-t23".into(),
+                Some(snapshot_exit),
+            )],
+        };
+        app.apply_manifest_snapshot(payload);
+
+        let got = app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .as_ref()
+            .expect("local last_exit must be preserved");
+        assert_eq!(
+            got, &local_exit,
+            "conservative merge: local Some(...) wins over snapshot's value",
+        );
+        assert!(
+            !app.needs_redraw,
+            "no mutation → no redraw",
+        );
+    }
+
+    // -- 10e-d cap-kill toast surfacing tests (T24-T29) --
+    //
+    // The unified daemon-path toast (CAP_KILL_TOAST_MESSAGE) is
+    // emitted via `try_emit_cap_kill_toast`. Both wire paths
+    // (attach-stream End-frame → `cap_kill_notes` → drain; and
+    // manifest.watch Exited diff → `apply_manifest_diff`) call
+    // the helper and share the `cap_kill_toasted` set.
+
+    fn count_cap_kill_entries(app: &App) -> usize {
+        app.activity_log
+            .iter()
+            .filter(|e| e.summary == CAP_KILL_TOAST_MESSAGE)
+            .count()
+    }
+
+    /// T24 — DETACHED session (no `daemon_memory_cap_kill` Arc;
+    /// truly detached from the attach-stream path) gets a
+    /// cap-kill toast when the manifest.watch `Exited` diff
+    /// arrives. This is the named-criterion path: detached
+    /// sessions surface cap kills via manifest.watch.
+    #[test]
+    fn detached_cap_kill_via_manifest_watch_fires_toast() {
+        let mut app = build_app_with_session("ts-t24");
+        // Sanity: build_app_with_session uses /bin/true so
+        // `daemon_memory_cap_kill` is None — this session is
+        // detached for the purposes of the cap-kill path.
+        assert!(app.workspaces[0].sessions[0]
+            .session
+            .daemon_memory_cap_kill
+            .is_none());
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-t24".into(),
+            last_exit: LastExit {
+                code: Some(137),
+                memory_cap_kill: true,
+                kills_file_offset: Some(1),
+                exited_at: 1.0,
+            },
+        });
+
+        assert_eq!(
+            count_cap_kill_entries(&app), 1,
+            "detached cap-kill must produce exactly one toast",
+        );
+        assert!(
+            app.cap_kill_toasted.contains("ts-t24"),
+            "cap_kill_toasted must mark the uid after emit",
+        );
+        // Toast string parity check (also pinned by T29 but
+        // immediate sanity here).
+        assert_eq!(
+            app.activity_log.back().unwrap().summary,
+            CAP_KILL_TOAST_MESSAGE,
+        );
+    }
+
+    /// T25 — ATTACHED session's cap-kill produces exactly ONE
+    /// toast regardless of which path's signal arrives first.
+    /// Runs the scenario twice with the arrival order swapped
+    /// to pin order-independence durably.
+    #[test]
+    fn attached_cap_kill_does_not_double_toast() {
+        for order in &["attach-first", "manifest-first"] {
+            let mut app = build_app_with_session("ts-t25");
+            // Simulate the attached-session shape: install a
+            // `daemon_memory_cap_kill` Arc that the attach-stream
+            // reader would latch to true on End frame. We can't
+            // run a real PTY here, so the attach-drain path is
+            // simulated by directly calling
+            // `try_emit_cap_kill_toast` (which is what
+            // `drain_terminal_events` calls after observing the
+            // flag).
+            let diff = ManifestDiff::Exited {
+                uid: "ts-t25".into(),
+                last_exit: LastExit {
+                    code: Some(137),
+                    memory_cap_kill: true,
+                    kills_file_offset: Some(2),
+                    exited_at: 1.0,
+                },
+            };
+
+            if *order == "attach-first" {
+                app.try_emit_cap_kill_toast("ts-t25");
+                app.apply_manifest_diff(diff);
+            } else {
+                app.apply_manifest_diff(diff);
+                app.try_emit_cap_kill_toast("ts-t25");
+            }
+
+            assert_eq!(
+                count_cap_kill_entries(&app), 1,
+                "order={}: attached + manifest paths must produce \
+                 exactly one toast",
+                order,
+            );
+            assert!(app.cap_kill_toasted.contains("ts-t25"));
+        }
+    }
+
+    /// T26 — applying the same `Exited` diff twice (network
+    /// replay, snapshot+diff overlap during reconnect) toasts
+    /// exactly once. The set is the load-bearing de-dup.
+    #[test]
+    fn duplicate_manifest_diff_toasts_once() {
+        let mut app = build_app_with_session("ts-t26");
+        let make_diff = || ManifestDiff::Exited {
+            uid: "ts-t26".into(),
+            last_exit: LastExit {
+                code: Some(137),
+                memory_cap_kill: true,
+                kills_file_offset: Some(3),
+                exited_at: 1.0,
+            },
+        };
+        app.apply_manifest_diff(make_diff());
+        app.apply_manifest_diff(make_diff());
+        assert_eq!(count_cap_kill_entries(&app), 1);
+    }
+
+    /// T27 — `apply_manifest_snapshot` adopts last_exit when
+    /// local is None AND fires toast iff the adopted value has
+    /// `memory_cap_kill=true`. This is the load-bearing F1
+    /// reconciliation case: post-reconnect snapshot recovers
+    /// cap-kill state the TUI missed.
+    #[test]
+    fn snapshot_adoption_with_cap_kill_fires_toast() {
+        let mut app = build_app_with_session("ts-t27");
+        assert!(app.workspaces[0].sessions[0]
+            .preserved_last_exit
+            .is_none());
+
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            session_last_exits: vec![(
+                "ts-t27".into(),
+                Some(LastExit {
+                    code: Some(137),
+                    memory_cap_kill: true,
+                    kills_file_offset: Some(4),
+                    exited_at: 1.0,
+                }),
+            )],
+        };
+        app.apply_manifest_snapshot(payload);
+        assert_eq!(count_cap_kill_entries(&app), 1);
+        assert!(app.cap_kill_toasted.contains("ts-t27"));
+    }
+
+    /// T28 — `apply_manifest_snapshot` when local
+    /// `preserved_last_exit` is already `Some` (TUI loaded the
+    /// value from disk at startup) does NOT re-fire the toast.
+    /// Conservative-merge skips the adoption; we only call the
+    /// helper inside the if-None branch, so try_emit isn't
+    /// reached.
+    #[test]
+    fn snapshot_when_local_already_some_does_not_toast() {
+        let mut app = build_app_with_session("ts-t28");
+        // Pretend disk-load already populated this from the
+        // previous TUI session's manifest write.
+        app.workspaces[0].sessions[0].preserved_last_exit =
+            Some(LastExit {
+                code: Some(137),
+                memory_cap_kill: true,
+                kills_file_offset: Some(5),
+                exited_at: 1.0,
+            });
+        assert!(app.cap_kill_toasted.is_empty());
+
+        let payload = crate::manifest_watch::ManifestSnapshotPayload {
+            session_last_exits: vec![(
+                "ts-t28".into(),
+                Some(LastExit {
+                    code: Some(137),
+                    memory_cap_kill: true,
+                    kills_file_offset: Some(5),
+                    exited_at: 1.0,
+                }),
+            )],
+        };
+        app.apply_manifest_snapshot(payload);
+
+        assert_eq!(
+            count_cap_kill_entries(&app), 0,
+            "snapshot reconciliation when local is already Some \
+             MUST NOT re-toast: the cap-kill happened in the past, \
+             toasting now would surface stale UI noise",
+        );
+        assert!(
+            app.cap_kill_toasted.is_empty(),
+            "no emit → set stays empty",
+        );
+    }
+
+    /// T29 (parity, daemon-path only) — both the attach-stream
+    /// drain helper call AND the manifest.watch diff path
+    /// produce IDENTICAL `summary` strings in the activity feed.
+    /// Local-spawn `MemoryKillEvent::Killed` uses a richer
+    /// PID/comm/RSS format and is intentionally different
+    /// (separate surface, separate signal); not asserted here.
+    #[test]
+    fn attached_and_detached_daemon_paths_produce_identical_toast_string() {
+        // Attached path (simulate by direct helper call as in
+        // T25's "attach-first" half).
+        let mut app_attached = build_app_with_session("ts-t29a");
+        app_attached.try_emit_cap_kill_toast("ts-t29a");
+        let attached_summary =
+            app_attached.activity_log.back().unwrap().summary.clone();
+
+        // Detached path via manifest.watch diff.
+        let mut app_detached = build_app_with_session("ts-t29d");
+        app_detached.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-t29d".into(),
+            last_exit: LastExit {
+                code: Some(137),
+                memory_cap_kill: true,
+                kills_file_offset: Some(7),
+                exited_at: 1.0,
+            },
+        });
+        let detached_summary =
+            app_detached.activity_log.back().unwrap().summary.clone();
+
+        assert_eq!(
+            attached_summary, detached_summary,
+            "daemon-path toast strings must match (T29 parity)",
+        );
+        assert_eq!(
+            attached_summary, CAP_KILL_TOAST_MESSAGE,
+            "both paths must use the unified constant",
+        );
+    }
+
+    /// T-respawn (10e-d helper-pin) — `clear_cap_kill_toast_state`
+    /// releases the de-dup entry so a re-spawned session under
+    /// the same uid can toast again. Production uids are
+    /// monotonic so this case is rare, but the helper exists
+    /// for test paths AND as the spawn-path contract anchor.
+    #[test]
+    fn clear_cap_kill_toast_state_re_enables_emit_for_same_uid() {
+        let mut app = build_app_with_session("ts-respawn");
+        // First spawn: cap-killed.
+        assert!(app.try_emit_cap_kill_toast("ts-respawn"));
+        assert_eq!(count_cap_kill_entries(&app), 1);
+        // Same uid again WITHOUT clearing → suppressed.
+        assert!(!app.try_emit_cap_kill_toast("ts-respawn"));
+        assert_eq!(count_cap_kill_entries(&app), 1);
+
+        // Simulate re-spawn under the same uid: clear releases.
+        app.clear_cap_kill_toast_state("ts-respawn");
+        assert!(!app.cap_kill_toasted.contains("ts-respawn"));
+        // After clear, helper emits again.
+        assert!(app.try_emit_cap_kill_toast("ts-respawn"));
+        assert_eq!(
+            count_cap_kill_entries(&app), 2,
+            "post-clear re-emit must land a second activity-feed \
+             entry — pre-fix the stale set entry would suppress it",
         );
     }
 }
@@ -11191,6 +13739,7 @@ mod transcript_rebind_tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -11230,6 +13779,7 @@ mod transcript_rebind_tests {
             workflow::run::RoleBinding {
                 session_label: "worker".into(),
                 current_session_id: Some("old-sid".into()),
+                daemon_session_uid: None,
             },
         );
         let mut role_baselines = BTreeMap::new();
@@ -11320,6 +13870,7 @@ mod rotation_binding_tests {
             created_at: Instant::now(),
             managed_by_uid: None,
             seeded_from_snapshot: None,
+            preserved_last_exit: None,
         }
     }
 
@@ -11446,6 +13997,244 @@ mod rotation_binding_tests {
             found.as_deref(),
             Some("new-sid"),
             "must pick the newer transcript (timestamp >= rotation)",
+        );
+    }
+}
+
+/// 11g-1: tests for the per-run pending-events buffer that
+/// `drain_workflow_watch_events` populates and that 11g-2's
+/// controller flip will consume from. File-tail in the
+/// controller's tick remains the production source of truth
+/// in 11g-1; these tests pin the buffer's behavior in
+/// isolation so 11g-2 can flip the consumer with confidence.
+#[cfg(test)]
+mod pending_workflow_events_tests {
+    use super::*;
+
+    fn build_app_for_buffer_tests() -> App {
+        // Mirror `build_app_with_session`'s home_lock + tempdir
+        // dance — App::new reads ~/.cm/ and spawns daemon-watch
+        // threads; isolating $HOME prevents cross-test bleed.
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        if let Some(h) = orig_home {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        // Leak the tempdir so the consumer threads (already
+        // spawned with the test HOME in their env) don't error
+        // on later ~/.cm accesses.
+        std::mem::forget(tmp);
+        app
+    }
+
+    fn make_event(id: &str, run_id: &str) -> cm_daemon::workflow::events::Event {
+        cm_daemon::workflow::events::Event {
+            id: id.into(),
+            ts: 0.0,
+            run_id: run_id.into(),
+            role: "worker".into(),
+            tool: "workflow_transition".into(),
+            args: serde_json::json!({"to": "reviewer", "prompt": ""}),
+            source: "daemon".into(),
+            from_role: None,
+            iteration: 0,
+        }
+    }
+
+    /// T_g1a — App::new produces an empty pending-events buffer.
+    /// Pins the initial state so a fresh App doesn't carry
+    /// stale entries across restarts.
+    #[test]
+    fn pending_workflow_events_starts_empty() {
+        let app = build_app_for_buffer_tests();
+        assert!(
+            app.pending_workflow_events.is_empty(),
+            "App::new must produce an empty buffer; got {:?}",
+            app.pending_workflow_events.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// T_g1b — `take_pending_workflow_events` drains in FIFO
+    /// order. Per-run deque preserves the daemon's broadcast
+    /// order, which matches `events.jsonl` append order.
+    /// Multiple pushes for one run, single drain, exact
+    /// ordering pinned.
+    #[test]
+    fn take_pending_workflow_events_drains_in_fifo_order() {
+        let mut app = build_app_for_buffer_tests();
+        let run_id = "wf_g1b";
+        // Push directly into the buffer (drain-path coverage
+        // is T_g1f below; this isolates the helper).
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-1", run_id));
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-2", run_id));
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-3", run_id));
+
+        let drained = app.take_pending_workflow_events(run_id);
+        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ev-1", "ev-2", "ev-3"],
+            "FIFO drain must preserve push order",
+        );
+        // Buffer entry empty post-drain (deque left present
+        // but empty per the helper's contract).
+        assert_eq!(
+            app.pending_workflow_events
+                .get(run_id)
+                .map(|d| d.len())
+                .unwrap_or(99),
+            0,
+            "drain leaves the deque empty",
+        );
+        // Second drain returns empty (no replay).
+        assert!(app.take_pending_workflow_events(run_id).is_empty());
+    }
+
+    /// T_g1c — `take_pending_workflow_events` for an unknown
+    /// run_id returns an empty Vec (no panic, no spurious
+    /// entry created).
+    #[test]
+    fn take_pending_workflow_events_unknown_run_returns_empty() {
+        let mut app = build_app_for_buffer_tests();
+        let drained = app.take_pending_workflow_events("wf_nope");
+        assert!(drained.is_empty());
+        assert!(
+            !app.pending_workflow_events.contains_key("wf_nope"),
+            "take must not create a spurious entry for an unknown run",
+        );
+    }
+
+    /// T_g1d — `requeue_pending_workflow_event_front` places
+    /// the event at the FRONT of the deque (LIFO with respect
+    /// to the existing tail). Used by 11g-2's retry path: a
+    /// failed decision pushes its source event back so the
+    /// next tick retries the same event.
+    #[test]
+    fn requeue_pending_workflow_event_front_inserts_at_head() {
+        let mut app = build_app_for_buffer_tests();
+        let run_id = "wf_g1d";
+        app.pending_workflow_events
+            .entry(run_id.into())
+            .or_default()
+            .push_back(make_event("ev-tail", run_id));
+        app.requeue_pending_workflow_event_front(
+            run_id,
+            make_event("ev-head", run_id),
+        );
+        let drained = app.take_pending_workflow_events(run_id);
+        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ev-head", "ev-tail"],
+            "requeue must place at the front — next take returns it first",
+        );
+    }
+
+    /// T_g1e — multi-run isolation. Events for run-A and run-B
+    /// land in separate per-run deques; draining run-A does
+    /// not affect run-B's pending events.
+    #[test]
+    fn take_pending_workflow_events_isolates_per_run() {
+        let mut app = build_app_for_buffer_tests();
+        app.pending_workflow_events
+            .entry("wf-A".into())
+            .or_default()
+            .push_back(make_event("a-1", "wf-A"));
+        app.pending_workflow_events
+            .entry("wf-A".into())
+            .or_default()
+            .push_back(make_event("a-2", "wf-A"));
+        app.pending_workflow_events
+            .entry("wf-B".into())
+            .or_default()
+            .push_back(make_event("b-1", "wf-B"));
+
+        let a = app.take_pending_workflow_events("wf-A");
+        assert_eq!(
+            a.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["a-1", "a-2"],
+        );
+        // B untouched.
+        let b = app.take_pending_workflow_events("wf-B");
+        assert_eq!(
+            b.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["b-1"],
+        );
+    }
+
+    /// T_g1f — end-to-end: `drain_workflow_watch_events` push
+    /// path. Substitute `app.workflow_watch_rx` with a synthetic
+    /// channel, send Events through it, call drain, assert the
+    /// per-run buffer contains them in the order sent. Pins the
+    /// drain Event arm's push behavior; the in-isolation drain
+    /// helpers above (T_g1b/T_g1d) cover the take/requeue
+    /// halves.
+    ///
+    /// Mutation-verifiable: remove the `push_back` call in the
+    /// drain's Event arm and this test fails (buffer stays
+    /// empty after drain).
+    #[test]
+    fn drain_workflow_watch_events_pushes_into_per_run_buffer() {
+        let mut app = build_app_for_buffer_tests();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            crate::workflow_watch::WorkflowWatchEvent,
+        >();
+        // Replace the real receiver. Drop the production one
+        // (its consumer thread keeps running but feeds nothing).
+        app.workflow_watch_rx = Some(rx);
+
+        let run_id = "wf_g1f";
+        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+            make_event("ev-1", run_id),
+        ))
+        .expect("send 1");
+        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+            make_event("ev-2", run_id),
+        ))
+        .expect("send 2");
+        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+            make_event("ev-3", run_id),
+        ))
+        .expect("send 3");
+
+        app.drain_workflow_watch_events();
+
+        let drained = app.take_pending_workflow_events(run_id);
+        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ev-1", "ev-2", "ev-3"],
+            "drain must populate the per-run buffer in send order",
+        );
+        assert!(
+            app.needs_redraw,
+            "drain must set needs_redraw on each Event",
         );
     }
 }
@@ -13310,6 +16099,7 @@ mod input_handler_tests {
                 created_at: Instant::now(),
                 managed_by_uid: None,
                 seeded_from_snapshot: None,
+                preserved_last_exit: None,
             });
         }
         out
@@ -14335,6 +17125,122 @@ context = "persistent"
         assert_eq!(
             filtered[0].0.file_name().and_then(|s| s.to_str()),
             Some("bad.toml"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod respawn_kills_daemon_session_tests {
+    //! Slice 10d-memory-cap-relocation review finding.
+    //!
+    //! Pins the structural invariant the reviewer surfaced:
+    //! `respawn_existing_with_workflow_mcp` swaps a fresh
+    //! `Session` into a live `TerminalSession` slot via
+    //! `ts.session = new_sess`. For local-PTY sessions, dropping
+    //! the old `Session` closes its master fd and reaps the old
+    //! agent. For daemon-attached sessions, Drop is detach-only
+    //! by design (slice 10c-e-3b-fix2) — so without an explicit
+    //! `App::kill_daemon_session_if_attached` BEFORE the
+    //! assignment, the daemon's old PTY child stays alive while
+    //! a freshly-resumed agent starts in the same slot.
+    //! Duplicate live agents, transcript / worktree races.
+    //!
+    //! This is the same bug class as the round-33 finding 1
+    //! (`MCP kill_session` orphan) and the slice-10c-e-3b-fix2
+    //! teardown-paths sweep — a *missed call site* of the kill
+    //! helper. The pinning test guards against a future
+    //! refactor that re-removes the call.
+    //!
+    //! **Why a source-presence test rather than a behavioral
+    //! one**: `respawn_existing_with_workflow_mcp` calls
+    //! `crate::session::spawn_agent_session`, which spawns a
+    //! real PTY child running the agent binary. Driving that
+    //! end-to-end requires a real worktree, a live daemon, and
+    //! the agent binary on `$PATH` — far too heavy for a unit
+    //! test. The lower-cost behavioral coverage already exists
+    //! (`client_session::tests` verifies that
+    //! `kill_daemon_session_if_attached` actually removes the
+    //! daemon-side registry entry). What's missing — and what
+    //! this test adds — is the *call-site* pin: a future change
+    //! that re-introduces the bug by removing or reordering the
+    //! call will fail this test by name.
+
+    const APP_SRC: &str = include_str!("app.rs");
+
+    /// Locate the start of `pub(crate) fn respawn_existing_with_workflow_mcp`
+    /// in this file and return the function body — from the
+    /// `{` after the signature through the matching `}`. Used
+    /// to scope the structural assertions below to the body of
+    /// the function under test (not the whole file).
+    fn respawn_body() -> &'static str {
+        let sig_marker = "pub(crate) fn respawn_existing_with_workflow_mcp";
+        let sig_idx = APP_SRC
+            .find(sig_marker)
+            .expect("respawn_existing_with_workflow_mcp must exist in app.rs");
+        let from_sig = &APP_SRC[sig_idx..];
+
+        // Find the first `{` that opens the body (after the
+        // signature + return type). `signed -> Option<String> {`
+        let body_open = from_sig
+            .find('{')
+            .expect("function signature must be followed by an opening brace");
+        let body = &from_sig[body_open..];
+
+        // Find the matching closing brace by counting depth.
+        let mut depth = 0usize;
+        let mut end = body.len();
+        for (i, c) in body.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &body[..end]
+    }
+
+    /// The named acceptance test. The function must call
+    /// `kill_daemon_session_if_attached(ts)` before assigning
+    /// `ts.session = new_sess`. Without that ordering, a
+    /// daemon-attached session being respawned leaves a live
+    /// orphan on the daemon side.
+    #[test]
+    fn respawn_calls_kill_daemon_before_session_swap() {
+        let body = respawn_body();
+        let kill_idx = body.find("kill_daemon_session_if_attached(ts)").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must call \
+                 App::kill_daemon_session_if_attached(ts) before swapping \
+                 `ts.session`. For daemon-attached sessions, Drop is \
+                 detach-only — without the explicit kill, the daemon's old \
+                 PTY child outlives the swap and races the new agent. \
+                 Same bug class as round-33 finding 1 + the slice \
+                 10c-e-3b-fix2 teardown-paths sweep.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let swap_idx = body.find("ts.session = new_sess").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must assign \
+                 `ts.session = new_sess` to install the freshly-spawned \
+                 session. If the assignment shape has changed, update \
+                 this test's needle.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        assert!(
+            kill_idx < swap_idx,
+            "kill_daemon_session_if_attached(ts) at byte {} must precede \
+             `ts.session = new_sess` at byte {} — otherwise the swap drops \
+             the old daemon-attached Session (detach-only Drop) BEFORE the \
+             explicit kill RPC fires, leaving an orphan daemon PTY child.\n\nFunction body:\n{}",
+            kill_idx, swap_idx, body
         );
     }
 }

@@ -2,21 +2,28 @@ mod agent;
 mod agent_memory;
 mod api;
 mod app;
+mod attached_pty;
 mod backend;
+mod client_session;
 mod config;
 mod control;
+mod daemon_launch;
 mod input;
+mod manifest_watch;
 mod mcp_config;
 mod memory_cap;
 mod planning;
 mod preflight;
 mod session;
 mod session_watch;
+mod term_shim;
 mod terminal_widget;
 #[cfg(test)]
 mod test_support;
 mod workflow;
-mod worktree;
+mod workflow_watch;
+// `worktree` relocated to the `cm-daemon` crate (slice 3 of
+// doc/persistent-host-daemon.md). Callers use `cm_daemon::worktree::*`.
 
 use std::io;
 use std::io::Write;
@@ -40,6 +47,76 @@ use config::Config;
 
 fn main() -> anyhow::Result<()> {
     let config = Config::load();
+
+    // 10f default-flip: daemon mode is now mandatory. The TUI cannot
+    // operate without the daemon — `mcp_config::build_env` injects
+    // `CM_DAEMON_SOCKET` into every spawned MCP agent, and session
+    // state lives on the daemon. A soft fallback would pin agents
+    // to a dead socket and lose session ownership. Loud failure on
+    // startup is the only safe shape.
+    let daemon_socket = cm_daemon::default_socket_path();
+    // Load (or generate-and-persist) the operator token BEFORE
+    // spawning the daemon. The daemon reads the same value from
+    // `CM_OPERATOR_TOKEN` in its spawn env and uses it to authenticate
+    // every `Caller::Operator` RPC. See
+    // `tui/src/daemon_launch.rs::load_or_create_operator_token`.
+    let operator_token = match daemon_launch::load_or_create_operator_token() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "cm-tui: failed to load/create ~/.cm/operator-token: {}",
+                e,
+            );
+            eprintln!(
+                "cm-tui: the operator token is the shared secret the TUI presents to its own \
+                 daemon. Without it, every daemon RPC will be unauthorized. Fix: ensure \
+                 ~/.cm is owned by you and writable."
+            );
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = daemon_launch::ensure_daemon_at_startup(&daemon_socket, &operator_token) {
+        eprintln!(
+            "cm-tui: failed to launch cm-daemon at {}: {}",
+            daemon_socket.display(),
+            e,
+        );
+        eprintln!(
+            "cm-tui: cannot start without the daemon. Fixes:"
+        );
+        eprintln!(
+            "  - Build the daemon: `cargo build -p cm-daemon`"
+        );
+        eprintln!(
+            "  - Override the binary path: `CM_DAEMON_BINARY=/path/to/cm-daemon cm-tui`"
+        );
+        eprintln!(
+            "  - Check permissions on ~/.cm/ (the daemon binds the socket there)"
+        );
+        std::process::exit(1);
+    }
+
+    // Sub-2a Finding (round 3) #1: do NOT push an empty
+    // `task.update_tree` at startup. The persistent-host
+    // daemon may already hold a non-empty tree from a previous
+    // TUI session — an unconditional empty push would wipe it
+    // (see `methods::task_update_tree`: clear-then-extend
+    // semantics; `client_session::tests::rpc_task_update_tree_replaces_on_second_push`
+    // pins this). Before reconcile fires, the TUI has nothing
+    // authoritative to publish; the empty `task.update_tree`
+    // would lose information rather than add any. The first
+    // `reconcile_tasks` call (which fires on
+    // `BackendEvent::TasksUpdated` and calls
+    // `push_task_tree_to_daemon` at the tail) is the
+    // authoritative populator — until then, the daemon's
+    // existing tree stands.
+    //
+    // Pre-fix this slot held an unconditional empty push that
+    // wiped the daemon's tree on every TUI startup. If the API
+    // was slow or unreachable, the daemon stayed wiped until
+    // reconcile eventually fired — opening a window where
+    // Session-caller descendant-task auth lost all parent
+    // edges. Deleting the empty push closes that window.
 
     // Setup terminal.
     enable_raw_mode()?;
@@ -119,6 +196,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_memory_kill_events();
         log_slow_phase("drain_memory_kill_events", t.elapsed());
+
+        // 10e-c: drain ManifestDiff frames from the
+        // manifest.watch consumer (daemon-mode opt-in only;
+        // no-op in legacy single-process mode).
+        let t = Instant::now();
+        app.drain_manifest_watch_events();
+        log_slow_phase("drain_manifest_watch_events", t.elapsed());
+
+        // 11d: drain WorkflowWatchEvent frames from the
+        // events.subscribe consumer. Same shape as the
+        // manifest_watch drain — single-thread apply under the
+        // main loop's invariant.
+        let t = Instant::now();
+        app.drain_workflow_watch_events();
+        log_slow_phase("drain_workflow_watch_events", t.elapsed());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

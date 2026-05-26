@@ -631,7 +631,7 @@ fn do_pull(
     };
 
     let task_label = task.name.as_deref().or(task.prompt.as_deref()).unwrap_or("task");
-    let slug = crate::worktree::slugify(task_label);
+    let slug = cm_daemon::worktree::slugify(task_label);
     let slug = if slug.is_empty() {
         session_id[..8.min(session_id.len())].to_string()
     } else {
@@ -649,7 +649,7 @@ fn do_pull(
         .args(["fetch", "origin", branch])
         .output();
 
-    let worktree_path = match crate::worktree::create_worktree(main_repo, &slug, Some(branch)) {
+    let worktree_path = match cm_daemon::worktree::create_worktree(main_repo, &slug, Some(branch)) {
         Ok(p) => p,
         Err(e) => {
             progress(&format!("Pull failed: worktree: {}", e));
@@ -664,7 +664,7 @@ fn do_pull(
         .args(["checkout", branch])
         .output();
 
-    crate::worktree::setup_worktree(main_repo, &worktree_path);
+    cm_daemon::worktree::setup_worktree(main_repo, &worktree_path);
 
     // 3. Download session from GCS.
     progress("Downloading session...");

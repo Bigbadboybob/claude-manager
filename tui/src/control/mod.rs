@@ -18,9 +18,15 @@
 //! (streaming subscriptions are a later phase).
 
 pub mod methods;
-pub mod protocol;
 pub mod queue;
 pub mod server;
+
+// Wire types relocated to the `cm-daemon` crate in slice 4 of
+// doc/persistent-host-daemon.md. Re-exported here as `crate::control::protocol`
+// so every existing TUI callsite continues to compile unchanged. The
+// re-export goes away when `server` / `queue` / `methods` follow the
+// App-state migration into the daemon (the deferred half of slice 4).
+pub use cm_daemon::control::protocol;
 
 #[cfg(test)]
 mod tests;
