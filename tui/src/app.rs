@@ -397,6 +397,11 @@ pub struct TaskEntry {
     ///   - "branch": a new worktree is created off the parent's branch
     ///     with name `cm-sub/<slug-chain>-<short_id>`.
     pub worktree_mode: WorktreeMode,
+    /// Free-form JSONB bag mirrored from the API row. Skills attach
+    /// structured context here — currently `metadata.resume.*` for the
+    /// design-doc bundle (`design_doc_path` + `designer_session_uid`).
+    /// `None` = no bag set.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// How a subtask's worktree relates to its parent. Default = `Inherit`
@@ -916,8 +921,6 @@ enum VisualItem {
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
     WorkflowHeader { ws_idx: usize, run_id: String },
-    /// Dim label that introduces the "Past workspaces" section. Not selectable.
-    SectionHeader(&'static str),
 }
 
 /// Modal input state.
@@ -1057,6 +1060,14 @@ enum InputMode {
     WorkflowHistory {
         run_id: String,
     },
+    /// Picker over past workspaces (closed or all-tasks-done) so the user
+    /// can reopen one without cluttering the sidebar. Opened via A-O from
+    /// Sessions view. Carries the candidate list up-front instead of
+    /// recomputing on every input event.
+    PastWorkspacePicker {
+        candidates: Vec<PastCandidate>,
+        selected: usize,
+    },
     /// Generic y/N confirmation overlay. The action runs only on `y`/`Y`/Enter;
     /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-d, A-x).
     Confirm {
@@ -1065,11 +1076,28 @@ enum InputMode {
     },
 }
 
+/// Snapshot of a past workspace surfaced in the A-O picker. `worktree_exists`
+/// is checked at modal-open time so the row can be greyed/disabled when the
+/// directory has been removed since close.
+#[derive(Clone, Debug)]
+pub struct PastCandidate {
+    pub ws_id: String,
+    pub display: String,
+    pub worktree_path: Option<std::path::PathBuf>,
+    pub worktree_exists: bool,
+    /// Latest tombstone `exited_at` if any — used to sort most-recent first.
+    pub last_exited_at: f64,
+}
+
 #[derive(Clone, Debug)]
 pub enum ConfirmAction {
     MarkDone,
     Delete,
     StopWorkflow { run_id: String },
+    /// Y/n prompt that follows A-O reopen when the workspace had any
+    /// tombstoned sessions. Y respawns one session per tombstone (claude
+    /// /codex resume via `--resume`, bash starts fresh in the worktree).
+    RestoreTombstones { ws_id: String },
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -1226,6 +1254,14 @@ pub(crate) enum SubmitAction {
     DeleteActive,
     StopWorkflow {
         run_id: String,
+    },
+    /// Picker chose a past workspace to reopen.
+    ReopenPastWorkspace {
+        ws_id: String,
+    },
+    /// Confirmed Y on the "Restore N closed sessions?" prompt.
+    RestoreTombstones {
+        ws_id: String,
     },
 }
 
@@ -2376,6 +2412,43 @@ pub(crate) fn handle_workflow_picker(
     }
 }
 
+pub(crate) fn handle_past_workspace_picker(
+    candidates: &[PastCandidate],
+    selected: &mut usize,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => InputOutcome::Cancel,
+        KeyCode::Enter => match candidates.get(*selected) {
+            Some(c) => InputOutcome::Submit(SubmitAction::ReopenPastWorkspace {
+                ws_id: c.ws_id.clone(),
+            }),
+            None => InputOutcome::Cancel,
+        },
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+            if !candidates.is_empty() {
+                *selected = (*selected + 1) % candidates.len();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+            if !candidates.is_empty() {
+                *selected = if *selected == 0 {
+                    candidates.len() - 1
+                } else {
+                    *selected - 1
+                };
+            }
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
 pub(crate) fn handle_workflow_history(
     _ctx: InputCtx<'_>,
     event: &CrosstermEvent,
@@ -2403,6 +2476,9 @@ pub(crate) fn handle_confirm(
                 ConfirmAction::MarkDone => SubmitAction::MarkActiveDone,
                 ConfirmAction::Delete => SubmitAction::DeleteActive,
                 ConfirmAction::StopWorkflow { run_id } => SubmitAction::StopWorkflow { run_id },
+                ConfirmAction::RestoreTombstones { ws_id } => {
+                    SubmitAction::RestoreTombstones { ws_id }
+                }
             };
             InputOutcome::Submit(submit)
         }
@@ -2435,6 +2511,11 @@ pub struct App {
     /// before restore_sessions populates self.workspaces.
     manifest_bindings: HashMap<String, String>,
     last_session_id_check: Instant,
+    /// Last time `tick_workflows` actually ran. The drain loop calls
+    /// it every iteration, but each workflow tick does several transcript
+    /// reads per active role — throttling to ~10Hz keeps that work off
+    /// the keystroke-to-paint path without delaying transitions noticeably.
+    last_workflow_tick: Instant,
     /// Workflow definitions loaded from `workflows/*.toml` at startup.
     pub workflows: HashMap<String, Workflow>,
     /// Files in the workflows directory that failed to parse or validate at
@@ -2637,6 +2718,7 @@ impl App {
             sessions_restored: false,
             manifest_bindings,
             last_session_id_check: Instant::now(),
+            last_workflow_tick: Instant::now(),
             workflows,
             workflow_load_errors,
             workflow_runs,
@@ -3939,45 +4021,82 @@ impl App {
         }
     }
 
-    /// Reopen the past workspace under the cursor: flip `is_closed` back to
-    /// false and bring any bound done tasks back to `running` so the
-    /// workspace re-enters the active sidebar. Refuses gracefully when the
-    /// worktree directory is gone (manually deleted or `git worktree
-    /// remove`'d) — the user can press A-x to drop the workspace entry
-    /// instead.
-    fn reopen_active_workspace(&mut self) {
-        let Some(wi) = self.active_workspace_index() else {
-            return;
-        };
-        if !self.is_past_workspace(wi) {
-            self.set_status_msg("Not a past workspace");
+    /// Build the candidate list for the A-O picker and open it. Shows a
+    /// status message when no past workspaces exist instead of an empty
+    /// modal. Most-recent (latest tombstone) first.
+    fn open_past_workspace_picker(&mut self) {
+        let mut candidates: Vec<PastCandidate> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(wi, _)| self.is_past_workspace(*wi))
+            .map(|(_, ws)| {
+                let last_exited_at = ws
+                    .tombstones
+                    .iter()
+                    .map(|t| t.exited_at)
+                    .fold(0.0f64, f64::max);
+                let worktree_exists = ws
+                    .worktree_path
+                    .as_ref()
+                    .map_or(false, |p| p.exists());
+                PastCandidate {
+                    ws_id: ws.id.clone(),
+                    display: ws.name.clone(),
+                    worktree_path: ws.worktree_path.clone(),
+                    worktree_exists,
+                    last_exited_at,
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            self.set_status_msg("No past workspaces");
             return;
         }
-        let ws_id = self.workspaces[wi].id.clone();
+        candidates.sort_by(|a, b| {
+            b.last_exited_at
+                .partial_cmp(&a.last_exited_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.input_mode = InputMode::PastWorkspacePicker {
+            candidates,
+            selected: 0,
+        };
+    }
+
+    /// Reopen a past workspace by id: flip `is_closed` back to false and
+    /// PATCH any bound done tasks back to `running` so the workspace
+    /// re-enters the active sidebar. Refuses gracefully when the worktree
+    /// directory is gone (manually deleted or `git worktree remove`'d).
+    /// Returns true on success — callers in modal mode use it to close
+    /// the picker only when the reopen actually went through.
+    fn reopen_workspace_by_id(&mut self, ws_id: &str) -> bool {
+        let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            self.set_status_msg("Workspace no longer in manifest");
+            return false;
+        };
         let worktree_path = self.workspaces[wi].worktree_path.clone();
         match worktree_path.as_deref() {
             Some(p) if p.exists() => {}
             Some(p) => {
                 self.set_status_msg(&format!(
-                    "Worktree gone: {} — A-x to remove",
+                    "Worktree gone: {} — can't reopen",
                     p.display()
                 ));
-                return;
+                return false;
             }
             None => {
                 self.set_status_msg("Workspace has no worktree to reopen");
-                return;
+                return false;
             }
         }
 
         self.workspaces[wi].is_closed = false;
 
-        // PATCH any bound done tasks back to running so they re-enter the
-        // active sidebar (reconcile only surfaces running/blocked).
         let bound_done: Vec<String> = self
             .tasks
             .iter()
-            .filter(|t| t.workspace_id.as_deref() == Some(&ws_id))
+            .filter(|t| t.workspace_id.as_deref() == Some(ws_id))
             .filter(|t| matches!(t.api_status, TaskStatus::Done))
             .filter_map(|t| t.task_id.clone())
             .collect();
@@ -4000,10 +4119,182 @@ impl App {
             self.planning.mark_task_running_by_id(tid);
         }
 
+        let respawned = self.resurrect_designer_sessions_for_workspace(wi);
+
         self.save_session_manifest();
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
-        self.set_status_msg("Workspace reopened — A-s to add session");
+
+        // Designer sessions tagged by `metadata.resume.designer_session_uid`
+        // were already auto-resurrected above. If any tombstones remain
+        // (workflow participants, ad-hoc sessions, etc.), offer to restore
+        // them via the confirm dialog. Task status / workspace_id are
+        // already wired up by this point.
+        let tombstone_count = self.workspaces[wi].tombstones.len();
+        if tombstone_count > 0 {
+            self.input_mode = InputMode::Confirm {
+                prompt: format!(
+                    "Restore {} closed session{} in this workspace?",
+                    tombstone_count,
+                    if tombstone_count == 1 { "" } else { "s" },
+                ),
+                action: ConfirmAction::RestoreTombstones {
+                    ws_id: ws_id.to_string(),
+                },
+            };
+        } else if respawned > 0 {
+            self.set_status_msg(&format!(
+                "Workspace reopened — resurrected {} designer session{}",
+                respawned,
+                if respawned == 1 { "" } else { "s" },
+            ));
+        } else {
+            self.set_status_msg("Workspace reopened — A-s to add session");
+        }
+        true
+    }
+
+    /// Respawn one PTY per tombstone in the named workspace. Claude/Codex
+    /// sessions are revived via `--resume <transcript_id>`; bash starts
+    /// fresh in the worktree (no transcript to resume). Tombstones that
+    /// successfully spawn are consumed from the workspace; failures stay
+    /// in the list and surface in the status bar so the user can retry.
+    fn restore_tombstones_for_workspace(&mut self, ws_id: &str) {
+        let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) else {
+            self.set_status_msg("Workspace no longer exists");
+            return;
+        };
+        if self.workspaces[wi].tombstones.is_empty() {
+            return;
+        }
+        let (cols, rows) = self.last_term_size;
+        let worktree = self.workspaces[wi].worktree_path.clone();
+
+        // Move tombstones out so the spawn loop can call &mut self helpers
+        // without aliasing through `self.workspaces[wi]`.
+        let tombstones: Vec<SessionTombstone> =
+            std::mem::take(&mut self.workspaces[wi].tombstones);
+        let total = tombstones.len();
+        let mut restored = 0;
+        let mut failed: Vec<SessionTombstone> = Vec::new();
+
+        for tomb in tombstones {
+            let session_uid = new_session_uid();
+            let result = match tomb.session_type.as_str() {
+                "claude" => {
+                    let resume = tomb.last_transcript_id.as_deref();
+                    let (program, args) = match crate::mcp_config::build_args(
+                        crate::mcp_config::SpawnTarget::TuiLocal,
+                        &workflow::toml_schema::Engine::ClaudeCode,
+                        &session_uid,
+                        None,
+                        resume,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.set_status_msg(&format!(
+                                "Restore failed to configure claude: {}",
+                                e
+                            ));
+                            failed.push(tomb);
+                            continue;
+                        }
+                    };
+                    self.spawn_agent_session(
+                        "claude",
+                        &session_uid,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        worktree.clone(),
+                        Default::default(),
+                    )
+                }
+                "codex" => {
+                    let resume = tomb.last_transcript_id.as_deref();
+                    let (program, args) = match crate::mcp_config::build_args(
+                        crate::mcp_config::SpawnTarget::TuiLocal,
+                        &workflow::toml_schema::Engine::Codex,
+                        &session_uid,
+                        None,
+                        resume,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.set_status_msg(&format!(
+                                "Restore failed to configure codex: {}",
+                                e
+                            ));
+                            failed.push(tomb);
+                            continue;
+                        }
+                    };
+                    self.spawn_agent_session(
+                        "codex",
+                        &session_uid,
+                        &program,
+                        &args,
+                        cols,
+                        rows,
+                        worktree.clone(),
+                        Default::default(),
+                    )
+                }
+                _ => Session::new(
+                    "/bin/bash",
+                    &[],
+                    cols,
+                    rows,
+                    worktree.clone(),
+                    Default::default(),
+                    None,
+                ),
+            };
+
+            match result {
+                Ok(s) => {
+                    let pending = match tomb.session_type.as_str() {
+                        "claude" => worktree.as_ref().map(|p| Self::list_jsonl_files(p)),
+                        "codex" => worktree.as_ref().map(|p| Self::list_codex_sessions(p)),
+                        _ => None,
+                    };
+                    let mut ts = make_simple_session_with_uid(
+                        session_uid,
+                        &tomb.label,
+                        &tomb.session_type,
+                        s,
+                        pending,
+                    );
+                    ts.task_id = tomb.task_id.clone();
+                    // For Claude `--resume` keeps writing to the same JSONL,
+                    // so the transcript id IS the live id immediately. For
+                    // Codex the live id is rebound by the detector when the
+                    // post-resume rollout appears in `pending_jsonl_files`.
+                    if tomb.session_type == "claude" {
+                        ts.transcript_id = tomb.last_transcript_id.clone();
+                    }
+                    self.workspaces[wi].sessions.push(ts);
+                    restored += 1;
+                }
+                Err(e) => {
+                    self.set_status_msg(&format!("Restore failed: {}", e));
+                    failed.push(tomb);
+                }
+            }
+        }
+
+        // Put any failures back so the user can A-O again later.
+        self.workspaces[wi].tombstones.extend(failed);
+        self.save_session_manifest();
+        self.cursor = Cursor::Workspace(wi);
+        self.clamp_cursor();
+        self.set_status_msg(&format!(
+            "Restored {}/{} session{}",
+            restored,
+            total,
+            if total == 1 { "" } else { "s" },
+        ));
     }
 
     /// Soft-close the workspace under the cursor: kill its session PTYs
@@ -4034,6 +4325,127 @@ impl App {
         }
         self.clamp_cursor();
         self.set_status_msg("Workspace closed");
+    }
+
+    /// Resurrect tombstoned sessions referenced by a bound task's
+    /// `metadata.resume.designer_session_uid`. Generic by design — any
+    /// skill that stashes a session uid under that key gets the same
+    /// behavior on workspace reopen. First and currently only caller is
+    /// the design-doc bundle (skill writes the uid; reopen brings the
+    /// session back as a live `claude --resume <transcript_id>`).
+    ///
+    /// Returns the number of tombstones successfully respawned so
+    /// callers can include it in status messages. Failures (missing
+    /// transcript id, spawn error, unsupported session type) leave the
+    /// tombstone in place so a subsequent reopen can retry.
+    fn resurrect_designer_sessions_for_workspace(&mut self, wi: usize) -> usize {
+        if wi >= self.workspaces.len() {
+            return 0;
+        }
+        let ws_id = self.workspaces[wi].id.clone();
+        let target_uids: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.workspace_id.as_deref() == Some(ws_id.as_str()))
+            .filter_map(|t| {
+                t.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("resume"))
+                    .and_then(|r| r.get("designer_session_uid"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        if target_uids.is_empty() {
+            return 0;
+        }
+
+        let (cols, rows) = self.last_term_size;
+        let mut respawned = 0usize;
+        for uid in target_uids {
+            // Skip if the uid is already live (e.g. a previous resurrect
+            // hop already brought it back) — never spawn a duplicate.
+            if self.workspaces[wi]
+                .sessions
+                .iter()
+                .any(|s| s.uid == uid)
+            {
+                continue;
+            }
+            let Some(ti) = self.workspaces[wi]
+                .tombstones
+                .iter()
+                .position(|t| t.uid == uid)
+            else {
+                continue;
+            };
+            let tomb = &self.workspaces[wi].tombstones[ti];
+            if tomb.session_type != "claude" {
+                continue;
+            }
+            let Some(transcript_id) = tomb.last_transcript_id.clone() else {
+                continue;
+            };
+            let worktree_path = tomb
+                .worktree_path
+                .clone()
+                .or_else(|| self.workspaces[wi].worktree_path.clone());
+            let label = tomb.label.clone();
+            let task_id = tomb.task_id.clone();
+
+            let (program, args) = match crate::mcp_config::build_args(
+                crate::mcp_config::SpawnTarget::TuiLocal,
+                &workflow::toml_schema::Engine::ClaudeCode,
+                &uid,
+                None,
+                Some(transcript_id.as_str()),
+            ) {
+                Ok(v) => v,
+                Err(_) => (
+                    "claude".to_string(),
+                    vec![
+                        "--dangerously-skip-permissions".to_string(),
+                        "--resume".to_string(),
+                        transcript_id.clone(),
+                    ],
+                ),
+            };
+
+            match self.spawn_agent_session(
+                "claude",
+                &uid,
+                &program,
+                &args,
+                cols,
+                rows,
+                worktree_path,
+                Default::default(),
+            ) {
+                Ok(s) => {
+                    let mut ts = make_simple_session_with_uid(
+                        uid.clone(),
+                        &label,
+                        "claude",
+                        s,
+                        None,
+                    );
+                    ts.transcript_id = Some(transcript_id);
+                    ts.task_id = task_id;
+                    self.workspaces[wi].sessions.push(ts);
+                    self.workspaces[wi].tombstones.remove(ti);
+                    respawned += 1;
+                }
+                Err(_) => {
+                    // Spawn failed — leave the tombstone alone so the
+                    // user can retry by closing and reopening again
+                    // (or by adding a session manually with A-s).
+                }
+            }
+        }
+        if respawned > 0 {
+            self.save_session_manifest();
+        }
+        respawned
     }
 
     fn toggle_session_hidden(&mut self) {
@@ -4322,20 +4734,16 @@ impl App {
     }
 
     /// Status view: flat list of sessions grouped by status.
-    /// Running sessions first, then idle, then workspaces with no sessions,
-    /// then a "Past workspaces" section for closed / done-task workspaces.
+    /// Running sessions first, then idle, then workspaces with no sessions.
+    /// Past workspaces (closed / all-tasks-done) are hidden — open the
+    /// A-O picker to reach them.
     fn visual_items_status(&self) -> Vec<VisualItem> {
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
-        let mut past: Vec<VisualItem> = Vec::new();
 
         for (wi, ws) in self.workspaces.iter().enumerate() {
-            if self.is_past_workspace(wi) {
-                past.push(VisualItem::WorkspaceHeader(wi));
-                continue;
-            }
-            if ws.is_closed {
+            if ws.is_closed || self.is_past_workspace(wi) {
                 continue;
             }
             if ws.sessions.is_empty() {
@@ -4363,30 +4771,18 @@ impl App {
             }
         }
         items.extend(no_session);
-        if !past.is_empty() {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
-                items.push(VisualItem::Separator);
-            }
-            items.push(VisualItem::SectionHeader("Past workspaces"));
-            items.extend(past);
-        }
         items
     }
 
     /// Task view: workspace headers with sessions indented underneath.
     /// Sessions grouped by workflow run appear contiguously under a workflow
-    /// subheader. Standalone sessions render first; each workflow group follows.
-    /// Past workspaces are gathered into a trailing "Past workspaces" section.
+    /// subheader. Standalone sessions render first; each workflow group
+    /// follows. Past workspaces are hidden — reachable via the A-O picker.
     fn visual_items_task(&self) -> Vec<VisualItem> {
         let mut items = Vec::new();
         let mut first = true;
-        let mut past: Vec<usize> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
-            if self.is_past_workspace(wi) {
-                past.push(wi);
-                continue;
-            }
-            if ws.is_closed {
+            if ws.is_closed || self.is_past_workspace(wi) {
                 continue;
             }
             if !first {
@@ -4495,15 +4891,6 @@ impl App {
                 }
             }
         }
-        if !past.is_empty() {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
-                items.push(VisualItem::Separator);
-            }
-            items.push(VisualItem::SectionHeader("Past workspaces"));
-            for wi in past {
-                items.push(VisualItem::WorkspaceHeader(wi));
-            }
-        }
         items
     }
 
@@ -4528,7 +4915,6 @@ impl App {
             VisualItem::TaskHeader { .. } => true,
             VisualItem::Separator => false,
             VisualItem::WorkflowHeader { .. } => false,
-            VisualItem::SectionHeader(_) => false,
         };
 
         if !items.iter().any(is_selectable) {
@@ -4580,7 +4966,18 @@ impl App {
         let should_check_session_ids =
             now.duration_since(self.last_session_id_check) >= SESSION_ID_CHECK_INTERVAL;
 
-        let mut had_event = false;
+        // Only PTY events that affect the *visible* UI should force a
+        // redraw — Wakeup floods from a background session don't change
+        // anything on screen (the alacritty grid is kept in sync inside
+        // the FairMutex regardless; we just don't repaint it when the
+        // user isn't looking at it). Without this gate, a chatty agent
+        // running in a non-focused pane drives the redraw loop at PTY-
+        // batch frequency and starves keystroke→paint latency.
+        let focused_idx: Option<(usize, usize)> = match &self.cursor {
+            Cursor::Session(wi, si) => Some((*wi, *si)),
+            _ => None,
+        };
+        let mut visible_dirty = false;
         struct DetectedSid {
             ws_id: String,
             sid: String,
@@ -4601,12 +4998,19 @@ impl App {
         // workflow reviewer + a regular codex pane) can't both pick the
         // same newly-written transcript file. Updated as the loop binds new
         // sids so later iterations see them too.
-        let mut bound_sids: std::collections::HashSet<String> = self
-            .workspaces
-            .iter()
-            .flat_map(|w| w.sessions.iter())
-            .filter_map(|s| s.transcript_id.clone())
-            .collect();
+        //
+        // Only build it on ticks where we're actually going to run sid
+        // detection — otherwise this allocates a fresh HashSet + clones
+        // every session's transcript_id on every drain (5+ Hz) for nothing.
+        let mut bound_sids: std::collections::HashSet<String> = if should_check_session_ids {
+            self.workspaces
+                .iter()
+                .flat_map(|w| w.sessions.iter())
+                .filter_map(|s| s.transcript_id.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         // Status-bar notes for write failures encountered during this drain.
         // Collected here and applied after the loop because we cannot borrow
         // `&mut self.status_msg` while iterating `&mut self.workspaces`.
@@ -4620,13 +5024,14 @@ impl App {
         // broadcast (which arrives via a separate channel) is
         // suppressed.
         let mut cap_kill_notes: Vec<String> = Vec::new();
-        for ws in &mut self.workspaces {
-            for ts in &mut ws.sessions {
+        for (wi, ws) in self.workspaces.iter_mut().enumerate() {
+            for (si, ts) in ws.sessions.iter_mut().enumerate() {
+                let is_focused = focused_idx == Some((wi, si));
                 while let Ok(event) = ts.session.event_rx.try_recv() {
-                    had_event = true;
                     match event {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
                             ts.session.exited = true;
+                            visible_dirty = true;
                             // Slice 10c-e-3b-fix4b (+ 10e-d
                             // unification): daemon-attached
                             // cap-kill toast. The reader half of
@@ -4657,9 +5062,29 @@ impl App {
                         }
                         TermEvent::Title(title) => {
                             ts.session.title = title;
+                            visible_dirty = true;
                         }
                         TermEvent::Wakeup => {
-                            ts.session.wakeup_times.push(now);
+                            // Background sessions can chatter at any rate
+                            // without forcing a repaint — only the focused
+                            // pane's grid is on screen.
+                            if is_focused {
+                                visible_dirty = true;
+                            }
+                            // Coalesce wakeup_times: alacritty fires one
+                            // Wakeup per PTY-output batch, which during heavy
+                            // output lands at kHz rates. Burst detection
+                            // only needs `>=5 in 2s`, so dropping to one
+                            // entry per 50ms keeps the in-memory window
+                            // bounded to ~40 entries even for the chattiest
+                            // sessions without changing observed behavior.
+                            let should_record = ts.session.wakeup_times.last().map_or(
+                                true,
+                                |last| now.duration_since(*last) >= Duration::from_millis(50),
+                            );
+                            if should_record {
+                                ts.session.wakeup_times.push(now);
+                            }
                         }
                         TermEvent::ClipboardStore(_, text) => {
                             // Forward OSC 52 clipboard store to the outer terminal.
@@ -4725,11 +5150,13 @@ impl App {
                         let quiet = ts.session.wakeup_times.is_empty();
                         if quiet && ts.status == SessionStatus::Running {
                             ts.status = SessionStatus::Idle;
+                            visible_dirty = true;
                             if ts.notify_on_idle {
                                 notify_session_idle(&ts.label);
                             }
                         } else if burst && ts.status != SessionStatus::Running {
                             ts.status = SessionStatus::Running;
+                            visible_dirty = true;
                         }
                     }
                 }
@@ -5011,7 +5438,14 @@ impl App {
         if should_check_session_ids {
             self.last_session_id_check = now;
         }
-        if had_event {
+        // sid_detections always result in sidebar/transcript binding changes,
+        // and manifest_needs_save tracks the same set of mutations that change
+        // what's painted. Mark them visible_dirty here so the focused-gate
+        // above doesn't accidentally suppress an important repaint.
+        if !sid_detections.is_empty() || manifest_needs_save {
+            visible_dirty = true;
+        }
+        if visible_dirty {
             self.needs_redraw = true;
         }
 
@@ -5043,7 +5477,18 @@ impl App {
         // Drive workflow transitions after per-session bookkeeping — this way
         // any session state changes above (idle detection, new session_id) are
         // visible to the workflow engine.
-        self.tick_workflows();
+        //
+        // Throttled: each tick does several transcript reads per active
+        // workflow role. At drain frequency (loop cadence) that adds up fast
+        // when workflows are running. 100ms latency on transition firing is
+        // imperceptible to the user.
+        const WORKFLOW_TICK_MIN_INTERVAL: Duration = Duration::from_millis(100);
+        if !self.workflow_runs.is_empty()
+            && now.duration_since(self.last_workflow_tick) >= WORKFLOW_TICK_MIN_INTERVAL
+        {
+            self.last_workflow_tick = now;
+            self.tick_workflows();
+        }
     }
 
     /// Drain new entries from `~/.claude/history.jsonl`. For each rotation-
@@ -5313,6 +5758,7 @@ impl App {
             "resolve_authorized_session" => {
                 methods::resolve_authorized_session(self, caller, &req.params)
             }
+            "get_caller_task" => methods::get_caller_task(self, caller, &req.params),
             "list_sessions" => methods::list_sessions(self, caller, &req.params),
             "send_input" => methods::send_input(self, caller, &req.params),
             "kill_session" => methods::kill_session(self, caller, &req.params),
@@ -5685,8 +6131,11 @@ impl App {
     pub fn drain_planning_events(&mut self) {
         if let Some(action) = self.planning.drain_editor_events() {
             match action {
-                PlanAction::UpdateTask { id, fields } => {
+                PlanAction::UpdateTask { id, fields, status_msg } => {
                     self.backend.update_plan_task(id, fields);
+                    if let Some(msg) = status_msg {
+                        self.set_status_msg(&msg);
+                    }
                 }
                 _ => {}
             }
@@ -5896,6 +6345,7 @@ impl App {
                 entry.project = task.project.clone();
                 entry.parent_task_id = task.parent_task_id.clone();
                 entry.worktree_mode = parse_worktree_mode(&task.worktree_mode);
+                entry.metadata = task.metadata.clone();
             } else {
                 self.tasks.push(TaskEntry {
                     task_id: Some(task.id.clone()),
@@ -5911,6 +6361,7 @@ impl App {
                     project: task.project.clone(),
                     parent_task_id: task.parent_task_id.clone(),
                     worktree_mode: parse_worktree_mode(&task.worktree_mode),
+                    metadata: task.metadata.clone(),
                 });
             }
 
@@ -6252,8 +6703,11 @@ impl App {
                     );
                     return true;
                 }
-                PlanAction::UpdateTask { id, fields } => {
+                PlanAction::UpdateTask { id, fields, status_msg } => {
                     self.backend.update_plan_task(id, fields);
+                    if let Some(msg) = status_msg {
+                        self.set_status_msg(&msg);
+                    }
                     return true;
                 }
                 PlanAction::BulkUpdateTasks { ids, fields } => {
@@ -6388,19 +6842,19 @@ impl App {
                         self.resume_workflow_for_cursor();
                         return true;
                     }
-                    // A-O (Alt+Shift+O): reopen the focused past workspace.
-                    // Mirrors A-W (close workspace) but in the other direction —
-                    // un-archive + flip any bound done tasks back to running.
-                    // Terminals differ on whether Shift is folded into the
-                    // case of the char or reported as a modifier — accept both.
+                    // A-O (Alt+Shift+O): open the past-workspaces picker.
+                    // Past workspaces never appear in the sidebar — this is
+                    // the only path to find and reopen them. Terminals
+                    // differ on whether Shift is folded into the case of
+                    // the char or reported as a modifier — accept both.
                     KeyCode::Char('O') => {
-                        self.reopen_active_workspace();
+                        self.open_past_workspace_picker();
                         return true;
                     }
                     KeyCode::Char('o')
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        self.reopen_active_workspace();
+                        self.open_past_workspace_picker();
                         return true;
                     }
                     KeyCode::Char('o') => {
@@ -6776,6 +7230,14 @@ impl App {
             InputMode::WorkflowHistory { run_id: _ } => {
                 handle_workflow_history(InputCtx { repo_urls: &urls }, event)
             }
+            InputMode::PastWorkspacePicker { candidates, selected } => {
+                handle_past_workspace_picker(
+                    candidates,
+                    selected,
+                    InputCtx { repo_urls: &urls },
+                    event,
+                )
+            }
             InputMode::Confirm { action, .. } => {
                 handle_confirm(action, InputCtx { repo_urls: &urls }, event)
             }
@@ -6989,6 +7451,12 @@ impl App {
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
+            SubmitAction::ReopenPastWorkspace { ws_id } => {
+                self.reopen_workspace_by_id(&ws_id);
+            }
+            SubmitAction::RestoreTombstones { ws_id } => {
+                self.restore_tombstones_for_workspace(&ws_id);
+            }
         }
     }
 
@@ -8290,6 +8758,7 @@ impl App {
                         project: None,
                         parent_task_id: None,
                         worktree_mode: WorktreeMode::Inherit,
+                        metadata: None,
                     });
                 }
                 self.workspaces.push(local_ws);
@@ -8739,6 +9208,7 @@ impl App {
                     // top-level until reconcile patched it.
                     parent_task_id: parent_task_id.map(str::to_string),
                     worktree_mode: WorktreeMode::Inherit,
+                    metadata: None,
                 });
 
                 self.cursor = Cursor::Session(new_wi, 0);
@@ -8880,6 +9350,7 @@ impl App {
                         // until reconcile patched it.
                         parent_task_id: parent_task_id.map(str::to_string),
                         worktree_mode: WorktreeMode::Inherit,
+                        metadata: None,
                     });
                 }
                 self.cursor = Cursor::Session(wi, si);
@@ -9038,6 +9509,8 @@ impl App {
         };
 
         self.workspaces[final_wi].is_closed = false;
+        let respawned = self.resurrect_designer_sessions_for_workspace(final_wi);
+        let final_ws_id = self.workspaces[final_wi].id.clone();
         self.cursor = Cursor::Workspace(final_wi);
         self.save_session_manifest();
         // Sub-2b-3 review-5 #2: reopen may have provisioned a
@@ -9048,7 +9521,27 @@ impl App {
         self.push_state_to_daemon();
         self.view_mode = ViewMode::Sessions;
         self.clamp_cursor();
-        self.set_status_msg("Reopened — A-s to add session");
+        let tombstone_count = self.workspaces[final_wi].tombstones.len();
+        if tombstone_count > 0 {
+            self.input_mode = InputMode::Confirm {
+                prompt: format!(
+                    "Restore {} closed session{} in this workspace?",
+                    tombstone_count,
+                    if tombstone_count == 1 { "" } else { "s" },
+                ),
+                action: ConfirmAction::RestoreTombstones {
+                    ws_id: final_ws_id,
+                },
+            };
+        } else if respawned > 0 {
+            self.set_status_msg(&format!(
+                "Reopened — resurrected {} designer session{}",
+                respawned,
+                if respawned == 1 { "" } else { "s" },
+            ));
+        } else {
+            self.set_status_msg("Reopened — A-s to add session");
+        }
     }
 
     fn unlaunch_task(&mut self, task_id: &str) {
@@ -9256,6 +9749,9 @@ impl App {
                 }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
+                }
+                InputMode::PastWorkspacePicker { candidates, selected } => {
+                    self.draw_past_workspace_picker(frame, area, candidates, *selected);
                 }
                 InputMode::Confirm { prompt, .. } => {
                     self.draw_confirm(frame, area, prompt);
@@ -9859,7 +10355,6 @@ impl App {
                         Cursor::Workspace(cwi) => cwi == wi,
                         _ => false,
                     };
-                    let is_past = self.is_past_workspace(*wi);
 
                     let max_name = (inner.width as usize).saturating_sub(2);
                     let name = if ws.name.len() > max_name {
@@ -9877,8 +10372,6 @@ impl App {
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
-                    } else if is_past {
-                        Style::default().fg(Color::DarkGray)
                     } else {
                         Style::default().fg(Color::Gray)
                     };
@@ -10073,10 +10566,6 @@ impl App {
                         Span::raw(name),
                     ]);
                     items.push(ListItem::new(line).style(base_style));
-                }
-                VisualItem::SectionHeader(label) => {
-                    let line = Line::from(Span::styled(format!(" {}", label), dim));
-                    items.push(ListItem::new(line));
                 }
             }
         }
@@ -10994,6 +11483,144 @@ impl App {
         frame.render_widget(paragraph, dialog);
     }
 
+    pub fn draw_past_workspace_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        candidates: &[PastCandidate],
+        selected: usize,
+    ) {
+        let total = candidates.len();
+        let width = area.width.min(80).max(40);
+        // Dialog chrome: 2 border rows + 1 blank + 1 footer line.
+        // Below that, each candidate (or scroll-indicator) takes one row.
+        let max_dialog_height = area.height.saturating_sub(2).max(7);
+        let desired_height = (total as u16).saturating_add(4).max(7);
+        let height = desired_height.min(max_dialog_height);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let inner_height = height.saturating_sub(2) as usize;
+        let footer_rows = 2; // blank + key-hint line
+        let list_budget = inner_height.saturating_sub(footer_rows).max(1);
+        let needs_scroll = total > list_budget;
+        // Reserve one line each for "↑ N more" / "↓ N more" when scrolling.
+        let body_rows = if needs_scroll {
+            list_budget.saturating_sub(2).max(1)
+        } else {
+            list_budget
+        };
+
+        // Stable scroll: keep selected at the bottom edge when it would
+        // otherwise scroll off, capped by the final page so we don't show
+        // empty rows below the last candidate.
+        let offset = if !needs_scroll || selected < body_rows {
+            0
+        } else {
+            selected
+                .saturating_sub(body_rows)
+                .saturating_add(1)
+                .min(total.saturating_sub(body_rows))
+        };
+        let above = offset;
+        let end = (offset + body_rows).min(total);
+        let below = total.saturating_sub(end);
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines: Vec<Line> = Vec::new();
+
+        if candidates.is_empty() {
+            lines.push(Line::from(Span::styled("No past workspaces.", dim)));
+        } else {
+            if needs_scroll {
+                if above > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  \u{2191} {} more", above),
+                        dim,
+                    )));
+                } else {
+                    lines.push(Line::from(""));
+                }
+            }
+            for idx in offset..end {
+                let cand = &candidates[idx];
+                let is_active = idx == selected;
+                let cursor = if is_active { "\u{25b8} " } else { "  " };
+                let path_repr = cand
+                    .worktree_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                let name_style = if !cand.worktree_exists {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::CROSSED_OUT)
+                } else if is_active {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let path_style = if !cand.worktree_exists {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT)
+                } else if is_active {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let suffix = if cand.worktree_exists {
+                    String::new()
+                } else {
+                    "  (worktree gone)".to_string()
+                };
+                let mut spans = vec![
+                    Span::raw(cursor),
+                    Span::styled(cand.display.clone(), name_style),
+                ];
+                if !path_repr.is_empty() {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(path_repr.to_string(), path_style));
+                }
+                if !suffix.is_empty() {
+                    spans.push(Span::styled(
+                        suffix,
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            if needs_scroll {
+                if below > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  \u{2193} {} more", below),
+                        dim,
+                    )));
+                } else {
+                    lines.push(Line::from(""));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "\u{2191}\u{2193} select   Enter: reopen   Esc: cancel",
+            dim,
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Reopen past workspace ")
+            .style(Style::default().fg(Color::White));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, dialog);
+    }
+
     pub fn draw_snapshot_catalog(
         &self,
         frame: &mut Frame,
@@ -11697,6 +12324,7 @@ mod stop_workflow_terminal_guard_tests {
             std::collections::BTreeMap::new(),
             None,
             std::collections::BTreeMap::new(),
+            0,
         );
         run.status = status;
         run.done_reason = done_reason.map(str::to_string);
@@ -11809,6 +12437,7 @@ mod stop_workflow_local_cleanup_tests {
             std::collections::BTreeMap::new(),
             None,
             std::collections::BTreeMap::new(),
+            0,
         );
         run.status = status;
         workflow::run::save(&run).expect("seed save");
@@ -13007,6 +13636,7 @@ mod transcript_rebind_tests {
             role_baselines,
             None,
             BTreeMap::new(),
+            0,
         );
         run.history[0].assistant_count_at_start = 7;
         let mut runs = vec![run];

@@ -17,7 +17,9 @@ engine = "codex"
 context = "fresh"
 activation_prompt = """Can you review unstaged changes.
 
-Only report findings you're at least 80% confident are real issues. Always surface security or correctness bugs. Consolidate similar findings into one. Prioritize real bugs over style nitpicks."""
+Only report findings you're at least 80% confident are real issues. Always surface security or correctness bugs. Consolidate similar findings into one. Prioritize real bugs over style nitpicks.
+
+{{ rejected_findings }}"""
 
 [roles.manager]
 engine = "claude-code"
@@ -41,11 +43,11 @@ User's most recent pre-launch prompt to the worker (the ask that immediately pre
 Most recent pre-launch text from the worker (last thing the worker said before launch, if any):
 {{ roles.worker.prior_assistant[-1] }}
 
-Worker's most recent message (this iteration):
-{{ roles.worker.last_message }}
+Everything the worker has said this iteration (multiple messages joined with `---` separators):
+{{ roles.worker.this_turn }}
 
-Reviewer's most recent review:
-{{ roles.reviewer.last_message }}
+Everything the reviewer has said this iteration:
+{{ roles.reviewer.this_turn }}
 
 Important context about the reviewer: Reviewer will almost always find things to comment on. Protect against scope creep by only relaying comments for essential or low effort fixes. This will come down to cost vs. benefit and relevancy to the original task.
 
@@ -53,18 +55,22 @@ Decide:
   - If the reviewer surfaced real issues that matter for the original goal, call the `workflow_transition` tool with `to = "worker"` and a concise `prompt` telling the worker exactly what to change. Be directive — distill the review into actionable items. Ignore nitpicks that don't serve the goal. If the worker got something right or did something particularly well, give it praise and encouragement.
   - If the reviewer is satisfied and the goal has been met, call `workflow_done` with a short `reason`.
 
-Call exactly one tool. Do not write code yourself.
+Before the transition/done call, you may *also* call `workflow_reject_finding(text)` 0–N times to permanently dismiss reviewer findings you've decided are not worth raising again. The rejected text is surfaced to the reviewer on every future activation so it stops re-raising the same concern round after round. Use it for recurring nits, out-of-scope paranoia, or threat models that don't match the user's situation — anything you'd otherwise have to deflect every single round. Paraphrase the finding into one concise line.
+
+Call `workflow_transition` or `workflow_done` exactly once. Do not write code yourself.
 """
 subsequent_activation_prompt = """Goal:
 {{ goal }}
 
-Worker's most recent message (this iteration):
-{{ roles.worker.last_message }}
+Everything the worker has said this iteration (multiple messages joined with `---` separators):
+{{ roles.worker.this_turn }}
 
-Reviewer's most recent review:
-{{ roles.reviewer.last_message }}
+Everything the reviewer has said this iteration:
+{{ roles.reviewer.this_turn }}
 
-Same decision rules as before. Remember the reviewer lacks goal context — only relay essential or low-effort fixes that serve the original goal. If the worker did something well this round, acknowledge it. Call exactly one tool (`workflow_transition` or `workflow_done`)."""
+Same decision rules as before. Remember the reviewer lacks goal context — only relay essential or low-effort fixes that serve the original goal. If the worker did something well this round, acknowledge it.
+
+You may optionally call `workflow_reject_finding(text)` 0–N times before your final tool call to permanently dismiss recurring reviewer nits — the rejection lands in the reviewer's prompt next round. Then call exactly one of `workflow_transition` or `workflow_done`."""
 
 [[transitions]]
 from = "worker"

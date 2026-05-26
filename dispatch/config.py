@@ -24,7 +24,6 @@ MANAGER_URL = os.getenv("CM_API_URL", "http://localhost:8000")
 API_TOKEN = os.getenv("CM_API_TOKEN")
 MAX_WORKERS = int(os.getenv("CM_MAX_WORKERS", "3"))
 
-<<<<<<< Updated upstream
 _missing = [name for name, value in (("CM_DB_DSN", DB_DSN), ("CM_API_TOKEN", API_TOKEN)) if not value]
 if _missing:
     raise RuntimeError(
@@ -32,8 +31,6 @@ if _missing:
         f"Set them in the systemd unit (production) or ~/.config/claude-manager/.env (local)."
     )
 
-=======
->>>>>>> Stashed changes
 # Repo shortnames -> full clone URLs (discovered from ~/.cm/projects/*/repo_url)
 def _discover_repos():
     repos = {}

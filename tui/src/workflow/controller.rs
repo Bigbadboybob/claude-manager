@@ -236,6 +236,33 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
         .collect()
     }
 
+    fn assistant_since_activation(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        // The role's most recent activation history entry holds the full
+        // list_messages count snapshotted at activation. Slicing the
+        // current list_messages from that offset gives everything the
+        // role has said during this activation.
+        let offset = self
+            .run
+            .history
+            .iter()
+            .rev()
+            .find(|h| h.role == role)
+            .map(|h| h.text_messages_at_start)
+            .unwrap_or(0);
+        workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            workflow::transcript::MessageKind::Assistant,
+        )
+        .into_iter()
+        .skip(offset)
+        .collect()
+    }
+
     fn prior_user_messages(&self, role: &str) -> Vec<String> {
         let Some((engine, wt, sid)) = self.lookup(role) else {
             return Vec::new();
@@ -289,6 +316,14 @@ impl<'a> workflow::template::RoleResolver for WorkflowResolver<'a> {
 
     fn goal(&self) -> Option<String> {
         self.run.goal.clone()
+    }
+
+    fn rejected_findings(&self) -> Vec<String> {
+        self.run
+            .rejected_findings
+            .iter()
+            .map(|r| r.text.clone())
+            .collect()
     }
 }
 
@@ -350,25 +385,10 @@ impl<'a> WorkflowControllerCtx<'a> {
                     ));
                     return actions;
                 }
-                // Engine match: an Existing slot's session type must agree
-                // with the role's TOML-declared engine. The bound session
-                // is the source of truth for the engine actually used at
-                // runtime (templating, respawn paths), so a mismatch
-                // silently overrides the TOML — almost certainly a bug.
-                // Fail loudly instead.
-                if let Some(ts) = self.workspaces[ws_index].sessions.get(*si) {
-                    let session_engine = engine_for_session_type(&ts.session_type);
-                    if session_engine != role.engine {
-                        actions.push(WorkflowAction::SetStatusMsg(format!(
-                            "Role '{}' declares engine '{}' but session '{}' is '{}'",
-                            slot.role,
-                            role.engine.as_session_type(),
-                            ts.label,
-                            ts.session_type,
-                        )));
-                        return actions;
-                    }
-                }
+                // The role's TOML `engine` is only a default for spawning
+                // *new* sessions; when the user explicitly binds an
+                // existing session, its actual type drives templating and
+                // respawn paths, so a different engine is allowed.
             }
         }
 
@@ -649,6 +669,29 @@ impl<'a> WorkflowControllerCtx<'a> {
             .first()
             .cloned()
             .unwrap_or_else(|| "worker".into());
+        // Snapshot the initial role's transcript text-bearing count so the
+        // history entry's `text_messages_at_start` can be used by the
+        // `this_turn` resolver to surface everything the initial role has
+        // said post-launch (regardless of whether it has activated again).
+        let initial_text_count = role_sessions
+            .get(&initial_role)
+            .and_then(|b| b.current_session_id.clone())
+            .and_then(|sid| {
+                let ts = self.workspaces[ws_index].sessions.iter().find(|s| {
+                    s.workflow_run_id.as_deref() == Some(&run_id)
+                        && s.workflow_role.as_deref() == Some(&initial_role)
+                })?;
+                let engine = engine_for_session_type(&ts.session_type);
+                let wt = worktree_path.as_deref()?;
+                Some(workflow::transcript::list_messages(
+                    &engine,
+                    wt,
+                    &sid,
+                    workflow::transcript::MessageKind::Assistant,
+                )
+                .len())
+            })
+            .unwrap_or(0);
         let run = WorkflowRun::new(
             run_id.clone(),
             workflow_name.to_string(),
@@ -658,6 +701,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             role_baselines,
             goal,
             role_plans,
+            initial_text_count,
         );
         // 10d-2c-1 review round-6 (F1): CREATE save. The run_id
         // was just minted and no other writer (daemon or TUI)
@@ -1092,6 +1136,36 @@ impl<'a> WorkflowControllerCtx<'a> {
                             ),
                         });
                     }
+                    workflow::events::EventKind::RejectFinding { text } => {
+                        // Apply in place — no state-machine decision to defer.
+                        // Appending to the run's stash and persisting is local
+                        // enough that we don't need a Decision variant. Note
+                        // that under Phase 1's relocation we persist via
+                        // `workflow::run::save` (re-exported from
+                        // `cm_daemon::workflow::run`); the daemon-side
+                        // controller (post-relocation) will write the same
+                        // rejected_findings field directly through `modify`.
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            let iteration = self.workflow_runs[idx].iteration;
+                            self.workflow_runs[idx]
+                                .rejected_findings
+                                .push(crate::workflow::run::RejectedFinding {
+                                    text: trimmed.to_string(),
+                                    recorded_at: crate::workflow::run::now_unix(),
+                                    iteration,
+                                });
+                            let _ = workflow::run::save(&self.workflow_runs[idx]);
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "reject_finding recorded ({} chars, total={} rejections)",
+                                    trimmed.len(),
+                                    self.workflow_runs[idx].rejected_findings.len(),
+                                ),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -1133,9 +1207,14 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 ts: &self.workspaces[ti].sessions[si],
                                 worktree_path: wt,
                             };
+                            // `assistant_turn_completed_since` is `count > base
+                            // && is_idle` by default — calling all three runs
+                            // the transcript parse four times per role per
+                            // tick. Derive `will_fire` from the two we already
+                            // need for logging.
                             let count = agent.count_assistant_turns(ctx);
                             let complete = agent.is_idle(ctx);
-                            let fire = agent.assistant_turn_completed_since(ctx, start_count);
+                            let fire = count > start_count && complete;
                             (fire, count, complete)
                         }
                         None => (false, 0, false),
@@ -1404,6 +1483,17 @@ impl<'a> WorkflowControllerCtx<'a> {
                                     event_iter_for_history,
                                     trigger,
                                     start_count,
+                                    // text_messages_at_start: no
+                                    // sibling compute method exists
+                                    // on this branch yet; the
+                                    // text-message tracking landed
+                                    // on main after this branch's
+                                    // 10d-2c-1 work, so passing 0
+                                    // here matches the pre-merge
+                                    // behavior. A follow-up can
+                                    // wire compute_role_text_count
+                                    // alongside compute_role_assistant_count.
+                                    0,
                                 );
                                 r.events_offset = captured_offset;
                             })
@@ -1830,7 +1920,15 @@ impl<'a> WorkflowControllerCtx<'a> {
         // Uses `count_messages` (any assistant JSONL entry counts) so that
         // downstream the idle gate compares turn-to-turn regardless of whether
         // the agent's reply contains text, thinking, or tool_use content.
-        let start_count = {
+        //
+        // Also snapshot the text-bearing count (`list_messages.len()`) so the
+        // `this_turn` resolver can slice out everything the role produces
+        // between this activation and its next deactivation. Two counters
+        // because the two consumers want different things: the idle gate
+        // wants "did the agent take any turn?" (turn count); the manager
+        // template wants "what did the role say to me?" (text count, no
+        // tool-only or thinking-only noise).
+        let (start_count, start_text_count) = {
             let current_sid = self.workspaces[ti].sessions[si].transcript_id.clone();
             let session_engine =
                 engine_for_session_type(&self.workspaces[ti].sessions[si].session_type);
@@ -1838,17 +1936,31 @@ impl<'a> WorkflowControllerCtx<'a> {
                 self.workspaces[ti].worktree_path.as_deref(),
                 current_sid.as_deref(),
             ) {
-                (Some(wt), Some(sid)) => workflow::transcript::count_messages(
-                    &session_engine,
-                    wt,
-                    sid,
-                    workflow::transcript::MessageKind::Assistant,
+                (Some(wt), Some(sid)) => (
+                    workflow::transcript::count_messages(
+                        &session_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::Assistant,
+                    ),
+                    workflow::transcript::list_messages(
+                        &session_engine,
+                        wt,
+                        sid,
+                        workflow::transcript::MessageKind::Assistant,
+                    )
+                    .len(),
                 ),
-                _ => 0,
+                _ => (0, 0),
             }
         };
 
-        self.workflow_runs[run_idx].activate_role(to_role.to_string(), trigger.clone(), start_count);
+        self.workflow_runs[run_idx].activate_role(
+            to_role.to_string(),
+            trigger.clone(),
+            start_count,
+            start_text_count,
+        );
         // 10d-2c-1 review round-6 (F1): persist via `modify`
         // rather than `save(&in_mem_copy)` so any daemon write
         // to non-overlapping fields (e.g., events_offset bumped
@@ -1895,7 +2007,7 @@ impl<'a> WorkflowControllerCtx<'a> {
             if let Some(b) = r.role_sessions.get_mut(&to_role_owned) {
                 b.current_session_id = current_sid_for_closure;
             }
-            r.activate_role(to_role_owned, trigger, start_count);
+            r.activate_role(to_role_owned, trigger, start_count, start_text_count);
             // 10d-2c-1 review round-7 (F1): persist events_offset
             // inside the SAME modify closure as the state
             // mutation, so the disk-loaded run that gets
@@ -2481,6 +2593,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         )
     }
 
@@ -2797,6 +2910,7 @@ mod tests {
                 baselines,
                 None,
                 BTreeMap::new(),
+                0,
             );
 
             // TUI gate behavior: count_assistant_turns >
@@ -2903,6 +3017,7 @@ mod tests {
                 baselines,
                 Some("the run goal".to_string()),
                 BTreeMap::new(),
+                0,
             );
 
             let mut role_engines = BTreeMap::new();
@@ -4770,6 +4885,7 @@ mod tests {
                 deactivated_at: Some(101),
                 trigger: TriggerKind::StaticIdle { from_role: "worker".into() },
                 assistant_count_at_start: 0,
+                text_messages_at_start: 0,
             });
             // Now simulate the daemon's mutation for the SECOND
             // reviewer activation: outgoing worker closed,
@@ -5117,9 +5233,6 @@ mod tests {
 
             let mut runs: Vec<WorkflowRun> = Vec::new();
             let mut workflows = HashMap::new();
-            // Worker role must declare Codex engine to match the
-            // codex worker session bound below — launch validation
-            // rejects engine mismatches on Existing slots.
             let mut codex_worker = role_with(Engine::Codex, Context::Persistent);
             codex_worker.needs_mcp = false;
             let mut reviewer_role = role_with(Engine::ClaudeCode, Context::Persistent);

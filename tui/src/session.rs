@@ -111,6 +111,12 @@ impl Session {
         // and our Enter encoding logic in app.rs has nothing to react to.
         let mut config = TermConfig::default();
         config.kitty_keyboard = true;
+        // Alacritty defaults to 10_000 lines of scrollback per Term. With
+        // many sessions open this dominates RAM in practice (each line
+        // holds `num_cols` cells, ~28 bytes each → ~56 MB per session at
+        // 200 cols when fully populated). We keep transcripts on disk for
+        // long history, so a much smaller in-memory window is fine here.
+        config.scrolling_history = 1500;
 
         let size = TermSize {
             columns: cols as usize,

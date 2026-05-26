@@ -74,7 +74,7 @@ _FULL_EXTRA_FIELDS = (
     "description", "prompt", "depends", "repo_url", "repo_branch",
     "wip_branch", "session_id", "ttyd_url", "worker_vm",
     "blocked_at", "created_at", "updated_at",
-    "parent_task_id", "worktree_mode",
+    "parent_task_id", "worktree_mode", "metadata",
 )
 
 
@@ -289,6 +289,8 @@ def update_task(
     difficulty: int | None = None,
     project: str | None = None,
     depends: list[str] | None = None,
+    parent_task_id: str | None = None,
+    metadata: dict | None = None,
 ) -> dict:
     """Edit a task's planning fields.
 
@@ -301,7 +303,9 @@ def update_task(
     The returned object includes the `source` field so you can confirm
     what you just modified.
 
-    Only the fields you pass (non-None) will be updated.
+    Only the fields you pass (non-None) will be updated. To clear
+    `parent_task_id` (promote a subtask back to top-level), pass the
+    literal string "null".
 
     Args:
         task_id: Task UUID.
@@ -313,8 +317,18 @@ def update_task(
         difficulty: 1-10.
         project: Reassign to a different project.
         depends: Replace the dependency list (task slugs).
+        parent_task_id: Reparent this task under another task's UUID,
+            or "null" to detach (make it top-level).
+        metadata: Free-form JSONB bag for skill/agent attachments. PATCH
+            REPLACES the whole object — read the existing `metadata` via
+            `get_current_task` (or `get_task`) first and re-send the
+            merged dict if you want to preserve other keys. The
+            design-doc skills nest under a `resume` key
+            (`metadata.resume.design_doc_path`,
+            `metadata.resume.designer_session_uid`); other skills should
+            namespace their own keys here rather than churn the schema.
     """
-    fields = {
+    fields: dict = {
         k: v for k, v in {
             "name": name,
             "description": description,
@@ -324,12 +338,58 @@ def update_task(
             "difficulty": difficulty,
             "project": project,
             "depends": depends,
+            "metadata": metadata,
         }.items() if v is not None
     }
+    if parent_task_id is not None:
+        fields["parent_task_id"] = None if parent_task_id == "null" else parent_task_id
     if not fields:
         raise ValueError("No fields to update — pass at least one field.")
     client = PlanningClient()
     return _shape_task(client.update_task(task_id, **fields), full=True)
+
+
+@mcp.tool()
+def get_current_task() -> dict:
+    """Return the task this session is bound to, plus its full
+    metadata bag.
+
+    Resolves your caller UID against the TUI's session→workspace→task
+    bindings and then fetches the live task row from the API. Skills use
+    this to discover the doc path / designer session a task is bundled
+    with (the design-doc bundle nests under `metadata.resume.*`) without
+    the user having to pass them in.
+
+    Returns:
+        {
+          "task": <full task dict>, or null when the caller has no
+            bound task (e.g. an `A-n` taskless session),
+          "workspace_id": <workspace UUID or null>,
+          "is_tombstone": <bool — true when the caller session has been
+            closed; the task lookup still works during the 30-day
+            retention window>,
+        }
+
+    The `task` dict carries the same shape as `get_task` plus a
+    `metadata` field (JSONB bag, or null). To update fields on it, call
+    `update_task` with the returned `task.id` — note that `metadata` is
+    REPLACED on PATCH, so merge first if you want to preserve other keys.
+    """
+    ctx = control_client.call("get_caller_task")
+    task_id = ctx.get("task_id")
+    if not task_id:
+        return {
+            "task": None,
+            "workspace_id": ctx.get("workspace_id"),
+            "is_tombstone": bool(ctx.get("is_tombstone")),
+        }
+    client = PlanningClient()
+    task = client.get_task(task_id)
+    return {
+        "task": _shape_task(task, full=True),
+        "workspace_id": ctx.get("workspace_id"),
+        "is_tombstone": bool(ctx.get("is_tombstone")),
+    }
 
 
 @mcp.tool()
@@ -962,6 +1022,35 @@ def workflow_done(reason: str) -> str:
     else:
         event = _append_event("workflow_done", {"reason": reason})
         return f"Workflow marked done (event {event['id']})."
+
+
+@mcp.tool()
+def workflow_reject_finding(text: str) -> str:
+    """Permanently dismiss a reviewer finding for the rest of this workflow run.
+
+    Use this when a reviewer surfaces a finding you've decided is not worth
+    acting on (a nit, an out-of-scope concern, a paranoid threat model, etc.)
+    AND you expect the reviewer to keep raising it round after round. The
+    rejection is appended to a stash on the workflow run and surfaced to the
+    reviewer on its next (fresh-context) activation so it knows to stop
+    re-raising the same concern.
+
+    This is a side-effect call. It does NOT end your turn or advance the
+    workflow — follow up with `workflow_transition` or `workflow_done` for
+    that. Call it 0–N times per round, before the final transition.
+
+    Paraphrase the rejected finding into one concise line. "Symlink check on
+    /tmp paranoid for a single-user laptop — won't re-raise" reads better in
+    the reviewer's prompt than pasting the reviewer's whole multi-paragraph
+    finding back.
+
+    Args:
+        text: One-line paraphrase of the rejected finding (plus a short why,
+            optionally). Free-text; surfaced to the reviewer verbatim as a
+            bullet point.
+    """
+    event = _append_event("workflow_reject_finding", {"text": text})
+    return f"Recorded rejection (event {event['id']})."
 
 
 if __name__ == "__main__":

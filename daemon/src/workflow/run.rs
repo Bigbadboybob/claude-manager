@@ -69,6 +69,15 @@ pub struct HistoryEntry {
     /// or on a role that hasn't produced any new work yet.
     #[serde(default)]
     pub assistant_count_at_start: usize,
+    /// Snapshot of the role's text-bearing message count at activation. Used
+    /// by the `this_turn` resolver to slice out only the assistant text the
+    /// role produced during *this* activation — so the manager's prompt
+    /// surfaces the whole stream of worker replies, not just `last_message`.
+    /// Distinct from `assistant_count_at_start` because that counts every
+    /// assistant JSONL entry (incl. thinking-only / tool-use-only turns)
+    /// for the on_idle gate; `list_messages` filters those out.
+    #[serde(default)]
+    pub text_messages_at_start: usize,
 }
 
 /// How a role is bound to a concrete TerminalSession in the TUI.
@@ -111,6 +120,24 @@ pub struct MessageBaseline {
     pub user_count: usize,
     #[serde(default)]
     pub assistant_count: usize,
+}
+
+/// One entry in the manager-curated rejected-findings stash.
+///
+/// The manager calls `workflow_reject_finding(text)` to add an entry; the
+/// reviewer's activation prompt then includes the running list so a fresh
+/// reviewer (which doesn't see the prior round's conversation) doesn't
+/// re-surface findings the manager has already decided to ignore.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RejectedFinding {
+    /// The text the manager wrote — usually a one-line paraphrase of
+    /// the rejected finding.
+    pub text: String,
+    /// Unix seconds at which the manager recorded it.
+    pub recorded_at: u64,
+    /// Run iteration that was active when the rejection landed. Helps
+    /// debug "which round did this come from" without reading events.jsonl.
+    pub iteration: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +185,12 @@ pub struct WorkflowRun {
     /// the live transcript's tail is no longer the plan tool_use.
     #[serde(default)]
     pub role_plans: BTreeMap<String, String>,
+    /// Findings the manager has explicitly dismissed via the
+    /// `workflow_reject_finding` MCP tool. Surfaced to the (fresh-context)
+    /// reviewer on its next activation so it doesn't re-raise the same
+    /// nits round after round.
+    #[serde(default)]
+    pub rejected_findings: Vec<RejectedFinding>,
 }
 
 impl WorkflowRun {
@@ -170,6 +203,7 @@ impl WorkflowRun {
         role_baselines: BTreeMap<String, MessageBaseline>,
         goal: Option<String>,
         role_plans: BTreeMap<String, String>,
+        initial_text_count: usize,
     ) -> Self {
         let now = now_unix();
         let initial_assistant_count = role_baselines
@@ -187,6 +221,7 @@ impl WorkflowRun {
             deactivated_at: None,
             trigger: TriggerKind::Initial,
             assistant_count_at_start: initial_assistant_count,
+            text_messages_at_start: initial_text_count,
         };
         WorkflowRun {
             run_id,
@@ -205,6 +240,7 @@ impl WorkflowRun {
             role_baselines,
             goal,
             role_plans,
+            rejected_findings: Vec::new(),
         }
     }
 
@@ -229,6 +265,7 @@ impl WorkflowRun {
         role: String,
         trigger: TriggerKind,
         assistant_count_at_start: usize,
+        text_messages_at_start: usize,
     ) {
         // Iteration increments when we cycle back to the first role in role_order.
         // For simplicity here, iteration tracks total activations / roles.len(), but
@@ -247,6 +284,7 @@ impl WorkflowRun {
             deactivated_at: None,
             trigger,
             assistant_count_at_start,
+            text_messages_at_start,
         });
         self.active_role = Some(role);
     }
@@ -306,6 +344,7 @@ impl WorkflowRun {
         event_iteration: u32,
         trigger: TriggerKind,
         assistant_count_at_start: usize,
+        text_messages_at_start: usize,
     ) -> bool {
         // Round-15: prefer the event's iteration. Fall back
         // to `self.iteration` for pre-r15 on-disk events
@@ -334,6 +373,7 @@ impl WorkflowRun {
             deactivated_at: None,
             trigger,
             assistant_count_at_start,
+            text_messages_at_start,
         });
         true
     }
@@ -415,7 +455,7 @@ pub fn new_run_id() -> String {
     format!("wf_{:x}{:x}", secs, rand_part)
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -745,6 +785,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         )
     }
 
@@ -759,6 +800,7 @@ mod tests {
             "reviewer".into(),
             TriggerKind::StaticIdle { from_role: "worker".into() },
             0,
+            0,
         );
         assert_eq!(run.active_role.as_deref(), Some("reviewer"));
         assert_eq!(run.history.len(), 2);
@@ -769,6 +811,27 @@ mod tests {
             .find(|h| h.role == "worker")
             .and_then(|h| h.last_message.as_deref());
         assert_eq!(worker_last, Some("worker was here"));
+    }
+
+    /// `activate_role` must persist `text_messages_at_start` on the new
+    /// history entry — the `this_turn` resolver slices the role's
+    /// transcript by this value to surface only the messages produced
+    /// during the most recent activation.
+    #[test]
+    fn activate_role_records_text_messages_at_start() {
+        let mut run = sample_run();
+        // Worker spoke 5 times before reviewer activates.
+        run.close_active_role(Some("done with first pass".into()));
+        run.activate_role(
+            "reviewer".into(),
+            TriggerKind::StaticIdle { from_role: "worker".into() },
+            12, // turn count
+            5,  // text-bearing count
+        );
+        let reviewer_entry = run.history.last().expect("reviewer entry");
+        assert_eq!(reviewer_entry.role, "reviewer");
+        assert_eq!(reviewer_entry.text_messages_at_start, 5);
+        assert_eq!(reviewer_entry.assistant_count_at_start, 12);
     }
 
     #[test]
@@ -900,6 +963,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
         run.mark_done("worker said done".into());
         save(&run).expect("save Done state");

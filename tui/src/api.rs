@@ -43,6 +43,11 @@ pub struct Task {
     /// `parent_task_id` is set. Phase 5 subtask field.
     #[serde(default = "default_worktree_mode")]
     pub worktree_mode: String,
+    /// Free-form JSONB bag. Skills attach structured context here (e.g.
+    /// `metadata.resume.design_doc_path` for the design-doc bundle) so
+    /// the schema doesn't churn for every new shape. None = no bag.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn default_worktree_mode() -> String {

@@ -8,10 +8,23 @@
 //!   {{ roles.<role>.prior_user[N] }}     Nth user message from BEFORE launch
 //!   {{ roles.<role>.prior_assistant[N] }} Nth assistant message from BEFORE launch
 //!   {{ roles.<role>.last_message }}      alias for `assistant[-1]`
+//!   {{ roles.<role>.this_turn }}         every assistant text message the role
+//!                                        produced since its most recent activation,
+//!                                        joined with `\n\n---\n\n`. Useful when
+//!                                        the role tends to speak in multiple turns
+//!                                        per round and `last_message` would drop
+//!                                        all but the final one.
 //!   {{ roles.<role>.initial_prompt }}    alias for `user[0]`
 //!   {{ roles.<role>.plan }}              the markdown plan from the most recent
 //!                                        ExitPlanMode tool call in that role's
 //!                                        Claude transcript (empty if never used)
+//!   {{ goal }}                           run-level goal set at launch (falls back
+//!                                        to worker.initial_prompt when empty)
+//!   {{ rejected_findings }}              header + bulleted list of findings the
+//!                                        manager has rejected this run via
+//!                                        `workflow_reject_finding`. Empty string
+//!                                        when the stash is empty so first-round
+//!                                        prompts stay clean.
 //! ```
 //!
 //! Negative indices count from the end of the respective slice (e.g.
@@ -35,6 +48,14 @@ pub trait RoleResolver {
     /// Post-launch assistant turns for the role, in order. Used for
     /// `assistant[N]` and the `last_message` alias.
     fn assistant_messages(&self, role: &str) -> Vec<String>;
+    /// Assistant turns the role produced since its most recent activation in
+    /// the run's history — i.e. everything it has said this round. Used for
+    /// `this_turn`. Default impl returns the same as `assistant_messages` so
+    /// the trait stays backward-compatible with simpler resolvers that don't
+    /// track activation history.
+    fn assistant_since_activation(&self, role: &str) -> Vec<String> {
+        self.assistant_messages(role)
+    }
     /// User turns from *before* the workflow launched (pre-baseline). Used for
     /// `prior_user[N]`.
     fn prior_user_messages(&self, role: &str) -> Vec<String>;
@@ -48,6 +69,14 @@ pub trait RoleResolver {
     /// `{{ goal }}` template var. Return `None` to fall back to the worker's
     /// `initial_prompt`.
     fn goal(&self) -> Option<String>;
+    /// Free-text findings the manager has dismissed via
+    /// `workflow_reject_finding`. Surfaced via the bare
+    /// `{{ rejected_findings }}` var; empty vec renders to empty string so
+    /// first-round prompts stay clean. Default impl returns empty so simpler
+    /// resolvers don't need to know about the stash.
+    fn rejected_findings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub fn render<R: RoleResolver + ?Sized>(template: &str, resolver: &R) -> String {
@@ -128,6 +157,25 @@ fn resolve<R: RoleResolver + ?Sized>(key: &str, resolver: &R) -> String {
         // Fall back to the worker's initial_prompt when no explicit goal was set.
         return resolver.user_messages("worker").into_iter().next().unwrap_or_default();
     }
+    if key == "rejected_findings" {
+        let items = resolver.rejected_findings();
+        if items.is_empty() {
+            return String::new();
+        }
+        // Header + bulleted list. Header lives inside the var (not the
+        // surrounding template) so the empty case collapses cleanly to
+        // an empty string and the surrounding blank line just becomes
+        // a single blank line.
+        let mut out = String::from(
+            "Previously-rejected findings — the manager has decided these are not worth raising again. Do not re-surface them:\n",
+        );
+        for item in items {
+            out.push_str("- ");
+            out.push_str(item.trim());
+            out.push('\n');
+        }
+        return out;
+    }
     let Some((role, accessor, idx)) = parse_key(key) else {
         return String::new();
     };
@@ -136,6 +184,7 @@ fn resolve<R: RoleResolver + ?Sized>(key: &str, resolver: &R) -> String {
             let msgs = resolver.assistant_messages(role);
             msgs.into_iter().last().unwrap_or_default()
         }
+        ("this_turn", None) => resolver.assistant_since_activation(role).join("\n\n---\n\n"),
         ("initial_prompt", None) => {
             let msgs = resolver.user_messages(role);
             msgs.into_iter().next().unwrap_or_default()
@@ -164,10 +213,16 @@ mod tests {
     struct Stub {
         user: std::collections::HashMap<String, Vec<String>>,
         assistant: std::collections::HashMap<String, Vec<String>>,
+        /// Per-role override for `assistant_since_activation`. When unset,
+        /// the trait's default returns the same as `assistant_messages` —
+        /// most tests want that, only the dedicated `this_turn` tests
+        /// populate it to exercise the activation-slicing path.
+        this_turn: std::collections::HashMap<String, Vec<String>>,
         prior_user: std::collections::HashMap<String, Vec<String>>,
         prior_assistant: std::collections::HashMap<String, Vec<String>>,
         plan: std::collections::HashMap<String, String>,
         goal: Option<String>,
+        rejected: Vec<String>,
     }
 
     impl RoleResolver for Stub {
@@ -176,6 +231,12 @@ mod tests {
         }
         fn assistant_messages(&self, role: &str) -> Vec<String> {
             self.assistant.get(role).cloned().unwrap_or_default()
+        }
+        fn assistant_since_activation(&self, role: &str) -> Vec<String> {
+            if let Some(msgs) = self.this_turn.get(role) {
+                return msgs.clone();
+            }
+            self.assistant_messages(role)
         }
         fn prior_user_messages(&self, role: &str) -> Vec<String> {
             self.prior_user.get(role).cloned().unwrap_or_default()
@@ -188,6 +249,9 @@ mod tests {
         }
         fn goal(&self) -> Option<String> {
             self.goal.clone()
+        }
+        fn rejected_findings(&self) -> Vec<String> {
+            self.rejected.clone()
         }
     }
 
@@ -227,7 +291,16 @@ mod tests {
         let mut plan = std::collections::HashMap::new();
         plan.insert("worker".into(), "# Plan\n\n1. thing\n2. other thing".into());
 
-        Stub { user, assistant, prior_user, prior_assistant, plan, goal: None }
+        Stub {
+            user,
+            assistant,
+            this_turn: std::collections::HashMap::new(),
+            prior_user,
+            prior_assistant,
+            plan,
+            goal: None,
+            rejected: Vec::new(),
+        }
     }
 
     #[test]
@@ -344,5 +417,95 @@ mod tests {
             "# Plan\n\n1. thing\n2. other thing"
         );
         assert_eq!(render("{{ roles.reviewer.plan }}", &stub()), "");
+    }
+
+    /// Multi-message `this_turn` joins each message with `---` separators
+    /// so the manager can tell where one assistant reply ends and the
+    /// next begins. Replaces the old `last_message` behavior that
+    /// silently dropped all but the final message.
+    #[test]
+    fn this_turn_joins_multiple_messages_with_separator() {
+        let mut s = stub();
+        s.this_turn.insert(
+            "worker".into(),
+            vec![
+                "first proposal".into(),
+                "actually here's a better approach".into(),
+                "done implementing".into(),
+            ],
+        );
+        let out = render("{{ roles.worker.this_turn }}", &s);
+        assert_eq!(
+            out,
+            "first proposal\n\n---\n\nactually here's a better approach\n\n---\n\ndone implementing"
+        );
+    }
+
+    /// When the role has produced no messages since its most recent
+    /// activation (e.g. activation just fired and the agent hasn't
+    /// responded yet), `this_turn` expands to empty string.
+    #[test]
+    fn this_turn_empty_when_no_messages() {
+        let mut s = stub();
+        s.this_turn.insert("worker".into(), vec![]);
+        assert_eq!(render("{{ roles.worker.this_turn }}", &s), "");
+    }
+
+    /// Default trait impl falls back to `assistant_messages` so simpler
+    /// resolvers that don't track activation history (or test stubs
+    /// that don't populate `this_turn`) still produce something
+    /// reasonable — the full post-launch assistant transcript.
+    #[test]
+    fn this_turn_default_impl_falls_back_to_assistant_messages() {
+        // stub() leaves this_turn empty → default impl returns
+        // assistant_messages("worker") = ["done, ran tests", "fixed"]
+        // joined with the separator.
+        let out = render("{{ roles.worker.this_turn }}", &stub());
+        assert_eq!(out, "done, ran tests\n\n---\n\nfixed");
+    }
+
+    /// Single-message case has no trailing separator.
+    #[test]
+    fn this_turn_single_message_has_no_separator() {
+        let mut s = stub();
+        s.this_turn.insert("worker".into(), vec!["only thing I said".into()]);
+        assert_eq!(render("{{ roles.worker.this_turn }}", &s), "only thing I said");
+    }
+
+    /// Empty stash → empty string. First-round reviewer prompts shouldn't
+    /// include a noisy "(no rejections yet)" block.
+    #[test]
+    fn rejected_findings_empty_renders_empty_string() {
+        assert_eq!(render("{{ rejected_findings }}", &stub()), "");
+    }
+
+    /// Non-empty stash → header + bullets. Header text lives inside the
+    /// var so callers can drop {{ rejected_findings }} into a template
+    /// without conditional logic.
+    #[test]
+    fn rejected_findings_renders_header_and_bullets() {
+        let mut s = stub();
+        s.rejected = vec![
+            "/tmp symlink check is paranoid for single-user laptops".into(),
+            "perf nit on the hot path is below the noise floor".into(),
+        ];
+        let out = render("{{ rejected_findings }}", &s);
+        assert!(
+            out.starts_with("Previously-rejected findings"),
+            "got: {:?}",
+            out
+        );
+        assert!(out.contains("- /tmp symlink check is paranoid for single-user laptops"));
+        assert!(out.contains("- perf nit on the hot path is below the noise floor"));
+    }
+
+    /// Whitespace inside an entry is preserved-but-trimmed; the bullet
+    /// shouldn't have a double-space after the dash.
+    #[test]
+    fn rejected_findings_trims_per_entry() {
+        let mut s = stub();
+        s.rejected = vec!["   leading and trailing whitespace   ".into()];
+        let out = render("{{ rejected_findings }}", &s);
+        assert!(out.contains("- leading and trailing whitespace\n"));
     }
 }

@@ -62,3 +62,17 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# `codegen-units = 1` keeps function layout stable across small source edits.
+# With the default 16, adding a few bytes to an uncalled function (e.g. the
+# transcript cache) reshuffles monomorphizations between codegen units and
+# can move hot functions like `App::draw_terminal` and `TerminalWidget::render`
+# by ~2 KB in random directions. That was load-bearing for a lag regression we
+# couldn't otherwise explain. With one codegen unit the same edit only shifts
+# downstream functions by ~64 bytes (one alignment slot), which is small
+# enough to not push anything across page/cache boundaries.
+[profile.dev]
+codegen-units = 1
+
+[profile.release]
+codegen-units = 1

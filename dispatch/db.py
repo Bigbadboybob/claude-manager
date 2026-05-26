@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 import asyncpg
 from dispatch.config import DB_DSN
@@ -9,8 +10,23 @@ def _serialize(row: dict) -> dict:
     return {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()}
 
 
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    """Per-connection setup. Registers a JSONB codec so columns like
+    `metadata` and `resume_metadata` round-trip as Python dicts in both
+    directions — without this, asyncpg returns raw JSON strings and the
+    Pydantic `dict | None` fields fail validation."""
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 async def get_pool() -> asyncpg.Pool:
-    return await asyncpg.create_pool(DB_DSN, min_size=1, max_size=5)
+    return await asyncpg.create_pool(
+        DB_DSN, min_size=1, max_size=5, init=_init_connection,
+    )
 
 
 async def init_db(pool: asyncpg.Pool):
@@ -31,7 +47,8 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                    source: str = "user", is_cloud: bool = False,
                    parent_task_id: str | None = None,
                    worktree_mode: str = "inherit",
-                   wip_branch: str | None = None) -> dict:
+                   wip_branch: str | None = None,
+                   metadata: dict | None = None) -> dict:
     """Insert a task. If `slug` collides with an existing row in the same
     project (idx_tasks_project_slug), auto-increment by appending `-2`,
     `-3`, ... until a free slot is found.
@@ -50,14 +67,15 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                 """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
                                       status, project, slug, name, description,
                                       difficulty, depends, source, is_cloud,
-                                      parent_task_id, worktree_mode, wip_branch)
+                                      parent_task_id, worktree_mode, wip_branch,
+                                      metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                           $14, $15, $16)
+                           $14, $15, $16, $17)
                    RETURNING *""",
                 repo_url, repo_branch, prompt, priority,
                 status, project, slug, name, description,
                 difficulty, depends or [], source, is_cloud,
-                parent_task_id, worktree_mode, wip_branch,
+                parent_task_id, worktree_mode, wip_branch, metadata,
             )
             return _serialize(dict(row))
 
@@ -73,14 +91,15 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                     """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
                                           status, project, slug, name, description,
                                           difficulty, depends, source, is_cloud,
-                                          parent_task_id, worktree_mode, wip_branch)
+                                          parent_task_id, worktree_mode, wip_branch,
+                                          metadata)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                               $14, $15, $16)
+                               $14, $15, $16, $17)
                        RETURNING *""",
                     repo_url, repo_branch, prompt, priority,
                     status, project, attempt_slug, name, description,
                     difficulty, depends or [], source, is_cloud,
-                    parent_task_id, worktree_mode, wip_branch,
+                    parent_task_id, worktree_mode, wip_branch, metadata,
                 )
                 return _serialize(dict(row))
             except asyncpg.UniqueViolationError as e:

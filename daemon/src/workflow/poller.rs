@@ -1241,6 +1241,7 @@ mod tests {
             baselines,
             None,
             BTreeMap::new(),
+            0,
         );
         // Persist to disk so `load_all()` in `collect_snapshots`
         // surfaces it. Pre-reviewer-fix the cache alone was
@@ -1704,6 +1705,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
         crate::workflow::run::save(&run).expect("save run to disk");
 
@@ -1789,6 +1791,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
         // Manually flip active_role to "reviewer" without
         // appending a history entry → gap window.
@@ -1886,6 +1889,7 @@ mod tests {
                 crate::workflow::run::TriggerKind::StaticIdle {
                     from_role: "worker".to_string(),
                 },
+                0,
                 0,
             );
         })
@@ -2155,6 +2159,7 @@ mod tests {
             baselines,
             None,
             BTreeMap::new(),
+            0,
         );
         let mut engines = BTreeMap::new();
         engines.insert("worker".to_string(), Engine::ClaudeCode);
@@ -3066,6 +3071,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
 
         let mut state = DaemonState::default();
@@ -3271,6 +3277,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
         crate::workflow::run::save(&run).expect("save");
 

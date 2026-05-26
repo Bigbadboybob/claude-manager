@@ -6502,6 +6502,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
         crate::workflow::run::save(&run).expect("seed save ok");
     }

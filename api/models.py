@@ -24,6 +24,9 @@ class TaskCreate(BaseModel):
     # modes so the API row matches the worktree on disk from the
     # first save (no UPDATE round-trip needed).
     wip_branch: str | None = None
+    # Free-form JSONB bag for skill/agent attachments (e.g.
+    # `metadata.resume.design_doc_path` for the design-doc bundle).
+    metadata: dict | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -49,6 +52,9 @@ class TaskUpdate(BaseModel):
     # Subtask fields
     parent_task_id: str | None = None
     worktree_mode: str | None = None
+    # Free-form JSONB bag. PATCH replaces the whole object — callers that
+    # want to merge should read first and re-send the merged dict.
+    metadata: dict | None = None
 
 
 class TaskResponse(BaseModel):
@@ -79,6 +85,8 @@ class TaskResponse(BaseModel):
     # Subtask fields (Phase 5)
     parent_task_id: str | None = None
     worktree_mode: str = "inherit"
+    # Free-form JSONB bag. Reads come back as a dict (or None).
+    metadata: dict | None = None
 
     class Config:
         from_attributes = True

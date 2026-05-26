@@ -6876,6 +6876,7 @@ mod tests {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            0,
         );
         crate::workflow::run::save(&run).expect("seed save ok");
         run
@@ -9636,6 +9637,7 @@ mod tests {
                         from_role: "worker".to_string(),
                     },
                     /* start_count */ 1, // post-baseline count
+                    /* start_text_count */ 0,
                 );
             })
             .expect("tui fire");
@@ -9673,6 +9675,7 @@ mod tests {
                         from_role: "worker".to_string(),
                     },
                     /* start_count */ 1,
+                    /* start_text_count */ 0,
                 );
             })
             .expect("tail-append");

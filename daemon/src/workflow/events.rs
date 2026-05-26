@@ -93,6 +93,11 @@ pub struct Event {
 pub enum EventKind {
     Transition { to: String, prompt: String },
     Done { reason: String },
+    /// Manager-curated stash of a reviewer finding. Ported from main's
+    /// `workflow_reject_finding` MCP tool — the controller appends the
+    /// text to the run's `rejected_findings` list (no state-machine
+    /// transition).
+    RejectFinding { text: String },
     Unknown,
 }
 
@@ -122,6 +127,15 @@ impl Event {
                     .unwrap_or("")
                     .to_string();
                 EventKind::Done { reason }
+            }
+            "workflow_reject_finding" => {
+                let text = self
+                    .args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                EventKind::RejectFinding { text }
             }
             _ => EventKind::Unknown,
         }
@@ -1672,6 +1686,7 @@ mod tests {
                 role_baselines,
                 Some("ship the thing".to_string()),
                 role_plans,
+                0,
             );
 
             run::save(&original).expect("save state.json ok");
