@@ -55,6 +55,7 @@
 
 pub mod attach;
 pub mod control;
+pub mod host_id;
 pub mod manifest;
 pub mod mcp_config;
 pub mod path;

@@ -863,6 +863,15 @@ impl<'a> WorkflowControllerCtx<'a> {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            // 12b: workflow participants inherit the parent
+            // workspace's host. At this slice every session is
+            // local (12e adds A-H selection); the parent
+            // workspace's host_id would be the right read-
+            // through if it existed, but workspaces don't carry
+            // host_id yet — 12c bundles that with the
+            // connection pool. Default to local here; harmless
+            // because all sessions are local-only through 12d.
+            host_id: crate::hosts::HostId::local(),
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -2539,6 +2548,7 @@ mod tests {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
         }
     }
 
@@ -4905,6 +4915,7 @@ mod tests {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
         }
     }
 

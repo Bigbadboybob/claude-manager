@@ -5839,6 +5839,7 @@ mod tests {
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
                     last_exit: None,
+                    host_id: crate::host_id::HostId::local(),
                 },
             );
         }
@@ -6080,6 +6081,7 @@ mod tests {
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
                     last_exit: None,
+                    host_id: crate::host_id::HostId::local(),
                 },
             );
         }
@@ -6272,6 +6274,7 @@ mod tests {
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
                     last_exit: None,
+                    host_id: crate::host_id::HostId::local(),
                 },
             );
         }

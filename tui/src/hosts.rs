@@ -55,41 +55,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Stable identifier for a host. `String` newtype with
-/// `#[serde(transparent)]` so it serializes as a bare string in
-/// TOML / JSON. Names are case-sensitive (no normalization), match
-/// the value of the `name = "..."` field in `[[host]]`.
-///
-/// The reserved value `""` is rejected at validation time —
-/// `HostId(String::new())` is what an unset / defaulted-by-mistake
-/// field would carry, and silently accepting it would mask bugs.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HostId(pub String);
-
-impl HostId {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// 12b-onward back-compat helper: when a pre-12 manifest is
-    /// loaded without a `host_id` field, fall back to the local
-    /// host. Constant-form so `#[serde(default = "...")]` can
-    /// reference it.
-    pub fn local() -> Self {
-        Self("local".to_string())
-    }
-}
-
-impl fmt::Display for HostId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// 12b: `HostId` moved to `cm_daemon::host_id` so the daemon-side
+// `ManifestEntry` can carry the field as a first-class type
+// without a layering inversion. Re-exported here so existing
+// callers continue to write `crate::hosts::HostId`. The host-
+// abstraction logic in this module (HostTransport, HostConfig,
+// HostsConfig) stays TUI-side; only the typed identifier crossed
+// the layer.
+pub use cm_daemon::host_id::HostId;
 
 /// Transport over which the TUI dials a daemon. The variant chosen
 /// determines which fields are required on the `[[host]]` entry.

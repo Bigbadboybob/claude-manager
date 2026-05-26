@@ -156,6 +156,15 @@ pub struct TerminalSession {
     /// clobber the field to `None` and the named acceptance
     /// criterion would fail.
     pub preserved_last_exit: Option<cm_daemon::manifest::LastExit>,
+    /// 12b (Phase 3): tags the in-memory session with the host
+    /// its daemon runs on. Read through from `ManifestEntry.host_id`
+    /// on load; new sessions get the active host
+    /// (`HostId::local()` at this slice — `A-H`-driven host
+    /// selection lands in 12e). The TUI's connection pool (12c)
+    /// keys off this field to route every per-session RPC to the
+    /// right daemon. For now (12b is plumbing-only), the field is
+    /// populated but no consumer reads it.
+    pub host_id: crate::hosts::HostId,
 }
 
 impl TerminalSession {
@@ -483,6 +492,11 @@ fn make_simple_session_with_uid(
         // Fresh sessions have no exit history; the daemon may
         // populate this later through manifest.watch diffs.
         preserved_last_exit: None,
+        // 12b: default to local. The factory builds sessions
+        // before App is constructed, so the active host hasn't
+        // been picked yet — callers that need a non-local host
+        // (12e onward) overwrite this after construction.
+        host_id: crate::hosts::HostId::local(),
     }
 }
 
@@ -3428,6 +3442,14 @@ impl App {
                     // reattach) breaks the moment the TUI saves
                     // after the daemon writes.
                     last_exit: ts.preserved_last_exit.clone(),
+                    // 12b: round-trip the host_id from the
+                    // in-memory session. Pre-12 manifests load
+                    // with `host_id = HostId::local()` via the
+                    // `#[serde(default)]` constructor; the next
+                    // save writes the upgraded shape back so the
+                    // load-after-save is a no-op-default-free
+                    // round-trip.
+                    host_id: ts.host_id.clone(),
                 })
                 .collect();
             workspaces.insert(
@@ -3877,6 +3899,11 @@ impl App {
             // load. The TUI doesn't yet inspect it; this passthrough
             // ensures the next save doesn't clobber it to None.
             preserved_last_exit: entry.last_exit.clone(),
+            // 12b: read-through from the manifest. Pre-12 entries
+            // already had `host_id` filled with `HostId::local()`
+            // by the `#[serde(default)]` constructor; nothing
+            // special to do here.
+            host_id: entry.host_id.clone(),
         })
     }
 
@@ -5990,6 +6017,13 @@ impl App {
             managed_by_uid: Some(caller_uid.to_string()),
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            // 12b: new sessions get local at this slice. 12e
+            // ("A-H cycles active host") changes this to the
+            // app's `active_host` field; for now MCP-spawned
+            // sessions are always on the local host (no remote
+            // session-spawn path until 12c lands the connection
+            // pool).
+            host_id: crate::hosts::HostId::local(),
         };
         self.workspaces[ws_index].sessions.push(ts);
         self.save_session_manifest();
@@ -8434,6 +8468,10 @@ impl App {
             managed_by_uid: None,
             seeded_from_snapshot: seed_from.map(str::to_string),
             preserved_last_exit: None,
+            // 12b: A-l "launch from planning" creates a new
+            // workspace + session, always on the local host
+            // (12e adds A-H selection — out of scope here).
+            host_id: crate::hosts::HostId::local(),
         };
         let ws = Workspace {
             id: workspace_id_pre,
@@ -12661,6 +12699,7 @@ mod stop_workflow_local_cleanup_tests {
             notify_on_idle: false,
             seeded_from_snapshot: None,
             last_exit: None,
+            host_id: cm_daemon::host_id::HostId::local(),
         }
     }
 
@@ -12813,6 +12852,7 @@ mod manifest_entry_seeded_from_tests {
             notify_on_idle: false,
             seeded_from_snapshot: Some("reviewer-strict".into()),
             last_exit: None,
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let bytes = serde_json::to_vec(&entry).unwrap();
         let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
@@ -12855,6 +12895,7 @@ mod manifest_entry_seeded_from_tests {
             notify_on_idle: false,
             seeded_from_snapshot: None,
             last_exit: None,
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let s = serde_json::to_string(&entry).unwrap();
         assert!(
@@ -12917,6 +12958,7 @@ mod manifest_entry_seeded_from_tests {
                 kills_file_offset: Some(0),
                 exited_at: 1_700_000_000.0,
             }),
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let bytes = serde_json::to_vec(&entry).unwrap();
         let back: ManifestEntry = serde_json::from_slice(&bytes).unwrap();
@@ -12971,6 +13013,7 @@ mod manifest_entry_seeded_from_tests {
             notify_on_idle: false,
             seeded_from_snapshot: None,
             last_exit: Some(stored_exit.clone()),
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let on_disk = serde_json::to_string(&initial).unwrap();
 
@@ -13012,6 +13055,7 @@ mod manifest_entry_seeded_from_tests {
             notify_on_idle: loaded.notify_on_idle,
             seeded_from_snapshot: loaded.seeded_from_snapshot.clone(),
             last_exit: preserved_last_exit.clone(),
+            host_id: loaded.host_id.clone(),
         };
         let after_save = serde_json::to_string(&rebuilt).unwrap();
 
@@ -13778,6 +13822,7 @@ mod transcript_rebind_tests {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
         }
     }
 
@@ -13909,6 +13954,7 @@ mod rotation_binding_tests {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
         }
     }
 
@@ -16237,6 +16283,7 @@ mod input_handler_tests {
                 managed_by_uid: None,
                 seeded_from_snapshot: None,
                 preserved_last_exit: None,
+                host_id: crate::hosts::HostId::local(),
             });
         }
         out

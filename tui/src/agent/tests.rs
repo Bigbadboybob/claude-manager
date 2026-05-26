@@ -537,6 +537,7 @@ fn with_stub_ctx<T>(f: impl FnOnce(AgentCtx<'_>) -> T) -> T {
         managed_by_uid: None,
         seeded_from_snapshot: None,
         preserved_last_exit: None,
+        host_id: crate::hosts::HostId::local(),
     };
     let wt = PathBuf::from("/tmp");
     let ctx = AgentCtx {
@@ -721,6 +722,7 @@ fn make_codex_test_session(transcript_id: &str) -> crate::app::TerminalSession {
         managed_by_uid: None,
         seeded_from_snapshot: None,
         preserved_last_exit: None,
+        host_id: crate::hosts::HostId::local(),
     }
 }
 
