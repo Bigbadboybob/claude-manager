@@ -113,6 +113,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # spawned and TUI-spawned participants can call.
     "workflow_transition",
     "workflow_done",
+    # 11e: workflow_reject_finding flips from Python `_append_event`
+    # direct file write to daemon-routed. Lets Option B's
+    # broadcaster-in-WorkflowEventsWriter cover this event type
+    # post-Phase-2 file-tail deletion.
+    "workflow_reject_finding",
     # Operator-only push from TUI; included for dispatch-surface
     # alignment, not Python-routable.
     "tui.update_sessions_snapshot",
@@ -142,6 +147,18 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # dispatch-surface alignment; not Python-routable — the MCP
     # server has no manifest-stream tool.
     "manifest.watch",
+    # 11b: events.subscribe — TUI subscribes to daemon-side
+    # workflow-event broadcasts (one WorkflowEventStateSnapshot
+    # per active run, followed by WorkflowEvent stream frames).
+    # Operator-only at the dispatch boundary; included here for
+    # dispatch-surface alignment, not Python-routable.
+    "events.subscribe",
+    # 11c: workflow.get_state — Operator-only cold-read companion
+    # to events.subscribe. Returns the full WorkflowRun JSON.
+    # Used by the TUI for one-shot reads (e.g. workflow history
+    # view); the Session-callable `get_workflow_state` covers
+    # agent-side reads. Not Python-routable.
+    "workflow.get_state",
 })
 
 

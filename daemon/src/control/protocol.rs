@@ -249,6 +249,26 @@ pub enum StreamKind {
     /// period would leak a handler thread + subscriber slot
     /// until the next real broadcast. Slice 10e-b r1 fix.
     Heartbeat,
+    /// Server → client: initial snapshot frame on an
+    /// `events.subscribe` stream. One frame per active
+    /// [`crate::workflow::run::WorkflowRun`] at subscribe time,
+    /// sent before any live [`StreamKind::WorkflowEvent`] frames.
+    /// Payload is the serialized `WorkflowRun` (variant-tagged
+    /// JSON). Slice 11b.
+    ///
+    /// Read from disk via `workflow::run::load_all()` rather than
+    /// the in-memory `state.workflow_runs` cache — the cache
+    /// update trails the broadcast point in
+    /// `append_event_with_retry`, so a subscriber landing between
+    /// broadcast and cache-update would otherwise miss the
+    /// just-broadcast event.
+    WorkflowEventStateSnapshot,
+    /// Server → client: a [`crate::workflow::events::Event`]
+    /// frame on an `events.subscribe` stream. Payload is the
+    /// serialized event (the same JSON the daemon writes to
+    /// `events.jsonl`). Repeats one frame per broadcast until
+    /// the client disconnects. Slice 11b.
+    WorkflowEvent,
 }
 
 impl StreamFrame {
@@ -307,6 +327,31 @@ impl StreamFrame {
             id: id.into(),
             kind: StreamKind::Heartbeat,
             payload: serde_json::Value::Null,
+        }
+    }
+
+    /// 11b: build an initial `WorkflowEventStateSnapshot` frame
+    /// for an `events.subscribe` stream. Payload is the
+    /// serialized `WorkflowRun`. One frame per active run is
+    /// sent before any live `WorkflowEvent` frames.
+    pub fn workflow_event_state_snapshot(
+        id: impl Into<String>,
+        payload: Value,
+    ) -> Self {
+        StreamFrame {
+            id: id.into(),
+            kind: StreamKind::WorkflowEventStateSnapshot,
+            payload,
+        }
+    }
+
+    /// 11b: build a live `WorkflowEvent` frame. Payload is the
+    /// serialized `crate::workflow::events::Event`.
+    pub fn workflow_event(id: impl Into<String>, payload: Value) -> Self {
+        StreamFrame {
+            id: id.into(),
+            kind: StreamKind::WorkflowEvent,
+            payload,
         }
     }
 }

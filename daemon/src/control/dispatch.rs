@@ -156,6 +156,15 @@ pub enum DispatchOutcome {
         response: Response,
         handle: ManifestWatchHandle,
     },
+    /// 11b: `events.subscribe` returns this so `handle_connection`
+    /// can write the immediate `{"subscribed": true}` response,
+    /// then enter the workflow-events-stream loop (one
+    /// `WorkflowEventStateSnapshot` per active run, followed by
+    /// live `WorkflowEvent` frames until the client disconnects).
+    EventsSubscribeStream {
+        response: Response,
+        handle: EventsSubscribeHandle,
+    },
 }
 
 impl DispatchOutcome {
@@ -166,6 +175,7 @@ impl DispatchOutcome {
             DispatchOutcome::Done(r) => r,
             DispatchOutcome::AttachStream { response, .. } => response,
             DispatchOutcome::ManifestWatchStream { response, .. } => response,
+            DispatchOutcome::EventsSubscribeStream { response, .. } => response,
         }
     }
 
@@ -177,6 +187,7 @@ impl DispatchOutcome {
             DispatchOutcome::Done(r) => r,
             DispatchOutcome::AttachStream { response, .. } => response,
             DispatchOutcome::ManifestWatchStream { response, .. } => response,
+            DispatchOutcome::EventsSubscribeStream { response, .. } => response,
         }
     }
 }
@@ -226,6 +237,47 @@ pub struct ManifestWatchHandle {
     pub request_id: String,
 }
 
+/// 11b: handle bundle for `events.subscribe` streaming. Mirror
+/// of [`ManifestWatchHandle`]. The dispatcher pre-loads the
+/// per-run snapshots via `workflow::run::load_all()` and
+/// subscribes to the broadcaster — both under the state lock
+/// the dispatcher already holds — so the consumer thread runs
+/// without re-locking and without a snapshot-vs-live race.
+///
+/// Snapshots come from DISK, not `state.workflow_runs`. The
+/// in-memory cache update trails the broadcast in
+/// `append_event_with_retry`'s ordering (state.json save →
+/// events.jsonl append + broadcast → cache update); reading
+/// the cache would re-open a missed-event window for new
+/// subscribers landing between broadcast and cache-update.
+/// state.json is durable before the broadcast, so a disk
+/// snapshot reflects every event broadcast up to that point.
+pub struct EventsSubscribeHandle {
+    /// One serialized `WorkflowRun` per active run at subscribe
+    /// time. Sent as `WorkflowEventStateSnapshot` frames before
+    /// any live `WorkflowEvent` frames. Empty Vec is the no-
+    /// active-runs case — the consumer still proceeds to the
+    /// live loop.
+    pub initial_snapshots: Vec<serde_json::Value>,
+    /// Bounded receiver from
+    /// [`crate::workflow::events::WorkflowEventWatcher::subscribe`].
+    /// Capacity is `WORKFLOW_EVENTS_BUFFER` (32). Drop on slow
+    /// consumer handled by `try_send` in the broadcaster.
+    pub event_rx: mpsc::Receiver<crate::workflow::events::Event>,
+    /// RAII guard: drop reaps the subscriber slot immediately
+    /// without waiting for the next broadcast's `try_send`
+    /// failure. Same shape as `ManifestWatchHandle::guard` (10e-b
+    /// r2).
+    pub guard: crate::workflow::events::WorkflowEventSubscriptionGuard,
+    /// Heartbeat interval. Production default mirrors
+    /// `manifest.watch`'s 15s constant; tests inject a short
+    /// value to exercise idle-disconnect quickly.
+    pub heartbeat_interval: std::time::Duration,
+    /// Echoed back on every outbound stream frame so the client
+    /// can demux. Matches the `events.subscribe` request id.
+    pub request_id: String,
+}
+
 /// Route `req` to the appropriate method handler. Returns
 /// `UnknownMethod` for everything that depends on App state that
 /// hasn't migrated; see the module doc for the cutoff.
@@ -267,6 +319,16 @@ pub fn dispatch_request(
         "manifest.watch" => {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             dispatch_manifest_watch(&mut s, req)
+        }
+        // 11b: `events.subscribe` — multi-subscriber workflow-event
+        // stream. Operator-only at the dispatch boundary; subscribe-
+        // then-snapshot happens under the state lock, but the
+        // snapshot comes from DISK via `workflow::run::load_all()`
+        // (the in-memory cache trails the broadcast point — see
+        // `EventsSubscribeHandle`'s doc).
+        "events.subscribe" => {
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            dispatch_events_subscribe(&mut s, req)
         }
 
         // Session-mutation methods (slice 10c-d). Each manages its
@@ -354,6 +416,14 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_workflow_transition(state, req))
         }
         "workflow_done" => DispatchOutcome::Done(dispatch_workflow_done(state, req)),
+        // 11e: workflow_reject_finding daemon-routed. Replaces
+        // the Python MCP-server-side `_append_event` direct file
+        // write so Option B's broadcaster-in-WorkflowEventsWriter
+        // hook covers reject-finding events too. Session +
+        // Operator callers (matches workflow_transition shape).
+        "workflow_reject_finding" => {
+            DispatchOutcome::Done(dispatch_workflow_reject_finding(state, req))
+        }
 
         // 10d-2c-3a: read-only workflow query methods relocated
         // from TUI socket. Session-callable AND Operator-
@@ -361,6 +431,17 @@ pub fn dispatch_request(
         // pass through the descendant-task scope filter.
         "get_workflow_state" => {
             DispatchOutcome::Done(dispatch_get_workflow_state(state, req))
+        }
+        // 11c: `workflow.get_state` — Operator-only cold-read
+        // companion to `events.subscribe`. Returns the full
+        // `WorkflowRun` JSON serialization (via
+        // `serde_json::to_value(&run)`, same shape as 11b's
+        // snapshot frame payload). Distinct from
+        // `get_workflow_state` above, which has Session-caller
+        // auth + TUI-display shape; this one is a thin disk
+        // read for clients that need state without subscribing.
+        "workflow.get_state" => {
+            DispatchOutcome::Done(dispatch_workflow_get_state(state, req))
         }
         "list_workflows" => {
             DispatchOutcome::Done(dispatch_list_workflows(state, req))
@@ -549,6 +630,19 @@ fn dispatch_workflow_done(
     }
 }
 
+/// 11e: `workflow_reject_finding` — daemon-routed replacement
+/// for the Python `_append_event` direct file write. Same
+/// caller policy as `workflow_transition` / `workflow_done`.
+fn dispatch_workflow_reject_finding(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    match methods::workflow_reject_finding(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// 10d-2c-3a: `get_workflow_state` — read-only workflow query.
 /// Both Operator and Session callers; Operator bypasses auth,
 /// Session callers must be in the run's bound-task descendant
@@ -558,6 +652,31 @@ fn dispatch_get_workflow_state(
     req: &Request,
 ) -> Response {
     match methods::get_workflow_state(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// 11c: `workflow.get_state` — Operator-only cold-read companion
+/// to `events.subscribe`. Returns the full `WorkflowRun` JSON
+/// (matching 11b's snapshot frame payload shape) so clients that
+/// only need a one-off read (e.g. the TUI's workflow history
+/// view) can avoid spinning up a long-lived subscription.
+///
+/// Reads disk via `workflow::run::load_one`. Same disk-
+/// authoritative invariant as `events.subscribe`: state.json is
+/// the canonical source of truth, not `state.workflow_runs`.
+fn dispatch_workflow_get_state(
+    _state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "workflow.get_state is Operator-only (no Session-caller use case; the Session-callable `get_workflow_state` exists for agents)",
+    ) {
+        return resp;
+    }
+    match methods::workflow_get_state(&req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -900,6 +1019,67 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
         request_id: req.id.clone(),
     };
     DispatchOutcome::ManifestWatchStream { response, handle }
+}
+
+/// 11b: `events.subscribe` dispatch arm. Operator-only.
+/// Subscribe-then-snapshot under the state lock (the dispatcher
+/// arm site holds it). Order is load-bearing — mirror of 10e-b's
+/// `manifest.watch`: subscribing FIRST so any broadcast that fires
+/// after the lock release lands in our receiver. Snapshot reads
+/// disk AFTER subscribe.
+///
+/// Disk-authoritative snapshot. `state.workflow_runs` is the
+/// write-side cache, not the consumer-facing source of truth —
+/// its update lags the broadcast point in
+/// `append_event_with_retry`. We read `workflow::run::load_all()`
+/// because state.json is durable BEFORE broadcast, so a fresh
+/// subscriber's snapshot already contains every just-broadcast
+/// event. Reading the in-memory cache would reopen the
+/// missed-event window.
+///
+/// Auth: `Caller::Session` rejected with `Unauthorized` — agents
+/// have no use case for events.subscribe. Operator-only matches
+/// the `manifest.watch` precedent.
+fn dispatch_events_subscribe(
+    state: &mut DaemonState,
+    req: &Request,
+) -> DispatchOutcome {
+    if let Err(resp) = require_operator(
+        req,
+        "events.subscribe is Operator-only (no Session-caller use case)",
+    ) {
+        return DispatchOutcome::Done(resp);
+    }
+
+    // Subscribe FIRST. After this call returns, any broadcast
+    // via `state.workflow_event_watcher.broadcast(...)` enqueues
+    // into our `event_rx`. Under the state lock so no broadcast
+    // can race the subscribe-vs-snapshot pair.
+    let (event_rx, guard) = state.workflow_event_watcher.subscribe();
+
+    // Snapshot from DISK. See struct doc + slice-11b NOTES for
+    // why this can't read `state.workflow_runs`.
+    let runs = crate::workflow::run::load_all();
+    let initial_snapshots: Vec<serde_json::Value> = runs
+        .into_iter()
+        .filter(|r| r.is_active())
+        .filter_map(|r| serde_json::to_value(&r).ok())
+        .collect();
+
+    let response = Response::ok(
+        req.id.clone(),
+        serde_json::json!({ "subscribed": true }),
+    );
+    let handle = EventsSubscribeHandle {
+        initial_snapshots,
+        event_rx,
+        guard,
+        heartbeat_interval: std::time::Duration::from_micros(
+            crate::control::stream::DEFAULT_MANIFEST_WATCH_HEARTBEAT_MICROS,
+        ),
+        request_id: req.id.clone(),
+    };
+    DispatchOutcome::EventsSubscribeStream { response, handle }
 }
 
 /// `send_input` — write bytes to a session's PTY. Session-caller

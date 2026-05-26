@@ -432,9 +432,14 @@ impl<R: Read> Read for StreamReader<R> {
                 // wired to this reader — surface as malformed.
                 // 10e-b r1: `Heartbeat` likewise — manifest.watch
                 // sends them on idle, but PTY attach never does.
+                // 11b: `WorkflowEventStateSnapshot` /
+                // `WorkflowEvent` belong to `events.subscribe`,
+                // same rationale.
                 StreamKind::ManifestSnapshot
                 | StreamKind::ManifestDiff
-                | StreamKind::Heartbeat => {
+                | StreamKind::Heartbeat
+                | StreamKind::WorkflowEventStateSnapshot
+                | StreamKind::WorkflowEvent => {
                     self.eof = true;
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,

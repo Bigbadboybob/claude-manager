@@ -720,16 +720,41 @@ Mirror of 10e-b's `dispatch_manifest_watch` + `handle_manifest_watch_stream`.
 - New dispatch arm `dispatch_events_subscribe` (Operator-only,
   empty params).
 - `daemon/src/control/stream.rs::handle_events_subscribe_stream`
-  — on subscribe, iterate `state.workflow_runs`, emit one
-  `WorkflowEventStateSnapshot` per active run, then drive
-  the live channel. Heartbeat ticks for idle-disconnect
-  detection (same 30s default as `manifest.watch`).
+  — on subscribe, iterate active runs **via
+  `workflow::run::load_all()` (reads `state.json` from disk),
+  NOT `state.workflow_runs` in-memory**. Emit one
+  `WorkflowEventStateSnapshot` per active run, then drive the
+  live channel from the 11a broadcaster. Heartbeat ticks for
+  idle-disconnect detection (same 30s default as
+  `manifest.watch`).
 - Wire the dispatcher's outcome handler in `daemon/src/lib.rs`.
+
+**Disk-authoritative snapshot — load-bearing.** 11a's write
+ordering is: (1) `try_modify` saves `state.json` to disk; (2)
+`append_event_with_retry` appends `events.jsonl` AND broadcasts;
+(3) `state.workflow_runs` cache update happens after both. The
+broadcast fires AFTER disk durability for `state.json`, but
+the in-memory cache update lags both. If 11b's snapshot reads
+the cache, a new subscriber that lands between (2) and (3)
+gets a snapshot WITHOUT the just-broadcast event applied —
+classic missed-event window. Reading from disk via
+`load_all()` closes the window: state.json is durable before
+broadcast, so the snapshot a new subscriber receives reflects
+every event broadcast up to that point.
+
+This mirrors the 10d-2c-2-b round-2 "cache invisibility" fix:
+the daemon's authoritative state is on DISK; `state.workflow_runs`
+is a transient write-side cache, not the consumer-facing
+source of truth. Future 11b reviewer/implementer: do NOT
+"optimize" the snapshot by reading the cache.
 
 **Acceptance**: T5-T10 mirror 10e-b's tests — snapshot-then-live,
 slow subscriber drop, concurrent broadcasts, reconnect,
 Session-caller rejected, heartbeat idle-disconnect, RAII guard,
-no accumulation across many reconnects.
+no accumulation across many reconnects. Plus T_snapshot_disk:
+write event → broadcast fires → fresh subscriber's first
+frame (snapshot) reflects the just-broadcast event. Pins the
+disk-authoritative ordering invariant.
 
 **Dependencies**: 11a.
 
@@ -780,6 +805,41 @@ The reveal slice. Switch the TUI's workflow-view code path
 from file-tail (`tui/src/workflow/events.rs::read_new` reads,
 direct `~/.cm/workflow-runs/<id>/state.json` reads) to the
 RPC-driven path landed in 11d.
+
+**Prerequisites (MUST land before 11e ships).** Once the TUI
+stops file-tailing, the 11a broadcaster is the ONLY signal
+consumers get. Every writer to `events.jsonl` MUST route
+through the broadcaster, or the corresponding event type
+becomes invisible to the TUI post-11e. Audit + cover before
+deletion:
+
+- **`workflow_reject_finding`** — currently writes via
+  `mcp_server/server.py:1052 _append_event` direct file
+  write, NOT through the daemon's
+  `append_event_with_retry`. Two resolution shapes:
+  (a) route the MCP tool through daemon dispatch (same
+  pattern as `propose_task`/`mcp_start_session` in sub-2b),
+  OR (b) move the broadcaster hook DOWN into
+  `WorkflowEventsWriter::append_event` itself so every
+  writer is automatically covered. (b) is structurally
+  better — single hook, can't be bypassed — but requires
+  passing a watcher Arc into the writer. Defer the choice
+  to the slice's own pre-coding audit.
+- **Direct `WorkflowEventsWriter::append_event` callers**
+  at `daemon/src/workflow/events.rs:396` and tests. Verify
+  no production caller bypasses `append_event_with_retry`.
+  If any are production-relevant, same resolution applies.
+- **Daemon poller's `fire_static_transition`** — already
+  routes through `dispatch_workflow_transition` →
+  `append_event_with_retry`, so already covered. Confirm
+  no change.
+
+Without this audit, post-11e the TUI sees zero
+`RejectFinding` events (or any other bypassed type) and
+the rejected-findings stash never updates from the
+manager-curated reviewer turn. Symptom would be silent —
+no test failure unless explicitly covered. This subsection
+is the alarm bell.
 
 - Audit and delete file-read sites in TUI:
   - `workflow::events::read_new` callers in `tui/src/workflow/controller.rs`.

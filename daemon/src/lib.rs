@@ -514,6 +514,18 @@ fn handle_connection_with_timeouts(
             }
             control::stream::handle_manifest_watch_stream(stream, handle);
         }
+        // 11b: events.subscribe streaming. Same shape as the
+        // 10e-b ManifestWatchStream arm.
+        control::dispatch::DispatchOutcome::EventsSubscribeStream { response, handle } => {
+            if let Err(e) = control::wire::write_response(stream, &response) {
+                eprintln!(
+                    "cm-daemon: events.subscribe OK write failed: {} (dropping subscription)",
+                    e
+                );
+                return;
+            }
+            control::stream::handle_events_subscribe_stream(stream, handle);
+        }
     }
 }
 

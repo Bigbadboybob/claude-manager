@@ -1077,6 +1077,27 @@ mod tests {
                                         handle,
                                     );
                                 }
+                                // 11b: events.subscribe streaming. Same
+                                // shape as ManifestWatchStream — write
+                                // the OK response, then run the
+                                // workflow-events-stream loop.
+                                cm_daemon::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                                    response,
+                                    handle,
+                                } => {
+                                    if cm_daemon::control::wire::write_response(
+                                        &mut stream,
+                                        &response,
+                                    )
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                    cm_daemon::control::stream::handle_events_subscribe_stream(
+                                        &mut stream,
+                                        handle,
+                                    );
+                                }
                             }
                         });
                     }

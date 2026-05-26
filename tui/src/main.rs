@@ -21,6 +21,7 @@ mod terminal_widget;
 #[cfg(test)]
 mod test_support;
 mod workflow;
+mod workflow_watch;
 // `worktree` relocated to the `cm-daemon` crate (slice 3 of
 // doc/persistent-host-daemon.md). Callers use `cm_daemon::worktree::*`.
 
@@ -202,6 +203,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_manifest_watch_events();
         log_slow_phase("drain_manifest_watch_events", t.elapsed());
+
+        // 11d: drain WorkflowWatchEvent frames from the
+        // events.subscribe consumer. Same shape as the
+        // manifest_watch drain — single-thread apply under the
+        // main loop's invariant.
+        let t = Instant::now();
+        app.drain_workflow_watch_events();
+        log_slow_phase("drain_workflow_watch_events", t.elapsed());
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

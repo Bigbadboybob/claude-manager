@@ -2437,6 +2437,30 @@ pub fn get_workflow_state(
     Ok(serialize_workflow_run_full(&run))
 }
 
+/// 11c: `workflow.get_state` body. Operator-only at the
+/// dispatcher; this just validates params, loads disk, and
+/// serializes the full `WorkflowRun` (matching 11b's snapshot
+/// frame shape so the TUI consumer can deserialize either via
+/// the same code path).
+pub fn workflow_get_state(params: &Value) -> MethodResult {
+    let p: GetWorkflowStateParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    if p.run_id.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "workflow.get_state: 'run_id' is required".into(),
+        ));
+    }
+    match crate::workflow::run::load_one(&p.run_id) {
+        Some(run) => serde_json::to_value(&run)
+            .map_err(|e| (ErrorCode::Internal, format!("serialize WorkflowRun: {}", e))),
+        None => Err((
+            ErrorCode::NotFound,
+            format!("workflow run {} not found", p.run_id),
+        )),
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct ListWorkflowsParams {
     #[serde(default)]
@@ -3394,7 +3418,15 @@ pub fn workflow_transition(
     // moved past the caller's role. NOTES.md captures the
     // rollback failure mode (rollback-save-also-fails) as
     // unrecoverable.
-    if let Err(e) = append_event_with_retry(&event) {
+    //
+    // Phase 2 slice 11a: pre-clone the broadcaster Arc so the
+    // post-write broadcast runs lock-free.
+    let watcher = state_arc
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .workflow_event_watcher
+        .clone();
+    if let Err(e) = append_event_with_retry(&event, &watcher) {
         eprintln!(
             "cm-daemon: workflow_transition({} → {}): state.json advanced but \
              append_event failed after retries: {} — rolling back state to \
@@ -3524,11 +3556,21 @@ pub fn workflow_transition(
 /// deflection rationale.
 fn append_event_with_retry(
     event: &crate::workflow::events::Event,
+    watcher: &Arc<crate::workflow::events::WorkflowEventWatcher>,
 ) -> std::io::Result<()> {
     const BACKOFFS_MS: &[u64] = &[50, 100, 200];
     let mut attempt: usize = 0;
     loop {
-        match crate::workflow::events::WorkflowEventsWriter::append_event(event) {
+        // 11e (Option B): broadcast is now hooked inside
+        // `WorkflowEventsWriter` itself — every successful writer
+        // path is automatically covered (including a future
+        // daemon-routed `workflow_reject_finding`), without each
+        // call site having to remember to broadcast. The post-
+        // write ordering invariant still holds: the broadcast
+        // fires AFTER the disk fsync inside `append_event_inner`.
+        match crate::workflow::events::WorkflowEventsWriter::append_event_and_broadcast(
+            event, watcher,
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempt += 1;
@@ -3715,7 +3757,15 @@ pub fn workflow_done(
     // Round-6 (F2): same rollback shape as
     // `workflow_transition` — restore pre-mutation snapshot if
     // event-write exhausts.
-    if let Err(e) = append_event_with_retry(&event) {
+    //
+    // Phase 2 slice 11a: broadcaster Arc pre-cloned for lock-free
+    // post-write broadcast.
+    let watcher = state_arc
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .workflow_event_watcher
+        .clone();
+    if let Err(e) = append_event_with_retry(&event, &watcher) {
         eprintln!(
             "cm-daemon: workflow_done(run={}): state.json advanced but \
              append_event failed after retries: {} — rolling back state to \
@@ -3780,6 +3830,239 @@ pub fn workflow_done(
     // the static `WRITER_LOCKS` HashMap that would otherwise grow
     // monotonically for the daemon's lifetime (post-review #10).
     crate::workflow::events::WorkflowEventsWriter::release_writer_lock(&event.run_id);
+
+    Ok(json!({
+        "ok": true,
+        "event_id": event.id,
+        "run_id": event.run_id,
+    }))
+}
+
+// ============================================================
+// workflow_reject_finding (11e prerequisite)
+// ============================================================
+//
+// 11e prerequisite: route Python `_append_event` writes through
+// the daemon so Option B's broadcaster-in-WorkflowEventsWriter
+// hook covers them. Pre-11e the Python MCP tool wrote directly
+// to events.jsonl; post-routing it goes through this RPC which
+// uses `append_event_and_broadcast`.
+//
+// Auth shape mirrors `workflow_transition`/`workflow_done`:
+// Session callers must be participants of the run (their
+// `workflow_run_id` must match `params.run_id` and their
+// `workflow_role` must equal the run's `active_role`). Operator
+// callers bypass.
+
+#[derive(serde::Deserialize)]
+pub struct WorkflowRejectFindingParams {
+    pub run_id: String,
+    pub role: String,
+    pub text: String,
+}
+
+pub fn workflow_reject_finding(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: WorkflowRejectFindingParams = serde_json::from_value(params.clone())
+        .map_err(|e| (
+            ErrorCode::InvalidParams,
+            format!("workflow_reject_finding params: {}", e),
+        ))?;
+    if p.run_id.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "workflow_reject_finding: 'run_id' is required".into(),
+        ));
+    }
+    let trimmed_text = p.text.trim().to_string();
+    if trimmed_text.is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "workflow_reject_finding: 'text' is required (non-empty)".into(),
+        ));
+    }
+    let role_for_event = if p.role.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        p.role.clone()
+    };
+
+    // Pre-fetch caller workflow info for auth.
+    let session_workflow_info: Option<(Option<String>, Option<String>)> =
+        if let Caller::Session(uid) = caller {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .lookup_session_any(&uid.session_uid)
+                .map(|s| (s.workflow_run_id, s.workflow_role))
+        } else {
+            None
+        };
+    let is_session_caller = matches!(caller, Caller::Session(_));
+
+    let mut event = crate::workflow::events::Event {
+        id: new_event_id(),
+        ts: now_unix_f64(),
+        run_id: p.run_id.clone(),
+        role: role_for_event,
+        tool: "workflow_reject_finding".to_string(),
+        args: json!({"text": trimmed_text}),
+        source: "daemon".to_string(),
+        from_role: None,
+        iteration: 0,
+    };
+
+    // Apply state mutation under flock. Captures iteration for
+    // the event after mutation succeeds. Mirrors workflow_done's
+    // capture-after-mutation pattern.
+    //
+    // Snapshot the pre-mutation `rejected_findings.len()` so an
+    // event-write failure below can roll back the push under
+    // flock. The mutation is monotone (push-only); restoring the
+    // pre-mutation length is sufficient — no need for a full
+    // `WorkflowRun` snapshot like `workflow_transition` carries.
+    // Mirrors the round-6 F2 rollback pattern from
+    // `workflow_transition` / `workflow_done`; we just have less
+    // to restore.
+    let run_id_for_closure = p.run_id.clone();
+    let text_for_closure = trimmed_text.clone();
+    let captured_iteration: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let captured_iteration_for_closure = captured_iteration.clone();
+    let rollback_len: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    let rollback_len_for_closure = rollback_len.clone();
+    let outcome = crate::workflow::run::try_modify(
+        &p.run_id,
+        move |run| -> Result<(), (ErrorCode, String)> {
+            if is_session_caller {
+                let active = run.active_role.as_deref();
+                let allowed = session_workflow_info
+                    .as_ref()
+                    .map(|(wf_id, wf_role)| {
+                        wf_id.as_deref() == Some(&run_id_for_closure)
+                            && wf_role.as_deref() == active
+                    })
+                    .unwrap_or(false);
+                if !allowed {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "workflow_reject_finding: caller is not a participant of run {}",
+                            run_id_for_closure,
+                        ),
+                    ));
+                }
+            }
+            if !matches!(run.status, crate::workflow::run::RunStatus::Running) {
+                return Err((
+                    ErrorCode::Conflict,
+                    format!(
+                        "workflow_reject_finding: run {} is not Running (status={:?})",
+                        run_id_for_closure, run.status,
+                    ),
+                ));
+            }
+            // Pre-mutation len AFTER validation, BEFORE mutation —
+            // matches the snapshot point `workflow_transition` /
+            // `workflow_done` use for `rollback_state`.
+            *rollback_len_for_closure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some(run.rejected_findings.len());
+            run.rejected_findings.push(crate::workflow::run::RejectedFinding {
+                text: text_for_closure.clone(),
+                recorded_at: crate::workflow::run::now_unix(),
+                iteration: run.iteration,
+            });
+            *captured_iteration_for_closure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = run.iteration;
+            Ok(())
+        },
+    );
+    let _updated = match outcome {
+        crate::workflow::run::TryModifyOutcome::Ok(r) => r,
+        crate::workflow::run::TryModifyOutcome::Aborted(e) => return Err(e),
+        crate::workflow::run::TryModifyOutcome::Persist(
+            crate::workflow::run::PersistError::Io(io_err),
+        ) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            return Err((
+                ErrorCode::NotFound,
+                format!(
+                    "workflow_reject_finding: workflow run {} has no state.json on disk",
+                    p.run_id,
+                ),
+            ));
+        }
+        crate::workflow::run::TryModifyOutcome::Persist(other) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("workflow_reject_finding: state.json mutation failed: {}", other),
+            ));
+        }
+    };
+
+    event.iteration = *captured_iteration
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    let watcher = state_arc
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .workflow_event_watcher
+        .clone();
+    if let Err(e) = append_event_with_retry(&event, &watcher) {
+        // Round-6 F2 rollback (mirrored from
+        // `workflow_transition` / `workflow_done`): state.json
+        // advanced (rejection pushed) but events.jsonl missed
+        // the event — a caller-side retry would push another
+        // duplicate `RejectedFinding`. Truncate back to the
+        // pre-mutation length under flock so the retry re-runs
+        // the full RMW cleanly. Field-targeted (only
+        // rejected_findings was touched) for the same reason
+        // workflow_transition's round-12 rollback is field-
+        // targeted: a TUI-owned field could have advanced on
+        // disk during the retry window.
+        eprintln!(
+            "cm-daemon: workflow_reject_finding(run={}): state.json advanced but \
+             append_event failed after retries: {} — rolling back \
+             rejected_findings push so caller retry sees the original state. \
+             See NOTES.md \"Rejected findings (10d-2c-1)\" for the rollback \
+             failure mode.",
+            event.run_id, e,
+        );
+        let snapshot_len = rollback_len
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(orig_len) = snapshot_len {
+            if let Err(re) = crate::workflow::run::modify(&p.run_id, move |r| {
+                if r.rejected_findings.len() > orig_len {
+                    r.rejected_findings.truncate(orig_len);
+                }
+            }) {
+                eprintln!(
+                    "cm-daemon: workflow_reject_finding({}): ROLLBACK ALSO FAILED: \
+                     {} — state.json on disk reflects the (uncommitted) \
+                     post-mutation shape with no matching event; manual \
+                     recovery required",
+                    p.run_id, re,
+                );
+            }
+        } else {
+            eprintln!(
+                "cm-daemon: workflow_reject_finding({}): no pre-mutation \
+                 snapshot captured (closure returned early); on-disk \
+                 state should be untouched",
+                p.run_id,
+            );
+        }
+        return Err((
+            ErrorCode::Internal,
+            format!("workflow_reject_finding: failed to append event: {}", e),
+        ));
+    }
 
     Ok(json!({
         "ok": true,
@@ -9202,6 +9485,338 @@ mod tests {
             )
             .expect_err("must be InvalidParams");
             assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 11c: `workflow.get_state` (Operator-only cold-read)
+    // ---------------------------------------------------------------
+
+    /// T11 (happy path) — `workflow.get_state` returns the full
+    /// `WorkflowRun` shape (serde-default serialization, matching
+    /// 11b's snapshot frame payload).
+    #[test]
+    fn workflow_get_state_happy_path_returns_full_workflow_run() {
+        let _tmp = with_temp_home(|| {
+            seed_workflow_run("wf_11c_happy", "worker");
+            let result = workflow_get_state(&json!({"run_id": "wf_11c_happy"}))
+                .expect("ok");
+            assert_eq!(result["run_id"], "wf_11c_happy");
+            assert_eq!(result["workflow_name"], "feedback");
+            assert_eq!(result["active_role"], "worker");
+            // Full WorkflowRun shape — has the raw serde fields
+            // (history, role_sessions, role_baselines, etc).
+            assert!(result.get("history").is_some());
+            assert!(result.get("role_sessions").is_some());
+            assert!(result.get("events_offset").is_some());
+            let hist = result["history"].as_array().expect("history array");
+            assert_eq!(hist.len(), 1);
+        });
+    }
+
+    /// T12 — unknown run_id surfaces `NotFound`.
+    #[test]
+    fn workflow_get_state_unknown_run_id_returns_not_found() {
+        let _tmp = with_temp_home(|| {
+            let err = workflow_get_state(&json!({"run_id": "wf-not-there"}))
+                .expect_err("must be NotFound");
+            assert_eq!(err.0, ErrorCode::NotFound);
+        });
+    }
+
+    /// T13 — Session caller rejected with `Unauthorized` at the
+    /// dispatcher layer (the method body is auth-agnostic by
+    /// design; the dispatcher's `require_operator` guard does
+    /// the rejection). Drive the dispatch arm directly so the
+    /// guard runs.
+    #[test]
+    fn workflow_get_state_session_caller_rejected_at_dispatcher() {
+        let _tmp = with_temp_home(|| {
+            seed_workflow_run("wf_11c_auth", "worker");
+            let state = make_state_arc();
+            let req = crate::control::protocol::Request {
+                id: "req-t13".into(),
+                caller: Caller::session("ts-some-agent"),
+                method: "workflow.get_state".into(),
+                params: json!({"run_id": "wf_11c_auth"}),
+            };
+            let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+            let response = outcome.into_response();
+            assert!(!response.ok, "Session caller must be rejected");
+            assert_eq!(
+                response.error.as_ref().expect("error body").code,
+                ErrorCode::Unauthorized,
+            );
+        });
+    }
+
+    /// 11c: empty run_id is `InvalidParams` (same shape as
+    /// `get_workflow_state`'s empty-string handling).
+    #[test]
+    fn workflow_get_state_empty_run_id_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            let err = workflow_get_state(&json!({"run_id": ""}))
+                .expect_err("must be InvalidParams");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 11e prerequisite: `workflow_reject_finding` daemon-routed
+    // ---------------------------------------------------------------
+
+    /// Happy path — `workflow_reject_finding` appends to state.json's
+    /// rejected_findings AND writes a daemon-source event to
+    /// events.jsonl (which Option B's writer broadcasts).
+    #[test]
+    fn workflow_reject_finding_appends_to_state_and_writes_event() {
+        let _tmp = with_temp_home(|| {
+            seed_workflow_run("wf_rf_happy", "worker");
+            let state = make_state_arc();
+            let result = workflow_reject_finding(
+                &state,
+                &Caller::operator("op"),
+                &json!({
+                    "run_id": "wf_rf_happy",
+                    "role": "manager",
+                    "text": "out of scope nit",
+                }),
+            )
+            .expect("ok");
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["run_id"], "wf_rf_happy");
+
+            // Disk: rejected_findings populated.
+            let reloaded =
+                crate::workflow::run::load_one("wf_rf_happy").expect("reload");
+            assert_eq!(reloaded.rejected_findings.len(), 1);
+            assert_eq!(reloaded.rejected_findings[0].text, "out of scope nit");
+
+            // Event on disk too — read events.jsonl and confirm
+            // the daemon-source workflow_reject_finding line is there.
+            let events_path = crate::workflow::run::events_path("wf_rf_happy");
+            let raw = std::fs::read_to_string(&events_path).expect("read events");
+            assert!(
+                raw.contains("\"tool\":\"workflow_reject_finding\""),
+                "events.jsonl must contain the daemon-source event; got {}",
+                raw,
+            );
+            assert!(raw.contains("\"source\":\"daemon\""));
+            assert!(raw.contains("\"text\":\"out of scope nit\""));
+        });
+    }
+
+    /// Empty `text` is `InvalidParams`.
+    #[test]
+    fn workflow_reject_finding_empty_text_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            seed_workflow_run("wf_rf_empty", "worker");
+            let state = make_state_arc();
+            let err = workflow_reject_finding(
+                &state,
+                &Caller::operator("op"),
+                &json!({"run_id": "wf_rf_empty", "role": "manager", "text": "   "}),
+            )
+            .expect_err("must be InvalidParams");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    /// Empty `run_id` is `InvalidParams`.
+    #[test]
+    fn workflow_reject_finding_empty_run_id_is_invalid_params() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let err = workflow_reject_finding(
+                &state,
+                &Caller::operator("op"),
+                &json!({"run_id": "", "role": "manager", "text": "x"}),
+            )
+            .expect_err("must be InvalidParams");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+        });
+    }
+
+    /// 11e rollback (reviewer round) — mirror of
+    /// `workflow_transition_persistent_event_failure_rolls_back_state_returns_internal`.
+    /// When `append_event_with_retry` exhausts (events.jsonl path
+    /// blocked by a directory in its place — the established
+    /// fault-injection trick), the rejection push to state.json
+    /// MUST be rolled back. Pre-fix `state.json` retained the
+    /// pushed RejectedFinding with no matching event on disk, and
+    /// a caller-side retry would push a duplicate.
+    #[test]
+    fn workflow_reject_finding_persistent_event_failure_rolls_back_state_returns_internal() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_rf_evfail", "worker");
+            let pre =
+                crate::workflow::run::load_one("wf_rf_evfail").expect("pre load");
+            let pre_len = pre.rejected_findings.len();
+
+            // Block append_event with EISDIR — persistent.
+            let dir = crate::workflow::run::run_dir("wf_rf_evfail");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path =
+                crate::workflow::run::events_path("wf_rf_evfail");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            let err = workflow_reject_finding(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "run_id": "wf_rf_evfail",
+                    "role": "manager",
+                    "text": "rejected nit A",
+                }),
+            )
+            .expect_err("event write must fail after retries");
+            assert_eq!(err.0, ErrorCode::Internal);
+            assert!(
+                err.1.contains("failed to append event"),
+                "error message surfaces event-write failure: {}",
+                err.1,
+            );
+
+            // state.json on disk is ROLLED BACK: rejected_findings
+            // back to pre-call length.
+            let post =
+                crate::workflow::run::load_one("wf_rf_evfail").expect("post load");
+            assert_eq!(
+                post.rejected_findings.len(),
+                pre_len,
+                "rollback: rejected_findings.len() MUST match pre-mutation \
+                 length ({}); observed {}. Pre-fix the pushed RejectedFinding \
+                 was retained with no matching event on disk.",
+                pre_len,
+                post.rejected_findings.len(),
+            );
+
+            // No event on disk either (the directory-at-events-path
+            // blocked every retry attempt).
+            std::fs::remove_dir(&events_path).expect("remove dir");
+            let (events, _) =
+                crate::workflow::events::read_new("wf_rf_evfail", 0);
+            assert!(events.is_empty(), "no events after rollback");
+        });
+    }
+
+    /// 11e rollback (reviewer round) — mirror of
+    /// `workflow_transition_caller_retry_after_rollback_succeeds_cleanly`.
+    /// After a failed call rolls back, the caller's external
+    /// retry runs the full RMW from scratch — exactly ONE
+    /// rejection lands in state.json, exactly ONE event in
+    /// events.jsonl. Pre-fix the rollback was a no-op and the
+    /// retry would have stacked a second RejectedFinding.
+    #[test]
+    fn workflow_reject_finding_caller_retry_after_rollback_succeeds_cleanly() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_rf_retry", "worker");
+
+            // Stage 1: block event write → rollback fires.
+            let dir = crate::workflow::run::run_dir("wf_rf_retry");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path =
+                crate::workflow::run::events_path("wf_rf_retry");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+            let err = workflow_reject_finding(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "run_id": "wf_rf_retry",
+                    "role": "manager",
+                    "text": "rejected nit (retry)",
+                }),
+            )
+            .expect_err("first call: event write fails");
+            assert_eq!(err.0, ErrorCode::Internal);
+            // Rolled back.
+            let mid =
+                crate::workflow::run::load_one("wf_rf_retry").expect("mid load");
+            assert_eq!(
+                mid.rejected_findings.len(),
+                0,
+                "rolled back to pre-mutation length",
+            );
+
+            // Stage 2: heal disk + retry with identical args.
+            std::fs::remove_dir(&events_path).expect("remove dir");
+            let ok = workflow_reject_finding(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "run_id": "wf_rf_retry",
+                    "role": "manager",
+                    "text": "rejected nit (retry)",
+                }),
+            )
+            .expect("retry must succeed after rollback");
+            assert_eq!(ok["ok"], json!(true));
+
+            // Single end-state: exactly ONE rejection on disk and
+            // exactly ONE event. Pre-fix the rollback was a no-op
+            // and the retry would stack a second RejectedFinding.
+            let post =
+                crate::workflow::run::load_one("wf_rf_retry").expect("post load");
+            assert_eq!(
+                post.rejected_findings.len(),
+                1,
+                "exactly one rejection after the retry; no double-push",
+            );
+            assert_eq!(
+                post.rejected_findings[0].text,
+                "rejected nit (retry)",
+            );
+            let (events, _) =
+                crate::workflow::events::read_new("wf_rf_retry", 0);
+            assert_eq!(events.len(), 1, "exactly one event after the retry");
+        });
+    }
+
+    /// Slice 11e Option B mechanical: the broadcaster hook lives
+    /// inside `WorkflowEventsWriter::append_event_and_broadcast`.
+    /// A successful append delivers the event to subscribers
+    /// AFTER the disk fsync. Pins the post-write ordering — a
+    /// regression that broadcast BEFORE write would fail this
+    /// (subscriber would see the event but disk would be empty
+    /// if write then failed).
+    #[test]
+    fn workflow_events_writer_broadcasts_after_disk_write() {
+        use std::sync::Arc;
+        let _tmp = with_temp_home(|| {
+            let watcher =
+                Arc::new(crate::workflow::events::WorkflowEventWatcher::new());
+            let (rx, _guard) = watcher.subscribe();
+            seed_workflow_run("wf_optb", "worker");
+            let ev = crate::workflow::events::Event {
+                id: "ev-optb-1".into(),
+                ts: 0.0,
+                run_id: "wf_optb".into(),
+                role: "worker".into(),
+                tool: "workflow_transition".into(),
+                args: json!({"to": "reviewer", "prompt": ""}),
+                source: "daemon".into(),
+                from_role: None,
+                iteration: 0,
+            };
+            crate::workflow::events::WorkflowEventsWriter::append_event_and_broadcast(
+                &ev, &watcher,
+            )
+            .expect("append + broadcast ok");
+
+            // Event on disk.
+            let raw = std::fs::read_to_string(
+                crate::workflow::run::events_path("wf_optb"),
+            )
+            .expect("read events");
+            assert!(raw.contains("ev-optb-1"));
+
+            // Event delivered to subscriber AFTER disk write.
+            let received = rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .expect("subscriber must receive after disk write");
+            assert_eq!(received.id, "ev-optb-1");
         });
     }
 

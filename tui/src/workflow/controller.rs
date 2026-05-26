@@ -1137,34 +1137,72 @@ impl<'a> WorkflowControllerCtx<'a> {
                         });
                     }
                     workflow::events::EventKind::RejectFinding { text } => {
-                        // Apply in place — no state-machine decision to defer.
-                        // Appending to the run's stash and persisting is local
-                        // enough that we don't need a Decision variant. Note
-                        // that under Phase 1's relocation we persist via
-                        // `workflow::run::save` (re-exported from
-                        // `cm_daemon::workflow::run`); the daemon-side
-                        // controller (post-relocation) will write the same
-                        // rejected_findings field directly through `modify`.
+                        // 11e: daemon-routed `workflow_reject_finding` ALREADY
+                        // mutated rejected_findings on disk under flock (matching
+                        // `workflow_transition` / `workflow_done`'s daemon
+                        // ownership). The TUI's tail observer for daemon-source
+                        // events must NOT re-apply the push or it'd double-add.
+                        // Reload from disk so in-memory mirrors the daemon's
+                        // mutation; if disk reload fails (transient I/O), the
+                        // next tick's full reload resyncs. TuiLocal fallback
+                        // (Python `_append_event` direct write — kept for
+                        // unpinned spawns) still goes through the in-memory
+                        // push + save path.
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
-                            let iteration = self.workflow_runs[idx].iteration;
-                            self.workflow_runs[idx]
-                                .rejected_findings
-                                .push(crate::workflow::run::RejectedFinding {
-                                    text: trimmed.to_string(),
-                                    recorded_at: crate::workflow::run::now_unix(),
-                                    iteration,
-                                });
-                            let _ = workflow::run::save(&self.workflow_runs[idx]);
-                            log_tick(
-                                &run_id,
-                                &format!(
-                                    "reject_finding recorded ({} chars, total={} rejections)",
-                                    trimmed.len(),
-                                    self.workflow_runs[idx].rejected_findings.len(),
-                                ),
-                            );
+                            if daemon_routed {
+                                if let Some(reloaded) =
+                                    crate::workflow::run::load_one(&run_id)
+                                {
+                                    self.workflow_runs[idx] = reloaded;
+                                }
+                                log_tick(
+                                    &run_id,
+                                    &format!(
+                                        "reject_finding recorded (daemon-routed, total={} rejections)",
+                                        self.workflow_runs[idx].rejected_findings.len(),
+                                    ),
+                                );
+                            } else {
+                                let iteration = self.workflow_runs[idx].iteration;
+                                self.workflow_runs[idx]
+                                    .rejected_findings
+                                    .push(crate::workflow::run::RejectedFinding {
+                                        text: trimmed.to_string(),
+                                        recorded_at: crate::workflow::run::now_unix(),
+                                        iteration,
+                                    });
+                                let _ = workflow::run::save(&self.workflow_runs[idx]);
+                                log_tick(
+                                    &run_id,
+                                    &format!(
+                                        "reject_finding recorded ({} chars, total={} rejections)",
+                                        trimmed.len(),
+                                        self.workflow_runs[idx].rejected_findings.len(),
+                                    ),
+                                );
+                            }
                         }
+                        // 11e fix (reviewer round): apply-in-place arms
+                        // STILL need a Decision::Skip — without one,
+                        // `events_offset` doesn't advance, the event
+                        // is re-read every tick, and because
+                        // `events_with_offsets` stays non-empty the
+                        // static-idle gate (below) is skipped → run
+                        // wedges after a reject_finding. Same wedge
+                        // shape the `Unknown` arm at 10d-2c-1 round-11
+                        // documents. Skip is gated by `failed_runs`
+                        // alongside every other decision, so a
+                        // reload-fail upstream doesn't blindly
+                        // advance past the event.
+                        decisions.push(Decision::Skip {
+                            run_id: run_id.clone(),
+                            new_offset: *post_event_offset,
+                            reason: format!(
+                                "reject_finding applied in-place (id={}, daemon_routed={})",
+                                ev.id, daemon_routed,
+                            ),
+                        });
                     }
                 }
             }
@@ -3538,6 +3576,168 @@ mod tests {
                 "round-11 F1: events_offset must advance past all 3 \
                  events (Unknown skip + Transition + Done); pre-fix \
                  the Unknown event wedged offset at 0",
+            );
+        });
+    }
+
+    /// 11e fix (reviewer round) — `EventKind::RejectFinding` is
+    /// an apply-in-place arm (no state-machine decision); it
+    /// MUST still push a `Decision::Skip` with `new_offset =
+    /// post_event_offset` so the decision-processing loop
+    /// advances `events_offset` past the event. Without the
+    /// Skip:
+    ///   1. offset stays at 0 → the same reject event is
+    ///      re-read every tick (re-applying the daemon-routed
+    ///      reload-from-disk over and over is benign but
+    ///      wasteful; for TuiLocal it'd double-push to
+    ///      rejected_findings every tick).
+    ///   2. `events_with_offsets` stays non-empty →
+    ///      static-idle gate (controller.rs around line 1191)
+    ///      is skipped → workflow can't fire its next
+    ///      transition → run wedges.
+    ///
+    /// Same wedge shape the `Unknown` arm at 10d-2c-1 round-11
+    /// documents. This test is the analog of
+    /// `tick_advances_offset_past_unknown_event_and_consumes_later_events`.
+    ///
+    /// Mutation-verifiable: remove the new `Decision::Skip`
+    /// push in the RejectFinding arm and this test fails
+    /// (offset stays at 0).
+    #[test]
+    fn tick_advances_offset_past_reject_finding_event() {
+        with_temp_home(|| {
+            let run_id = "wf_11e_reject_skip";
+            let run = make_run(run_id, "feedback", "worker");
+            workflow::run::save(&run).expect("seed save");
+
+            // Daemon-source reject_finding event — the controller's
+            // RejectFinding arm picks the daemon_routed branch
+            // (reload-from-disk). Single event in the batch so
+            // ONLY a successful Skip advances the offset.
+            let ev_reject = workflow::events::Event {
+                id: "evt-11e-reject-1".to_string(),
+                ts: 1.0,
+                run_id: run_id.to_string(),
+                role: "manager".to_string(),
+                tool: "workflow_reject_finding".to_string(),
+                args: serde_json::json!({"text": "out of scope nit"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev_reject)
+                .expect("append reject");
+
+            let (with_offsets1, _) =
+                workflow::events::read_new_with_offsets(run_id, 0);
+            assert_eq!(with_offsets1.len(), 1);
+            let post_reject = with_offsets1[0].1;
+
+            let mut runs = vec![run];
+            let worker = stub_session("worker", "claude", run_id, "worker", None);
+            let reviewer = stub_session("reviewer", "claude", run_id, "reviewer", None);
+            let manager = stub_session("manager", "claude", run_id, "manager", None);
+            let workspace = workspace_with(vec![worker, reviewer, manager], None);
+            let mut workspaces = vec![workspace];
+
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "manager".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let workflow_def = make_workflow(
+                "feedback",
+                roles,
+                vec![
+                    "worker".to_string(),
+                    "reviewer".to_string(),
+                    "manager".to_string(),
+                ],
+                vec![],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), workflow_def);
+
+            let dummy = dummy_cap_state();
+
+            // First tick: reject_finding alone in the batch.
+            // Without the new Skip push, offset stays at 0 → wedge.
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.tick();
+            }
+
+            let post1 = workflow::run::load_one(run_id).expect("post1 load");
+            assert_eq!(
+                post1.events_offset, post_reject,
+                "11e fix: events_offset MUST advance past a sole \
+                 reject_finding event; pre-fix it wedged at 0 \
+                 because the RejectFinding arm pushed no Decision",
+            );
+
+            // Append a downstream event past the reject. If the
+            // first tick had wedged at offset=0, the second tick
+            // would re-read the reject AND the new event; the
+            // controller would AGAIN fail to advance offset (same
+            // wedge). Post-fix the second tick sees only the new
+            // event and advances offset past it.
+            let ev_done = workflow::events::Event {
+                id: "evt-11e-done".to_string(),
+                ts: 2.0,
+                run_id: run_id.to_string(),
+                role: "manager".to_string(),
+                tool: "workflow_done".to_string(),
+                args: serde_json::json!({"reason": "ok"}),
+                source: "daemon".to_string(),
+                from_role: None,
+                iteration: 0,
+            };
+            workflow::events::WorkflowEventsWriter::append_event(&ev_done)
+                .expect("append done");
+            let (with_offsets2, _) =
+                workflow::events::read_new_with_offsets(run_id, post1.events_offset);
+            assert_eq!(
+                with_offsets2.len(),
+                1,
+                "second read must surface ONLY the new event \
+                 (the reject was consumed in tick 1)",
+            );
+            let post_done = with_offsets2[0].1;
+
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                };
+                let _ = ctx.tick();
+            }
+            let post2 = workflow::run::load_one(run_id).expect("post2 load");
+            assert_eq!(
+                post2.events_offset, post_done,
+                "downstream event after reject_finding is processed \
+                 on the next tick — proves the reject_finding \
+                 didn't wedge the controller",
             );
         });
     }

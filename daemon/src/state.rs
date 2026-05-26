@@ -438,6 +438,14 @@ pub struct DaemonState {
     /// enough that a ring buffer would only add lifecycle complexity
     /// without buying replay).
     pub manifest_watcher: Arc<crate::manifest::ManifestWatcher>,
+    /// Phase 2 slice 11a: broadcaster for workflow `events.jsonl`
+    /// writes. Hooked into `append_event_with_retry`; every
+    /// successfully-persisted event fans out to subscribers via
+    /// the [11b] `events.subscribe` RPC. Same RAII guard +
+    /// `sync_channel` shape as `manifest_watcher`. See
+    /// `daemon/src/workflow/events.rs::WorkflowEventWatcher` and
+    /// daemon/NOTES.md §"Phase 2: Workflow events over RPC".
+    pub workflow_event_watcher: Arc<crate::workflow::events::WorkflowEventWatcher>,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -507,6 +515,9 @@ impl Default for DaemonState {
             workflow_runs: HashMap::new(),
             workflow_definitions: HashMap::new(),
             manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),
+            workflow_event_watcher: Arc::new(
+                crate::workflow::events::WorkflowEventWatcher::new(),
+            ),
         }
     }
 }

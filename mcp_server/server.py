@@ -1049,8 +1049,27 @@ def workflow_reject_finding(text: str) -> str:
             optionally). Free-text; surfaced to the reviewer verbatim as a
             bullet point.
     """
-    event = _append_event("workflow_reject_finding", {"text": text})
-    return f"Recorded rejection (event {event['id']})."
+    # 11e: flip from `_append_event` (direct file write) to
+    # daemon-routed when a daemon is pinned. Same shape as
+    # `workflow_transition` / `workflow_done`. The TUI-local
+    # fallback preserves pre-11e behavior so A-f-launched
+    # workflow participants still work.
+    if control_client.daemon_socket_pinned():
+        run_id = os.environ.get("CM_WORKFLOW_RUN_ID", "").strip()
+        if not run_id:
+            raise RuntimeError(
+                "CM_WORKFLOW_RUN_ID is not set — workflow tools are only "
+                "usable inside a workflow-participant session."
+            )
+        role = os.environ.get("CM_ROLE", "").strip() or "unknown"
+        result = control_client.call(
+            "workflow_reject_finding",
+            {"text": text, "run_id": run_id, "role": role},
+        )
+        return f"Recorded rejection (event {result['event_id']})."
+    else:
+        event = _append_event("workflow_reject_finding", {"text": text})
+        return f"Recorded rejection (event {event['id']})."
 
 
 if __name__ == "__main__":

@@ -2586,6 +2586,15 @@ pub struct App {
     /// the thread is a "daemon" thread reaped by process exit.
     /// `None` when consumer wasn't spawned.
     pub _manifest_watch_thread: Option<std::thread::JoinHandle<()>>,
+    /// 11d: receiver from the `events.subscribe` consumer thread.
+    /// Drained per tick by [`App::drain_workflow_watch_events`].
+    /// Carries either a `Snapshot(WorkflowRun)` (one per active
+    /// run on (re)subscribe) or `Event(Event)` (live broadcast).
+    pub workflow_watch_rx:
+        Option<std::sync::mpsc::Receiver<crate::workflow_watch::WorkflowWatchEvent>>,
+    /// 11d: thread handle for the events.subscribe consumer.
+    /// Same lifecycle convention as `_manifest_watch_thread`.
+    pub _workflow_watch_thread: Option<std::thread::JoinHandle<()>>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
     /// side-channels — the attach-stream End frame (immediate,
@@ -2698,6 +2707,11 @@ impl App {
         // be wasted work + log noise.
         let (manifest_watch_rx, _manifest_watch_thread) =
             crate::manifest_watch::maybe_spawn_for_app();
+        // 11d: spawn the events.subscribe consumer alongside
+        // manifest_watch. Same reconnect-with-backoff shape;
+        // delivers WorkflowEvent broadcasts to the main loop.
+        let (workflow_watch_rx, _workflow_watch_thread) =
+            crate::workflow_watch::maybe_spawn_for_app();
 
         App {
             tasks: Vec::new(),
@@ -2733,6 +2747,8 @@ impl App {
             memory_kill_rx,
             manifest_watch_rx,
             _manifest_watch_thread,
+            workflow_watch_rx,
+            _workflow_watch_thread,
             cap_kill_toasted: std::collections::HashSet::new(),
         }
     }
@@ -5990,6 +6006,76 @@ impl App {
                     self.apply_manifest_snapshot(payload);
                 }
             }
+        }
+    }
+
+    /// 11d: drain the events.subscribe consumer's channel.
+    /// Called per tick from the main loop. Snapshot frames apply
+    /// conservative-merge: the daemon's `WorkflowRun` becomes
+    /// authoritative for fields the TUI hasn't observed yet
+    /// (history past local `events_offset`); local in-memory
+    /// state wins for everything else (mirrors 10e-c r1 F1).
+    /// Event frames append to the run's history via the same
+    /// per-event tail logic the file-watcher path uses today —
+    /// in 11d they're forwarded raw to the workflow controller's
+    /// existing tail-observer entry point so 11e's file-tail
+    /// removal swaps the source without touching the apply
+    /// pipeline.
+    pub fn drain_workflow_watch_events(&mut self) {
+        let mut events: Vec<crate::workflow_watch::WorkflowWatchEvent> = Vec::new();
+        if let Some(rx) = self.workflow_watch_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        for ev in events {
+            match ev {
+                crate::workflow_watch::WorkflowWatchEvent::Snapshot(run) => {
+                    self.apply_workflow_watch_snapshot(run);
+                }
+                crate::workflow_watch::WorkflowWatchEvent::Event(_event) => {
+                    // 11d wires the receiver + per-tick drain.
+                    // Slice 11e replaces the file-tail path in the
+                    // workflow controller with a consumer of
+                    // these events; this branch becomes the
+                    // single dispatch site at that point.
+                    //
+                    // 11d intentionally no-ops the event arm to
+                    // keep the file-tail path authoritative
+                    // through this slice — the channel still
+                    // flows so 11d's tests can pin reception
+                    // shape without affecting today's behavior.
+                    self.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    /// 11d: apply a snapshot frame from `events.subscribe`. The
+    /// daemon's `WorkflowRun` is authoritative for the post-
+    /// (re)subscribe view; the TUI's local state-machine driver
+    /// (controller) holds in-memory continuations the daemon
+    /// doesn't see (e.g. activation-prompt scheduling). The
+    /// conservative-merge rule: ONLY insert when local has no
+    /// entry; do NOT overwrite when both sides have one — the
+    /// local entry has already absorbed live diffs that the
+    /// daemon's snapshot may not reflect yet. This mirrors
+    /// 10e-c r1 F1's conservative-merge for manifest snapshots.
+    pub(crate) fn apply_workflow_watch_snapshot(
+        &mut self,
+        run: cm_daemon::workflow::run::WorkflowRun,
+    ) {
+        let already_present = self
+            .workflow_runs
+            .iter()
+            .any(|r| r.run_id == run.run_id);
+        if !already_present {
+            self.workflow_runs.push(run);
+            self.needs_redraw = true;
         }
     }
 

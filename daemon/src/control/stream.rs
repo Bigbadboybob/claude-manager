@@ -189,6 +189,102 @@ pub fn handle_attach_stream(
 /// override/restore of a shared atomic.
 pub const DEFAULT_MANIFEST_WATCH_HEARTBEAT_MICROS: u64 = 15_000_000;
 
+/// 11b: stream handler for `events.subscribe`. One-way (daemon →
+/// client). Mirror of [`handle_manifest_watch_stream`].
+///
+/// Loop:
+///   - Write one `WorkflowEventStateSnapshot` frame per active
+///     run captured under the dispatch lock.
+///   - `recv_timeout(heartbeat_interval)` on `event_rx`:
+///     - `Ok(event)` → write `WorkflowEvent` frame; on write
+///       error (BrokenPipe), exit.
+///     - `Err(Timeout)` → write a `Heartbeat` frame; on write
+///       error, exit. Same 10e-b r1 idle-disconnect path.
+///     - `Err(Disconnected)` → broadcaster reaped our sender
+///       (daemon shutdown or slow-subscriber retain). Exit.
+///
+/// On exit, the receiver drops at end-of-scope; the RAII guard
+/// reaps the subscriber slot immediately.
+pub fn handle_events_subscribe_stream(
+    stream: &mut UnixStream,
+    handle: crate::control::dispatch::EventsSubscribeHandle,
+) {
+    let crate::control::dispatch::EventsSubscribeHandle {
+        initial_snapshots,
+        event_rx,
+        guard: _guard,
+        heartbeat_interval,
+        request_id,
+    } = handle;
+
+    // Events stream is long-lived. Clear any read timeout the
+    // RPC path may have set.
+    let _ = stream.set_read_timeout(None);
+
+    // Snapshot frames: one per active run. Sent before any live
+    // diff frames so the consumer has a baseline.
+    for snapshot in &initial_snapshots {
+        let frame = StreamFrame::workflow_event_state_snapshot(
+            request_id.clone(),
+            snapshot.clone(),
+        );
+        if let Err(e) = wire::write_stream_frame(stream, &frame) {
+            eprintln!(
+                "cm-daemon: events.subscribe snapshot write failed: {} \
+                 (client likely disconnected before we got started)",
+                e,
+            );
+            return;
+        }
+    }
+
+    // Live loop with heartbeat-on-timeout.
+    loop {
+        match event_rx.recv_timeout(heartbeat_interval) {
+            Ok(event) => {
+                let payload = match serde_json::to_value(&event) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "cm-daemon: events.subscribe event serialize \
+                             failed: {} (event id {:?}) — dropping \
+                             subscriber",
+                            e, event.id,
+                        );
+                        return;
+                    }
+                };
+                let frame = StreamFrame::workflow_event(
+                    request_id.clone(),
+                    payload,
+                );
+                if let Err(e) = wire::write_stream_frame(stream, &frame) {
+                    eprintln!(
+                        "cm-daemon: events.subscribe event write \
+                         error: {} (client disconnected)",
+                        e,
+                    );
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let frame = StreamFrame::heartbeat(request_id.clone());
+                if let Err(e) = wire::write_stream_frame(stream, &frame) {
+                    eprintln!(
+                        "cm-daemon: events.subscribe heartbeat write \
+                         error: {} (idle client disconnected)",
+                        e,
+                    );
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return;
+            }
+        }
+    }
+}
+
 /// 10e-b: stream handler for `manifest.watch`. One-way (daemon →
 /// client), so simpler than `handle_attach_stream` (no inbound
 /// thread, no Input/Resize dispatch).
@@ -2632,5 +2728,743 @@ mod tests {
             .unwrap()
             .sessions
             .remove("ts-reconnect-multi");
+    }
+
+    // =================================================================
+    // 11b: events.subscribe streaming tests
+    // =================================================================
+    //
+    // Tests exercise `handle_events_subscribe_stream` end-to-end through
+    // `UnixStream::pair`. The handler is driven on one end, the test
+    // reads frames from the other. Mirror of the manifest.watch
+    // T3-T11 suite above, plus T_snapshot_disk for the
+    // disk-authoritative snapshot invariant.
+
+    /// Build an `EventsSubscribeHandle` synthetically. Mirrors what
+    /// `dispatch_events_subscribe` does in production. The
+    /// `initial_snapshots` arg lets a test inject whatever payload
+    /// it wants (or empty) without forcing a disk write — the
+    /// `T_snapshot_disk` test exercises the real disk path
+    /// separately.
+    fn build_events_subscribe_handle(
+        state: &Arc<Mutex<DaemonState>>,
+        request_id: &str,
+        heartbeat_interval: Duration,
+        initial_snapshots: Vec<serde_json::Value>,
+    ) -> crate::control::dispatch::EventsSubscribeHandle {
+        let s = state.lock().unwrap();
+        let (event_rx, guard) = s.workflow_event_watcher.subscribe();
+        crate::control::dispatch::EventsSubscribeHandle {
+            initial_snapshots,
+            event_rx,
+            guard,
+            heartbeat_interval,
+            request_id: request_id.to_string(),
+        }
+    }
+
+    fn make_test_event(id: &str, run_id: &str) -> crate::workflow::events::Event {
+        crate::workflow::events::Event {
+            id: id.into(),
+            ts: 0.0,
+            run_id: run_id.into(),
+            role: "worker".into(),
+            tool: "workflow_transition".into(),
+            args: serde_json::json!({"to": "reviewer", "prompt": ""}),
+            source: String::new(),
+            from_role: None,
+            iteration: 0,
+        }
+    }
+
+    /// T5 — subscribe via `handle_events_subscribe_stream` → one
+    /// `WorkflowEventStateSnapshot` per active run arrives first →
+    /// broadcaster fires a `WorkflowEvent` → next frame matches.
+    #[test]
+    fn events_subscribe_sends_snapshot_then_streams_events() {
+        let test_heartbeat = Duration::from_micros(50_000);
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+
+        // Inject two synthetic snapshot payloads (the handler
+        // doesn't care how they were obtained; the dispatcher's
+        // disk-read path is exercised by T_snapshot_disk).
+        let snapshots = vec![
+            serde_json::json!({"run_id": "wf-1"}),
+            serde_json::json!({"run_id": "wf-2"}),
+        ];
+
+        let (mut client, mut server) =
+            UnixStream::pair().expect("socket pair");
+        let handle = build_events_subscribe_handle(
+            &state,
+            "req-t5",
+            test_heartbeat,
+            snapshots,
+        );
+        let state_clone = state.clone();
+        let join = std::thread::spawn(move || {
+            handle_events_subscribe_stream(&mut server, handle);
+            drop(state_clone);
+        });
+
+        // Frame 1: first snapshot.
+        let frame = read_one_frame(&mut client);
+        assert_eq!(frame.kind, StreamKind::WorkflowEventStateSnapshot);
+        assert_eq!(frame.id, "req-t5");
+        assert_eq!(frame.payload["run_id"], "wf-1");
+
+        // Frame 2: second snapshot.
+        let frame = read_one_frame(&mut client);
+        assert_eq!(frame.kind, StreamKind::WorkflowEventStateSnapshot);
+        assert_eq!(frame.payload["run_id"], "wf-2");
+
+        // Fire a broadcast — simulates what
+        // `append_event_with_retry` does post-write.
+        state
+            .lock()
+            .unwrap()
+            .workflow_event_watcher
+            .broadcast(make_test_event("e-1", "wf-1"));
+
+        // Frame 3: the WorkflowEvent.
+        let frame = read_one_frame(&mut client);
+        assert_eq!(frame.kind, StreamKind::WorkflowEvent);
+        assert_eq!(frame.id, "req-t5");
+        assert_eq!(frame.payload["id"], "e-1");
+        assert_eq!(frame.payload["run_id"], "wf-1");
+
+        drop(client);
+        let _ = join.join();
+    }
+
+    /// T6 — Operator-only auth: a Session caller is rejected with
+    /// `Unauthorized` AND no subscription is created on the
+    /// broadcaster.
+    #[test]
+    fn events_subscribe_session_caller_rejected_no_subscription_leak() {
+        use crate::control::protocol::{Caller, CallerSession, Request};
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let initial_slots = state
+            .lock()
+            .unwrap()
+            .workflow_event_watcher
+            .subscriber_slot_count();
+
+        let req = Request {
+            id: "req-t6".into(),
+            caller: Caller::Session(CallerSession {
+                session_uid: "ts-some-agent".into(),
+            }),
+            method: "events.subscribe".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let response = outcome.into_response();
+        assert!(
+            !response.ok,
+            "Session-caller events.subscribe MUST be rejected",
+        );
+        assert_eq!(
+            response.error.as_ref().expect("error body").code,
+            crate::control::protocol::ErrorCode::Unauthorized,
+        );
+
+        let post_slots = state
+            .lock()
+            .unwrap()
+            .workflow_event_watcher
+            .subscriber_slot_count();
+        assert_eq!(
+            post_slots, initial_slots,
+            "rejected Session caller MUST NOT leak a subscriber slot",
+        );
+    }
+
+    /// T7 — handle receives broadcasts after the dispatcher
+    /// releases the state lock. Mirror of manifest.watch T8: the
+    /// subscribe happens inside the dispatch arm under the state
+    /// lock; once `dispatch_request` returns, broadcasts MUST
+    /// land in our receiver.
+    #[test]
+    fn events_subscribe_handle_receives_broadcasts_after_lock_release() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+        // env_lock + tempdir for HOME so dispatch_events_subscribe's
+        // load_all() read doesn't see real user state.
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let req = Request {
+            id: "req-t7".into(),
+            caller: Caller::Operator(CallerOperator {
+                token_id: "t".into(),
+            }),
+            method: "events.subscribe".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let handle = match outcome {
+            crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                handle,
+                ..
+            } => handle,
+            _ => panic!("expected EventsSubscribeStream outcome"),
+        };
+
+        // Lock is released. Broadcast an event; our receiver
+        // MUST observe it because subscribe ran inside the dispatch
+        // arm's locked critical section.
+        state
+            .lock()
+            .unwrap()
+            .workflow_event_watcher
+            .broadcast(make_test_event("e-post-release", "wf-x"));
+
+        let event = handle
+            .event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect(
+                "subscribe-before-snapshot MUST deliver \
+                 post-release broadcasts to the receiver",
+            );
+        assert_eq!(event.id, "e-post-release");
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// T8 — handle Drop reaps the subscriber slot immediately
+    /// via the guard's Drop. Mirror of manifest.watch T11.
+    #[test]
+    fn events_subscribe_handle_drop_immediately_reaps_subscriber_slot() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let req = Request {
+            id: "req-t8".into(),
+            caller: Caller::Operator(CallerOperator {
+                token_id: "t".into(),
+            }),
+            method: "events.subscribe".into(),
+            params: serde_json::json!({}),
+        };
+
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let handle = match outcome {
+            crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                handle,
+                ..
+            } => handle,
+            _ => panic!("expected EventsSubscribeStream outcome"),
+        };
+        // Subscribe should have taken effect.
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .workflow_event_watcher
+                .subscriber_slot_count(),
+            1,
+        );
+
+        drop(handle);
+        // Guard Drop must reap immediately.
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .workflow_event_watcher
+                .subscriber_slot_count(),
+            0,
+            "events.subscribe handle Drop MUST reap slot immediately",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// T9 — idle-disconnect detection via the heartbeat path.
+    /// A client that closes during a quiet period (no events) must
+    /// be detected within roughly one heartbeat interval — the
+    /// handler's `recv_timeout` boundary writes a heartbeat,
+    /// hits BrokenPipe, and exits.
+    #[test]
+    fn events_subscribe_idle_disconnect_detected_within_heartbeat_interval() {
+        let test_heartbeat = Duration::from_micros(50_000);
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+
+        let (client, mut server) = UnixStream::pair().expect("socket pair");
+        let handle = build_events_subscribe_handle(
+            &state,
+            "req-t9",
+            test_heartbeat,
+            Vec::new(),
+        );
+        let join = std::thread::spawn(move || {
+            handle_events_subscribe_stream(&mut server, handle);
+        });
+
+        // Close the client. The next heartbeat write will hit
+        // BrokenPipe and the handler exits.
+        drop(client);
+
+        let start = std::time::Instant::now();
+        let _ = join.join();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handler must exit within heartbeat interval of client \
+             close, elapsed={:?}",
+            elapsed,
+        );
+
+        // No slot leak after handler exit.
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .workflow_event_watcher
+                .subscriber_slot_count(),
+            0,
+        );
+    }
+
+    /// T_snapshot_disk — the critical disk-authoritative
+    /// snapshot invariant. Write a WorkflowRun's state.json (the
+    /// post-write durability point), broadcast an event AFTER
+    /// the write (the broadcast happens after disk-persist),
+    /// then have a fresh subscriber dial `events.subscribe`.
+    /// The subscriber's first frame MUST be a snapshot
+    /// reflecting the post-event state — because state.json on
+    /// disk has already advanced.
+    ///
+    /// Pins the invariant from NOTES.md slice 11b: snapshots
+    /// MUST come from disk via `load_all()`, not from the
+    /// `state.workflow_runs` in-memory cache (whose update
+    /// trails the broadcast). Mutation-verify by swapping the
+    /// dispatch arm to read `state.workflow_runs` and watching
+    /// this test fail.
+    #[test]
+    fn events_subscribe_snapshot_reflects_disk_state_not_cache() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+        use crate::workflow::run::{
+            save, RoleBinding, RunStatus, WorkflowRun,
+        };
+
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        // Build + save the WorkflowRun on disk. Active status so
+        // the dispatch arm picks it up.
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "claude".into(),
+                current_session_id: Some("sid-w".into()),
+                daemon_session_uid: None,
+            },
+        );
+        let run = WorkflowRun::new(
+            "wf_snapshot_disk_t".into(),
+            "feedback".into(),
+            "/tmp/repo".into(),
+            roles,
+            "worker".into(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+            0,
+        );
+        // Assert active so the dispatch arm includes it.
+        assert!(matches!(run.status, RunStatus::Running));
+        save(&run).expect("save state.json");
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        // NOTE: do NOT populate `state.workflow_runs`. The cache
+        // is intentionally empty — proving that the dispatch
+        // arm reads from DISK is the contract this test pins.
+
+        // Broadcast an event BEFORE subscribing — mirrors the
+        // ordering in `append_event_with_retry`: state.json
+        // written first, broadcast fired, cache update LAGS.
+        // A new subscriber landing now must still see the run
+        // in its snapshot frame.
+        state
+            .lock()
+            .unwrap()
+            .workflow_event_watcher
+            .broadcast(make_test_event("e-pre-subscribe", "wf_snapshot_disk_t"));
+
+        let req = Request {
+            id: "req-snap-disk".into(),
+            caller: Caller::Operator(CallerOperator {
+                token_id: "t".into(),
+            }),
+            method: "events.subscribe".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+        let handle = match outcome {
+            crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                handle,
+                ..
+            } => handle,
+            _ => panic!("expected EventsSubscribeStream outcome"),
+        };
+
+        // The handle's initial_snapshots MUST contain our saved
+        // run — proving the snapshot came from disk, not from
+        // the empty cache.
+        assert_eq!(
+            handle.initial_snapshots.len(),
+            1,
+            "snapshot MUST be built from disk via load_all(); \
+             cache was intentionally empty so a cache-read \
+             dispatch arm would produce zero snapshots",
+        );
+        assert_eq!(
+            handle.initial_snapshots[0]["run_id"],
+            "wf_snapshot_disk_t",
+        );
+
+        drop(handle);
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// T21 (slice 11f) — Phase 2 named acceptance gate: Killing
+    /// the TUI mid-workflow and reattaching shows the current
+    /// active role and recent transitions via `events.subscribe`'s
+    /// snapshot frame. Pins the disk-authoritative snapshot
+    /// invariant end-to-end:
+    ///
+    ///   1. Seed a workflow run on disk with multiple history
+    ///      entries (simulating prior transitions).
+    ///   2. attach1 subscribes → observes snapshot frame +
+    ///      receives a fresh event broadcast → drops.
+    ///   3. attach2 subscribes fresh → assert FIRST frame is
+    ///      `WorkflowEventStateSnapshot` containing the
+    ///      post-transition WorkflowRun (history.len() > 1).
+    ///
+    /// Mutation-verify the snapshot-send path by removing the
+    /// snapshot frame emission in `handle_events_subscribe_stream`
+    /// (the for-loop over `initial_snapshots`) and confirming this
+    /// test fails because attach2's first frame is a heartbeat
+    /// (no snapshot to read).
+    #[test]
+    fn t21_reconnect_first_frame_is_snapshot_with_post_transition_history() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+        use crate::workflow::run::{
+            save, HistoryEntry, RoleBinding, TriggerKind, WorkflowRun,
+        };
+
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+
+        // Seed a workflow run with TWO history entries (initial
+        // worker + an activation to reviewer) — simulates the
+        // post-transition state at TUI-disconnect time.
+        let mut roles = std::collections::BTreeMap::new();
+        for r in ["worker", "reviewer", "manager"] {
+            roles.insert(
+                r.to_string(),
+                RoleBinding {
+                    session_label: r.into(),
+                    current_session_id: None,
+                    daemon_session_uid: None,
+                },
+            );
+        }
+        let mut run = WorkflowRun::new(
+            "wf_t21_reconnect".into(),
+            "feedback".into(),
+            "/tmp/repo".into(),
+            roles,
+            "worker".into(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+            0,
+        );
+        // Append a second history entry to simulate a transition.
+        run.history.push(HistoryEntry {
+            iteration: 2,
+            role: "reviewer".into(),
+            session_id: None,
+            last_message: Some("worker said diff lgtm?".into()),
+            activated_at: 1,
+            deactivated_at: None,
+            trigger: TriggerKind::McpTransition {
+                from_role: "worker".into(),
+                prompt: "diff lgtm?".into(),
+                event_id: "ev-pre-disconnect".into(),
+            },
+            assistant_count_at_start: 3,
+            text_messages_at_start: 3,
+        });
+        run.active_role = Some("reviewer".into());
+        run.iteration = 2;
+        save(&run).expect("save wf state.json");
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+
+        // --- attach1: subscribe + drop ---
+        let req1 = Request {
+            id: "req-attach1".into(),
+            caller: Caller::Operator(CallerOperator { token_id: "t".into() }),
+            method: "events.subscribe".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome1 = crate::control::dispatch::dispatch_request(&state, &req1);
+        let handle1 = match outcome1 {
+            crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                handle,
+                ..
+            } => handle,
+            _ => panic!("attach1: expected EventsSubscribeStream"),
+        };
+        assert_eq!(handle1.initial_snapshots.len(), 1);
+        assert_eq!(
+            handle1.initial_snapshots[0]["history"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(2),
+            "attach1 snapshot must reflect post-transition history",
+        );
+        // Drop attach1 (simulates TUI exit).
+        drop(handle1);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .workflow_event_watcher
+                .subscriber_slot_count(),
+            0,
+            "attach1 drop must reap subscriber slot",
+        );
+
+        // --- attach2: fresh subscribe; first frame MUST be the
+        //     snapshot reflecting the same post-transition state ---
+        let req2 = Request {
+            id: "req-attach2".into(),
+            caller: Caller::Operator(CallerOperator { token_id: "t".into() }),
+            method: "events.subscribe".into(),
+            params: serde_json::json!({}),
+        };
+        let outcome2 = crate::control::dispatch::dispatch_request(&state, &req2);
+        let handle2 = match outcome2 {
+            crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                handle,
+                ..
+            } => handle,
+            _ => panic!("attach2: expected EventsSubscribeStream"),
+        };
+        assert_eq!(
+            handle2.initial_snapshots.len(),
+            1,
+            "attach2 fresh subscribe must surface the active run",
+        );
+        let snap = &handle2.initial_snapshots[0];
+        assert_eq!(snap["run_id"], "wf_t21_reconnect");
+        assert_eq!(snap["active_role"], "reviewer");
+        assert_eq!(snap["iteration"], 2);
+        assert_eq!(
+            snap["history"].as_array().map(|a| a.len()),
+            Some(2),
+            "attach2 snapshot's history MUST contain the pre-disconnect \
+             transition — this is the slice 11f acceptance gate",
+        );
+
+        // Drive a wire-level acceptance loop too — sends the snapshot
+        // through the actual stream handler and reads the frame back.
+        // Pins that the in-process snapshot bundle survives the
+        // serialize→write→deserialize round-trip.
+        let (mut client, mut server) =
+            UnixStream::pair().expect("socket pair");
+        let join = std::thread::spawn(move || {
+            handle_events_subscribe_stream(&mut server, handle2);
+        });
+        let frame = read_one_frame(&mut client);
+        assert_eq!(frame.kind, StreamKind::WorkflowEventStateSnapshot);
+        assert_eq!(frame.payload["run_id"], "wf_t21_reconnect");
+        assert_eq!(frame.payload["active_role"], "reviewer");
+        drop(client);
+        let _ = join.join();
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// T22 (slice 11f) — multi-reconnect: 3 cycles of
+    /// subscribe-then-drop, each cycle's FIRST handle frame is
+    /// the snapshot. Pins that the per-subscribe disk-read
+    /// reliably surfaces the run across many reconnects (the
+    /// "killing the TUI repeatedly" stress case).
+    #[test]
+    fn t22_multi_reconnect_each_first_frame_is_snapshot() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+        use crate::workflow::run::{save, RoleBinding, WorkflowRun};
+
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()); }
+
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "claude".into(),
+                current_session_id: None,
+                daemon_session_uid: None,
+            },
+        );
+        let run = WorkflowRun::new(
+            "wf_t22_multi".into(),
+            "feedback".into(),
+            "/tmp/repo".into(),
+            roles,
+            "worker".into(),
+            std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
+            0,
+        );
+        save(&run).expect("save");
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        for cycle in 0..3 {
+            let req = Request {
+                id: format!("req-multi-{}", cycle),
+                caller: Caller::Operator(CallerOperator { token_id: "t".into() }),
+                method: "events.subscribe".into(),
+                params: serde_json::json!({}),
+            };
+            let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+            let handle = match outcome {
+                crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                    handle,
+                    ..
+                } => handle,
+                _ => panic!("cycle {}: expected EventsSubscribeStream", cycle),
+            };
+            assert_eq!(
+                handle.initial_snapshots.len(),
+                1,
+                "cycle {}: snapshot must surface the run",
+                cycle,
+            );
+            assert_eq!(
+                handle.initial_snapshots[0]["run_id"],
+                "wf_t22_multi",
+                "cycle {}: snapshot must be the seeded run",
+                cycle,
+            );
+            drop(handle);
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .workflow_event_watcher
+                    .subscriber_slot_count(),
+                0,
+                "cycle {}: handle drop must reap slot",
+                cycle,
+            );
+        }
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// T_reconnect_no_accumulation — repeated dispatch + drop
+    /// cycles do NOT accumulate subscriber slots. Mirror of
+    /// manifest.watch's T12-equivalent (subscription leak
+    /// guard). Drives 5 dispatch/drop cycles and asserts the
+    /// slot count returns to zero after each.
+    #[test]
+    fn events_subscribe_repeated_dispatch_cycles_do_not_accumulate_slots() {
+        use crate::control::protocol::{Caller, CallerOperator, Request};
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        for i in 0..5 {
+            let req = Request {
+                id: format!("req-reconnect-{}", i),
+                caller: Caller::Operator(CallerOperator {
+                    token_id: "t".into(),
+                }),
+                method: "events.subscribe".into(),
+                params: serde_json::json!({}),
+            };
+            let outcome = crate::control::dispatch::dispatch_request(&state, &req);
+            let handle = match outcome {
+                crate::control::dispatch::DispatchOutcome::EventsSubscribeStream {
+                    handle,
+                    ..
+                } => handle,
+                _ => panic!("iter {}: expected EventsSubscribeStream", i),
+            };
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .workflow_event_watcher
+                    .subscriber_slot_count(),
+                1,
+                "iter {}: subscribe should have produced one slot",
+                i,
+            );
+            drop(handle);
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .workflow_event_watcher
+                    .subscriber_slot_count(),
+                0,
+                "iter {}: handle drop must reap slot",
+                i,
+            );
+        }
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }
