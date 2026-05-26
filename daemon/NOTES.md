@@ -1200,6 +1200,515 @@ findings — which is the point of the feedback workflow.
   doc stands; ambiguity resolutions captured above are
   implementation defaults, not doc updates.
 
+## Phase 3: Multi-host + remote transport
+
+Phase 3 makes the daemon multi-host: the operator runs the TUI on
+their laptop and drives sessions on `cm-manager` (or a Mac mini, or
+any other remote host running `cm-daemon`). Phase 1+2 are the
+prerequisites — Phase 1 gave us a persistent host daemon worth
+talking to remotely; Phase 2 closed the file-system dependency
+that would otherwise have bound the TUI to the daemon's
+filesystem. Both shipped; this is the "remote transport + UX"
+arc that completes the original "persistent host" goal in
+`doc/persistent-host-daemon.md`.
+
+The design doc's Phase 3 section is the source of truth for what
+the user-visible behavior should be. This NOTES section captures
+the implementation defaults and slice sequence — the per-slice
+scope, acceptance, dependencies, and the ambiguity-resolutions
+the doc explicitly leaves to "Phase 3 itself."
+
+### Design ambiguities resolved (defaults baked into the slice plan)
+
+- **A1: Local-as-host uniform model.** `[[host]] name="local"
+  transport="unix" socket="~/.cm/daemon.sock" default=true` is the
+  baseline entry. The connection pool sees EVERY session through
+  one code path; there is no "no host" branch. When `hosts.toml`
+  doesn't exist or doesn't declare a default host, slice 12a's
+  loader synthesizes the local entry in memory so existing
+  single-user setups don't need a config file change to keep
+  working. Decision rationale: Phase 2 taught us vestigial
+  alternative paths (TuiLocal) become maintenance burden. Uniform
+  model = fewer branches forever; the only "no host" case is the
+  startup gap before App::new finishes, which doesn't reach any
+  RPC site.
+
+- **A2: SSH-unix transport ships first; TLS-TCP follows in a
+  separate sub-slice.** For a single-operator deployment SSH-unix
+  is operationally trivial — no certs, no firewall rule, no token
+  storage, no new dep. The daemon code is also unchanged: it keeps
+  listening on the same Unix socket; the TUI orchestrates
+  `ssh -L <local-path>:<remote-path>` and dials the local end.
+  TLS-TCP becomes slice 12h (post-acceptance) and adds the rustls
+  listener, `auth.hello` handshake, and `tls_fingerprint`
+  pinning. The TLS-TCP work is bounded; deferring it keeps the
+  initial Phase 3 acceptance reachable in fewer commits.
+
+- **A5 (reviewer round): Operator-token auth model per transport.**
+  Phase 1's `require_operator` gate validates `CM_OPERATOR_TOKEN`
+  on every daemon-only RPC. The local case worked because the TUI
+  spawns the daemon and writes the token file. A remote daemon
+  launched by systemd has no TUI to share state with — three
+  options were on the table:
+  (a) Disable the operator-token check entirely for Unix-listener
+      connections, on the rationale that filesystem perms /
+      SSH session ARE the trust boundary.
+  (b) Pre-share the token via `daemon.toml` (TUI reads from a
+      local config that mirrors the remote's). Brittle (drift
+      risk) and exposes the secret in two places.
+  (c) Defer the operator-token contract to slice 12h (TLS-TCP).
+      SSH-unix runs in "ssh-trust" mode (daemon's listen socket
+      bound to localhost on the remote host, operator-token check
+      off); TLS-TCP runs in "token" mode where `auth.hello`'s
+      token IS the operator credential.
+  **Decision: (c).** `daemon.toml` gains an `[auth]` section
+  with `mode = "ssh-trust"` or `mode = "token"`. The remote
+  daemon's listen socket binds 127.0.0.1 in ssh-trust mode (a
+  firewall rule belt-and-suspenders). The TUI never holds a
+  remote operator token until 12h; SSH-unix transport sends
+  any operator-tagged frame and the daemon accepts it under
+  ssh-trust mode. This keeps the SSH-unix path operationally
+  zero-secret while leaving a clean upgrade path to per-host
+  cryptographic auth in 12h.
+
+- **A3: VM prep is the LAST slice + the acceptance gate.** The
+  cm-manager VM prep work (instance sizing, disk resize, daemon
+  user, systemd unit, firewall, TLS cert, `CM_DAEMON_TOKEN`
+  storage, SSH key) is operational, not code. Doing it FIRST
+  would block code development on completed-but-untested
+  infrastructure. Doing it INTERLEAVED would mean partial prep
+  states that drift from the code. Doing it LAST — with code
+  developed against a local-second-daemon-via-SSH-unix-to-self
+  setup — keeps code velocity high and makes the prep work into
+  one focused gcloud session that doubles as the named acceptance
+  test on the real cm-manager.
+
+- **A4: HostId plumbing is sub-sliced.** Five distinct touches:
+  (i) `hosts.toml` schema + loader; (ii) `HostId` newtype +
+  manifest field with serde back-compat; (iii) connection pool
+  abstraction (still local-only); (iv) SSH-unix transport
+  implementation; (v) UX (`A-H` cycle, sidebar grouping). Phase 2
+  validated that small slices ship and review better.
+
+### Slice sequence
+
+#### Slice 12a — `~/.cm/hosts.toml` schema + loader
+
+Pure-config slice. No behavior change in the TUI's runtime path
+yet.
+
+- New `tui/src/hosts.rs` module:
+  - `HostId(String)` newtype with `#[serde(transparent)]`.
+  - `HostTransport` enum: `Unix { socket: PathBuf }`,
+    `SshUnix { ssh_host: String, ssh_user: Option<String>,
+    remote_socket: PathBuf }`. `TcpTls { ... }` is a placeholder
+    variant that errors at load with "not yet implemented — use
+    transport=ssh-unix for now" until slice 12h.
+  - `HostConfig { id: HostId, transport: HostTransport, default:
+    bool }`.
+  - `HostsConfig::load(path)` — reads `~/.cm/hosts.toml`. If the
+    file doesn't exist, returns the synthesized default
+    `{[{ id: "local", transport: Unix { socket:
+    cm_daemon::default_socket_path() }, default: true }]}` per A1.
+  - Validation: exactly one entry has `default=true`; entry names
+    are unique; no entry uses the reserved name `""`.
+- App::new loads `HostsConfig` and stashes it on `App`. Not yet
+  consumed by RPC sites.
+- Tests: load valid file (multi-host); load missing file
+  (synthesizes local); reject duplicate names; reject zero
+  defaults; reject multiple defaults; reject TcpTls with the
+  forward-compat error message.
+
+**Acceptance**: T_g3a_synthesized (no file → default-local
+entry); T_g3a_multi_host (real file with local + manager);
+T_g3a_validation_failures.
+
+**Dependencies**: none. Pure config layer.
+
+#### Slice 12b — `HostId` field on session-bearing types
+
+Adds the field everywhere a session is referenced in TUI state.
+Serde back-compat means pre-12 manifests load cleanly.
+
+- `ManifestEntry` gains `host_id: HostId` with `#[serde(default
+  = "default_local_host_id")]`.
+- `TerminalSession` gains `host_id: HostId`. Constructed from the
+  manifest entry on load; new sessions get the active host
+  (default = local at this slice — A-H lands in 12e).
+- All in-memory references to a session that need to be host-aware
+  (workspace bindings, workflow run participants, etc.) get the
+  same field with the same default.
+- App::new wires through: load manifest → fill missing host_id
+  from default → save back so the next read is no-op-default-free.
+- Save path: `serde::Serialize` emits the field; pre-12 files get
+  upgraded on first save.
+- Tests: load pre-12 manifest (host_id defaults to "local"),
+  save, reload, byte-stable; explicit host_id="manager" round-trips.
+
+**Acceptance**: T_g3b_pre_12_manifest_load; T_g3b_explicit_host_id;
+T_g3b_serde_byte_stable_after_upgrade.
+
+**Dependencies**: 12a (HostId type).
+
+#### Slice 12c — Per-host RPC connection pool (local-only)
+
+The load-bearing refactor. Once shipped, every RPC site is
+host-aware even though only one host exists.
+
+- New `tui/src/host_pool.rs` module:
+  - `HostPool { entries: HashMap<HostId, ConnectionHandle> }`.
+  - `ConnectionHandle` is a thin wrapper that knows how to dial
+    the host's socket (Unix today; SshUnix in 12d; TcpTls in 12h).
+  - `HostPool::for_host(&HostId) -> &ConnectionHandle`.
+  - Construction: walk `HostsConfig`, build one entry per host
+    with its transport-specific dialer.
+- Refactor every existing call site that dials
+  `cm_daemon::default_socket_path()` (or its equivalent) to route
+  through `app.host_pool.for_host(&session.host_id)`. Use grep to
+  find them all — primarily `tui/src/client_session.rs`,
+  `tui/src/manifest_watch.rs`, `tui/src/workflow_watch.rs`,
+  control RPC sites in `tui/src/control/methods.rs`.
+- This slice is INVISIBLE to the user — local-only behavior is
+  byte-identical to pre-12c (one host in the pool, default).
+- Tests: pool returns same handle across calls for the same
+  host_id; distinct host_ids get distinct handles; pool can be
+  constructed with synthetic configs.
+
+**Acceptance**: T_g3c_pool_per_host_id; T_g3c_local_behavior_byte_stable
+(integration-style: load a pre-12 manifest, drive a feedback workflow,
+assert events.jsonl SHAPE-compares — not strict byte-compare — to a
+pre-12c golden).
+
+**Reviewer round note on byte-compare**: events carry `ts: f64`
+from `now_unix_f64()`, so a strict byte-compare diverges on every
+run. Two options for the test:
+(i) Filter the `ts` field out of both sides before comparison
+    (jq-style normalization); compare the remaining fields
+    byte-for-byte.
+(ii) Inject a fake clock via the sub-2b-3 `TimeSource` pattern
+    (the existing test helper that overrides `now_unix_f64()`
+    behind an Arc) and assert strict byte equality.
+Lean (i): smaller change, no production code touched, and the
+operationally-meaningful invariant (every other field stable)
+is the one we actually want.
+
+**Dependencies**: 12a + 12b.
+
+#### Slice 12d — SSH-unix transport
+
+Lets the TUI dial a remote daemon over an SSH-tunneled Unix
+socket. Daemon side unchanged.
+
+- `ConnectionHandle::dial` for `HostTransport::SshUnix`:
+  - Compute a local tunnel path: `/tmp/cm-host-<name>.sock`.
+  - Spawn `ssh -N -L <local>:<remote_socket> [user@]<host>` as
+    a background child. Lifetime tied to the HostPool entry —
+    killed when the entry is dropped (TUI shutdown).
+  - Wait up to ~3s for the local socket to appear, then dial it.
+  - On reconnect (the SSH process exited): respawn; the
+    connection-retry path in existing consumers
+    (`workflow_watch::run_consumer`, etc.) handles the
+    re-dial naturally.
+
+**Reviewer round — SSH child lifecycle details that bite during
+operator triage:**
+
+- **Capture ssh stderr.** A bare "timed out after 3s waiting for
+  socket" message is hard to triage when the real cause is
+  "ssh: command not found", a misconfigured `~/.ssh/config`, an
+  unreachable host, or a missing remote socket. Tee ssh's stderr
+  to a per-host log buffer on the ConnectionHandle and surface
+  the last N lines in the timeout error.
+- **Unlink local socket on Drop.** `/tmp/cm-host-<name>.sock`
+  accumulates on TUI crash (or abrupt SIGKILL). Implement an
+  RAII guard on ConnectionHandle that `std::fs::remove_file`s
+  the local socket on drop, plus a startup-time
+  remove-stale-socket pass keyed by the host name. The startup
+  pass closes the crash-recovery gap that Drop can't.
+- **Lazy respawn on next `for_host` call, not mid-dial.** Phase 1's
+  reconnect pattern (`workflow_watch::run_consumer`'s outer loop)
+  retries with backoff against the same socket path. The
+  ConnectionHandle should DETECT a dead ssh child + dead local
+  socket, mark itself "needs respawn", and respawn on the NEXT
+  `for_host` call. Mid-dial respawn would block the current
+  consumer thread for ~3s waiting for the tunnel to re-establish;
+  letting the consumer's existing backoff loop handle it spreads
+  the wait across natural retry boundaries.
+- New `daemon.toml` field on the REMOTE daemon: nothing required
+  — the remote daemon is unchanged. The local daemon at
+  `~/.cm/daemon.sock` is unchanged too.
+- Tests: synthetic SSH-localhost-to-self setup via a dedicated
+  `ssh -L` tunnel against a known Unix socket; verify dial,
+  round-trip RPC, tunnel teardown on shutdown.
+
+**Acceptance**: T_g3d_ssh_localhost_tunnel (drive a `ping` RPC
+through SSH-tunneled local daemon); T_g3d_ssh_tunnel_dies_consumer_reconnects.
+
+**Dependencies**: 12c.
+
+#### Slice 12e — `A-H` keybind + sidebar host grouping
+
+UX polish. Lets the operator actually use the multi-host setup.
+
+- New `App.active_host: HostId` field, default = the host with
+  `default=true` in HostsConfig.
+- `A-H` keybind in Sessions view cycles through configured hosts
+  in HostsConfig order. Visible in the status bar / sidebar header.
+  **Reviewer round**: when HostsConfig has exactly one entry (the
+  synthesized local default — the common case for users who haven't
+  written a `hosts.toml`), `A-H` shows a status-bar hint
+  ("single host configured — add `~/.cm/hosts.toml` to enable
+  multi-host") rather than silently doing nothing. The
+  no-op-with-feedback shape avoids a "is the keybind broken?"
+  diagnostic round.
+- Session creation (`A-n` / `A-s` / `A-f`) sets the new session's
+  `host_id = active_host` at spawn time.
+- Sidebar rendering: when HostsConfig has >1 entry, group sessions
+  by host with a header per host. Single-host setups render
+  unchanged.
+- Per-existing-session host pinning: existing sessions stay on
+  their original host; `A-H` only affects new-session creation
+  (per design doc — "existing sessions stay pinned").
+- Tests: keybind cycles through hosts; new session inherits
+  active_host; sidebar grouping rendering snapshot for 1-host
+  and 2-host configs.
+
+**Acceptance**: T_g3e_active_host_cycle; T_g3e_new_session_inherits;
+T_g3e_sidebar_groups_per_host.
+
+**Dependencies**: 12c (so spawned sessions have somewhere to dial).
+
+#### Slice 12f — Remote-host packaging (daemon side)
+
+Adds the daemon-side env injection and `daemon.toml` schema that
+a remote daemon needs to spawn sessions correctly.
+
+- New `daemon/daemon.toml` schema (loaded by `cm-daemon` at
+  startup):
+  ```toml
+  mcp_server_path = "/opt/cm-daemon/mcp_server/server.py"
+  api_url = "http://localhost:8000"  # or wherever the planning
+                                     # API lives from the daemon's
+                                     # perspective
+  api_token = "..."
+  log_path = "/var/log/cm-daemon.log"
+  workflows_dir = "/opt/cm-daemon/workflows/"
+
+  [auth]
+  # A5 (reviewer round): per-transport auth model.
+  #   "ssh-trust" — SSH session IS the auth boundary; daemon
+  #     accepts any Operator-tagged frame on connections from
+  #     its listen socket. Listen socket binds 127.0.0.1
+  #     (or remains a Unix socket) so only SSH-tunneled
+  #     traffic can reach it. Used by slice 12d.
+  #   "token" — `auth.hello` frame required as the first frame
+  #     after TLS handshake completes. Token compared in
+  #     constant time against `CM_DAEMON_TOKEN`. Used by
+  #     slice 12h.
+  mode = "ssh-trust"
+  ```
+- **Reviewer round — `daemon.toml` permissions.** The file
+  contains `api_token` and (in 12h) potentially the
+  `CM_DAEMON_TOKEN` reference. Enforce 0o600 owned by the
+  daemon user. Mirror Phase 1's `/etc/cm-daemon/token` model:
+  daemon refuses to start if `daemon.toml` is world-readable
+  AND contains an `api_token` value (loud-fail rather than
+  silent leak). Validation lives in the loader; tested.
+- Daemon-side spawn path injects into every agent process env
+  (per design doc Phase 3 "Daemon-side env injection"):
+  `CM_TUI_SOCKET` (daemon socket), `CM_TUI_SESSION_ID`,
+  `CM_DAEMON_SOCKET` (= same as tui-socket-at-daemon-host;
+  needed for per-method routing per DAEMON_METHODS),
+  `CM_MCP_SERVER` (resolved from daemon.toml),
+  `CM_API_URL` / `CM_API_TOKEN` (so `propose_task` etc. reach
+  planning from a remote daemon — these come from the daemon's
+  config, NOT from the TUI's env), `CM_WORKFLOW_RUN_ID` and
+  `CM_ROLE` for workflow participants.
+- `tui/src/workflow/spawn.rs` (and equivalents) check
+  `CM_MCP_SERVER` before falling back to workflows-dir-relative
+  paths — verify this is already in place or add it.
+- Tests: daemon.toml round-trip; env-injection contains all
+  expected vars; missing daemon.toml falls back to today's
+  inline defaults (so the local daemon doesn't need a config
+  file change).
+
+**Acceptance**: T_g3f_daemon_config_load; T_g3f_env_injection_complete.
+
+**Dependencies**: 12c (the daemon needs to know its own config
+shape before remote spawns happen).
+
+#### Slice 12g — cm-manager VM prep + named A_smoke acceptance gate
+
+Operational + final acceptance. The named Phase 3 acceptance from
+the design doc lands here.
+
+**Operational checklist (run on cm-manager, recorded in the PR
+description as reproducible gcloud commands):**
+
+- Instance sizing: bump cm-manager to at least `e2-standard-4`
+  (4 vCPU, 16 GB). Reversible.
+- Disk: resize boot disk to ~200 GB (or mount a separate disk at
+  `~/.cm/` — pick during the slice).
+- Daemon user: reuse `lucas` or provision dedicated `cm` user.
+  Document which.
+- Install daemon binary at `/opt/cm-daemon/cm-daemon` (Linux
+  release build).
+- Install `mcp_server/` Python package at
+  `/opt/cm-daemon/mcp_server/`.
+- **Reviewer round — Python toolchain decision.** The mcp_server
+  package has its own `pyproject.toml` deps. Default: install
+  `uv` system-wide, run `uv sync --project /opt/cm-daemon/mcp_server`
+  to create a project-local venv at
+  `/opt/cm-daemon/mcp_server/.venv/`. `CM_MCP_SERVER` points at
+  `/opt/cm-daemon/mcp_server/server.py` and the daemon's spawn
+  path invokes it via `/opt/cm-daemon/mcp_server/.venv/bin/python`.
+  Alternatives considered (system Python with `--break-system-packages`;
+  shared venv at `/opt/cm-daemon/venv/`) — both flunk on
+  reproducibility or on letting the mcp_server's pyproject.toml
+  be the lock source of truth.
+- **Reviewer round — claude + codex CLI binaries.** The daemon
+  spawns these in every workflow session. `claude` is npm-packaged
+  (`npm install -g @anthropic-ai/claude-code` on the VM); `codex`
+  is rust-distributed (`cargo install codex-cli` or its
+  pre-built release if Codex publishes one). Decide DURING 12g
+  whether the install path is npm-global + cargo-global, or
+  per-user via `~/.local/bin`. Document the choice in the PR.
+- Install `workflows/` at `/opt/cm-daemon/workflows/`.
+- Generate `CM_DAEMON_TOKEN` (`openssl rand -hex 32 >
+  /etc/cm-daemon/token`, mode 0600, owned by daemon user) — used
+  by SSH-unix path for symmetry with future TLS-TCP, even though
+  SSH-unix doesn't need it for auth (SSH session IS the auth).
+  Decision: defer the token to slice 12h (TLS-TCP) — SSH-unix
+  doesn't need it.
+- Confirm operator's SSH key is in `~/.ssh/authorized_keys` for
+  the daemon user.
+- Install systemd unit `/etc/systemd/system/cm-daemon.service`,
+  `Restart=always`. EnvironmentFile / Environment block carrying
+  the daemon.toml-referenced paths.
+- Start the service; confirm `systemctl status cm-daemon` clean.
+- Operator's `~/.cm/hosts.toml` adds:
+  ```toml
+  [[host]]
+  name = "manager"
+  transport = "ssh-unix"
+  ssh_host = "cm-manager"  # via gcloud SSH config alias
+  remote_socket = "/home/<daemon-user>/.cm/daemon.sock"
+  ```
+
+**Named A_smoke acceptance (from design doc Phase 3 §"Acceptance
+criteria"):**
+
+- Operator with `[[host]] name = "manager"` in `~/.cm/hosts.toml`
+  runs the TUI on their laptop, switches to that host via `A-H`,
+  creates a session with `A-n`, attaches with `A-a`, drives a
+  feedback-mode workflow end-to-end, kills the session.
+- Closes the TUI and reopens — the remote session is still
+  running and reattaches without state loss (modulo ring-buffer
+  overflow).
+- An agent inside a remote-host session calls `propose_task` and
+  the task appears in the planning view (host-independent
+  planning).
+- SSH-unix transport works against the real cm-manager.
+
+**Documentation:**
+
+- Update `CLAUDE.md`'s "Cloud mode" section to describe the
+  host-daemon model.
+- Update the "the MCP server runs locally on user machines
+  (cm-manager has no `mcp_server/` directory)" claim to reflect
+  the new deployment.
+
+**Dependencies**: 12d + 12e + 12f.
+
+#### Slice 12h — TLS-TCP transport (follow-up)
+
+Adds the "real" answer to remote transport for users who don't
+want to manage SSH tunnels. Lands after 12g's acceptance is met,
+so the host-abstraction skeleton is known-good before the
+crypto layer is added.
+
+- Daemon-side: rustls TCP listener bound per `daemon.toml`
+  `[tls]` section (`cert_path`, `key_path`, `listen_addr`).
+- `auth.hello` JSON-RPC frame on the daemon: first frame after
+  TLS handshake must be `auth.hello` with the configured
+  `CM_DAEMON_TOKEN`; otherwise close connection.
+- TUI-side: `HostTransport::TcpTls { addr, tls_fingerprint,
+  auth_env }` becomes a real variant (was a placeholder error in
+  12a). Dialer connects, completes TLS, pins the cert SHA-256
+  fingerprint, sends `auth.hello`.
+- VM prep additions: self-signed TLS cert generation, firewall
+  rule `tcp:8443` scoped to operator IP (NOT `0.0.0.0/0`), token
+  generation per slice 12g's deferred item.
+- Tests: cert-fingerprint mismatch surfaces a clear error;
+  auth.hello with wrong token gets Unauthorized + close;
+  legitimate handshake works end-to-end against a
+  rustls-test-server.
+
+**Acceptance**: T_g3h_tls_handshake_ok; T_g3h_fingerprint_mismatch_clear_error;
+T_g3h_auth_hello_required_first; T_g3h_wrong_token_unauthorized.
+Plus a manual run of the design doc's Phase 3 acceptance
+criteria against the TLS transport (mirror of 12g's smoke).
+
+**Dependencies**: 12g (host abstraction known-good against
+real cm-manager via SSH-unix first).
+
+### Phase 2 follow-ups absorbed vs. deferred
+
+- **Absorbed into Phase 3**: none. Phase 2's deferred items (the
+  rejected-findings stash auto-cleanup, the
+  WorkflowEventsWriter's torn-record handling above PIPE_BUF, etc.)
+  are orthogonal to multi-host transport.
+- **New: events.jsonl byte-compare A_durability** — Phase 2's
+  manual A_durability gate is folded into slice 12c's
+  T_g3c_local_behavior_byte_stable test, which drives a feedback
+  workflow under the new host pool and asserts the daemon-side
+  write path is byte-identical to a pre-12c golden. This catches
+  any inadvertent host-pool refactor regression on the
+  daemon-write side.
+
+### Estimated commit count
+
+- 12a: 1 commit (config layer).
+- 12b: 1-2 commits (manifest field + serde back-compat tests).
+- 12c: 2-3 commits (refactor + every call site + integration test).
+- 12d: 1-2 commits (SSH-unix dialer + reconnect tests).
+- 12e: 1 commit (UX).
+- 12f: 1-2 commits (daemon.toml + env injection).
+- 12g: 1-2 commits (VM prep PR + CLAUDE.md doc updates).
+- 12h: 2-3 commits (rustls listener + TUI dialer + tests).
+
+Total estimate: 15-25 commits (reviewer-round adjustment from
+the original 10-16). Phase 2 ran 60+ commits with extensive
+review rounds and a mid-arc TuiLocal deletion. Phase 3 has no
+mid-flight rearchitecture analogous to Phase 2's events_offset
+retirement, but two real upper-bound risks:
+- **12c is a wide-surface refactor.** Every TUI call site that
+  dials a daemon socket gets re-routed through the host pool.
+  Phase 1's relocation work taught us that wide refactors land
+  in 4-8 commits, not 2-3.
+- **12g surfaces operational issues that aren't predictable
+  from code review.** "First real cm-manager VM run" routinely
+  uncovers gaps (missing system packages, AppArmor / SELinux
+  rules, gcloud IAM, etc.) that add commits which weren't
+  visible from the plan.
+The 15-25 range bakes in those failure modes; 25+ would be a
+defeat worth pausing for re-scoping. Phase 2's 60+ is the
+out-of-bounds warning sign for "review rounds got away from us
+— rethink the slice boundaries."
+
+### What this Phase 3 plan is NOT
+
+- A spec for `daemon.toml`'s exact wire-level TOML schema beyond
+  the per-slice sketches — that lives in each slice's PR.
+- A decision on a third transport (mTLS, QUIC, etc.). The
+  hosts.toml `transport` field is open-ended, but Phase 3 ships
+  only SSH-unix (12d) and TLS-TCP (12h). Adding a third
+  transport is a future slice that extends the enum.
+- A revision to `doc/persistent-host-daemon.md`. The design
+  doc stands; ambiguity resolutions captured above are
+  implementation defaults, not doc updates. (Q4 stability
+  invariant carried forward from Phase 1+2.)
+
 ## Future work
 
 - **Socket-close cancellation for `mcp_start_session` slot wait** (sub-2b-3 review-9): the bounded 20s wait closes the orphan-on-client-timeout bug, but the cleaner shape is to abort the wait when the client socket closes. The daemon's current RPC framework (synchronous per-connection threads, blocking reads) doesn't expose a "client disconnected" signal during a blocking wait; wiring it would require either an async runtime or a peer-poll thread. Deferred — the bounded wait alone is sufficient for the named acceptance criterion.
