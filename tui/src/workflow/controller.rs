@@ -785,14 +785,21 @@ impl<'a> WorkflowControllerCtx<'a> {
             run_id,
             role: role_name,
         };
-        // Workflow respawns are TUI-local (slice 10c-e-3a per-spawn
-        // routing). They have no daemon-side equivalent in Phase 1;
-        // the workflow control plane lives in `~/.cm/workflow-runs/`
-        // which the daemon doesn't manage. MCP calls from a
-        // workflow participant (e.g. `workflow_transition`) must
-        // reach the TUI socket, not the daemon — pinning explicitly.
+        // Phase 2 (slice 10d-2b) relocated `workflow_transition` /
+        // `workflow_done` to daemon dispatch; 11e added
+        // `workflow_reject_finding`. The TUI's MCP socket no longer
+        // handles any of them. A workflow participant spawned with
+        // `SpawnTarget::TuiLocal` gets `CM_DAEMON_SOCKET=""`, so the
+        // Python resolver routes daemon-listed methods through to
+        // the TUI socket — which returns `unknown_method` since the
+        // handlers moved. Caught by the Phase 2 A_smoke gate when
+        // the manager couldn't call `workflow_done`. Spawning as
+        // `SpawnTarget::Daemon` populates both sockets; the Python
+        // resolver then routes workflow_* methods to the daemon
+        // (per `DAEMON_METHODS`) where the post-Phase-2 handlers
+        // live, and non-workflow methods continue to reach the TUI.
         let (program, args) = match crate::mcp_config::build_args(
-            crate::mcp_config::SpawnTarget::TuiLocal,
+            crate::mcp_config::SpawnTarget::Daemon,
             engine,
             &session_uid,
             Some(workflow_meta),
