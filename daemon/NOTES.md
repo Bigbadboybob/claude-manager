@@ -1292,7 +1292,7 @@ the doc explicitly leaves to "Phase 3 itself."
 
 ### Slice sequence
 
-#### Slice 12a — `~/.cm/hosts.toml` schema + loader
+### Phase 12a: `~/.cm/hosts.toml` schema + loader
 
 Pure-config slice. No behavior change in the TUI's runtime path
 yet.
@@ -1325,7 +1325,7 @@ T_g3a_validation_failures.
 
 **Dependencies**: none. Pure config layer.
 
-#### Slice 12b — `HostId` field on session-bearing types
+### Phase 12b: `HostId` field on session-bearing types
 
 Adds the field everywhere a session is referenced in TUI state.
 Serde back-compat means pre-12 manifests load cleanly.
@@ -1350,7 +1350,7 @@ T_g3b_serde_byte_stable_after_upgrade.
 
 **Dependencies**: 12a (HostId type).
 
-#### Slice 12c — Per-host RPC connection pool (local-only)
+### Phase 12c: Per-host RPC connection pool (local-only)
 
 The load-bearing refactor. Once shipped, every RPC site is
 host-aware even though only one host exists.
@@ -1394,7 +1394,7 @@ is the one we actually want.
 
 **Dependencies**: 12a + 12b.
 
-#### Slice 12d — SSH-unix transport
+### Phase 12d: SSH-unix transport
 
 Lets the TUI dial a remote daemon over an SSH-tunneled Unix
 socket. Daemon side unchanged.
@@ -1446,7 +1446,7 @@ through SSH-tunneled local daemon); T_g3d_ssh_tunnel_dies_consumer_reconnects.
 
 **Dependencies**: 12c.
 
-#### Slice 12e — `A-H` keybind + sidebar host grouping
+### Phase 12e: `A-H` keybind + sidebar host grouping
 
 UX polish. Lets the operator actually use the multi-host setup.
 
@@ -1478,7 +1478,7 @@ T_g3e_sidebar_groups_per_host.
 
 **Dependencies**: 12c (so spawned sessions have somewhere to dial).
 
-#### Slice 12f — Remote-host packaging (daemon side)
+### Phase 12f: Remote-host packaging (daemon side)
 
 Adds the daemon-side env injection and `daemon.toml` schema that
 a remote daemon needs to spawn sessions correctly.
@@ -1537,7 +1537,7 @@ a remote daemon needs to spawn sessions correctly.
 **Dependencies**: 12c (the daemon needs to know its own config
 shape before remote spawns happen).
 
-#### Slice 12g — cm-manager VM prep + named A_smoke acceptance gate
+### Phase 12g: cm-manager VM prep + named A_smoke acceptance gate
 
 Operational + final acceptance. The named Phase 3 acceptance from
 the design doc lands here.
@@ -1620,7 +1620,7 @@ criteria"):**
 
 **Dependencies**: 12d + 12e + 12f.
 
-#### Slice 12h — TLS-TCP transport (follow-up)
+### Phase 12h: TLS-TCP transport (follow-up)
 
 Adds the "real" answer to remote transport for users who don't
 want to manage SSH tunnels. Lands after 12g's acceptance is met,
