@@ -666,26 +666,47 @@ Each slice leaves the tree green. The architecture closely
 mirrors 10e (manifest.watch), so most slices have a Phase 1
 analog and should compress vs. their 10e counterparts.
 
-#### Slice 11a — Daemon-side broadcaster on `events::read_new`
+#### Slice 11a — Daemon-side `WorkflowEventWatcher` broadcaster
 
-Mirror of 10e-b's `ManifestWatcher`. Add a broadcaster wrapper
-around the existing `daemon/src/workflow/events.rs::read_new`
-loop in the daemon's poller. Each tick's parsed `Event` goes
-to both the existing in-daemon dispatch AND a fan-out broadcast
-to all subscribers (`sync_channel(N)` + `try_send` + `retain`
-for slow-subscriber drop, same shape as `ManifestWatcher`).
+Mirror of 10e-b's `ManifestWatcher`. Hook a broadcaster into
+the daemon's event-write funnel so every persisted event
+fans out to subscribers in addition to landing on disk.
+`sync_channel(N)` + `try_send` + `retain` for slow-subscriber
+drop — same shape as `ManifestWatcher`.
 
-- New type: `WorkflowEventWatcher` in `daemon/src/workflow/`
-  with `subscribe()` returning `(Receiver<WorkflowEvent>, SubscriptionGuard)`.
+- New type: `WorkflowEventWatcher` in `daemon/src/workflow/events.rs`
+  (alongside the writer it broadcasts after) with
+  `subscribe()` returning `(Receiver<Event>, SubscriptionGuard)`.
 - Wire into `daemon/src/state.rs::DaemonState`.
-- The poller's existing tick callbacks invoke
-  `state.workflow_event_watcher.broadcast(event)` after the
-  in-daemon dispatch settles.
+- **Broadcast point**: `append_event_with_retry` in
+  `daemon/src/control/methods.rs`, AFTER successful
+  `WorkflowEventsWriter::append_event`. Single funnel; every
+  caller (`dispatch_workflow_transition`,
+  `dispatch_workflow_done`, `workflow_reject_finding`, and the
+  daemon poller's `fire_static_transition` which routes
+  through `dispatch_workflow_transition`) goes through this
+  one path. Earlier draft suggested the poller's tick
+  callbacks — the audit caught that the actual single funnel
+  is the retry wrapper, since the poller writes via
+  `workflow_transition` not directly.
+- Durability invariant: broadcast AFTER disk-write success.
+  Subscriber-observed event ≡ disk-persisted event.
+- `append_event_with_retry` signature gains a thin
+  `&Arc<WorkflowEventWatcher>` parameter (broadcaster clone,
+  not the full `DaemonState` lock). Callers pre-clone from
+  state.
 
-**Acceptance**: T1 — one subscriber sees every event the poller
-processes, in order. T2 — slow subscriber is dropped without
-blocking the broadcast. T3 — concurrent broadcasts all delivered.
-T4 — RAII guard drops slot on receiver drop.
+**Acceptance**: T1 — one subscriber sees one event after a
+successful append. T2 — failed append (write error) does NOT
+broadcast. T3 — slow subscriber dropped without blocking
+broadcast loop. T4 — RAII guard reaps slot on receiver drop.
+T5 — concurrent broadcasts all delivered. T6 — subscribe AFTER
+broadcast does not replay (no buffer). T_order — three
+distinct events appended sequentially arrive in append-order
+on the subscriber. Pins ordering as its own invariant so a
+future parallel-broadcast regression surfaces immediately
+(T1 implicitly covers single-event order; T_order makes the
+multi-event sequence explicit).
 
 **Dependencies**: Phase 1 (already shipped).
 
