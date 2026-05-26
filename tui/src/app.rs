@@ -2644,6 +2644,13 @@ pub struct App {
     /// (defensive: covers test-paths that reuse uids; not
     /// required for production correctness).
     pub cap_kill_toasted: std::collections::HashSet<String>,
+    /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
+    /// local-default when the file is missing (A1 in the Phase 3
+    /// plan). No consumer yet — 12b adds the field to manifest
+    /// entries; 12c wires the connection pool; the load happens
+    /// here so a malformed config file surfaces at App::new
+    /// rather than at first RPC.
+    pub hosts: crate::hosts::HostsConfig,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -2748,6 +2755,36 @@ impl App {
         // delivers WorkflowEvent broadcasts to the main loop.
         let (workflow_watch_rx, _workflow_watch_thread) =
             crate::workflow_watch::maybe_spawn_for_app();
+        // 12a (Phase 3): load `~/.cm/hosts.toml`. Synthesizes the
+        // local-default entry when the file is missing (the common
+        // case for users who haven't opted into multi-host).
+        // Load failures (malformed TOML, validation errors) print
+        // to stderr and fall through to the synthesized default so
+        // the TUI still launches — the operator can fix the file
+        // and restart. No RPC consumer yet (12c wires that).
+        //
+        // Reviewer-round (12a): the fallback uses
+        // `HostsConfig::synthesized_local_default()` directly — a
+        // pure constructor with no filesystem touch — rather than
+        // re-loading from a sentinel path. The old shape used
+        // `/dev/null/hosts.toml-nonexistent` as the "missing"
+        // sentinel, but opening a child path of `/dev/null` returns
+        // `NotADirectory`, not `NotFound`, so the sentinel hit the
+        // I/O-error branch and the `.expect` panicked — exactly
+        // the lockout we were trying to prevent.
+        let hosts = match crate::hosts::HostsConfig::load(
+            &crate::hosts::default_path(),
+        ) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: hosts.toml load failed: {} — \
+                     falling back to synthesized local default",
+                    e,
+                );
+                crate::hosts::HostsConfig::synthesized_local_default()
+            }
+        };
 
         App {
             tasks: Vec::new(),
@@ -2787,6 +2824,7 @@ impl App {
             _workflow_watch_thread,
             pending_workflow_events: HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
+            hosts,
         }
     }
 
@@ -14236,6 +14274,105 @@ mod pending_workflow_events_tests {
             app.needs_redraw,
             "drain must set needs_redraw on each Event",
         );
+    }
+}
+
+/// 12a reviewer round: `App::new` falls back to
+/// `HostsConfig::synthesized_local_default()` when the on-disk
+/// `~/.cm/hosts.toml` is malformed. Pre-fix the fallback re-loaded
+/// from `/dev/null/hosts.toml-nonexistent` and `.expect`ed
+/// success; on Unix that sentinel path returns `NotADirectory`
+/// rather than `NotFound`, so the `.expect` panicked and locked
+/// the operator out of the TUI for any malformed config — the
+/// exact failure mode the fallback was supposed to prevent.
+#[cfg(test)]
+mod hosts_malformed_fallback_tests {
+    use super::*;
+
+    /// Drive `App::new` with garbage at `~/.cm/hosts.toml`.
+    /// Pre-fix this panics inside the fallback's `.expect`.
+    /// Post-fix the synthesized-default constructor is
+    /// infallible-by-construction and `app.hosts` ends up
+    /// with the single local entry.
+    #[test]
+    fn malformed_hosts_toml_falls_back_without_panic() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).expect("mkdir .cm");
+        std::fs::write(
+            cm_dir.join("hosts.toml"),
+            b"this is not valid toml = = =",
+        )
+        .expect("write malformed hosts.toml");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        // The point of the test: `App::new` must NOT panic on a
+        // malformed hosts.toml. Pre-reviewer-round-fix the
+        // sentinel-path fallback's `.expect("synthesized-default
+        // load is infallible")` panicked here because
+        // `HostsConfig::load("/dev/null/hosts.toml-nonexistent")`
+        // returned `Err(Error::Io(NotADirectory))` on Unix —
+        // `/dev/null` is a device file, not a directory.
+        let app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Capture the expected socket path WHILE $HOME is still
+        // the tempdir — `cm_daemon::default_socket_path()` reads
+        // $HOME at call time, so restoring HOME first would
+        // resolve a different path than the one baked into
+        // `app.hosts` during App::new.
+        let expected_socket = cm_daemon::default_socket_path();
+
+        if let Some(h) = orig_home {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        // Leak the tempdir so daemon-watch threads spawned with the
+        // test HOME don't error on later ~/.cm accesses.
+        std::mem::forget(tmp);
+
+        // The fallback produced the synthesized local default:
+        // one entry, id="local", marked default=true, Unix
+        // transport pointing at the canonical daemon socket.
+        assert_eq!(
+            app.hosts.hosts.len(),
+            1,
+            "fallback should synthesize a single local entry",
+        );
+        let entry = &app.hosts.hosts[0];
+        assert_eq!(entry.id, crate::hosts::HostId::local());
+        assert!(
+            entry.default,
+            "synthesized entry must be the default",
+        );
+        match &entry.transport {
+            crate::hosts::HostTransport::Unix { socket } => {
+                assert_eq!(
+                    socket,
+                    &expected_socket,
+                    "synthesized socket must match \
+                     cm_daemon::default_socket_path() resolved \
+                     under the test HOME",
+                );
+            }
+            other => panic!(
+                "expected Unix transport, got {:?}",
+                other,
+            ),
+        }
     }
 }
 

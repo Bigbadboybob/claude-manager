@@ -8,6 +8,7 @@ mod client_session;
 mod config;
 mod control;
 mod daemon_launch;
+mod hosts;
 mod input;
 mod manifest_watch;
 mod mcp_config;
