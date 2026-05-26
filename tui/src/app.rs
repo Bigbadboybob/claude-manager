@@ -2801,15 +2801,52 @@ impl App {
         // pre-12c because the pool's local-host entry holds
         // exactly that path (verified by
         // `host_pool::tests::synthesized_default_pool_local_path_matches_daemon_default`).
-        let host_pool = crate::host_pool::HostPool::from_config(&hosts);
+        let host_pool = crate::host_pool::HostPool::from_config(&hosts)
+            .unwrap_or_else(|e| {
+                // build_handle errors only on tunnel-dir
+                // resolution failure (Finding 1 fix). At App::new
+                // we don't have a non-fatal recovery path, but
+                // App::new isn't fallible — fall back to the
+                // synthesized local default so the TUI still
+                // starts. The error message tells the operator
+                // what to fix.
+                eprintln!(
+                    "cm-tui: HostPool::from_config failed: {} — \
+                     falling back to local-only default",
+                    e,
+                );
+                let local = crate::hosts::HostsConfig::synthesized_local_default();
+                crate::host_pool::HostPool::from_config(&local)
+                    .expect("local-only default is infallible (no ssh hosts)")
+            });
         // The watch-consumer threads dial the default host (12c
         // only has one host; 12e adds the per-session-host
         // routing UX). Pre-12c these read
         // `cm_daemon::default_socket_path()` directly inside
         // `maybe_spawn_for_app`; the path is now passed in so
         // the consumer threads stay in lockstep with the pool.
-        let watch_socket_path =
-            host_pool.default_handle().socket_path().to_path_buf();
+        //
+        // 12d-r2: default_handle() now returns Result; on spawn
+        // failure we still need a path for the consumer threads
+        // to dial (they retry-loop, so they'll surface the
+        // failure via reconnect attempts). Fall back to the
+        // daemon's canonical local socket path so the consumer
+        // threads at least target the right place if the SSH
+        // tunnel is going to be the default but failed to come
+        // up at startup — operator sees the eprintln + the
+        // ssh-down loop reconnect log lines.
+        let watch_socket_path = match host_pool.default_handle() {
+            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: default host_pool handle unavailable \
+                     at App::new: {} — consumer threads will dial \
+                     the local default and retry",
+                    e,
+                );
+                cm_daemon::default_socket_path()
+            }
+        };
         // 10e-c: spawn the manifest.watch consumer. Without
         // daemon there's no manifest to subscribe to; spawning
         // a consumer that tight-loops trying to dial a non-
@@ -3036,11 +3073,18 @@ impl App {
         // 12c: route through the host pool. For 12c every
         // session is local; 12e ("A-H cycles active host")
         // will switch this to `self.host_pool.for_host(&ts.host_id)`.
-        let daemon_socket = self
-            .host_pool
-            .default_handle()
-            .socket_path()
-            .to_path_buf();
+        // 12d-r2: surface SSH-spawn errors directly to the
+        // caller via Result rather than masking them as a
+        // downstream connect failure.
+        let daemon_socket = match self.host_pool.default_handle() {
+            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+            Err(e) => {
+                return Some(Err(anyhow::anyhow!(
+                    "default host_pool handle unavailable: {}",
+                    e
+                )));
+            }
+        };
         // Memory-cap wire fields (slice 10c-e-3b-fix2). When
         // `memory_cap` is Some, the soft byte count signals the
         // daemon to populate `SpawnParams.kills_dir`, and the
@@ -8012,11 +8056,20 @@ impl App {
         // the full session snapshot goes to the default host
         // (local in 12c; future multi-host shape may need to
         // partition by host and push per-daemon).
-        let daemon_socket = self
-            .host_pool
-            .default_handle()
-            .socket_path()
-            .to_path_buf();
+        // 12d-r2: bail early with the SSH-spawn error rather
+        // than dialing a stale path that yields a generic
+        // socket-connect failure.
+        let daemon_socket = match self.host_pool.default_handle() {
+            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: tui.update_sessions_snapshot skipped: \
+                     default host_pool handle unavailable: {}",
+                    e,
+                );
+                return;
+            }
+        };
         if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
@@ -8091,11 +8144,19 @@ impl App {
         // are a per-host concept (the daemon caches them for
         // its own workflow runs); push to the default host
         // here. Future multi-host shape would push per-host.
-        let daemon_socket = self
-            .host_pool
-            .default_handle()
-            .socket_path()
-            .to_path_buf();
+        // 12d-r2: bail early on SSH-spawn failure so the
+        // operator sees the actual cause.
+        let daemon_socket = match self.host_pool.default_handle() {
+            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: workflow.update_definitions skipped: \
+                     default host_pool handle unavailable: {}",
+                    e,
+                );
+                return;
+            }
+        };
         if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
@@ -8144,11 +8205,18 @@ impl App {
         // the full task hierarchy to the default host. Multi-
         // host planning isn't a concept (planning is the FastAPI
         // server's domain); every daemon gets the same view.
-        let daemon_socket = self
-            .host_pool
-            .default_handle()
-            .socket_path()
-            .to_path_buf();
+        // 12d-r2: bail early on SSH-spawn failure.
+        let daemon_socket = match self.host_pool.default_handle() {
+            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: task.update_tree skipped: \
+                     default host_pool handle unavailable: {}",
+                    e,
+                );
+                return;
+            }
+        };
         if let Err(e) = crate::client_session::rpc_task_update_tree(
             &daemon_socket,
             crate::daemon_launch::operator_token(),

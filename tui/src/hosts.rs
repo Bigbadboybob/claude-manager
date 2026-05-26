@@ -235,6 +235,17 @@ impl HostsConfig {
             }
         }
 
+        // Round 3 F3: filename-safe host-name validation. The
+        // host name becomes a substring of the per-spawn
+        // tunnel socket path (`<dir>/cm-host-<name>-<rnd>.sock`),
+        // so `name = "../bogus"` would escape the tunnel dir
+        // and `name = "prod/us"` would nest into a non-existent
+        // subdir. Strict allow-list: `[A-Za-z0-9._-]+`,
+        // ≤64 chars, no leading dot, no `..` substring.
+        for h in &self.hosts {
+            validate_host_name(&h.id.0)?;
+        }
+
         // Duplicate names. Case-sensitive — `Local` and `local`
         // count as distinct. Surface ALL collisions in the error
         // (not just the first) so the user fixes them in one pass.
@@ -276,6 +287,50 @@ impl HostsConfig {
     }
 }
 
+/// Round 3 F3: enforce that a host name is a filename-safe token
+/// suitable to embed in a path component. The tunnel socket
+/// path is `<tunnel_dir>/cm-host-<name>-<random>.sock`; a
+/// name with `/`, `..`, or other path separators would either
+/// nest into a subdir we don't own or escape the tunnel dir
+/// entirely.
+///
+/// Allowed: `[A-Za-z0-9._-]+`, 1..=64 chars, no leading dot,
+/// no `..` substring. Practical examples that pass: `local`,
+/// `cm-manager`, `prod_us.dev`, `worker-01`. Examples that
+/// fail: `prod/us` (slash), `..` (dot-dot), `.hidden` (leading
+/// dot), the empty string (handled separately upstream).
+fn validate_host_name(name: &str) -> Result<(), Error> {
+    if name.len() > 64 {
+        return Err(Error::InvalidHostName {
+            name: name.to_string(),
+            reason: "name exceeds 64 characters",
+        });
+    }
+    if name.starts_with('.') {
+        return Err(Error::InvalidHostName {
+            name: name.to_string(),
+            reason: "name must not start with `.` (would be a hidden file in the tunnel dir)",
+        });
+    }
+    if name.contains("..") {
+        return Err(Error::InvalidHostName {
+            name: name.to_string(),
+            reason: "name must not contain `..` (parent-directory traversal)",
+        });
+    }
+    for c in name.chars() {
+        let allowed = c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+        if !allowed {
+            return Err(Error::InvalidHostName {
+                name: name.to_string(),
+                reason: "name must match [A-Za-z0-9._-]+ (slashes, backslashes, \
+                         whitespace, and non-ASCII are not allowed)",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Wire-level deserialization wrapper. `[[host]]` in TOML becomes
 /// a `Vec<HostConfig>` field named `host` (singular, matching the
 /// TOML array name). Not exposed publicly — consumers see
@@ -312,6 +367,14 @@ pub enum Error {
     /// SSH-unix ships first; TLS-TCP lands in slice 12h. The
     /// message names the workaround.
     TlsNotImplemented(String),
+    /// Round 3 F3: host name failed the filename-safe regex.
+    /// `reason` is a short human-readable string naming the
+    /// specific rule that was violated (length, leading dot,
+    /// `..`, invalid char).
+    InvalidHostName {
+        name: String,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for Error {
@@ -350,6 +413,13 @@ impl fmt::Display for Error {
                  `transport = \"ssh-unix\"` for remote daemons \
                  today; TLS-TCP lands in Phase 3 slice 12h.",
                 name,
+            ),
+            Error::InvalidHostName { name, reason } => write!(
+                f,
+                "hosts.toml: invalid host name `{}`: {}. Host \
+                 names must match [A-Za-z0-9._-]+ (1..=64 chars, \
+                 no leading dot, no `..`).",
+                name, reason,
             ),
         }
     }
@@ -680,5 +750,149 @@ default = true
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    // -----------------------------------------------------------
+    // Round 3 F3: host-name filename-safety tests.
+    // -----------------------------------------------------------
+
+    /// Helper: build a hosts.toml with one named entry plus a
+    /// uniquely-named default. Returns the load result so tests
+    /// can pin whether validation accepted or rejected the
+    /// candidate name. The default uses a synthetic name
+    /// (`__test_default__`) to avoid colliding with any
+    /// candidate name the tests might pass.
+    fn load_with_host_name(name: &str) -> Result<HostsConfig, Error> {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("hosts.toml");
+        // Use a TOML literal-string ('...') for the candidate
+        // name so backslashes don't get re-interpreted as TOML
+        // escape sequences (e.g. `\b` → backspace).
+        let content = format!(
+            "[[host]]\n\
+             name = \"__test_default__\"\n\
+             transport = \"unix\"\n\
+             socket = \"/tmp/local.sock\"\n\
+             default = true\n\
+             \n\
+             [[host]]\n\
+             name = '{}'\n\
+             transport = \"ssh-unix\"\n\
+             ssh_host = \"irrelevant\"\n\
+             remote_socket = \"/irrelevant.sock\"\n",
+            name,
+        );
+        std::fs::write(&path, content).expect("write hosts.toml");
+        HostsConfig::load(&path)
+    }
+
+    /// Round 3 F3: host names with path separators (`/`, `\`)
+    /// must be rejected.
+    #[test]
+    fn host_name_rejects_path_separators() {
+        for name in ["prod/us", "a\\b", "with/slash"].iter() {
+            match load_with_host_name(name) {
+                Err(Error::InvalidHostName { name: n, .. }) => {
+                    assert_eq!(&n, name);
+                }
+                other => panic!(
+                    "host name {:?} must be rejected with \
+                     InvalidHostName; got: {:?}",
+                    name, other,
+                ),
+            }
+        }
+    }
+
+    /// Round 3 F3: host names with `..` (anywhere) must be
+    /// rejected. Examples: `..`, `a..b`, `a/../b`.
+    #[test]
+    fn host_name_rejects_dot_dot() {
+        for name in ["..", "a..b", "x..y..z"].iter() {
+            match load_with_host_name(name) {
+                Err(Error::InvalidHostName { name: n, reason: _ }) => {
+                    assert_eq!(&n, name);
+                }
+                other => panic!(
+                    "host name {:?} must be rejected with \
+                     InvalidHostName; got: {:?}",
+                    name, other,
+                ),
+            }
+        }
+        // `a/../b` is rejected by the path-separator check
+        // first; that's also an InvalidHostName error.
+        match load_with_host_name("a/../b") {
+            Err(Error::InvalidHostName { .. }) => {}
+            other => panic!(
+                "`a/../b` must be rejected; got: {:?}",
+                other,
+            ),
+        }
+    }
+
+    /// Round 3 F3: host names with a leading dot must be
+    /// rejected (would be a hidden file in the tunnel dir).
+    #[test]
+    fn host_name_rejects_leading_dot() {
+        for name in [".foo", ".hidden", "."].iter() {
+            match load_with_host_name(name) {
+                Err(Error::InvalidHostName { name: n, .. }) => {
+                    assert_eq!(&n, name);
+                }
+                other => panic!(
+                    "host name {:?} must be rejected with \
+                     InvalidHostName; got: {:?}",
+                    name, other,
+                ),
+            }
+        }
+    }
+
+    /// Round 3 F3: alnum + dash + underscore + dot are accepted.
+    /// Pin the positive case so we don't regress the validator
+    /// into rejecting realistic operator-chosen names like
+    /// `manager-prod_us.dev`.
+    #[test]
+    fn host_name_accepts_alnum_dash_underscore_dot() {
+        for name in [
+            "local",
+            "cm-manager",
+            "worker-01",
+            "prod_us.dev",
+            "manager-prod_us.dev",
+            "A.B-C_D",
+            "abc123",
+        ]
+        .iter()
+        {
+            let r = load_with_host_name(name);
+            assert!(
+                r.is_ok(),
+                "host name {:?} should be accepted; got: {:?}",
+                name,
+                r.err(),
+            );
+        }
+    }
+
+    /// Round 3 F3: too-long names (>64 chars) are rejected.
+    #[test]
+    fn host_name_rejects_too_long() {
+        let name = "a".repeat(65);
+        match load_with_host_name(&name) {
+            Err(Error::InvalidHostName { name: n, reason }) => {
+                assert_eq!(n, name);
+                assert!(reason.contains("64"));
+            }
+            other => panic!(
+                "65-char name must be rejected; got: {:?}",
+                other,
+            ),
+        }
+        // 64-char name is fine.
+        let ok_name = "a".repeat(64);
+        assert!(load_with_host_name(&ok_name).is_ok());
     }
 }

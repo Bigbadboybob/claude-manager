@@ -156,6 +156,17 @@ pub fn should_spawn() -> bool {
 /// re-read from `cm_daemon::default_socket_path()` here. Routes
 /// the consumer's daemon-dial through the same host-pool that
 /// every other RPC site uses.
+///
+/// TODO(F2-deferred): SSH-unix tunnel death will not
+/// auto-recover here without a separate RPC firing
+/// `ensure_alive`. The path captured at `App::new` time is the
+/// per-spawn random path (round 3 F1) — if the ssh child dies
+/// and `ensure_alive` respawns at a NEW random path, this
+/// consumer thread keeps retrying the stale path until some
+/// other code path (`for_host` / `default_handle`) re-fires
+/// `ensure_alive`. For multi-host UX (12e) the consumer needs
+/// the `HostPool` itself (or a respawn-aware handle) instead of
+/// a static `PathBuf` snapshot.
 pub fn maybe_spawn_for_app(
     socket_path: PathBuf,
 ) -> (
