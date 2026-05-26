@@ -2665,6 +2665,13 @@ pub struct App {
     /// here so a malformed config file surfaces at App::new
     /// rather than at first RPC.
     pub hosts: crate::hosts::HostsConfig,
+    /// 12c (Phase 3): host_id → ConnectionHandle pool. Built
+    /// once from `hosts` at App::new; every RPC call site that
+    /// pre-12c dialed `cm_daemon::default_socket_path()`
+    /// directly now routes through `host_pool` instead
+    /// (`for_host(&ts.host_id)` for per-session calls,
+    /// `default_handle()` for TUI-level pushes).
+    pub host_pool: crate::host_pool::HostPool,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -2756,19 +2763,6 @@ impl App {
         }
         let (memory_kill_tx, memory_kill_rx) = std::sync::mpsc::channel();
 
-        // 10e-c: spawn the manifest.watch consumer only when
-        // daemon mode is opt-in active. Without opt-in, the TUI
-        // runs in legacy single-process mode and there's no
-        // daemon to subscribe to; spawning a consumer that
-        // tight-loops trying to dial a non-existent socket would
-        // be wasted work + log noise.
-        let (manifest_watch_rx, _manifest_watch_thread) =
-            crate::manifest_watch::maybe_spawn_for_app();
-        // 11d: spawn the events.subscribe consumer alongside
-        // manifest_watch. Same reconnect-with-backoff shape;
-        // delivers WorkflowEvent broadcasts to the main loop.
-        let (workflow_watch_rx, _workflow_watch_thread) =
-            crate::workflow_watch::maybe_spawn_for_app();
         // 12a (Phase 3): load `~/.cm/hosts.toml`. Synthesizes the
         // local-default entry when the file is missing (the common
         // case for users who haven't opted into multi-host).
@@ -2799,6 +2793,38 @@ impl App {
                 crate::hosts::HostsConfig::synthesized_local_default()
             }
         };
+        // 12c (Phase 3): build the host_id → ConnectionHandle
+        // pool from the loaded HostsConfig. Every runtime RPC
+        // site below routes through this pool; pre-12c they
+        // each called `cm_daemon::default_socket_path()`
+        // directly. Local-only behavior is byte-identical to
+        // pre-12c because the pool's local-host entry holds
+        // exactly that path (verified by
+        // `host_pool::tests::synthesized_default_pool_local_path_matches_daemon_default`).
+        let host_pool = crate::host_pool::HostPool::from_config(&hosts);
+        // The watch-consumer threads dial the default host (12c
+        // only has one host; 12e adds the per-session-host
+        // routing UX). Pre-12c these read
+        // `cm_daemon::default_socket_path()` directly inside
+        // `maybe_spawn_for_app`; the path is now passed in so
+        // the consumer threads stay in lockstep with the pool.
+        let watch_socket_path =
+            host_pool.default_handle().socket_path().to_path_buf();
+        // 10e-c: spawn the manifest.watch consumer. Without
+        // daemon there's no manifest to subscribe to; spawning
+        // a consumer that tight-loops trying to dial a non-
+        // existent socket would be wasted work + log noise.
+        let (manifest_watch_rx, _manifest_watch_thread) =
+            crate::manifest_watch::maybe_spawn_for_app(
+                watch_socket_path.clone(),
+            );
+        // 11d: spawn the events.subscribe consumer alongside
+        // manifest_watch. Same reconnect-with-backoff shape;
+        // delivers WorkflowEvent broadcasts to the main loop.
+        let (workflow_watch_rx, _workflow_watch_thread) =
+            crate::workflow_watch::maybe_spawn_for_app(
+                watch_socket_path,
+            );
 
         App {
             tasks: Vec::new(),
@@ -2839,6 +2865,7 @@ impl App {
             pending_workflow_events: HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             hosts,
+            host_pool,
         }
     }
 
@@ -3006,7 +3033,14 @@ impl App {
             std::collections::BTreeMap::new();
         env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
 
-        let daemon_socket = cm_daemon::default_socket_path();
+        // 12c: route through the host pool. For 12c every
+        // session is local; 12e ("A-H cycles active host")
+        // will switch this to `self.host_pool.for_host(&ts.host_id)`.
+        let daemon_socket = self
+            .host_pool
+            .default_handle()
+            .socket_path()
+            .to_path_buf();
         // Memory-cap wire fields (slice 10c-e-3b-fix2). When
         // `memory_cap` is Some, the soft byte count signals the
         // daemon to populate `SpawnParams.kills_dir`, and the
@@ -7778,6 +7812,17 @@ impl App {
     /// until exit), not a permanent leak.
     pub(crate) fn kill_daemon_session_if_attached(ts: &TerminalSession) {
         if let Some(uid) = ts.session.daemon_session_uid.as_deref() {
+            // 12c-deferred: this is a static-context helper
+            // called from Drop-adjacent paths where the App's
+            // `host_pool` isn't reachable without restructuring
+            // the call chain. Reads `cm_daemon::default_socket_path()`
+            // directly; for 12c (local-only) this resolves to
+            // exactly the same path the pool's default handle
+            // would, so the byte-stability invariant holds. A
+            // future slice that goes multi-host-aware on
+            // per-session kill needs to thread a `&HostPool`
+            // (or path) through `respawn_existing_with_workflow_mcp`
+            // and the workspace-teardown callers.
             let daemon_socket = cm_daemon::default_socket_path();
             if let Err(e) = crate::client_session::rpc_kill_session(
                 &daemon_socket,
@@ -7835,6 +7880,11 @@ impl App {
             return;
         };
         let path_str = path.to_string_lossy().to_string();
+        // 12c-deferred: same shape as `kill_daemon_session_if_attached`
+        // — static-context helper called from rebind sites; reads
+        // the canonical local-host path directly. Byte-equivalent
+        // to `host_pool.default_handle()` for 12c (local-only);
+        // future multi-host-aware refactor threads a HostPool ref.
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_set_transcript_path(
             &daemon_socket,
@@ -7879,6 +7929,9 @@ impl App {
         };
         // 10f: daemon-mandatory; `daemon_session_uid` being Some
         // already implies a daemon-spawned session.
+        // 12c-deferred: same static-context shape as the other
+        // `*_if_attached` helpers — uses the canonical local
+        // path directly; byte-equivalent for local-only.
         let daemon_socket = cm_daemon::default_socket_path();
         if let Err(e) = crate::client_session::rpc_set_workflow_context(
             &daemon_socket,
@@ -7955,7 +8008,15 @@ impl App {
                 workflow_role: ts.workflow_role.as_deref(),
             })
             .collect();
-        let daemon_socket = cm_daemon::default_socket_path();
+        // 12c: route through the host pool. TUI-level push of
+        // the full session snapshot goes to the default host
+        // (local in 12c; future multi-host shape may need to
+        // partition by host and push per-daemon).
+        let daemon_socket = self
+            .host_pool
+            .default_handle()
+            .socket_path()
+            .to_path_buf();
         if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
@@ -8026,7 +8087,15 @@ impl App {
     /// driver reads from `DaemonState.workflow_definitions`.
     pub(crate) fn push_workflow_definitions_to_daemon(&self) {
         // 10f: daemon-mandatory; always push.
-        let daemon_socket = cm_daemon::default_socket_path();
+        // 12c: route through host pool. Workflow definitions
+        // are a per-host concept (the daemon caches them for
+        // its own workflow runs); push to the default host
+        // here. Future multi-host shape would push per-host.
+        let daemon_socket = self
+            .host_pool
+            .default_handle()
+            .socket_path()
+            .to_path_buf();
         if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
@@ -8071,7 +8140,15 @@ impl App {
                 )
             })
             .collect();
-        let daemon_socket = cm_daemon::default_socket_path();
+        // 12c: route through host pool. task.update_tree pushes
+        // the full task hierarchy to the default host. Multi-
+        // host planning isn't a concept (planning is the FastAPI
+        // server's domain); every daemon gets the same view.
+        let daemon_socket = self
+            .host_pool
+            .default_handle()
+            .socket_path()
+            .to_path_buf();
         if let Err(e) = crate::client_session::rpc_task_update_tree(
             &daemon_socket,
             crate::daemon_launch::operator_token(),

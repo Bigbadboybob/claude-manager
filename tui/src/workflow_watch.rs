@@ -78,14 +78,21 @@ pub fn should_spawn() -> bool {
 
 /// App-side helper: spawn the consumer and return the channel +
 /// thread handle. Called once from `App::new`.
-pub fn maybe_spawn_for_app() -> (
+///
+/// 12c: `socket_path` is passed in by the caller (resolved from
+/// `App.host_pool.default_handle().socket_path()`) rather than
+/// re-read from `cm_daemon::default_socket_path()` here. Routes
+/// the consumer's daemon-dial through the same host-pool that
+/// every other RPC site uses.
+pub fn maybe_spawn_for_app(
+    socket_path: PathBuf,
+) -> (
     Option<mpsc::Receiver<WorkflowWatchEvent>>,
     Option<JoinHandle<()>>,
 ) {
     if !should_spawn() {
         return (None, None);
     }
-    let socket_path = cm_daemon::default_socket_path();
     let consumer = spawn(socket_path);
     (Some(consumer.event_rx), Some(consumer._thread))
 }
