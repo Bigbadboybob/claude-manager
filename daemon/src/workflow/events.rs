@@ -143,88 +143,13 @@ impl Event {
     }
 }
 
-/// 10d-2c-1 review round-10: per-event variant of [`read_new`].
-/// Returns each parsed event paired with the byte offset
-/// **immediately after** that event's line (i.e., the offset to
-/// persist if processing through that event succeeds).
-///
-/// Used by the TUI's tail to advance `events_offset` per-event
-/// rather than once at batch end. Pre-round-10 the tail
-/// advanced to the batch-final offset on every successful event
-/// — a Failed event in the middle of a batch was permanently
-/// skipped because earlier successes had already advanced past
-/// it (and later successes would advance past it on the next
-/// tick). Round-10's per-event offset + stop-at-first-failure
-/// keeps the failed event re-readable.
-///
-/// 10d-2c-1 review round-12 (F2): returns a tuple
-/// `(events, final_consumed_offset)`. `final_consumed_offset`
-/// is the byte position after the last newline-terminated line
-/// consumed (parsed or malformed-but-consumed). The caller
-/// uses this to advance `events_offset` past malformed lines
-/// that don't surface as Events — pre-r12 a malformed line in
-/// events.jsonl wedged offset at 0 forever because
-/// `events_with_offsets.is_empty()` triggered the static-idle
-/// path (which doesn't advance offset).
-pub fn read_new_with_offsets(run_id: &str, offset: u64) -> (Vec<(Event, u64)>, u64) {
-    let path = run::events_path(run_id);
-    let Ok(mut f) = File::open(&path) else {
-        return (Vec::new(), offset);
-    };
-    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if offset >= file_len {
-        return (Vec::new(), offset);
-    }
-    if f.seek(SeekFrom::Start(offset)).is_err() {
-        return (Vec::new(), offset);
-    }
-    let mut reader = BufReader::new(f);
-    let mut out: Vec<(Event, u64)> = Vec::new();
-    let mut consumed: u64 = 0;
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        match reader.read_line(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                // Same torn-record + recovery semantics as
-                // `read_new` — see that function for the round-5
-                // / round-6 commentary on un-terminated tails.
-                if !buf.ends_with('\n') {
-                    let line = buf.trim();
-                    if !line.is_empty() {
-                        if let Ok(ev) = serde_json::from_str::<Event>(line) {
-                            consumed += n as u64;
-                            out.push((ev, offset + consumed));
-                        }
-                    }
-                    break;
-                }
-                // Round-12 (F2): advance `consumed` BEFORE the
-                // parse attempt. Newline-terminated lines are
-                // permanently consumed (the writer never goes
-                // back to fix a malformed line). Pre-r12 only
-                // parsed-successfully lines were counted via
-                // `out.push((ev, offset + consumed))`; the
-                // caller had no way to learn about
-                // malformed-but-consumed bytes.
-                consumed += n as u64;
-                let line = buf.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(ev) = serde_json::from_str::<Event>(line) {
-                    out.push((ev, offset + consumed));
-                }
-                // Malformed JSON: bytes consumed (offset
-                // advances via the final_consumed_offset
-                // return), no event surfaced.
-            }
-            Err(_) => break,
-        }
-    }
-    (out, offset + consumed)
-}
+// 11g-2-d: `read_new_with_offsets` retired. Its only caller was
+// the TUI's controller (file-tail path); post-11g-2-a the controller
+// consumes events from the daemon's `events.subscribe` channel and
+// no longer tracks per-event file offsets. The simpler `read_new`
+// below stays as a test utility for daemon-side tests that verify
+// `events.jsonl` content after a daemon-side call (no offset
+// bookkeeping needed in that role).
 
 /// Read new events for `run_id` starting at `offset`. Returns the parsed events
 /// plus the new byte offset to persist. Malformed lines are skipped silently
