@@ -962,6 +962,13 @@ impl PlanningView {
                         local_task.source = api_task.source.clone();
                         local_task.is_cloud = api_task.is_cloud;
                         local_task.slug = api_task.slug.clone();
+                        // Without this, an API-side reparent (e.g. an
+                        // agent's `update_task(parent_task_id=...)`) never
+                        // reached the planning grid: the merge silently
+                        // dropped the field, the `children_of` walk read
+                        // stale `None` from `pd.tasks`, and the subtask
+                        // never appeared under its parent.
+                        local_task.parent_task_id = api_task.parent_task_id.clone();
                     } else {
                         // New task from API — add it.
                         pd.tasks.push(api_task.clone());
@@ -4201,6 +4208,60 @@ mod tests {
 
         let (_, repo_url, _) = extract_create(view.create_task("New", None));
         assert_eq!(repo_url, stored);
+
+        if let Some(p) = prev {
+            std::env::set_var("HOME", p);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn update_from_api_propagates_parent_task_id_change() {
+        // Regression: an API-side reparent (e.g. an agent calling
+        // `update_task(parent_task_id=...)`) must take effect on the
+        // next refresh. Pre-fix, the merge block overwrote every other
+        // PlanTask field from the API row but silently dropped
+        // `parent_task_id`, so `children_of` kept reading stale `None`
+        // from `pd.tasks` and the subtask never appeared under its
+        // parent in the grid.
+        let _lock = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        // Two tasks already hydrated locally with the child unparented.
+        pd.tasks.push(make_task("parent-id", "parent", None));
+        pd.tasks.push(make_task("child-id", "child", None));
+        view.project_data.push(pd);
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+
+        // API now reports the child reparented under "parent-id".
+        let mut parent_api = api_task("parent-id", "p", "");
+        parent_api.slug = Some("parent".to_string());
+        let mut child_api = api_task("child-id", "p", "");
+        child_api.slug = Some("child".to_string());
+        child_api.parent_task_id = Some("parent-id".to_string());
+
+        view.update_from_api(vec![parent_api, child_api]);
+
+        let pd = view
+            .project_data
+            .iter()
+            .find(|pd| pd.project.name == "p")
+            .expect("project survived refresh");
+        let child = pd
+            .tasks
+            .iter()
+            .find(|t| t.id == "child-id")
+            .expect("child still present");
+        assert_eq!(
+            child.parent_task_id.as_deref(),
+            Some("parent-id"),
+            "API-side parent_task_id must propagate to pd.tasks",
+        );
 
         if let Some(p) = prev {
             std::env::set_var("HOME", p);
