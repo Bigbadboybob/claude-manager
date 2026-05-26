@@ -897,23 +897,20 @@ impl<'a> WorkflowControllerCtx<'a> {
                 from: String,
                 prompt: String,
                 event_id: String,
-                daemon_routed: bool,
-                // 10d-2c-1 review round-3 (F1): post-event byte
-                // offset, captured at event-read time (line ~752).
-                // Threaded through the Decision so the apply
-                // phase sets `run.events_offset = new_offset`
-                // explicitly inside `run::modify` — closes the
-                // 3rd-round regression where the closure read
-                // events_offset from the post-reload (stale) run.
-                new_offset: u64,
-                // 10d-2c-1 review round-15: per-event iteration
-                // captured by the daemon's post-mutation closure.
-                // The TUI's history append uses this — pre-r15
-                // it read state.json's current `iteration` which
-                // gave queued events the LATEST value rather
-                // than the per-event activation iteration.
-                // `0` for pre-r15 on-disk events; the appender
-                // falls back to `r.iteration` then.
+                // 11g-2 (A2 + daemon_routed cleanup): the
+                // `daemon_routed: bool` and `new_offset: u64`
+                // fields are gone. Every channel event is
+                // daemon-source post-TuiLocal deletion, so the
+                // forks collapsed. `new_offset` was retired with
+                // events_offset (A4) in 11g-2-a.
+                //
+                // Per-event iteration captured by the daemon's
+                // post-mutation closure. The TUI's history append
+                // uses this — pre-r15 it read state.json's current
+                // `iteration` which gave queued events the LATEST
+                // value rather than the per-event activation
+                // iteration. `0` for pre-r15 on-disk events; the
+                // appender falls back to `r.iteration` then.
                 event_iteration: u32,
                 /// 10d-2c-2-2-b F3: `args.trigger` discriminator
                 /// from the event. `Some("static_idle")` when the
@@ -927,12 +924,11 @@ impl<'a> WorkflowControllerCtx<'a> {
             Done {
                 run_id: String,
                 reason: String,
-                daemon_routed: bool,
-                new_offset: u64,
-                // 10d-2c-1 review round-15: per-event iteration
-                // from the daemon's post-mutation capture.
-                // Unused by Done's TUI processing (no history
-                // append) but carried for parity.
+                // 11g-2: `daemon_routed` and `new_offset` retired
+                // (see ActivateDynamic above).
+                //
+                // event_iteration: unused by Done's TUI processing
+                // (no history append) but carried for parity.
                 event_iteration: u32,
             },
             /// 10d-2c-1 review round-11 (F1): skip-but-advance.
@@ -955,10 +951,13 @@ impl<'a> WorkflowControllerCtx<'a> {
             /// loop is the single serial point for offset writes.
             Skip {
                 run_id: String,
-                new_offset: u64,
                 /// Free-form reason for the log line. Surfaces
                 /// in `log_tick` so an operator can correlate
-                /// silent skips against the events.jsonl tail.
+                /// silent skips against the channel event stream.
+                ///
+                /// 11g-2: `new_offset` retired (per A4) — Skip is
+                /// now log-only; the deque drain consumed the
+                /// event already.
                 reason: String,
             },
         }
@@ -1064,44 +1063,38 @@ impl<'a> WorkflowControllerCtx<'a> {
             events_by_run.insert(run_id.clone(), events.clone());
 
             for ev in &events {
-                let daemon_routed = ev.source == "daemon";
                 match ev.kind() {
                     workflow::events::EventKind::Transition { to, prompt } => {
-                        // 10d-2c-1 review round-7 (F2): for daemon-
-                        // routed events, the authoritative
-                        // outgoing role lives on the event itself
-                        // (captured pre-mutation under flock by
-                        // `workflow_transition`'s closure).
-                        // Deriving from in-memory `active_role`
-                        // gives the WRONG role after a TUI
-                        // restart: state.json already carries the
+                        // 10d-2c-1 review round-7 (F2): the
+                        // authoritative outgoing role lives on the
+                        // event itself (captured pre-mutation under
+                        // flock by the daemon's
+                        // `workflow_transition` closure). Deriving
+                        // from in-memory `active_role` gives the
+                        // WRONG role after a TUI restart:
+                        // state.json already carries the
                         // post-mutation `active_role = to`, so the
                         // snapshot would record `from_role = to`.
                         //
-                        // 10d-2c-1 review round-11 (F2):
-                        // intermediate fallback to `ev.role` for
-                        // daemon-source events whose `from_role`
-                        // is None (e.g. pre-round-7 events on
-                        // disk; or any future case where the
+                        // Round-11 (F2): intermediate fallback to
+                        // `ev.role` for daemon-source events whose
+                        // `from_role` is None (pre-round-7 events
+                        // on disk; or any future case where the
                         // capture missed). `ev.role` carries the
-                        // outgoing caller role from the
-                        // RPC params — semantically equivalent
-                        // to `from_role` for the wf-routed path.
-                        // Final fallback to in-memory
-                        // `active_role` remains for TuiLocal
-                        // events (where state hasn't mutated yet
-                        // and `ev.role` may be "unknown" from
-                        // the legacy `_append_event` path).
+                        // outgoing caller role from the RPC params
+                        // — semantically equivalent to `from_role`
+                        // for the daemon path.
+                        //
+                        // 11g-2 (post-A2): the `ev.source ==
+                        // "daemon"` gate on the ev.role fallback
+                        // is gone — every channel event is
+                        // daemon-source post-TuiLocal deletion. We
+                        // unconditionally fall through to ev.role,
+                        // then active_role as last resort.
                         let from_opt = ev
                             .from_role
                             .clone()
-                            .or_else(|| {
-                                if ev.source == "daemon" {
-                                    Some(ev.role.clone())
-                                } else {
-                                    None
-                                }
-                            })
+                            .or_else(|| Some(ev.role.clone()))
                             .or_else(|| active_role.clone());
                         // 10d-2c-2-2-b F3: extract `args.trigger`
                         // discriminator at decision-build time. The
@@ -1120,27 +1113,26 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 from,
                                 prompt,
                                 event_id: ev.id.clone(),
-                                daemon_routed,
-                                new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                                 event_iteration: ev.iteration,
                                 trigger,
                             });
                         } else {
                             // No from_role derivable at all
-                            // (event.from_role None, source !=
-                            // daemon so no ev.role fallback,
-                            // and in-memory active_role None).
-                            // Skip-but-advance: log loudly and
-                            // move the offset past this event so
-                            // the run doesn't wedge.
+                            // (event.from_role None, ev.role
+                            // empty/missing, and in-memory
+                            // active_role None). Skip-but-log: the
+                            // deque drain consumes the event, the
+                            // log line surfaces the anomaly. Path
+                            // is effectively unreachable post-A2
+                            // (daemon always populates ev.role from
+                            // RPC params) but kept defensive.
                             decisions.push(Decision::Skip {
                                 run_id: run_id.clone(),
-                                new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                                 reason: format!(
                                     "Transition event {} has no derivable \
                                      from_role (event.from_role=None, \
-                                     source={:?}, in-memory active_role=None)",
-                                    ev.id, ev.source,
+                                     ev.role={:?}, in-memory active_role=None)",
+                                    ev.id, ev.role,
                                 ),
                             });
                         }
@@ -1149,8 +1141,6 @@ impl<'a> WorkflowControllerCtx<'a> {
                         decisions.push(Decision::Done {
                             run_id: run_id.clone(),
                             reason,
-                            daemon_routed,
-                            new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                             event_iteration: ev.iteration,
                         });
                     }
@@ -1158,17 +1148,12 @@ impl<'a> WorkflowControllerCtx<'a> {
                         // 10d-2c-1 review round-11 (F1):
                         // skip-but-advance. Pre-round-11 the
                         // empty arm `{}` ignored Unknown events
-                        // entirely, leaving `events_offset`
-                        // un-advanced — same event re-read
-                        // forever; static-idle check skipped
-                        // because `events_with_offsets`
-                        // non-empty; run wedged. Push a Skip so
-                        // the decision-processing loop advances
-                        // offset (subject to `failed_runs`
-                        // gating, same as any other decision).
+                        // entirely, leaving the deque blocked on
+                        // an unprocessable event. The Skip
+                        // decision flows through the standard
+                        // failure-gating pipeline.
                         decisions.push(Decision::Skip {
                             run_id: run_id.clone(),
-                            new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                             reason: format!(
                                 "Unknown event kind (tool={:?}, id={})",
                                 ev.tool, ev.id,
@@ -1176,70 +1161,46 @@ impl<'a> WorkflowControllerCtx<'a> {
                         });
                     }
                     workflow::events::EventKind::RejectFinding { text } => {
-                        // 11e: daemon-routed `workflow_reject_finding` ALREADY
-                        // mutated rejected_findings on disk under flock (matching
-                        // `workflow_transition` / `workflow_done`'s daemon
-                        // ownership). The TUI's tail observer for daemon-source
-                        // events must NOT re-apply the push or it'd double-add.
-                        // Reload from disk so in-memory mirrors the daemon's
-                        // mutation; if disk reload fails (transient I/O), the
-                        // next tick's full reload resyncs. TuiLocal fallback
-                        // (Python `_append_event` direct write — kept for
-                        // unpinned spawns) still goes through the in-memory
-                        // push + save path.
+                        // 11e + 11g-2: the daemon's
+                        // `workflow_reject_finding` ALREADY
+                        // mutated rejected_findings on disk under
+                        // flock. The TUI tail must NOT re-apply
+                        // the push or it'd double-add. Reload
+                        // from disk so in-memory mirrors the
+                        // daemon's mutation; if disk reload fails
+                        // (transient I/O), the next tick's full
+                        // reload resyncs.
+                        //
+                        // Post-11g-2-b (A2): the TuiLocal in-place
+                        // push branch is gone — every event is
+                        // daemon-source so reload-from-disk is the
+                        // only path.
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
-                            if daemon_routed {
-                                if let Some(reloaded) =
-                                    crate::workflow::run::load_one(&run_id)
-                                {
-                                    self.workflow_runs[idx] = reloaded;
-                                }
-                                log_tick(
-                                    &run_id,
-                                    &format!(
-                                        "reject_finding recorded (daemon-routed, total={} rejections)",
-                                        self.workflow_runs[idx].rejected_findings.len(),
-                                    ),
-                                );
-                            } else {
-                                let iteration = self.workflow_runs[idx].iteration;
-                                self.workflow_runs[idx]
-                                    .rejected_findings
-                                    .push(crate::workflow::run::RejectedFinding {
-                                        text: trimmed.to_string(),
-                                        recorded_at: crate::workflow::run::now_unix(),
-                                        iteration,
-                                    });
-                                let _ = workflow::run::save(&self.workflow_runs[idx]);
-                                log_tick(
-                                    &run_id,
-                                    &format!(
-                                        "reject_finding recorded ({} chars, total={} rejections)",
-                                        trimmed.len(),
-                                        self.workflow_runs[idx].rejected_findings.len(),
-                                    ),
-                                );
+                            if let Some(reloaded) =
+                                crate::workflow::run::load_one(&run_id)
+                            {
+                                self.workflow_runs[idx] = reloaded;
                             }
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "reject_finding recorded (daemon-routed, total={} rejections)",
+                                    self.workflow_runs[idx].rejected_findings.len(),
+                                ),
+                            );
                         }
-                        // 11e fix (reviewer round): apply-in-place arms
-                        // STILL need a Decision::Skip — without one,
-                        // `events_offset` doesn't advance, the event
-                        // is re-read every tick, and because
-                        // `events_with_offsets` stays non-empty the
-                        // static-idle gate (below) is skipped → run
-                        // wedges after a reject_finding. Same wedge
-                        // shape the `Unknown` arm at 10d-2c-1 round-11
-                        // documents. Skip is gated by `failed_runs`
-                        // alongside every other decision, so a
-                        // reload-fail upstream doesn't blindly
-                        // advance past the event.
+                        // 11e fix (reviewer round): apply-in-place
+                        // arms STILL need a Decision::Skip — the
+                        // deque drain consumed the event, but the
+                        // Skip decision flows through the standard
+                        // log + per-tick consumption accounting.
+                        // Same shape as the Unknown arm.
                         decisions.push(Decision::Skip {
                             run_id: run_id.clone(),
-                            new_offset: 0, // 11g-2: events_offset retired (per A4); field kept for Decision shape, value unused downstream
                             reason: format!(
-                                "reject_finding applied in-place (id={}, daemon_routed={})",
-                                ev.id, daemon_routed,
+                                "reject_finding applied in-place (id={})",
+                                ev.id,
                             ),
                         });
                     }
@@ -1399,8 +1360,11 @@ impl<'a> WorkflowControllerCtx<'a> {
                         None,
                     );
                 }
-                Decision::ActivateDynamic { run_id, to, from, prompt, event_id, daemon_routed, new_offset, event_iteration, trigger: trigger_str } => {
-                    if daemon_routed {
+                Decision::ActivateDynamic { run_id, to, from, prompt, event_id, event_iteration, trigger: trigger_str } => {
+                    {
+                        // 11g-2: daemon-routed path is the only
+                        // path (TuiLocal deleted). Sequence:
+                        //
                         // 10d-2c-1 review round-1 (F2 + F4 +
                         // P1 #1/#2):
                         //
@@ -1561,7 +1525,6 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 event_id: event_id.clone(),
                             }
                         };
-                        let _ = new_offset; // 11g-2: events_offset retired (A4)
                         let captured_reset = reset_mutations;
                         // 10d-2c-1 review round-14: pass the event's
                         // target role (`to`) explicitly into the
@@ -1614,48 +1577,25 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 *slot = updated_run;
                             }
                         }
-                    } else {
-                        // TUI-local path (source != "daemon").
-                        // 10d-2c-1 review round-7 (F1): pass
-                        // `new_offset` into fire_transition so its
-                        // single modify closure persists state
-                        // mutation AND events_offset together —
-                        // pre-fix the outer modify advanced disk
-                        // but the prior fire_transition modify had
-                        // already replaced in-memory with the
-                        // disk-loaded OLD events_offset; next tick
-                        // re-read the event.
-                        self.fire_transition(
-                            &run_id,
-                            &to,
-                            TriggerKind::McpTransition {
-                                from_role: from,
-                                prompt: prompt.clone(),
-                                event_id,
-                            },
-                            Some(prompt),
-                            &mut actions,
-                            Some(new_offset),
-                        );
                     }
+                    let _ = (event_id, prompt, from); // 11g-2: consumed by removed TuiLocal fire_transition path
                     // 11g-2: mark this event consumed for the retry-tail
-                    // accounting. Reached on both daemon-routed and
-                    // TUI-local success paths (failure returns above
-                    // via `continue` after re-pushing the tail).
+                    // accounting (failure returns above via `continue`
+                    // after re-pushing the tail).
                     *events_processed_by_run
                         .entry(run_id.clone())
                         .or_insert(0) += 1;
                 }
-                Decision::Done { run_id, reason, daemon_routed, new_offset, event_iteration: _ } => {
-                    let _ = new_offset; // 11g-2: events_offset retired (A4)
-                    if daemon_routed {
+                Decision::Done { run_id, reason, event_iteration: _ } => {
+                    let _ = reason; // 11g-2: state.json mutation is the daemon's; we only sync in-mem
+                    {
                         // 11g-2: the daemon's `workflow_done` already
                         // mutated state.json (status=Done, active_role=None,
                         // done_reason=...) under flock before broadcasting.
-                        // Pre-11g-2 this arm did a modify just to write
-                        // events_offset; post-A4 that's a no-op. Re-load
-                        // from disk so in-memory mirrors the daemon's
-                        // mutation (matches the RejectFinding arm pattern).
+                        // Re-load from disk so in-memory mirrors the
+                        // daemon's mutation. The TuiLocal fork
+                        // (`self.finish_run`) is gone with A2 —
+                        // daemon-routed is the only path now.
                         if let Some(reloaded) =
                             workflow::run::load_one(&run_id)
                         {
@@ -1667,32 +1607,21 @@ impl<'a> WorkflowControllerCtx<'a> {
                                 *slot = reloaded;
                             }
                         }
-                    } else {
-                        // TUI-local file-write path: apply state
-                        // mutation + events_offset in a single
-                        // modify (10d-2c-1 review round-7 F1).
-                        self.finish_run(
-                            &run_id,
-                            reason,
-                            &mut actions,
-                            Some(new_offset),
-                        );
                     }
                     // 11g-2: mark consumed.
                     *events_processed_by_run
                         .entry(run_id.clone())
                         .or_insert(0) += 1;
                 }
-                Decision::Skip { run_id, new_offset, reason } => {
-                    // 11g-2: events_offset retired (A4). Skip is now
-                    // log-only — the event was already drained from
-                    // the per-run deque by `take_pending_events`, so
-                    // there's no "advance past" semantics to apply.
-                    // The decision exists for log-trail parity with
+                Decision::Skip { run_id, reason } => {
+                    // 11g-2: Skip is log-only — the event was
+                    // already drained from the per-run deque by
+                    // `take_pending_events`, so there's no
+                    // "advance past" semantics to apply. The
+                    // decision exists for log-trail parity with
                     // the file-tail era (operators can grep
                     // `skip-but-advance` to find apply-in-place
                     // events like RejectFinding).
-                    let _ = new_offset;
                     log_tick(
                         &run_id,
                         &format!(
