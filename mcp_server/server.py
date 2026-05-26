@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
