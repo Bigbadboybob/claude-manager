@@ -8513,6 +8513,16 @@ impl App {
         &self,
         host_id: &cm_daemon::host_id::HostId,
     ) {
+        // 12e-perf: skip the dial if the host is in backoff.
+        // Pre-12e-perf an unreachable ssh-unix host blocked every
+        // save_session_manifest call for ~3s while the SSH spawn
+        // wait elapsed.
+        if self
+            .host_pool
+            .should_skip_for_push(host_id, Instant::now())
+        {
+            return;
+        }
         // 10f: daemon-mandatory; always push.
         // Flatten App.workspaces[*].sessions[*] into one vec —
         // but filter OUT daemon-attached sessions
@@ -8561,6 +8571,8 @@ impl App {
                 "socket_path returns Some after ensure_alive succeeded",
             ),
             Err(e) => {
+                self.host_pool
+                    .mark_push_failure(host_id, Instant::now());
                 eprintln!(
                     "cm-tui: tui.update_sessions_snapshot to host {} \
                      skipped: {}",
@@ -8570,17 +8582,24 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = crate::client_session::rpc_tui_update_sessions_snapshot(
+        match crate::client_session::rpc_tui_update_sessions_snapshot(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
             &sessions,
         ) {
-            eprintln!(
-                "cm-tui: tui.update_sessions_snapshot to host {} failed: {} \
-                 (that daemon's TUI-session view will lag until the next push)",
-                host_id.as_str(),
-                e,
-            );
+            Ok(()) => {
+                self.host_pool.mark_push_success(host_id);
+            }
+            Err(e) => {
+                self.host_pool
+                    .mark_push_failure(host_id, Instant::now());
+                eprintln!(
+                    "cm-tui: tui.update_sessions_snapshot to host {} failed: {} \
+                     (that daemon's TUI-session view will lag until the next push)",
+                    host_id.as_str(),
+                    e,
+                );
+            }
         }
     }
 
@@ -8647,6 +8666,13 @@ impl App {
         &self,
         host_id: &cm_daemon::host_id::HostId,
     ) {
+        // 12e-perf: skip the dial if the host is in backoff.
+        if self
+            .host_pool
+            .should_skip_for_push(host_id, Instant::now())
+        {
+            return;
+        }
         // 12e-r3 F2: per-host. Pre-r3 only the default host
         // received workflow definitions — non-default daemons
         // had an empty `workflow_definitions` map and their
@@ -8656,6 +8682,8 @@ impl App {
                 "socket_path returns Some after ensure_alive succeeded",
             ),
             Err(e) => {
+                self.host_pool
+                    .mark_push_failure(host_id, Instant::now());
                 eprintln!(
                     "cm-tui: workflow.update_definitions to host {} \
                      skipped: {}",
@@ -8665,16 +8693,23 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = crate::client_session::rpc_workflow_update_definitions(
+        match crate::client_session::rpc_workflow_update_definitions(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
             &self.workflows,
         ) {
-            eprintln!(
-                "cm-tui: workflow.update_definitions to host {} failed: {}",
-                host_id.as_str(),
-                e,
-            );
+            Ok(()) => {
+                self.host_pool.mark_push_success(host_id);
+            }
+            Err(e) => {
+                self.host_pool
+                    .mark_push_failure(host_id, Instant::now());
+                eprintln!(
+                    "cm-tui: workflow.update_definitions to host {} failed: {}",
+                    host_id.as_str(),
+                    e,
+                );
+            }
         }
     }
 
@@ -8716,11 +8751,20 @@ impl App {
         tasks: &[(String, Option<String>, Option<String>)],
         workspaces: &[(String, Option<String>)],
     ) {
+        // 12e-perf: skip the dial if the host is in backoff.
+        if self
+            .host_pool
+            .should_skip_for_push(host_id, Instant::now())
+        {
+            return;
+        }
         let daemon_socket = match self.host_pool.for_host(host_id) {
             Ok(h) => h.socket_path().expect(
                 "socket_path returns Some after ensure_alive succeeded",
             ),
             Err(e) => {
+                self.host_pool
+                    .mark_push_failure(host_id, Instant::now());
                 eprintln!(
                     "cm-tui: task.update_tree to host {} skipped: {}",
                     host_id.as_str(),
@@ -8729,17 +8773,24 @@ impl App {
                 return;
             }
         };
-        if let Err(e) = crate::client_session::rpc_task_update_tree(
+        match crate::client_session::rpc_task_update_tree(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
             tasks,
             workspaces,
         ) {
-            eprintln!(
-                "cm-tui: task.update_tree to host {} failed: {}",
-                host_id.as_str(),
-                e,
-            );
+            Ok(()) => {
+                self.host_pool.mark_push_success(host_id);
+            }
+            Err(e) => {
+                self.host_pool
+                    .mark_push_failure(host_id, Instant::now());
+                eprintln!(
+                    "cm-tui: task.update_tree to host {} failed: {}",
+                    host_id.as_str(),
+                    e,
+                );
+            }
         }
     }
 

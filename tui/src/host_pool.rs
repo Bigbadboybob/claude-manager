@@ -91,7 +91,7 @@
 //!   chars, no leading dot, no `..` substring) at
 //!   `HostsConfig::load`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -102,6 +102,78 @@ use std::time::{Duration, Instant};
 use cm_daemon::host_id::HostId;
 
 use crate::hosts::{HostConfig, HostTransport, HostsConfig};
+
+// 12e-perf: per-host reachability cache for push fanout.
+//
+// `App::push_state_to_daemon` synchronously fans out to every host in
+// `~/.cm/hosts.toml`. For ssh-unix and tcp-tls hosts whose tunnel /
+// remote is unreachable, each `for_host(host_id)` dial blocks up to
+// the SSH spawn-wait timeout (~3s) before returning Err. Common
+// session mutations (A-s, A-w, settings change) trigger that fanout
+// via `save_session_manifest` → `push_state_to_daemon`, so an offline
+// configured remote freezes the TUI on every mutation. Pre-12e-perf
+// the workaround was to comment the offending host out of hosts.toml.
+//
+// Fix: track per-host reachability in memory. Mark Dead on push
+// failure with a doubling backoff (10s → 20s → ... → 5min cap); skip
+// the dial when `now < next_retry`. Local-Unix hosts are loopback —
+// the daemon socket is on the same machine and the daemon is launched
+// by the TUI at startup — so they're always treated as Live and never
+// enter the map. State lives in memory only; resets on TUI restart.
+//
+// Logging is one-shot on transitions only: first failure → "now
+// considered offline", recovery → "back online". Skip events
+// themselves stay silent so the log doesn't fill up with one line per
+// manifest save.
+
+const REACHABILITY_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
+const REACHABILITY_BACKOFF_MAX: Duration = Duration::from_secs(300);
+const REACHABILITY_BACKOFF_MULTIPLIER: u32 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct BackoffConfig {
+    initial: Duration,
+    max: Duration,
+    multiplier: u32,
+}
+
+impl BackoffConfig {
+    const fn prod() -> Self {
+        Self {
+            initial: REACHABILITY_BACKOFF_INITIAL,
+            max: REACHABILITY_BACKOFF_MAX,
+            multiplier: REACHABILITY_BACKOFF_MULTIPLIER,
+        }
+    }
+}
+
+/// Reachability state for one tracked host. Absent map entry is
+/// equivalent to Live (the default for a fresh pool).
+#[derive(Debug, Clone, Copy)]
+enum ReachabilityState {
+    Live,
+    Dead {
+        /// Earliest Instant at which we'll attempt another dial.
+        next_retry: Instant,
+        /// The backoff duration that produced `next_retry`. Used as
+        /// the seed for the next doubling on a continued failure.
+        last_backoff: Duration,
+    },
+}
+
+struct ReachabilityCache {
+    state: Mutex<HashMap<HostId, ReachabilityState>>,
+    config: BackoffConfig,
+}
+
+impl ReachabilityCache {
+    fn new(config: BackoffConfig) -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+            config,
+        }
+    }
+}
 
 /// Capacity of the per-tunnel stderr ring buffer. ssh's actually
 /// helpful diagnostic output (auth failures, ProxyJump errors,
@@ -780,6 +852,16 @@ fn format_stderr_dump(buf: &Arc<Mutex<VecDeque<String>>>) -> String {
 pub struct HostPool {
     entries: HashMap<HostId, ConnectionHandle>,
     default_host_id: HostId,
+    /// 12e-perf: which hosts get reachability tracking. Computed
+    /// at construction from each entry's transport — UnixDirect
+    /// hosts (loopback) are NOT tracked because there's no spawn
+    /// or network timeout to amortize; SshUnix and TcpTls are.
+    /// Membership is read-only after `from_config`.
+    tracked_hosts: HashSet<HostId>,
+    /// 12e-perf: per-host Live/Dead state with doubling backoff.
+    /// Mutated by `mark_push_success` / `mark_push_failure`; read
+    /// by `should_skip_for_push`. Only tracked hosts have entries.
+    reachability: ReachabilityCache,
 }
 
 /// 12e (F2 fix): a closure that returns the *current* socket
@@ -822,9 +904,22 @@ impl HostPool {
     pub fn from_config(cfg: &HostsConfig) -> io::Result<Self> {
         let mut entries: HashMap<HostId, ConnectionHandle> =
             HashMap::new();
+        let mut tracked_hosts: HashSet<HostId> = HashSet::new();
         let mut default_host_id: Option<HostId> = None;
         for host in &cfg.hosts {
             let handle = build_handle(host)?;
+            // 12e-perf: classify which hosts get reachability
+            // tracking. Local-Unix is loopback — there's no
+            // network failure mode worth amortizing, and the
+            // local daemon is launched by the TUI at startup
+            // (see main.rs), so a failed local dial is a real
+            // fault that warrants retrying on every push.
+            // Remote transports (ssh-unix, tcp-tls) can stall
+            // for ~3s per dial when the network or remote is
+            // down; those get the backoff cache.
+            if !matches!(host.transport, HostTransport::Unix { .. }) {
+                tracked_hosts.insert(host.id.clone());
+            }
             entries.insert(host.id.clone(), handle);
             if host.default {
                 default_host_id = Some(host.id.clone());
@@ -837,6 +932,8 @@ impl HostPool {
         Ok(HostPool {
             entries,
             default_host_id,
+            tracked_hosts,
+            reachability: ReachabilityCache::new(BackoffConfig::prod()),
         })
     }
 
@@ -892,6 +989,130 @@ impl HostPool {
             )
         })?;
         Ok(handle)
+    }
+
+    /// 12e-perf: returns true if `host_id` is a tracked remote
+    /// host currently in Dead state with `now` preceding the
+    /// scheduled retry. Callers in the push fanout
+    /// (`push_*_to_host` in `tui/src/app.rs`) consult this BEFORE
+    /// calling `for_host` so an unreachable remote doesn't gate
+    /// a manifest save on the 3s SSH spawn timeout.
+    ///
+    /// Always false for untracked hosts (local-Unix loopback)
+    /// and for tracked hosts with no recorded failure.
+    pub fn should_skip_for_push(
+        &self,
+        host_id: &HostId,
+        now: Instant,
+    ) -> bool {
+        if !self.tracked_hosts.contains(host_id) {
+            return false;
+        }
+        let state = self
+            .reachability
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        matches!(
+            state.get(host_id),
+            Some(ReachabilityState::Dead { next_retry, .. })
+                if now < *next_retry,
+        )
+    }
+
+    /// 12e-perf: record a successful push. Clears any Dead state
+    /// for `host_id` and emits a one-shot "back online" log on the
+    /// Dead → Live transition. No-op for untracked hosts.
+    pub fn mark_push_success(&self, host_id: &HostId) {
+        if !self.tracked_hosts.contains(host_id) {
+            return;
+        }
+        let mut state = self
+            .reachability
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let was_dead = matches!(
+            state.get(host_id),
+            Some(ReachabilityState::Dead { .. }),
+        );
+        state.insert(host_id.clone(), ReachabilityState::Live);
+        // Drop the lock before logging to keep the critical
+        // section small.
+        drop(state);
+        if was_dead {
+            eprintln!(
+                "cm-tui: host `{}` reachable again — pushes resume",
+                host_id.as_str(),
+            );
+        }
+    }
+
+    /// 12e-perf: record a failed push. Marks Dead with a
+    /// doubling backoff (seeded at `BackoffConfig::initial`,
+    /// capped at `max`). Emits a one-shot "now considered
+    /// offline" log on the Live → Dead transition; continued
+    /// failures are silent (just extend the backoff). No-op for
+    /// untracked hosts.
+    pub fn mark_push_failure(&self, host_id: &HostId, now: Instant) {
+        if !self.tracked_hosts.contains(host_id) {
+            return;
+        }
+        let mut state = self
+            .reachability
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cfg = self.reachability.config;
+        let (new_backoff, was_live) = match state.get(host_id) {
+            Some(ReachabilityState::Dead { last_backoff, .. }) => {
+                let doubled =
+                    last_backoff.saturating_mul(cfg.multiplier);
+                let capped = if doubled > cfg.max {
+                    cfg.max
+                } else {
+                    doubled
+                };
+                (capped, false)
+            }
+            _ => (cfg.initial, true),
+        };
+        state.insert(
+            host_id.clone(),
+            ReachabilityState::Dead {
+                next_retry: now + new_backoff,
+                last_backoff: new_backoff,
+            },
+        );
+        drop(state);
+        if was_live {
+            eprintln!(
+                "cm-tui: host `{}` push failed — suppressing pushes \
+                 for {:?} (next retry on first push after that)",
+                host_id.as_str(),
+                new_backoff,
+            );
+        }
+    }
+
+    /// Test helper: override the backoff config so tests can run
+    /// without sleeping for the production 10s initial. Tests
+    /// pass arbitrary `Instant` values through
+    /// `mark_push_failure` / `should_skip_for_push`, so the only
+    /// reason to call this is to verify the doubling/capping
+    /// arithmetic at faster intervals.
+    #[cfg(test)]
+    pub(crate) fn set_backoff_for_test(
+        &mut self,
+        initial: Duration,
+        max: Duration,
+        multiplier: u32,
+    ) {
+        self.reachability.config = BackoffConfig {
+            initial,
+            max,
+            multiplier,
+        };
     }
 
     /// Test helper: number of entries in the pool.
@@ -1878,9 +2099,13 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
                 cm_daemon::default_socket_path(),
             ),
         );
+        let mut tracked: HashSet<HostId> = HashSet::new();
+        tracked.insert(host_id.clone());
         let pool = HostPool {
             entries,
             default_host_id: HostId::local(),
+            tracked_hosts: tracked,
+            reachability: ReachabilityCache::new(BackoffConfig::prod()),
         };
 
         let result = pool.for_host(&host_id);
@@ -2257,5 +2482,328 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
             }
             Ok(_) => panic!("spawn should have errored on early exit"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // 12e-perf acceptance: per-host reachability cache.
+    //
+    // The slice ships the cache + early-skip; the production trigger
+    // is the three `push_*_to_host` helpers in `tui/src/app.rs`.
+    // Standing up a full App for tests is heavy, so the four
+    // acceptance invariants are pinned here at the HostPool level —
+    // same state machine, same constructors, same `Instant`-as-
+    // parameter shape that the production call sites use.
+    // ---------------------------------------------------------------
+
+    /// Build a HostPool with one local-Unix entry (default,
+    /// untracked) and one ssh-unix entry (tracked) whose
+    /// `command` is a bin that doesn't exist. `for_host(ssh)`
+    /// fails synchronously inside `SshTunnel::spawn` (no 3s wait —
+    /// the spawn errors at `Command::spawn` because the binary is
+    /// missing) so the test runs fast while still hitting the
+    /// `for_host → mark_push_failure` path.
+    fn pool_with_dead_ssh(host_name: &str) -> (HostPool, HostId) {
+        let host_id = HostId::new(host_name);
+        let bad_command =
+            PathBuf::from("/nonexistent/bin/that/never/exists-xyz");
+        let spec = SshTunnelSpec::with_explicit_socket(
+            "ghost-host".into(),
+            None,
+            PathBuf::from("/tmp/ignored-by-test.sock"),
+            PathBuf::from("/tmp/ignored-remote.sock"),
+            bad_command,
+            vec!["-N".into()],
+        );
+        let mut entries: HashMap<HostId, ConnectionHandle> =
+            HashMap::new();
+        entries.insert(
+            HostId::local(),
+            ConnectionHandle::unix_direct(PathBuf::from(
+                "/tmp/local-unused.sock",
+            )),
+        );
+        entries.insert(host_id.clone(), ConnectionHandle::ssh_unix(spec));
+        let mut tracked: HashSet<HostId> = HashSet::new();
+        tracked.insert(host_id.clone());
+        let pool = HostPool {
+            entries,
+            default_host_id: HostId::local(),
+            tracked_hosts: tracked,
+            reachability: ReachabilityCache::new(BackoffConfig::prod()),
+        };
+        (pool, host_id)
+    }
+
+    /// T_g3e_perf_dead_host_skipped_after_first_failure
+    ///
+    /// First push attempt against a dead ssh-unix host takes the
+    /// normal SSH-fail time (here, the synchronous spawn-failure
+    /// time of a missing binary). The SECOND push within the
+    /// backoff window completes in <50ms because
+    /// `should_skip_for_push` returns true and the dial is
+    /// skipped entirely.
+    #[test]
+    fn t_g3e_perf_dead_host_skipped_after_first_failure() {
+        let _guard = crate::test_support::home_lock();
+        let (pool, host_id) = pool_with_dead_ssh("dead-1");
+
+        // First attempt: `for_host` runs `ensure_alive` →
+        // `SshTunnel::spawn` → `Command::spawn` errors because
+        // the binary doesn't exist. Whatever time it takes, the
+        // important shape is: the call did run + Err'd.
+        assert!(
+            !pool.should_skip_for_push(&host_id, Instant::now()),
+            "fresh pool entry must not be skipped on first attempt",
+        );
+        let result = pool.for_host(&host_id);
+        assert!(
+            result.is_err(),
+            "for_host must Err for a dead ssh-unix host",
+        );
+        // Mark the failure, matching what the push helpers in
+        // app.rs do on for_host error.
+        let t_failure = Instant::now();
+        pool.mark_push_failure(&host_id, t_failure);
+
+        // Second attempt within the backoff window: the cache
+        // says Dead, `should_skip_for_push` returns true, and
+        // the call site returns early without dialing.
+        let t_second = t_failure + Duration::from_millis(10);
+        let start = Instant::now();
+        let skip = pool.should_skip_for_push(&host_id, t_second);
+        let elapsed = start.elapsed();
+        assert!(
+            skip,
+            "second attempt within the 10s default backoff must be skipped",
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "should_skip_for_push must be a HashMap lookup; got {:?}",
+            elapsed,
+        );
+    }
+
+    /// T_g3e_perf_dead_host_retried_after_ttl
+    ///
+    /// After the backoff window elapses, the next push attempts
+    /// the dial again. On continued failure, the backoff
+    /// doubles. Uses arbitrary `Instant` values rather than
+    /// wall-clock sleeps so the test runs instantly.
+    #[test]
+    fn t_g3e_perf_dead_host_retried_after_ttl() {
+        let _guard = crate::test_support::home_lock();
+        let (mut pool, host_id) = pool_with_dead_ssh("dead-2");
+        // Use a short test-only initial to verify both the
+        // doubling arithmetic AND that the values land where the
+        // arithmetic says they should. Cap of 200ms means the
+        // 3rd consecutive failure tops out at the cap rather
+        // than 4× initial.
+        pool.set_backoff_for_test(
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            2,
+        );
+
+        let t0 = Instant::now();
+        pool.mark_push_failure(&host_id, t0);
+        // Just before the 50ms window expires → still skipped.
+        assert!(
+            pool.should_skip_for_push(
+                &host_id,
+                t0 + Duration::from_millis(49),
+            ),
+            "still within initial 50ms backoff — must skip",
+        );
+        // Just after the window → no longer skipped (retry now).
+        assert!(
+            !pool.should_skip_for_push(
+                &host_id,
+                t0 + Duration::from_millis(51),
+            ),
+            "past initial 50ms backoff — must attempt dial again",
+        );
+
+        // Second failure at the retry boundary → doubling lands
+        // at 100ms.
+        let t1 = t0 + Duration::from_millis(51);
+        pool.mark_push_failure(&host_id, t1);
+        assert!(
+            pool.should_skip_for_push(
+                &host_id,
+                t1 + Duration::from_millis(99),
+            ),
+            "still within doubled 100ms window — must skip",
+        );
+        assert!(
+            !pool.should_skip_for_push(
+                &host_id,
+                t1 + Duration::from_millis(101),
+            ),
+            "past doubled 100ms window — must attempt dial again",
+        );
+
+        // Third failure → doubling lands at 200ms (cap).
+        let t2 = t1 + Duration::from_millis(101);
+        pool.mark_push_failure(&host_id, t2);
+        assert!(
+            pool.should_skip_for_push(
+                &host_id,
+                t2 + Duration::from_millis(199),
+            ),
+            "still within capped 200ms window — must skip",
+        );
+        assert!(
+            !pool.should_skip_for_push(
+                &host_id,
+                t2 + Duration::from_millis(201),
+            ),
+            "past capped 200ms window — must attempt dial again",
+        );
+
+        // Fourth failure → doubling would be 400ms but cap is
+        // 200ms; verify the cap holds rather than doubling
+        // unbounded.
+        let t3 = t2 + Duration::from_millis(201);
+        pool.mark_push_failure(&host_id, t3);
+        assert!(
+            pool.should_skip_for_push(
+                &host_id,
+                t3 + Duration::from_millis(199),
+            ),
+            "still within capped backoff after the 4th failure",
+        );
+        assert!(
+            !pool.should_skip_for_push(
+                &host_id,
+                t3 + Duration::from_millis(201),
+            ),
+            "cap must hold — backoff after 4th failure is still 200ms, \
+             not 400ms",
+        );
+    }
+
+    /// T_g3e_perf_live_host_unaffected
+    ///
+    /// A local-Unix host is never marked Dead even if its
+    /// sibling ssh-unix host is in backoff. Local hosts are
+    /// loopback — the daemon socket is on the same machine, the
+    /// daemon is launched at TUI startup, and a failure there is
+    /// a real fault we want to retry on every push (not back
+    /// off).
+    #[test]
+    fn t_g3e_perf_live_host_unaffected() {
+        let _guard = crate::test_support::home_lock();
+        let (pool, ssh_host_id) = pool_with_dead_ssh("dead-3");
+        let local_id = HostId::local();
+
+        // Local-Unix is untracked, so:
+        //   - mark_push_failure is a no-op
+        //   - mark_push_success is a no-op
+        //   - should_skip_for_push always returns false
+        pool.mark_push_failure(&local_id, Instant::now());
+        assert!(
+            !pool.should_skip_for_push(&local_id, Instant::now()),
+            "local-Unix host must never enter Dead state",
+        );
+
+        // Mark the ssh-unix sibling Dead.
+        pool.mark_push_failure(&ssh_host_id, Instant::now());
+        assert!(
+            pool.should_skip_for_push(&ssh_host_id, Instant::now()),
+            "ssh-unix sibling must be marked Dead",
+        );
+
+        // Local-Unix is still Live regardless of the sibling.
+        assert!(
+            !pool.should_skip_for_push(&local_id, Instant::now()),
+            "Dead ssh-unix sibling must not affect the local-Unix host",
+        );
+    }
+
+    /// Regression: a dead host doesn't gate other hosts' pushes.
+    ///
+    /// The push fanout in `app.rs` calls `should_skip_for_push`
+    /// per-host inside the loop. This test mimics that loop: for
+    /// each host in the pool, consult the cache; the local host's
+    /// "would I push?" answer must remain `yes` even when the
+    /// ssh sibling is `no` (skip).
+    #[test]
+    fn t_g3e_perf_dead_host_does_not_gate_live_host_push() {
+        let _guard = crate::test_support::home_lock();
+        let (pool, ssh_host_id) = pool_with_dead_ssh("dead-4");
+        let local_id = HostId::local();
+
+        pool.mark_push_failure(&ssh_host_id, Instant::now());
+
+        // Mirror the push fanout pattern in `push_state_to_daemon`:
+        // for each host_id, decide whether to skip; collect the
+        // skip-decisions to confirm the live host still runs.
+        let mut decisions: Vec<(HostId, bool)> = Vec::new();
+        for host_id in [local_id.clone(), ssh_host_id.clone()] {
+            let skip = pool.should_skip_for_push(&host_id, Instant::now());
+            decisions.push((host_id, skip));
+        }
+        assert_eq!(
+            decisions,
+            vec![(local_id, false), (ssh_host_id, true)],
+            "live local-Unix push must proceed even when ssh-unix \
+             sibling is in Dead-backoff",
+        );
+    }
+
+    /// Recovery transition: a Dead host that subsequently
+    /// succeeds (e.g. the operator brought the tunnel back up)
+    /// clears the cache entry. The next push for that host
+    /// proceeds without consulting backoff state.
+    #[test]
+    fn dead_host_clears_on_successful_push() {
+        let _guard = crate::test_support::home_lock();
+        let (pool, ssh_host_id) = pool_with_dead_ssh("recover-1");
+
+        let t0 = Instant::now();
+        pool.mark_push_failure(&ssh_host_id, t0);
+        assert!(
+            pool.should_skip_for_push(
+                &ssh_host_id,
+                t0 + Duration::from_millis(10),
+            ),
+            "host is Dead after first failure",
+        );
+
+        // Simulate the next push (post-TTL) succeeding —
+        // production-side this is `rpc_*` returning Ok.
+        pool.mark_push_success(&ssh_host_id);
+        assert!(
+            !pool.should_skip_for_push(
+                &ssh_host_id,
+                t0 + Duration::from_millis(20),
+            ),
+            "success must clear Dead state regardless of next_retry",
+        );
+
+        // And a subsequent failure starts the backoff from the
+        // initial again, not from where it left off — verifies
+        // the cache key got fully reset, not just `next_retry`
+        // patched.
+        let t1 = t0 + Duration::from_secs(1);
+        pool.mark_push_failure(&ssh_host_id, t1);
+        // With production initial = 10s, the second-attempt
+        // skip window starts at the same 10s, not at a doubled
+        // 20s from the prior cycle.
+        assert!(
+            pool.should_skip_for_push(
+                &ssh_host_id,
+                t1 + Duration::from_secs(9),
+            ),
+            "post-recovery failure must re-seed from initial backoff",
+        );
+        assert!(
+            !pool.should_skip_for_push(
+                &ssh_host_id,
+                t1 + Duration::from_secs(11),
+            ),
+            "post-recovery failure must NOT carry over the prior \
+             doubled backoff",
+        );
     }
 }
