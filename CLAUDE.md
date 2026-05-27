@@ -106,10 +106,13 @@ indexes into the tree-aware visible-rows projection (not raw
 `GridLayout`), and `Space` toggles a parent's fold. The cursor stays
 on the same task across fold toggles. Default state is fully
 collapsed; fold state lives in memory only (resets on restart).
-Raw-layout mutations (`A-J/K` reorder, `A-H/L` move-column, separator
-/empty/header inserts, status cycling on layout slots) no-op when
-the cursor is on a synthetic subtask row — subtasks have no raw
-position to operate on. Task-level ops (`A-d` done, `A-s/S` status,
+Raw-layout mutations (`A-H/L` move-column, separator/empty/header
+inserts, status cycling on layout slots) no-op when the cursor is
+on a synthetic subtask row — subtasks have no raw position to
+operate on. `A-J/K` reorder is the exception: on a subtask it
+swaps with the adjacent sibling under the same parent (clamped
+to the parent's slot range, so subtasks never leak out from
+under their parent). Task-level ops (`A-d` done, `A-s/S` status,
 `A-e` edit, `A-x` delete, `A-f` launch) work on subtasks normally
 since they go through the slug, not the raw layout.
 

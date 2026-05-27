@@ -1086,7 +1086,7 @@ impl PlanningView {
                     0
                 });
             let insert_at = if self.cursor_project_idx() == Some(pi) {
-                let raw = self.anchor_raw_idx().unwrap_or_else(|| {
+                let raw = self.insert_anchor_raw_idx().unwrap_or_else(|| {
                     self.project_data[pi].layout.columns[ci].len().saturating_sub(1)
                 });
                 (raw + 1).min(self.project_data[pi].layout.columns[ci].len())
@@ -2438,30 +2438,122 @@ impl PlanningView {
         if let Some((range_start, range_end)) = self.visual_range() {
             self.move_visual_block(pi, ci, range_start, range_end, direction);
         } else {
-            // Synthetic subtask rows have no raw position — reordering
-            // them in their own column is meaningless. Skip.
-            let ri = match self.cursor_raw_idx() { Some(r) => r, None => return };
-            let target = match self.next_visible_row(pi, ci, ri, direction) {
-                Some(t) => t,
-                None => {
-                    if direction <= 0 { return; }
-                    let col = &mut self.project_data[pi].layout.columns[ci];
-                    col.push(GridItem::Empty);
-                    col.len() - 1
+            match self.cursor_raw_idx() {
+                Some(ri) => {
+                    let target = match self.next_visible_row(pi, ci, ri, direction) {
+                        Some(t) => t,
+                        None => {
+                            if direction <= 0 { return; }
+                            let col = &mut self.project_data[pi].layout.columns[ci];
+                            col.push(GridItem::Empty);
+                            col.len() - 1
+                        }
+                    };
+                    self.project_data[pi].layout.columns[ci].swap(ri, target);
+                    // Recompute cursor row in visible-row space — find the
+                    // swapped item's new raw_idx in the new visible list.
+                    if let Some(rows) = self.cursor_visible_column() {
+                        if let Some(idx) = rows.iter().position(|r| matches!(&r.kind, VisibleRowKind::Layout { raw_idx, .. } if *raw_idx == target)) {
+                            self.cursor.row = idx;
+                        }
+                    }
                 }
-            };
-            self.project_data[pi].layout.columns[ci].swap(ri, target);
-            // Recompute cursor row in visible-row space — find the
-            // swapped item's new raw_idx in the new visible list.
-            if let Some(rows) = self.cursor_visible_column() {
-                if let Some(idx) = rows.iter().position(|r| matches!(&r.kind, VisibleRowKind::Layout { raw_idx, .. } if *raw_idx == target)) {
-                    self.cursor.row = idx;
+                None => {
+                    // Synthetic subtask row — swap with adjacent sibling
+                    // under the same parent. Bails (no layout change) at
+                    // the sibling-list boundary so subtasks stay confined
+                    // to under-parent slots.
+                    if !self.reorder_subtask_within_siblings(pi, direction) {
+                        return;
+                    }
                 }
             }
         }
         self.save_project_layout(pi);
         self.recompute_conflicts();
         self.ensure_cursor_visible();
+    }
+
+    /// Swap the focused subtask with its adjacent sibling under the same
+    /// parent. The swap is performed on the raw `GridItem::Task` slots in
+    /// the layout (across columns if needed) since sibling order is encoded
+    /// by column-walk position. Returns true on swap, false when the
+    /// subtask is at the sibling-list boundary in `direction` or when a
+    /// state lookup fails.
+    fn reorder_subtask_within_siblings(&mut self, pi: usize, direction: i32) -> bool {
+        let row = match self.cursor_visible_row() { Some(r) => r, None => return false };
+        let slug = match row.kind {
+            VisibleRowKind::Subtask { slug } => slug,
+            _ => return false,
+        };
+        let pd = match self.project_data.get(pi) { Some(p) => p, None => return false };
+        let parent_id = match pd.tasks.iter().find(|t| t.slug == slug)
+            .and_then(|t| t.parent_task_id.clone())
+        {
+            Some(p) => p,
+            None => return false,
+        };
+        if !pd.tasks.iter().any(|t| t.id == parent_id) { return false; }
+
+        // Build sibling slug list in column-walk order. Mirrors the
+        // children_of construction in visible_rows_for_column, and
+        // honours show_archived so the swap target matches what the
+        // user sees.
+        let task_by_slug: HashMap<&str, &PlanTask> = pd.tasks.iter()
+            .map(|t| (t.slug.as_str(), t))
+            .collect();
+        let mut siblings: Vec<String> = Vec::new();
+        for col in &pd.layout.columns {
+            for item in col {
+                if let GridItem::Task(s) = item {
+                    let t = match task_by_slug.get(s.as_str()) { Some(t) => *t, None => continue };
+                    if t.parent_task_id.as_deref() != Some(&parent_id) { continue; }
+                    if !self.show_archived && t.status == PlanStatus::Archived { continue; }
+                    siblings.push(s.clone());
+                }
+            }
+        }
+
+        let cur_idx = match siblings.iter().position(|s| s == &slug) {
+            Some(i) => i,
+            None => return false,
+        };
+        let tgt_idx = cur_idx as i32 + direction;
+        if tgt_idx < 0 || tgt_idx as usize >= siblings.len() { return false; }
+        let other = siblings[tgt_idx as usize].clone();
+
+        let find_pos = |target: &str| -> Option<(usize, usize)> {
+            for (ci, col) in pd.layout.columns.iter().enumerate() {
+                for (ri, item) in col.iter().enumerate() {
+                    if let GridItem::Task(s) = item {
+                        if s == target { return Some((ci, ri)); }
+                    }
+                }
+            }
+            None
+        };
+        let cur_pos = match find_pos(&slug) { Some(p) => p, None => return false };
+        let oth_pos = match find_pos(&other) { Some(p) => p, None => return false };
+
+        // Drop the immutable borrow before mutating.
+        let _ = pd;
+        let cols = &mut self.project_data[pi].layout.columns;
+        if cur_pos.0 == oth_pos.0 {
+            cols[cur_pos.0].swap(cur_pos.1, oth_pos.1);
+        } else {
+            let cur_item = std::mem::replace(&mut cols[cur_pos.0][cur_pos.1], GridItem::Empty);
+            let oth_item = std::mem::replace(&mut cols[oth_pos.0][oth_pos.1], GridItem::Empty);
+            cols[cur_pos.0][cur_pos.1] = oth_item;
+            cols[oth_pos.0][oth_pos.1] = cur_item;
+        }
+
+        // Refocus the moved subtask in the rebuilt visible-row list.
+        if let Some(rows) = self.cursor_visible_column() {
+            if let Some(idx) = rows.iter().position(|r| matches!(&r.kind, VisibleRowKind::Subtask { slug: s } if s == &slug)) {
+                self.cursor.row = idx;
+            }
+        }
+        true
     }
 
     /// Walk `direction` from `from_row` and return the first row whose item
@@ -2610,16 +2702,47 @@ impl PlanningView {
         self.clamp_cursor();
     }
 
-    /// Anchor for inserts/removes. Resolves cursor.row (visible) to a
-    /// raw layout index. When cursor is on a synthetic subtask row,
-    /// returns the raw index of the parent's row in this column so
-    /// inserts land just after the parent's subtree.
+    /// Anchor for ops that target the cursor's exact raw item (e.g.
+    /// `remove_separator`, `update_header_at_cursor`). Returns `None`
+    /// for synthetic subtask rows — they have no raw slot, so the
+    /// op should no-op rather than silently mutate something else.
     fn anchor_raw_idx(&self) -> Option<usize> {
         let row = self.cursor_visible_row()?;
         match row.kind {
             VisibleRowKind::Layout { raw_idx, .. } => Some(raw_idx),
             VisibleRowKind::Subtask { .. } => None,
         }
+    }
+
+    /// Anchor for inserts (new task / separator / header land at
+    /// `result + 1`). For a synthetic subtask cursor row, walks up the
+    /// `parent_task_id` chain to the top-level ancestor in the
+    /// cursor's column and returns ITS raw idx, so inserts drop in
+    /// just after the parent's subtree instead of falling through to
+    /// end-of-column. By construction, the top-level ancestor of any
+    /// visible subtask row in column `ci` lives in `ci` — that's why
+    /// the subtree renders there at all.
+    fn insert_anchor_raw_idx(&self) -> Option<usize> {
+        let row = self.cursor_visible_row()?;
+        let slug = match row.kind {
+            VisibleRowKind::Layout { raw_idx, .. } => return Some(raw_idx),
+            VisibleRowKind::Subtask { slug } => slug,
+        };
+        let (pi, ci) = *self.unified_cols.get(self.cursor.col)?;
+        let pd = self.project_data.get(pi)?;
+        let by_id: HashMap<&str, &PlanTask> =
+            pd.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let mut cur = pd.tasks.iter().find(|t| t.slug == slug)?;
+        while let Some(pid) = cur.parent_task_id.as_deref() {
+            match by_id.get(pid).copied() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        let top_slug = cur.slug.as_str();
+        pd.layout.columns.get(ci)?
+            .iter()
+            .position(|item| matches!(item, GridItem::Task(s) if s == top_slug))
     }
 
     fn insert_separator(&mut self) {
@@ -4863,5 +4986,228 @@ mod tests {
         assert_eq!(out, "real prompt");
         let out = compose_launch_prompt("real desc", "  \t", "T");
         assert_eq!(out, "real desc");
+    }
+
+    // ── A-J/K reorder on synthetic subtask rows ─────────────────
+    //
+    // Subtasks have no raw position in their own column (they render
+    // under the parent). A-J/K used to no-op on synthetic rows; now
+    // they swap with the adjacent sibling under the same parent, and
+    // bail at the sibling-list boundary so subtasks never leak out of
+    // the parent's slots.
+
+    fn setup_subtask_reorder_view() -> PlanningView {
+        // Layout: column 0 holds parent + three children in order
+        // [c1, c2, c3]; child slugs are also their task ids for clarity.
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("p1", "parent", None),
+            make_task("c1", "c1", Some("p1")),
+            make_task("c2", "c2", Some("p1")),
+            make_task("c3", "c3", Some("p1")),
+        ];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("parent".to_string()),
+            GridItem::Task("c1".to_string()),
+            GridItem::Task("c2".to_string()),
+            GridItem::Task("c3".to_string()),
+        ]];
+        view.project_data.push(pd);
+        view.rebuild_unified_cols();
+        view.expanded_tasks.insert("p1".to_string());
+        view
+    }
+
+    fn column_slugs(view: &PlanningView, pi: usize, ci: usize) -> Vec<String> {
+        view.project_data[pi].layout.columns[ci]
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Task(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reorder_subtask_swaps_with_next_sibling() {
+        let mut view = setup_subtask_reorder_view();
+        // Visible rows in column 0: [parent, c1, c2, c3]. Cursor on c2.
+        view.cursor = GridCursor { col: 0, row: 2 };
+        view.reorder_task(1);
+        assert_eq!(column_slugs(&view, 0, 0), vec!["parent", "c1", "c3", "c2"]);
+        // Cursor follows the moved subtask: c2 is now at visible row 3.
+        let row = view.cursor_visible_row().expect("row");
+        assert!(matches!(row.kind, VisibleRowKind::Subtask { slug } if slug == "c2"));
+    }
+
+    #[test]
+    fn reorder_subtask_swaps_with_previous_sibling() {
+        let mut view = setup_subtask_reorder_view();
+        // Cursor on c2.
+        view.cursor = GridCursor { col: 0, row: 2 };
+        view.reorder_task(-1);
+        assert_eq!(column_slugs(&view, 0, 0), vec!["parent", "c2", "c1", "c3"]);
+        let row = view.cursor_visible_row().expect("row");
+        assert!(matches!(row.kind, VisibleRowKind::Subtask { slug } if slug == "c2"));
+    }
+
+    #[test]
+    fn reorder_subtask_at_top_of_siblings_is_noop() {
+        let mut view = setup_subtask_reorder_view();
+        // Cursor on c1 (first sibling).
+        view.cursor = GridCursor { col: 0, row: 1 };
+        view.reorder_task(-1);
+        // Layout unchanged — c1 stays at top of sibling list.
+        assert_eq!(column_slugs(&view, 0, 0), vec!["parent", "c1", "c2", "c3"]);
+    }
+
+    #[test]
+    fn reorder_subtask_at_bottom_of_siblings_is_noop() {
+        let mut view = setup_subtask_reorder_view();
+        // Cursor on c3 (last sibling).
+        view.cursor = GridCursor { col: 0, row: 3 };
+        view.reorder_task(1);
+        // Crucially, c3 must NOT escape out of the parent's slots
+        // (e.g. by appending an Empty and swapping past it).
+        assert_eq!(column_slugs(&view, 0, 0), vec!["parent", "c1", "c2", "c3"]);
+    }
+
+    #[test]
+    fn reorder_subtask_swaps_across_columns() {
+        // Children of the same parent can live in different columns.
+        // The sibling order is column-walk order (left→right, then
+        // top→bottom), so swapping across columns is a real case.
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("p1", "parent", None),
+            make_task("c1", "c1", Some("p1")),
+            make_task("c2", "c2", Some("p1")),
+        ];
+        // Parent + c1 in col 0; c2 in col 1. Sibling list = [c1, c2].
+        pd.layout.columns = vec![
+            vec![
+                GridItem::Task("parent".to_string()),
+                GridItem::Task("c1".to_string()),
+            ],
+            vec![GridItem::Task("c2".to_string())],
+        ];
+        view.project_data.push(pd);
+        view.rebuild_unified_cols();
+        view.expanded_tasks.insert("p1".to_string());
+
+        // Cursor on c1 (visible row 1 of col 0). Move down to swap
+        // with c2, which lives in col 1.
+        view.cursor = GridCursor { col: 0, row: 1 };
+        view.reorder_task(1);
+        // c1 and c2 have swapped raw positions across columns.
+        assert_eq!(column_slugs(&view, 0, 0), vec!["parent", "c2"]);
+        assert_eq!(column_slugs(&view, 0, 1), vec!["c1"]);
+    }
+
+    // ── insert_anchor_raw_idx ───────────────────────────────────
+    //
+    // When the cursor is on a synthetic subtask row, the old
+    // `anchor_raw_idx` returned None and `on_task_created`'s fallback
+    // appended to `column.len() - 1` — i.e. end of column, "way at the
+    // bottom of the screen". The new insert anchor walks up to the
+    // top-level ancestor in the cursor's column so new tasks land just
+    // after the parent's subtree.
+
+    #[test]
+    fn insert_anchor_returns_top_level_ancestor_for_subtask_cursor() {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("top", "top", None),
+            make_task("child", "child", Some("top")),
+            make_task("grand", "grand", Some("child")),
+            make_task("tail", "tail", None),
+        ];
+        // Column 0 raw layout: [top, child, grand, tail].
+        // With top expanded and child expanded, visible rows are
+        // [top, child, grand, tail].
+        pd.layout.columns = vec![vec![
+            GridItem::Task("top".to_string()),
+            GridItem::Task("child".to_string()),
+            GridItem::Task("grand".to_string()),
+            GridItem::Task("tail".to_string()),
+        ]];
+        view.project_data.push(pd);
+        view.rebuild_unified_cols();
+        view.expanded_tasks.insert("top".to_string());
+        view.expanded_tasks.insert("child".to_string());
+
+        // Cursor on `grand` (depth-2 subtask, visible row 2).
+        view.cursor = GridCursor { col: 0, row: 2 };
+        // Sanity: grand IS a synthetic row (no raw_idx).
+        assert!(view.anchor_raw_idx().is_none());
+        // Insert anchor walks up to `top` (raw idx 0), so inserts land
+        // at raw idx 1 — directly after the parent's subtree once the
+        // subtree is filtered out of visible rendering.
+        assert_eq!(view.insert_anchor_raw_idx(), Some(0));
+    }
+
+    #[test]
+    fn insert_anchor_passes_through_for_layout_cursor() {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("a", "a", None),
+            make_task("b", "b", None),
+            make_task("c", "c", None),
+        ];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("a".to_string()),
+            GridItem::Task("b".to_string()),
+            GridItem::Task("c".to_string()),
+        ]];
+        view.project_data.push(pd);
+        view.rebuild_unified_cols();
+
+        view.cursor = GridCursor { col: 0, row: 1 };
+        // Normal row → same as anchor_raw_idx.
+        assert_eq!(view.insert_anchor_raw_idx(), Some(1));
+        assert_eq!(view.anchor_raw_idx(), Some(1));
+    }
+
+    #[test]
+    fn reorder_subtask_never_crosses_into_other_parents_children() {
+        // Two parents, each with two children. Cursor on parent A's
+        // last child — moving down must NOT swap it with parent B's
+        // first child even though that's the next visible task in
+        // column-walk order.
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        pd.tasks = vec![
+            make_task("pa", "pa", None),
+            make_task("pb", "pb", None),
+            make_task("a1", "a1", Some("pa")),
+            make_task("a2", "a2", Some("pa")),
+            make_task("b1", "b1", Some("pb")),
+            make_task("b2", "b2", Some("pb")),
+        ];
+        pd.layout.columns = vec![vec![
+            GridItem::Task("pa".to_string()),
+            GridItem::Task("a1".to_string()),
+            GridItem::Task("a2".to_string()),
+            GridItem::Task("pb".to_string()),
+            GridItem::Task("b1".to_string()),
+            GridItem::Task("b2".to_string()),
+        ]];
+        view.project_data.push(pd);
+        view.rebuild_unified_cols();
+        view.expanded_tasks.insert("pa".to_string());
+        view.expanded_tasks.insert("pb".to_string());
+
+        // Visible rows in col 0: [pa, a1, a2, pb, b1, b2]. Cursor on a2.
+        view.cursor = GridCursor { col: 0, row: 2 };
+        view.reorder_task(1);
+        // a2 is the last child of pa — must stay put.
+        assert_eq!(
+            column_slugs(&view, 0, 0),
+            vec!["pa", "a1", "a2", "pb", "b1", "b2"],
+        );
     }
 }
