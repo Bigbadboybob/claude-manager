@@ -151,24 +151,15 @@ pub fn should_spawn() -> bool {
 ///
 /// Called once from `App::new`.
 ///
-/// 12c: `socket_path` is passed in by the caller (resolved from
-/// `App.host_pool.default_handle().socket_path()`) rather than
-/// re-read from `cm_daemon::default_socket_path()` here. Routes
-/// the consumer's daemon-dial through the same host-pool that
-/// every other RPC site uses.
-///
-/// TODO(F2-deferred): SSH-unix tunnel death will not
-/// auto-recover here without a separate RPC firing
-/// `ensure_alive`. The path captured at `App::new` time is the
-/// per-spawn random path (round 3 F1) — if the ssh child dies
-/// and `ensure_alive` respawns at a NEW random path, this
-/// consumer thread keeps retrying the stale path until some
-/// other code path (`for_host` / `default_handle`) re-fires
-/// `ensure_alive`. For multi-host UX (12e) the consumer needs
-/// the `HostPool` itself (or a respawn-aware handle) instead of
-/// a static `PathBuf` snapshot.
+/// 12c: `socket_path` was passed in by the caller as a static
+/// `PathBuf`. 12e (F2 fix): now takes a
+/// [`crate::host_pool::SocketPathProvider`] — a closure that
+/// resolves to the *current* socket path on every dial attempt.
+/// After an SSH tunnel respawn at a new random path (round 3
+/// F1), the next reconnect picks up the new path automatically
+/// rather than retrying the stale one forever.
 pub fn maybe_spawn_for_app(
-    socket_path: PathBuf,
+    path_provider: crate::host_pool::SocketPathProvider,
 ) -> (
     Option<mpsc::Receiver<ManifestEvent>>,
     Option<JoinHandle<()>>,
@@ -176,26 +167,80 @@ pub fn maybe_spawn_for_app(
     if !should_spawn() {
         return (None, None);
     }
-    let consumer = spawn(socket_path);
+    let consumer = spawn(path_provider);
     (Some(consumer.event_rx), Some(consumer._thread))
 }
 
 /// Spawn the consumer thread + return the handle. Caller wires
 /// `diff_rx` into `App.manifest_watch_rx`.
 ///
-/// `socket_path` is resolved by the caller (production via
-/// `cm_daemon::default_socket_path()`; tests pass a path to a
-/// synthetic listener). Stays test-friendly.
-pub fn spawn(socket_path: PathBuf) -> ManifestWatchConsumer {
+/// `path_provider` is invoked at every reconnect attempt to get
+/// the current socket path. Production builds the provider from
+/// `Arc<HostPool>` + `HostId` via
+/// `crate::host_pool::path_provider_for_host`. Tests use
+/// [`fixed_path_provider`] for a stable path.
+pub fn spawn(
+    path_provider: crate::host_pool::SocketPathProvider,
+) -> ManifestWatchConsumer {
     let (event_tx, event_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("cm-tui-manifest-watch".to_string())
-        .spawn(move || run_consumer(&socket_path, event_tx))
+        .spawn(move || run_consumer_with_provider(&path_provider, event_tx))
         .expect("spawn manifest.watch consumer thread");
     ManifestWatchConsumer {
         event_rx,
         _thread: thread,
     }
+}
+
+/// Test helper: wrap a static path as a
+/// `SocketPathProvider` so existing tests stay simple.
+#[cfg(test)]
+pub(crate) fn fixed_path_provider(
+    path: PathBuf,
+) -> crate::host_pool::SocketPathProvider {
+    std::sync::Arc::new(move || Some(path.clone()))
+}
+
+/// 12e-r2 F2 (Option A): spawn one manifest.watch consumer
+/// per host in `hosts`. All consumers share a single
+/// `mpsc::Sender` so the App's drain loop reads events from
+/// every host through one `Receiver`. Pre-r2 we spawned a
+/// single consumer bound to `active_host` at App::new — a
+/// later `cycle_active_host` left sessions on the new host
+/// without live event streaming.
+///
+/// Single-host case: still one consumer, no overhead.
+pub fn spawn_per_host(
+    host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
+    hosts: &crate::hosts::HostsConfig,
+) -> (
+    Option<mpsc::Receiver<ManifestEvent>>,
+    Vec<JoinHandle<()>>,
+) {
+    if !should_spawn() {
+        return (None, Vec::new());
+    }
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut threads = Vec::new();
+    for host in &hosts.hosts {
+        let provider = crate::host_pool::path_provider_for_host(
+            host_pool,
+            host.id.clone(),
+        );
+        let tx = event_tx.clone();
+        let host_name = host.id.as_str().to_string();
+        let thread = std::thread::Builder::new()
+            .name(format!("cm-tui-manifest-watch-{}", host_name))
+            .spawn(move || run_consumer_with_provider(&provider, tx))
+            .expect("spawn manifest.watch consumer thread");
+        threads.push(thread);
+    }
+    // Drop the original sender so the receiver disconnects
+    // when ALL per-host consumers exit (otherwise it would
+    // wait indefinitely on this last sender).
+    drop(event_tx);
+    (Some(event_rx), threads)
 }
 
 /// Consumer thread body. Two nested loops:
@@ -207,15 +252,32 @@ pub fn spawn(socket_path: PathBuf) -> ManifestWatchConsumer {
 ///     outer for reconnect; on `SendError` (channel disconnect →
 ///     App gone), return entirely.
 ///
-/// Made `pub(crate)` so the 10e-c test module can drive it
-/// against a synthetic Unix listener.
-pub(crate) fn run_consumer(
-    socket_path: &Path,
+/// 12e (F2 fix): provider-based consumer loop. Each reconnect
+/// attempt calls `path_provider()` to get the *current* socket
+/// path so a respawned SSH tunnel's new random path is picked
+/// up automatically. Pre-12e the path was static, captured at
+/// `App::new` time, and would forever miss the new path after
+/// a tunnel respawn.
+pub(crate) fn run_consumer_with_provider(
+    path_provider: &crate::host_pool::SocketPathProvider,
     event_tx: mpsc::Sender<ManifestEvent>,
 ) {
     let mut backoff = RECONNECT_BACKOFF_BASE;
     loop {
-        match connect_and_subscribe(socket_path) {
+        let Some(socket_path) = path_provider() else {
+            // No socket path available (e.g. SSH tunnel hasn't
+            // spawned yet, or pool lookup failed). Treat as a
+            // transient connect failure — backoff + retry.
+            eprintln!(
+                "cm-tui: manifest.watch path_provider returned None \
+                 (retrying in {}s)",
+                backoff.as_secs(),
+            );
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            continue;
+        };
+        match connect_and_subscribe(&socket_path) {
             Ok(stream) => {
                 // Reset backoff on each successful subscription.
                 // A flaky daemon that goes down/up shouldn't
@@ -234,7 +296,9 @@ pub(crate) fn run_consumer(
             }
             Err(e) => {
                 eprintln!(
-                    "cm-tui: manifest.watch connect failed: {} (retrying in {}s)",
+                    "cm-tui: manifest.watch connect to {} failed: {} \
+                     (retrying in {}s)",
+                    socket_path.display(),
                     e,
                     backoff.as_secs(),
                 );
@@ -243,6 +307,23 @@ pub(crate) fn run_consumer(
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
+}
+
+/// Backward-compatible test seam: wraps `socket_path` in a
+/// fixed-path provider and dispatches to
+/// `run_consumer_with_provider`. Production no longer uses this
+/// — the path provider goes all the way through. Kept for tests
+/// that drive the consumer against a synthetic listener with a
+/// fixed path.
+pub(crate) fn run_consumer(
+    socket_path: &Path,
+    event_tx: mpsc::Sender<ManifestEvent>,
+) {
+    let provider: crate::host_pool::SocketPathProvider = {
+        let p = socket_path.to_path_buf();
+        std::sync::Arc::new(move || Some(p.clone()))
+    };
+    run_consumer_with_provider(&provider, event_tx);
 }
 
 /// Why the inner stream loop ended. Drives the outer loop's

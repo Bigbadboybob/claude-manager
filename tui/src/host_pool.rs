@@ -735,6 +735,37 @@ pub struct HostPool {
     default_host_id: HostId,
 }
 
+/// 12e (F2 fix): a closure that returns the *current* socket
+/// path for a given host. Captures `Arc<HostPool>` + `HostId`;
+/// each invocation calls `pool.for_host(host_id)` which
+/// transparently respawns a dead SSH tunnel. Used by the
+/// watch-consumer threads in `manifest_watch` / `workflow_watch`
+/// so they pick up the new per-spawn-random socket path after
+/// a tunnel respawn.
+///
+/// Pre-12e (slice 12c) the consumers took a static `PathBuf`
+/// captured at `App::new` time — they couldn't recover from
+/// a tunnel respawn (round-3 random suffix changes per spawn).
+/// The 12d round-2 review flagged this as F2-deferred; this
+/// type is the 12e landing point.
+pub type SocketPathProvider =
+    Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
+/// Build a `SocketPathProvider` closure that resolves to the
+/// live socket path for `host_id` via `pool.for_host`. Each
+/// call triggers `ensure_alive` so a dead SSH tunnel respawns.
+pub fn path_provider_for_host(
+    pool: &Arc<HostPool>,
+    host_id: HostId,
+) -> SocketPathProvider {
+    let pool = Arc::clone(pool);
+    Arc::new(move || {
+        pool.for_host(&host_id)
+            .ok()
+            .and_then(|h| h.socket_path())
+    })
+}
+
 impl HostPool {
     /// Build the pool from a validated `HostsConfig`. Errors if
     /// any SshUnix entry can't resolve its tunnel-socket

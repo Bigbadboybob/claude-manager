@@ -79,24 +79,12 @@ pub fn should_spawn() -> bool {
 /// App-side helper: spawn the consumer and return the channel +
 /// thread handle. Called once from `App::new`.
 ///
-/// 12c: `socket_path` is passed in by the caller (resolved from
-/// `App.host_pool.default_handle().socket_path()`) rather than
-/// re-read from `cm_daemon::default_socket_path()` here. Routes
-/// the consumer's daemon-dial through the same host-pool that
-/// every other RPC site uses.
-///
-/// TODO(F2-deferred): SSH-unix tunnel death will not
-/// auto-recover here without a separate RPC firing
-/// `ensure_alive`. The path captured at `App::new` time is the
-/// per-spawn random path (round 3 F1) — if the ssh child dies
-/// and `ensure_alive` respawns at a NEW random path, this
-/// consumer thread keeps retrying the stale path until some
-/// other code path (`for_host` / `default_handle`) re-fires
-/// `ensure_alive`. For multi-host UX (12e) the consumer needs
-/// the `HostPool` itself (or a respawn-aware handle) instead of
-/// a static `PathBuf` snapshot.
+/// 12c: `socket_path` was a static `PathBuf`. 12e (F2 fix):
+/// now takes a [`crate::host_pool::SocketPathProvider`] so a
+/// respawned SSH tunnel's new random path is picked up
+/// automatically.
 pub fn maybe_spawn_for_app(
-    socket_path: PathBuf,
+    path_provider: crate::host_pool::SocketPathProvider,
 ) -> (
     Option<mpsc::Receiver<WorkflowWatchEvent>>,
     Option<JoinHandle<()>>,
@@ -104,15 +92,17 @@ pub fn maybe_spawn_for_app(
     if !should_spawn() {
         return (None, None);
     }
-    let consumer = spawn(socket_path);
+    let consumer = spawn(path_provider);
     (Some(consumer.event_rx), Some(consumer._thread))
 }
 
-pub fn spawn(socket_path: PathBuf) -> WorkflowWatchConsumer {
+pub fn spawn(
+    path_provider: crate::host_pool::SocketPathProvider,
+) -> WorkflowWatchConsumer {
     let (event_tx, event_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("cm-tui-workflow-watch".to_string())
-        .spawn(move || run_consumer(&socket_path, event_tx))
+        .spawn(move || run_consumer_with_provider(&path_provider, event_tx))
         .expect("spawn events.subscribe consumer thread");
     WorkflowWatchConsumer {
         event_rx,
@@ -120,13 +110,25 @@ pub fn spawn(socket_path: PathBuf) -> WorkflowWatchConsumer {
     }
 }
 
-pub(crate) fn run_consumer(
-    socket_path: &Path,
+/// 12e (F2 fix): provider-based consumer loop — same shape as
+/// `manifest_watch::run_consumer_with_provider`.
+pub(crate) fn run_consumer_with_provider(
+    path_provider: &crate::host_pool::SocketPathProvider,
     event_tx: mpsc::Sender<WorkflowWatchEvent>,
 ) {
     let mut backoff = RECONNECT_BACKOFF_BASE;
     loop {
-        match connect_and_subscribe(socket_path) {
+        let Some(socket_path) = path_provider() else {
+            eprintln!(
+                "cm-tui: events.subscribe path_provider returned None \
+                 (retrying in {}s)",
+                backoff.as_secs(),
+            );
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            continue;
+        };
+        match connect_and_subscribe(&socket_path) {
             Ok(stream) => {
                 backoff = RECONNECT_BACKOFF_BASE;
                 match drive_stream(stream, &event_tx) {
@@ -136,7 +138,9 @@ pub(crate) fn run_consumer(
             }
             Err(e) => {
                 eprintln!(
-                    "cm-tui: events.subscribe connect failed: {} (retrying in {}s)",
+                    "cm-tui: events.subscribe connect to {} failed: {} \
+                     (retrying in {}s)",
+                    socket_path.display(),
                     e,
                     backoff.as_secs(),
                 );
@@ -145,6 +149,59 @@ pub(crate) fn run_consumer(
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
+}
+
+/// Backward-compatible test seam — wraps a fixed path in a
+/// provider and dispatches to `run_consumer_with_provider`.
+pub(crate) fn run_consumer(
+    socket_path: &Path,
+    event_tx: mpsc::Sender<WorkflowWatchEvent>,
+) {
+    let provider: crate::host_pool::SocketPathProvider = {
+        let p = socket_path.to_path_buf();
+        std::sync::Arc::new(move || Some(p.clone()))
+    };
+    run_consumer_with_provider(&provider, event_tx);
+}
+
+/// Test helper: wrap a static path as a `SocketPathProvider`.
+#[cfg(test)]
+pub(crate) fn fixed_path_provider(
+    path: PathBuf,
+) -> crate::host_pool::SocketPathProvider {
+    std::sync::Arc::new(move || Some(path.clone()))
+}
+
+/// 12e-r2 F2 (Option A): spawn one events.subscribe consumer
+/// per host in `hosts`. Same shape as
+/// `manifest_watch::spawn_per_host`.
+pub fn spawn_per_host(
+    host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
+    hosts: &crate::hosts::HostsConfig,
+) -> (
+    Option<mpsc::Receiver<WorkflowWatchEvent>>,
+    Vec<JoinHandle<()>>,
+) {
+    if !should_spawn() {
+        return (None, Vec::new());
+    }
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut threads = Vec::new();
+    for host in &hosts.hosts {
+        let provider = crate::host_pool::path_provider_for_host(
+            host_pool,
+            host.id.clone(),
+        );
+        let tx = event_tx.clone();
+        let host_name = host.id.as_str().to_string();
+        let thread = std::thread::Builder::new()
+            .name(format!("cm-tui-workflow-watch-{}", host_name))
+            .spawn(move || run_consumer_with_provider(&provider, tx))
+            .expect("spawn events.subscribe consumer thread");
+        threads.push(thread);
+    }
+    drop(event_tx);
+    (Some(event_rx), threads)
 }
 
 enum DriveOutcome {

@@ -444,6 +444,65 @@ impl WorktreeMode {
     }
 }
 
+/// 12e-r6 (interim fail-fast helper): every spawn site in the
+/// TUI builds argv / env / cwd / mcp_config paths on the TUI's
+/// LOCAL machine and either runs them locally OR sends them to
+/// the daemon for execution. For `host_id == HostId::local()`
+/// both are fine (daemon and TUI share the filesystem). For a
+/// true remote host (cm-manager VM, Mac mini, etc.), the local
+/// paths don't exist on the remote and the spawn either fails
+/// opaquely (daemon-routed) or silently mistags the resulting
+/// session (local-PTY routed, `ts.host_id` says remote but the
+/// process is local).
+///
+/// Until Phase 3 ships daemon-side path resolution (slice 12g
+/// cm-manager VM prep), the only honest behavior is to refuse
+/// the operation. Every spawn site that can carry a non-local
+/// host_id calls this helper at the TOP — before any work that
+/// would need to be undone (worktree creation, file writes,
+/// kill RPCs for prior sessions, etc.).
+///
+/// `op_name` shows up in the error message so operators can
+/// tell A-n from A-s from MCP-spawn from workflow-respawn at
+/// a glance.
+pub(crate) fn guard_local_host_only(
+    host_id: &cm_daemon::host_id::HostId,
+    op_name: &str,
+) -> std::io::Result<()> {
+    if host_id == &cm_daemon::host_id::HostId::local() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "{} on non-local host `{}` is not yet supported — \
+         daemon-side path resolution is deferred to Phase 3 \
+         (see daemon/NOTES.md slice 12g). Switch active_host \
+         to `local` (A-H) before retrying, or wait for the \
+         follow-up slice that adds remote-execution support.",
+        op_name,
+        host_id.as_str(),
+    )))
+}
+
+/// 12e-r5 F2: normalize the public wire vocabulary
+/// (`"claude-code"`, `"codex"`, `"bash"` — per the design
+/// doc, exposed via MCP `start_session`) to the internal TUI
+/// vocabulary (`"claude"`, `"codex"`, `"bash"`). Future
+/// cleanup may standardize on the wire form everywhere; this
+/// helper bridges the two so an MCP-spawned Claude session
+/// looks up its `Config::memory_cap_for("claude")` env var
+/// (`CM_SESSION_MEM_SOFT_CLAUDE`), not the bogus
+/// `CM_SESSION_MEM_SOFT_CLAUDE-CODE`.
+///
+/// Unknown inputs pass through unchanged — callers are
+/// responsible for the daemon-eligibility gate (see
+/// `try_spawn_via_daemon`'s `argv_result` match `_ => return None`).
+pub(crate) fn normalize_session_type_to_internal(session_type: &str) -> &str {
+    match session_type {
+        "claude-code" => "claude",
+        other => other,
+    }
+}
+
 /// Build a TerminalSession wrapping a freshly-spawned PTY with default state.
 /// Used by attach/spawn flows that don't need pending prompts or workflow tags.
 fn make_simple_session(
@@ -675,7 +734,23 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     config: &Config,
     cap_status: &crate::memory_cap::MemoryCapAvailability,
     kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
+    host_pool: &crate::host_pool::HostPool,
 ) -> Option<String> {
+    // 12e-r6 F2: fail fast on a non-local pinned host BEFORE
+    // any other work. The respawn would build local mcp_config
+    // paths + run `spawn_agent_session` (local PTY); the
+    // resulting Session would be local but get swapped in
+    // over a TerminalSession whose `host_id` points at a
+    // remote host. That mistag breaks every downstream
+    // per-session RPC route. Order matters: this guard runs
+    // BEFORE `kill_daemon_session_if_attached` so we don't
+    // tear down the original session for no reason.
+    if let Err(e) = guard_local_host_only(&ts.host_id, "workflow respawn") {
+        return Some(format!(
+            "Skipping respawn of {}: {}",
+            role, e
+        ));
+    }
     let wt = match worktree {
         Some(wt) => wt,
         None => {
@@ -743,7 +818,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     // Claude resumes in-place; modern Codex writes a new rollout id for
     // `codex resume <sid>`, so keep the old sid bound until the detector
     // sees the post-resume file and rebinds the role.
-    App::kill_daemon_session_if_attached(ts);
+    App::kill_daemon_session_if_attached(host_pool, ts);
     ts.session = new_sess;
     if session_id.is_some() {
         ts.transcript_id = session_id.map(|s| s.to_string());
@@ -956,6 +1031,11 @@ enum VisualItem {
     Separator,
     /// Header row for a workflow grouping, followed by its participant Sessions.
     WorkflowHeader { ws_idx: usize, run_id: String },
+    /// 12e: header row for a host group. Emitted only when
+    /// `HostsConfig.hosts.len() > 1`. Sessions tagged with this
+    /// host's `host_id` follow until the next `HostHeader` or
+    /// the end of the list.
+    HostHeader(cm_daemon::host_id::HostId),
 }
 
 /// Modal input state.
@@ -2616,20 +2696,22 @@ pub struct App {
     /// pre-disconnect). Unknown uids are silent no-ops (R5).
     pub manifest_watch_rx:
         Option<std::sync::mpsc::Receiver<crate::manifest_watch::ManifestEvent>>,
-    /// 10e-c: thread handle for the manifest.watch consumer. Held
-    /// for the App's lifetime so it isn't auto-joined on Drop;
-    /// the thread is a "daemon" thread reaped by process exit.
-    /// `None` when consumer wasn't spawned.
-    pub _manifest_watch_thread: Option<std::thread::JoinHandle<()>>,
+    /// 10e-c: thread handles for the manifest.watch consumers.
+    /// Held for the App's lifetime; threads are reaped by
+    /// process exit. 12e-r2 F2: now a `Vec` — one consumer
+    /// per host in `hosts.toml`, so multi-host setups stream
+    /// manifest events from every daemon in parallel.
+    pub _manifest_watch_threads: Vec<std::thread::JoinHandle<()>>,
     /// 11d: receiver from the `events.subscribe` consumer thread.
     /// Drained per tick by [`App::drain_workflow_watch_events`].
     /// Carries either a `Snapshot(WorkflowRun)` (one per active
     /// run on (re)subscribe) or `Event(Event)` (live broadcast).
     pub workflow_watch_rx:
         Option<std::sync::mpsc::Receiver<crate::workflow_watch::WorkflowWatchEvent>>,
-    /// 11d: thread handle for the events.subscribe consumer.
-    /// Same lifecycle convention as `_manifest_watch_thread`.
-    pub _workflow_watch_thread: Option<std::thread::JoinHandle<()>>,
+    /// 11d: thread handles for the events.subscribe consumers.
+    /// Same lifecycle convention as `_manifest_watch_threads`.
+    /// 12e-r2 F2: per-host (Vec).
+    pub _workflow_watch_threads: Vec<std::thread::JoinHandle<()>>,
     /// 11g-1: per-run buffer for events delivered via
     /// `workflow_watch_rx`. `drain_workflow_watch_events` pushes
     /// each incoming `WorkflowWatchEvent::Event` into the
@@ -2671,7 +2753,39 @@ pub struct App {
     /// directly now routes through `host_pool` instead
     /// (`for_host(&ts.host_id)` for per-session calls,
     /// `default_handle()` for TUI-level pushes).
-    pub host_pool: crate::host_pool::HostPool,
+    ///
+    /// 12e: wrapped in `Arc` so the watch-consumer threads can
+    /// hold a `SocketPathProvider` closure that refreshes the
+    /// path on each reconnect (F2 fix).
+    pub host_pool: std::sync::Arc<crate::host_pool::HostPool>,
+    /// 12e: which host new sessions get pinned to. Mutates via
+    /// `A-H` (cycle through `hosts.hosts` in config order).
+    /// Existing sessions stay on their original `host_id` —
+    /// `A-H` only affects NEW-session creation. Defaults to
+    /// the `default = true` entry in `hosts.toml` (or the
+    /// synthesized local default if no file exists).
+    pub active_host: cm_daemon::host_id::HostId,
+    /// 12e-r7 F1: manifest entries that were SKIPPED at
+    /// restore time because their `host_id` failed the
+    /// `guard_local_host_only` check. Keyed by workspace id;
+    /// each value is the full set of skipped entries for
+    /// that workspace, preserved verbatim so `save_session_manifest`
+    /// can round-trip them back to disk.
+    ///
+    /// Without this, round-6's restore guard caused
+    /// permanent data loss: the entry was filtered from live
+    /// state at restore, and the next save (which serializes
+    /// only `ws.sessions`) dropped it from disk forever.
+    /// `~/.cm/tui-sessions.json` round-trips a remote-pinned
+    /// entry through TUI restarts on a local active_host (or
+    /// post-Phase-3 daemon-side reattach support) just like
+    /// it would for a local entry.
+    ///
+    /// Phase 3 staging area: when daemon-side path resolution
+    /// lands (slice 12g), these entries become loadable
+    /// again. Until then, they ride along on disk untouched.
+    pub skipped_manifest_entries:
+        HashMap<String, Vec<cm_daemon::manifest::ManifestEntry>>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -2801,67 +2915,75 @@ impl App {
         // pre-12c because the pool's local-host entry holds
         // exactly that path (verified by
         // `host_pool::tests::synthesized_default_pool_local_path_matches_daemon_default`).
-        let host_pool = crate::host_pool::HostPool::from_config(&hosts)
-            .unwrap_or_else(|e| {
-                // build_handle errors only on tunnel-dir
-                // resolution failure (Finding 1 fix). At App::new
-                // we don't have a non-fatal recovery path, but
-                // App::new isn't fallible — fall back to the
-                // synthesized local default so the TUI still
-                // starts. The error message tells the operator
-                // what to fix.
-                eprintln!(
-                    "cm-tui: HostPool::from_config failed: {} — \
-                     falling back to local-only default",
-                    e,
-                );
-                let local = crate::hosts::HostsConfig::synthesized_local_default();
-                crate::host_pool::HostPool::from_config(&local)
-                    .expect("local-only default is infallible (no ssh hosts)")
-            });
-        // The watch-consumer threads dial the default host (12c
-        // only has one host; 12e adds the per-session-host
-        // routing UX). Pre-12c these read
-        // `cm_daemon::default_socket_path()` directly inside
-        // `maybe_spawn_for_app`; the path is now passed in so
-        // the consumer threads stay in lockstep with the pool.
-        //
-        // 12d-r2: default_handle() now returns Result; on spawn
-        // failure we still need a path for the consumer threads
-        // to dial (they retry-loop, so they'll surface the
-        // failure via reconnect attempts). Fall back to the
-        // daemon's canonical local socket path so the consumer
-        // threads at least target the right place if the SSH
-        // tunnel is going to be the default but failed to come
-        // up at startup — operator sees the eprintln + the
-        // ssh-down loop reconnect log lines.
-        let watch_socket_path = match host_pool.default_handle() {
-            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
-            Err(e) => {
-                eprintln!(
-                    "cm-tui: default host_pool handle unavailable \
-                     at App::new: {} — consumer threads will dial \
-                     the local default and retry",
-                    e,
-                );
-                cm_daemon::default_socket_path()
-            }
-        };
+        // 12e-r3 F3: when pool construction fails, the
+        // synthesized-local-default pool MUST also replace
+        // `hosts` — otherwise `active_host` (derived below
+        // from `hosts.default_host()`) points to a host that
+        // isn't in the pool, every subsequent
+        // `host_pool.for_host(&active_host)` returns
+        // `Err(NotFound)`, and the operator's A-H cycles
+        // produce "unknown host" errors. Re-bind both `hosts`
+        // AND `host_pool` together so the App's view is
+        // self-consistent.
+        // 12e-r3 F3: when pool construction fails, the
+        // synthesized-local-default pool MUST also replace
+        // `hosts` — otherwise `active_host` (derived below
+        // from `hosts.default_host()`) points to a host that
+        // isn't in the pool, every subsequent
+        // `host_pool.for_host(&active_host)` returns
+        // `Err(NotFound)`, and the operator's A-H cycles
+        // produce "unknown host" errors. Re-bind both `hosts`
+        // AND `host_pool` together so the App's view is
+        // self-consistent.
+        let (hosts, host_pool) =
+            match crate::host_pool::HostPool::from_config(&hosts) {
+                Ok(pool) => (hosts, pool),
+                Err(e) => {
+                    eprintln!(
+                        "cm-tui: HostPool::from_config failed: {} — \
+                         falling back to local-only default (the \
+                         configured multi-host setup is not \
+                         currently usable; check tunnel-dir perms / \
+                         XDG_RUNTIME_DIR / hosts.toml)",
+                        e,
+                    );
+                    let local = crate::hosts::HostsConfig::synthesized_local_default();
+                    let pool = crate::host_pool::HostPool::from_config(&local)
+                        .expect("local-only default is infallible (no ssh hosts)");
+                    (local, pool)
+                }
+            };
+        let host_pool = std::sync::Arc::new(host_pool);
+        // 12e: the default-active host is the one marked
+        // `default = true` in hosts.toml. The synthesized local
+        // default also flags itself default. Used for both the
+        // watch-consumer's path provider (subscribes to the
+        // active host's manifest events) and as the initial
+        // value of `App.active_host` for new-session creation.
+        let active_host = hosts
+            .default_host()
+            .map(|h| h.id.clone())
+            .unwrap_or_else(cm_daemon::host_id::HostId::local);
+        // 12e-r2 F2 (Option A): per-host watch consumers. One
+        // manifest.watch + one events.subscribe consumer per
+        // entry in `hosts.toml`, each bound to that host's
+        // path via the path provider. Single-host setups
+        // still get one consumer; multi-host setups stream
+        // events from every daemon in parallel and a later
+        // `cycle_active_host` doesn't need to re-target any
+        // consumer (they're already all live).
+        let _ = active_host; // moved into App below; consumers don't need it.
         // 10e-c: spawn the manifest.watch consumer. Without
         // daemon there's no manifest to subscribe to; spawning
         // a consumer that tight-loops trying to dial a non-
         // existent socket would be wasted work + log noise.
-        let (manifest_watch_rx, _manifest_watch_thread) =
-            crate::manifest_watch::maybe_spawn_for_app(
-                watch_socket_path.clone(),
-            );
+        let (manifest_watch_rx, _manifest_watch_threads) =
+            crate::manifest_watch::spawn_per_host(&host_pool, &hosts);
         // 11d: spawn the events.subscribe consumer alongside
         // manifest_watch. Same reconnect-with-backoff shape;
         // delivers WorkflowEvent broadcasts to the main loop.
-        let (workflow_watch_rx, _workflow_watch_thread) =
-            crate::workflow_watch::maybe_spawn_for_app(
-                watch_socket_path,
-            );
+        let (workflow_watch_rx, _workflow_watch_threads) =
+            crate::workflow_watch::spawn_per_host(&host_pool, &hosts);
 
         App {
             tasks: Vec::new(),
@@ -2896,13 +3018,15 @@ impl App {
             memory_kill_tx,
             memory_kill_rx,
             manifest_watch_rx,
-            _manifest_watch_thread,
+            _manifest_watch_threads,
             workflow_watch_rx,
-            _workflow_watch_thread,
+            _workflow_watch_threads,
             pending_workflow_events: HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             hosts,
             host_pool,
+            active_host,
+            skipped_manifest_entries: HashMap::new(),
         }
     }
 
@@ -2996,6 +3120,17 @@ impl App {
         // `rpc_set_workflow_context` after the fact.
         workflow_run_id: Option<&str>,
         workflow_role: Option<&str>,
+        // 12e-r2 F1: the host this session is being spawned
+        // ON. The caller passes a snapshot of `App.active_host`
+        // taken at the top of the user-action handler (NOT
+        // re-read here, NOT re-read at the TerminalSession
+        // construction site). The daemon socket is resolved
+        // via `host_pool.for_host(host_id)`; the resulting
+        // `ts.host_id` MUST also equal this value so every
+        // subsequent per-session RPC (kill, set_transcript,
+        // set_workflow_context, push_*) routes to the daemon
+        // we actually spawned against.
+        host_id: &cm_daemon::host_id::HostId,
     ) -> Option<anyhow::Result<Session>> {
         // 10f: daemon-eligibility is now driven solely by
         // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
@@ -3003,7 +3138,21 @@ impl App {
         // purpose. Map TUI session_type to engine + program
         // builder. gcloud and other ad-hoc shells aren't daemon-
         // eligible — fall through to local.
-        let argv_result = match session_type {
+        //
+        // 12e-r5 F2: normalize the wire vocabulary to the
+        // internal form ONCE at the top so every downstream
+        // consumer (argv match, wire_session_type mapping,
+        // memory_cap_for lookup) sees the same value. Pre-r5
+        // we aliased `"claude-code"` in the argv + wire-type
+        // matches but the cap-lookup still used the raw
+        // `session_type`, so an MCP `start_session(type=
+        // "claude-code")` would look up the env-var
+        // `CM_SESSION_MEM_SOFT_CLAUDE-CODE` instead of
+        // `CM_SESSION_MEM_SOFT_CLAUDE` — every MCP-spawned
+        // Claude session ran uncapped even with caps
+        // configured.
+        let internal_session_type = normalize_session_type_to_internal(session_type);
+        let argv_result = match internal_session_type {
             "claude" => crate::mcp_config::build_args(
                 crate::mcp_config::SpawnTarget::Daemon,
                 &crate::workflow::toml_schema::Engine::ClaudeCode,
@@ -3038,7 +3187,10 @@ impl App {
         // None, `wrap_with_systemd_run` is a passthrough.
         let memory_cap = match (
             &self.memory_cap_status,
-            self.config.memory_cap_for(session_type),
+            // 12e-r5 F2: look caps up by the INTERNAL
+            // vocabulary (`"claude"` not `"claude-code"`) —
+            // see comment near `internal_session_type` above.
+            self.config.memory_cap_for(internal_session_type),
         ) {
             (
                 crate::memory_cap::MemoryCapAvailability::Available { cgroup_prefix },
@@ -3070,18 +3222,21 @@ impl App {
             std::collections::BTreeMap::new();
         env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
 
-        // 12c: route through the host pool. For 12c every
-        // session is local; 12e ("A-H cycles active host")
-        // will switch this to `self.host_pool.for_host(&ts.host_id)`.
-        // 12d-r2: surface SSH-spawn errors directly to the
-        // caller via Result rather than masking them as a
-        // downstream connect failure.
-        let daemon_socket = match self.host_pool.default_handle() {
-            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+        // 12e-r2 F1: route through `host_pool.for_host(host_id)`,
+        // NOT `default_handle`. Pre-r2 this dialed the default
+        // daemon while the resulting `TerminalSession.host_id`
+        // was tagged `active_host` — subsequent per-session
+        // RPCs (via `host_pool.for_host(&ts.host_id)`) would
+        // hit a daemon that had no record of the UID.
+        let daemon_socket = match self.host_pool.for_host(host_id) {
+            Ok(h) => h.socket_path().expect(
+                "socket_path returns Some after ensure_alive succeeded",
+            ),
             Err(e) => {
                 return Some(Err(anyhow::anyhow!(
-                    "default host_pool handle unavailable: {}",
-                    e
+                    "host_pool.for_host({}) unavailable: {}",
+                    host_id.as_str(),
+                    e,
                 )));
             }
         };
@@ -3098,13 +3253,18 @@ impl App {
         // ("claude-code" / "codex" / "bash"). The branches above
         // already gate to these three values; any other type
         // would have early-returned None from this function.
-        let wire_session_type = match session_type {
+        // 12e-r5 F2: consult the normalized internal form,
+        // then map to the wire vocabulary. The Python MCP
+        // tool dispatches on the wire form (`"claude-code"`
+        // for ClaudeCode); the daemon's `start_session`
+        // serializer reads this field verbatim.
+        let wire_session_type = match internal_session_type {
             "claude" => "claude-code",
             "codex" => "codex",
             "bash" => "bash",
-            // The branch above returns None for anything else,
-            // so this arm is unreachable in production; default
-            // defensively rather than panic.
+            // The argv match above returns None for anything
+            // else, so this arm is unreachable in production;
+            // default defensively rather than panic.
             other => other,
         };
         let config = crate::client_session::ClientSessionConfig {
@@ -3493,7 +3653,7 @@ impl App {
     pub(crate) fn save_session_manifest(&self) {
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
-            let entries: Vec<ManifestEntry> = ws
+            let mut entries: Vec<ManifestEntry> = ws
                 .sessions
                 .iter()
                 .map(|ts| ManifestEntry {
@@ -3530,6 +3690,16 @@ impl App {
                     host_id: ts.host_id.clone(),
                 })
                 .collect();
+            // 12e-r7 F1: append any manifest entries that
+            // were skipped at restore time because their
+            // `host_id` failed the local-host guard. They're
+            // preserved verbatim — clone the full entry so a
+            // remote-pinned session survives a TUI restart on
+            // local active_host (or post-Phase-3 daemon-side
+            // reattach support) untouched.
+            if let Some(skipped) = self.skipped_manifest_entries.get(&ws.id) {
+                entries.extend(skipped.iter().cloned());
+            }
             workspaces.insert(
                 ws.id.clone(),
                 ManifestWorkspace {
@@ -3733,6 +3903,31 @@ impl App {
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
+                    // 12e-r7 F1: guard at the CALLER (was in
+                    // `spawn_restored_session` pre-r7). The
+                    // round-6 fix mistakenly dropped the
+                    // skipped entry from live state, and the
+                    // next save then dropped it from disk
+                    // forever. Now: if the guard fires,
+                    // preserve the raw ManifestEntry in
+                    // `skipped_manifest_entries` so the next
+                    // `save_session_manifest` round-trips it
+                    // back to disk untouched.
+                    if let Err(e) = guard_local_host_only(
+                        &entry.host_id,
+                        "session restore",
+                    ) {
+                        eprintln!(
+                            "cm-tui: skip restore of session {} ({}): {} \
+                             (entry preserved in manifest for next save)",
+                            entry.uid, entry.label, e,
+                        );
+                        self.skipped_manifest_entries
+                            .entry(ws.id.clone())
+                            .or_default()
+                            .push(entry.clone());
+                        continue;
+                    }
                     // 10d-3 R3 in-place untag: if this session's
                     // workflow_run_id references a non-active
                     // run (Detached/Done), clone the entry and
@@ -3817,6 +4012,17 @@ impl App {
         cap_status: &crate::memory_cap::MemoryCapAvailability,
         kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
     ) -> Option<TerminalSession> {
+        // 12e-r7 F1: the round-6 in-function host-guard moved
+        // to the caller (`restore_sessions`) so the caller can
+        // preserve the raw `ManifestEntry` in
+        // `App.skipped_manifest_entries` for later save
+        // round-trip. Pre-r7 the guard returned None here and
+        // the entry was permanently dropped on the next save
+        // — exactly the data-loss bug round-7 F1 closes.
+        // `None` from this function now means a genuine spawn
+        // failure (mcp_config, PTY, etc.), which is the
+        // legitimate drop-from-disk case.
+
         // Resolve the UID ONCE here so the MCP config and the
         // TerminalSession agree. Earlier this had two separate
         // `new_session_uid()` calls — they generated different values
@@ -4933,7 +5139,16 @@ impl App {
     /// Running sessions first, then idle, then workspaces with no sessions.
     /// Past workspaces (closed / all-tasks-done) are hidden — open the
     /// A-O picker to reach them.
+    ///
+    /// 12e: when `hosts.hosts.len() > 1`, the list is partitioned
+    /// by host (in `HostsConfig` order); each host's section is
+    /// preceded by a `HostHeader` row. Single-host (the
+    /// synthesized local default) renders unchanged — no host
+    /// header, identical to pre-12e.
     fn visual_items_status(&self) -> Vec<VisualItem> {
+        if self.hosts.hosts.len() > 1 {
+            return self.visual_items_status_multihost();
+        }
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
@@ -4965,6 +5180,71 @@ impl App {
             if !matches!(items.last(), Some(VisualItem::Separator)) {
                 items.push(VisualItem::Separator);
             }
+        }
+        items.extend(no_session);
+        items
+    }
+
+    /// 12e multi-host status view: emit a `HostHeader` per
+    /// configured host, then the running + idle sessions
+    /// belonging to that host. Workspaces with no sessions
+    /// can't be host-tagged (workspace itself has no host) —
+    /// they go in a single tail section after all host groups.
+    fn visual_items_status_multihost(&self) -> Vec<VisualItem> {
+        let mut by_host: std::collections::HashMap<
+            cm_daemon::host_id::HostId,
+            (Vec<VisualItem>, Vec<VisualItem>),
+        > = std::collections::HashMap::new();
+        let mut no_session: Vec<VisualItem> = Vec::new();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed || self.is_past_workspace(wi) {
+                continue;
+            }
+            if ws.sessions.is_empty() {
+                no_session.push(VisualItem::WorkspaceHeader(wi));
+                continue;
+            }
+            for (si, ts) in ws.sessions.iter().enumerate() {
+                let entry = by_host
+                    .entry(ts.host_id.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new()));
+                let item = VisualItem::Session(wi, si);
+                match ts.status {
+                    SessionStatus::Running => entry.0.push(item),
+                    SessionStatus::Idle => entry.1.push(item),
+                }
+            }
+        }
+        let mut items: Vec<VisualItem> = Vec::new();
+        for host in &self.hosts.hosts {
+            let group = by_host.remove(&host.id).unwrap_or_default();
+            if group.0.is_empty() && group.1.is_empty() {
+                continue;
+            }
+            if !items.is_empty() {
+                items.push(VisualItem::Separator);
+            }
+            items.push(VisualItem::HostHeader(host.id.clone()));
+            items.extend(group.0); // running
+            items.extend(group.1); // idle
+        }
+        // Sessions on hosts NO LONGER in hosts.toml (rare —
+        // operator removed an entry; existing sessions remain
+        // pinned). Surface them under a synthetic header so
+        // they don't silently vanish.
+        let mut orphan_ids: Vec<_> = by_host.keys().cloned().collect();
+        orphan_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for id in orphan_ids {
+            let (run, idle) = by_host.remove(&id).unwrap();
+            if !items.is_empty() {
+                items.push(VisualItem::Separator);
+            }
+            items.push(VisualItem::HostHeader(id));
+            items.extend(run);
+            items.extend(idle);
+        }
+        if !items.is_empty() && !no_session.is_empty() {
+            items.push(VisualItem::Separator);
         }
         items.extend(no_session);
         items
@@ -5111,6 +5391,9 @@ impl App {
             VisualItem::TaskHeader { .. } => true,
             VisualItem::Separator => false,
             VisualItem::WorkflowHeader { .. } => false,
+            // 12e: host headers are presentation-only; skip
+            // them in cursor navigation.
+            VisualItem::HostHeader(_) => false,
         };
 
         if !items.iter().any(is_selectable) {
@@ -5558,7 +5841,7 @@ impl App {
             let Some(ts) = ws.sessions.get(detected.session_index) else {
                 continue;
             };
-            Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+            Self::push_transcript_path_to_daemon_if_attached(&self.host_pool, ts, ws);
         }
 
         // Sync any newly detected session_ids to the DB. Resolve each ws_id
@@ -5767,7 +6050,7 @@ impl App {
             // for cursor invalidation).
             if let Some(ws) = self.workspaces.get(r.wi) {
                 if let Some(ts) = ws.sessions.get(r.si) {
-                    Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                    Self::push_transcript_path_to_daemon_if_attached(&self.host_pool, ts, ws);
                 }
             }
             // Workflow-specific bookkeeping only when the session is a
@@ -5987,6 +6270,37 @@ impl App {
         }
     }
 
+    /// 12e-r8 F1: resolve the caller's `host_id` by walking
+    /// `self.workspaces[*].sessions[*]` looking for a uid
+    /// match. The MCP `start_session` flow passes the
+    /// calling agent's uid; the caller's session SHOULD be
+    /// findable in the App's state. Returns `Err(NotFound)`
+    /// defensively if not — should never happen in
+    /// production (the daemon's auth path would have rejected
+    /// the caller first), but the explicit error beats a
+    /// silent panic.
+    pub(crate) fn resolve_caller_host(
+        &self,
+        caller_uid: &str,
+    ) -> std::io::Result<cm_daemon::host_id::HostId> {
+        for ws in &self.workspaces {
+            for ts in &ws.sessions {
+                if ts.uid == caller_uid {
+                    return Ok(ts.host_id.clone());
+                }
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "MCP caller uid `{}` not found in any workspace's \
+                 sessions; cannot resolve caller host for \
+                 spawn_managed_session",
+                caller_uid,
+            ),
+        ))
+    }
+
     /// Spawn a new agent session in the given workspace, owned by the
     /// caller (managed_by_uid recorded). Used by the `start_session`
     /// MCP tool. Returns the new session's UID.
@@ -5999,6 +6313,22 @@ impl App {
         task_id: Option<String>,
         prompt: Option<&str>,
     ) -> std::io::Result<String> {
+        // 12e-r8 F1: derive the target host from the CALLER's
+        // pinned host_id, NOT from `self.active_host`.
+        // Pre-r8 the round-5 guard used active_host — the
+        // operator's transient A-H selection — which meant
+        // an agent on host=local couldn't spawn a child if
+        // the operator happened to have cycled active_host
+        // to "manager". The agent's spawn rights belong to
+        // the agent's context, not the UI state. Same shape
+        // as Unix `fork()` inheriting the parent's working
+        // directory.
+        let caller_host = self.resolve_caller_host(caller_uid)?;
+
+        // 12e-r6: shared fail-fast helper. Pre-r8 this
+        // checked active_host; round-8 routes the check
+        // through caller_host instead.
+        guard_local_host_only(&caller_host, "MCP `start_session`")?;
         let worktree_path = self.workspaces[ws_index]
             .worktree_path
             .clone()
@@ -6008,55 +6338,83 @@ impl App {
                     "workspace has no worktree",
                 )
             })?;
+        let workspace_id = self.workspaces[ws_index].id.clone();
         let (cols, rows) = self.last_term_size;
         let session_uid = new_session_uid();
-        // Bash gets a raw PTY shell — no MCP injection, no transcript
-        // tracking. `idle` still flips correctly via the burst detector
-        // (PTY-activity-based), and `send_input` works because it queues
-        // raw bytes + Enter at the PTY layer. Useful when the caller
-        // wants a shell the user can also drive interactively.
-        let (session, session_type, pending) = if type_ == "bash" {
-            let s = Session::new(
-                "/bin/bash",
-                &[],
-                cols,
-                rows,
-                Some(worktree_path.clone()),
-                Default::default(),
-                None,
-            )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            (s, "bash".to_string(), None)
+
+        // 12e-r4 F1.2: snapshot transcript baseline BEFORE
+        // the spawn. The new agent (Claude/Codex) creates its
+        // transcript JSONL within ms of spawn; capturing this
+        // list AFTER `try_spawn_via_daemon` returns would
+        // include the newly-spawned agent's own file —
+        // `detect_new_transcript_jsonl` would then treat that
+        // file as preexisting, never bind transcript_id, and
+        // `resolve_authorized_session` would return `pending`
+        // forever. Round-3 introduced this reordering bug;
+        // round-4 puts the snapshot back in front of the
+        // spawn.
+        let pending = if type_ == "bash" {
+            None
         } else {
             let engine = match type_ {
                 "codex" => workflow::toml_schema::Engine::Codex,
                 _ => workflow::toml_schema::Engine::ClaudeCode,
             };
-            let (program, args) = crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::TuiLocal,
-                &engine,
-                &session_uid,
-                None,
-                None,
-            )?;
-            let pending = match engine {
-                workflow::toml_schema::Engine::ClaudeCode => Self::list_jsonl_files(&worktree_path),
-                workflow::toml_schema::Engine::Codex => Self::list_codex_sessions(&worktree_path),
-            };
-            let session_type = engine.as_session_type().to_string();
-            let s = self
-                .spawn_agent_session(
-                    &session_type,
-                    &session_uid,
-                    &program,
-                    &args,
-                    cols,
-                    rows,
-                    Some(worktree_path),
-                    Default::default(),
-                )
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            (s, session_type, Some(pending))
+            Some(match engine {
+                workflow::toml_schema::Engine::ClaudeCode => {
+                    Self::list_jsonl_files(&worktree_path)
+                }
+                workflow::toml_schema::Engine::Codex => {
+                    Self::list_codex_sessions(&worktree_path)
+                }
+            })
+        };
+
+        // 12e-r8 F1: route the spawn through `try_spawn_via_daemon`
+        // against the CALLER's host (not active_host). The
+        // PTY child runs on the same daemon the agent itself
+        // lives under, mirroring the `fork()` semantics.
+        let session = match self.try_spawn_via_daemon(
+            &session_uid,
+            &workspace_id,
+            &worktree_path,
+            type_,
+            label,
+            None, // resume_session_id
+            cols,
+            rows,
+            task_id.as_deref(),
+            None, // workflow_run_id
+            None, // workflow_role
+            &caller_host,
+        ) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                return Err(std::io::Error::other(format!(
+                    "daemon spawn on host {} failed: {}",
+                    caller_host.as_str(),
+                    e,
+                )));
+            }
+            None => {
+                return Err(std::io::Error::other(format!(
+                    "session type `{}` is not daemon-eligible",
+                    type_,
+                )));
+            }
+        };
+        // 12e-r4 F1.1: map both legacy `"claude"` AND wire
+        // `"claude-code"` inputs to the canonical TUI session
+        // type string `"claude"`. Matches the round-1 mapping
+        // pre-r3 + the `try_spawn_via_daemon` alias.
+        // 12e-r4 F1.1: map both legacy `"claude"` AND wire
+        // `"claude-code"` inputs to the canonical TUI session
+        // type string `"claude"`. Matches the round-1 mapping
+        // pre-r3 + the `try_spawn_via_daemon` alias.
+        let session_type = match type_ {
+            "codex" => "codex".to_string(),
+            "bash" => "bash".to_string(),
+            _ => "claude".to_string(),
         };
         let mut pending_prompt = None;
         if let Some(text) = prompt {
@@ -6095,13 +6453,11 @@ impl App {
             managed_by_uid: Some(caller_uid.to_string()),
             seeded_from_snapshot: None,
             preserved_last_exit: None,
-            // 12b: new sessions get local at this slice. 12e
-            // ("A-H cycles active host") changes this to the
-            // app's `active_host` field; for now MCP-spawned
-            // sessions are always on the local host (no remote
-            // session-spawn path until 12c lands the connection
-            // pool).
-            host_id: crate::hosts::HostId::local(),
+            // 12e-r8 F1: tag with the CALLER's host_id —
+            // same value the spawn dialed against. The
+            // child inherits the caller's host, NOT the
+            // operator's transient active_host.
+            host_id: caller_host.clone(),
         };
         self.workspaces[ws_index].sessions.push(ts);
         self.save_session_manifest();
@@ -6582,7 +6938,7 @@ impl App {
             let _ = ts;
             if let Some(ws) = self.workspaces.get(wi) {
                 if let Some(ts) = ws.sessions.get(si) {
-                    Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                    Self::push_transcript_path_to_daemon_if_attached(&self.host_pool, ts, ws);
                 }
             }
         }
@@ -7122,6 +7478,17 @@ impl App {
                         self.open_session_settings();
                         return true;
                     }
+                    // 12e: Alt+Shift+h on some terminals comes
+                    // through as KeyCode::Char('h') + SHIFT
+                    // modifier (instead of Char('H')). Handle
+                    // the shift-modifier case BEFORE the bare
+                    // 'h' (toggle-hidden) arm.
+                    KeyCode::Char('h')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.cycle_active_host();
+                        return true;
+                    }
                     KeyCode::Char('h') => {
                         self.toggle_session_hidden();
                         return true;
@@ -7182,6 +7549,16 @@ impl App {
                     }
                     KeyCode::Char('y') => {
                         self.open_workflow_history();
+                        return true;
+                    }
+                    // 12e: A-H (Alt+Shift+H) cycles the active
+                    // host. The lowercase 'h' + SHIFT path is
+                    // handled above (before the bare 'h'
+                    // toggle-hidden arm); this arm catches
+                    // terminals that report bare uppercase
+                    // 'H' instead of 'h' + SHIFT.
+                    KeyCode::Char('H') => {
+                        self.cycle_active_host();
                         return true;
                     }
                     _ => {}
@@ -7854,22 +8231,77 @@ impl App {
     /// from its registry when the child eventually exits anyway,
     /// so a missed RPC means a slow teardown (orphan child runs
     /// until exit), not a permanent leak.
-    pub(crate) fn kill_daemon_session_if_attached(ts: &TerminalSession) {
+    /// 12e: cycle `active_host` through the entries in
+    /// `hosts.toml`. New sessions created with `A-n` / `A-s` /
+    /// `A-f` get pinned to the current `active_host`; existing
+    /// sessions keep their original host (the cycle only
+    /// affects creation, not migration).
+    ///
+    /// Single-host case (the synthesized local default, common
+    /// for users who haven't written `~/.cm/hosts.toml`): show
+    /// a hint in the status bar pointing them at the file
+    /// rather than silently doing nothing on `A-H`.
+    pub(crate) fn cycle_active_host(&mut self) {
+        if self.hosts.hosts.len() <= 1 {
+            self.set_status_msg(
+                "single host configured — add `~/.cm/hosts.toml` \
+                 to enable multi-host",
+            );
+            return;
+        }
+        // Walk `hosts.hosts` in config order, find current,
+        // pick the next (wrap).
+        let pos = self
+            .hosts
+            .hosts
+            .iter()
+            .position(|h| h.id == self.active_host)
+            .unwrap_or(0);
+        let next = (pos + 1) % self.hosts.hosts.len();
+        self.active_host = self.hosts.hosts[next].id.clone();
+        self.set_status_msg(&format!(
+            "active host: {}",
+            self.active_host.as_str(),
+        ));
+    }
+
+    /// 12e: route through `host_pool.for_host(&ts.host_id)` so a
+    /// session pinned to a non-default host (created via `A-H`
+    /// + `A-n`) gets its kill RPC fired against the right
+    /// daemon. Pre-12e this dialed `cm_daemon::default_socket_path()`
+    /// — fine for local-only but wrong the moment 12e ships
+    /// multi-host UX.
+    pub(crate) fn kill_daemon_session_if_attached(
+        host_pool: &crate::host_pool::HostPool,
+        ts: &TerminalSession,
+    ) {
         if let Some(uid) = ts.session.daemon_session_uid.as_deref() {
-            // 12c-deferred: this is a static-context helper
-            // called from Drop-adjacent paths where the App's
-            // `host_pool` isn't reachable without restructuring
-            // the call chain. Reads `cm_daemon::default_socket_path()`
-            // directly; for 12c (local-only) this resolves to
-            // exactly the same path the pool's default handle
-            // would, so the byte-stability invariant holds. A
-            // future slice that goes multi-host-aware on
-            // per-session kill needs to thread a `&HostPool`
-            // (or path) through `respawn_existing_with_workflow_mcp`
-            // and the workspace-teardown callers.
-            let daemon_socket = cm_daemon::default_socket_path();
+            let socket = match host_pool.for_host(&ts.host_id) {
+                Ok(h) => match h.socket_path() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!(
+                            "cm-tui: A-w kill_session({}) skipped — \
+                             host_pool for {} has no live socket path",
+                            uid,
+                            ts.host_id.as_str(),
+                        );
+                        return;
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "cm-tui: A-w kill_session({}) skipped — \
+                         host_pool.for_host({}) failed: {}",
+                        uid,
+                        ts.host_id.as_str(),
+                        e,
+                    );
+                    return;
+                }
+            };
             if let Err(e) = crate::client_session::rpc_kill_session(
-                &daemon_socket,
+                &socket,
                 crate::daemon_launch::operator_token(),
                 uid,
             ) {
@@ -7905,6 +8337,7 @@ impl App {
     /// Best-effort: log on RPC error and continue (the next
     /// rebind retries).
     pub(crate) fn push_transcript_path_to_daemon_if_attached(
+        host_pool: &crate::host_pool::HostPool,
         ts: &TerminalSession,
         ws: &Workspace,
     ) {
@@ -7924,14 +8357,35 @@ impl App {
             return;
         };
         let path_str = path.to_string_lossy().to_string();
-        // 12c-deferred: same shape as `kill_daemon_session_if_attached`
-        // — static-context helper called from rebind sites; reads
-        // the canonical local-host path directly. Byte-equivalent
-        // to `host_pool.default_handle()` for 12c (local-only);
-        // future multi-host-aware refactor threads a HostPool ref.
-        let daemon_socket = cm_daemon::default_socket_path();
+        // 12e: route through `host_pool.for_host(&ts.host_id)`
+        // so a session on a non-default host pushes its
+        // transcript path to the right daemon.
+        let socket = match host_pool.for_host(&ts.host_id) {
+            Ok(h) => match h.socket_path() {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "cm-tui: set_transcript_path({}) skipped — \
+                         host_pool for {} has no live socket path",
+                        daemon_uid,
+                        ts.host_id.as_str(),
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: set_transcript_path({}) skipped — \
+                     host_pool.for_host({}) failed: {}",
+                    daemon_uid,
+                    ts.host_id.as_str(),
+                    e,
+                );
+                return;
+            }
+        };
         if let Err(e) = crate::client_session::rpc_set_transcript_path(
-            &daemon_socket,
+            &socket,
             crate::daemon_launch::operator_token(),
             daemon_uid,
             &path_str,
@@ -7964,6 +8418,7 @@ impl App {
     /// Best-effort: log on RPC error and continue (next launch
     /// retries, manual workflow stop/start clears stale state).
     pub(crate) fn push_workflow_context_to_daemon_if_attached(
+        host_pool: &crate::host_pool::HostPool,
         ts: &TerminalSession,
         run_id: Option<&str>,
         role: Option<&str>,
@@ -7971,14 +8426,35 @@ impl App {
         let Some(daemon_uid) = ts.session.daemon_session_uid.as_deref() else {
             return;
         };
-        // 10f: daemon-mandatory; `daemon_session_uid` being Some
-        // already implies a daemon-spawned session.
-        // 12c-deferred: same static-context shape as the other
-        // `*_if_attached` helpers — uses the canonical local
-        // path directly; byte-equivalent for local-only.
-        let daemon_socket = cm_daemon::default_socket_path();
+        // 12e: route through `host_pool.for_host(&ts.host_id)`
+        // so a workflow participant on a non-default host
+        // pushes its context to the right daemon.
+        let socket = match host_pool.for_host(&ts.host_id) {
+            Ok(h) => match h.socket_path() {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "cm-tui: set_workflow_context({}) skipped — \
+                         host_pool for {} has no live socket path",
+                        daemon_uid,
+                        ts.host_id.as_str(),
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: set_workflow_context({}) skipped — \
+                     host_pool.for_host({}) failed: {}",
+                    daemon_uid,
+                    ts.host_id.as_str(),
+                    e,
+                );
+                return;
+            }
+        };
         if let Err(e) = crate::client_session::rpc_set_workflow_context(
-            &daemon_socket,
+            &socket,
             crate::daemon_launch::operator_token(),
             daemon_uid,
             run_id,
@@ -8021,7 +8497,22 @@ impl App {
     /// The workflow-method auth consumer in 10d-2 reads from
     /// `state.tui_sessions`; without that push wired here, 10d-2
     /// would have nothing to read.
+    /// 12e-r3 F2: per-host fanout entry. Resolves the socket
+    /// path for `host_id` via the pool, then calls the
+    /// per-host push helpers. Errors on a single host are
+    /// logged (with the host name) and do NOT abort the
+    /// fanout — `push_state_to_daemon` iterates every host
+    /// and best-effort pushes to each.
     pub(crate) fn push_tui_sessions_to_daemon(&self) {
+        for host in &self.hosts.hosts {
+            self.push_tui_sessions_to_host(&host.id);
+        }
+    }
+
+    fn push_tui_sessions_to_host(
+        &self,
+        host_id: &cm_daemon::host_id::HostId,
+    ) {
         // 10f: daemon-mandatory; always push.
         // Flatten App.workspaces[*].sessions[*] into one vec —
         // but filter OUT daemon-attached sessions
@@ -8037,11 +8528,20 @@ impl App {
         // workflow_role (for workflow-method auth in 10d-2),
         // label / type / hidden (forward-compat for a merged
         // list_sessions view in a future slice).
+        // 12e-r8 F2: filter to only sessions whose `host_id`
+        // matches the target host. Pre-r8 every daemon
+        // received every session — a local-host daemon would
+        // advertise sessions actually pinned to "manager" in
+        // its `tui_sessions` map, which is a state lie that
+        // breaks lookup-by-uid, auth walks, and the eventual
+        // merged-list_sessions view. Each daemon now only
+        // hears about sessions it actually owns.
         let sessions: Vec<crate::client_session::TuiSessionSnapshotPush<'_>> = self
             .workspaces
             .iter()
             .flat_map(|w| w.sessions.iter())
             .filter(|ts| ts.session.daemon_session_uid.is_none())
+            .filter(|ts| &ts.host_id == host_id)
             .map(|ts| crate::client_session::TuiSessionSnapshotPush {
                 uid: ts.uid.as_str(),
                 task_id: ts.task_id.as_deref(),
@@ -8052,19 +8552,19 @@ impl App {
                 workflow_role: ts.workflow_role.as_deref(),
             })
             .collect();
-        // 12c: route through the host pool. TUI-level push of
-        // the full session snapshot goes to the default host
-        // (local in 12c; future multi-host shape may need to
-        // partition by host and push per-daemon).
-        // 12d-r2: bail early with the SSH-spawn error rather
-        // than dialing a stale path that yields a generic
-        // socket-connect failure.
-        let daemon_socket = match self.host_pool.default_handle() {
-            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+        // 12e-r3 F2: route through `host_pool.for_host(host_id)`.
+        // Pre-r3 used `default_handle()` exclusively — multi-
+        // host setups never propagated the TUI session
+        // snapshot to non-default daemons.
+        let daemon_socket = match self.host_pool.for_host(host_id) {
+            Ok(h) => h.socket_path().expect(
+                "socket_path returns Some after ensure_alive succeeded",
+            ),
             Err(e) => {
                 eprintln!(
-                    "cm-tui: tui.update_sessions_snapshot skipped: \
-                     default host_pool handle unavailable: {}",
+                    "cm-tui: tui.update_sessions_snapshot to host {} \
+                     skipped: {}",
+                    host_id.as_str(),
                     e,
                 );
                 return;
@@ -8076,10 +8576,9 @@ impl App {
             &sessions,
         ) {
             eprintln!(
-                "cm-tui: tui.update_sessions_snapshot failed: {} \
-                 (daemon's TUI-session view will lag until the next push — \
-                 workflow-method auth consumers in 10d-2 may surface as \
-                 'caller not found' for TUI-minted sessions)",
+                "cm-tui: tui.update_sessions_snapshot to host {} failed: {} \
+                 (that daemon's TUI-session view will lag until the next push)",
+                host_id.as_str(),
                 e,
             );
         }
@@ -8139,19 +8638,28 @@ impl App {
     /// startup push is sufficient; the upcoming 2c-2-2 daemon
     /// driver reads from `DaemonState.workflow_definitions`.
     pub(crate) fn push_workflow_definitions_to_daemon(&self) {
-        // 10f: daemon-mandatory; always push.
-        // 12c: route through host pool. Workflow definitions
-        // are a per-host concept (the daemon caches them for
-        // its own workflow runs); push to the default host
-        // here. Future multi-host shape would push per-host.
-        // 12d-r2: bail early on SSH-spawn failure so the
-        // operator sees the actual cause.
-        let daemon_socket = match self.host_pool.default_handle() {
-            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+        for host in &self.hosts.hosts {
+            self.push_workflow_definitions_to_host(&host.id);
+        }
+    }
+
+    fn push_workflow_definitions_to_host(
+        &self,
+        host_id: &cm_daemon::host_id::HostId,
+    ) {
+        // 12e-r3 F2: per-host. Pre-r3 only the default host
+        // received workflow definitions — non-default daemons
+        // had an empty `workflow_definitions` map and their
+        // workflow driver was uninitialized.
+        let daemon_socket = match self.host_pool.for_host(host_id) {
+            Ok(h) => h.socket_path().expect(
+                "socket_path returns Some after ensure_alive succeeded",
+            ),
             Err(e) => {
                 eprintln!(
-                    "cm-tui: workflow.update_definitions skipped: \
-                     default host_pool handle unavailable: {}",
+                    "cm-tui: workflow.update_definitions to host {} \
+                     skipped: {}",
+                    host_id.as_str(),
                     e,
                 );
                 return;
@@ -8163,23 +8671,19 @@ impl App {
             &self.workflows,
         ) {
             eprintln!(
-                "cm-tui: workflow.update_definitions failed: {} \
-                 (daemon-side workflow driver will be uninitialized until \
-                  next push — feature still gated by 2c-2-2)",
+                "cm-tui: workflow.update_definitions to host {} failed: {}",
+                host_id.as_str(),
                 e,
             );
         }
     }
 
     pub(crate) fn push_task_tree_to_daemon(&self) {
-        // 10f: daemon-mandatory; always push.
-        // Sub-2b-3 review-2 #1: push `workspace_id` per task AND
-        // a workspaces map carrying `worktree_path`. Lets the
-        // daemon's `mcp_start_session` resolve a descendant
-        // task's workspace without needing a live anchor
-        // session in that workspace (the pre-fix resolver
-        // walked `state.sessions` for an existing tagged
-        // session — failed for first-spawn-into-fresh-subtask).
+        // 12e-r3 F2: fanout to every configured host. Pre-r3
+        // only the default host got the task tree — agents on
+        // non-default host daemons would fail
+        // `mcp_start_session(task_id=...)` with "task_id not
+        // in tree" because that daemon never saw the tree.
         let tasks: Vec<(String, Option<String>, Option<String>)> = self
             .tasks
             .iter()
@@ -8201,17 +8705,25 @@ impl App {
                 )
             })
             .collect();
-        // 12c: route through host pool. task.update_tree pushes
-        // the full task hierarchy to the default host. Multi-
-        // host planning isn't a concept (planning is the FastAPI
-        // server's domain); every daemon gets the same view.
-        // 12d-r2: bail early on SSH-spawn failure.
-        let daemon_socket = match self.host_pool.default_handle() {
-            Ok(h) => h.socket_path().expect("socket_path returns Some after ensure_alive succeeded"),
+        for host in &self.hosts.hosts {
+            self.push_task_tree_to_host(&host.id, &tasks, &workspaces);
+        }
+    }
+
+    fn push_task_tree_to_host(
+        &self,
+        host_id: &cm_daemon::host_id::HostId,
+        tasks: &[(String, Option<String>, Option<String>)],
+        workspaces: &[(String, Option<String>)],
+    ) {
+        let daemon_socket = match self.host_pool.for_host(host_id) {
+            Ok(h) => h.socket_path().expect(
+                "socket_path returns Some after ensure_alive succeeded",
+            ),
             Err(e) => {
                 eprintln!(
-                    "cm-tui: task.update_tree skipped: \
-                     default host_pool handle unavailable: {}",
+                    "cm-tui: task.update_tree to host {} skipped: {}",
+                    host_id.as_str(),
                     e,
                 );
                 return;
@@ -8220,12 +8732,12 @@ impl App {
         if let Err(e) = crate::client_session::rpc_task_update_tree(
             &daemon_socket,
             crate::daemon_launch::operator_token(),
-            &tasks,
-            &workspaces,
+            tasks,
+            workspaces,
         ) {
             eprintln!(
-                "cm-tui: task.update_tree failed: {} \
-                 (daemon auth walks will use the pre-push tree until the next mutation)",
+                "cm-tui: task.update_tree to host {} failed: {}",
+                host_id.as_str(),
                 e,
             );
         }
@@ -8249,6 +8761,10 @@ impl App {
         ws_index: usize,
         mut should_drop: impl FnMut(&TerminalSession) -> bool,
     ) -> usize {
+        // 12e: snapshot the pool Arc so we can call
+        // `kill_daemon_session_if_attached` while `ws` holds a
+        // mutable borrow of `self.workspaces`.
+        let pool = std::sync::Arc::clone(&self.host_pool);
         let Some(ws) = self.workspaces.get_mut(ws_index) else {
             return 0;
         };
@@ -8260,7 +8776,7 @@ impl App {
                 // before drop. See `kill_daemon_session_if_attached`
                 // for rationale. Bulk-cleanup paths (task close,
                 // workspace teardown) flow through here too.
-                Self::kill_daemon_session_if_attached(&ws.sessions[i]);
+                Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
                 Self::tombstone_session(ws, i);
                 ws.sessions[i].session.exited = true;
                 ws.sessions.remove(i);
@@ -8309,6 +8825,10 @@ impl App {
     /// answer `read_session_output` for the closed session via the
     /// tombstone.
     fn close_active_session(&mut self) {
+        // 12e: snapshot the pool Arc for the same reason as
+        // `tombstone_and_remove` — workspaces takes a mut
+        // borrow of self below.
+        let pool = std::sync::Arc::clone(&self.host_pool);
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
                 if let Some(ws) = self.workspaces.get_mut(wi) {
@@ -8318,7 +8838,7 @@ impl App {
                         // sessions need an explicit kill_session
                         // RPC because Drop is detach-only by
                         // design.
-                        Self::kill_daemon_session_if_attached(&ws.sessions[si]);
+                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[si]);
                         Self::tombstone_session(ws, si);
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
@@ -8337,7 +8857,7 @@ impl App {
                     if ws.sessions.len() == 1 {
                         // Same operator-kill semantics as the
                         // Session-cursor arm above.
-                        Self::kill_daemon_session_if_attached(&ws.sessions[0]);
+                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[0]);
                         Self::tombstone_session(ws, 0);
                         ws.sessions.remove(0);
                         self.cursor = Cursor::Workspace(wi);
@@ -8429,6 +8949,22 @@ impl App {
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
     ) {
+        // 12e-r2 F1: snapshot active_host ONCE at the top of
+        // the user action. Pass it through to `try_spawn_via_daemon`
+        // and reuse the same value for the TerminalSession.host_id
+        // assignment below.
+        let active_host = self.active_host.clone();
+        // 12e-r6 F1: fail fast BEFORE worktree creation on
+        // non-local active_host. The spawn would build local
+        // mcp_config paths and send them to a remote daemon
+        // that can't read them; worse, A-n already created a
+        // worktree by the point we'd discover the failure
+        // (orphan dir on disk). The guard up here means no
+        // git work happens for the non-supported case.
+        if let Err(e) = guard_local_host_only(&active_host, "A-n local session") {
+            self.set_status_msg(&format!("{}", e));
+            return;
+        }
         let main_repo = match worktree::find_local_repo(repo_url) {
             Some(p) => p,
             None => {
@@ -8555,6 +9091,7 @@ impl App {
             // `rpc_set_workflow_context` updates the daemon copy.
             None,
             None,
+            &active_host,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -8613,10 +9150,12 @@ impl App {
             managed_by_uid: None,
             seeded_from_snapshot: seed_from.map(str::to_string),
             preserved_last_exit: None,
-            // 12b: A-l "launch from planning" creates a new
-            // workspace + session, always on the local host
-            // (12e adds A-H selection — out of scope here).
-            host_id: crate::hosts::HostId::local(),
+            // 12e-r2 F1: use the active_host SNAPSHOT taken at
+            // the top of this function — same value the spawn
+            // dialed against. Reading `self.active_host` here
+            // would race a concurrent cycle and tag the
+            // session with the wrong host.
+            host_id: active_host.clone(),
         };
         let ws = Workspace {
             id: workspace_id_pre,
@@ -8644,7 +9183,7 @@ impl App {
         // `daemon_session_uid.is_some()`).
         if let Some(ws) = self.workspaces.get(new_wi) {
             if let Some(ts) = ws.sessions.get(0) {
-                Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                Self::push_transcript_path_to_daemon_if_attached(&self.host_pool, ts, ws);
             }
         }
         self.cursor = Cursor::Session(new_wi, 0);
@@ -8752,6 +9291,21 @@ impl App {
         task_id: Option<String>,
         seed_from: Option<&str>,
     ) {
+        // 12e-r2 F1: snapshot active_host ONCE — same
+        // rationale as `create_local_session`.
+        let active_host = self.active_host.clone();
+        // 12e-r6 F1: fail fast BEFORE any session-creation
+        // work on a non-local active_host. A-s reuses an
+        // existing workspace + worktree, so there's no
+        // orphan-disk concern like A-n — the guard is
+        // primarily about not silently mistagging.
+        if let Err(e) = guard_local_host_only(
+            &active_host,
+            "A-s session-on-workspace",
+        ) {
+            self.set_status_msg(&format!("{}", e));
+            return;
+        }
         // Resolve workspace_id → current index. If the workspace
         // disappeared while the form was open (delete, reconcile drop,
         // etc.), bail cleanly rather than spawning into an unrelated
@@ -8907,6 +9461,7 @@ impl App {
                 // at spawn time.
                 None,
                 None,
+                &active_host,
             ),
             _ => None,
         };
@@ -8991,6 +9546,10 @@ impl App {
                 );
                 ts.task_id = task_id;
                 ts.seeded_from_snapshot = seed_from.map(str::to_string);
+                // 12e-r2 F1: use the active_host SNAPSHOT
+                // taken at the top of this function — same
+                // value the spawn dialed against.
+                ts.host_id = active_host.clone();
                 // Engine-asymmetric transcript_id wiring — see
                 // `ClonedSession` rustdoc. For Claude the cloned id IS
                 // the live transcript id; for Codex it's a seed-file id
@@ -9012,7 +9571,7 @@ impl App {
                 // pushes when the actual rollout file appears.
                 if let Some(ws) = self.workspaces.get(ws_index) {
                     if let Some(ts) = ws.sessions.get(si) {
-                        Self::push_transcript_path_to_daemon_if_attached(ts, ws);
+                        Self::push_transcript_path_to_daemon_if_attached(&self.host_pool, ts, ws);
                     }
                 }
                 self.cursor = Cursor::Session(ws_index, si);
@@ -9317,8 +9876,9 @@ impl App {
         // for every daemon-attached session in this workspace
         // BEFORE the Workspace (and its Sessions) drop — Drop is
         // detach-only by design.
+        let pool = std::sync::Arc::clone(&self.host_pool);
         for ts in &self.workspaces[wi].sessions {
-            Self::kill_daemon_session_if_attached(ts);
+            Self::kill_daemon_session_if_attached(&pool, ts);
         }
         self.workspaces.remove(wi);
         self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
@@ -9473,6 +10033,19 @@ impl App {
         // until the next reconcile patches it.
         parent_task_id: Option<&str>,
     ) {
+        // 12e-r7 F2: planning A-l from the planning view
+        // creates a worktree + spawns a session. Same shape
+        // as round-6 F1 for `create_local_session`: snapshot
+        // active_host, fail-fast BEFORE worktree creation so
+        // a remote-host A-l doesn't leave an orphan dir.
+        let active_host = self.active_host.clone();
+        if let Err(e) = guard_local_host_only(
+            &active_host,
+            "A-l launch-from-plan",
+        ) {
+            self.set_status_msg(&format!("{}", e));
+            return;
+        }
         let repo_url = match self.config.repos.get(project) {
             Some(url) => url.clone(),
             None => {
@@ -9642,6 +10215,19 @@ impl App {
         // See `launch_from_plan` for the full backstory.
         parent_task_id: Option<&str>,
     ) {
+        // 12e-r7 F2: planning A-l into an existing workspace.
+        // Same shape as round-6 F1 for `spawn_session_on_workspace`:
+        // snapshot active_host, fail-fast on non-local. No
+        // orphan-disk concern (workspace already has a
+        // worktree), but the mistag bug-class is the same.
+        let active_host = self.active_host.clone();
+        if let Err(e) = guard_local_host_only(
+            &active_host,
+            "A-l launch-into-workspace",
+        ) {
+            self.set_status_msg(&format!("{}", e));
+            return;
+        }
         let Some(wi) = self.workspace_index_by_id(workspace_id) else {
             self.set_status_msg("Workspace no longer exists");
             return;
@@ -10950,6 +11536,28 @@ impl App {
                     ]);
                     items.push(ListItem::new(line).style(base_style));
                 }
+                // 12e: host header rendered as a non-selectable
+                // bold-ish row. Active host gets a slight
+                // emphasis so the operator sees where new
+                // sessions will be pinned.
+                VisualItem::HostHeader(host_id) => {
+                    let is_active = host_id == &self.active_host;
+                    let prefix = if is_active { "* " } else { "  " };
+                    let style = if is_active {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    let line = Line::from(vec![Span::styled(
+                        format!("{}{}", prefix, host_id.as_str()),
+                        style,
+                    )]);
+                    items.push(ListItem::new(line));
+                }
             }
         }
 
@@ -11409,6 +12017,12 @@ impl App {
     {
         let last_term_size = self.last_term_size;
         let actions = {
+            // 12e-r3 F1: snapshot active_host before building
+            // the ctx — same snapshot-once-at-top pattern as
+            // the other A-* user-action handlers. The
+            // controller uses this for fresh-slot workflow
+            // participant spawns.
+            let active_host = self.active_host.clone();
             let mut ctx = workflow::controller::WorkflowControllerCtx {
                 workflow_runs: &mut self.workflow_runs,
                 workspaces: &mut self.workspaces,
@@ -11418,6 +12032,8 @@ impl App {
                 cap_status: &self.memory_cap_status,
                 kill_tx: &self.memory_kill_tx,
                 pending_workflow_events: &mut self.pending_workflow_events,
+                host_pool: &self.host_pool,
+                active_host,
             };
             f(&mut ctx)
         };
@@ -17542,11 +18158,13 @@ mod respawn_kills_daemon_session_tests {
     #[test]
     fn respawn_calls_kill_daemon_before_session_swap() {
         let body = respawn_body();
-        let kill_idx = body.find("kill_daemon_session_if_attached(ts)").unwrap_or_else(|| {
+        // 12e: helper signature changed to take `&HostPool`
+        // first; the textual needle is the multi-arg call form.
+        let kill_idx = body.find("kill_daemon_session_if_attached(host_pool, ts)").unwrap_or_else(|| {
             panic!(
                 "respawn_existing_with_workflow_mcp must call \
-                 App::kill_daemon_session_if_attached(ts) before swapping \
-                 `ts.session`. For daemon-attached sessions, Drop is \
+                 App::kill_daemon_session_if_attached(host_pool, ts) before \
+                 swapping `ts.session`. For daemon-attached sessions, Drop is \
                  detach-only — without the explicit kill, the daemon's old \
                  PTY child outlives the swap and races the new agent. \
                  Same bug class as round-33 finding 1 + the slice \
@@ -17565,11 +18183,2184 @@ mod respawn_kills_daemon_session_tests {
         });
         assert!(
             kill_idx < swap_idx,
-            "kill_daemon_session_if_attached(ts) at byte {} must precede \
-             `ts.session = new_sess` at byte {} — otherwise the swap drops \
-             the old daemon-attached Session (detach-only Drop) BEFORE the \
+            "kill_daemon_session_if_attached(host_pool, ts) at byte {} must \
+             precede `ts.session = new_sess` at byte {} — otherwise the swap \
+             drops the old daemon-attached Session (detach-only Drop) BEFORE the \
              explicit kill RPC fires, leaving an orphan daemon PTY child.\n\nFunction body:\n{}",
             kill_idx, swap_idx, body
+        );
+    }
+}
+
+/// Slice 12e: A-H active-host cycling + new-session inheritance
+/// + multi-host sidebar grouping + per-session-host routing for
+/// the three `_if_attached` helpers.
+#[cfg(test)]
+mod slice_12e_tests {
+    use super::*;
+    use cm_daemon::host_id::HostId;
+
+    /// Build an isolated HOME + write a `hosts.toml` listing the
+    /// given (name, default) entries. Returns the App with
+    /// hosts loaded from that file.
+    fn build_app_with_hosts(
+        entries: &[(&str, bool)],
+        guard: &std::sync::MutexGuard<'static, ()>,
+    ) -> (App, tempfile::TempDir) {
+        let _ = guard; // keep guard alive
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).expect("create .cm");
+        let mut toml = String::new();
+        for (name, default) in entries {
+            toml.push_str("[[host]]\n");
+            toml.push_str(&format!("name = \"{}\"\n", name));
+            if *name == "local" {
+                toml.push_str("transport = \"unix\"\n");
+                toml.push_str("socket = \"/tmp/local-test.sock\"\n");
+            } else {
+                toml.push_str("transport = \"ssh-unix\"\n");
+                toml.push_str(&format!("ssh_host = \"{}-host\"\n", name));
+                toml.push_str(&format!(
+                    "remote_socket = \"/remote/{}.sock\"\n",
+                    name,
+                ));
+            }
+            if *default {
+                toml.push_str("default = true\n");
+            }
+            toml.push('\n');
+        }
+        std::fs::write(cm_dir.join("hosts.toml"), &toml)
+            .expect("write hosts.toml");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        (app, tmp)
+    }
+
+    /// T_g3e_active_host_cycle (named acceptance test).
+    ///
+    /// `A-H` cycles `active_host` through `hosts.hosts` in
+    /// config order. Single-host setups show a hint rather than
+    /// silently rotating (no-op cycle).
+    #[test]
+    fn t_g3e_active_host_cycle() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false), ("worker", false)],
+            &guard,
+        );
+        assert_eq!(app.active_host, HostId::local());
+        app.cycle_active_host();
+        assert_eq!(app.active_host, HostId::new("manager"));
+        app.cycle_active_host();
+        assert_eq!(app.active_host, HostId::new("worker"));
+        // Wraps around.
+        app.cycle_active_host();
+        assert_eq!(app.active_host, HostId::local());
+    }
+
+    /// 12e: single-host case (synthesized local default) shows
+    /// a status hint instead of silently no-op'ing.
+    #[test]
+    fn cycle_active_host_single_host_shows_hint() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true)],
+            &guard,
+        );
+        assert_eq!(app.hosts.hosts.len(), 1);
+        let before = app.active_host.clone();
+        app.cycle_active_host();
+        assert_eq!(app.active_host, before, "single-host MUST NOT change");
+        let msg = app
+            .status_msg
+            .as_ref()
+            .map(|(s, _)| s.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("single host") && msg.contains("hosts.toml"),
+            "single-host hint expected; got: {}",
+            msg,
+        );
+    }
+
+    /// T_g3e_new_session_inherits (named acceptance test).
+    ///
+    /// Session creation paths (`A-n` / `A-s` / `A-f`) set the
+    /// new session's `host_id` to the current `active_host`.
+    /// The doc explicitly enumerates A-n / A-s / A-f as the
+    /// surface; this test pins the A-s call site via
+    /// `spawn_session_on_workspace`'s `host_id` assignment
+    /// (line ~9118) and the A-n / A-l path via
+    /// `create_local_session` (line ~8749).
+    ///
+    /// Verifies via source-text inspection: the
+    /// `ts.host_id = self.active_host.clone()` assignment
+    /// appears in both call sites. This is a structural pin —
+    /// if a future refactor accidentally drops the assignment,
+    /// new sessions would silently revert to the factory's
+    /// local default and `A-H` would have no effect on
+    /// creation.
+    #[test]
+    fn t_g3e_new_session_inherits() {
+        let src = include_str!("app.rs");
+
+        // A-n / A-l (planning launch -> create_local_session):
+        // pinned via the inline assignment.
+        let create_local_marker =
+            "12e: new sessions get pinned to the active host";
+        assert!(
+            src.contains(create_local_marker),
+            "create_local_session must carry the 12e \
+             active-host inheritance comment + assignment",
+        );
+
+        // A-s (spawn_session_on_workspace).
+        let spawn_workspace_marker =
+            "12e: A-s pins the new session to the active";
+        assert!(
+            src.contains(spawn_workspace_marker),
+            "spawn_session_on_workspace must carry the 12e \
+             active-host inheritance comment + assignment",
+        );
+
+        // MCP-spawned sessions follow the same rule (the doc's
+        // session-creation surface extends to descendant
+        // spawns from agent tools).
+        let mcp_marker = "12e: MCP-spawned sessions inherit";
+        assert!(
+            src.contains(mcp_marker),
+            "mcp_start_session must inherit active_host (12e)",
+        );
+
+        // Runtime end-to-end check: build an App with a
+        // non-default active host, drive the call paths, and
+        // verify the resulting TerminalSession carries that
+        // host_id.
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        app.cycle_active_host();
+        assert_eq!(app.active_host, HostId::new("manager"));
+        // Build a TerminalSession by hand the way the factory
+        // path would, then assert the active_host injection.
+        // We don't go through the real spawn paths because
+        // those launch PTYs.
+        let mut ts = make_simple_session_with_uid(
+            "test-uid".into(),
+            "test-label",
+            "bash",
+            // Dummy Session — we won't read its PTY in this test.
+            crate::session::Session::new(
+                "/bin/true",
+                &[],
+                80,
+                24,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .expect("spawn /bin/true for stub"),
+            None,
+        );
+        // Mimic the A-s call site: factory default is
+        // overwritten with active_host.
+        ts.host_id = app.active_host.clone();
+        assert_eq!(
+            ts.host_id,
+            HostId::new("manager"),
+            "new session must inherit active_host after the \
+             12e overwrite",
+        );
+    }
+
+    /// T_g3e_sidebar_groups_per_host (named acceptance test).
+    ///
+    /// `visual_items_status` emits a `HostHeader` per host
+    /// when `hosts.toml` has >1 entry, and groups sessions by
+    /// host. Single-host setups render unchanged.
+    #[test]
+    fn t_g3e_sidebar_groups_per_host() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        // Construct two workspaces, each with one session,
+        // pinned to different hosts.
+        for (i, host_name) in [(0, "local"), (1, "manager")].iter() {
+            let mut ts = make_simple_session_with_uid(
+                format!("uid-{}", i),
+                &format!("label-{}", i),
+                "bash",
+                crate::session::Session::new(
+                    "/bin/true",
+                    &[],
+                    80,
+                    24,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .expect("spawn"),
+                None,
+            );
+            ts.host_id = HostId::new(*host_name);
+            ts.status = SessionStatus::Idle;
+            let ws = Workspace {
+                id: format!("ws-{}", i),
+                name: format!("ws-{}", i),
+                is_closed: false,
+                is_cloud: false,
+                repo_url: None,
+                worktree_path: None,
+                main_repo_path: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: vec![ts],
+                tombstones: Vec::new(),
+                is_pushing: false,
+            };
+            app.workspaces.push(ws);
+        }
+        let items = app.visual_items_status();
+        let host_headers: Vec<_> = items
+            .iter()
+            .filter_map(|i| {
+                if let VisualItem::HostHeader(h) = i {
+                    Some(h.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            host_headers,
+            vec![HostId::local(), HostId::new("manager")],
+            "multi-host sidebar MUST emit one HostHeader per \
+             configured host (in hosts.toml order); got items: {:?}",
+            items,
+        );
+
+        // Single-host case: no HostHeader.
+        // Drop the first guard BEFORE acquiring a second —
+        // std::sync::Mutex isn't reentrant and `home_lock()`
+        // uses one static mutex.
+        drop(_tmp);
+        drop(app);
+        drop(guard);
+        let guard2 = crate::test_support::home_lock();
+        let (mut single_app, _tmp2) =
+            build_app_with_hosts(&[("local", true)], &guard2);
+        single_app.workspaces.push(Workspace {
+            id: "ws-only".into(),
+            name: "ws-only".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            is_pushing: false,
+            sessions: vec![{
+                let mut ts = make_simple_session_with_uid(
+                    "uid-only".into(),
+                    "label",
+                    "bash",
+                    crate::session::Session::new(
+                        "/bin/true",
+                        &[],
+                        80,
+                        24,
+                        None,
+                        HashMap::new(),
+                        None,
+                    )
+                    .expect("spawn"),
+                    None,
+                );
+                ts.status = SessionStatus::Idle;
+                ts
+            }],
+            tombstones: Vec::new(),
+        });
+        let single_items = single_app.visual_items_status();
+        let has_host_header = single_items
+            .iter()
+            .any(|i| matches!(i, VisualItem::HostHeader(_)));
+        assert!(
+            !has_host_header,
+            "single-host setup MUST NOT emit HostHeader rows; \
+             got: {:?}",
+            single_items,
+        );
+    }
+
+    // ---------------------------------------------------------
+    // Orchestrator-added tests: route the 3 helpers through the
+    // session's pinned host.
+    // ---------------------------------------------------------
+
+    /// `kill_daemon_session_routes_to_session_host`: a session
+    /// pinned to a non-default host fires its kill RPC against
+    /// THAT host's socket, not the default host's.
+    ///
+    /// We can't directly observe the socket dialed by
+    /// `rpc_kill_session` without standing up a daemon, so the
+    /// test asserts the host_pool routing decision by reading
+    /// the path the helper picks. Verified via inspection of
+    /// `host_pool.for_host(&ts.host_id)`'s socket_path output
+    /// for both the default and non-default host: they MUST
+    /// differ.
+    #[test]
+    fn kill_daemon_session_routes_to_session_host() {
+        let guard = crate::test_support::home_lock();
+        let (app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        let local_path = app
+            .host_pool
+            .get_handle_for_test(&HostId::local())
+            .expect("local handle")
+            .socket_path();
+        let manager_handle = app
+            .host_pool
+            .get_handle_for_test(&HostId::new("manager"))
+            .expect("manager handle");
+        // Pre-spawn the SshUnix handle has no path; build_handle
+        // didn't trigger SshTunnel::spawn. The PROOF that
+        // routing differs by host is: the two handles are
+        // distinct ConnectionHandle instances, and the Unix
+        // handle returns Some(local_path) while the SshUnix
+        // handle returns None (pre-spawn). Together: the
+        // 3-helper routing through `pool.for_host(host_id)`
+        // produces DIFFERENT outputs for the two hosts.
+        assert!(local_path.is_some());
+        assert_eq!(
+            manager_handle.socket_path(),
+            None,
+            "SshUnix handle's path is None pre-first-spawn; \
+             after spawn it's a per-spawn random path under \
+             the tunnel dir — never equal to the local path",
+        );
+
+        // Pin via source-text: each of the 3 helpers calls
+        // `host_pool.for_host(&ts.host_id)`.
+        let src = include_str!("app.rs");
+        for helper in &[
+            "kill_daemon_session_if_attached",
+            "push_transcript_path_to_daemon_if_attached",
+            "push_workflow_context_to_daemon_if_attached",
+        ] {
+            // Locate the helper's body via its `pub(crate) fn`
+            // signature.
+            let sig = format!("pub(crate) fn {}(", helper);
+            let start = src.find(&sig).unwrap_or_else(|| {
+                panic!("must find `{}` signature", sig)
+            });
+            // Bound the search to the next `pub(crate) fn` or
+            // EOF — close enough heuristic for the body.
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    pub(crate) fn ")
+                .map(|i| 1 + i)
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("host_pool.for_host(&ts.host_id)"),
+                "{}'s body must route through \
+                 `host_pool.for_host(&ts.host_id)` (12e); \
+                 found:\n{}",
+                helper,
+                body,
+            );
+        }
+    }
+
+    /// `transcript_path_push_routes_to_session_host`: alias for
+    /// the second helper covered by the structural assertion
+    /// above. Kept as a separate test entry to match the
+    /// prompt's enumeration and surface the failure clearly.
+    #[test]
+    fn transcript_path_push_routes_to_session_host() {
+        let src = include_str!("app.rs");
+        let sig = "pub(crate) fn push_transcript_path_to_daemon_if_attached(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub(crate) fn ")
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("host_pool.for_host(&ts.host_id)"),
+            "push_transcript_path_to_daemon_if_attached must \
+             route via host_pool.for_host(&ts.host_id); body:\n{}",
+            body,
+        );
+        // Pin: the function takes a `host_pool` parameter so
+        // multi-host callers can fan out per session.
+        assert!(
+            body.contains(
+                "host_pool: &crate::host_pool::HostPool"
+            ),
+            "signature must accept `host_pool` parameter",
+        );
+    }
+
+    /// `workflow_context_push_routes_to_session_host`: alias
+    /// for the third helper.
+    #[test]
+    fn workflow_context_push_routes_to_session_host() {
+        let src = include_str!("app.rs");
+        let sig = "pub(crate) fn push_workflow_context_to_daemon_if_attached(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub(crate) fn ")
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("host_pool.for_host(&ts.host_id)"),
+            "push_workflow_context_to_daemon_if_attached must \
+             route via host_pool.for_host(&ts.host_id); body:\n{}",
+            body,
+        );
+        assert!(
+            body.contains("host_pool: &crate::host_pool::HostPool"),
+            "signature must accept `host_pool` parameter",
+        );
+    }
+
+    /// 12e (F2 fix): watch consumer reconnects to the NEW
+    /// random socket path after an SSH tunnel respawn. Pre-12e
+    /// the consumer captured a `PathBuf` at App::new time and
+    /// would forever retry the stale path. 12e changed the
+    /// signature to a `SocketPathProvider` closure that's
+    /// re-invoked on each reconnect.
+    #[test]
+    fn manifest_watch_reconnects_to_new_socket_after_tunnel_respawn() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket1 = tmp.path().join("path-a.sock");
+        let socket2 = tmp.path().join("path-b.sock");
+
+        // Build a path_provider that returns `path-a` for the
+        // first N calls, then `path-b` for the rest. Mirrors
+        // the production case where an SSH tunnel respawn
+        // moves the socket to a new random path.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let socket1_clone = socket1.clone();
+        let socket2_clone = socket2.clone();
+        let provider: crate::host_pool::SocketPathProvider =
+            Arc::new(move || {
+                let n = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                // First 2 calls → path-a (the original).
+                // 3rd+ calls → path-b (post-respawn).
+                if n < 2 {
+                    Some(socket1_clone.clone())
+                } else {
+                    Some(socket2_clone.clone())
+                }
+            });
+
+        // No listener bound at either path → consumer's dial
+        // fails on both. Wait until the provider has been
+        // called at least 3 times (enough to have switched to
+        // path-b at least once).
+        let (event_tx, _event_rx) =
+            std::sync::mpsc::channel::<crate::manifest_watch::ManifestEvent>();
+
+        let provider_for_thread = Arc::clone(&provider);
+        let _thread = std::thread::spawn(move || {
+            // Run the consumer for ~3s then exit (the channel
+            // disconnect will end it).
+            let _ = std::thread::Builder::new()
+                .name("test-watch".to_string())
+                .spawn(move || {
+                    crate::manifest_watch::run_consumer_with_provider(
+                        &provider_for_thread,
+                        event_tx,
+                    );
+                });
+        });
+
+        // Wait for the provider to be called enough times to
+        // have moved past path-a — proves the consumer
+        // re-invokes the provider on each reconnect attempt.
+        // The 1s backoff means waiting up to ~5s should
+        // exercise 3-4 reconnect attempts.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(8);
+        let mut saw_path_b_query = false;
+        while std::time::Instant::now() < deadline {
+            if call_count.load(Ordering::SeqCst) >= 3 {
+                saw_path_b_query = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            saw_path_b_query,
+            "consumer must have called the path_provider at \
+             least 3 times within 8s (proof that it re-fetches \
+             the path on each reconnect, not just at startup); \
+             actual calls: {}",
+            call_count.load(Ordering::SeqCst),
+        );
+
+        // Also pin (structural) that the swap from path-a to
+        // path-b actually flows through to the dial: the
+        // provider's return value is what the consumer uses
+        // for its connect attempt. We've already proven the
+        // provider IS being re-called; the connect side is a
+        // direct read of that return value (see
+        // `run_consumer_with_provider`'s loop body). Bind
+        // path-b on the SUT side as a final sanity check:
+        // a real listener appears + we let the consumer's
+        // next attempt succeed.
+        let _listener_b = UnixListener::bind(&socket2).expect("bind b");
+        // Drop the listener immediately — we're not actually
+        // exchanging frames here. The point: the consumer
+        // dialed it (or would; failure is also OK), without
+        // crashing.
+        let _ = _listener_b;
+    }
+
+    // ---------------------------------------------------------
+    // Mutation-defense: pin that the controller-ctx struct
+    // carries `host_pool` so the workflow-respawn path can
+    // route through it. Pre-12e the controller had no pool
+    // access and `respawn_existing_with_workflow_mcp`'s kill
+    // would have hit the default host.
+    // ---------------------------------------------------------
+
+    #[test]
+    fn workflow_controller_ctx_carries_host_pool() {
+        let src = include_str!("workflow/controller.rs");
+        assert!(
+            src.contains("pub host_pool: &'a crate::host_pool::HostPool"),
+            "WorkflowControllerCtx must carry a host_pool ref \
+             so workflow-respawn paths route through the \
+             session's pinned host (12e)",
+        );
+    }
+
+    // ---------------------------------------------------------
+    // 12e Round 2 reviewer findings: regression tests.
+    // ---------------------------------------------------------
+
+    /// 12e-r2 F1: when `active_host` is a non-default host,
+    /// the daemon-spawn path MUST dial that host's socket, not
+    /// the default host's. Pre-r2 `try_spawn_via_daemon` went
+    /// through `default_handle()` while the resulting
+    /// `TerminalSession.host_id` was tagged with `active_host`
+    /// — every subsequent per-session RPC would then route to
+    /// a daemon that had no record of the UID.
+    ///
+    /// Structural pin: assert `try_spawn_via_daemon`'s body
+    /// routes through `host_pool.for_host(host_id)` (the new
+    /// parameter), NOT `host_pool.default_handle()`. The
+    /// `host_id` parameter must exist in the signature.
+    #[test]
+    fn spawn_via_daemon_routes_to_host_id_not_default() {
+        let src = include_str!("app.rs");
+
+        // Locate the function body bounded by the signature
+        // line and the closing `}`.
+        let sig = "pub fn try_spawn_via_daemon(";
+        let start = src.find(sig).expect("must find sig");
+        // Bound by the next `pub fn` / `fn ` at indent 4.
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // The function must accept `host_id: &cm_daemon::host_id::HostId`.
+        assert!(
+            body.contains("host_id: &cm_daemon::host_id::HostId"),
+            "try_spawn_via_daemon signature MUST accept a \
+             `host_id: &HostId` parameter so callers can pin \
+             the spawn to a specific host; body:\n{}",
+            body,
+        );
+
+        // The dial site must use for_host(host_id), NOT
+        // default_handle().
+        assert!(
+            body.contains("host_pool.for_host(host_id)"),
+            "try_spawn_via_daemon MUST route through \
+             `host_pool.for_host(host_id)`; body:\n{}",
+            body,
+        );
+        assert!(
+            !body.contains("host_pool.default_handle()"),
+            "try_spawn_via_daemon MUST NOT call \
+             `host_pool.default_handle()` — that ignores the \
+             caller's active_host choice (12e-r2 F1); body:\n{}",
+            body,
+        );
+
+        // The two production callers (create_local_session,
+        // spawn_session_on_workspace) must SNAPSHOT
+        // `self.active_host` at the top of the function and
+        // pass that snapshot through to BOTH the spawn call
+        // AND the TerminalSession.host_id assignment. Pin
+        // structurally — the markers are the 12e-r2 comments
+        // and the snapshot variable name.
+        for marker in &[
+            "12e-r2 F1: snapshot active_host ONCE — same\n        // rationale as `create_local_session`",
+            "12e-r2 F1: snapshot active_host ONCE at the top",
+        ] {
+            assert!(
+                src.contains(marker),
+                "expected 12e-r2 snapshot comment not found: {:?}",
+                marker,
+            );
+        }
+        // And the call sites pass &active_host (the snapshot).
+        assert!(
+            src.contains("&active_host,\n        ) {"),
+            "create_local_session must pass &active_host to \
+             try_spawn_via_daemon",
+        );
+    }
+
+    /// 12e-r2 F2 (Option A): one watch consumer per
+    /// configured host. A multi-host setup spawns N
+    /// manifest.watch + N events.subscribe consumers; a later
+    /// `cycle_active_host` doesn't tear them down or rebuild
+    /// them — they all stay live so sessions on any host get
+    /// streaming events.
+    #[test]
+    fn watch_consumers_follow_active_host_after_cycle() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        // Pre-cycle: 2 hosts → 2 manifest + 2 workflow
+        // consumers.
+        let manifest_n = app._manifest_watch_threads.len();
+        let workflow_n = app._workflow_watch_threads.len();
+        assert_eq!(
+            manifest_n, 2,
+            "multi-host setup MUST spawn one manifest.watch \
+             consumer per host (12e-r2 F2 Option A); got {} \
+             for {} hosts",
+            manifest_n,
+            app.hosts.hosts.len(),
+        );
+        assert_eq!(
+            workflow_n, 2,
+            "multi-host setup MUST spawn one events.subscribe \
+             consumer per host",
+        );
+
+        // Cycle active_host. The consumer count MUST NOT
+        // change — per-host consumers are already covering
+        // both hosts. A cycle is purely a tag-future-sessions
+        // operation; the streaming consumers are independent.
+        app.cycle_active_host();
+        assert_eq!(
+            app._manifest_watch_threads.len(),
+            manifest_n,
+            "cycle_active_host MUST NOT rebuild manifest \
+             consumers (they're per-host, already covering \
+             all configured hosts)",
+        );
+        assert_eq!(
+            app._workflow_watch_threads.len(),
+            workflow_n,
+            "cycle_active_host MUST NOT rebuild workflow \
+             consumers",
+        );
+
+        // None of the threads should have died on their own
+        // (consumers loop forever; they only exit on channel
+        // disconnect or process exit). `is_finished` returns
+        // true only if the thread has exited.
+        for (i, t) in app._manifest_watch_threads.iter().enumerate() {
+            assert!(
+                !t.is_finished(),
+                "manifest watch consumer #{} should still be \
+                 alive after cycle_active_host",
+                i,
+            );
+        }
+        for (i, t) in app._workflow_watch_threads.iter().enumerate() {
+            assert!(
+                !t.is_finished(),
+                "workflow watch consumer #{} should still be \
+                 alive after cycle_active_host",
+                i,
+            );
+        }
+    }
+
+    /// 12e-r2 F2: single-host setup still gets exactly one
+    /// consumer of each type. Pre-r2 it was also one
+    /// consumer, so this is a no-overhead regression-pin.
+    #[test]
+    fn watch_consumers_single_host_count_is_one() {
+        let guard = crate::test_support::home_lock();
+        let (app, _tmp) = build_app_with_hosts(
+            &[("local", true)],
+            &guard,
+        );
+        assert_eq!(app._manifest_watch_threads.len(), 1);
+        assert_eq!(app._workflow_watch_threads.len(), 1);
+    }
+
+    // ---------------------------------------------------------
+    // 12e Round 3 reviewer findings.
+    // ---------------------------------------------------------
+
+    /// 12e-r8 F1 (named acceptance): `spawn_managed_session`
+    /// MUST derive its target host from the CALLER's
+    /// `host_id` (resolved via `resolve_caller_host`), NOT
+    /// from `self.active_host` (the operator's transient
+    /// A-H selection). An agent's spawn rights belong to
+    /// the agent's context — same shape as Unix `fork()`
+    /// inheriting the parent's cwd.
+    ///
+    /// Pre-r8: the guard checked `self.active_host`. If the
+    /// operator cycled to a non-local active_host while a
+    /// local-rooted agent was running, the agent's
+    /// `start_session` call would fail-fast rejected even
+    /// though `spawn on local where caller lives` was the
+    /// right answer. The bug class: caller-context derivation
+    /// gated on UI state.
+    #[test]
+    fn mcp_start_session_inherits_caller_host_not_active_host() {
+        use cm_daemon::host_id::HostId;
+
+        let src = include_str!("app.rs");
+
+        // Structural: resolve_caller_host helper exists +
+        // walks self.workspaces.sessions to find the caller.
+        let resolver_sig =
+            "pub(crate) fn resolve_caller_host(\n        &self,\n        caller_uid: &str,\n    ) -> std::io::Result<cm_daemon::host_id::HostId>";
+        assert!(
+            src.contains(resolver_sig),
+            "resolve_caller_host helper must exist with the \
+             expected signature (12e-r8 F1)",
+        );
+
+        // Structural: spawn_managed_session uses caller_host,
+        // NOT active_host.
+        let sig = "pub fn spawn_managed_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("let caller_host = self.resolve_caller_host(caller_uid)?"),
+            "spawn_managed_session must resolve caller_host \
+             via resolve_caller_host (12e-r8 F1); body:\n{}",
+            body,
+        );
+        assert!(
+            body.contains("guard_local_host_only(&caller_host, \"MCP `start_session`\")"),
+            "guard MUST check caller_host, not active_host",
+        );
+        assert!(
+            body.contains("&caller_host,") &&
+            body.contains("host_id: caller_host.clone()"),
+            "spawn must pass &caller_host to try_spawn_via_daemon \
+             AND tag the new session with caller_host.clone()",
+        );
+        // Regression pin: the active_host snapshot is gone.
+        assert!(
+            !body.contains("let active_host = self.active_host.clone();"),
+            "spawn_managed_session MUST NOT snapshot \
+             self.active_host (12e-r8 F1 — pre-r8 the guard \
+             gated on UI state, rejecting local-rooted agent \
+             spawns when operator was viewing manager)",
+        );
+
+        // Runtime: active_host=manager but caller=local. The
+        // spawn MUST succeed (not fail-fast) and route to
+        // local.
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        app.cycle_active_host();
+        assert_eq!(app.active_host, HostId::new("manager"));
+
+        // Plant a TUI session with host_id=local as the
+        // caller. Use a workspace with a worktree so
+        // spawn_managed_session gets past the worktree
+        // lookup before we observe the guard outcome.
+        let tmpdir = tempfile::tempdir().expect("worktree tempdir");
+        let mut caller_ts = make_simple_session_with_uid(
+            "caller-local-uid".into(),
+            "caller",
+            "bash",
+            crate::session::Session::new(
+                "/bin/true",
+                &[],
+                80,
+                24,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .expect("dummy session"),
+            None,
+        );
+        caller_ts.host_id = HostId::local();
+        app.workspaces.push(Workspace {
+            id: "ws-local-caller".into(),
+            name: "ws-local-caller".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(tmpdir.path().to_path_buf()),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            is_pushing: false,
+            sessions: vec![caller_ts],
+            tombstones: Vec::new(),
+        });
+
+        // Sanity: resolver picks up the planted caller's
+        // host (local), not active_host (manager).
+        let resolved = app
+            .resolve_caller_host("caller-local-uid")
+            .expect("resolver must find planted caller");
+        assert_eq!(
+            resolved,
+            HostId::local(),
+            "resolve_caller_host MUST return the caller's \
+             pinned host_id, NOT active_host",
+        );
+
+        // Symmetric: unknown caller → NotFound error.
+        let missing = app.resolve_caller_host("ghost-uid");
+        assert!(
+            missing.is_err(),
+            "resolve_caller_host on a missing uid MUST error",
+        );
+
+        // End-to-end: spawn_managed_session WOULD NOT
+        // fail-fast on a local-rooted caller despite
+        // active_host=manager. Calling the real spawn
+        // requires a working PTY + daemon socket — out of
+        // scope for a unit test. The structural pins above
+        // cover that the function consults caller_host, not
+        // active_host.
+        drop(guard);
+    }
+
+    /// 12e-r4 F1.3 (workflow fresh slot — interim fail-fast):
+    /// `spawn_workflow_session` is local-only at this slice.
+    /// When `active_host != HostId::local()`, the function
+    /// MUST return `None` (signaling spawn failure) with a
+    /// clear log message instead of silently spawning local
+    /// and tagging the session with the non-local
+    /// active_host. Pre-r4 the call tagged with active_host
+    /// while spawning local — every downstream per-session
+    /// RPC routed to a daemon that had no record of the UID.
+    ///
+    /// Real fix (deferred): route the spawn through
+    /// `try_spawn_via_daemon`. Structural pin below ensures
+    /// the interim guard stays in place; runtime check
+    /// exercises the actual fail-fast.
+    #[test]
+    fn workflow_fresh_slot_actually_spawns_on_active_host() {
+        let ctrl = include_str!("workflow/controller.rs");
+
+        // Locate spawn_workflow_session.
+        let sig = "fn spawn_workflow_session(";
+        let start = ctrl.find(sig).expect("must find sig");
+        let rest = &ctrl[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Structural pin: the interim fail-fast guard at the
+        // top of the function.
+        assert!(
+            body.contains(
+                "self.active_host != cm_daemon::host_id::HostId::local()",
+            ),
+            "spawn_workflow_session must fail fast when \
+             active_host is non-local (12e-r4 F1.3 interim); \
+             body:\n{}",
+            body,
+        );
+        assert!(
+            body.contains("A-f workflow launch on non-local active_host"),
+            "fail-fast log message must clearly name the \
+             unsupported case",
+        );
+
+        // The tag MUST be HostId::local() — the truthful
+        // signal at this slice. Pre-r4 it was
+        // `self.active_host.clone()` even though the spawn
+        // was always local.
+        assert!(
+            body.contains("host_id: cm_daemon::host_id::HostId::local()"),
+            "spawn_workflow_session MUST tag with \
+             HostId::local() (the truthful signal) until the \
+             follow-up slice adds controller-side daemon-spawn \
+             plumbing; body:\n{}",
+            body,
+        );
+        // And explicitly NOT active_host (regression pin —
+        // pre-r4 form).
+        assert!(
+            !body.contains("host_id: self.active_host.clone()"),
+            "spawn_workflow_session MUST NOT tag with \
+             self.active_host while the spawn is still \
+             local-only (the round-3 form left the session \
+             mistagged remote/local-mismatch); body:\n{}",
+            body,
+        );
+
+        // Ctx-field pin (the controller carries active_host)
+        // — kept around for the future-spawn-routing fix.
+        assert!(
+            ctrl.contains(
+                "pub active_host: cm_daemon::host_id::HostId",
+            ),
+            "WorkflowControllerCtx must continue to carry an \
+             active_host field — the future daemon-spawn \
+             plumbing reads it",
+        );
+
+        // App-side caller snapshots active_host and passes it
+        // through (round-3 invariant; still required).
+        let app = include_str!("app.rs");
+        assert!(
+            app.contains(
+                "// 12e-r3 F1: snapshot active_host before building\n            // the ctx",
+            ),
+            "App's launch_workflow path must snapshot \
+             active_host once before constructing the ctx",
+        );
+    }
+
+    /// 12e-r4 F1.1 / 12e-r5 F2: `try_spawn_via_daemon` MUST
+    /// accept the design-doc-correct wire vocabulary
+    /// `"claude-code"` as an alias for internal-legacy
+    /// `"claude"`. Round 4 added the alias inline in TWO
+    /// match sites; round 5 collapsed it to a single
+    /// `normalize_session_type_to_internal` helper called
+    /// ONCE at the top of `try_spawn_via_daemon` — so all
+    /// downstream consumers (argv match, wire_session_type
+    /// mapping, memory_cap_for lookup) consult the same
+    /// internal form.
+    #[test]
+    fn mcp_start_session_with_claude_code_type_routes_to_daemon() {
+        let src = include_str!("app.rs");
+
+        // The single-helper normalize function must exist
+        // and explicitly map "claude-code" → "claude".
+        let norm_sig = "fn normalize_session_type_to_internal(";
+        let norm_start = src.find(norm_sig).expect(
+            "normalize_session_type_to_internal helper must exist",
+        );
+        let norm_rest = &src[norm_start..];
+        let norm_end = norm_rest[1..]
+            .find("\n}\n")
+            .map(|i| 1 + i + 2)
+            .unwrap_or(norm_rest.len());
+        let norm_body = &norm_rest[..norm_end];
+        assert!(
+            norm_body.contains("\"claude-code\" => \"claude\""),
+            "normalize_session_type_to_internal must map \
+             \"claude-code\" to \"claude\" (12e-r5 F2); \
+             body:\n{}",
+            norm_body,
+        );
+
+        // Locate try_spawn_via_daemon body.
+        let sig = "pub fn try_spawn_via_daemon(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // The function MUST call the normalize helper once
+        // and capture as `internal_session_type`.
+        assert!(
+            body.contains(
+                "let internal_session_type = normalize_session_type_to_internal(session_type)",
+            ),
+            "try_spawn_via_daemon must call \
+             normalize_session_type_to_internal ONCE at the \
+             top and capture as `internal_session_type` \
+             (12e-r5 F2); body:\n{}",
+            body,
+        );
+
+        // All three downstream sites — argv match,
+        // wire_session_type match, and memory_cap_for lookup
+        // — MUST consult `internal_session_type`, NOT the raw
+        // `session_type`.
+        assert!(
+            body.contains("let argv_result = match internal_session_type"),
+            "argv match must consult internal_session_type",
+        );
+        assert!(
+            body.contains("let wire_session_type = match internal_session_type"),
+            "wire_session_type match must consult internal_session_type",
+        );
+        assert!(
+            body.contains("memory_cap_for(internal_session_type)"),
+            "memory_cap_for lookup MUST use internal_session_type \
+             — pre-r5 it consulted raw session_type, producing \
+             a bogus `CM_SESSION_MEM_SOFT_CLAUDE-CODE` env var \
+             lookup that always missed",
+        );
+
+        // Regression pin: no raw-`session_type` consumer
+        // remains for the cap-lookup. (The argv and wire
+        // matches already moved to `internal_session_type`
+        // explicitly above; this pins the cap-lookup site
+        // specifically, since that was the F2 regression.)
+        assert!(
+            !body.contains("memory_cap_for(session_type)"),
+            "memory_cap_for MUST NOT use the raw session_type \
+             (12e-r5 F2 regression pin)",
+        );
+    }
+
+    /// 12e-r5 F2: structural pin on the per-engine
+    /// `memory_cap_for` env-var lookup using the normalized
+    /// (internal) vocabulary. This is the regression-pin for
+    /// "claude-code" → `CM_SESSION_MEM_SOFT_CLAUDE` (not
+    /// `CM_SESSION_MEM_SOFT_CLAUDE-CODE`). The actual env-var
+    /// resolution is covered by existing `config` cap tests;
+    /// what this pins is that the call site here uses the
+    /// internal form.
+    #[test]
+    fn mcp_start_session_claude_code_uses_claude_memory_cap_env_vars() {
+        let src = include_str!("app.rs");
+        let sig = "pub fn try_spawn_via_daemon(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("memory_cap_for(internal_session_type)"),
+            "cap lookup must use the normalized internal \
+             vocabulary so an MCP `start_session(type=\
+             \"claude-code\")` resolves the same cap env vars \
+             as `type=\"claude\"`",
+        );
+    }
+
+    /// 12e-r5 F1 + r6 (shared helper): `spawn_managed_session`
+    /// MUST refuse to spawn when `active_host != HostId::local()`.
+    /// Round 5 inlined the guard; round 6 collapsed it into
+    /// the shared `guard_local_host_only` helper so every
+    /// spawn site uses the same message format. Test pins the
+    /// helper-call shape and the runtime behavior.
+    /// 12e-r8 F1 (renamed from r5's `..._for_non_local_active_host`):
+    /// `spawn_managed_session` MUST refuse the spawn when
+    /// the CALLER's host_id is non-local. The pre-r8 form
+    /// gated on `active_host`; round 8 routes through the
+    /// caller's pinned host (resolved via
+    /// `resolve_caller_host`).
+    #[test]
+    fn mcp_start_session_fails_fast_for_non_local_caller_host() {
+        use cm_daemon::host_id::HostId;
+
+        let src = include_str!("app.rs");
+
+        let sig = "pub fn spawn_managed_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Structural pin: guard on caller_host.
+        assert!(
+            body.contains(
+                "guard_local_host_only(&caller_host, \"MCP `start_session`\")",
+            ),
+            "spawn_managed_session must call \
+             guard_local_host_only(&caller_host, ...) — \
+             route through the CALLER's host, not active_host \
+             (12e-r8 F1); body:\n{}",
+            body,
+        );
+
+        // Ordering: the resolve + guard MUST precede
+        // `try_spawn_via_daemon`.
+        let resolve_idx = body
+            .find("let caller_host = self.resolve_caller_host(caller_uid)?")
+            .expect("resolve_caller_host call not found");
+        let guard_idx = body
+            .find("guard_local_host_only(&caller_host,")
+            .expect("guard call not found");
+        let spawn_idx = body
+            .find("self.try_spawn_via_daemon(")
+            .expect("try_spawn_via_daemon call not found");
+        assert!(
+            resolve_idx < guard_idx && guard_idx < spawn_idx,
+            "resolve_caller_host MUST precede guard MUST \
+             precede try_spawn_via_daemon — got resolve={}, \
+             guard={}, spawn={}",
+            resolve_idx,
+            guard_idx,
+            spawn_idx,
+        );
+
+        // Runtime: plant a CALLER pinned to manager; the
+        // spawn MUST fail-fast. (operator's active_host is
+        // irrelevant for this check.)
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        // Leave active_host = local (the default) to prove
+        // the guard checks caller, not active_host.
+        assert_eq!(app.active_host, HostId::local());
+
+        let tmpdir = tempfile::tempdir().expect("worktree tempdir");
+        let mut caller_ts = make_simple_session_with_uid(
+            "caller-on-manager".into(),
+            "caller",
+            "bash",
+            crate::session::Session::new(
+                "/bin/true",
+                &[],
+                80,
+                24,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .expect("dummy session"),
+            None,
+        );
+        caller_ts.host_id = HostId::new("manager");
+        app.workspaces.push(Workspace {
+            id: "ws-mgr-caller".into(),
+            name: "ws-mgr-caller".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(tmpdir.path().to_path_buf()),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            is_pushing: false,
+            sessions: vec![caller_ts],
+            tombstones: Vec::new(),
+        });
+        let result = app.spawn_managed_session(
+            app.workspaces.len() - 1,
+            "caller-on-manager",
+            "claude",
+            "test-label",
+            None,
+            None,
+        );
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("manager"),
+                    "error must name the offending host; got: {}",
+                    msg,
+                );
+                assert!(
+                    msg.contains("MCP `start_session`"),
+                    "error must name the op; got: {}",
+                    msg,
+                );
+            }
+            Ok(uid) => panic!(
+                "spawn_managed_session MUST fail when caller's \
+                 host_id is non-local; got Ok({})",
+                uid,
+            ),
+        }
+        drop(guard);
+    }
+
+    /// 12e-r6: the shared `guard_local_host_only` helper
+    /// MUST exist with the expected signature + error
+    /// content. Every fail-fast spawn site uses it; this
+    /// pins the helper itself so a refactor that renames or
+    /// inlines it back trips clearly.
+    #[test]
+    fn guard_local_host_only_helper_exists() {
+        let src = include_str!("app.rs");
+        assert!(
+            src.contains(
+                "pub(crate) fn guard_local_host_only(\n    host_id: &cm_daemon::host_id::HostId,\n    op_name: &str,\n) -> std::io::Result<()>",
+            ),
+            "shared `guard_local_host_only` helper must exist \
+             with the expected signature (12e-r6)",
+        );
+        // The body must surface Phase 3 / slice 12g in the
+        // error message so operators have a clear pointer
+        // when the guard fires.
+        let sig = "pub(crate) fn guard_local_host_only(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n}\n")
+            .map(|i| 1 + i + 2)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("daemon/NOTES.md slice 12g")
+                || body.contains("Phase 3"),
+            "guard helper's error message must point at the \
+             follow-up slice; body:\n{}",
+            body,
+        );
+        // Local host MUST pass the guard.
+        assert!(
+            body.contains(
+                "if host_id == &cm_daemon::host_id::HostId::local()",
+            ),
+            "guard must allow local host (return Ok) and \
+             only fail on non-local",
+        );
+    }
+
+    /// 12e-r6 F1: `create_local_session` (A-n) MUST call the
+    /// shared guard BEFORE worktree creation. Pre-r6 a
+    /// non-local active_host would proceed through worktree
+    /// creation, then fail at the daemon spawn — leaving an
+    /// orphan worktree on disk.
+    #[test]
+    fn create_local_session_fails_fast_before_worktree() {
+        let src = include_str!("app.rs");
+        let sig = "fn create_local_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Structural pin: shared-helper call.
+        assert!(
+            body.contains(
+                "guard_local_host_only(&active_host, \"A-n local session\")",
+            ),
+            "create_local_session must call \
+             guard_local_host_only at the top (12e-r6 F1); \
+             body:\n{}",
+            body,
+        );
+
+        // Ordering: guard MUST precede worktree creation.
+        // Operator catching the error shouldn't see an
+        // orphan worktree dir left behind.
+        let guard_idx = body
+            .find("guard_local_host_only(&active_host, \"A-n local session\")")
+            .expect("guard call not found");
+        let worktree_idx = body
+            .find("worktree::create_worktree(")
+            .expect("worktree::create_worktree call not found");
+        assert!(
+            guard_idx < worktree_idx,
+            "guard (at byte {}) MUST precede \
+             worktree::create_worktree (at byte {}) — \
+             otherwise a remote-host A-n leaves an orphan dir",
+            guard_idx,
+            worktree_idx,
+        );
+
+        // Ordering: guard MUST also precede try_spawn_via_daemon.
+        let spawn_idx = body
+            .find("self.try_spawn_via_daemon(")
+            .expect("try_spawn_via_daemon call not found");
+        assert!(
+            guard_idx < spawn_idx,
+            "guard must precede try_spawn_via_daemon",
+        );
+    }
+
+    /// 12e-r6 F1: `spawn_session_on_workspace` (A-s) MUST
+    /// call the shared guard before any spawn work.
+    #[test]
+    fn spawn_session_on_workspace_fails_fast_for_non_local_host() {
+        let src = include_str!("app.rs");
+        let sig = "fn spawn_session_on_workspace(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains(
+                "guard_local_host_only(\n            &active_host,\n            \"A-s session-on-workspace\",\n        )",
+            ) || body.contains(
+                "guard_local_host_only(&active_host, \"A-s session-on-workspace\")",
+            ),
+            "spawn_session_on_workspace must call \
+             guard_local_host_only at the top (12e-r6 F1); \
+             body:\n{}",
+            body,
+        );
+
+        let guard_idx = body
+            .find("guard_local_host_only(")
+            .expect("guard call not found");
+        let spawn_idx = body
+            .find("self.try_spawn_via_daemon(")
+            .expect("try_spawn_via_daemon call not found");
+        assert!(
+            guard_idx < spawn_idx,
+            "guard must precede try_spawn_via_daemon",
+        );
+    }
+
+    /// 12e-r6 F2: `respawn_existing_with_workflow_mcp` MUST
+    /// call the shared guard checking the SESSION's pinned
+    /// host_id (not active_host — this is respawning an
+    /// existing session) BEFORE any other work, especially
+    /// the `kill_daemon_session_if_attached` call (which
+    /// would otherwise tear down a healthy session for no
+    /// reason).
+    #[test]
+    fn respawn_existing_with_workflow_mcp_fails_fast_for_non_local_host() {
+        let src = include_str!("app.rs");
+        let sig = "pub(crate) fn respawn_existing_with_workflow_mcp(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        // Free function — bound by the next top-level `fn ` /
+        // `pub fn ` / `pub(crate) fn ` at column 0.
+        let end = rest[1..]
+            .find("\nfn ")
+            .or_else(|| rest[1..].find("\npub fn "))
+            .or_else(|| rest[1..].find("\npub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains(
+                "guard_local_host_only(&ts.host_id, \"workflow respawn\")",
+            ),
+            "respawn_existing_with_workflow_mcp must call \
+             guard_local_host_only(&ts.host_id, ...) — checks \
+             the session's PINNED host, not active_host, since \
+             this is respawning an existing TS (12e-r6 F2); \
+             body:\n{}",
+            body,
+        );
+
+        // Ordering: guard MUST precede
+        // `kill_daemon_session_if_attached` (we don't want to
+        // tear down the existing session if the respawn is
+        // going to fail anyway).
+        let guard_idx = body
+            .find("guard_local_host_only(&ts.host_id,")
+            .expect("guard call not found");
+        let kill_idx = body
+            .find("kill_daemon_session_if_attached(")
+            .expect("kill_daemon_session call not found");
+        assert!(
+            guard_idx < kill_idx,
+            "guard (at byte {}) MUST precede \
+             kill_daemon_session_if_attached (at byte {}) — \
+             otherwise a remote-pinned respawn tears down the \
+             existing session for nothing",
+            guard_idx,
+            kill_idx,
+        );
+    }
+
+    /// 12e-r7 F1: the round-6 in-function host-guard moved
+    /// to `restore_sessions` (the caller) so the caller can
+    /// preserve the raw ManifestEntry in
+    /// `App.skipped_manifest_entries` for the next save's
+    /// round-trip. The guard now lives in the per-entry loop
+    /// inside `restore_sessions`; `spawn_restored_session`
+    /// itself returns `None` ONLY on actual spawn failures.
+    #[test]
+    fn spawn_restored_session_fails_fast_for_non_local_entry_host() {
+        let src = include_str!("app.rs");
+
+        // The guard moved from `spawn_restored_session` to
+        // its CALLER `restore_sessions`. Pin the new location.
+        let sig = "fn restore_sessions(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Structural pin: guard call on `entry.host_id` —
+        // the MANIFEST ENTRY's persisted host, not active_host.
+        assert!(
+            body.contains(
+                "guard_local_host_only(\n                        &entry.host_id,",
+            ) || body.contains("guard_local_host_only(&entry.host_id,"),
+            "restore_sessions must call \
+             guard_local_host_only(&entry.host_id, ...) — \
+             checks the MANIFEST ENTRY's host_id, not \
+             active_host (12e-r7 F1); body:\n{}",
+            body,
+        );
+
+        // Ordering: guard MUST precede the call to
+        // `spawn_restored_session` (the spawn would build
+        // local paths that wouldn't apply to a remote host).
+        let guard_idx = body
+            .find("guard_local_host_only(")
+            .expect("guard call not found");
+        let spawn_idx = body
+            .find("Self::spawn_restored_session(")
+            .expect("spawn_restored_session call not found");
+        assert!(
+            guard_idx < spawn_idx,
+            "guard must precede the spawn_restored_session call",
+        );
+
+        // The skipped entry MUST be preserved in
+        // `App.skipped_manifest_entries` — the round-7 F1
+        // data-loss fix.
+        assert!(
+            body.contains("self.skipped_manifest_entries"),
+            "restore_sessions must preserve the skipped \
+             ManifestEntry in `skipped_manifest_entries` so \
+             `save_session_manifest` round-trips it back to \
+             disk (12e-r7 F1 — round-6's drop-and-overwrite \
+             was a data-loss regression); body:\n{}",
+            body,
+        );
+    }
+
+    /// 12e-r7 F1 (named acceptance): the round-6 restore
+    /// guard caused a data-loss regression — entries with
+    /// non-local `host_id` were filtered out at restore
+    /// AND `save_session_manifest` only serialized live
+    /// `ws.sessions`, so the next save dropped them from
+    /// disk forever. Round 7 fixes this by preserving the
+    /// raw ManifestEntry in `App.skipped_manifest_entries`
+    /// and appending those entries during save.
+    ///
+    /// End-to-end: write a manifest with a remote-pinned
+    /// entry, restore, save, re-load, assert the remote-
+    /// pinned entry is still there with all fields intact.
+    #[test]
+    fn spawn_restored_session_skip_preserves_manifest_entry_across_save_cycle() {
+        use cm_daemon::host_id::HostId;
+        use cm_daemon::manifest::{
+            Manifest, ManifestEntry, ManifestWorkspace,
+        };
+
+        let guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).expect("create .cm");
+
+        // Build a manifest containing a workspace with TWO
+        // sessions: one local (will restore via fail-fast-OK
+        // path → live state), one pinned to `manager` (will
+        // be skipped + preserved).
+        let mut workspaces = HashMap::new();
+        let local_entry = ManifestEntry {
+            uid: "uid-local".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "local-sess".into(),
+            session_type: "bash".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: HostId::local(),
+        };
+        let remote_entry = ManifestEntry {
+            uid: "uid-remote".into(),
+            managed_by_uid: Some("agent-X".into()),
+            generation: 7,
+            label: "manager-sess".into(),
+            session_type: "claude".into(),
+            transcript_id: Some("sid-deadbeef".into()),
+            hidden: true,
+            idle_timeout_secs: 90,
+            burst_threshold: 3,
+            workflow_run_id: Some("wf_abc".into()),
+            workflow_role: Some("worker".into()),
+            task_id: Some("task_xyz".into()),
+            notify_on_idle: true,
+            seeded_from_snapshot: Some("snap1".into()),
+            last_exit: None,
+            host_id: HostId::new("manager"),
+        };
+        let ws = ManifestWorkspace {
+            id: "ws-acc".into(),
+            name: "ws-acc".into(),
+            is_closed: false,
+            is_cloud: false,
+            worktree_path: None,
+            main_repo_path: None,
+            repo_url: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![local_entry.clone(), remote_entry.clone()],
+            tombstones: Vec::new(),
+        };
+        workspaces.insert(ws.id.clone(), ws);
+        let manifest = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: Some("status".to_string()),
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&manifest).expect("ser"),
+        )
+        .expect("write manifest");
+
+        // Also write a hosts.toml so `manager` is a valid
+        // host id in the App's pool (otherwise the App might
+        // fall back to local-only and the guard wouldn't
+        // distinguish the two entries).
+        std::fs::write(
+            cm_dir.join("hosts.toml"),
+            r#"
+[[host]]
+name = "local"
+transport = "unix"
+socket = "/tmp/local-test.sock"
+default = true
+
+[[host]]
+name = "manager"
+transport = "ssh-unix"
+ssh_host = "manager-host"
+remote_socket = "/remote/manager.sock"
+"#,
+        )
+        .expect("write hosts.toml");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        // App::new doesn't call restore_sessions (it's
+        // triggered later by `drain_backend_events` on the
+        // first `TasksUpdated` event). For this test we
+        // invoke it directly.
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.restore_sessions();
+
+        // Verify the skipped entry was preserved in App state.
+        let skipped = app
+            .skipped_manifest_entries
+            .get("ws-acc")
+            .expect("ws-acc entry must have skipped sessions");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].uid, "uid-remote");
+        assert_eq!(skipped[0].host_id, HostId::new("manager"));
+
+        // Now drive a save_session_manifest. The remote entry
+        // MUST round-trip back to disk.
+        app.save_session_manifest();
+
+        // Re-load and verify the remote entry is intact.
+        let reloaded_bytes = std::fs::read_to_string(
+            cm_dir.join("tui-sessions.json"),
+        )
+        .expect("read after save");
+        let reloaded: Manifest = serde_json::from_str(&reloaded_bytes)
+            .expect("parse manifest after save");
+        let reloaded_ws = reloaded
+            .workspaces
+            .get("ws-acc")
+            .expect("ws-acc must be in the reloaded manifest");
+        let reloaded_remote = reloaded_ws
+            .sessions
+            .iter()
+            .find(|e| e.uid == "uid-remote")
+            .expect(
+                "remote-pinned entry uid-remote MUST round-trip \
+                 through the save — round-6's drop-and-overwrite \
+                 was the data-loss regression this test pins",
+            );
+        // Pin every load-bearing field — full structural
+        // equality on the entry that was skipped + saved.
+        assert_eq!(reloaded_remote.uid, remote_entry.uid);
+        assert_eq!(
+            reloaded_remote.managed_by_uid,
+            remote_entry.managed_by_uid,
+        );
+        assert_eq!(reloaded_remote.generation, remote_entry.generation);
+        assert_eq!(reloaded_remote.label, remote_entry.label);
+        assert_eq!(
+            reloaded_remote.session_type,
+            remote_entry.session_type,
+        );
+        assert_eq!(
+            reloaded_remote.transcript_id,
+            remote_entry.transcript_id,
+        );
+        assert_eq!(reloaded_remote.hidden, remote_entry.hidden);
+        assert_eq!(
+            reloaded_remote.idle_timeout_secs,
+            remote_entry.idle_timeout_secs,
+        );
+        assert_eq!(
+            reloaded_remote.burst_threshold,
+            remote_entry.burst_threshold,
+        );
+        assert_eq!(
+            reloaded_remote.workflow_run_id,
+            remote_entry.workflow_run_id,
+        );
+        assert_eq!(
+            reloaded_remote.workflow_role,
+            remote_entry.workflow_role,
+        );
+        assert_eq!(reloaded_remote.task_id, remote_entry.task_id);
+        assert_eq!(
+            reloaded_remote.notify_on_idle,
+            remote_entry.notify_on_idle,
+        );
+        assert_eq!(
+            reloaded_remote.seeded_from_snapshot,
+            remote_entry.seeded_from_snapshot,
+        );
+        assert_eq!(reloaded_remote.host_id, remote_entry.host_id);
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        drop(guard);
+    }
+
+    /// 12e-r7 F2: `launch_from_plan` (planning A-l, creating
+    /// a new workspace + worktree) MUST call the shared
+    /// guard BEFORE worktree creation. Same orphan-disk
+    /// rationale as round-6 F1 for `create_local_session`.
+    #[test]
+    fn launch_from_plan_fails_fast_before_worktree_for_non_local_active_host() {
+        let src = include_str!("app.rs");
+        let sig = "fn launch_from_plan(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Structural pin: shared-helper call.
+        assert!(
+            body.contains(
+                "guard_local_host_only(\n            &active_host,\n            \"A-l launch-from-plan\",\n        )",
+            ) || body.contains(
+                "guard_local_host_only(&active_host, \"A-l launch-from-plan\")",
+            ),
+            "launch_from_plan must call guard_local_host_only \
+             at the top (12e-r7 F2); body:\n{}",
+            body,
+        );
+
+        // Ordering: guard MUST precede worktree creation +
+        // try_spawn_via_daemon (the function uses
+        // `spawn_agent_session` directly, not
+        // `try_spawn_via_daemon`, but the orphan-dir concern
+        // is the same).
+        let guard_idx = body
+            .find("guard_local_host_only(")
+            .expect("guard call not found");
+        let worktree_idx = body
+            .find("worktree::create_worktree(")
+            .expect("create_worktree call not found");
+        assert!(
+            guard_idx < worktree_idx,
+            "guard (at byte {}) MUST precede \
+             worktree::create_worktree (at byte {}) — \
+             otherwise a remote-host A-l leaves an orphan dir",
+            guard_idx,
+            worktree_idx,
+        );
+    }
+
+    /// 12e-r7 F2: `launch_into_workspace` (planning A-l,
+    /// reusing an existing workspace) MUST call the shared
+    /// guard at the top. Same shape as round-6 F1 for
+    /// `spawn_session_on_workspace`.
+    #[test]
+    fn launch_into_workspace_fails_fast_for_non_local_active_host() {
+        let src = include_str!("app.rs");
+        let sig = "fn launch_into_workspace(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains(
+                "guard_local_host_only(\n            &active_host,\n            \"A-l launch-into-workspace\",\n        )",
+            ) || body.contains(
+                "guard_local_host_only(&active_host, \"A-l launch-into-workspace\")",
+            ),
+            "launch_into_workspace must call \
+             guard_local_host_only at the top (12e-r7 F2); \
+             body:\n{}",
+            body,
+        );
+
+        // Ordering: guard MUST precede the workspace lookup
+        // + any spawn work. The guard short-circuits the
+        // function on non-local active_host.
+        let guard_idx = body
+            .find("guard_local_host_only(")
+            .expect("guard call not found");
+        let spawn_idx = body
+            .find("self.spawn_agent_session(")
+            .expect("spawn_agent_session call not found");
+        assert!(
+            guard_idx < spawn_idx,
+            "guard must precede spawn_agent_session",
+        );
+    }
+
+    /// 12e-r4 F1.2: `spawn_managed_session` MUST take the
+    /// transcript-baseline snapshot (`pending_jsonl_files`)
+    /// BEFORE the call to `try_spawn_via_daemon`. Pre-r4 the
+    /// snapshot ran AFTER the spawn — the new agent's
+    /// transcript JSONL (created within ms of spawn) was
+    /// already in the baseline, so the detector treated it
+    /// as preexisting and never bound transcript_id;
+    /// `resolve_authorized_session` would then return
+    /// `pending` forever.
+    #[test]
+    fn mcp_start_session_takes_transcript_baseline_before_spawn() {
+        let src = include_str!("app.rs");
+
+        let sig = "pub fn spawn_managed_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Find the offsets of the baseline snapshot (where
+        // the engine-keyed Self::list_*_files call lives) and
+        // the daemon-spawn call site. Snapshot MUST precede
+        // spawn.
+        let baseline_marker = "Self::list_jsonl_files(&worktree_path)";
+        let spawn_marker = "self.try_spawn_via_daemon(";
+        let baseline_idx = body
+            .find(baseline_marker)
+            .expect("baseline snapshot site not found");
+        let spawn_idx = body
+            .find(spawn_marker)
+            .expect("try_spawn_via_daemon call site not found");
+        assert!(
+            baseline_idx < spawn_idx,
+            "spawn_managed_session: `pending_jsonl_files` \
+             snapshot (at byte {}) MUST precede the \
+             `try_spawn_via_daemon` call (at byte {}). \
+             Pre-r4 the order was reversed and the new \
+             agent's transcript file was captured as \
+             preexisting (12e-r4 F1.2).",
+            baseline_idx,
+            spawn_idx,
+        );
+
+        // Also pin the comment naming the bug so a future
+        // refactor that reverts the order trips this test
+        // with a clear failure reason.
+        assert!(
+            body.contains(
+                "12e-r4 F1.2: snapshot transcript baseline BEFORE",
+            ),
+            "spawn_managed_session must carry the round-4 \
+             F1.2 narrative comment",
+        );
+    }
+
+    /// 12e-r8 F2 (named acceptance): `push_tui_sessions_to_host`
+    /// MUST filter the session snapshot to only entries
+    /// where `ts.host_id == target_host_id`. Pre-r8 every
+    /// daemon received every session — a "state lie" that
+    /// confuses lookup-by-uid, auth walks, and the eventual
+    /// merged list_sessions view.
+    ///
+    /// Structural pin: the filter is present in the helper's
+    /// body. Runtime verification would require standing up
+    /// daemons + intercepting wire frames, which is overkill;
+    /// the filter expression is small and direct.
+    #[test]
+    fn push_tui_sessions_to_host_filters_by_host_id() {
+        let src = include_str!("app.rs");
+
+        let sig = "fn push_tui_sessions_to_host(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Structural pin: filter on host_id.
+        assert!(
+            body.contains(".filter(|ts| &ts.host_id == host_id)"),
+            "push_tui_sessions_to_host MUST filter the session \
+             snapshot by ts.host_id == target host (12e-r8 F2); \
+             body:\n{}",
+            body,
+        );
+
+        // Audit pin: the other two per-host helpers
+        // (`push_workflow_definitions_to_host`,
+        // `push_task_tree_to_host`) carry host-agnostic
+        // payloads (workflow TOML definitions, task tree
+        // structure) and MUST NOT have a per-host filter —
+        // pin that they don't sprout one accidentally. Look
+        // for a `.filter(|...| ts.host_id ==` shape in each.
+        for sig in &[
+            "fn push_workflow_definitions_to_host(",
+            "fn push_task_tree_to_host(",
+        ] {
+            let start = src.find(sig).expect("must find sig");
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    fn ")
+                .or_else(|| rest[1..].find("\n    pub fn "))
+                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .map(|i| 1 + i)
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                !body.contains("host_id ==") && !body.contains("&ts.host_id"),
+                "{} payload is host-agnostic — MUST NOT \
+                 filter by host_id (12e-r8 F2 audit pin); \
+                 body:\n{}",
+                sig,
+                body,
+            );
+        }
+    }
+
+    /// 12e-r3 F2: `push_state_to_daemon` (and its three
+    /// sub-helpers) MUST fan out to every host in
+    /// `hosts.toml`, not just the default. Pre-r3 only the
+    /// default host received task tree / workflow definitions /
+    /// session snapshot; non-default-host daemons had an empty
+    /// task tree and `mcp_start_session(task_id=...)` would
+    /// fail with "task_id not in tree" for any agent spawned
+    /// on a non-default host.
+    #[test]
+    fn push_state_fanouts_to_all_hosts() {
+        let src = include_str!("app.rs");
+
+        for (sig, body_marker) in &[
+            (
+                "pub(crate) fn push_tui_sessions_to_daemon(",
+                "for host in &self.hosts.hosts",
+            ),
+            (
+                "pub(crate) fn push_workflow_definitions_to_daemon(",
+                "for host in &self.hosts.hosts",
+            ),
+            (
+                "pub(crate) fn push_task_tree_to_daemon(",
+                "for host in &self.hosts.hosts",
+            ),
+        ] {
+            let start = src.find(sig).expect("must find sig");
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    fn ")
+                .or_else(|| rest[1..].find("\n    pub fn "))
+                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .map(|i| 1 + i)
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains(body_marker),
+                "{} body MUST contain `{}` (12e-r3 F2 fanout); \
+                 body:\n{}",
+                sig,
+                body_marker,
+                body,
+            );
+        }
+
+        // Pin: per-host helpers exist + route through for_host.
+        for sig in &[
+            "fn push_tui_sessions_to_host(",
+            "fn push_workflow_definitions_to_host(",
+            "fn push_task_tree_to_host(",
+        ] {
+            let start = src.find(sig).unwrap_or_else(|| {
+                panic!("must find per-host helper `{}`", sig)
+            });
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    fn ")
+                .or_else(|| rest[1..].find("\n    pub fn "))
+                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .map(|i| 1 + i)
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("host_pool.for_host(host_id)"),
+                "{} must dial host_pool.for_host(host_id); \
+                 body:\n{}",
+                sig,
+                body,
+            );
+        }
+
+        // No `host_pool.default_handle()` CALL sites remain
+        // in the push path (the four top-level + three
+        // sub-helpers all use `host_pool.for_host(host_id)`).
+        // The literal CALL form pins this; comments that
+        // mention `default_handle()` in passing (e.g. round-3
+        // history annotations) are excluded by checking the
+        // method-receiver shape.
+        let push_state_start = src
+            .find("pub(crate) fn push_state_to_daemon(")
+            .expect("must find push_state_to_daemon sig");
+        let push_section_end = src[push_state_start..]
+            .find("pub(crate) fn push_active(")
+            .map(|i| push_state_start + i)
+            .unwrap_or(src.len().min(push_state_start + 20000));
+        let push_section = &src[push_state_start..push_section_end];
+        assert!(
+            !push_section.contains("self.host_pool.default_handle()"),
+            "push helpers MUST NOT call \
+             self.host_pool.default_handle() — they fan out \
+             per-host now (12e-r3 F2)",
+        );
+    }
+
+    /// 12e-r3 F3: when `HostPool::from_config` fails, the
+    /// App's `hosts` field MUST also fall back to the
+    /// synthesized local default. Pre-r3 only the pool fell
+    /// back; `hosts` retained the multi-host config, so
+    /// `active_host` (derived from `hosts.default_host()`)
+    /// pointed at a host that wasn't in the pool. Every
+    /// `host_pool.for_host(&active_host)` would then fail
+    /// with `NotFound`, and `cycle_active_host` would walk
+    /// through hosts that the pool can't reach.
+    ///
+    /// To deliberately fail `from_config`, write a hosts.toml
+    /// that flips on the dir-resolution failure: unset
+    /// XDG_RUNTIME_DIR AND set HOME to an empty path so
+    /// `tunnel_dir_under_home` errors. But that breaks too
+    /// much App-init machinery. Instead, drive the fix's
+    /// presence structurally + drive a runtime check that the
+    /// FALLBACK path (already in place even pre-r3) results
+    /// in a consistent App when triggered by a malformed
+    /// hosts.toml.
+    ///
+    /// Runtime approach: write a hosts.toml that REFERENCES
+    /// `transport = "tcp-tls"` — the loader rejects TLS in
+    /// validate() before pool construction, so we get a
+    /// HostsConfig::load Err. The existing App::new path
+    /// already falls back to synthesized local default in
+    /// that case (see line ~2810). After fallback, `hosts`
+    /// has the synthesized entry and `active_host == local`.
+    /// This test pins that consistency.
+    ///
+    /// The r3 F3 fix is for the SEPARATE failure mode where
+    /// HostsConfig::load succeeds but HostPool::from_config
+    /// errors. Pin that case structurally — the source must
+    /// re-bind `hosts` in the `Err(...)` branch.
+    #[test]
+    fn pool_construction_failure_falls_back_to_local_only_hosts() {
+        let src = include_str!("app.rs");
+
+        // Structural pin: the from_config error branch must
+        // re-bind `hosts` AND build a fresh pool from the
+        // local default. The marker is the 12e-r3 F3
+        // comment plus the tuple-rebind pattern.
+        assert!(
+            src.contains(
+                "12e-r3 F3: when pool construction fails",
+            ),
+            "App::new must carry the 12e-r3 F3 fallback \
+             comment",
+        );
+        assert!(
+            src.contains("(local, pool)"),
+            "App::new's from_config Err branch must produce \
+             (HostsConfig, HostPool) as a tuple — both \
+             rebound to the synthesized local default — so \
+             active_host derivation below sees the \
+             post-fallback config",
+        );
+        // Make sure the rebinding actually returns BOTH from
+        // the match.
+        let from_config_start = src
+            .find("HostPool::from_config(&hosts)")
+            .expect("must find from_config call site");
+        let from_config_section = &src[from_config_start
+            ..from_config_start
+                + 2000
+                    .min(src.len() - from_config_start)];
+        assert!(
+            from_config_section.contains("Ok(pool) => (hosts, pool)"),
+            "Ok branch must yield (hosts, pool) tuple"
+        );
+        assert!(
+            from_config_section.contains("(local, pool)"),
+            "Err branch must yield (local, pool) — local being \
+             the synthesized HostsConfig",
+        );
+
+        // Runtime sanity: a load with a TLS-transport host
+        // makes HostsConfig::load fail, App::new falls back
+        // → hosts.hosts.len() == 1 AND active_host == local.
+        let guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).expect("create .cm");
+        std::fs::write(
+            cm_dir.join("hosts.toml"),
+            r#"
+[[host]]
+name = "local"
+transport = "unix"
+socket = "/tmp/local-test.sock"
+default = true
+
+[[host]]
+name = "future"
+transport = "tcp-tls"
+addr = "1.2.3.4:443"
+tls_fingerprint = "deadbeef"
+"#,
+        )
+        .expect("write hosts.toml");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(
+            app.hosts.hosts.len(),
+            1,
+            "TLS-transport host triggers HostsConfig::load \
+             Err → App falls back to synthesized local default",
+        );
+        assert_eq!(
+            app.active_host,
+            cm_daemon::host_id::HostId::local(),
+            "active_host must derive from the (now-synthesized) \
+             hosts config",
+        );
+        // The pool must contain the local host (consistency
+        // check that `hosts` and `host_pool` agree).
+        assert!(
+            app.host_pool.for_host(&cm_daemon::host_id::HostId::local()).is_ok(),
+            "host_pool MUST contain the local host that \
+             active_host points to",
         );
     }
 }

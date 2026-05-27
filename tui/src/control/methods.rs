@@ -729,8 +729,9 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
     // leaves the daemon's PTY child running. The same helper
     // the operator-driven `A-w` path uses.
     {
+        let pool = std::sync::Arc::clone(&app.host_pool);
         let ws = &mut app.workspaces[wi];
-        crate::app::App::kill_daemon_session_if_attached(&ws.sessions[si]);
+        crate::app::App::kill_daemon_session_if_attached(&pool, &ws.sessions[si]);
         App::tombstone_session_pub(ws, si);
         if let Some(ts) = ws.sessions.get_mut(si) {
             ts.session.exited = true;
