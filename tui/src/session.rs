@@ -394,39 +394,51 @@ impl Session {
     }
 }
 
-// Drop semantics (slice 10c-e-3b-fix2): no daemon-side kill.
+// Drop semantics: send `Msg::Shutdown` so alacritty's EventLoop
+// thread exits. Without this the thread runs forever holding the
+// PTY master fd, the child never sees EOF/SIGHUP, and every A-w
+// leaks a claude process plus a "PTY" thread inside the TUI.
 //
-// Pre-fix2, this Drop arm issued a `kill_session` RPC for every
-// daemon-attached session. That defeats the whole point of the
-// "persistent host daemon" design — every TUI exit (A-q, crash,
-// `cargo run` shutdown) would tear down every daemon session, and
-// the reconnect-on-restart acceptance criterion the design names
-// would be unreachable.
+// The EventLoop owns the only path to the master fd: `pty: T` is
+// `move`d into the spawned thread at `event_loop.rs:205-322`, and
+// the thread only exits on `Msg::Shutdown` (`event_loop.rs:96`).
+// `EventLoopSender` has no `Drop`, and the EventLoop holds its
+// own internal `tx` clone, so simply dropping our sender does NOT
+// close the channel — the thread keeps polling. `pty_writer` is
+// a `try_clone()` dup of the master fd, so closing it alone is
+// not sufficient either; both fds must drop before the child sees
+// SIGHUP.
 //
-// Drop is now detach-only for both flavors:
-//   - **Local-PTY sessions** (`pty_writer = Some(File)`): dropping
-//     the master fd sends SIGHUP to the child, which exits and
-//     reaps via the kernel — the existing behavior, unchanged.
+// Per-flavor behavior with Shutdown sent:
+//   - **Local-PTY sessions** (`pty_writer = Some(File)`): EventLoop
+//     drops its `pty` → master fd closes → child sees EOF on slave
+//     reads → kernel sends SIGHUP → child exits. `pty_writer`
+//     dropping in the same Drop closes the dup'd fd, so the SIGHUP
+//     actually fires.
 //   - **Daemon-attached sessions** (`daemon_session_uid = Some(...)`,
-//     `pty_writer = None`): dropping the `sender` and the
-//     EventLoop closes the attach socket. The daemon's reader
-//     half sees EOF, the attach handler thread winds down. The
-//     daemon's PTY child KEEPS RUNNING. This is the property
-//     that makes reconnect possible.
+//     `pty_writer = None`): EventLoop exits, closing the attach
+//     socket. The daemon's reader sees EOF and detaches; the
+//     daemon's PTY child KEEPS RUNNING (the daemon owns its own
+//     master fd separately). This preserves the reconnect property.
 //
-// Operator-driven teardown (A-w) explicitly calls
-// `kill_session` BEFORE removing the Session from the workspace.
-// See `App::close_active_session` and
-// `App::tombstone_and_remove`. The same kill is owed by any
-// destructive-cleanup path (workspace delete, task close, etc.).
+// Operator-driven teardown (A-w) still issues `kill_session` via
+// `App::kill_daemon_session_if_attached` BEFORE Drop runs, so
+// daemon-attached sessions go fully away on A-w. Drop's role here
+// is the cleanup floor that runs no matter how the Session is
+// removed.
+//
+// Best-effort: a send error means the EventLoop has already
+// exited (e.g., child died naturally and the thread broke out of
+// the poll loop at `event_loop.rs:269`); nothing to do.
 //
 // TODO(reconnect-slice): on TUI restart, `spawn_restored_session`
 // should probe the daemon for a matching uid and attach instead
-// of respawning. Until then a daemon session whose TUI is
-// restarted is functionally orphaned (the bookkeeping is gone
-// from `~/.cm/tui-sessions.json`'s next read but the daemon's
-// `state.sessions` still has it). Acceptable for the 10c-e-3c
-// smoke since the operator won't restart mid-smoke.
+// of respawning.
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Msg::Shutdown);
+    }
+}
 
 /// Simple dimensions struct implementing alacritty's Dimensions trait.
 pub struct TermSize {
