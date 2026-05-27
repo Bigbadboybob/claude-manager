@@ -271,6 +271,15 @@ enum HandleState {
         spec: SshTunnelSpec,
         tunnel: Option<SshTunnel>,
     },
+    /// 12h: TLS-TCP transport. No persistent process and no
+    /// socket file — each RPC opens a fresh TCP connect + TLS
+    /// handshake (the daemon doesn't multiplex on a single
+    /// connection in v1). `socket_path()` returns `None` for
+    /// this variant; consumers should use the dialer in
+    /// `crate::tls_dialer` directly.
+    TcpTls {
+        spec: crate::tls_dialer::TlsDialerSpec,
+    },
 }
 
 impl ConnectionHandle {
@@ -298,6 +307,32 @@ impl ConnectionHandle {
         }
     }
 
+    /// 12h: TLS-TCP handle. Stores the dialer spec; no
+    /// connection is established until a consumer calls
+    /// `tls_dialer_spec()` and dials directly.
+    pub fn tcp_tls(spec: crate::tls_dialer::TlsDialerSpec) -> Self {
+        Self {
+            state: Mutex::new(HandleState::TcpTls { spec }),
+        }
+    }
+
+    /// 12h: clone-out the TLS dialer spec for this handle.
+    /// `None` for non-TcpTls handles. The clone is required
+    /// because the spec lives behind a Mutex; the dialer keeps
+    /// its own copy for the duration of one dial.
+    pub fn tls_dialer_spec(
+        &self,
+    ) -> Option<crate::tls_dialer::TlsDialerSpec> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match &*state {
+            HandleState::TcpTls { spec } => Some(spec.clone()),
+            _ => None,
+        }
+    }
+
     /// Return the live socket path. `None` for an SshUnix
     /// handle that hasn't been spawned yet (pre-first-
     /// `ensure_alive`). Returns an owned `PathBuf` because the
@@ -314,6 +349,13 @@ impl ConnectionHandle {
             HandleState::SshUnix { tunnel, .. } => {
                 tunnel.as_ref().map(|t| t.local_socket.clone())
             }
+            // 12h: TCP-TLS handles have no socket file. The
+            // dialer in `tls_dialer.rs` opens a fresh TCP
+            // connection per RPC; consumers that go through
+            // `socket_path()` will see `None` and fall back to
+            // their no-socket error path until the full TLS
+            // wiring lands in a follow-up slice.
+            HandleState::TcpTls { .. } => None,
         }
     }
 
@@ -335,6 +377,11 @@ impl ConnectionHandle {
             .unwrap_or_else(|p| p.into_inner());
         match &mut *state {
             HandleState::UnixDirect { .. } => Ok(()),
+            // 12h: TLS-TCP has no persistent liveness to check —
+            // each RPC opens a fresh handshake. `ensure_alive`
+            // is a no-op so `for_host` keeps a uniform return
+            // shape across transports.
+            HandleState::TcpTls { .. } => Ok(()),
             HandleState::SshUnix { spec, tunnel } => {
                 // Dead-child detection: try_wait returns
                 // Ok(Some(_)) if the child has exited. Clear
@@ -892,12 +939,45 @@ fn build_handle(host: &HostConfig) -> io::Result<ConnectionHandle> {
                 remote_socket.clone(),
             ))
         }
-        HostTransport::TcpTls { .. } => {
-            // Unreachable: `HostsConfig::load` (12a) rejects
-            // TcpTls. Defensive fallback to default_socket_path
-            // so a future regression in 12a (silent TcpTls
-            // accept) doesn't panic the pool at construction.
-            ConnectionHandle::unix_direct(cm_daemon::default_socket_path())
+        HostTransport::TcpTls {
+            addr,
+            tls_fingerprint,
+            auth_env,
+        } => {
+            // 12h: real TLS-TCP variant. The handle carries a
+            // dialer spec rather than a socket path because the
+            // wire path isn't a `UnixStream::connect(path)` —
+            // it's a fresh TCP connect + rustls handshake +
+            // auth.hello per logical RPC. The dialer itself
+            // lives in `crate::tls_dialer`; this module only
+            // owns the spec storage so `for_host` keeps a
+            // stable shape across transports.
+            //
+            // Note: existing TUI call sites that go through
+            // `socket_path()` (UnixDirect / SshUnix world) will
+            // observe `None` here. The end-to-end wiring
+            // through every consumer is out of scope for 12h
+            // proper — slice 12i (or follow-up) routes RPCs
+            // through `TlsDialer::dial_and_send` on those
+            // sites. The acceptance test gate for 12h is the
+            // four named dialer tests.
+            let fingerprint =
+                crate::hosts::parse_tls_fingerprint(tls_fingerprint)
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "host `{}` tls_fingerprint: {}",
+                                host.id.as_str(),
+                                e,
+                            ),
+                        )
+                    })?;
+            ConnectionHandle::tcp_tls(crate::tls_dialer::TlsDialerSpec {
+                addr: addr.clone(),
+                fingerprint,
+                auth_env: auth_env.clone(),
+            })
         }
     })
 }

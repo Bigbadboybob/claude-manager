@@ -5717,6 +5717,7 @@ mod tests {
                 log_path: String::new(),
                 workflows_dir: String::new(),
                 auth: Default::default(),
+                tls: None,
             };
             Arc::new(Mutex::new(s))
         };

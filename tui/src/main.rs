@@ -22,6 +22,7 @@ mod term_shim;
 mod terminal_widget;
 #[cfg(test)]
 mod test_support;
+mod tls_dialer;
 mod workflow;
 mod workflow_watch;
 // `worktree` relocated to the `cm-daemon` crate (slice 3 of

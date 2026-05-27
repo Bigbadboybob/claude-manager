@@ -60,6 +60,15 @@ sha2 = "0.10"
 # dispatcher is sync too, so no Tokio runtime is needed (would
 # have been required for `reqwest`).
 ureq = { version = "3", features = ["json"] }
+# Slice 12h: TLS-TCP transport (server side). `ring` provider
+# is the only one whose .crate file is in the offline cache;
+# `aws-lc-rs` (rustls's other default) would pull a build-time
+# C toolchain in. Disable default features so we don't transitively
+# enable `aws_lc_rs` + `prefer-post-quantum`; explicit `ring`
+# + `std` + `tls12` + `logging` matches what `ureq` already
+# pulls in, so the dep graph stays single-version.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
 
 [dev-dependencies]
 tempfile = "3"

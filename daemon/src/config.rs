@@ -70,6 +70,35 @@ pub struct AuthConfig {
     pub mode: AuthMode,
 }
 
+/// `[tls]` section. Optional — when absent, the daemon binds only
+/// its Unix control socket. When present, the daemon ALSO binds a
+/// rustls TCP listener on `listen_addr` and requires every
+/// connection's first frame to be `auth.hello` carrying the
+/// `CM_DAEMON_TOKEN` value (slice 12h).
+///
+/// All three fields are required. The loader does NOT auto-create
+/// or auto-generate certs; operators run the documented openssl
+/// invocation on the VM (see PR description / `doc/`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TlsConfig {
+    /// PEM-encoded server certificate (or chain). Absolute path;
+    /// the daemon reads it at startup. Self-signed certs are
+    /// expected — the TUI pins SHA-256 of the leaf, not a chain
+    /// of trust.
+    pub cert_path: String,
+    /// PEM-encoded private key matching `cert_path`. Accepts
+    /// `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY`, or
+    /// `EC PRIVATE KEY` (SEC1) blocks. Mode 0o600 is the
+    /// operator's responsibility — the daemon does NOT validate
+    /// it here because key/cert perms are usually file-system-
+    /// owner enforced (sudo / systemd User=).
+    pub key_path: String,
+    /// `host:port` to bind. Production: `0.0.0.0:8443` behind a
+    /// firewall rule scoped to the operator's IP (NOT
+    /// `0.0.0.0/0`).
+    pub listen_addr: String,
+}
+
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
@@ -107,6 +136,12 @@ pub struct DaemonConfig {
     /// when the section is omitted.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// `[tls]` section. `Some` enables the rustls TCP listener
+    /// (slice 12h); `None` leaves it disabled — the daemon binds
+    /// only its Unix socket. Omitting the section in `daemon.toml`
+    /// is the local-workstation default.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for DaemonConfig {
@@ -118,6 +153,7 @@ impl Default for DaemonConfig {
             log_path: String::new(),
             workflows_dir: String::new(),
             auth: AuthConfig::default(),
+            tls: None,
         }
     }
 }
@@ -400,6 +436,7 @@ mode = "ssh-trust"
             auth: AuthConfig {
                 mode: AuthMode::Token,
             },
+            tls: None,
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =
@@ -410,5 +447,60 @@ mode = "ssh-trust"
         assert_eq!(reparsed.log_path, original.log_path);
         assert_eq!(reparsed.workflows_dir, original.workflows_dir);
         assert_eq!(reparsed.auth.mode, original.auth.mode);
+        assert!(reparsed.tls.is_none());
+    }
+
+    /// 12h: `[tls]` section parses when present. All three fields
+    /// (cert_path, key_path, listen_addr) are required — the
+    /// loader doesn't auto-fill any defaults because there's no
+    /// safe production default for a cert path.
+    #[test]
+    fn tls_section_parses_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            r#"
+mcp_server_path = ""
+[auth]
+mode = "token"
+
+[tls]
+cert_path = "/etc/cm-daemon/cert.pem"
+key_path = "/etc/cm-daemon/key.pem"
+listen_addr = "0.0.0.0:8443"
+"#,
+        )
+        .expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        let tls = cfg.tls.expect("tls section");
+        assert_eq!(tls.cert_path, "/etc/cm-daemon/cert.pem");
+        assert_eq!(tls.key_path, "/etc/cm-daemon/key.pem");
+        assert_eq!(tls.listen_addr, "0.0.0.0:8443");
+        // The token-mode auth pair is the natural companion of
+        // a TLS listener (auth.hello frame validates the token).
+        assert_eq!(cfg.auth.mode, AuthMode::Token);
+    }
+
+    /// 12h: omitting `[tls]` keeps the field `None` — the
+    /// listener is opt-in.
+    #[test]
+    fn tls_section_defaults_to_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(&path, "mcp_server_path = \"\"\n")
+            .expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        assert!(cfg.tls.is_none());
     }
 }

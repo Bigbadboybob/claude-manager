@@ -39,14 +39,17 @@
 //! uses `cm_daemon::default_socket_path()` so it stays in lockstep
 //! with the rest of the daemon path resolution.
 //!
-//! ## TLS-TCP placeholder (A2 from the Phase 3 plan)
+//! ## TLS-TCP transport (12h — was a 12a placeholder)
 //!
-//! `HostTransport::TcpTls` is a placeholder variant — declaring
-//! it on the public schema lets a user write a `transport = "tcp-tls"`
-//! entry today, but the loader returns `Error::TlsNotImplemented`
-//! pointing them at `transport = "ssh-unix"` for now. Slice 12h
-//! flips the loader to accept it. The forward-compat error message
-//! is the first thing the user sees, so it has to be actionable.
+//! `HostTransport::TcpTls` is now a real variant. The TUI dialer
+//! (`crate::tls_dialer`) opens a TCP connection, completes a
+//! rustls handshake while pinning the cert's SHA-256 fingerprint
+//! via a custom `ServerCertVerifier`, and sends an `auth.hello`
+//! JSON-RPC frame carrying the value of `auth_env` (resolved from
+//! the TUI's process env at dial time, NOT at config-load time).
+//! The daemon's matching listener (`cm_daemon::control::tls`)
+//! validates the `auth.hello` token and forwards the connection to
+//! the same dispatch loop the Unix socket uses.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -104,23 +107,43 @@ pub enum HostTransport {
         /// shape in the Phase 3 NOTES).
         remote_socket: PathBuf,
     },
-    /// Placeholder for slice 12h (TLS-TCP transport). Declaring
-    /// the variant on the public schema lets users write
-    /// `transport = "tcp-tls"` today; the loader returns
-    /// `Error::TlsNotImplemented` so the message names slice 12h
-    /// rather than a confusing "unknown transport" parse error.
+    /// TLS-over-TCP transport (slice 12h). The TUI dialer
+    /// connects to `addr`, completes a rustls handshake while
+    /// pinning the leaf cert's SHA-256 fingerprint against
+    /// `tls_fingerprint`, then sends an `auth.hello` JSON-RPC
+    /// frame carrying the value of `$auth_env` from the
+    /// invoking process's env (e.g. `CM_DAEMON_TOKEN`).
     ///
-    /// Fields are intentionally untyped (single `addr` string +
-    /// pass-through `tls_fingerprint`) so 12h can replace this
-    /// without a wire-shape break. The acceptance criterion
-    /// "TLS-TCP not yet implemented — use transport=ssh-unix for
-    /// now" governs the user-facing error.
+    /// All three fields are required at config load — the 12a
+    /// placeholder allowed optional fields with a friendly
+    /// "not implemented" error; 12h flips that to "real". Use
+    /// `transport = "ssh-unix"` instead for setups where you'd
+    /// rather lean on SSH for auth + transport.
     TcpTls {
-        #[serde(default)]
-        addr: Option<String>,
-        #[serde(default)]
-        tls_fingerprint: Option<String>,
+        /// `host:port` of the daemon's TLS listener (matches
+        /// `daemon.toml`'s `[tls] listen_addr`).
+        addr: String,
+        /// Lower-case hex-encoded SHA-256 of the leaf cert's DER
+        /// bytes (64 hex chars). Colon-separated `aa:bb:..`
+        /// shape is also accepted at parse time so operators can
+        /// paste the output of `openssl x509 -fingerprint -sha256`
+        /// without reformatting.
+        tls_fingerprint: String,
+        /// Name of the env var the TUI reads at dial time to
+        /// learn the daemon token. Default `CM_DAEMON_TOKEN`.
+        /// Carried in the TOML so power users can run two
+        /// daemons with different tokens from the same TUI
+        /// session without env-var collisions.
+        #[serde(default = "default_auth_env")]
+        auth_env: String,
     },
+}
+
+/// Default `auth_env` for [`HostTransport::TcpTls`] when the
+/// operator omits the field. Matches the daemon's documented
+/// env var.
+fn default_auth_env() -> String {
+    "CM_DAEMON_TOKEN".to_string()
 }
 
 /// One entry from `[[host]]` in `hosts.toml`. Field order in the
@@ -262,11 +285,16 @@ impl HostsConfig {
             return Err(Error::DuplicateHostName(dupes));
         }
 
-        // TcpTls placeholder — reject at load. A future slice 12h
-        // flips this to an accept path with rustls dialing.
+        // 12h: TcpTls is now a real variant. Validate the
+        // fingerprint shape here rather than at dial time so a
+        // typo in hosts.toml surfaces at TUI startup with the
+        // bad host name in the error, not at first-click.
         for h in &self.hosts {
-            if matches!(h.transport, HostTransport::TcpTls { .. }) {
-                return Err(Error::TlsNotImplemented(h.id.0.clone()));
+            if let HostTransport::TcpTls {
+                tls_fingerprint, ..
+            } = &h.transport
+            {
+                validate_tls_fingerprint(&h.id.0, tls_fingerprint)?;
             }
         }
 
@@ -285,6 +313,58 @@ impl HostsConfig {
             _ => Err(Error::MultipleDefaultHosts(defaults)),
         }
     }
+}
+
+/// 12h: validate `tls_fingerprint` is a SHA-256 hex digest, either
+/// 64 lower/upper hex chars or 32 colon-separated bytes (the
+/// `openssl x509 -fingerprint -sha256` shape). Conversion to bytes
+/// is deferred to dial time — the loader only proves the input
+/// could become a 32-byte digest.
+fn validate_tls_fingerprint(
+    host_name: &str,
+    raw: &str,
+) -> Result<(), Error> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect();
+    if cleaned.len() != 64
+        || !cleaned.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(Error::InvalidTlsFingerprint {
+            host: host_name.to_string(),
+            raw: raw.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Parse a `tls_fingerprint` value into its 32 raw bytes. Used by
+/// the dialer at connection time. Returns an io::Error so the
+/// dialer can surface it without an extra error type.
+pub fn parse_tls_fingerprint(raw: &str) -> io::Result<[u8; 32]> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect();
+    if cleaned.len() != 64
+        || !cleaned.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tls_fingerprint must be 64 hex chars or 32 \
+                 colon-separated bytes; got {:?}",
+                raw,
+            ),
+        ));
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
+            .expect("hex validation pre-checked");
+    }
+    Ok(out)
 }
 
 /// Round 3 F3: enforce that a host name is a filename-safe token
@@ -363,10 +443,14 @@ pub enum Error {
     MultipleDefaultHosts(Vec<String>),
     /// An entry has `name = ""` (empty string). Reserved.
     ReservedHostName,
-    /// An entry has `transport = "tcp-tls"`. Phase 3 plan A2:
-    /// SSH-unix ships first; TLS-TCP lands in slice 12h. The
-    /// message names the workaround.
-    TlsNotImplemented(String),
+    /// 12h: a [`HostTransport::TcpTls`] entry has a
+    /// `tls_fingerprint` field that isn't a 64-hex / 32-byte
+    /// SHA-256 digest. Validated at load time so a typo
+    /// surfaces at TUI startup, not at first-click.
+    InvalidTlsFingerprint {
+        host: String,
+        raw: String,
+    },
     /// Round 3 F3: host name failed the filename-safe regex.
     /// `reason` is a short human-readable string naming the
     /// specific rule that was violated (length, leading dot,
@@ -406,13 +490,14 @@ impl fmt::Display for Error {
                  (empty string). The empty name is reserved; pick \
                  a real identifier (e.g. \"local\" or \"manager\").",
             ),
-            Error::TlsNotImplemented(name) => write!(
+            Error::InvalidTlsFingerprint { host, raw } => write!(
                 f,
-                "hosts.toml: [[host]] `{}` uses `transport = \
-                 \"tcp-tls\"`, which is not yet implemented. Use \
-                 `transport = \"ssh-unix\"` for remote daemons \
-                 today; TLS-TCP lands in Phase 3 slice 12h.",
-                name,
+                "hosts.toml: [[host]] `{}` has invalid \
+                 `tls_fingerprint = {:?}`. Expected a SHA-256 \
+                 digest (64 hex chars, or 32 colon-separated \
+                 bytes — `openssl x509 -fingerprint -sha256` \
+                 format).",
+                host, raw,
             ),
             Error::InvalidHostName { name, reason } => write!(
                 f,
@@ -666,11 +751,12 @@ default = true
             other => panic!("expected ReservedHostName, got {:?}", other),
         }
 
-        // (5) TcpTls placeholder — forward-compat error pointing
-        //     at slice 12h. Message must name the workaround
-        //     transport (ssh-unix) so the operator fixes it in
-        //     one round.
-        let p = tmp.path().join("tcp-tls.toml");
+        // (5) 12h: TcpTls is a real variant now. A well-formed
+        //     entry loads cleanly; a malformed fingerprint
+        //     surfaces InvalidTlsFingerprint with the host name
+        //     in the message so the operator fixes it in one
+        //     round.
+        let p = tmp.path().join("tcp-tls-bad-fp.toml");
         std::fs::write(
             &p,
             r#"
@@ -678,28 +764,50 @@ default = true
 name = "manager"
 transport = "tcp-tls"
 addr = "34.11.80.141:8443"
+tls_fingerprint = "not-a-real-fingerprint"
 default = true
 "#,
         )
         .unwrap();
         match HostsConfig::load(&p) {
-            Err(Error::TlsNotImplemented(name)) => {
-                assert_eq!(name, "manager");
-                let msg = Error::TlsNotImplemented(name).to_string();
-                assert!(
-                    msg.contains("ssh-unix"),
-                    "the error message must name the workaround \
-                     transport so the operator fixes it in one round; \
-                     got: {}",
-                    msg,
-                );
-                assert!(
-                    msg.contains("12h"),
-                    "and reference the slice that lands TLS-TCP; got: {}",
-                    msg,
-                );
+            Err(Error::InvalidTlsFingerprint { host, raw }) => {
+                assert_eq!(host, "manager");
+                assert_eq!(raw, "not-a-real-fingerprint");
             }
-            other => panic!("expected TlsNotImplemented, got {:?}", other),
+            other => panic!(
+                "expected InvalidTlsFingerprint, got {:?}",
+                other,
+            ),
+        }
+
+        // (5b) 12h: a valid TcpTls entry parses + validates. Uses
+        //     a 64-hex SHA-256 digest. `auth_env` defaults to
+        //     `CM_DAEMON_TOKEN` when omitted.
+        let p = tmp.path().join("tcp-tls-ok.toml");
+        std::fs::write(
+            &p,
+            r#"
+[[host]]
+name = "manager"
+transport = "tcp-tls"
+addr = "34.11.80.141:8443"
+tls_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+default = true
+"#,
+        )
+        .unwrap();
+        let cfg = HostsConfig::load(&p).expect("valid tcp-tls config");
+        match &cfg.hosts[0].transport {
+            HostTransport::TcpTls {
+                addr,
+                tls_fingerprint,
+                auth_env,
+            } => {
+                assert_eq!(addr, "34.11.80.141:8443");
+                assert_eq!(tls_fingerprint.len(), 64);
+                assert_eq!(auth_env, "CM_DAEMON_TOKEN");
+            }
+            other => panic!("expected TcpTls, got {:?}", other),
         }
 
         // (6) TOML parse error (bare malformed file).
