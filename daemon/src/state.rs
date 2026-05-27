@@ -446,6 +446,14 @@ pub struct DaemonState {
     /// `daemon/src/workflow/events.rs::WorkflowEventWatcher` and
     /// daemon/NOTES.md §"Phase 2: Workflow events over RPC".
     pub workflow_event_watcher: Arc<crate::workflow::events::WorkflowEventWatcher>,
+    /// Slice 12f: loaded `daemon.toml`. Read once at startup
+    /// (`run()` reads + validates, then stuffs the result
+    /// here). Immutable after load — `start_session` reads
+    /// `mcp_server_path` / `api_url` / `api_token` / etc.
+    /// from this to populate every agent's env. Defaults to
+    /// `DaemonConfig::default()` so an in-test `DaemonState::new()`
+    /// doesn't touch the filesystem.
+    pub config: crate::config::DaemonConfig,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -518,6 +526,7 @@ impl Default for DaemonState {
             workflow_event_watcher: Arc::new(
                 crate::workflow::events::WorkflowEventWatcher::new(),
             ),
+            config: crate::config::DaemonConfig::default(),
         }
     }
 }
@@ -659,6 +668,7 @@ mod tests {
             notify_on_idle: false,
             seeded_from_snapshot: None,
             last_exit: None,
+            host_id: crate::host_id::HostId::local(),
         }
     }
 

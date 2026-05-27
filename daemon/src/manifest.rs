@@ -366,6 +366,30 @@ pub struct ManifestEntry {
     /// this field across saves (slice 12 review fix).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit: Option<LastExit>,
+    /// Phase 3 schema addition (slice 12b of `daemon/NOTES.md`).
+    /// Tags each session with the host its daemon runs on. Pre-12
+    /// manifests have no field; `#[serde(default = ...)]` fills in
+    /// `HostId::local()` on load, and the next save writes the
+    /// upgraded shape back to disk. The TUI's load-modify-save
+    /// discipline preserves this across saves the same way the
+    /// slice-9 `last_exit` does.
+    ///
+    /// On a local-daemon manifest the value is always `local` —
+    /// the daemon doesn't know its own remote name (the operator's
+    /// `~/.cm/hosts.toml` is what assigns names). The field exists
+    /// here so the TUI's in-memory model has a uniform type when
+    /// it loads sessions from any daemon; remote-loaded sessions
+    /// get their `host_id` overridden to the configured name at
+    /// TUI load time (12c).
+    #[serde(default = "default_local_host_id")]
+    pub host_id: crate::host_id::HostId,
+}
+
+/// 12b: serde-default constructor for `ManifestEntry::host_id`.
+/// `#[serde(default = "<path>")]` requires a fn item, not a
+/// closure — this is the smallest one.
+fn default_local_host_id() -> crate::host_id::HostId {
+    crate::host_id::HostId::local()
 }
 
 /// Persisted workspace metadata. Lives in `Manifest::workspaces`
@@ -701,6 +725,134 @@ mod tests {
             "100 subscribe-drop cycles MUST leave zero slots — \
              RAII guard reaps each one on drop, no broadcast \
              needed to trigger cleanup",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 12b (Phase 3): `host_id` on ManifestEntry — serde
+    // back-compat for pre-12 manifests, explicit-value round-trip,
+    // and byte-stability post-upgrade.
+    // ---------------------------------------------------------------
+
+    /// T_g3b_pre_12_manifest_load — a manifest written before
+    /// slice 12b had no `host_id` field at all. The
+    /// `#[serde(default = "default_local_host_id")]` attr must
+    /// fill in `HostId::local()` so the load doesn't error and
+    /// the in-memory model has a uniform type.
+    ///
+    /// Pre-fix (no default): serde would reject the missing
+    /// field and the whole manifest load would fail — the TUI
+    /// would lock out the operator from every pre-12 session.
+    #[test]
+    fn t_g3b_pre_12_manifest_load() {
+        // Pre-12 wire shape — no host_id field anywhere.
+        let pre_12_json = r#"{
+            "uid": "ts-pre-12",
+            "managed_by_uid": null,
+            "generation": 0,
+            "label": "old-session",
+            "session_type": "claude-code",
+            "transcript_id": null,
+            "hidden": false,
+            "idle_timeout_secs": 0,
+            "burst_threshold": 0,
+            "task_id": null,
+            "notify_on_idle": false
+        }"#;
+        let entry: ManifestEntry = serde_json::from_str(pre_12_json)
+            .expect("pre-12 manifest must load via #[serde(default)]");
+        assert_eq!(
+            entry.host_id,
+            crate::host_id::HostId::local(),
+            "missing host_id field must default to local",
+        );
+        // Sanity: every other pre-12 field round-trips.
+        assert_eq!(entry.uid, "ts-pre-12");
+        assert_eq!(entry.label, "old-session");
+        assert_eq!(entry.session_type, "claude-code");
+    }
+
+    /// T_g3b_explicit_host_id — a post-12 manifest with an
+    /// explicit non-local `host_id` round-trips byte-for-byte.
+    /// Pins the wire shape so future field-addition slices
+    /// (e.g. 12h's `tls_fingerprint`) can't silently shift the
+    /// encoding.
+    #[test]
+    fn t_g3b_explicit_host_id() {
+        let entry = ManifestEntry {
+            uid: "ts-12b-mgr".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "manager-session".into(),
+            session_type: "claude-code".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: crate::host_id::HostId::new("manager"),
+        };
+        let s = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            s.contains(r#""host_id":"manager""#),
+            "explicit host_id must serialize as a bare string: {}",
+            s,
+        );
+        let back: ManifestEntry =
+            serde_json::from_str(&s).expect("round-trip");
+        assert_eq!(back.host_id, crate::host_id::HostId::new("manager"));
+        assert_eq!(back.uid, entry.uid);
+        assert_eq!(back.label, entry.label);
+    }
+
+    /// T_g3b_serde_byte_stable_after_upgrade — load a pre-12
+    /// manifest, save it, reload, and assert the reload-then-save
+    /// is byte-identical to the first save. Catches the
+    /// upgrade-once + idempotent-thereafter contract: the
+    /// `#[serde(default)]` fill happens ONCE (on the load that
+    /// sees the missing field), the next save writes the field
+    /// explicitly, and from then on the encoding is stable.
+    ///
+    /// Without this, a pre-12 file would get re-upgraded on every
+    /// load — sometimes triggering save churn even when nothing
+    /// else changed.
+    #[test]
+    fn t_g3b_serde_byte_stable_after_upgrade() {
+        // Pre-12 JSON without host_id.
+        let pre_12_json = r#"{"uid":"ts","managed_by_uid":null,"generation":0,"label":"x","session_type":"claude","transcript_id":null,"hidden":false,"idle_timeout_secs":0,"burst_threshold":0,"task_id":null,"notify_on_idle":false}"#;
+
+        // First load: serde fills `host_id = HostId::local()`.
+        let loaded: ManifestEntry =
+            serde_json::from_str(pre_12_json).expect("load");
+        assert_eq!(loaded.host_id, crate::host_id::HostId::local());
+
+        // Save: the entry now writes host_id explicitly.
+        let after_first_save =
+            serde_json::to_string(&loaded).expect("save");
+        assert!(
+            after_first_save.contains(r#""host_id":"local""#),
+            "first save must persist host_id explicitly so the \
+             next load doesn't re-trigger the default fill: {}",
+            after_first_save,
+        );
+
+        // Reload from the saved bytes.
+        let reloaded: ManifestEntry =
+            serde_json::from_str(&after_first_save).expect("reload");
+
+        // Save again — must be byte-identical to the first save.
+        let after_second_save =
+            serde_json::to_string(&reloaded).expect("save 2");
+        assert_eq!(
+            after_first_save, after_second_save,
+            "post-upgrade saves must be byte-stable — the first \
+             save baked host_id into the encoding, so the second \
+             read+write is a no-op-default-free round-trip",
         );
     }
 }

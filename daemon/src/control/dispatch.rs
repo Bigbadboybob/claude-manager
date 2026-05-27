@@ -6383,6 +6383,83 @@ mod tests {
         );
     }
 
+    /// 12f F2 (acceptance): the daemon's `methods::propose_task`
+    /// threads `state.config.api_url` + `state.config.api_token`
+    /// through to `planning_client::propose_task` as overrides.
+    /// Drives the full dispatch path: populate DaemonState's
+    /// config, clear env, dispatch, assert the stub server
+    /// captures a request with the CONFIG's URL and token
+    /// (NOT env-derived values).
+    #[test]
+    fn propose_task_threads_config_credentials_to_planning_client() {
+        let _g = crate::planning_client::test_env_lock();
+        // Bogus env points the resolver at a non-listening
+        // port + wrong token — if methods.rs DIDN'T thread
+        // the config through, the HTTP call would target
+        // the bogus env URL and the test would fail by
+        // connection refusal (or, worse, by Authorization
+        // mismatch against the stub if the test runner
+        // happened to have a token that worked).
+        unsafe {
+            std::env::set_var("CM_API_URL", "http://127.0.0.1:1");
+            std::env::set_var("CM_API_TOKEN", "env-bogus");
+        }
+        let (port, captured) =
+            crate::planning_client::spawn_stub_api_for_test(
+                200,
+                r#"{"id":"task-cfg-threaded"}"#,
+            );
+        let cfg_url = format!("http://127.0.0.1:{}", port);
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.config = crate::config::DaemonConfig {
+                mcp_server_path: String::new(),
+                api_url: cfg_url.clone(),
+                api_token: "cfg-tok-threaded".into(),
+                log_path: String::new(),
+                workflows_dir: String::new(),
+                auth: Default::default(),
+            };
+        }
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "propose_task",
+                serde_json::json!({
+                    "project": "p",
+                    "name": "n",
+                    "repo_url": "git@x.com:a/b.git",
+                }),
+            ),
+        )
+        .into_response();
+        assert!(
+            resp.ok,
+            "propose_task must succeed when state.config carries \
+             valid creds (12f F2); got: {:?}",
+            resp.error,
+        );
+        let cap = captured.lock().unwrap();
+        // Verify the stub received the request — proves the
+        // config URL won over the env URL.
+        let (method, path) = cap.method_and_path();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/tasks");
+        // Authorization header MUST carry the config token,
+        // not the env token.
+        assert_eq!(
+            cap.auth_header().as_deref(),
+            Some("Bearer cfg-tok-threaded"),
+            "config-supplied api_token MUST override env value \
+             (12f F2 — methods.rs threading pin)",
+        );
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+    }
+
     /// Sub-2b-1 review-r#4 #2: simulate the TUI's
     /// workflow-launch transcript binding. The TUI's
     /// `WorkflowControllerCtx::launch_workflow` sets/rebinds

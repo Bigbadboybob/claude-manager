@@ -602,19 +602,103 @@ pub(crate) fn start_session_with_spawn_fn(
     spawn_params.working_dir = Some(working_dir);
     spawn_params.cols = p.cols;
     spawn_params.rows = p.rows;
-    // Adopt the caller's env wholesale. The TUI provides the
-    // MCP-server routing pin (`CM_TUI_SOCKET=""` /
+    // Adopt the caller's env wholesale FIRST. The TUI
+    // provides the MCP-server routing pin (`CM_TUI_SOCKET=""` /
     // `CM_DAEMON_SOCKET=<abs path>` per slice 10c-e-3a's
     // SpawnTarget::Daemon) plus `CM_TUI_SESSION_ID` and any
-    // workflow vars. Daemon does not modify.
+    // workflow vars.
     for (k, v) in p.env {
         spawn_params.env.insert(k, v);
     }
-    // Always pin `CM_TUI_SESSION_ID` to the daemon-minted uid even
-    // if the caller didn't (or sent a different value). This is
-    // the correlation key for `~/.cm/memory_kills/<uid>.jsonl`,
-    // and the daemon owns the uid identity for daemon-spawned
-    // sessions.
+
+    // Slice 12f: daemon-side env injection. The daemon's
+    // config (loaded from daemon.toml at startup) is the
+    // authoritative source for environment that the TUI
+    // can't safely supply for a remote daemon — local TUI
+    // paths don't exist on the cm-manager VM / Mac mini.
+    // These insertions OVERRIDE anything the TUI sent so
+    // remote-host correctness wins by default.
+    //
+    // Spec (daemon/NOTES.md 12f):
+    //   - CM_TUI_SOCKET   = daemon's listen socket (path of
+    //                       the cm-daemon's own .sock; the
+    //                       agent's MCP client dials this
+    //                       for TUI-routed methods that the
+    //                       daemon serves on the same socket
+    //                       in remote-host mode).
+    //   - CM_DAEMON_SOCKET = same as CM_TUI_SOCKET for
+    //                        daemon-routed methods.
+    //   - CM_MCP_SERVER  = absolute path to `mcp_server/server.py`
+    //                      on the DAEMON's host (resolved from
+    //                      `daemon.toml::mcp_server_path`; empty
+    //                      means "let the resolver fall back").
+    //   - CM_API_URL / CM_API_TOKEN = planning API ingress.
+    //                                 From daemon.toml so the
+    //                                 daemon can reach the
+    //                                 planning server from the
+    //                                 daemon's host rather than
+    //                                 borrowing the TUI's local
+    //                                 binding.
+    //   - CM_WORKFLOW_RUN_ID / CM_ROLE = workflow context for
+    //                                    participant spawns; from
+    //                                    the RPC params, not env
+    //                                    or config.
+    //   - CM_TUI_SESSION_ID = daemon-minted uid (the
+    //                         correlation key for
+    //                         `~/.cm/memory_kills/<uid>.jsonl`;
+    //                         daemon owns the uid identity for
+    //                         daemon-spawned sessions).
+    // 12f F1: absolutize before injection. `default_socket_path()`
+    // returns whatever `CM_DAEMON_SOCKET` was set to verbatim
+    // (including a relative path like `daemon.sock`). Injecting
+    // a relative path into the child's env makes the agent
+    // dial relative to ITS own worktree cwd — wrong location,
+    // NotFound at dial time. `absolutize_socket_path` joins
+    // the daemon's cwd-at-startup when the path is relative;
+    // absolute paths pass through unchanged.
+    let daemon_socket_abs = crate::path::absolutize_socket_path(
+        &crate::default_socket_path(),
+    )
+    .map_err(|e| (
+        ErrorCode::Internal,
+        format!("absolutize daemon socket path for env injection: {}", e),
+    ))?;
+    let daemon_socket_str =
+        daemon_socket_abs.to_string_lossy().into_owned();
+    spawn_params
+        .env
+        .insert("CM_TUI_SOCKET".into(), daemon_socket_str.clone());
+    spawn_params
+        .env
+        .insert("CM_DAEMON_SOCKET".into(), daemon_socket_str);
+    {
+        let st = state_arc.lock().expect("state mutex");
+        if !st.config.mcp_server_path.is_empty() {
+            spawn_params
+                .env
+                .insert("CM_MCP_SERVER".into(), st.config.mcp_server_path.clone());
+        }
+        if !st.config.api_url.is_empty() {
+            spawn_params
+                .env
+                .insert("CM_API_URL".into(), st.config.api_url.clone());
+        }
+        if !st.config.api_token.is_empty() {
+            spawn_params
+                .env
+                .insert("CM_API_TOKEN".into(), st.config.api_token.clone());
+        }
+    }
+    if let Some(run_id) = p.workflow_run_id.as_deref() {
+        spawn_params
+            .env
+            .insert("CM_WORKFLOW_RUN_ID".into(), run_id.to_string());
+    }
+    if let Some(role) = p.workflow_role.as_deref() {
+        spawn_params
+            .env
+            .insert("CM_ROLE".into(), role.to_string());
+    }
     spawn_params
         .env
         .insert("CM_TUI_SESSION_ID".into(), session_uid.clone());
@@ -2876,7 +2960,7 @@ struct ProposeTaskParams {
     depends: Option<Vec<String>>,
 }
 
-pub fn propose_task(_state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+pub fn propose_task(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
     let p: ProposeTaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("propose_task params: {}", e)))?;
     if p.project.trim().is_empty() {
@@ -2908,7 +2992,33 @@ pub fn propose_task(_state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Met
         difficulty: p.difficulty,
         depends: p.depends.as_deref(),
     };
-    match crate::planning_client::propose_task(&req) {
+    // 12f F2: pass daemon.toml-sourced credentials as
+    // overrides. Empty fields fall through to env in the
+    // resolver — preserves the local-workstation case
+    // (daemon launched from a shell with CM_API_URL /
+    // CM_API_TOKEN exported, no daemon.toml on disk).
+    let (api_url_cfg, api_token_cfg) = {
+        let st = state_arc.lock().expect("state mutex");
+        (
+            st.config.api_url.clone(),
+            st.config.api_token.clone(),
+        )
+    };
+    let api_url_override = if api_url_cfg.is_empty() {
+        None
+    } else {
+        Some(api_url_cfg.as_str())
+    };
+    let api_token_override = if api_token_cfg.is_empty() {
+        None
+    } else {
+        Some(api_token_cfg.as_str())
+    };
+    match crate::planning_client::propose_task(
+        &req,
+        api_url_override,
+        api_token_override,
+    ) {
         Ok(task) => Ok(task),
         Err(e) => Err(e.to_method_err()),
     }
@@ -5565,6 +5675,504 @@ mod tests {
         );
     }
 
+    /// T_g3f_env_injection_complete (named acceptance for
+    /// slice 12f): daemon-side spawn env contains every var
+    /// the doc enumerates — `CM_TUI_SOCKET`,
+    /// `CM_TUI_SESSION_ID`, `CM_DAEMON_SOCKET`, `CM_MCP_SERVER`,
+    /// `CM_API_URL`, `CM_API_TOKEN`, plus `CM_WORKFLOW_RUN_ID` /
+    /// `CM_ROLE` when the spawn carries workflow context.
+    ///
+    /// We can't dump portable-pty's env hashmap directly, so
+    /// we drive a `/bin/bash -c 'env > $OUTFILE; exit 0'`
+    /// child and read the dumped env from disk after the
+    /// session exits.
+    #[test]
+    fn t_g3f_env_injection_complete() {
+        let dir = TempDir::new().unwrap();
+        let env_dump = dir.path().join("env-dump.txt");
+        // Pre-populate daemon.toml-like values in state.
+        let state = {
+            let mut s = DaemonState::new();
+            s.workspaces.insert(
+                "ws-envinj".into(),
+                ManifestWorkspace {
+                    id: "ws-envinj".into(),
+                    name: "test-ws".into(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: Some(dir.path().to_path_buf()),
+                    main_repo_path: None,
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+            );
+            s.config = crate::config::DaemonConfig {
+                mcp_server_path:
+                    "/opt/cm-daemon/mcp_server/server.py".to_string(),
+                api_url: "http://10.150.0.2:8000".to_string(),
+                api_token: "test-token-XYZ".to_string(),
+                log_path: String::new(),
+                workflows_dir: String::new(),
+                auth: Default::default(),
+            };
+            Arc::new(Mutex::new(s))
+        };
+        let uid = fresh_test_uid();
+        let argv = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            format!(
+                "env > {} && sleep 30",
+                env_dump.display()
+            ),
+        ];
+        let params = json!({
+            "uid": uid,
+            "workspace_id": "ws-envinj",
+            "label": "env-inj",
+            "argv": argv,
+            "working_dir": dir.path().display().to_string(),
+            // Workflow context — exercises the CM_WORKFLOW_RUN_ID /
+            // CM_ROLE injection branch.
+            "workflow_run_id": "wf-test-123",
+            "workflow_role": "worker",
+        });
+        let _result = start_session(&state, &params).expect("ok");
+
+        // Wait for the env-dump file to exist + be non-empty
+        // (the bash child runs `env > ...` then sleeps, so
+        // the file appears within milliseconds of spawn).
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5);
+        loop {
+            if env_dump.is_file() {
+                if let Ok(meta) = std::fs::metadata(&env_dump) {
+                    if meta.len() > 0 {
+                        break;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                kill_all_sessions(&state);
+                panic!(
+                    "env dump file {} did not appear within 5s",
+                    env_dump.display(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let dumped = std::fs::read_to_string(&env_dump)
+            .expect("read env dump");
+        kill_all_sessions(&state);
+
+        // Parse `KEY=VALUE\n` lines.
+        let env: std::collections::HashMap<&str, &str> = dumped
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        // Doc-spec'd vars MUST all be present with the
+        // expected values.
+        assert_eq!(
+            env.get("CM_TUI_SESSION_ID").copied(),
+            Some(uid.as_str()),
+            "CM_TUI_SESSION_ID must be the daemon-minted uid",
+        );
+        // Daemon socket var — value is the daemon's own
+        // socket path. Verify it's set + non-empty rather
+        // than pinning a specific filesystem path (test
+        // home_lock setup varies).
+        assert!(
+            env.contains_key("CM_TUI_SOCKET"),
+            "CM_TUI_SOCKET MUST be set",
+        );
+        assert!(
+            env.contains_key("CM_DAEMON_SOCKET"),
+            "CM_DAEMON_SOCKET MUST be set",
+        );
+        let tui_sock = env.get("CM_TUI_SOCKET").copied().unwrap();
+        let daemon_sock = env.get("CM_DAEMON_SOCKET").copied().unwrap();
+        assert!(
+            !tui_sock.is_empty() && !daemon_sock.is_empty(),
+            "both socket vars MUST be non-empty",
+        );
+        assert_eq!(
+            tui_sock, daemon_sock,
+            "CM_TUI_SOCKET == CM_DAEMON_SOCKET per 12f \
+             (both point at daemon's own socket)",
+        );
+
+        // Daemon-config-driven vars: MUST take their values
+        // from daemon.toml (the pre-populated state.config
+        // above), NOT from the caller's env (which was empty
+        // in this test).
+        assert_eq!(
+            env.get("CM_MCP_SERVER").copied(),
+            Some("/opt/cm-daemon/mcp_server/server.py"),
+            "CM_MCP_SERVER must come from daemon.toml",
+        );
+        assert_eq!(
+            env.get("CM_API_URL").copied(),
+            Some("http://10.150.0.2:8000"),
+            "CM_API_URL must come from daemon.toml",
+        );
+        assert_eq!(
+            env.get("CM_API_TOKEN").copied(),
+            Some("test-token-XYZ"),
+            "CM_API_TOKEN must come from daemon.toml",
+        );
+
+        // Workflow context vars from the RPC params.
+        assert_eq!(
+            env.get("CM_WORKFLOW_RUN_ID").copied(),
+            Some("wf-test-123"),
+        );
+        assert_eq!(env.get("CM_ROLE").copied(), Some("worker"));
+    }
+
+    /// 12f: when daemon.toml is empty / missing (local
+    /// workstation case), the always-on injections still
+    /// fire (CM_TUI_SOCKET, CM_DAEMON_SOCKET,
+    /// CM_TUI_SESSION_ID), and workflow context isn't
+    /// injected if the RPC params don't carry it.
+    ///
+    /// Honest gap: we can't cleanly assert "CM_API_URL is
+    /// NOT injected" from the child's env because the test
+    /// runner's parent env already has CM_API_URL set
+    /// (developer workstation, CI env, etc.) and the
+    /// portable-pty child inherits parent env by default.
+    /// The structural pin is that the daemon code only
+    /// inserts these vars when the config field is
+    /// non-empty (see the `!st.config.api_url.is_empty()`
+    /// guards in `start_session`). `t_g3f_env_injection_complete`
+    /// proves the positive case (non-empty config → injected
+    /// values reach the child).
+    #[test]
+    fn env_injection_with_empty_config_skips_config_vars() {
+        let dir = TempDir::new().unwrap();
+        let env_dump = dir.path().join("env-dump.txt");
+        let state = {
+            let mut s = DaemonState::new();
+            s.workspaces.insert(
+                "ws-empty-cfg".into(),
+                ManifestWorkspace {
+                    id: "ws-empty-cfg".into(),
+                    name: "test-ws".into(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: Some(dir.path().to_path_buf()),
+                    main_repo_path: None,
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+            );
+            // config defaults to empty fields — matches
+            // the local-workstation case (no daemon.toml).
+            Arc::new(Mutex::new(s))
+        };
+        let uid = fresh_test_uid();
+        let argv = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            format!("env > {} && sleep 30", env_dump.display()),
+        ];
+        let params = json!({
+            "uid": uid,
+            "workspace_id": "ws-empty-cfg",
+            "label": "empty-cfg",
+            "argv": argv,
+            "working_dir": dir.path().display().to_string(),
+        });
+        let _r = start_session(&state, &params).expect("ok");
+
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5);
+        loop {
+            if env_dump.is_file() {
+                if let Ok(m) = std::fs::metadata(&env_dump) {
+                    if m.len() > 0 {
+                        break;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                kill_all_sessions(&state);
+                panic!("env dump did not appear");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let dumped = std::fs::read_to_string(&env_dump).unwrap();
+        kill_all_sessions(&state);
+        let env: std::collections::HashMap<&str, &str> = dumped
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        // Always-on injections fire regardless of config.
+        assert!(env.contains_key("CM_TUI_SOCKET"));
+        assert!(env.contains_key("CM_DAEMON_SOCKET"));
+        assert_eq!(
+            env.get("CM_TUI_SESSION_ID").copied(),
+            Some(uid.as_str()),
+        );
+        // Workflow context vars: NOT injected when params
+        // carry none. These vars aren't inherited from the
+        // test parent env (the test runner doesn't set
+        // CM_WORKFLOW_RUN_ID or CM_ROLE), so the negative
+        // assertion is meaningful here.
+        assert!(
+            !env.contains_key("CM_WORKFLOW_RUN_ID"),
+            "non-workflow spawn MUST NOT inject CM_WORKFLOW_RUN_ID",
+        );
+        assert!(
+            !env.contains_key("CM_ROLE"),
+            "non-workflow spawn MUST NOT inject CM_ROLE",
+        );
+    }
+
+    /// 12f: structural pin on the start_session env-injection
+    /// block. Every doc-spec'd var must have its insertion
+    /// site in the function's source. Pins what the runtime
+    /// test would otherwise miss (the inherited-env-pollution
+    /// problem documented in `env_injection_with_empty_config_skips_config_vars`).
+    #[test]
+    /// 12f F1 (acceptance): the daemon-injected CM_TUI_SOCKET
+    /// / CM_DAEMON_SOCKET env values MUST be absolute paths,
+    /// even when the daemon was launched with a relative
+    /// `$CM_DAEMON_SOCKET`. Pre-F1 the raw `default_socket_path()`
+    /// value was injected — a relative parent value would
+    /// make the agent dial relative to its own worktree cwd
+    /// (wrong location, NotFound at MCP-routing time).
+    #[test]
+    fn env_injection_absolutizes_relative_socket_paths() {
+        // Serialize against other env-mutating tests in this
+        // binary that touch CM_DAEMON_SOCKET (the
+        // planning_client test_env_lock covers CM_API_*; we
+        // reuse the same lock — process-wide env mutation
+        // can't safely parallelize across modules anyway).
+        let _g = crate::planning_client::test_env_lock();
+
+        let dir = TempDir::new().unwrap();
+        let env_dump = dir.path().join("env-dump.txt");
+
+        // Snapshot the pre-test value so we can restore.
+        // SAFETY: serialized by the env_lock above.
+        let prior_sock = std::env::var_os("CM_DAEMON_SOCKET");
+        unsafe {
+            std::env::set_var("CM_DAEMON_SOCKET", "daemon.sock");
+        }
+
+        let state = {
+            let mut s = DaemonState::new();
+            s.workspaces.insert(
+                "ws-abs".into(),
+                ManifestWorkspace {
+                    id: "ws-abs".into(),
+                    name: "test-ws".into(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: Some(dir.path().to_path_buf()),
+                    main_repo_path: None,
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+            );
+            Arc::new(Mutex::new(s))
+        };
+
+        let uid = fresh_test_uid();
+        let argv = vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            format!("env > {} && sleep 30", env_dump.display()),
+        ];
+        let params = json!({
+            "uid": uid,
+            "workspace_id": "ws-abs",
+            "label": "abs-paths",
+            "argv": argv,
+            "working_dir": dir.path().display().to_string(),
+        });
+        let _result = start_session(&state, &params).expect("spawn ok");
+
+        // Wait for env dump.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5);
+        loop {
+            if env_dump.is_file() {
+                if let Ok(m) = std::fs::metadata(&env_dump) {
+                    if m.len() > 0 {
+                        break;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                kill_all_sessions(&state);
+                // Restore env before bailing.
+                unsafe {
+                    match &prior_sock {
+                        Some(v) => std::env::set_var("CM_DAEMON_SOCKET", v),
+                        None => std::env::remove_var("CM_DAEMON_SOCKET"),
+                    }
+                }
+                panic!("env dump did not appear in 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let dumped = std::fs::read_to_string(&env_dump).unwrap();
+        kill_all_sessions(&state);
+
+        // Restore CM_DAEMON_SOCKET before assertions so a
+        // panic on assert doesn't leak the test value into
+        // subsequent (serialized) tests.
+        unsafe {
+            match prior_sock {
+                Some(v) => std::env::set_var("CM_DAEMON_SOCKET", v),
+                None => std::env::remove_var("CM_DAEMON_SOCKET"),
+            }
+        }
+
+        // Parse env. The daemon's injection MUST have
+        // overridden the parent-inherited relative
+        // `CM_DAEMON_SOCKET=daemon.sock` with an absolute
+        // path (cwd-joined via `absolutize_socket_path`).
+        let env: std::collections::HashMap<&str, &str> = dumped
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let tui_sock = env
+            .get("CM_TUI_SOCKET")
+            .copied()
+            .expect("CM_TUI_SOCKET must be set");
+        let daemon_sock = env
+            .get("CM_DAEMON_SOCKET")
+            .copied()
+            .expect("CM_DAEMON_SOCKET must be set");
+        assert!(
+            tui_sock.starts_with('/'),
+            "CM_TUI_SOCKET MUST be absolute (12f F1); got: {:?}",
+            tui_sock,
+        );
+        assert!(
+            daemon_sock.starts_with('/'),
+            "CM_DAEMON_SOCKET MUST be absolute (12f F1); \
+             pre-fix a relative `$CM_DAEMON_SOCKET` parent value \
+             would have been injected verbatim, making the \
+             agent dial relative to its worktree cwd; got: {:?}",
+            daemon_sock,
+        );
+        // Sanity: the relative form is NOT what landed in
+        // the child's env.
+        assert_ne!(
+            tui_sock, "daemon.sock",
+            "raw relative parent value must NOT be injected",
+        );
+        assert_ne!(daemon_sock, "daemon.sock");
+        // Both pin to the same absolute value.
+        assert_eq!(
+            tui_sock, daemon_sock,
+            "CM_TUI_SOCKET == CM_DAEMON_SOCKET (12f invariant)",
+        );
+        // Ends with the relative filename (cwd was joined,
+        // not replaced).
+        assert!(
+            daemon_sock.ends_with("daemon.sock"),
+            "absolutized path should preserve the filename; got: {:?}",
+            daemon_sock,
+        );
+    }
+
+    #[test]
+    fn env_injection_source_pins_every_spec_var() {
+        let src = include_str!("methods.rs");
+        // Locate `pub(crate) fn start_session_with_spawn_fn`
+        // body bounds.
+        let sig = "pub(crate) fn start_session_with_spawn_fn(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub fn ")
+            .or_else(|| rest[1..].find("\npub(crate) fn "))
+            .or_else(|| rest[1..].find("\nfn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Always-on insertions: CM_TUI_SOCKET, CM_DAEMON_SOCKET,
+        // CM_TUI_SESSION_ID. Sockets come from
+        // `crate::default_socket_path()`.
+        assert!(
+            body.contains("\"CM_TUI_SOCKET\".into()"),
+            "start_session must insert CM_TUI_SOCKET (12f); body:\n{}",
+            body,
+        );
+        assert!(
+            body.contains("\"CM_DAEMON_SOCKET\".into()"),
+            "start_session must insert CM_DAEMON_SOCKET (12f)",
+        );
+        assert!(
+            body.contains("\"CM_TUI_SESSION_ID\".into()"),
+            "start_session must insert CM_TUI_SESSION_ID (12f)",
+        );
+        // 12f F1: sockets MUST be absolutized before injection.
+        // A relative `$CM_DAEMON_SOCKET` parent value would
+        // otherwise be injected verbatim and the agent would
+        // dial relative to its own worktree cwd. Pin the
+        // helper call.
+        assert!(
+            body.contains("crate::path::absolutize_socket_path"),
+            "start_session must absolutize the daemon socket \
+             path before injecting it (12f F1); body:\n{}",
+            body,
+        );
+
+        // Config-gated insertions: CM_MCP_SERVER / CM_API_URL /
+        // CM_API_TOKEN, each guarded by `!st.config.<field>.is_empty()`.
+        for var in &["CM_MCP_SERVER", "CM_API_URL", "CM_API_TOKEN"] {
+            assert!(
+                body.contains(&format!("\"{}\".into()", var)),
+                "start_session must insert {} when config \
+                 carries it (12f); body:\n{}",
+                var,
+                body,
+            );
+        }
+        // The config-driven inserts MUST be guarded so empty
+        // config doesn't blast over inherited values.
+        assert!(
+            body.contains("!st.config.mcp_server_path.is_empty()"),
+            "CM_MCP_SERVER insertion must be guarded on \
+             non-empty config field (12f)",
+        );
+        assert!(
+            body.contains("!st.config.api_url.is_empty()"),
+            "CM_API_URL insertion must be guarded",
+        );
+        assert!(
+            body.contains("!st.config.api_token.is_empty()"),
+            "CM_API_TOKEN insertion must be guarded",
+        );
+
+        // Workflow context insertions: CM_WORKFLOW_RUN_ID /
+        // CM_ROLE, gated on the RPC param being Some.
+        assert!(
+            body.contains("\"CM_WORKFLOW_RUN_ID\".into()"),
+            "CM_WORKFLOW_RUN_ID insertion must exist (12f)",
+        );
+        assert!(
+            body.contains("\"CM_ROLE\".into()"),
+            "CM_ROLE insertion must exist (12f)",
+        );
+    }
+
     #[test]
     fn two_consecutive_spawns_with_distinct_uids_both_land_in_registry() {
         // Slice 10c-e-3b-fix: uids are caller-supplied. The TUI's
@@ -5839,6 +6447,7 @@ mod tests {
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
                     last_exit: None,
+                    host_id: crate::host_id::HostId::local(),
                 },
             );
         }
@@ -6080,6 +6689,7 @@ mod tests {
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
                     last_exit: None,
+                    host_id: crate::host_id::HostId::local(),
                 },
             );
         }
@@ -6272,6 +6882,7 @@ mod tests {
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
                     last_exit: None,
+                    host_id: crate::host_id::HostId::local(),
                 },
             );
         }

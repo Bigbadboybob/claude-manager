@@ -54,7 +54,9 @@
 #![cfg(target_os = "linux")]
 
 pub mod attach;
+pub mod config;
 pub mod control;
+pub mod host_id;
 pub mod manifest;
 pub mod mcp_config;
 pub mod path;
@@ -299,6 +301,41 @@ pub fn run() -> anyhow::Result<()> {
     // launching the daemon (see tui/src/daemon_launch.rs).
     control::operator::init_from_env();
 
+    // Slice 12f: load daemon.toml. Missing file is the
+    // normal local-workstation case — we get inline
+    // defaults (empty api_url/api_token/etc.) which matches
+    // pre-12f behavior. Present file with 0o600 + valid TOML
+    // parses; present file with world/group-readable +
+    // non-empty api_token = loud refusal (bearer-leak gate).
+    // Other errors (parse, IO) abort startup loudly so an
+    // operator misconfiguration doesn't silently swallow.
+    let config_path = config::default_config_path();
+    let daemon_config = match config::load_or_default(&config_path) {
+        Ok(c) => {
+            if config_path.exists() {
+                eprintln!(
+                    "cm-daemon: loaded config from {} (auth.mode = {:?})",
+                    config_path.display(),
+                    c.auth.mode,
+                );
+            } else {
+                eprintln!(
+                    "cm-daemon: no daemon.toml at {}; using inline \
+                     defaults (api_url/api_token empty, mcp_server_path \
+                     falls back to crate::workflow::spawn resolver)",
+                    config_path.display(),
+                );
+            }
+            c
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cm-daemon: refusing to start: {}",
+                e,
+            ));
+        }
+    };
+
     let path = default_socket_path();
     let listener = bind_socket(&path).map_err(|e| {
         anyhow::anyhow!("failed to bind cm-daemon socket at {}: {}", path.display(), e)
@@ -310,6 +347,10 @@ pub fn run() -> anyhow::Result<()> {
     // fields (sessions, etc.) as App-state migrates; 10a-types
     // already wires the read-only manifest snapshot below.
     let mut initial_state = state::DaemonState::new();
+    // 12f: stash the loaded config so `start_session`'s
+    // env-injection step can read it (mcp_server_path /
+    // api_url / api_token).
+    initial_state.config = daemon_config;
     // The path the TUI dials for a dedicated attach connection.
     // For Phase 1 (Unix socket only), the attach connection lands
     // on the same listener as the control connection — the

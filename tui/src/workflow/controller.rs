@@ -50,6 +50,21 @@ pub struct WorkflowControllerCtx<'a> {
     /// Sender clone for memory-kill events. Cloned again into each
     /// per-session watcher thread spawned by `spawn_agent_session`.
     pub kill_tx: &'a std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
+    /// 12e: host_pool reference so workflow-respawn paths can
+    /// route their `kill_daemon_session_if_attached` /
+    /// `push_*_to_daemon_if_attached` calls through the
+    /// session's pinned host.
+    pub host_pool: &'a crate::host_pool::HostPool,
+    /// 12e-r3 F1: snapshot of `App.active_host` taken at the
+    /// top of the user-action handler (e.g. `A-f` launch).
+    /// `spawn_workflow_session` reads this for the fresh-slot
+    /// participant's host_id tag AND consults
+    /// `host_pool.for_host(&active_host)` to dial the right
+    /// daemon. Pre-r3 the field didn't exist; fresh slots
+    /// were hardcoded to `HostId::local()`, so A-f on a
+    /// non-default active_host produced participants that
+    /// silently ran locally and were tagged local.
+    pub active_host: cm_daemon::host_id::HostId,
     /// 11g-2: per-run buffer of channel-delivered events. Drained
     /// by `tick()` per run via [`take_pending_events`]; failed
     /// decisions re-push the source event at the front via
@@ -514,6 +529,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                     // No-op for TUI-local sessions (the helper
                     // gates on `daemon_session_uid.is_some()`).
                     crate::app::App::push_workflow_context_to_daemon_if_attached(
+                        self.host_pool,
                         ts,
                         Some(&run_id),
                         Some(&slot.role),
@@ -595,6 +611,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                             self.config,
                             self.cap_status,
                             self.kill_tx,
+                            self.host_pool,
                         )
                     } else {
                         None
@@ -703,7 +720,9 @@ impl<'a> WorkflowControllerCtx<'a> {
                 continue;
             };
             crate::app::App::push_transcript_path_to_daemon_if_attached(
-                ts, ws,
+                self.host_pool,
+                ts,
+                ws,
             );
         }
 
@@ -776,6 +795,40 @@ impl<'a> WorkflowControllerCtx<'a> {
         run_id: &str,
         task_id: Option<String>,
     ) -> Option<(String, Option<String>)> {
+        // 12e-r4 F1.3 (interim fail-fast): A-f workflow launch
+        // on a non-local active_host requires routing the
+        // fresh-slot spawn through `try_spawn_via_daemon` so
+        // the daemon-on-active_host owns the PTY child and
+        // the `host_id` tag matches reality. That plumbing
+        // would be >100 LOC of controller-side daemon-spawn
+        // wiring (the controller doesn't have the App's
+        // `&mut self`), so the reviewer-accepted interim is
+        // to FAIL the spawn with a clear error message. Pre-
+        // round-4 we silently spawned LOCAL and tagged the
+        // session with `active_host` — every downstream
+        // per-session RPC (kill, transcript push, workflow
+        // context push) then fired against the wrong daemon.
+        //
+        // Real fix (deferred): controller's `spawn_workflow_session`
+        // calls `try_spawn_via_daemon` (or its equivalent for
+        // the controller context) and tags based on the
+        // actual spawn site.
+        if self.active_host != cm_daemon::host_id::HostId::local() {
+            log_tick(
+                run_id,
+                &format!(
+                    "A-f workflow launch on non-local active_host \
+                     `{}` is not yet supported — controller-side \
+                     daemon-spawn wiring is deferred. Switch \
+                     active_host to `local` (A-H) before launching \
+                     the workflow, or wait for the follow-up slice \
+                     that adds the daemon-spawn plumbing to the \
+                     controller path.",
+                    self.active_host.as_str(),
+                ),
+            );
+            return None;
+        }
         let worktree_path = self.workspaces[ws_index].worktree_path.clone()?;
         let (cols, rows) = self.last_term_size;
         // Generate the uid first so the MCP config bakes the same value
@@ -819,6 +872,23 @@ impl<'a> WorkflowControllerCtx<'a> {
             Engine::Codex => App::list_codex_sessions(&worktree_path),
         });
         let session_type = engine.as_session_type().to_string();
+        // 12e-r4 F1.3: at this point `self.active_host ==
+        // HostId::local()` (verified at function top), so the
+        // local-PTY spawn below is the truthful path. The
+        // `host_pool.for_host(&self.active_host)` call still
+        // runs as a sanity probe — it surfaces a startup-time
+        // local-daemon issue (unlikely but cheap to detect).
+        if let Err(e) = self.host_pool.for_host(&self.active_host) {
+            log_tick(
+                run_id,
+                &format!(
+                    "host_pool.for_host(&active_host {}): {} — \
+                     proceeding with local PTY spawn anyway",
+                    self.active_host.as_str(),
+                    e,
+                ),
+            );
+        }
         let sess = crate::session::spawn_agent_session(
             &session_type,
             &session_uid,
@@ -863,6 +933,18 @@ impl<'a> WorkflowControllerCtx<'a> {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            // 12e-r4 F1.3: the local-only invariant at the
+            // top of this function means `active_host ==
+            // HostId::local()` here. Use `HostId::local()`
+            // directly (rather than `self.active_host.clone()`)
+            // so the tag is a truthful signal — pre-r4 we'd
+            // tagged with active_host even when the spawn was
+            // local, producing the "tagged remote but running
+            // locally" bug. The follow-up slice that adds
+            // daemon-spawn plumbing should swap this back to
+            // the active_host snapshot once the spawn actually
+            // routes through that host.
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -2539,6 +2621,7 @@ mod tests {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
         }
     }
 
@@ -2605,6 +2688,12 @@ mod tests {
             String,
             std::collections::VecDeque<workflow::events::Event>,
         >,
+        /// 12e: host_pool field on `WorkflowControllerCtx`. Tests
+        /// don't actually route any RPCs through this — workflow
+        /// controller paths that DO call into the pool are
+        /// covered by `host_pool::tests` directly. This dummy
+        /// just satisfies the ctx-struct's lifetime/typing.
+        host_pool: crate::host_pool::HostPool,
     }
 
     /// 11g-2 helper: push channel-delivered events into the
@@ -2645,6 +2734,10 @@ mod tests {
             kill_tx,
             _kill_rx: kill_rx,
             pending_events: HashMap::new(),
+            host_pool: crate::host_pool::HostPool::from_config(
+                &crate::hosts::HostsConfig::synthesized_local_default(),
+            )
+            .expect("synthesized-local pool"),
         }
     }
 
@@ -2810,6 +2903,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -2914,6 +3009,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3307,6 +3404,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3474,6 +3573,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3589,6 +3690,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3630,6 +3733,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3719,6 +3824,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3890,6 +3997,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3933,6 +4042,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -3956,6 +4067,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -4049,6 +4162,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -4081,6 +4196,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -4168,6 +4285,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -4256,6 +4375,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -4346,6 +4467,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 ctx.sync_role_session_ids();
             }
@@ -4404,6 +4527,8 @@ mod tests {
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
                 pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
             };
             let mut actions = Vec::new();
             ctx.finish_run(run_id, "completed by test".into(), &mut actions, None);
@@ -4478,6 +4603,8 @@ mod tests {
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
                 pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
             };
             let mut actions = Vec::new();
             // 10d-2c-1 review round-4 (F1): `reset_fresh_session`
@@ -4576,6 +4703,8 @@ mod tests {
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
                 pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
             };
             let actions = ctx.tick();
 
@@ -4695,6 +4824,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -4817,6 +4948,8 @@ mod tests {
                 cap_status: &dummy.cap_status,
                 kill_tx: &dummy.kill_tx,
                 pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
             };
             // Direct-call the deliver-only helper with the
             // shape it would see for a daemon-routed second
@@ -4905,6 +5038,7 @@ mod tests {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
         }
     }
 
@@ -4983,6 +5117,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.launch_workflow(
                     0,
@@ -5007,6 +5143,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.deliver_initial_workflow_prompt(&run_id, "worker", 0);
             }
@@ -5048,6 +5186,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -5147,6 +5287,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.launch_workflow(0, "feedback", launch_test_slots(), None);
             }
@@ -5198,6 +5340,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
             };
@@ -5314,6 +5458,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }
@@ -5425,6 +5571,8 @@ mod tests {
                     cap_status: &dummy.cap_status,
                     kill_tx: &dummy.kill_tx,
                     pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
                 };
                 let _ = ctx.tick();
             }

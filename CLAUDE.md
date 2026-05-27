@@ -89,6 +89,7 @@ Sessions view:
 - `A-a` — attach
 - `A-w` — close session
 - `A-h` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden)
+- `A-H` — switch active host (cycles through entries in `~/.cm/hosts.toml`; see Multi-host below)
 - `A-e` — session settings
 - `A-v` — toggle Status / Task sub-view
 - `A-p` — push (cloud)
@@ -120,7 +121,7 @@ The GCP path is fully functional but used less. All infra is in GCP project **`c
 
 | VM | Role | IP | Notes |
 |----|------|----|-------|
-| `cm-manager` | API server | `34.11.80.141` | Runs uvicorn on port 8000 |
+| `cm-manager` | API server + remote daemon host | `35.186.186.160` (static) | Runs uvicorn on port 8000 and `cm-daemon` (see Multi-host) |
 | `cm-db` | PostgreSQL | `10.150.0.2` (internal) | Database: `claude_manager`, user: `cmuser` |
 | `cm-worker-*` | Ephemeral workers | Dynamic | Launched by dispatch daemon from `cm-worker-base` image family |
 
@@ -139,7 +140,7 @@ gcloud compute ssh cm-manager --zone=us-east4-a --project=claude-manager-prod \
   --command="sudo systemctl restart claude-manager"
 ```
 
-Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server runs locally on user machines (cm-manager has no `mcp_server/` directory), so changes there take effect on next local MCP spawn. The TUI and local `workflows/` are built and run locally — no deploy needed.
+Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + restart. The MCP server is installed both on user machines (for local sessions) and at `/opt/cm-daemon/mcp_server/` on cm-manager (for sessions running against the remote daemon). Local edits take effect on next local MCP spawn; remote edits need an scp + `systemctl restart cm-daemon` (see Multi-host). The TUI and local `workflows/` are built and run locally — no deploy needed.
 
 **Don't `pkill -f uvicorn`** — the systemd unit auto-respawns immediately, so a manual nohup launch fights the systemd-spawned one for port 8000. Also, `pkill -f uvicorn` over `gcloud ssh` self-matches on the SSH command line (which contains "uvicorn") and kills its own shell, returning exit 255. Use `systemctl restart` instead.
 
@@ -152,3 +153,52 @@ Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + r
 ### GCS
 
 - `gs://cm-sessions` — cloud session JSONL files for push/pull and preemption recovery.
+
+## Multi-host (`hosts.toml`)
+
+The TUI can drive sessions on multiple host daemons declared in `~/.cm/hosts.toml`. `local` is always present (synthesized when the file is missing or doesn't declare it). Each entry has `name`, `transport` (`unix` or `ssh-unix`), and transport-specific fields. Switch the active host with `A-H` in the Sessions view; the sidebar groups sessions by host.
+
+Example `~/.cm/hosts.toml`:
+
+```toml
+[[host]]
+name = "local"
+transport = "unix"
+socket = "~/.cm/daemon.sock"
+default = true
+
+[[host]]
+name = "manager"
+transport = "ssh-unix"
+ssh_host = "cm-manager"
+ssh_user = "lucas"
+remote_socket = "/home/lucas/.cm/daemon.sock"
+```
+
+`ssh_host` resolves through `~/.ssh/config`, so the operator needs a `Host cm-manager` alias pointing at the VM (use `IdentityFile ~/.ssh/google_compute_engine` + `IdentitiesOnly yes` for the gcloud-managed key). On first use the TUI spawns an `ssh -fN -L <local-sock>:<remote-sock>` tunnel under a private 0o700 dir with an unguessable per-spawn suffix; readiness is detected via `UnixStream::connect()` (not stat). The tunnel is respawned on death.
+
+### `cm-manager` as a remote daemon host
+
+`cm-manager` runs `cm-daemon.service` alongside `claude-manager.service`. Layout on the VM:
+
+- `/opt/cm-daemon/cm-daemon` — daemon binary (Linux x86_64 release build)
+- `/opt/cm-daemon/mcp_server/` — MCP server source + `.venv/` (deps installed via `uv pip install -r requirements.txt`)
+- `/opt/cm-daemon/workflows/` — workflow TOMLs
+- `/home/lucas/.cm/daemon.sock` — control socket
+- `/home/lucas/.cm/daemon.toml` — daemon config (mode 0600). Sets `mcp_server_path`, `api_url = "http://localhost:8000"`, `api_token`, `log_path`, `workflows_dir`, and `[auth] mode = "ssh-trust"` (the SSH session IS the auth — no separate operator token over SSH-unix).
+- `/etc/systemd/system/cm-daemon.service` — `Restart=always`, runs as user `lucas`, `Environment=PATH=/opt/cm-daemon/mcp_server/.venv/bin:...`
+
+Deploying daemon-side changes:
+
+```bash
+# Binary
+cargo build --release -p cm-daemon  # locally
+gcloud compute scp target/release/cm-daemon cm-manager:/tmp/cm-daemon --zone=us-east4-a --project=claude-manager-prod
+ssh cm-manager 'sudo cp /tmp/cm-daemon /opt/cm-daemon/cm-daemon && sudo systemctl restart cm-daemon'
+
+# MCP server / workflows
+gcloud compute scp --recurse mcp_server/ cm-manager:/tmp/ --zone=us-east4-a --project=claude-manager-prod
+ssh cm-manager 'sudo cp -r /tmp/mcp_server/* /opt/cm-daemon/mcp_server/ && sudo systemctl restart cm-daemon'
+```
+
+`claude` (npm `@anthropic-ai/claude-code`) and `codex` (npm `@openai/codex`) are installed system-wide so the daemon can spawn them from any session.
