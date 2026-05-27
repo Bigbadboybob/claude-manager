@@ -52,6 +52,15 @@ sha2 = "0.10"
 # UUID v4 for cloned-Codex transcript ids (agent_memory clone flow).
 uuid = { version = "1", features = ["v4"] }
 
+# Slice 12h: TLS-TCP transport (client side). Pin SHA-256 cert
+# fingerprint via a custom `ServerCertVerifier`; the `dangerous`
+# builder gives us access to that. Same `ring` provider as the
+# daemon side; default features off so we don't pull in
+# `aws-lc-rs` (no .crate in the offline cache) or
+# `prefer-post-quantum` (irrelevant for self-signed pinning).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+
 # Low-level Unix syscalls. Used by the per-session memory cap
 # watcher (Linux: getuid, kill, pidfd_open / pidfd_send_signal) and
 # by the daemon-launch setsid+chdir pre_exec (any Unix). libc

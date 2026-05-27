@@ -1190,16 +1190,33 @@ impl PendingSession {
         for (k, v) in &params.env {
             cmd.env(k, v);
         }
-        // Defense-in-depth for the operator-token plumbing
-        // (`cm_daemon::control::operator`): a daemon-spawned agent
-        // must NOT inherit the daemon's `CM_OPERATOR_TOKEN`,
-        // otherwise it could forge `Caller::Operator` and bypass
-        // descendant-scoped Session-caller auth. portable-pty's
-        // `CommandBuilder::new` is not documented as env-clearing
-        // by default, so explicitly override the var with an empty
-        // value (which the daemon treats as "unset" — see
-        // `operator::init_from_env`'s `.filter(!is_empty)`).
+        // Defense-in-depth for daemon-scoped auth tokens. A
+        // daemon-spawned agent must NOT inherit either of these:
+        //   - `CM_OPERATOR_TOKEN`
+        //     (`cm_daemon::control::operator::ENV_VAR`): forging
+        //     `Caller::Operator` would bypass descendant-scoped
+        //     Session-caller auth on the local Unix socket.
+        //   - `CM_DAEMON_TOKEN`
+        //     (`cm_daemon::control::tls::ENV_VAR`, slice 12h):
+        //     the token authenticates ANY peer to the TLS-TCP
+        //     listener. An agent that inherited it could dial
+        //     the TLS port (locally, or — in a misconfigured-
+        //     firewall scenario — from outside the host) and
+        //     issue operator-level RPCs from a session-scoped
+        //     process. Closing this gap is part of 12h landing
+        //     safely; the attack surface didn't exist before
+        //     the listener did.
+        //
+        // portable-pty's `CommandBuilder::new` is not documented
+        // as env-clearing by default, so explicitly override
+        // each var with an empty value. Both consumers treat
+        // empty-string as "unset" — see
+        // `operator::init_from_env` and the TLS listener's
+        // `MissingDaemonToken` refuse-to-bind gate. A descendant
+        // that re-reads the empty var hits the same path as if
+        // the var were unset.
         cmd.env("CM_OPERATOR_TOKEN", "");
+        cmd.env("CM_DAEMON_TOKEN", "");
         if let Some(wd) = &params.working_dir {
             cmd.cwd(wd);
         }
@@ -2791,5 +2808,100 @@ mod tests {
             !memory_cap_kill,
             "stale pre-baseline record must NOT flag memory_cap_kill on a clean exit"
         );
+    }
+
+    /// 12h reviewer round 3: PTY env scrub must cover BOTH
+    /// `CM_OPERATOR_TOKEN` (pre-12h) and `CM_DAEMON_TOKEN`
+    /// (new in 12h). Pre-fix the latter was inherited from the
+    /// daemon's systemd-injected env into every spawned agent,
+    /// letting a session-scoped agent dial the TLS port and
+    /// issue operator-level RPCs.
+    ///
+    /// Test sets both vars in the test binary's process env,
+    /// spawns a `bash -c 'env > <file>; exit 0'` child via
+    /// `DaemonSession::spawn`, and asserts the dumped env
+    /// either lacks the keys or carries them with empty values
+    /// (`cmd.env(KEY, "")` semantics — both consumers
+    /// `init_from_env` / `MissingDaemonToken` treat empty as
+    /// "unset").
+    #[test]
+    fn spawn_scrubs_daemon_and_operator_tokens_from_child_env() {
+        let _g = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_dump = dir.path().join("env-dump.txt");
+
+        // Set BOTH vars on the test process so they'd otherwise
+        // be inherited by `CommandBuilder::new`.
+        std::env::set_var("CM_OPERATOR_TOKEN", "operator-leak-canary");
+        std::env::set_var("CM_DAEMON_TOKEN", "daemon-leak-canary");
+
+        let mut params = SpawnParams::new(
+            "ts-scrub",
+            "scrub-test",
+            "/bin/bash",
+        );
+        params.args = vec![
+            "-c".into(),
+            format!(
+                "env > {}; exit 0",
+                env_dump.display(),
+            ),
+        ];
+        let mut session =
+            DaemonSession::spawn(params).expect("spawn bash");
+        let _ = await_exit(&mut session, "bash env-dump");
+
+        // Restore env BEFORE asserting so a panic doesn't leak
+        // canary tokens into adjacent tests sharing env_lock.
+        std::env::remove_var("CM_OPERATOR_TOKEN");
+        std::env::remove_var("CM_DAEMON_TOKEN");
+
+        let dumped =
+            std::fs::read_to_string(&env_dump).expect("read env dump");
+        let env: std::collections::HashMap<&str, &str> = dumped
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        // Critical: neither canary value must reach the child.
+        // The scrub uses `cmd.env(KEY, "")` so the key MAY be
+        // present with empty value; what matters is that the
+        // INHERITED canary value does not propagate.
+        assert_ne!(
+            env.get("CM_OPERATOR_TOKEN").copied(),
+            Some("operator-leak-canary"),
+            "CM_OPERATOR_TOKEN canary value MUST NOT leak into \
+             the child (would let the agent forge \
+             Caller::Operator on the Unix socket); got dump:\n{}",
+            dumped,
+        );
+        assert_ne!(
+            env.get("CM_DAEMON_TOKEN").copied(),
+            Some("daemon-leak-canary"),
+            "CM_DAEMON_TOKEN canary value MUST NOT leak into \
+             the child (would let the agent authenticate to the \
+             TLS-TCP listener and issue operator-level RPCs); \
+             got dump:\n{}",
+            dumped,
+        );
+        // Defensive: if the key IS present, it MUST be empty.
+        // Tightens the assertion above against a future change
+        // that introduces a different non-canary value.
+        if let Some(v) = env.get("CM_OPERATOR_TOKEN").copied() {
+            assert!(
+                v.is_empty(),
+                "if CM_OPERATOR_TOKEN is present it must be \
+                 empty; got {:?}",
+                v,
+            );
+        }
+        if let Some(v) = env.get("CM_DAEMON_TOKEN").copied() {
+            assert!(
+                v.is_empty(),
+                "if CM_DAEMON_TOKEN is present it must be \
+                 empty; got {:?}",
+                v,
+            );
+        }
     }
 }

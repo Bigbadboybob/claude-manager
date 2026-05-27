@@ -387,6 +387,73 @@ pub fn run() -> anyhow::Result<()> {
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
 
+    // 12h: spawn the TLS-TCP listener if daemon.toml carries
+    // a `[tls]` section. The TUI's TLS-TCP host transport
+    // (slice 12a placeholder → 12h real variant) dials this
+    // listener. The acceptor runs on a separate accept thread
+    // so it's independent of the Unix socket loop below.
+    //
+    // Failure to bind (port conflict, missing cert / key,
+    // missing CM_DAEMON_TOKEN) is loud-fatal — the operator
+    // opted into TLS by setting the section, and silently
+    // running without it would leave them thinking the
+    // listener was up.
+    if let Some(tls_cfg) = state.lock().unwrap().config.tls.clone() {
+        let token = std::env::var(control::tls::ENV_VAR)
+            .unwrap_or_default();
+        match control::tls::TlsAcceptor::bind(&tls_cfg, token) {
+            Ok(acceptor) => {
+                let local = acceptor
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| tls_cfg.listen_addr.clone());
+                eprintln!(
+                    "cm-daemon: TLS listener configured on {} \
+                     (cert={}, key={})",
+                    local,
+                    tls_cfg.cert_path,
+                    tls_cfg.key_path,
+                );
+                let state_for_tls = std::sync::Arc::clone(&state);
+                // Reviewer round 3: propagate the thread-spawn
+                // result. Pre-fix the `Result` was dropped
+                // via `let _ = ...`, so a `Builder::spawn`
+                // failure (EAGAIN / ulimit / OOM at startup)
+                // would silently land us in "TLS listener
+                // configured" log + no listener running.
+                // `[tls]` is opt-in: the operator asked for it,
+                // so bind-side failure is already loud-fatal
+                // above; the spawn side gets the same shape.
+                std::thread::Builder::new()
+                    .name("cm-daemon-tls-accept".into())
+                    .spawn(move || {
+                        if let Err(e) =
+                            acceptor.serve(state_for_tls)
+                        {
+                            eprintln!(
+                                "cm-daemon: TLS serve loop \
+                                 exited: {}",
+                                e,
+                            );
+                        }
+                    })
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "cm-daemon: TLS accept-thread \
+                             spawn failed: {}",
+                            e,
+                        )
+                    })?;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cm-daemon: TLS listener bind failed: {}",
+                    e,
+                ));
+            }
+        }
+    }
+
     // 10d-2c-2-2-a: spawn the workflow on_idle poller. 2c-2-2-a's
     // gate is hard-coded to "TUI owns" so this is a no-op behavior
     // change — the loop runs and produces decisions but every

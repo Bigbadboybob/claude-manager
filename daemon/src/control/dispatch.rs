@@ -6420,6 +6420,7 @@ mod tests {
                 log_path: String::new(),
                 workflows_dir: String::new(),
                 auth: Default::default(),
+                tls: None,
             };
         }
         let resp = dispatch_request(
