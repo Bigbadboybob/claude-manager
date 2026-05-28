@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# cm-redeploy — rebuild workspace, kill running daemon + TUI, start fresh daemon.
+#
+# The mistake this protects against: `cargo build --release` produces a new
+# binary on disk, but the running cm-daemon process keeps using the in-memory
+# code it loaded at its start time. Until you kill + restart the daemon, none
+# of your code changes are actually live. This is easy to forget because
+# nothing about a normal interaction tells you you're on stale code.
+#
+# What this script does:
+#   1. `cargo build --release --workspace` from the repo root.
+#   2. Compares the new cm-daemon binary's mtime to the running daemon's
+#      start time. Bails early if nothing actually needs reloading.
+#   3. Shows the kill list (daemon PID + every child PTY) so you can see
+#      exactly what's about to die before confirming.
+#   4. SIGTERM-then-SIGKILL the TUI and daemon. Sessions die — that's
+#      the cost of loading new daemon code.
+#   5. Starts the new daemon detached (setsid + nohup so it survives the
+#      shell exit), logs to ~/.cm/daemon.log.
+#   6. Prints the TUI launch command for you to run in your interactive
+#      terminal (we can't start the TUI from a script — it needs your tty).
+#
+# Usage:
+#   scripts/cm-redeploy          # interactive confirm
+#   scripts/cm-redeploy --yes    # skip confirm (CI / cron / autonomous use)
+#   scripts/cm-redeploy --dry    # show what would happen, don't kill anything
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+
+DAEMON_BINARY="$REPO_ROOT/target/release/cm-daemon"
+TUI_BINARY="$REPO_ROOT/target/release/claude-manager-tui"
+DAEMON_LOG="$HOME/.cm/daemon.log"
+
+YES=0
+DRY=0
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y) YES=1 ;;
+        --dry|--dry-run) DRY=1 ;;
+        --help|-h)
+            sed -n '3,30p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $arg" >&2
+            echo "use --help for usage" >&2
+            exit 2
+            ;;
+    esac
+done
+
+step() { printf '\n=== %s ===\n' "$1"; }
+
+step "cargo build --release --workspace"
+if [ "$DRY" = "1" ]; then
+    echo "(dry-run: would run cargo build)"
+else
+    cargo build --release --workspace
+fi
+
+if [ ! -x "$DAEMON_BINARY" ]; then
+    echo "ERROR: daemon binary missing at $DAEMON_BINARY after build" >&2
+    exit 1
+fi
+
+DAEMON_BIN_MTIME=$(stat -c %Y "$DAEMON_BINARY")
+DAEMON_BIN_HUMAN=$(date -d "@$DAEMON_BIN_MTIME" '+%Y-%m-%d %H:%M:%S')
+
+step "current daemon state"
+DAEMON_PID=$(pgrep -f "/target/release/cm-daemon$" | head -1 || true)
+if [ -z "$DAEMON_PID" ]; then
+    echo "no running cm-daemon found; will start fresh"
+    DAEMON_START_EPOCH=0
+else
+    DAEMON_START_HUMAN=$(ps -p "$DAEMON_PID" -o lstart= | xargs)
+    DAEMON_START_EPOCH=$(date -d "$DAEMON_START_HUMAN" +%s)
+    echo "daemon PID:        $DAEMON_PID"
+    echo "daemon started:    $DAEMON_START_HUMAN"
+    echo "binary on disk:    $DAEMON_BIN_HUMAN"
+    if [ "$DAEMON_BIN_MTIME" -le "$DAEMON_START_EPOCH" ]; then
+        echo
+        echo "Binary is NOT newer than the running daemon. Nothing to deploy."
+        echo "(If you want to restart anyway, kill the daemon manually and re-run.)"
+        exit 0
+    fi
+    AGE_SECS=$((DAEMON_BIN_MTIME - DAEMON_START_EPOCH))
+    echo "binary newer by:   ${AGE_SECS}s"
+fi
+
+TUI_PID=$(pgrep -f "/target/release/claude-manager-tui$" | head -1 || true)
+if [ -n "$TUI_PID" ]; then
+    TUI_START_HUMAN=$(ps -p "$TUI_PID" -o lstart= | xargs)
+    echo "TUI PID:           $TUI_PID  (started $TUI_START_HUMAN)"
+fi
+
+if [ -n "$DAEMON_PID" ]; then
+    step "kill list (these die on restart)"
+    pgrep -P "$DAEMON_PID" -af | sed 's/^/  /' || echo "  (no daemon children)"
+fi
+
+if [ "$DRY" = "1" ]; then
+    step "dry-run complete — no processes killed"
+    exit 0
+fi
+
+if [ "$YES" != "1" ]; then
+    echo
+    read -r -p "Proceed with restart? [y/N] " confirm
+    case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) echo "aborted"; exit 0 ;;
+    esac
+fi
+
+step "stopping TUI"
+if [ -n "$TUI_PID" ]; then
+    kill -TERM "$TUI_PID" 2>/dev/null || true
+    for _ in 1 2 3; do
+        kill -0 "$TUI_PID" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$TUI_PID" 2>/dev/null; then
+        echo "TUI didn't exit on SIGTERM — sending SIGKILL"
+        kill -KILL "$TUI_PID" 2>/dev/null || true
+    fi
+    echo "TUI stopped"
+else
+    echo "no TUI running"
+fi
+
+step "stopping daemon"
+if [ -n "$DAEMON_PID" ]; then
+    kill -TERM "$DAEMON_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        kill -0 "$DAEMON_PID" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+        echo "daemon didn't exit on SIGTERM — sending SIGKILL"
+        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+        sleep 1
+    fi
+    echo "daemon stopped"
+else
+    echo "no daemon was running"
+fi
+
+step "starting new daemon"
+mkdir -p "$(dirname "$DAEMON_LOG")"
+# setsid + nohup: detach from this shell so the daemon survives our exit.
+# Redirect stdout/stderr to the log file with a date header for grep-ability.
+{
+    echo
+    echo "===== cm-daemon start at $(date -Iseconds) (binary $DAEMON_BIN_HUMAN) ====="
+} >> "$DAEMON_LOG"
+setsid nohup "$DAEMON_BINARY" >> "$DAEMON_LOG" 2>&1 < /dev/null &
+NEW_DAEMON_PID=$!
+disown "$NEW_DAEMON_PID" 2>/dev/null || true
+sleep 1
+if ! kill -0 "$NEW_DAEMON_PID" 2>/dev/null; then
+    echo "ERROR: daemon failed to start. tail of $DAEMON_LOG:" >&2
+    tail -20 "$DAEMON_LOG" >&2
+    exit 1
+fi
+echo "new daemon PID: $NEW_DAEMON_PID"
+echo "log:            $DAEMON_LOG"
+
+step "ready"
+cat <<EOF
+Daemon restarted on the new binary. To bring the TUI back up, run from
+your interactive terminal:
+
+  $TUI_BINARY
+
+(The TUI reads ~/.config/claude-manager/.env directly, so you don't need
+to source it first.)
+EOF

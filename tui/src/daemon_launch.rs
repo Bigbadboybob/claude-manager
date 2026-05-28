@@ -530,6 +530,54 @@ fn apply_detach_pre_exec(cmd: &mut std::process::Command) {
     }
 }
 
+/// Warn at TUI startup if the `cm-daemon` binary on disk is newer than
+/// the connected daemon's socket file mtime — i.e., the binary was
+/// rebuilt but the running daemon process is still using older
+/// in-memory code. Code changes that touch the daemon (mcp_start_session
+/// semantics, dispatcher arms, session lifecycle, auth) will NOT be
+/// live until the daemon is killed and restarted with the new binary.
+///
+/// The socket file's mtime is set when the daemon binds it at startup,
+/// so it's a reliable proxy for daemon start time without having to
+/// shell out to `ps` for the running PID.
+///
+/// Best-effort: if any of the metadata lookups fail (binary not found,
+/// socket missing, mtime not available on this filesystem), this
+/// returns silently. The warning is a usability nudge, not a
+/// correctness contract.
+///
+/// See `scripts/cm-redeploy` for the clean rebuild+restart workflow.
+pub fn warn_if_daemon_is_stale(socket_path: &Path) {
+    let bin_path = match locate_daemon_binary() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let bin_mtime = match std::fs::metadata(&bin_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let sock_mtime = match std::fs::metadata(socket_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    // 60s tolerance: a clean redeploy legitimately writes both the
+    // binary and (later) the new socket within a tight window — the
+    // binary's mtime can be a few seconds newer than the socket without
+    // the daemon being stale. Without slop we'd false-positive on every
+    // restart-immediately-after-build cycle.
+    const TOLERANCE: Duration = Duration::from_secs(60);
+    if let Ok(age) = bin_mtime.duration_since(sock_mtime + TOLERANCE) {
+        eprintln!(
+            "WARNING: cm-daemon binary at {} was rebuilt ~{}s after the running daemon started.\n\
+             The running daemon is using OLD in-memory code. Code changes that touch the daemon\n\
+             (mcp_start_session, dispatcher, session lifecycle, auth) are NOT live until the\n\
+             daemon is restarted. Run scripts/cm-redeploy to rebuild and load the new binary.",
+            bin_path.display(),
+            age.as_secs(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

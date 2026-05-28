@@ -100,6 +100,14 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // Warn (don't fail) if the cm-daemon binary on disk is newer
+    // than the running daemon's socket — symptom of "I ran
+    // `cargo build` but forgot to restart the daemon, so my code
+    // changes aren't live." Best-effort; silent if metadata
+    // lookups fail. See `scripts/cm-redeploy` for the clean
+    // rebuild+restart workflow.
+    daemon_launch::warn_if_daemon_is_stale(&daemon_socket);
+
     // Sub-2a Finding (round 3) #1: do NOT push an empty
     // `task.update_tree` at startup. The persistent-host
     // daemon may already hold a non-empty tree from a previous
