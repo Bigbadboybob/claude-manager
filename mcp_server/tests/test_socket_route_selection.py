@@ -843,10 +843,19 @@ class DaemonMethodsAlignmentTests(unittest.TestCase):
     method and forgets to update `DAEMON_METHODS`, the call
     would route to TUI (which returns method-not-found — loud
     failure, but the test catches it earlier at build time).
+
+    `DAEMON_DISPATCHED_BUT_TUI_ROUTED` covers the inverse
+    direction: methods the daemon dispatches but Python
+    deliberately routes to TUI (see the constant's docstring
+    for the motivating bug). The alignment check folds that
+    set into the expected daemon-side surface.
     """
 
     def test_daemon_methods_matches_dispatch_arms(self):
-        from mcp_server.control_client import DAEMON_METHODS
+        from mcp_server.control_client import (
+            DAEMON_DISPATCHED_BUT_TUI_ROUTED,
+            DAEMON_METHODS,
+        )
 
         dispatch_path = (
             Path(__file__).resolve().parent.parent.parent
@@ -862,15 +871,49 @@ class DaemonMethodsAlignmentTests(unittest.TestCase):
         arms = re.findall(r'^\s{8}"([a-zA-Z0-9_.]+)"\s*=>', content, re.MULTILINE)
         # `_` => is the catch-all; not a method name.
         dispatch_methods = {m for m in arms if m and not m.startswith("_")}
-        # The set must match exactly. If the daemon adds a method,
+        # The set must match exactly when we fold in the
+        # deliberate divergences. If the daemon adds a method,
         # update DAEMON_METHODS; if a method is removed from
-        # daemon dispatch, drop it from DAEMON_METHODS.
+        # daemon dispatch, drop it from both DAEMON_METHODS and
+        # DAEMON_DISPATCHED_BUT_TUI_ROUTED.
+        expected = set(DAEMON_METHODS) | set(DAEMON_DISPATCHED_BUT_TUI_ROUTED)
         self.assertEqual(
-            set(DAEMON_METHODS),
+            expected,
             dispatch_methods,
-            "DAEMON_METHODS must match daemon/src/control/dispatch.rs arms. "
-            f"Only-in-DAEMON_METHODS: {set(DAEMON_METHODS) - dispatch_methods!r}; "
-            f"only-in-dispatch.rs: {dispatch_methods - set(DAEMON_METHODS)!r}",
+            "DAEMON_METHODS ∪ DAEMON_DISPATCHED_BUT_TUI_ROUTED must "
+            "match daemon/src/control/dispatch.rs arms. "
+            f"Only-in-expected: {expected - dispatch_methods!r}; "
+            f"only-in-dispatch.rs: {dispatch_methods - expected!r}",
+        )
+
+    def test_send_input_routes_to_tui_under_daemon_pin(self):
+        """`send_input` is in `DAEMON_DISPATCHED_BUT_TUI_ROUTED`,
+        so Python MUST route it to the TUI socket even when the
+        daemon socket is pinned. Regression guard against
+        accidentally re-adding `send_input` to DAEMON_METHODS —
+        which would silently break Enter delivery for any agent
+        in kitty keyboard mode (see the constant's docstring).
+        """
+        from mcp_server import control_client
+
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp,
+                    "CM_DAEMON_SOCKET": "/tmp/d.sock",
+                    "CM_TUI_SOCKET": "/tmp/t.sock",
+                },
+                clear=True,
+            ):
+                path = control_client.resolve_socket_for_method("send_input")
+        self.assertEqual(
+            str(path),
+            "/tmp/t.sock",
+            "send_input must route to TUI — its drainer is the only "
+            "code path that emits the correct kitty Enter (\\x1b[13u). "
+            "The daemon-side handler writes raw \\n which agents in "
+            "kitty mode ignore.",
         )
 
 

@@ -82,7 +82,8 @@ class SocketRoute:
 # the daemon's actual dispatch arms is caught by
 # `tests/test_socket_route_selection.py::DaemonMethodsAlignmentTests`
 # which reads `daemon/src/control/dispatch.rs` and asserts the
-# match-arm method names match this set.
+# match-arm method names match this set (modulo
+# `DAEMON_DISPATCHED_BUT_TUI_ROUTED`).
 #
 # Internal methods (TUI-pushed, not agent-called) are still
 # included for correctness — the resolver gives the right
@@ -92,7 +93,6 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "start_session",
     "session.attach",
     "attach.open",
-    "send_input",
     "kill_session",
     "read_session_output",
     "list_sessions",
@@ -159,6 +159,27 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # view); the Session-callable `get_workflow_state` covers
     # agent-side reads. Not Python-routable.
     "workflow.get_state",
+})
+
+
+# Methods that exist as daemon dispatch arms but are deliberately
+# routed to the TUI by Python. The daemon's `send_input` writes
+# `text + b'\n'` raw to the PTY, which is the wrong Enter
+# encoding for any agent that has pushed kitty keyboard mode
+# (kitty Enter = `\x1b[13u`, not `\n`/`\r`). The body lands in
+# the input box but the agent never submits — the recurring
+# "Enter didn't work for some reason" symptom that breaks
+# orchestrator-driven `send_input` against Claude Code workers.
+# Routing back to the TUI's `send_input` puts the call through
+# the encoding-aware drainer (`enter_bytes_for_mode` +
+# `format_body_for_delivery` + the ENTER_GAP separator that
+# stops codex classifying the trailing keystroke as paste tail).
+# The daemon-side dispatch arm is retained as an
+# Operator-callable surface for direct daemon clients (no
+# kitty-mode concern for those use cases); MCP just doesn't
+# route there.
+DAEMON_DISPATCHED_BUT_TUI_ROUTED: frozenset[str] = frozenset({
+    "send_input",
 })
 
 

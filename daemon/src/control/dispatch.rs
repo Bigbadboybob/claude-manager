@@ -1087,6 +1087,20 @@ fn dispatch_events_subscribe(
 /// (sub-2a TUI-mirror rule: self / same-task / descendant-task /
 /// taskless+same-workspace). Operator callers bypass auth.
 ///
+/// ## Not the MCP path
+///
+/// The Python MCP `send_input` tool deliberately routes to the
+/// TUI socket (see `mcp_server/control_client.py`'s
+/// `DAEMON_DISPATCHED_BUT_TUI_ROUTED`). This handler writes
+/// `text + b'\n'` raw to the PTY, which is wrong Enter for any
+/// agent that has pushed kitty keyboard mode — kitty Enter is
+/// `\x1b[13u`, and `\n` is just a literal newline that lands in
+/// the agent's input box without submitting. The TUI's
+/// `send_input` runs the body through the encoding-aware drainer
+/// (`enter_bytes_for_mode` + the ENTER_GAP separator) and is the
+/// only path with correct kitty/codex behavior. This arm exists
+/// for direct daemon clients (no MCP routing concern) and tests.
+///
 /// ## Sub-2a Finding #2 TOCTOU fix
 ///
 /// Pre-fix the dispatcher called a shared
