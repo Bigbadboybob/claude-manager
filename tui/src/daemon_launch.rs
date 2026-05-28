@@ -218,6 +218,14 @@ where
     F: FnOnce() -> std::io::Result<()>,
 {
     if try_connect(socket_path) {
+        // Daemon already running. Sanity-check it isn't a stale
+        // build — common after `cargo build` produces a new
+        // binary on disk while the previously-started daemon
+        // process keeps the old in-memory image. The stale
+        // process is missing any dispatch arms / RPC handlers
+        // added after its build time; agents calling those
+        // methods see `unknown_method` from the daemon.
+        warn_if_daemon_binary_stale(socket_path);
         return Ok(());
     }
     spawn_daemon()?;
@@ -242,6 +250,72 @@ where
 /// asks the OS whether something accepted the connection.
 fn try_connect(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
+}
+
+/// Detect "daemon is running but its binary on disk was
+/// replaced after the process started" and warn the operator.
+/// Linux annotates `/proc/<pid>/exe` with a literal ` (deleted)`
+/// suffix when the executable file has been unlinked or replaced
+/// (the typical outcome of `cargo build` producing a fresh
+/// binary). When that suffix is present, the running daemon is
+/// executing in-memory code that may be missing dispatch arms or
+/// RPC handlers added in the on-disk version — symptom: agents
+/// see `unknown_method` from methods that exist in source.
+///
+/// Best-effort: any failure to read PID or symlink → silent
+/// pass. False negatives are tolerable (worst case the operator
+/// hits the original unknown_method again); false positives
+/// would be noisy and the connect-time peer-cred / procfs reads
+/// can fail for benign reasons.
+fn warn_if_daemon_binary_stale(socket_path: &Path) {
+    let Some(pid) = peer_pid_of_socket(socket_path) else {
+        return;
+    };
+    let exe_link = std::path::PathBuf::from(format!("/proc/{}/exe", pid));
+    let Ok(target) = std::fs::read_link(&exe_link) else {
+        return;
+    };
+    if !target.to_string_lossy().ends_with(" (deleted)") {
+        return;
+    }
+    eprintln!(
+        "cm-tui: WARNING: running cm-daemon (pid {}) is executing a stale \
+         binary — the on-disk binary has been replaced since the daemon \
+         started. Symptom: agent RPCs may return `unknown_method` for \
+         methods that exist in the current source.",
+        pid,
+    );
+    eprintln!(
+        "cm-tui:   To pick up the new binary: stop the TUI, run \
+         `pkill cm-daemon`, then relaunch the TUI (it will respawn the \
+         daemon from the on-disk binary). All running sessions will be \
+         killed."
+    );
+}
+
+/// Read the peer's PID off a UnixStream connected to
+/// `socket_path` via `SO_PEERCRED`. Linux-only API; the project
+/// targets Linux exclusively. Returns `None` on any failure
+/// (connect refused, getsockopt error, etc.) — the caller treats
+/// the absence of a PID as "skip the staleness check."
+fn peer_pid_of_socket(socket_path: &Path) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let stream = UnixStream::connect(socket_path).ok()?;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(cred.pid as u32)
 }
 
 /// Resolution order for the `cm-daemon` binary:

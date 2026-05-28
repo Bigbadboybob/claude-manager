@@ -2786,6 +2786,21 @@ pub struct App {
     /// again. Until then, they ride along on disk untouched.
     pub skipped_manifest_entries:
         HashMap<String, Vec<cm_daemon::manifest::ManifestEntry>>,
+    /// Background fanout worker for daemon RPC pushes. Main
+    /// thread builds owned snapshots and fires them at this
+    /// worker; the worker coalesces bursts and does the per-host
+    /// RPC. Keeps keystroke handling off the network's RTT
+    /// budget (~500ms-1s per push to SSH-tunneled `cm-manager`).
+    pub push_worker: crate::push_worker::PushWorker,
+    /// Last-drawn `view_mode` for the Clear-on-transition gate.
+    /// `None` until the first draw — that draw always clears
+    /// (initial paint).
+    last_drawn_view_mode: Option<ViewMode>,
+    /// Discriminant of the last-drawn `input_mode`. Opening or
+    /// closing an input dialog flips the discriminant; sub-field
+    /// edits (typing inside the dialog) don't. Used as the
+    /// second half of the Clear-on-transition gate.
+    last_drawn_input_disc: Option<std::mem::Discriminant<InputMode>>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -2985,6 +3000,13 @@ impl App {
         let (workflow_watch_rx, _workflow_watch_threads) =
             crate::workflow_watch::spawn_per_host(&host_pool, &hosts);
 
+        // Push fanout worker. Owns its own thread; receives
+        // owned snapshots from the main thread via mpsc and
+        // does the per-host daemon RPC fanout off the keystroke
+        // path. See `push_worker` module doc for design.
+        let push_worker =
+            crate::push_worker::PushWorker::spawn(std::sync::Arc::clone(&host_pool));
+
         App {
             tasks: Vec::new(),
             workspaces: Vec::new(),
@@ -3027,6 +3049,9 @@ impl App {
             host_pool,
             active_host,
             skipped_manifest_entries: HashMap::new(),
+            push_worker,
+            last_drawn_view_mode: None,
+            last_drawn_input_disc: None,
         }
     }
 
@@ -8497,110 +8522,48 @@ impl App {
     /// The workflow-method auth consumer in 10d-2 reads from
     /// `state.tui_sessions`; without that push wired here, 10d-2
     /// would have nothing to read.
-    /// 12e-r3 F2: per-host fanout entry. Resolves the socket
-    /// path for `host_id` via the pool, then calls the
-    /// per-host push helpers. Errors on a single host are
-    /// logged (with the host name) and do NOT abort the
-    /// fanout — `push_state_to_daemon` iterates every host
-    /// and best-effort pushes to each.
+    /// Build a per-host owned snapshot of TUI sessions and hand
+    /// it off to the background `push_worker`. Main-thread cost:
+    /// one clone of each session's small strings + an mpsc
+    /// `send`. The fanout (per-host dial, RPC, reachability cache
+    /// updates) happens on the worker thread — keystroke handling
+    /// no longer waits on network RTT.
     pub(crate) fn push_tui_sessions_to_daemon(&self) {
+        // Pre-seed each configured host with an empty vec so an
+        // empty snapshot still produces a (host, []) entry and
+        // clears the daemon's `tui_sessions` map on the
+        // worker-side full-replace.
+        let mut per_host: HashMap<
+            cm_daemon::host_id::HostId,
+            Vec<crate::push_worker::TuiSessionRow>,
+        > = HashMap::new();
         for host in &self.hosts.hosts {
-            self.push_tui_sessions_to_host(&host.id);
+            per_host.insert(host.id.clone(), Vec::new());
         }
-    }
-
-    fn push_tui_sessions_to_host(
-        &self,
-        host_id: &cm_daemon::host_id::HostId,
-    ) {
-        // 12e-perf: skip the dial if the host is in backoff.
-        // Pre-12e-perf an unreachable ssh-unix host blocked every
-        // save_session_manifest call for ~3s while the SSH spawn
-        // wait elapsed.
-        if self
-            .host_pool
-            .should_skip_for_push(host_id, Instant::now())
-        {
-            return;
-        }
-        // 10f: daemon-mandatory; always push.
-        // Flatten App.workspaces[*].sessions[*] into one vec —
-        // but filter OUT daemon-attached sessions
-        // (`session.daemon_session_uid.is_some()`). Those already
-        // live in `state.sessions` on the daemon; appearing in
-        // `state.tui_sessions` too would double-register them and
-        // make `lookup_session_any`'s ordering load-bearing for
-        // correctness. Keeping the two maps non-overlapping by
-        // construction means the lookup can prefer either without
-        // ambiguity. Carries the auth-relevant fields per
-        // `daemon::state::TuiSessionSnapshot` shape — task_id
-        // (for descendant-task scoping), workflow_run_id /
-        // workflow_role (for workflow-method auth in 10d-2),
-        // label / type / hidden (forward-compat for a merged
-        // list_sessions view in a future slice).
-        // 12e-r8 F2: filter to only sessions whose `host_id`
-        // matches the target host. Pre-r8 every daemon
-        // received every session — a local-host daemon would
-        // advertise sessions actually pinned to "manager" in
-        // its `tui_sessions` map, which is a state lie that
-        // breaks lookup-by-uid, auth walks, and the eventual
-        // merged-list_sessions view. Each daemon now only
-        // hears about sessions it actually owns.
-        let sessions: Vec<crate::client_session::TuiSessionSnapshotPush<'_>> = self
-            .workspaces
-            .iter()
-            .flat_map(|w| w.sessions.iter())
-            .filter(|ts| ts.session.daemon_session_uid.is_none())
-            .filter(|ts| &ts.host_id == host_id)
-            .map(|ts| crate::client_session::TuiSessionSnapshotPush {
-                uid: ts.uid.as_str(),
-                task_id: ts.task_id.as_deref(),
-                label: Some(ts.label.as_str()),
-                session_type: Some(ts.session_type.as_str()),
-                hidden: ts.hidden,
-                workflow_run_id: ts.workflow_run_id.as_deref(),
-                workflow_role: ts.workflow_role.as_deref(),
-            })
-            .collect();
-        // 12e-r3 F2: route through `host_pool.for_host(host_id)`.
-        // Pre-r3 used `default_handle()` exclusively — multi-
-        // host setups never propagated the TUI session
-        // snapshot to non-default daemons.
-        let daemon_socket = match self.host_pool.for_host(host_id) {
-            Ok(h) => h.socket_path().expect(
-                "socket_path returns Some after ensure_alive succeeded",
-            ),
-            Err(e) => {
-                self.host_pool
-                    .mark_push_failure(host_id, Instant::now());
-                eprintln!(
-                    "cm-tui: tui.update_sessions_snapshot to host {} \
-                     skipped: {}",
-                    host_id.as_str(),
-                    e,
-                );
-                return;
-            }
-        };
-        match crate::client_session::rpc_tui_update_sessions_snapshot(
-            &daemon_socket,
-            crate::daemon_launch::operator_token(),
-            &sessions,
-        ) {
-            Ok(()) => {
-                self.host_pool.mark_push_success(host_id);
-            }
-            Err(e) => {
-                self.host_pool
-                    .mark_push_failure(host_id, Instant::now());
-                eprintln!(
-                    "cm-tui: tui.update_sessions_snapshot to host {} failed: {} \
-                     (that daemon's TUI-session view will lag until the next push)",
-                    host_id.as_str(),
-                    e,
-                );
+        // Filter out daemon-attached sessions (`daemon_session_uid.is_some()`):
+        // those already live in `state.sessions` on the daemon and would
+        // double-register if we also pushed them to `state.tui_sessions`.
+        // Bucket each remaining session by its pinned `host_id` so each
+        // daemon only hears about sessions it actually owns (12e-r8 F2).
+        for w in &self.workspaces {
+            for ts in &w.sessions {
+                if ts.session.daemon_session_uid.is_some() {
+                    continue;
+                }
+                if let Some(bucket) = per_host.get_mut(&ts.host_id) {
+                    bucket.push(crate::push_worker::TuiSessionRow {
+                        uid: ts.uid.clone(),
+                        task_id: ts.task_id.clone(),
+                        label: Some(ts.label.clone()),
+                        session_type: Some(ts.session_type.clone()),
+                        hidden: ts.hidden,
+                        workflow_run_id: ts.workflow_run_id.clone(),
+                        workflow_role: ts.workflow_role.clone(),
+                    });
+                }
             }
         }
+        self.push_worker.push_tui_sessions(per_host);
     }
 
     /// 10d-1: unified state-snapshot push. Sites that mutate
@@ -8656,69 +8619,21 @@ impl App {
     /// Workflow definitions are static after launch, so a single
     /// startup push is sufficient; the upcoming 2c-2-2 daemon
     /// driver reads from `DaemonState.workflow_definitions`.
+    /// Clone the in-memory workflow-definitions map and hand off
+    /// to the background `push_worker`. Static after TOML load;
+    /// the worker's dedup will short-circuit re-pushes after the
+    /// startup propagation.
     pub(crate) fn push_workflow_definitions_to_daemon(&self) {
-        for host in &self.hosts.hosts {
-            self.push_workflow_definitions_to_host(&host.id);
-        }
+        let hosts: Vec<cm_daemon::host_id::HostId> =
+            self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
+        self.push_worker.push_workflow_defs(self.workflows.clone(), hosts);
     }
 
-    fn push_workflow_definitions_to_host(
-        &self,
-        host_id: &cm_daemon::host_id::HostId,
-    ) {
-        // 12e-perf: skip the dial if the host is in backoff.
-        if self
-            .host_pool
-            .should_skip_for_push(host_id, Instant::now())
-        {
-            return;
-        }
-        // 12e-r3 F2: per-host. Pre-r3 only the default host
-        // received workflow definitions — non-default daemons
-        // had an empty `workflow_definitions` map and their
-        // workflow driver was uninitialized.
-        let daemon_socket = match self.host_pool.for_host(host_id) {
-            Ok(h) => h.socket_path().expect(
-                "socket_path returns Some after ensure_alive succeeded",
-            ),
-            Err(e) => {
-                self.host_pool
-                    .mark_push_failure(host_id, Instant::now());
-                eprintln!(
-                    "cm-tui: workflow.update_definitions to host {} \
-                     skipped: {}",
-                    host_id.as_str(),
-                    e,
-                );
-                return;
-            }
-        };
-        match crate::client_session::rpc_workflow_update_definitions(
-            &daemon_socket,
-            crate::daemon_launch::operator_token(),
-            &self.workflows,
-        ) {
-            Ok(()) => {
-                self.host_pool.mark_push_success(host_id);
-            }
-            Err(e) => {
-                self.host_pool
-                    .mark_push_failure(host_id, Instant::now());
-                eprintln!(
-                    "cm-tui: workflow.update_definitions to host {} failed: {}",
-                    host_id.as_str(),
-                    e,
-                );
-            }
-        }
-    }
-
+    /// Build owned task-tree + workspaces vecs and hand off to
+    /// the background `push_worker`. Was the main source of the
+    /// 5s-tick lag spike (reconcile_tasks fires this on every
+    /// `TasksUpdated` event); now non-blocking on the main thread.
     pub(crate) fn push_task_tree_to_daemon(&self) {
-        // 12e-r3 F2: fanout to every configured host. Pre-r3
-        // only the default host got the task tree — agents on
-        // non-default host daemons would fail
-        // `mcp_start_session(task_id=...)` with "task_id not
-        // in tree" because that daemon never saw the tree.
         let tasks: Vec<(String, Option<String>, Option<String>)> = self
             .tasks
             .iter()
@@ -8740,58 +8655,9 @@ impl App {
                 )
             })
             .collect();
-        for host in &self.hosts.hosts {
-            self.push_task_tree_to_host(&host.id, &tasks, &workspaces);
-        }
-    }
-
-    fn push_task_tree_to_host(
-        &self,
-        host_id: &cm_daemon::host_id::HostId,
-        tasks: &[(String, Option<String>, Option<String>)],
-        workspaces: &[(String, Option<String>)],
-    ) {
-        // 12e-perf: skip the dial if the host is in backoff.
-        if self
-            .host_pool
-            .should_skip_for_push(host_id, Instant::now())
-        {
-            return;
-        }
-        let daemon_socket = match self.host_pool.for_host(host_id) {
-            Ok(h) => h.socket_path().expect(
-                "socket_path returns Some after ensure_alive succeeded",
-            ),
-            Err(e) => {
-                self.host_pool
-                    .mark_push_failure(host_id, Instant::now());
-                eprintln!(
-                    "cm-tui: task.update_tree to host {} skipped: {}",
-                    host_id.as_str(),
-                    e,
-                );
-                return;
-            }
-        };
-        match crate::client_session::rpc_task_update_tree(
-            &daemon_socket,
-            crate::daemon_launch::operator_token(),
-            tasks,
-            workspaces,
-        ) {
-            Ok(()) => {
-                self.host_pool.mark_push_success(host_id);
-            }
-            Err(e) => {
-                self.host_pool
-                    .mark_push_failure(host_id, Instant::now());
-                eprintln!(
-                    "cm-tui: task.update_tree to host {} failed: {}",
-                    host_id.as_str(),
-                    e,
-                );
-            }
-        }
+        let hosts: Vec<cm_daemon::host_id::HostId> =
+            self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
+        self.push_worker.push_task_tree(tasks, workspaces, hosts);
     }
 
     /// Bulk session removal that preserves the tombstone invariant.
@@ -10606,7 +10472,7 @@ impl App {
 
     // ── Drawing ──────────────────────────────────────────────────────
 
-    pub fn draw(&self, frame: &mut Frame) {
+    pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
         // Phase 6: bottom layout — content / [activity strip] / status bar.
@@ -10642,7 +10508,23 @@ impl App {
         // user sees artifacts in the gaps after switching views/panels (the
         // status bar is fully painted by draw_status_bar so it doesn't need
         // clearing here).
-        frame.render_widget(Clear, content_area);
+        // Clear-on-transition: only wipe the content area when a
+        // layout-changing event happened (view switch, input
+        // dialog open/close). Steady-state draws skip Clear and
+        // let ratatui's incremental diff handle redraw — which
+        // was the dominant cost pre-fix (Clear forced every cell
+        // changed → ratatui flushed the entire screen as ANSI
+        // escapes on every frame, ~200-400ms per draw).
+        let cur_input_disc = std::mem::discriminant(&self.input_mode);
+        let layout_changed = self.last_drawn_view_mode.as_ref() != Some(&self.view_mode)
+            || self.last_drawn_input_disc != Some(cur_input_disc);
+        if layout_changed {
+            let t = std::time::Instant::now();
+            frame.render_widget(Clear, content_area);
+            log_draw_section("clear", t.elapsed());
+        }
+        self.last_drawn_view_mode = Some(self.view_mode.clone());
+        self.last_drawn_input_disc = Some(cur_input_disc);
 
         match self.view_mode {
             ViewMode::Sessions => {
@@ -10650,18 +10532,29 @@ impl App {
                     Layout::horizontal([Constraint::Min(40), Constraint::Length(SIDEBAR_WIDTH)])
                         .split(content_area);
 
+                let t = std::time::Instant::now();
                 self.draw_terminal(frame, cols[0]);
+                log_draw_section("sessions:terminal", t.elapsed());
+
+                let t = std::time::Instant::now();
                 self.draw_session_list(frame, cols[1]);
+                log_draw_section("sessions:list", t.elapsed());
             }
             ViewMode::Planning => {
+                let t = std::time::Instant::now();
                 self.planning.draw(frame, content_area);
+                log_draw_section("planning", t.elapsed());
             }
         }
 
         if let Some(act_area) = activity_area {
+            let t = std::time::Instant::now();
             self.draw_activity_feed(frame, act_area);
+            log_draw_section("activity", t.elapsed());
         }
+        let t = std::time::Instant::now();
         self.draw_status_bar(frame, bar_area);
+        log_draw_section("status", t.elapsed());
 
         // Draw input overlay if active (sessions mode only).
         if matches!(self.view_mode, ViewMode::Sessions) {
@@ -15616,6 +15509,43 @@ mod entry_matches_delivery_tests {
     }
 }
 
+/// Per-draw-section timing logger. Mirrors `main::log_slow_phase`
+/// but with a tighter 50ms threshold so sub-components of a slow
+/// `draw` phase get attributed individually (the main-loop
+/// `phase=draw` log only fires on the aggregate, which can hide
+/// a single hot widget). Same log file + format prefix so a
+/// reader can tail one file for both granularities.
+fn log_draw_section(section: &str, elapsed: std::time::Duration) {
+    const THRESHOLD: std::time::Duration = std::time::Duration::from_millis(50);
+    if elapsed < THRESHOLD {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".cm");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("slow-ticks.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(
+            f,
+            "{} phase=draw:{} elapsed_ms={}",
+            now,
+            section,
+            elapsed.as_millis(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod input_handler_tests {
     //! Per-mode handler tests. Each input mode is exercised through its
@@ -20132,10 +20062,16 @@ remote_socket = "/remote/manager.sock"
     /// daemons + intercepting wire frames, which is overkill;
     /// the filter expression is small and direct.
     #[test]
-    fn push_tui_sessions_to_host_filters_by_host_id() {
+    fn push_tui_sessions_to_daemon_buckets_by_host_id() {
+        // Post-push-worker refactor: per-host bucketing happens
+        // in `push_tui_sessions_to_daemon` when building the
+        // owned snapshot, not in a `push_tui_sessions_to_host`
+        // helper (the helper was removed). Pin the bucketing
+        // pattern so a session pinned to host X is only
+        // delivered to host X's daemon, never to the others
+        // (12e-r8 F2 invariant preserved post-async).
         let src = include_str!("app.rs");
-
-        let sig = "fn push_tui_sessions_to_host(";
+        let sig = "pub(crate) fn push_tui_sessions_to_daemon(";
         let start = src.find(sig).expect("must find sig");
         let rest = &src[start..];
         let end = rest[1..]
@@ -20145,26 +20081,19 @@ remote_socket = "/remote/manager.sock"
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
-
-        // Structural pin: filter on host_id.
         assert!(
-            body.contains(".filter(|ts| &ts.host_id == host_id)"),
-            "push_tui_sessions_to_host MUST filter the session \
-             snapshot by ts.host_id == target host (12e-r8 F2); \
-             body:\n{}",
+            body.contains("per_host.get_mut(&ts.host_id)"),
+            "push_tui_sessions_to_daemon MUST route each session \
+             into its pinned host's bucket (12e-r8 F2 — preserved \
+             post-async); body:\n{}",
             body,
         );
-
-        // Audit pin: the other two per-host helpers
-        // (`push_workflow_definitions_to_host`,
-        // `push_task_tree_to_host`) carry host-agnostic
-        // payloads (workflow TOML definitions, task tree
-        // structure) and MUST NOT have a per-host filter —
-        // pin that they don't sprout one accidentally. Look
-        // for a `.filter(|...| ts.host_id ==` shape in each.
+        // The other two pushers (task_tree, workflow_defs) carry
+        // host-agnostic payloads — pin that they don't sprout a
+        // per-host filter accidentally.
         for sig in &[
-            "fn push_workflow_definitions_to_host(",
-            "fn push_task_tree_to_host(",
+            "pub(crate) fn push_workflow_definitions_to_daemon(",
+            "pub(crate) fn push_task_tree_to_daemon(",
         ] {
             let start = src.find(sig).expect("must find sig");
             let rest = &src[start..];
@@ -20176,40 +20105,41 @@ remote_socket = "/remote/manager.sock"
                 .unwrap_or(rest.len());
             let body = &rest[..end];
             assert!(
-                !body.contains("host_id ==") && !body.contains("&ts.host_id"),
-                "{} payload is host-agnostic — MUST NOT \
-                 filter by host_id (12e-r8 F2 audit pin); \
-                 body:\n{}",
+                !body.contains("ts.host_id"),
+                "{} payload is host-agnostic — MUST NOT filter \
+                 by per-session host_id; body:\n{}",
                 sig,
                 body,
             );
         }
     }
 
-    /// 12e-r3 F2: `push_state_to_daemon` (and its three
-    /// sub-helpers) MUST fan out to every host in
-    /// `hosts.toml`, not just the default. Pre-r3 only the
-    /// default host received task tree / workflow definitions /
-    /// session snapshot; non-default-host daemons had an empty
-    /// task tree and `mcp_start_session(task_id=...)` would
-    /// fail with "task_id not in tree" for any agent spawned
-    /// on a non-default host.
+    /// 12e-r3 F2 preserved post-async: each `_to_daemon` method
+    /// MUST enumerate every host in `hosts.toml` when building
+    /// its payload (task tree / workflow defs collect a
+    /// `Vec<HostId>`; tui sessions seeds a per-host bucket map),
+    /// and MUST hand off to `self.push_worker`. The per-host
+    /// fanout itself lives in `push_worker.rs`; this test pins
+    /// the main-thread half (everyone-enumerated + worker-routed).
     #[test]
     fn push_state_fanouts_to_all_hosts() {
         let src = include_str!("app.rs");
 
-        for (sig, body_marker) in &[
+        for (sig, host_iter_marker, worker_marker) in &[
             (
                 "pub(crate) fn push_tui_sessions_to_daemon(",
                 "for host in &self.hosts.hosts",
+                "self.push_worker.push_tui_sessions",
             ),
             (
                 "pub(crate) fn push_workflow_definitions_to_daemon(",
-                "for host in &self.hosts.hosts",
+                "self.hosts.hosts.iter()",
+                "self.push_worker.push_workflow_defs",
             ),
             (
                 "pub(crate) fn push_task_tree_to_daemon(",
-                "for host in &self.hosts.hosts",
+                "self.hosts.hosts.iter()",
+                "self.push_worker.push_task_tree",
             ),
         ] {
             let start = src.find(sig).expect("must find sig");
@@ -20222,48 +20152,29 @@ remote_socket = "/remote/manager.sock"
                 .unwrap_or(rest.len());
             let body = &rest[..end];
             assert!(
-                body.contains(body_marker),
-                "{} body MUST contain `{}` (12e-r3 F2 fanout); \
-                 body:\n{}",
+                body.contains(host_iter_marker),
+                "{} body MUST enumerate `{}` to include every \
+                 host; body:\n{}",
                 sig,
-                body_marker,
+                host_iter_marker,
                 body,
             );
-        }
-
-        // Pin: per-host helpers exist + route through for_host.
-        for sig in &[
-            "fn push_tui_sessions_to_host(",
-            "fn push_workflow_definitions_to_host(",
-            "fn push_task_tree_to_host(",
-        ] {
-            let start = src.find(sig).unwrap_or_else(|| {
-                panic!("must find per-host helper `{}`", sig)
-            });
-            let rest = &src[start..];
-            let end = rest[1..]
-                .find("\n    fn ")
-                .or_else(|| rest[1..].find("\n    pub fn "))
-                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
-                .map(|i| 1 + i)
-                .unwrap_or(rest.len());
-            let body = &rest[..end];
             assert!(
-                body.contains("host_pool.for_host(host_id)"),
-                "{} must dial host_pool.for_host(host_id); \
+                body.contains(worker_marker),
+                "{} body MUST hand off to `{}` (async push \
+                 worker — keeps the main thread off network RTT); \
                  body:\n{}",
                 sig,
+                worker_marker,
                 body,
             );
         }
 
-        // No `host_pool.default_handle()` CALL sites remain
-        // in the push path (the four top-level + three
-        // sub-helpers all use `host_pool.for_host(host_id)`).
-        // The literal CALL form pins this; comments that
-        // mention `default_handle()` in passing (e.g. round-3
-        // history annotations) are excluded by checking the
-        // method-receiver shape.
+        // The push helpers in app.rs MUST NOT do their own
+        // direct RPC dialing — that's the whole point of the
+        // worker. No `rpc_*`, no `for_host(`, no
+        // `default_handle()` call sites in the push path of
+        // app.rs.
         let push_state_start = src
             .find("pub(crate) fn push_state_to_daemon(")
             .expect("must find push_state_to_daemon sig");
@@ -20275,8 +20186,17 @@ remote_socket = "/remote/manager.sock"
         assert!(
             !push_section.contains("self.host_pool.default_handle()"),
             "push helpers MUST NOT call \
-             self.host_pool.default_handle() — they fan out \
-             per-host now (12e-r3 F2)",
+             self.host_pool.default_handle() — fanout lives in \
+             the push worker (12e-r3 F2 preserved)",
+        );
+        assert!(
+            !push_section.contains("rpc_task_update_tree(")
+                && !push_section
+                    .contains("rpc_tui_update_sessions_snapshot(")
+                && !push_section
+                    .contains("rpc_workflow_update_definitions("),
+            "push helpers in app.rs MUST NOT call rpc_* directly \
+             — those run on the push_worker thread",
         );
     }
 

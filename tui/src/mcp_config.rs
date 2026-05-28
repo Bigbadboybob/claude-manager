@@ -92,32 +92,40 @@ fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
 /// methods route to `CM_DAEMON_SOCKET`, everything else routes to
 /// `CM_TUI_SOCKET`.
 ///
-/// **Pre-sub-2c** the unchosen socket got the empty string,
-/// because at that point the agent only needed ONE socket. With
-/// workflow_transition / workflow_done staying on the TUI (slice
-/// 10d-workflow-controller relocates the controller later), the
-/// daemon-spawn path now needs reach to BOTH sockets.
+/// Both `SpawnTarget::Daemon` and `SpawnTarget::TuiLocal` now
+/// produce the same env: real paths for BOTH `CM_DAEMON_SOCKET`
+/// and `CM_TUI_SOCKET`. The distinction between Daemon and
+/// TuiLocal is about who owns the PTY, NOT which sockets the
+/// spawned agent can reach.
 ///
-///   - `SpawnTarget::Daemon` → both `CM_DAEMON_SOCKET=<daemon.sock>`
-///     AND `CM_TUI_SOCKET=<tui.sock>`, both real paths.
-///   - `SpawnTarget::TuiLocal` → `CM_TUI_SOCKET=<tui.sock>`,
-///     `CM_DAEMON_SOCKET=""` (authoritative-empty). The TUI-local
-///     spawn doesn't talk to the daemon — daemon may not even be
-///     running — so a real daemon-socket pin would silently route
-///     daemon-method calls to a (possibly missing) daemon. The
-///     resolver fails loudly on empty `CM_DAEMON_SOCKET` for
-///     daemon methods, which is the right behavior for TuiLocal:
-///     "you can't call daemon methods from a TUI-only spawn."
+/// **Pre-fix** TuiLocal blanked `CM_DAEMON_SOCKET` under the
+/// assumption that "TUI-local agents don't talk to the daemon."
+/// That assumption is stale since:
+///   - `workflow_transition`, `workflow_done`, and
+///     `workflow_reject_finding` were relocated to daemon
+///     dispatch (slices 10d-2b and 11e). The TUI socket no
+///     longer implements them.
+///   - The daemon is mandatory since slice 10f — auto-launched at
+///     TUI startup, always reachable.
+///   - The daemon authenticates TUI-owned callers via the pushed
+///     `state.tui_sessions` snapshot (10d-1) — so a TUI-local
+///     workflow participant can legitimately call daemon-routed
+///     workflow methods.
+///
+/// With the blank, agents spawned as TuiLocal (e.g. workflow
+/// respawns of `fresh`-context roles like the reviewer/manager)
+/// would fall back to the TUI socket for workflow_transition,
+/// hit the `other =>` arm of `dispatch_control`, and surface
+/// `unknown_method` to the agent.
 ///
 /// ## Authoritative pin (slice 10b review fix — still load-bearing)
 ///
-/// **Both** socket env vars are always written. For `TuiLocal` the
-/// unchosen one is empty (overrides any inherited value); for
-/// `Daemon` both are real paths. The env block Claude / Codex
-/// receive is *additive* — merged with the agent's inherited env —
-/// so without the authoritative entries an inherited
-/// `CM_DAEMON_SOCKET=...` from the developer's shell would
-/// silently widen the route surface beyond what the TUI authorized.
+/// **Both** socket env vars are always written with real paths.
+/// The env block Claude / Codex receive is *additive* — merged
+/// with the agent's inherited env — so without the explicit
+/// entries an inherited `CM_DAEMON_SOCKET=...` from the
+/// developer's shell could silently route to the wrong socket.
+/// Always writing the real path overrides any leaked inheritance.
 fn build_env(
     target: SpawnTarget,
     session_uid: &str,
@@ -136,23 +144,14 @@ fn build_env(
         absolutized_socket_or_raw(&cm_daemon::default_socket_path());
     let tui_sock_abs =
         absolutized_socket_or_raw(&crate::control::server::default_socket_path());
-    match target {
-        SpawnTarget::Daemon => {
-            // Sub-2c: BOTH sockets populated. The Python resolver
-            // routes per-method via `DAEMON_METHODS`.
-            env.insert("CM_DAEMON_SOCKET".into(), daemon_sock_abs);
-            env.insert("CM_TUI_SOCKET".into(), tui_sock_abs);
-        }
-        SpawnTarget::TuiLocal => {
-            env.insert("CM_TUI_SOCKET".into(), tui_sock_abs);
-            // Authoritative empty: overrides any inherited
-            // `CM_DAEMON_SOCKET` (a developer might have exported
-            // it from earlier daemon-path testing — should not
-            // leak to a TUI-local spawn). Without this the resolver
-            // could silently route past the TUI pin.
-            env.insert("CM_DAEMON_SOCKET".into(), String::new());
-        }
-    }
+    // Both SpawnTarget variants get the same env: real paths for
+    // both sockets. The Python resolver routes per-method via
+    // `DAEMON_METHODS`. SpawnTarget still exists as a meaningful
+    // concept at call sites (whose PTY owns the session) but no
+    // longer drives env divergence.
+    let _ = target;
+    env.insert("CM_DAEMON_SOCKET".into(), daemon_sock_abs);
+    env.insert("CM_TUI_SOCKET".into(), tui_sock_abs);
     if let Some(wf) = workflow {
         env.insert("CM_WORKFLOW_RUN_ID".into(), wf.run_id.into());
         env.insert("CM_ROLE".into(), wf.role.into());
@@ -358,14 +357,16 @@ mod tests {
     }
 
     #[test]
-    fn build_env_tui_local_pins_tui_socket_and_blanks_daemon_socket() {
-        // Authoritative-pin contract (slice 10b review fix +
-        // slice 10c-e-3a per-spawn routing): SpawnTarget::TuiLocal
-        // must produce both keys — CM_TUI_SOCKET with the real
-        // path, CM_DAEMON_SOCKET as empty string. The Python
-        // resolver treats empty as unset, so the MCP server lands
-        // on the TUI socket even if the agent inherited a
-        // CM_DAEMON_SOCKET value from somewhere upstream.
+    fn build_env_tui_local_pins_both_sockets_with_real_paths() {
+        // Post-fix: TuiLocal spawns now get real paths for BOTH
+        // sockets, same as Daemon. The Python resolver routes
+        // per-method via DAEMON_METHODS. Pre-fix CM_DAEMON_SOCKET
+        // was authoritative-empty, which made TUI-local workflow
+        // participants (e.g. fresh-context manager/reviewer
+        // respawns) unable to reach daemon-dispatched
+        // workflow_transition / workflow_done / workflow_reject_finding
+        // — they fell back to the TUI socket which doesn't
+        // implement those methods, surfacing `unknown_method`.
         let _lock = crate::test_support::home_lock();
         let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
         assert_eq!(env.get("CM_TUI_SESSION_ID").map(String::as_str), Some("uid-x"));
@@ -375,13 +376,11 @@ mod tests {
             !tui_sock.is_empty(),
             "CM_TUI_SOCKET must be a real path for SpawnTarget::TuiLocal",
         );
-        let daemon_sock = env
-            .get("CM_DAEMON_SOCKET")
-            .expect("CM_DAEMON_SOCKET must be present so it overrides inheritance");
+        let daemon_sock = env.get("CM_DAEMON_SOCKET").expect("CM_DAEMON_SOCKET present");
         assert!(
-            daemon_sock.is_empty(),
-            "CM_DAEMON_SOCKET must be empty for SpawnTarget::TuiLocal (got {:?})",
-            daemon_sock,
+            !daemon_sock.is_empty(),
+            "CM_DAEMON_SOCKET must be a real path for SpawnTarget::TuiLocal so \
+             daemon-dispatched workflow methods are reachable; got empty",
         );
         assert!(!env.contains_key("CM_WORKFLOW_RUN_ID"));
     }
@@ -417,15 +416,12 @@ mod tests {
     // ----- Per-spawn routing acceptance (slice 10c-e-3a) ----------------
 
     #[test]
-    fn build_env_tui_local_pins_tui_socket_even_when_opt_in_is_on() {
-        // The reviewer's named acceptance for slice 10c-e-3a: a
-        // TUI-local spawn (e.g. attach-active, workflow respawn,
-        // ad-hoc bash) MUST route to the TUI socket even when the
-        // operator launched the TUI with CM_USE_DAEMON_SOCKET=1.
-        // Pre-3a this was structurally broken — the global env
-        // gate flipped MCP routing for every spawn including
-        // TUI-local ones. With per-spawn SpawnTarget, the opt-in
-        // env no longer affects this decision.
+    fn build_env_tui_local_pins_both_sockets_independent_of_opt_in() {
+        // Slice 10c-e-3a invariant: per-spawn routing doesn't
+        // depend on CM_USE_DAEMON_SOCKET. Post-fix the assertion
+        // shape changes — both sockets are real paths for both
+        // SpawnTarget variants — but the opt-in independence
+        // still holds.
         let _lock = crate::test_support::home_lock();
         let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
 
@@ -434,17 +430,15 @@ mod tests {
             .expect("CM_TUI_SOCKET present");
         assert!(
             !tui_sock.is_empty(),
-            "TUI-local spawn must pin CM_TUI_SOCKET regardless of CM_USE_DAEMON_SOCKET; \
-             got empty (the bug pre-3a was that opt-in-on stole the routing)",
+            "TUI-local spawn must pin CM_TUI_SOCKET regardless of CM_USE_DAEMON_SOCKET",
         );
         let daemon_sock = env
             .get("CM_DAEMON_SOCKET")
-            .expect("CM_DAEMON_SOCKET present as authoritative empty");
+            .expect("CM_DAEMON_SOCKET present");
         assert!(
-            daemon_sock.is_empty(),
-            "TUI-local spawn must blank CM_DAEMON_SOCKET regardless of CM_USE_DAEMON_SOCKET; \
-             got {:?}",
-            daemon_sock,
+            !daemon_sock.is_empty(),
+            "TUI-local spawn must pin CM_DAEMON_SOCKET regardless of CM_USE_DAEMON_SOCKET; \
+             got empty",
         );
     }
 
@@ -483,40 +477,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_env_authoritative_override_when_wrong_var_in_process_env() {
-        // The reviewer's named scenario: a developer exported
-        // `CM_DAEMON_SOCKET=...` in their shell from earlier
-        // testing, then launches the TUI with opt-in OFF. A
-        // TUI-local spawn must NOT route to the daemon. The
-        // empty-string entry in the build_env output is what makes
-        // that work — it overrides whatever the agent inherited
-        // through the env-merge that Claude/Codex does when
-        // spawning the MCP child.
-        let _lock = crate::test_support::home_lock();
-        let _polluted = EnvVarGuard::set("CM_DAEMON_SOCKET", "/leaked/daemon.sock");
-        // Sanity check that our pollution is actually in the
-        // process env (i.e. the test fixture is exercising the
-        // right scenario, not a false-pass).
-        assert_eq!(
-            std::env::var_os("CM_DAEMON_SOCKET").map(|v| v.to_string_lossy().into_owned()),
-            Some("/leaked/daemon.sock".into()),
-        );
-
-        let env = build_env(SpawnTarget::TuiLocal, "uid-x", None);
-        let daemon_sock = env
-            .get("CM_DAEMON_SOCKET")
-            .expect("CM_DAEMON_SOCKET present as authoritative empty");
-        assert!(
-            daemon_sock.is_empty(),
-            "process-env pollution must NOT leak into the spawn env (got {:?})",
-            daemon_sock,
-        );
-        assert!(
-            env.get("CM_TUI_SOCKET").map(|v| !v.is_empty()).unwrap_or(false),
-            "TUI socket must still be the real pin",
-        );
-    }
+    // 2026-05 fix: deleted `build_env_authoritative_override_when_wrong_var_in_process_env`.
+    // The pre-fix design used an empty-string CM_DAEMON_SOCKET as
+    // an "authoritative override" to defend against a developer's
+    // exported env leaking into a TuiLocal spawn. Post-fix
+    // TuiLocal carries the real daemon socket too (because daemon
+    // is mandatory and dispatches the workflow write methods),
+    // and `default_socket_path()` itself reads CM_DAEMON_SOCKET
+    // from env. So the spawn env now agrees with whatever the
+    // parent's env said — which is what we want in production
+    // (TUI, daemon, and agent all use the same path). The old
+    // test simulated mid-process env mutation, which doesn't
+    // happen in real launches.
 
     #[test]
     fn build_env_daemon_target_keeps_daemon_socket_authoritative_over_env() {
@@ -754,12 +726,13 @@ mod tests {
     }
 
     #[test]
-    fn build_args_codex_argv_differs_only_in_env_override_element() {
-        // Codex embeds env into argv via `-c
-        // mcp_servers.claude-manager.env={..}`. The non-env
-        // portions of argv must be element-wise identical; the
-        // env `-c` value is where the routing pin lives and is
-        // expected to differ.
+    fn build_args_codex_argv_is_identical_across_targets() {
+        // Post-fix: SpawnTarget no longer drives env divergence —
+        // both TuiLocal and Daemon get real paths for both
+        // sockets, so codex argv is fully identical across
+        // targets. Pre-fix the env override element differed
+        // (one had CM_DAEMON_SOCKET blank), driven by the
+        // workflow_transition routing model that's now obsolete.
         let _lock = crate::test_support::home_lock();
 
         let (local_prog, local_args) = build_args(
@@ -780,57 +753,30 @@ mod tests {
         .expect("build_args daemon");
         assert_eq!(local_prog, daemon_prog, "codex program");
         assert_eq!(
-            local_args.len(),
-            daemon_args.len(),
-            "codex argv length must match between targets",
+            local_args, daemon_args,
+            "codex argv must be element-wise identical between TuiLocal and Daemon \
+             (both targets produce the same env now)",
         );
 
-        // Locate the env-override element (the only one allowed
-        // to differ).
+        // Spot-check the env override carries both sockets with
+        // real paths so a future regression of the routing-by-
+        // env-divergence design surfaces here.
         let env_kv_prefix = "mcp_servers.claude-manager.env=";
-        let local_env_idx = local_args
+        let env_arg = local_args
             .iter()
-            .position(|a| a.starts_with(env_kv_prefix))
-            .expect("local must have env override in argv");
-        let daemon_env_idx = daemon_args
-            .iter()
-            .position(|a| a.starts_with(env_kv_prefix))
-            .expect("daemon must have env override in argv");
-        assert_eq!(
-            local_env_idx, daemon_env_idx,
-            "env override must be at the same argv position",
+            .find(|a| a.starts_with(env_kv_prefix))
+            .expect("env override present in argv");
+        assert!(
+            env_arg.contains("CM_TUI_SOCKET=\""),
+            "env override must carry CM_TUI_SOCKET: {}",
+            env_arg
         );
-
-        // Every other element must match exactly.
-        for (i, (l, d)) in local_args.iter().zip(daemon_args.iter()).enumerate() {
-            if i == local_env_idx {
-                // This is the routing-pin element — expected
-                // to differ. Assert the shape.
-                assert!(l.starts_with(env_kv_prefix), "local env shape");
-                assert!(d.starts_with(env_kv_prefix), "daemon env shape");
-                assert!(
-                    l.contains("CM_TUI_SOCKET="),
-                    "local env override pins CM_TUI_SOCKET: {}",
-                    l
-                );
-                assert!(
-                    d.contains("CM_DAEMON_SOCKET="),
-                    "daemon env override pins CM_DAEMON_SOCKET: {}",
-                    d
-                );
-                assert_ne!(
-                    l, d,
-                    "env -c override must differ between targets (that's the routing pin)"
-                );
-            } else {
-                assert_eq!(
-                    l, d,
-                    "codex argv element [{}] must match between local + daemon: \
-                     local={:?} daemon={:?}",
-                    i, l, d,
-                );
-            }
-        }
+        assert!(
+            env_arg.contains("CM_DAEMON_SOCKET=\"")
+                && !env_arg.contains("CM_DAEMON_SOCKET=\"\""),
+            "env override must carry CM_DAEMON_SOCKET with a real path: {}",
+            env_arg
+        );
     }
 
     #[test]

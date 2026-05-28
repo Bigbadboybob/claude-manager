@@ -57,7 +57,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -496,6 +496,18 @@ fn next_request_id() -> String {
 fn rpc_round_trip(daemon_socket: &Path, req: &Request) -> anyhow::Result<Response> {
     let mut stream = UnixStream::connect(daemon_socket)
         .with_context(|| format!("dial daemon socket {}", daemon_socket.display()))?;
+    // Without these the read blocks the main thread forever when the
+    // remote side stops responding — e.g. ssh-tunneled cm-manager
+    // after laptop sleep / wifi loss. The local UnixStream stays
+    // alive (local ssh holds it) but the remote daemon never
+    // replies; the 12e-perf reachability cache can't help because
+    // it only registers on a real failure.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("set rpc read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .context("set rpc write timeout")?;
     wire::write_request(&mut stream, req)
         .context("write request frame")?;
     // Best-effort half-close on the write side so the daemon's

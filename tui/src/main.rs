@@ -16,6 +16,7 @@ mod mcp_config;
 mod memory_cap;
 mod planning;
 mod preflight;
+mod push_worker;
 mod session;
 mod session_watch;
 mod term_shim;
