@@ -57,7 +57,7 @@ Decide:
 
 Before the transition/done call, you may *also* call `workflow_reject_finding(text)` 0–N times to permanently dismiss reviewer findings you've decided are not worth raising again. The rejected text is surfaced to the reviewer on every future activation so it stops re-raising the same concern round after round. Use it for recurring nits, out-of-scope paranoia, or threat models that don't match the user's situation — anything you'd otherwise have to deflect every single round. Paraphrase the finding into one concise line.
 
-Call `workflow_transition` or `workflow_done` exactly once. Do not write code yourself.
+You MUST end your turn by calling exactly one of `workflow_transition` or `workflow_done`. That tool call is the ONLY thing that advances the workflow — the manager role has no automatic hand-off. Writing your verdict as prose (e.g. "Manager verdict: STOP — goal complete") does NOT end the run: with no tool call the workflow sits idle forever, waiting on a transition that never comes. A decision is not real until the tool call lands. So in the same turn you reach a decision, make the call — never stop at narrating it. Do not write code yourself.
 """
 subsequent_activation_prompt = """Goal:
 {{ goal }}
@@ -70,7 +70,7 @@ Everything the reviewer has said this iteration:
 
 Same decision rules as before. Remember the reviewer lacks goal context — only relay essential or low-effort fixes that serve the original goal. If the worker did something well this round, acknowledge it.
 
-You may optionally call `workflow_reject_finding(text)` 0–N times before your final tool call to permanently dismiss recurring reviewer nits — the rejection lands in the reviewer's prompt next round. Then call exactly one of `workflow_transition` or `workflow_done`."""
+You may optionally call `workflow_reject_finding(text)` 0–N times before your final tool call to permanently dismiss recurring reviewer nits — the rejection lands in the reviewer's prompt next round. Then you MUST end your turn by calling exactly one of `workflow_transition` or `workflow_done`. That tool call is the ONLY thing that advances the workflow — a prose verdict alone leaves the run idling forever, waiting on a transition that never comes. Make the call in the same turn you reach the decision; never stop at narrating it."""
 
 [[transitions]]
 from = "worker"
