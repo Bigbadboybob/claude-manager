@@ -1149,13 +1149,17 @@ fn is_valid_session_type(session_type: &str) -> bool {
 /// pre-fix dispatcher's separate-lock pattern had); these
 /// methods short-circuit on the decision before extracting any
 /// per-session handle.
-/// Map an `AuthDecision` to a wire `MethodResult`. Also consults
-/// `state.tui_sessions` so a target uid missing from
-/// `state.sessions` but present in the TUI's snapshot returns a
-/// clearer "TUI-owned, can't be proxied" error instead of the
-/// generic NotFound. `state` is `Option<&DaemonState>` so callers
-/// that genuinely have no state to consult (currently none) can
-/// pass `None`.
+/// Map an `AuthDecision` to a wire `MethodResult`.
+///
+/// migrate-tui-local: pre-migrate this consulted
+/// `state.tui_sessions` to surface a distinct "TUI-owned, can't
+/// be proxied" Conflict for callers targeting a TUI-spawned
+/// session. The migration moves every spawn site to the daemon
+/// (workflow respawn, manifest restore, A-l resume, etc.), so
+/// no production session is "TUI-owned" anymore — the branch is
+/// unreachable. The `state` parameter is kept (Option) to
+/// preserve the call shape; callers may pass `None` if they
+/// don't have state at hand.
 fn return_auth_error_if_denied_with_state(
     decision: crate::control::auth::AuthDecision,
     caller_uid: &str,
@@ -1163,6 +1167,7 @@ fn return_auth_error_if_denied_with_state(
     state: Option<&DaemonState>,
 ) -> MethodResult {
     use crate::control::auth::AuthDecision;
+    let _ = state;
     match decision {
         AuthDecision::Allow => Ok(Value::Null),
         AuthDecision::CallerNotInRegistry => Err((
@@ -1172,26 +1177,10 @@ fn return_auth_error_if_denied_with_state(
                 caller_uid
             ),
         )),
-        AuthDecision::TargetNotInRegistry => {
-            if let Some(s) = state {
-                if s.tui_sessions.contains_key(target_uid) {
-                    return Err((
-                        ErrorCode::Conflict,
-                        format!(
-                            "target session '{}' is TUI-owned; the daemon does not \
-                             proxy mutations / reads to TUI-owned sessions yet. \
-                             Route this call through the TUI socket directly, or \
-                             wait for the post-Phase-1 cross-route work to land.",
-                            target_uid
-                        ),
-                    ));
-                }
-            }
-            Err((
-                ErrorCode::NotFound,
-                format!("target session '{}' not in the daemon registry", target_uid),
-            ))
-        }
+        AuthDecision::TargetNotInRegistry => Err((
+            ErrorCode::NotFound,
+            format!("target session '{}' not in the daemon registry", target_uid),
+        )),
         AuthDecision::OutOfScope => Err((
             ErrorCode::Unauthorized,
             format!(
@@ -1571,6 +1560,23 @@ struct ListSessionsParams {
     /// surface-2 (task-subtree auth). Sub-1 accepts but ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
+    /// migrate-tui-local Issue A: when `true`, the response
+    /// omits rows backed only by `state.tui_sessions` (TUI-pushed
+    /// snapshot metadata). Only sessions actually live in
+    /// `state.sessions` (daemon-owned PTYs) appear in the array.
+    ///
+    /// Used by the TUI's manifest-restore probe so a stale
+    /// snapshot row left over from a previous TUI process doesn't
+    /// trick `spawn_restored_session` into the attach branch (the
+    /// attach RPC would then fail because there's no live PTY
+    /// behind the snapshot row, and the restored entry would be
+    /// silently dropped).
+    ///
+    /// Default `false` preserves the Python MCP tool's contract
+    /// (it expects to see TUI-owned sibling sessions in the
+    /// listing).
+    #[serde(default)]
+    daemon_owned_only: bool,
 }
 
 pub fn list_sessions(
@@ -1714,6 +1720,19 @@ pub fn list_sessions(
     // Daemon-owned takes precedence: if a uid is in BOTH maps
     // (shouldn't happen, but TUI's push filter is best-effort),
     // skip the TUI entry rather than emit duplicates.
+    //
+    // migrate-tui-local Issue A: when the caller passes
+    // `daemon_owned_only: true`, skip this loop entirely. The
+    // manifest-restore probe sets it so a stale tui_sessions row
+    // (e.g. from a previous TUI process) can't trick the restore
+    // into attaching to a UID with no live PTY behind it.
+    if p.daemon_owned_only {
+        // Stable sort + return — same shape as the no-skip path.
+        sessions.sort_by(|a, b| {
+            a["session_uid"].as_str().unwrap_or("").cmp(b["session_uid"].as_str().unwrap_or(""))
+        });
+        return Ok(Value::Array(sessions));
+    }
     for (uid, snap) in state.tui_sessions.iter() {
         if state.sessions.contains_key(uid) {
             continue;

@@ -19,6 +19,12 @@ mod cursor;
 mod tests;
 
 pub use claude_code::ClaudeCodeAgent;
+// migrate-tui-local Issue 3: re-export the deterministic path
+// resolver so resume/restore call sites can compute the
+// transcript path BEFORE spawn (the daemon's `transcript_path`
+// session-registration field then resolves immediately, sparing
+// MCP `read_session_output` callers a `pending` round-trip).
+pub(crate) use claude_code::claude_transcript_path;
 pub use codex::CodexAgent;
 pub use cursor::Cursor;
 #[allow(unused_imports)]

@@ -406,6 +406,23 @@ impl<'a> WorkflowControllerCtx<'a> {
         workflow_name: &str,
         slots: Vec<WorkflowSlotChoice>,
         goal: Option<String>,
+        // migrate-tui-local Issue G: the LAUNCHING task_id —
+        // passed by `start_workflow_run` when the workflow is
+        // launched from a tasked context (the MCP `start_workflow`
+        // tool or a planning `A-f` on a bound task). Fresh
+        // workflow participants spawned in this run inherit this
+        // value so the daemon's `DaemonSession.task_id` is
+        // recorded at spawn time — without it the descendant-
+        // scope auth check rejects the launching agent's
+        // subsequent `list_sessions` / `read_session_output` /
+        // `send_input` / `workflow_transition` calls against the
+        // freshly-spawned participants.
+        //
+        // `None` when the workflow is launched from a workspace-
+        // scope context (UI `A-f` on an unbound workspace);
+        // participants then keep the pre-migration "workspace-
+        // level" semantics.
+        launching_task_id: Option<String>,
     ) -> Vec<WorkflowAction> {
         let mut actions: Vec<WorkflowAction> = Vec::new();
         let Some(wf) = self.workflows.get(workflow_name).cloned() else {
@@ -458,15 +475,26 @@ impl<'a> WorkflowControllerCtx<'a> {
         // Inherit task_id from the first existing session in a slot so new
         // workflow participants sit under the same task subheader in the
         // sidebar. If all slots are fresh, participants are workspace-level.
-        let inherit_task_id: Option<String> = slots.iter().find_map(|slot| {
-            if let WorkflowSlotSource::Existing(si) = slot.source() {
-                self.workspaces[ws_index]
-                    .sessions
-                    .get(*si)
-                    .and_then(|ts| ts.task_id.clone())
-            } else {
-                None
-            }
+        //
+        // migrate-tui-local Issue G: `launching_task_id` (passed
+        // by tasked launchers — `start_workflow_run` from MCP or
+        // a tasked A-f) takes precedence over the existing-slot
+        // inheritance. Pre-fix the spawn helper received `None`
+        // for all-fresh runs and the daemon recorded
+        // `DaemonSession.task_id = None`, so the launching
+        // agent's subsequent management calls failed descendant
+        // auth. Order: launching → inherit → None.
+        let inherit_task_id: Option<String> = launching_task_id.clone().or_else(|| {
+            slots.iter().find_map(|slot| {
+                if let WorkflowSlotSource::Existing(si) = slot.source() {
+                    self.workspaces[ws_index]
+                        .sessions
+                        .get(*si)
+                        .and_then(|ts| ts.task_id.clone())
+                } else {
+                    None
+                }
+            })
         });
 
         // Spawn / bind sessions for each slot and build role_sessions.
@@ -514,6 +542,13 @@ impl<'a> WorkflowControllerCtx<'a> {
                     // try to detect it NOW (newest JSONL heuristic) so the
                     // baseline below is computed from the actual transcript.
                     let worktree_for_detect = self.workspaces[ws_index].worktree_path.clone();
+                    // migrate-tui-local: snapshot workspace_id while
+                    // we still have immut access — needed by the
+                    // daemon-routed respawn below, which can't take
+                    // workspace_id via &self.workspaces while a
+                    // mutable borrow on `ts` is live.
+                    let workspace_id_for_respawn =
+                        self.workspaces[ws_index].id.clone();
                     let (cols, rows) = self.last_term_size;
                     let ts = match self.workspaces[ws_index].sessions.get_mut(*si) {
                         Some(s) => s,
@@ -610,8 +645,8 @@ impl<'a> WorkflowControllerCtx<'a> {
                             rows,
                             self.config,
                             self.cap_status,
-                            self.kill_tx,
                             self.host_pool,
+                            &workspace_id_for_respawn,
                         )
                     } else {
                         None
@@ -637,15 +672,20 @@ impl<'a> WorkflowControllerCtx<'a> {
                         &run_id,
                         inherit_task_id.clone(),
                     ) {
-                        // Round-5 F1: spawn_workflow_session
-                        // returns (label, sid). Workflow respawns
-                        // are TUI-local in Phase 1 (see the
-                        // method's "SpawnTarget::TuiLocal" comment),
-                        // so daemon_session_uid is always None
-                        // for this branch. When workflows
-                        // eventually relocate to daemon-spawn,
-                        // this becomes Some(uid).
-                        Some((label, sid)) => (label, sid, engine.clone(), None),
+                        // migrate-tui-local: spawn_workflow_session
+                        // now routes through the daemon RPC, so the
+                        // newly-spawned participant is daemon-owned
+                        // (its TerminalSession.session carries a
+                        // Some daemon_session_uid). Look it up off
+                        // the pushed session at the end of the
+                        // workspaces vec.
+                        Some((label, sid)) => {
+                            let daemon_uid = self.workspaces[ws_index]
+                                .sessions
+                                .last()
+                                .and_then(|s| s.session.daemon_session_uid.clone());
+                            (label, sid, engine.clone(), daemon_uid)
+                        }
                         None => {
                             actions.push(WorkflowAction::SetStatusMsg(format!(
                                 "Failed to spawn {}",
@@ -795,114 +835,79 @@ impl<'a> WorkflowControllerCtx<'a> {
         run_id: &str,
         task_id: Option<String>,
     ) -> Option<(String, Option<String>)> {
-        // 12e-r4 F1.3 (interim fail-fast): A-f workflow launch
-        // on a non-local active_host requires routing the
-        // fresh-slot spawn through `try_spawn_via_daemon` so
-        // the daemon-on-active_host owns the PTY child and
-        // the `host_id` tag matches reality. That plumbing
-        // would be >100 LOC of controller-side daemon-spawn
-        // wiring (the controller doesn't have the App's
-        // `&mut self`), so the reviewer-accepted interim is
-        // to FAIL the spawn with a clear error message. Pre-
-        // round-4 we silently spawned LOCAL and tagged the
-        // session with `active_host` — every downstream
-        // per-session RPC (kill, transcript push, workflow
-        // context push) then fired against the wrong daemon.
-        //
-        // Real fix (deferred): controller's `spawn_workflow_session`
-        // calls `try_spawn_via_daemon` (or its equivalent for
-        // the controller context) and tags based on the
-        // actual spawn site.
-        if self.active_host != cm_daemon::host_id::HostId::local() {
-            log_tick(
-                run_id,
-                &format!(
-                    "A-f workflow launch on non-local active_host \
-                     `{}` is not yet supported — controller-side \
-                     daemon-spawn wiring is deferred. Switch \
-                     active_host to `local` (A-H) before launching \
-                     the workflow, or wait for the follow-up slice \
-                     that adds the daemon-spawn plumbing to the \
-                     controller path.",
-                    self.active_host.as_str(),
-                ),
-            );
+        // migrate-tui-local Issue C: the controller hands the
+        // shared daemon-spawn helper a local-filesystem
+        // worktree + per-session MCP config under
+        // `~/.cm/mcp/...` (the build_args side effect). A non-
+        // local active host would route those at a daemon that
+        // can't read them. Use the same `guard_local_host_only`
+        // helper every other entry point uses — no hand-rolled
+        // fail-fast. The pre-migration 12e-r4 F1.3 interim was
+        // a one-off check; replacing it with the canonical
+        // helper keeps the surface consistent across A-n /
+        // A-s / A-l / A-O / A-a / A-f.
+        if let Err(e) = crate::app::guard_local_host_only(
+            &self.active_host,
+            "A-f workflow-session spawn",
+        ) {
+            log_tick(run_id, &format!("{}", e));
             return None;
         }
         let worktree_path = self.workspaces[ws_index].worktree_path.clone()?;
+        let workspace_id = self.workspaces[ws_index].id.clone();
         let (cols, rows) = self.last_term_size;
         // Generate the uid first so the MCP config bakes the same value
         // the TerminalSession ends up holding.
         let session_uid = new_session_uid();
-        let workflow_meta = crate::mcp_config::WorkflowMeta {
-            run_id,
-            role: role_name,
-        };
-        // Phase 2 (slice 10d-2b) relocated `workflow_transition` /
-        // `workflow_done` to daemon dispatch; 11e added
-        // `workflow_reject_finding`. The TUI's MCP socket no longer
-        // handles any of them. A workflow participant spawned with
-        // `SpawnTarget::TuiLocal` gets `CM_DAEMON_SOCKET=""`, so the
-        // Python resolver routes daemon-listed methods through to
-        // the TUI socket — which returns `unknown_method` since the
-        // handlers moved. Caught by the Phase 2 A_smoke gate when
-        // the manager couldn't call `workflow_done`. Spawning as
-        // `SpawnTarget::Daemon` populates both sockets; the Python
-        // resolver then routes workflow_* methods to the daemon
-        // (per `DAEMON_METHODS`) where the post-Phase-2 handlers
-        // live, and non-workflow methods continue to reach the TUI.
-        let (program, args) = match crate::mcp_config::build_args(
-            crate::mcp_config::SpawnTarget::Daemon,
-            engine,
-            &session_uid,
-            Some(workflow_meta),
-            None,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                // The caller will surface a generic "Failed to spawn"
-                // status; the more specific args-build error is logged
-                // here so it's visible in the workflow log.
-                log_tick(run_id, &format!("spawn args: {}", e));
-                return None;
-            }
-        };
+        let session_type_str = engine.as_session_type().to_string();
         let pending = Some(match engine {
             Engine::ClaudeCode => App::list_jsonl_files(&worktree_path),
             Engine::Codex => App::list_codex_sessions(&worktree_path),
         });
-        let session_type = engine.as_session_type().to_string();
-        // 12e-r4 F1.3: at this point `self.active_host ==
-        // HostId::local()` (verified at function top), so the
-        // local-PTY spawn below is the truthful path. The
-        // `host_pool.for_host(&self.active_host)` call still
-        // runs as a sanity probe — it surfaces a startup-time
-        // local-daemon issue (unlikely but cheap to detect).
-        if let Err(e) = self.host_pool.for_host(&self.active_host) {
-            log_tick(
-                run_id,
-                &format!(
-                    "host_pool.for_host(&active_host {}): {} — \
-                     proceeding with local PTY spawn anyway",
-                    self.active_host.as_str(),
-                    e,
-                ),
-            );
-        }
-        let sess = crate::session::spawn_agent_session(
-            &session_type,
-            &session_uid,
-            &program,
-            &args,
-            cols,
-            rows,
-            Some(worktree_path.clone()),
-            Default::default(),
+        // migrate-tui-local: route the fresh-context workflow
+        // participant spawn through the daemon RPC so the new
+        // session lands in `state.sessions` with workflow context
+        // (run_id + role) recorded at spawn time. Pre-migrate this
+        // called `spawn_agent_session` (local PTY) and only
+        // worked when active_host was local; the migration removes
+        // the local-PTY path entirely.
+        let sess = match crate::app::try_spawn_via_daemon_with_deps(
+            self.host_pool,
             self.config,
             self.cap_status,
-            self.kill_tx,
-        )
-        .ok()?;
+            &session_uid,
+            &workspace_id,
+            &worktree_path,
+            &session_type_str,
+            role_name,
+            None,
+            cols,
+            rows,
+            task_id.as_deref(),
+            Some(run_id),
+            Some(role_name),
+            &self.active_host,
+            // Fresh workflow participant — post-spawn detector
+            // discovers the transcript path.
+            None,
+        ) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                log_tick(run_id, &format!("spawn (daemon): {}", e));
+                return None;
+            }
+            None => {
+                log_tick(
+                    run_id,
+                    &format!(
+                        "spawn (daemon) returned None for engine {:?}",
+                        engine
+                    ),
+                );
+                return None;
+            }
+        };
+        let session_type = session_type_str;
         let label = role_name.to_string();
         let ts = TerminalSession {
             uid: session_uid,
@@ -933,18 +938,16 @@ impl<'a> WorkflowControllerCtx<'a> {
             managed_by_uid: None,
             seeded_from_snapshot: None,
             preserved_last_exit: None,
-            // 12e-r4 F1.3: the local-only invariant at the
-            // top of this function means `active_host ==
-            // HostId::local()` here. Use `HostId::local()`
-            // directly (rather than `self.active_host.clone()`)
-            // so the tag is a truthful signal — pre-r4 we'd
-            // tagged with active_host even when the spawn was
-            // local, producing the "tagged remote but running
-            // locally" bug. The follow-up slice that adds
-            // daemon-spawn plumbing should swap this back to
-            // the active_host snapshot once the spawn actually
-            // routes through that host.
-            host_id: cm_daemon::host_id::HostId::local(),
+            // migrate-tui-local: the daemon spawn above routed to
+            // `self.active_host`, so tag the TerminalSession with
+            // the same value. The local-only fail-fast at the top
+            // of this function still gates A-f on non-local
+            // active_host pending downstream changes (kill /
+            // transcript push / workflow-context push are
+            // host-aware via the host_pool); once those are
+            // verified end-to-end for remote hosts the gate can
+            // relax.
+            host_id: self.active_host.clone(),
         };
         self.workspaces[ws_index].sessions.push(ts);
         Some((label, None))
@@ -5125,6 +5128,7 @@ mod tests {
                     "feedback",
                     launch_test_slots(),
                     Some(goal.to_string()),
+                    None,
                 );
             }
             assert_eq!(runs.len(), 1, "launch should push exactly one run");
@@ -5189,7 +5193,7 @@ mod tests {
                     host_pool: &dummy.host_pool,
                     active_host: cm_daemon::host_id::HostId::local(),
                 };
-                ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
+                ctx.launch_workflow(0, "feedback", launch_test_slots(), None, None)
             };
 
             assert_eq!(runs.len(), 1, "exactly one run pushed");
@@ -5290,7 +5294,7 @@ mod tests {
                     host_pool: &dummy.host_pool,
                     active_host: cm_daemon::host_id::HostId::local(),
                 };
-                let _ = ctx.launch_workflow(0, "feedback", launch_test_slots(), None);
+                let _ = ctx.launch_workflow(0, "feedback", launch_test_slots(), None, None);
             }
 
             let worker = &workspaces[0].sessions[0];
@@ -5343,7 +5347,7 @@ mod tests {
                     host_pool: &dummy.host_pool,
                     active_host: cm_daemon::host_id::HostId::local(),
                 };
-                ctx.launch_workflow(0, "feedback", launch_test_slots(), None)
+                ctx.launch_workflow(0, "feedback", launch_test_slots(), None, None)
             };
 
             // Every slot session got tagged into the new run AND

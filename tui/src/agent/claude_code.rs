@@ -83,7 +83,7 @@ impl Agent for ClaudeCodeAgent {
 /// Mirrors the encoding used by `workflow::transcript::claude_transcript_path`
 /// (which is `pub(crate)` only inside the workflow module — duplicated here
 /// to avoid coupling agent → workflow internals).
-pub(super) fn claude_transcript_path(
+pub(crate) fn claude_transcript_path(
     worktree_path: &Path,
     transcript_id: &str,
 ) -> Option<PathBuf> {
