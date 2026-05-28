@@ -315,6 +315,36 @@ impl ClientSession {
         }
     }
 
+    /// migrate-tui-local Issue 1: re-attach to an ALREADY-LIVE
+    /// daemon-side session (skip `start_session`). Used by the
+    /// manifest-restore path when the TUI restarts but the daemon
+    /// + its PTY children survive — pre-fix the restore tried to
+    /// `start_session` the same UID, got `Conflict` from the
+    /// daemon's collision guard, and lost the session.
+    ///
+    /// The caller has already established (via `rpc_list_sessions`
+    /// or equivalent) that `config.uid` matches a live entry in
+    /// the daemon's registry. We trust that and go straight to
+    /// step 2 (`session.attach`) + step 3 (`attach.open`).
+    ///
+    /// On failure (e.g. the session exited between the probe and
+    /// the attach), the daemon-side child is NOT touched — we
+    /// don't own it. The pre-fix `new()` cleanup arm only fires
+    /// on `start_session`-driven failures.
+    pub fn attach_existing(config: ClientSessionConfig) -> anyhow::Result<Self> {
+        // Step 1 skipped: the daemon already has the session.
+        // The wire shape for steps 2–6 is identical to `new()`
+        // — `build_after_start` only consumes
+        // `start_result.session_uid` + `start_result.cgroup_path`
+        // (which is `None` for re-attach since the daemon's
+        // existing session already owns the scope).
+        let synthetic_start = StartSessionResult {
+            session_uid: config.uid.to_string(),
+            cgroup_path: None,
+        };
+        Self::build_after_start(&config, &synthetic_start)
+    }
+
     /// Steps 2–6 of the dance. Factored out so the outer `new`
     /// can wrap the entire result in one cleanup arm.
     fn build_after_start(
@@ -730,6 +760,51 @@ pub fn rpc_kill_session(
         params: serde_json::json!({ "session_uid": session_uid }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// migrate-tui-local Issue 1: enumerate the daemon's currently
+/// known session UIDs. The manifest-restore path uses this on TUI
+/// startup to distinguish "daemon already has this session"
+/// (attach) from "daemon doesn't know about it, must spawn"
+/// (start_session).
+///
+/// migrate-tui-local Issue A: passes `daemon_owned_only: true`
+/// so the response excludes UIDs that only exist in
+/// `state.tui_sessions` (stale TUI-pushed snapshot rows from a
+/// previous TUI process). Without the filter the probe would
+/// treat snapshot rows as attachable; `session.attach` would
+/// then fail (no live PTY behind a snapshot row) and the
+/// restore would silently drop the manifest entry.
+///
+/// Operator-only on the daemon side. Returns the set of
+/// daemon-owned session UIDs. Empty set on RPC error (treated as
+/// "daemon doesn't know about anything"; the caller then falls
+/// back to the start_session path which is the pre-fix
+/// behavior).
+pub fn rpc_list_session_uids(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "list_sessions".into(),
+        params: serde_json::json!({ "daemon_owned_only": true }),
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp
+        .result
+        .context("list_sessions response missing result")?;
+    let arr = result
+        .as_array()
+        .context("list_sessions result not an array")?;
+    let mut out = std::collections::HashSet::with_capacity(arr.len());
+    for entry in arr {
+        if let Some(uid) = entry.get("session_uid").and_then(|v| v.as_str()) {
+            out.insert(uid.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// `session.set_transcript_path` RPC. Sub-2b-1 review #1: the

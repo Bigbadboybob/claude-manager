@@ -259,6 +259,35 @@ impl Session {
     /// owns memory-cap enforcement for daemon-attached sessions (a
     /// 10c-d concern); the TUI's `spawn_agent_session` watcher
     /// path is not exercised here.
+    /// migrate-tui-local Issue 1: re-attach to an ALREADY-LIVE
+    /// daemon-side session WITHOUT calling `start_session`.
+    /// Manifest restore on TUI startup uses this when the daemon
+    /// survived but the TUI is fresh — pre-fix the restore called
+    /// `start_session` against an existing UID and the daemon's
+    /// collision guard returned Conflict, dropping the session
+    /// from `ws.sessions`. The caller has already established
+    /// (e.g. via `rpc_list_session_uids`) that the UID is live.
+    pub fn new_attached_existing(
+        config: crate::client_session::ClientSessionConfig,
+    ) -> anyhow::Result<Self> {
+        let title_label = config.label.to_string();
+        let cs = crate::client_session::ClientSession::attach_existing(config)?;
+        let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
+        Ok(Session {
+            term: cs.term,
+            sender: cs.sender,
+            pty_writer: None,
+            event_rx: cs.event_rx,
+            title: format!("{} (daemon:{})", title_label, cs.session_uid),
+            exited: false,
+            wakeup_times: Vec::new(),
+            memory_cap: None,
+            cgroup_path,
+            daemon_session_uid: Some(cs.session_uid),
+            daemon_memory_cap_kill: Some(cs.memory_cap_kill),
+        })
+    }
+
     pub fn new_attached(
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {

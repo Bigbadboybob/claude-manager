@@ -413,6 +413,26 @@ pub struct TaskEntry {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// migrate-tui-local Issue J: outcome of `spawn_restored_session`
+/// for a single manifest entry. The caller (`restore_sessions`)
+/// uses this to skip the Codex JSONL rebind primer on the
+/// attach path — the daemon's transcript binding survived the
+/// TUI restart, so post-restart rebind detection would be a
+/// category error (and could let an unrelated Codex rollout
+/// claim the daemon-known transcript_id during the window).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreOutcome {
+    /// `session.attach` succeeded against an already-live
+    /// daemon session. Transcript binding stays at whatever the
+    /// daemon recorded; no post-spawn detection is needed.
+    Attached,
+    /// `start_session` ran fresh — either the daemon didn't
+    /// have this UID, or the attach probe raced and the fallback
+    /// to spawn succeeded. Post-spawn detection / rebind primer
+    /// applies normally.
+    Spawned,
+}
+
 /// How a subtask's worktree relates to its parent. Default = `Inherit`
 /// per the design discussion (the common case is "go do this side thing
 /// in the same codebase").
@@ -501,6 +521,388 @@ pub(crate) fn normalize_session_type_to_internal(session_type: &str) -> &str {
         "claude-code" => "claude",
         other => other,
     }
+}
+
+/// migrate-tui-local Issue 1: attach to a daemon session whose
+/// UID the daemon already knows. This is the manifest-restore
+/// path on TUI startup: the daemon + its PTY children survive
+/// across TUI restarts, so the restore must `session.attach` /
+/// `attach.open` against the existing entry rather than
+/// `start_session` (which would return Conflict on the duplicate
+/// UID and drop the session from `ws.sessions`).
+///
+/// Returns:
+///   - `Ok(Session)` — attach succeeded; caller wraps in a
+///     TerminalSession that references the same daemon child.
+///   - `Err(e)` — attach failed (e.g. the session exited between
+///     the `list_sessions` probe and this call). Caller may
+///     either surface to the user or fall back to spawning.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_attach_via_daemon_with_deps(
+    host_pool: &crate::host_pool::HostPool,
+    session_uid: &str,
+    workspace_id: &str,
+    worktree_path: &Path,
+    session_type: &str,
+    label: &str,
+    cols: u16,
+    rows: u16,
+    task_id: Option<&str>,
+    workflow_run_id: Option<&str>,
+    workflow_role: Option<&str>,
+    host_id: &cm_daemon::host_id::HostId,
+    transcript_path: Option<&str>,
+) -> anyhow::Result<Session> {
+    let internal_session_type = normalize_session_type_to_internal(session_type);
+    let wire_session_type = match internal_session_type {
+        "claude" => "claude-code",
+        other => other,
+    };
+    let daemon_socket = host_pool
+        .for_host(host_id)
+        .map_err(|e| anyhow::anyhow!(
+            "host_pool.for_host({}) unavailable: {}",
+            host_id.as_str(),
+            e,
+        ))?
+        .socket_path()
+        .ok_or_else(|| anyhow::anyhow!(
+            "host_pool.for_host({}) has no live socket path",
+            host_id.as_str(),
+        ))?;
+    // The attach path doesn't need argv / env / memory cap
+    // fields — the daemon's existing session owns those. We
+    // still populate the ClientSessionConfig shape so the
+    // attach call has a uniform builder.
+    let argv: Vec<String> = Vec::new();
+    let env: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let cs_config = crate::client_session::ClientSessionConfig {
+        daemon_socket: &daemon_socket,
+        operator_token_id: crate::daemon_launch::operator_token(),
+        uid: session_uid,
+        workspace_id,
+        label,
+        session_type: wire_session_type,
+        argv: &argv,
+        working_dir: worktree_path,
+        env,
+        cols,
+        rows,
+        memory_cap_bytes: None,
+        memory_cap_hard_bytes: None,
+        cgroup_prefix: None,
+        cgroup_path: None,
+        worktree_path: Some(worktree_path),
+        task_id,
+        transcript_path,
+        workflow_run_id,
+        workflow_role,
+    };
+    let session = crate::session::Session::new_attached_existing(cs_config)?;
+
+    // migrate-tui-local Issue D: the `session.attach` RPC only
+    // takes `{ uid }` — the daemon doesn't read transcript_path
+    // / workflow tags from its params. The spawn branch threads
+    // those via `start_session`'s param shape, but the attach
+    // branch has to push them through the existing setter
+    // channels AFTER attach succeeds. Without these pushes the
+    // restored session stays `pending` for
+    // `resolve_authorized_session` and MCP `read_session_output`
+    // serves nothing.
+    //
+    // Conditional: only push fields the manifest carries. The
+    // daemon already has whatever values were set on the
+    // surviving session, and the setters are idempotent — a
+    // no-change push is harmless.
+    //
+    // `task_id` has no setter RPC. That's fine: the attach
+    // branch only fires when the daemon's `state.sessions` map
+    // already has this UID, which means the daemon's
+    // `task_id` field is whatever it was set to at the original
+    // `start_session` time (preserved across TUI restart since
+    // the daemon owns it).
+    let operator_token_id = crate::daemon_launch::operator_token();
+    if let Some(tp) = transcript_path {
+        if let Err(e) = crate::client_session::rpc_set_transcript_path(
+            &daemon_socket,
+            operator_token_id,
+            session_uid,
+            tp,
+        ) {
+            eprintln!(
+                "cm-tui: attach({}) set_transcript_path failed: {} \
+                 (daemon's resolve_authorized_session may stay \
+                 pending until next rebind retries)",
+                session_uid, e,
+            );
+        }
+    }
+    // migrate-tui-local Issue E: push the manifest's workflow
+    // state in BOTH directions, not just the set direction.
+    //   - (Some, Some) → set the daemon-side tags.
+    //   - (None, None) → CLEAR. `restore_sessions` runs
+    //     `untag_stale_workflow` against the manifest entry
+    //     before reaching this helper, so a manifest with
+    //     `(None, None)` is the authoritative "this session is
+    //     no longer a workflow participant" signal. Without the
+    //     clear, the daemon's `lookup_session_any` keeps
+    //     returning the old (Detached/Done) run id and
+    //     `workflow_transition` / `workflow_done` authorize
+    //     against the wrong run.
+    //   - half-tagged (Some/None or None/Some) → log + skip.
+    //     Represents a corrupted manifest entry; the daemon
+    //     rejects half-tagged pushes by contract.
+    match (workflow_run_id, workflow_role) {
+        (Some(_), Some(_)) | (None, None) => {
+            if let Err(e) = crate::client_session::rpc_set_workflow_context(
+                &daemon_socket,
+                operator_token_id,
+                session_uid,
+                workflow_run_id,
+                workflow_role,
+            ) {
+                eprintln!(
+                    "cm-tui: attach({}) set_workflow_context failed: {} \
+                     (workflow auth from this role may target the \
+                     wrong run until next push)",
+                    session_uid, e,
+                );
+            }
+        }
+        _ => {
+            eprintln!(
+                "cm-tui: attach({}) half-tagged workflow state \
+                 (run_id={:?}, role={:?}), skipping push — \
+                 daemon rejects partial workflow tuples",
+                session_uid, workflow_run_id, workflow_role,
+            );
+        }
+    }
+
+    Ok(session)
+}
+
+/// migrate-tui-local Issue 3: compute the on-disk transcript
+/// path for a session_type + transcript_id pair WITHOUT a live
+/// `TerminalSession`. Resume/restore call sites use this to
+/// thread the path into `try_spawn_via_daemon_with_deps` so the
+/// daemon's `resolve_authorized_session` resolves immediately
+/// instead of returning `pending` until the post-spawn detector
+/// pushes the path.
+///
+/// Returns `Some` only for Claude (the file is deterministic in
+/// the worktree + transcript_id). Codex's path is discovered by
+/// scanning `~/.codex/sessions/`, but on resume the new rollout
+/// id is fresh post-spawn — pre-spawn the path is unknown, so
+/// the post-spawn detector + `push_transcript_path_to_daemon_if_attached`
+/// continues to handle codex resumes.
+pub(crate) fn pre_spawn_transcript_path(
+    session_type: &str,
+    worktree_path: &Path,
+    transcript_id: &str,
+) -> Option<String> {
+    let internal = normalize_session_type_to_internal(session_type);
+    match internal {
+        "claude" => crate::agent::claude_transcript_path(worktree_path, transcript_id)
+            .map(|p| p.to_string_lossy().to_string()),
+        _ => None,
+    }
+}
+
+/// migrate-tui-local: free-function form of `App::try_spawn_via_daemon`
+/// so spawn sites that don't have `&App` (workflow respawn path,
+/// controller fresh-context respawn) can share the same daemon-
+/// routing body. `App::try_spawn_via_daemon` is now a thin
+/// wrapper around this; both forms produce identical wire
+/// behavior.
+///
+/// Returns:
+///   - `Some(Ok(Session))` — daemon spawn succeeded.
+///   - `Some(Err(e))` — daemon spawn failed; caller surfaces.
+///   - `None` — the session_type isn't daemon-eligible
+///     (post-migrate this should not happen for the three
+///     supported types `claude` / `codex` / `bash`; callers
+///     surface `None` as an internal-invariant error).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_spawn_via_daemon_with_deps(
+    host_pool: &crate::host_pool::HostPool,
+    config: &crate::config::Config,
+    memory_cap_status: &crate::memory_cap::MemoryCapAvailability,
+    session_uid: &str,
+    workspace_id: &str,
+    worktree_path: &Path,
+    session_type: &str,
+    label: &str,
+    resume_session_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+    task_id: Option<&str>,
+    workflow_run_id: Option<&str>,
+    workflow_role: Option<&str>,
+    host_id: &cm_daemon::host_id::HostId,
+    // migrate-tui-local Issue 3: pre-known transcript path for
+    // resume/restore flows. Fresh spawns pass `None` (post-spawn
+    // detector + `push_transcript_path_to_daemon_if_attached`
+    // handles them). Resume/restore callers thread the path so
+    // the daemon's `resolve_authorized_session` flips ready
+    // immediately and MCP `read_session_output` can serve.
+    transcript_path: Option<&str>,
+) -> Option<anyhow::Result<Session>> {
+    // 10f: daemon-eligibility is now driven solely by
+    // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
+    // gate sat here; with the daemon always-on it served no
+    // purpose. Map TUI session_type to engine + program
+    // builder. gcloud and other ad-hoc shells aren't daemon-
+    // eligible — fall through to local.
+    //
+    // 12e-r5 F2: normalize the wire vocabulary to the
+    // internal form ONCE at the top so every downstream
+    // consumer (argv match, wire_session_type mapping,
+    // memory_cap_for lookup) sees the same value.
+    let internal_session_type = normalize_session_type_to_internal(session_type);
+    // migrate-tui-local Issue 2: build the WorkflowMeta tuple
+    // ONCE here so `build_args` writes `CM_WORKFLOW_RUN_ID` +
+    // `CM_ROLE` into the MCP server's env block. Pre-fix the
+    // workflow tuple was constructed by the local spawn path
+    // (spawn_agent_session) but dropped on the daemon-routed
+    // shared helper — daemon stored workflow context on the
+    // session record but the spawned MCP server child saw no
+    // CM_WORKFLOW_RUN_ID env, so `workflow_transition` /
+    // `workflow_done` from inside the role failed.
+    let workflow_meta = match (workflow_run_id, workflow_role) {
+        (Some(run_id), Some(role)) => {
+            Some(crate::mcp_config::WorkflowMeta { run_id, role })
+        }
+        _ => None,
+    };
+    let argv_result = match internal_session_type {
+        "claude" => crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::Daemon,
+            &crate::workflow::toml_schema::Engine::ClaudeCode,
+            session_uid,
+            workflow_meta.clone(),
+            resume_session_id,
+        ),
+        "codex" => crate::mcp_config::build_args(
+            crate::mcp_config::SpawnTarget::Daemon,
+            &crate::workflow::toml_schema::Engine::Codex,
+            session_uid,
+            workflow_meta.clone(),
+            resume_session_id,
+        ),
+        "bash" => Ok(("/bin/bash".to_string(), Vec::new())),
+        _ => return None,
+    };
+    let (program, args) = match argv_result {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(Err(anyhow::anyhow!(
+                "build_args(SpawnTarget::Daemon) for {} failed: {}",
+                session_type,
+                e
+            )));
+        }
+    };
+
+    // Memory cap wrap (slice 10c-e-3b parity). Same resolution
+    // the local `spawn_agent_session` path uses — preflight
+    // status × per-engine config bytes. When the cap is
+    // None, `wrap_with_systemd_run` is a passthrough.
+    let memory_cap = match (
+        memory_cap_status,
+        // 12e-r5 F2: look caps up by the INTERNAL
+        // vocabulary (`"claude"` not `"claude-code"`).
+        config.memory_cap_for(internal_session_type),
+    ) {
+        (
+            crate::memory_cap::MemoryCapAvailability::Available { cgroup_prefix },
+            Some((soft_bytes, hard_bytes)),
+        ) => Some(crate::memory_cap::MemoryCap {
+            soft_bytes,
+            hard_bytes,
+            session_uid: session_uid.to_string(),
+            cgroup_prefix: cgroup_prefix.clone(),
+        }),
+        _ => None,
+    };
+    let (final_program, final_args, cgroup_path) =
+        crate::session::wrap_with_systemd_run(&program, &args, &memory_cap);
+
+    // Compose final argv as Vec<String> for the wire.
+    let mut argv = Vec::with_capacity(final_args.len() + 1);
+    argv.push(final_program);
+    argv.extend(final_args);
+
+    // Daemon-spawned child's process env. Mirrors what the
+    // local `spawn_agent_session` injects (CM_TUI_SESSION_ID
+    // is the only one — the MCP routing pin lives in the MCP
+    // config file via `build_args` above, not in the parent
+    // process env).
+    let mut env: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
+
+    // 12e-r2 F1: route through `host_pool.for_host(host_id)`,
+    // NOT `default_handle`. Pre-r2 this dialed the default
+    // daemon while the resulting `TerminalSession.host_id`
+    // was tagged `active_host` — subsequent per-session
+    // RPCs (via `host_pool.for_host(&ts.host_id)`) would
+    // hit a daemon that had no record of the UID.
+    let daemon_socket = match host_pool.for_host(host_id) {
+        Ok(h) => h.socket_path().expect(
+            "socket_path returns Some after ensure_alive succeeded",
+        ),
+        Err(e) => {
+            return Some(Err(anyhow::anyhow!(
+                "host_pool.for_host({}) unavailable: {}",
+                host_id.as_str(),
+                e,
+            )));
+        }
+    };
+    // Memory-cap wire fields. When `memory_cap` is Some, the
+    // soft byte count signals the daemon to populate
+    // `SpawnParams.kills_dir`.
+    let memory_cap_bytes = memory_cap.as_ref().map(|c| c.soft_bytes);
+    // Map TUI's session_type to the canonical wire vocabulary
+    // the daemon dispatches on ("claude-code" / "codex" /
+    // "bash"). The branches above gate to these three values.
+    let wire_session_type = match internal_session_type {
+        "claude" => "claude-code",
+        "codex" => "codex",
+        "bash" => "bash",
+        other => other,
+    };
+    let cs_config = crate::client_session::ClientSessionConfig {
+        daemon_socket: &daemon_socket,
+        operator_token_id: crate::daemon_launch::operator_token(),
+        uid: session_uid,
+        workspace_id,
+        label,
+        session_type: wire_session_type,
+        argv: &argv,
+        working_dir: worktree_path,
+        env,
+        cols,
+        rows,
+        memory_cap_bytes,
+        memory_cap_hard_bytes: memory_cap.as_ref().map(|c| c.hard_bytes),
+        cgroup_prefix: memory_cap.as_ref().map(|c| c.cgroup_prefix.as_path()),
+        cgroup_path: cgroup_path.as_deref(),
+        worktree_path: Some(worktree_path),
+        task_id,
+        // migrate-tui-local Issue 3: thread the caller-supplied
+        // transcript path so the daemon registers the session
+        // with the path already known. Resume/restore callers
+        // pass `Some(...)`; fresh spawns pass `None` and let the
+        // post-spawn detector + `push_transcript_path_to_daemon_if_attached`
+        // resolve it.
+        transcript_path,
+        workflow_run_id,
+        workflow_role,
+    };
+    Some(crate::session::Session::new_attached(cs_config))
 }
 
 /// Build a TerminalSession wrapping a freshly-spawned PTY with default state.
@@ -733,8 +1135,8 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     rows: u16,
     config: &Config,
     cap_status: &crate::memory_cap::MemoryCapAvailability,
-    kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
     host_pool: &crate::host_pool::HostPool,
+    workspace_id: &str,
 ) -> Option<String> {
     // 12e-r6 F2: fail fast on a non-local pinned host BEFORE
     // any other work. The respawn would build local mcp_config
@@ -760,7 +1162,6 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
             ));
         }
     };
-    let workflow_meta = crate::mcp_config::WorkflowMeta { run_id, role };
     // Snapshot pre-spawn transcript files so the watcher can identify the
     // new one. For Codex this matters even with `--resume` because resume
     // writes a fresh rollout id; for Claude it's only needed when we're
@@ -770,55 +1171,62 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         workflow::toml_schema::Engine::ClaudeCode => App::list_jsonl_files(wt),
         workflow::toml_schema::Engine::Codex => App::list_codex_sessions(wt),
     };
-    let (program, args) = match crate::mcp_config::build_args(
-        crate::mcp_config::SpawnTarget::TuiLocal,
-        engine,
-        &ts.uid,
-        Some(workflow_meta),
-        session_id,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return Some(format!(
-                "MCP config build failed for {}: {} — workflow MCP tools unavailable",
-                role, e
-            ));
-        }
-    };
-    let session_type = engine.as_session_type();
-    let new_sess = match crate::session::spawn_agent_session(
-        session_type,
-        &ts.uid,
-        &program,
-        &args,
-        cols,
-        rows,
-        Some(wt.to_path_buf()),
-        Default::default(),
+    // migrate-tui-local: route workflow respawn through the
+    // daemon RPC so the replacement participant lands in
+    // state.sessions (workflow context known at spawn time via
+    // workflow_run_id/workflow_role). The kill_daemon_session_if_attached
+    // call below fires FIRST so any existing daemon-side child
+    // is reaped before we start the replacement.
+    let session_type_str = engine.as_session_type();
+    App::kill_daemon_session_if_attached(host_pool, ts);
+    // migrate-tui-local Issue 3: workflow respawn with a known
+    // transcript_id (the role's current session_id) lets us
+    // hand the deterministic claude path to the daemon. For
+    // codex resumes a fresh rollout id is written post-spawn,
+    // so pre_spawn_transcript_path returns None and the post-
+    // spawn detector continues to handle that case.
+    let pre_spawn_transcript = session_id.and_then(|sid| {
+        pre_spawn_transcript_path(session_type_str, wt, sid)
+    });
+    let new_sess = match try_spawn_via_daemon_with_deps(
+        host_pool,
         config,
         cap_status,
-        kill_tx,
+        &ts.uid,
+        workspace_id,
+        wt,
+        session_type_str,
+        role,
+        session_id,
+        cols,
+        rows,
+        ts.task_id.as_deref(),
+        Some(run_id),
+        Some(role),
+        &ts.host_id,
+        pre_spawn_transcript.as_deref(),
     ) {
-        Ok(s) => s,
-        Err(e) => {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
             return Some(format!(
                 "Reload failed for {}: {} — workflow MCP tools unavailable",
                 role, e
             ));
         }
+        None => {
+            return Some(format!(
+                "Reload failed for {}: try_spawn_via_daemon returned None for \
+                 daemon-eligible engine {:?}",
+                role, engine,
+            ));
+        }
     };
-    // Swap the Session. For local-PTY sessions, dropping the old one closes
-    // its master fd which reaps the old agent process. For daemon-attached
-    // sessions, Drop is detach-only (slice 10c-e-3b-fix2) — we MUST issue an
-    // explicit kill RPC before the assignment, else the daemon's old child
-    // PTY keeps running while a new resumed agent starts in the same slot:
-    // duplicate live agents, transcript / worktree races. Same bug class as
-    // the operator A-w / workspace-teardown / task-close paths fixed in fix2
-    // and fix6 (`kill_daemon_session_if_attached` is the shared helper).
-    // Claude resumes in-place; modern Codex writes a new rollout id for
-    // `codex resume <sid>`, so keep the old sid bound until the detector
-    // sees the post-resume file and rebinds the role.
-    App::kill_daemon_session_if_attached(host_pool, ts);
+    // Swap the Session. migrate-tui-local: the explicit kill of
+    // the prior daemon-side child happened up-front (before
+    // try_spawn_via_daemon), so there's no detached-Drop window
+    // here. The structural pin
+    // (respawn_calls_kill_daemon_before_session_swap) still
+    // matches because the kill call precedes this assignment.
     ts.session = new_sess;
     if session_id.is_some() {
         ts.transcript_id = session_id.map(|s| s.to_string());
@@ -1157,6 +1565,15 @@ enum InputMode {
         focused_si: Option<usize>,
         names: Vec<String>,
         selected: usize,
+        /// migrate-tui-local Issue I: the task scope the launch
+        /// descends from, captured at A-f time from
+        /// `Cursor::Task { task_id, .. }`. Threaded through to
+        /// `LaunchWorkflow` so the controller's
+        /// `spawn_workflow_session` records the daemon-side
+        /// `DaemonSession.task_id` at spawn time. `None` for
+        /// workspace-scope launches (cursor wasn't on a task);
+        /// the existing-slot inheritance fallback still applies.
+        cursor_task_id: Option<String>,
     },
     /// Confirming launch of a workflow on a workspace.
     WorkflowLaunchConfirm {
@@ -1170,6 +1587,9 @@ enum InputMode {
         /// Optional run-level goal typed by the user. Persists on the run so
         /// templates' `{{ goal }}` expands to it across restarts.
         goal: String,
+        /// migrate-tui-local Issue I: launching task scope, see
+        /// `WorkflowPicker::cursor_task_id`.
+        cursor_task_id: Option<String>,
     },
     /// Showing a workflow run's history.
     WorkflowHistory {
@@ -1358,12 +1778,20 @@ pub(crate) enum SubmitAction {
         ws_index: usize,
         focused_si: Option<usize>,
         workflow_name: String,
+        /// migrate-tui-local Issue I: launching task scope. See
+        /// `InputMode::WorkflowPicker::cursor_task_id`.
+        cursor_task_id: Option<String>,
     },
     LaunchWorkflow {
         ws_index: usize,
         workflow_name: String,
         slots: Vec<WorkflowSlotChoice>,
         goal: Option<String>,
+        /// migrate-tui-local Issue I: launching task scope —
+        /// forwarded into `App::launch_workflow` so the daemon
+        /// records `DaemonSession.task_id` for fresh workflow
+        /// participants. `None` for workspace-scope launches.
+        cursor_task_id: Option<String>,
     },
     MarkActiveDone,
     DeleteActive,
@@ -1639,6 +2067,11 @@ pub(crate) struct WorkflowLaunchConfirmMut<'a> {
     pub slots: &'a mut Vec<WorkflowSlotChoice>,
     pub active_slot: &'a mut usize,
     pub goal: &'a mut String,
+    /// migrate-tui-local Issue I: launching task scope captured
+    /// at `open_workflow_launch` time. Forwarded into the
+    /// `LaunchWorkflow` submit action so `App::launch_workflow`
+    /// can thread it through to the daemon.
+    pub cursor_task_id: Option<&'a str>,
 }
 
 pub(crate) struct WorkflowPickerMut<'a> {
@@ -1646,6 +2079,9 @@ pub(crate) struct WorkflowPickerMut<'a> {
     pub focused_si: Option<usize>,
     pub names: &'a [String],
     pub selected: &'a mut usize,
+    /// migrate-tui-local Issue I: launching task scope. See
+    /// `WorkflowLaunchConfirmMut::cursor_task_id`.
+    pub cursor_task_id: Option<&'a str>,
 }
 
 pub(crate) fn handle_new_session(
@@ -2416,6 +2852,7 @@ pub(crate) fn handle_workflow_launch_confirm(
                 workflow_name: state.workflow_name.to_string(),
                 slots: state.slots.clone(),
                 goal: goal_opt,
+                cursor_task_id: state.cursor_task_id.map(str::to_string),
             })
         }
         KeyCode::Down | KeyCode::Tab => {
@@ -2503,6 +2940,7 @@ pub(crate) fn handle_workflow_picker(
                     ws_index: state.ws_index,
                     focused_si: state.focused_si,
                     workflow_name: wf_name,
+                    cursor_task_id: state.cursor_task_id.map(str::to_string),
                 })
             }
             None => InputOutcome::Submit(SubmitAction::None),
@@ -3131,203 +3569,34 @@ impl App {
         // set_workflow_context, push_*) routes to the daemon
         // we actually spawned against.
         host_id: &cm_daemon::host_id::HostId,
+        // migrate-tui-local Issue 3: caller-known transcript
+        // path for resume/restore flows. Fresh A-n / A-s
+        // spawns pass `None`.
+        transcript_path: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
-        // 10f: daemon-eligibility is now driven solely by
-        // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
-        // gate sat here; with the daemon always-on it served no
-        // purpose. Map TUI session_type to engine + program
-        // builder. gcloud and other ad-hoc shells aren't daemon-
-        // eligible — fall through to local.
-        //
-        // 12e-r5 F2: normalize the wire vocabulary to the
-        // internal form ONCE at the top so every downstream
-        // consumer (argv match, wire_session_type mapping,
-        // memory_cap_for lookup) sees the same value. Pre-r5
-        // we aliased `"claude-code"` in the argv + wire-type
-        // matches but the cap-lookup still used the raw
-        // `session_type`, so an MCP `start_session(type=
-        // "claude-code")` would look up the env-var
-        // `CM_SESSION_MEM_SOFT_CLAUDE-CODE` instead of
-        // `CM_SESSION_MEM_SOFT_CLAUDE` — every MCP-spawned
-        // Claude session ran uncapped even with caps
-        // configured.
-        let internal_session_type = normalize_session_type_to_internal(session_type);
-        let argv_result = match internal_session_type {
-            "claude" => crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::Daemon,
-                &crate::workflow::toml_schema::Engine::ClaudeCode,
-                session_uid,
-                None,
-                resume_session_id,
-            ),
-            "codex" => crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::Daemon,
-                &crate::workflow::toml_schema::Engine::Codex,
-                session_uid,
-                None,
-                resume_session_id,
-            ),
-            "bash" => Ok(("/bin/bash".to_string(), Vec::new())),
-            _ => return None,
-        };
-        let (program, args) = match argv_result {
-            Ok(v) => v,
-            Err(e) => {
-                return Some(Err(anyhow::anyhow!(
-                    "build_args(SpawnTarget::Daemon) for {} failed: {}",
-                    session_type,
-                    e
-                )));
-            }
-        };
-
-        // Memory cap wrap (slice 10c-e-3b parity). Same resolution
-        // the local `spawn_agent_session` path uses — preflight
-        // status × per-engine config bytes. When the cap is
-        // None, `wrap_with_systemd_run` is a passthrough.
-        let memory_cap = match (
+        // migrate-tui-local: thin wrapper around the free
+        // `try_spawn_via_daemon_with_deps` helper so workflow
+        // respawn paths (which don't have `&App`) can share the
+        // same daemon-routing body. App stays the canonical
+        // entry point for sites that already hold &self.
+        try_spawn_via_daemon_with_deps(
+            &self.host_pool,
+            &self.config,
             &self.memory_cap_status,
-            // 12e-r5 F2: look caps up by the INTERNAL
-            // vocabulary (`"claude"` not `"claude-code"`) —
-            // see comment near `internal_session_type` above.
-            self.config.memory_cap_for(internal_session_type),
-        ) {
-            (
-                crate::memory_cap::MemoryCapAvailability::Available { cgroup_prefix },
-                Some((soft_bytes, hard_bytes)),
-            ) => Some(crate::memory_cap::MemoryCap {
-                soft_bytes,
-                hard_bytes,
-                session_uid: session_uid.to_string(),
-                cgroup_prefix: cgroup_prefix.clone(),
-            }),
-            _ => None,
-        };
-        let (final_program, final_args, cgroup_path) =
-            crate::session::wrap_with_systemd_run(&program, &args, &memory_cap);
-
-        // Compose final argv as Vec<String> for the wire.
-        let mut argv = Vec::with_capacity(final_args.len() + 1);
-        argv.push(final_program);
-        argv.extend(final_args);
-
-        // Daemon-spawned child's process env. Mirrors what the
-        // local `spawn_agent_session` injects (CM_TUI_SESSION_ID
-        // is the only one — the MCP routing pin lives in the MCP
-        // config file via `build_args` above, not in the parent
-        // process env). The daemon also defensively re-pins
-        // CM_TUI_SESSION_ID on its side; sending it here makes
-        // the wire shape self-contained.
-        let mut env: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
-
-        // 12e-r2 F1: route through `host_pool.for_host(host_id)`,
-        // NOT `default_handle`. Pre-r2 this dialed the default
-        // daemon while the resulting `TerminalSession.host_id`
-        // was tagged `active_host` — subsequent per-session
-        // RPCs (via `host_pool.for_host(&ts.host_id)`) would
-        // hit a daemon that had no record of the UID.
-        let daemon_socket = match self.host_pool.for_host(host_id) {
-            Ok(h) => h.socket_path().expect(
-                "socket_path returns Some after ensure_alive succeeded",
-            ),
-            Err(e) => {
-                return Some(Err(anyhow::anyhow!(
-                    "host_pool.for_host({}) unavailable: {}",
-                    host_id.as_str(),
-                    e,
-                )));
-            }
-        };
-        // Memory-cap wire fields (slice 10c-e-3b-fix2). When
-        // `memory_cap` is Some, the soft byte count signals the
-        // daemon to populate `SpawnParams.kills_dir`, and the
-        // cgroup_path round-trips back so the TUI's `Session`
-        // sees the same predicted path the local-spawn helper
-        // produces.
-        let memory_cap_bytes = memory_cap.as_ref().map(|c| c.soft_bytes);
-        // Slice 10d-mcp-surface-1 fix #1: map TUI's session_type
-        // ("claude" / "codex" / "bash") to the canonical wire
-        // vocabulary the Python MCP tool dispatches on
-        // ("claude-code" / "codex" / "bash"). The branches above
-        // already gate to these three values; any other type
-        // would have early-returned None from this function.
-        // 12e-r5 F2: consult the normalized internal form,
-        // then map to the wire vocabulary. The Python MCP
-        // tool dispatches on the wire form (`"claude-code"`
-        // for ClaudeCode); the daemon's `start_session`
-        // serializer reads this field verbatim.
-        let wire_session_type = match internal_session_type {
-            "claude" => "claude-code",
-            "codex" => "codex",
-            "bash" => "bash",
-            // The argv match above returns None for anything
-            // else, so this arm is unreachable in production;
-            // default defensively rather than panic.
-            other => other,
-        };
-        let config = crate::client_session::ClientSessionConfig {
-            daemon_socket: &daemon_socket,
-            // Shared secret presented to the daemon's operator
-            // auth (see `cm_daemon::control::operator`). Loaded at
-            // TUI startup by `daemon_launch::load_or_create_operator_token`
-            // and persisted to `~/.cm/operator-token`; the daemon
-            // reads the same value from its `CM_OPERATOR_TOKEN`
-            // spawn env.
-            operator_token_id: crate::daemon_launch::operator_token(),
-            // Slice 10c-e-3b-fix: TUI is source of truth for uid.
-            // The same uid is already baked into the MCP config
-            // (CM_TUI_SESSION_ID env block written above by
-            // build_args). The daemon validates format + checks
-            // collision but otherwise uses this verbatim.
-            uid: session_uid,
+            session_uid,
             workspace_id,
+            worktree_path,
+            session_type,
             label,
-            session_type: wire_session_type,
-            argv: &argv,
-            working_dir: worktree_path,
-            env,
+            resume_session_id,
             cols,
             rows,
-            memory_cap_bytes,
-            // Sub-2b-3 review-fix #1: send the hard cap byte
-            // count + cgroup_prefix so the daemon can re-wrap
-            // argv for descendant `mcp_start_session` spawns
-            // and the subtask inherits the cap. Pre-fix only
-            // the soft byte count flowed.
-            memory_cap_hard_bytes: memory_cap.as_ref().map(|c| c.hard_bytes),
-            cgroup_prefix: memory_cap.as_ref().map(|c| c.cgroup_prefix.as_path()),
-            cgroup_path: cgroup_path.as_deref(),
-            // Auto-register the workspace if the daemon doesn't
-            // know about it yet (pre-10e bridge). Always pass —
-            // the daemon ignores the hint when the workspace is
-            // already registered.
-            worktree_path: Some(worktree_path),
-            // Sub-2a Finding #1: thread task_id so the daemon
-            // records it on DaemonSession.task_id. Without it,
-            // every daemon-spawned session looks taskless and
-            // tasked agents fall into the same-workspace-allow
-            // branch — re-introducing the widening sub-2a closes.
             task_id,
-            // Sub-2b-1: transcript_path is None at spawn time
-            // for fresh sessions; the TUI's existing post-spawn
-            // detector (`pending_jsonl_files`) discovers the
-            // path later. A follow-up will push it to the daemon
-            // via a `session.set_transcript_path` RPC. Until
-            // then daemon's `resolve_authorized_session` returns
-            // `pending` and the Python tool polls.
-            transcript_path: None,
-            // 10d-2c-1 review round-5 (F1): callers that spawn a
-            // workflow participant with workflow context already
-            // known pass these. A-n / A-s spawns from the regular
-            // sidebar paths pass `None`; the after-the-fact
-            // tagging path (workflow launched on this session
-            // later) uses `rpc_set_workflow_context` instead.
             workflow_run_id,
             workflow_role,
-        };
-        Some(crate::session::Session::new_attached(config))
+            host_id,
+            transcript_path,
+        )
     }
 
     /// 10e-d: idempotent cap-kill toast emission. Both the
@@ -3818,6 +4087,35 @@ impl App {
 
         let (cols, rows) = self.last_term_size;
 
+        // migrate-tui-local Issue 1: probe the local daemon's
+        // session registry ONCE before the spawn loop. Pre-fix
+        // the restore unconditionally called `start_session`
+        // against UIDs that the daemon ALREADY owned (because
+        // the daemon survives TUI restarts), and the daemon's
+        // collision guard returned Conflict — restored sessions
+        // disappeared from `ws.sessions`. Now: for each manifest
+        // entry whose UID is in this set, `spawn_restored_session`
+        // routes through `session.attach` instead of
+        // `start_session`.
+        //
+        // Probe is best-effort. RPC failure → empty set →
+        // pre-fix behavior (spawn-then-Conflict for any UIDs the
+        // daemon already had). The list_sessions call is
+        // O(daemon's session count) and runs once.
+        let live_daemon_uids: std::collections::HashSet<String> = self
+            .host_pool
+            .for_host(&cm_daemon::host_id::HostId::local())
+            .ok()
+            .and_then(|h| h.socket_path())
+            .and_then(|sock| {
+                crate::client_session::rpc_list_session_uids(
+                    &sock,
+                    crate::daemon_launch::operator_token(),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+
         // Identify worktree paths that are "covered" by a useful workspace —
         // one with sessions or referenced in bindings. We use this to drop
         // orphan-duplicate empty workspaces that accumulated from the pre-fix
@@ -3938,15 +4236,29 @@ impl App {
                     // at spawn time).
                     let cleaned = untag_stale_workflow(entry, &active_run_ids);
                     let entry_to_spawn = cleaned.as_ref().unwrap_or(entry);
-                    let ts = Self::spawn_restored_session(
+                    // migrate-tui-local Issue 1: pass the live-
+                    // daemon-UID set so the restore can attach
+                    // to surviving daemon sessions instead of
+                    // colliding on start_session.
+                    //
+                    // migrate-tui-local Issue J: the returned
+                    // `RestoreOutcome` distinguishes Attached
+                    // (daemon kept the session across restart)
+                    // from Spawned (fresh start_session). The
+                    // Codex JSONL rebind primer inside
+                    // `spawn_restored_session` consults this so
+                    // attached restores skip the rebind window
+                    // — the daemon's transcript binding is
+                    // already authoritative. `_outcome` is
+                    // pulled here so future call sites can
+                    // log/observe it; the gating itself lives
+                    // inside spawn_restored_session.
+                    if let Some((ts, _outcome)) = self.spawn_restored_session(
                         entry_to_spawn,
                         &ws,
                         (cols, rows),
-                        &self.config,
-                        &self.memory_cap_status,
-                        &self.memory_kill_tx,
-                    );
-                    if let Some(ts) = ts {
+                        &live_daemon_uids,
+                    ) {
                         ws.sessions.push(ts);
                     }
                 }
@@ -4002,16 +4314,44 @@ impl App {
         self.push_state_to_daemon();
     }
 
+
     /// Spawn a session from a ManifestEntry within a Workspace context.
     /// Extracted so both restore + manual creation paths can share it.
+    ///
+    /// migrate-tui-local: takes `&self` so the claude/codex branches
+    /// can route through `try_spawn_via_daemon` (the cloud-VM and
+    /// bash branches stay local). Pre-migrate this was a free
+    /// associated fn that took `config`/`cap_status`/`kill_tx` —
+    /// those now come from `self` for the daemon-routed branches.
+    ///
+    /// migrate-tui-local Issue 1: `live_daemon_uids` is the set of
+    /// session UIDs the daemon currently owns (probed once at the
+    /// top of `restore_sessions`). When the entry's UID is in
+    /// that set, we route through `session.attach` instead of
+    /// `start_session` — the daemon survives TUI restarts and
+    /// would otherwise return Conflict on the duplicate UID.
+    ///
+    /// migrate-tui-local Issue J: returns the outcome
+    /// (`Attached` vs `Spawned`) alongside the TerminalSession
+    /// so the Codex JSONL rebind primer can be skipped on the
+    /// attach path. The daemon's transcript binding survived the
+    /// TUI restart for attached sessions; priming
+    /// `pending_jsonl_files` for Codex during the rebind window
+    /// would otherwise let an unrelated rollout claim the binding
+    /// and overwrite the correct transcript_id.
     fn spawn_restored_session(
+        &self,
         entry: &ManifestEntry,
         ws: &Workspace,
         (cols, rows): (u16, u16),
-        config: &Config,
-        cap_status: &crate::memory_cap::MemoryCapAvailability,
-        kill_tx: &std::sync::mpsc::Sender<crate::session_watch::MemoryKillEvent>,
-    ) -> Option<TerminalSession> {
+        live_daemon_uids: &std::collections::HashSet<String>,
+    ) -> Option<(TerminalSession, RestoreOutcome)> {
+        let config = &self.config;
+        // migrate-tui-local Issue J: default is Spawned — the
+        // common case for fresh manifest entries / clean daemon
+        // restarts. The attach-success arm below upgrades to
+        // Attached.
+        let mut outcome = RestoreOutcome::Spawned;
         // 12e-r7 F1: the round-6 in-function host-guard moved
         // to the caller (`restore_sessions`) so the caller can
         // preserve the raw `ManifestEntry` in
@@ -4064,80 +4404,165 @@ impl App {
                 ),
             ];
             Session::new("gcloud", &args, cols, rows, None, Default::default(), None)
-        } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
-            let wt = ws.worktree_path.clone();
-            let engine = if entry.session_type == "codex" {
-                workflow::toml_schema::Engine::Codex
-            } else {
-                workflow::toml_schema::Engine::ClaudeCode
+        } else if matches!(entry.session_type.as_str(), "claude" | "codex" | "bash") {
+            // migrate-tui-local: route claude/codex/bash restores through
+            // the daemon RPC with `--resume <transcript_id>` plumbed
+            // as `resume_session_id`. The daemon then registers the
+            // restored session in `state.sessions` with the resumed
+            // transcript bound from spawn time. Without a worktree
+            // the daemon can't auto-register the workspace, so the
+            // restore is skipped (matches pre-migrate behavior for
+            // worktree-less manifest entries).
+            //
+            // migrate-tui-local Issue H: bash MUST join the
+            // daemon-routed branch. A-s spawns bash daemon-owned;
+            // pre-fix the restore path fell back to
+            // `Session::new("/bin/bash", ...)` and produced a
+            // local TUI-owned session — silently breaking the
+            // "every local session is daemon-owned" invariant,
+            // and (worse) duplicating a live daemon bash session
+            // under the same UID if the daemon survived the
+            // restart. Bash carries no transcript and no resume
+            // arg, so the daemon-spawn shape is the same as
+            // claude/codex except `transcript_id` /
+            // `resume_session_id` / `pre_spawn_transcript` are
+            // all None.
+            let Some(wt_path) = ws.worktree_path.as_deref() else {
+                return None;
             };
-            // Use the resolved-up-front UID so the MCP env's
-            // CM_TUI_SESSION_ID matches what the TerminalSession will hold.
             let session_uid_for_mcp = restored_uid.clone();
-            let workflow_meta = match (
-                entry.workflow_run_id.as_deref(),
-                entry.workflow_role.as_deref(),
-            ) {
-                (Some(run_id), Some(role)) => {
-                    Some(crate::mcp_config::WorkflowMeta { run_id, role })
-                }
-                _ => None,
-            };
-            match crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::TuiLocal,
-                &engine,
-                &session_uid_for_mcp,
-                workflow_meta,
-                entry.transcript_id.as_deref(),
-            ) {
-                Ok((program, args)) => crate::session::spawn_agent_session(
-                    &entry.session_type,
-                    &session_uid_for_mcp,
-                    &program,
-                    &args,
-                    cols,
-                    rows,
-                    wt,
-                    Default::default(),
-                    config,
-                    cap_status,
-                    kill_tx,
-                ),
-                Err(_) => {
-                    // Fallback: spawn without MCP. Agent loses access to
-                    // workflow + control-socket tools but the session
-                    // still runs.
-                    let program = if entry.session_type == "codex" {
-                        "codex"
-                    } else {
-                        "claude"
-                    };
-                    let mut args: Vec<String> = if entry.session_type == "codex" {
-                        vec!["--yolo".into()]
-                    } else {
-                        vec!["--dangerously-skip-permissions".into()]
-                    };
-                    if let Some(ref sid) = entry.transcript_id {
-                        if entry.session_type == "codex" {
-                            args.push("resume".into());
-                        } else {
-                            args.push("--resume".into());
-                        }
-                        args.push(sid.clone());
-                    }
-                    crate::session::spawn_agent_session(
-                        &entry.session_type,
+            // migrate-tui-local Issue 3: manifest entries with a
+            // known transcript_id can hand the deterministic
+            // claude path to the daemon up front so MCP
+            // `read_session_output` can serve the restored
+            // transcript without waiting for the post-spawn
+            // detector. Codex resumes get None — the new
+            // rollout id is fresh and only discoverable post-
+            // spawn.
+            let pre_spawn_transcript =
+                entry.transcript_id.as_deref().and_then(|sid| {
+                    pre_spawn_transcript_path(&entry.session_type, wt_path, sid)
+                });
+
+            // migrate-tui-local Issue 1: the daemon survives TUI
+            // restarts. If the daemon already has this UID, we
+            // MUST `session.attach` to the live child instead of
+            // calling `start_session` (which would Conflict and
+            // drop the session). Only call `start_session` when
+            // the daemon doesn't know the UID (clean daemon
+            // restart, fresh manifest entry, etc.).
+            //
+            // migrate-tui-local Issue F: the live-UID probe is a
+            // snapshot. The daemon's session can exit between
+            // the probe and the `session.attach` call — that
+            // race used to drop the manifest entry via the bare
+            // `result.ok()?` site below. Restructured so the
+            // attach-Err arm falls through to the spawn helper
+            // with the same args, distinct from (but symmetric
+            // with) the "UID not in live set → spawn" arm. Now
+            // the only way the entry gets dropped is a genuine
+            // spawn failure or a misconfigured non-daemon-
+            // eligible type.
+            let attach_result: Option<anyhow::Result<Session>> =
+                if live_daemon_uids.contains(&session_uid_for_mcp) {
+                    Some(try_attach_via_daemon_with_deps(
+                        &self.host_pool,
                         &session_uid_for_mcp,
-                        program,
-                        &args,
+                        &ws.id,
+                        wt_path,
+                        &entry.session_type,
+                        &entry.label,
                         cols,
                         rows,
-                        wt,
-                        Default::default(),
-                        config,
-                        cap_status,
-                        kill_tx,
-                    )
+                        entry.task_id.as_deref(),
+                        entry.workflow_run_id.as_deref(),
+                        entry.workflow_role.as_deref(),
+                        &entry.host_id,
+                        pre_spawn_transcript.as_deref(),
+                    ))
+                } else {
+                    None
+                };
+            match attach_result {
+                Some(Ok(s)) => {
+                    // migrate-tui-local Issue J: mark this
+                    // restore as Attached so the post-dispatch
+                    // `pending_jsonl_files` priming below knows
+                    // to skip the Codex rebind window. The
+                    // daemon's transcript binding survived the
+                    // TUI restart; any unrelated rollout that
+                    // appears now would be a category error,
+                    // not a legitimate rebind candidate.
+                    outcome = RestoreOutcome::Attached;
+                    Ok(s)
+                }
+                Some(Err(attach_err)) => {
+                    // Issue F: probe-vs-attach TOCTOU. The
+                    // daemon-side session exited between the
+                    // `rpc_list_session_uids` probe at the top
+                    // of `restore_sessions` and this attach.
+                    // Falling through to spawn re-creates the
+                    // session under the same UID — `start_session`
+                    // is now safe because the daemon's registry
+                    // no longer holds the entry. Don't preserve
+                    // the manifest in limbo waiting for next
+                    // restart.
+                    eprintln!(
+                        "cm-tui: attach({}) failed after live-UID \
+                         probe ({}); falling back to start_session",
+                        session_uid_for_mcp, attach_err,
+                    );
+                    match self.try_spawn_via_daemon(
+                        &session_uid_for_mcp,
+                        &ws.id,
+                        wt_path,
+                        &entry.session_type,
+                        &entry.label,
+                        entry.transcript_id.as_deref(),
+                        cols,
+                        rows,
+                        entry.task_id.as_deref(),
+                        entry.workflow_run_id.as_deref(),
+                        entry.workflow_role.as_deref(),
+                        &entry.host_id,
+                        pre_spawn_transcript.as_deref(),
+                    ) {
+                        Some(Ok(s)) => Ok(s),
+                        Some(Err(e)) => Err(e),
+                        None => {
+                            // Unexpected: claude/codex/bash are daemon-eligible.
+                            return None;
+                        }
+                    }
+                }
+                None => {
+                    // UID not in the live-daemon set: clean
+                    // start_session path. Reached either when
+                    // the daemon never had this UID OR when the
+                    // daemon restarted between TUI sessions and
+                    // its registry is empty.
+                    match self.try_spawn_via_daemon(
+                        &session_uid_for_mcp,
+                        &ws.id,
+                        wt_path,
+                        &entry.session_type,
+                        &entry.label,
+                        entry.transcript_id.as_deref(),
+                        cols,
+                        rows,
+                        entry.task_id.as_deref(),
+                        entry.workflow_run_id.as_deref(),
+                        entry.workflow_role.as_deref(),
+                        &entry.host_id,
+                        pre_spawn_transcript.as_deref(),
+                    ) {
+                        Some(Ok(s)) => Ok(s),
+                        Some(Err(e)) => Err(e),
+                        None => {
+                            // Unexpected: claude/codex/bash are daemon-eligible.
+                            return None;
+                        }
+                    }
                 }
             }
         } else {
@@ -4145,17 +4570,34 @@ impl App {
             Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None)
         };
         let s = result.ok()?;
-        let pending = if entry.transcript_id.is_some() {
-            codex_resume_baseline
-        } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
-            Some(Vec::new())
-        } else {
-            None
+        // migrate-tui-local Issue J: the Codex rebind primer
+        // exists for the SPAWN path — codex resume writes a
+        // fresh rollout id and the post-spawn detector binds
+        // the live transcript_id to that rollout. The ATTACH
+        // path doesn't spawn a new rollout: the daemon's
+        // existing transcript binding survived the TUI restart.
+        // Priming `pending_jsonl_files` in that case would let
+        // an unrelated rollout (created elsewhere on the
+        // system during the rebind window) overwrite the
+        // legitimate transcript_id via the detector at
+        // `app.rs::6203`. Skip the primer entirely when
+        // attached; the daemon's binding is authoritative.
+        let pending = match outcome {
+            RestoreOutcome::Attached => None,
+            RestoreOutcome::Spawned => {
+                if entry.transcript_id.is_some() {
+                    codex_resume_baseline
+                } else if matches!(entry.session_type.as_str(), "claude" | "codex") {
+                    Some(Vec::new())
+                } else {
+                    None
+                }
+            }
         };
         // `restored_uid` was computed at the top of this function — same
         // value used in `session_uid_for_mcp` above. Don't generate a
         // fresh one here.
-        Some(TerminalSession {
+        let ts = TerminalSession {
             uid: restored_uid,
             label: entry.label.clone(),
             session_type: entry.session_type.clone(),
@@ -4188,7 +4630,8 @@ impl App {
             // by the `#[serde(default)]` constructor; nothing
             // special to do here.
             host_id: entry.host_id.clone(),
-        })
+        };
+        Some((ts, outcome))
     }
 
     /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
@@ -4571,6 +5014,23 @@ impl App {
         }
         let (cols, rows) = self.last_term_size;
         let worktree = self.workspaces[wi].worktree_path.clone();
+        let workspace_id_owned = self.workspaces[wi].id.clone();
+        // migrate-tui-local: snapshot active_host once at the top so
+        // every per-tombstone spawn dials the same daemon.
+        let active_host = self.active_host.clone();
+        // migrate-tui-local Issue C: the daemon-routed spawn
+        // below sends local-only paths (worktree + per-session
+        // MCP config under `~/.cm/mcp/...`). A non-local active
+        // host would route those at a daemon that can't read
+        // them. Fail fast with the shared helper — same shape
+        // every other entry point uses.
+        if let Err(e) = guard_local_host_only(
+            &active_host,
+            "A-O restore-tombstones-for-workspace",
+        ) {
+            self.set_status_msg(&format!("{}", e));
+            return;
+        }
 
         // Move tombstones out so the spawn loop can call &mut self helpers
         // without aliasing through `self.workspaces[wi]`.
@@ -4583,65 +5043,88 @@ impl App {
         for tomb in tombstones {
             let session_uid = new_session_uid();
             let result = match tomb.session_type.as_str() {
-                "claude" => {
+                "claude" | "codex" | "bash" => {
+                    // migrate-tui-local: route restored claude/codex/bash
+                    // tombstones through the daemon. The `--resume
+                    // <transcript_id>` arg is threaded as
+                    // resume_session_id so daemon's start_session
+                    // registers the session with the resumed
+                    // transcript bound from spawn time — no rebind
+                    // dance, no /resume-inside-PTY workaround.
+                    //
+                    // migrate-tui-local Issue H: bash joins the
+                    // daemon-routed arm. A-s spawns bash daemon-
+                    // owned; pre-fix the tombstone restore fell
+                    // back to `Session::new("/bin/bash", ...)`
+                    // and produced a local TUI-owned session,
+                    // breaking the "every local session is
+                    // daemon-owned" invariant and potentially
+                    // colliding with a still-live daemon bash
+                    // session under the same UID. Bash carries
+                    // no transcript, so `resume` and
+                    // `pre_spawn_transcript` resolve to None
+                    // naturally.
                     let resume = tomb.last_transcript_id.as_deref();
-                    let (program, args) = match crate::mcp_config::build_args(
-                        crate::mcp_config::SpawnTarget::TuiLocal,
-                        &workflow::toml_schema::Engine::ClaudeCode,
+                    let session_type = tomb.session_type.as_str();
+                    let Some(wt_path) = worktree.as_deref() else {
+                        self.set_status_msg(
+                            "Restore failed: workspace has no worktree",
+                        );
+                        failed.push(tomb);
+                        continue;
+                    };
+                    // migrate-tui-local Issue 3: claude tombstone
+                    // restores have a deterministic transcript
+                    // path (worktree + transcript_id); hand it
+                    // to the daemon up front so MCP reads serve
+                    // immediately. Codex resumes get None
+                    // (post-spawn detector handles rebind).
+                    let pre_spawn_transcript = resume.and_then(|sid| {
+                        pre_spawn_transcript_path(session_type, wt_path, sid)
+                    });
+                    // migrate-tui-local Issue K: the label arg
+                    // is what the daemon stores on
+                    // `DaemonSession.title` and what MCP
+                    // `list_sessions` surfaces. Pre-fix this
+                    // passed `session_type` (e.g. "claude" /
+                    // "codex" / "bash"), clobbering the user-
+                    // visible label the tombstone carried (e.g.
+                    // "reviewer", "planner"). The session_type
+                    // belongs in the slot immediately above
+                    // (which is the daemon's type field); the
+                    // label slot takes `&tomb.label`.
+                    match self.try_spawn_via_daemon(
                         &session_uid,
-                        None,
+                        &workspace_id_owned,
+                        wt_path,
+                        session_type,
+                        &tomb.label,
                         resume,
+                        cols,
+                        rows,
+                        tomb.task_id.as_deref(),
+                        None,
+                        None,
+                        &active_host,
+                        pre_spawn_transcript.as_deref(),
                     ) {
-                        Ok(v) => v,
-                        Err(e) => {
+                        Some(Ok(s)) => Ok(s),
+                        Some(Err(e)) => {
                             self.set_status_msg(&format!(
-                                "Restore failed to configure claude: {}",
+                                "Restore failed (daemon spawn): {}",
                                 e
                             ));
                             failed.push(tomb);
                             continue;
                         }
-                    };
-                    self.spawn_agent_session(
-                        "claude",
-                        &session_uid,
-                        &program,
-                        &args,
-                        cols,
-                        rows,
-                        worktree.clone(),
-                        Default::default(),
-                    )
-                }
-                "codex" => {
-                    let resume = tomb.last_transcript_id.as_deref();
-                    let (program, args) = match crate::mcp_config::build_args(
-                        crate::mcp_config::SpawnTarget::TuiLocal,
-                        &workflow::toml_schema::Engine::Codex,
-                        &session_uid,
-                        None,
-                        resume,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.set_status_msg(&format!(
-                                "Restore failed to configure codex: {}",
-                                e
-                            ));
+                        None => {
+                            self.set_status_msg(
+                                "Internal: try_spawn_via_daemon returned None for daemon-eligible type",
+                            );
                             failed.push(tomb);
                             continue;
                         }
-                    };
-                    self.spawn_agent_session(
-                        "codex",
-                        &session_uid,
-                        &program,
-                        &args,
-                        cols,
-                        rows,
-                        worktree.clone(),
-                        Default::default(),
-                    )
+                    }
                 }
                 _ => Session::new(
                     "/bin/bash",
@@ -4669,6 +5152,12 @@ impl App {
                         pending,
                     );
                     ts.task_id = tomb.task_id.clone();
+                    // migrate-tui-local: claude/codex sessions are
+                    // daemon-owned now; pin host to the snapshot
+                    // taken at the top of this method. Bash bypass
+                    // also tags local (which is what active_host
+                    // is in non-cloud reopen flows).
+                    ts.host_id = active_host.clone();
                     // For Claude `--resume` keeps writing to the same JSONL,
                     // so the transcript id IS the live id immediately. For
                     // Codex the live id is rebound by the detector when the
@@ -4763,6 +5252,23 @@ impl App {
         }
 
         let (cols, rows) = self.last_term_size;
+        // migrate-tui-local: snapshot active_host + workspace id for
+        // the per-tombstone daemon spawn.
+        let active_host = self.active_host.clone();
+        // migrate-tui-local Issue C: the resurrect path resolves a
+        // claude transcript path on the local filesystem and
+        // hands it (plus the workspace's worktree) to the daemon.
+        // Fail fast on a non-local active host so we don't send
+        // local-only paths to a remote daemon. Matches the
+        // canonical guard pattern used by A-n / A-s / A-l.
+        if let Err(e) = guard_local_host_only(
+            &active_host,
+            "designer-session resurrect",
+        ) {
+            self.set_status_msg(&format!("{}", e));
+            return 0;
+        }
+        let workspace_id_owned = self.workspaces[wi].id.clone();
         let mut respawned = 0usize;
         for uid in target_uids {
             // Skip if the uid is already live (e.g. a previous resurrect
@@ -4795,35 +5301,40 @@ impl App {
             let label = tomb.label.clone();
             let task_id = tomb.task_id.clone();
 
-            let (program, args) = match crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::TuiLocal,
-                &workflow::toml_schema::Engine::ClaudeCode,
-                &uid,
-                None,
-                Some(transcript_id.as_str()),
-            ) {
-                Ok(v) => v,
-                Err(_) => (
-                    "claude".to_string(),
-                    vec![
-                        "--dangerously-skip-permissions".to_string(),
-                        "--resume".to_string(),
-                        transcript_id.clone(),
-                    ],
-                ),
+            let Some(wt_path) = worktree_path.as_deref() else {
+                // No worktree — can't daemon-spawn. Leave tombstone
+                // for retry on next reopen.
+                continue;
             };
 
-            match self.spawn_agent_session(
+            // migrate-tui-local: route the resume through the
+            // daemon RPC with --resume <transcript_id> threaded as
+            // resume_session_id. The daemon registers the session
+            // with the resumed transcript bound from spawn time.
+            //
+            // migrate-tui-local Issue 3: hand the deterministic
+            // claude transcript path to the daemon up front.
+            let pre_spawn_transcript = pre_spawn_transcript_path(
                 "claude",
+                wt_path,
+                transcript_id.as_str(),
+            );
+            match self.try_spawn_via_daemon(
                 &uid,
-                &program,
-                &args,
+                &workspace_id_owned,
+                wt_path,
+                "claude",
+                &label,
+                Some(transcript_id.as_str()),
                 cols,
                 rows,
-                worktree_path,
-                Default::default(),
+                task_id.as_deref(),
+                None,
+                None,
+                &active_host,
+                pre_spawn_transcript.as_deref(),
             ) {
-                Ok(s) => {
+                Some(Ok(s)) => {
                     let mut ts = make_simple_session_with_uid(
                         uid.clone(),
                         &label,
@@ -4833,14 +5344,15 @@ impl App {
                     );
                     ts.transcript_id = Some(transcript_id);
                     ts.task_id = task_id;
+                    ts.host_id = active_host.clone();
                     self.workspaces[wi].sessions.push(ts);
                     self.workspaces[wi].tombstones.remove(ti);
                     respawned += 1;
                 }
-                Err(_) => {
-                    // Spawn failed — leave the tombstone alone so the
-                    // user can retry by closing and reopening again
-                    // (or by adding a session manually with A-s).
+                Some(Err(_)) | None => {
+                    // Spawn failed (or daemon returned None for an
+                    // unexpected reason) — leave the tombstone in
+                    // place so the user can retry.
                 }
             }
         }
@@ -6387,6 +6899,9 @@ impl App {
             None, // workflow_run_id
             None, // workflow_role
             &caller_host,
+            // MCP-driven spawn is always fresh — post-spawn
+            // detector handles transcript path discovery.
+            None,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -7890,6 +8405,7 @@ impl App {
                 slots,
                 active_slot,
                 goal,
+                cursor_task_id,
             } => handle_workflow_launch_confirm(
                 WorkflowLaunchConfirmMut {
                     ws_index: *ws_index,
@@ -7897,6 +8413,7 @@ impl App {
                     slots,
                     active_slot,
                     goal,
+                    cursor_task_id: cursor_task_id.as_deref(),
                 },
                 InputCtx { repo_urls: &urls },
                 event,
@@ -7906,12 +8423,14 @@ impl App {
                 focused_si,
                 names,
                 selected,
+                cursor_task_id,
             } => handle_workflow_picker(
                 WorkflowPickerMut {
                     ws_index: *ws_index,
                     focused_si: *focused_si,
                     names,
                     selected,
+                    cursor_task_id: cursor_task_id.as_deref(),
                 },
                 InputCtx { repo_urls: &urls },
                 event,
@@ -8126,16 +8645,41 @@ impl App {
                 ws_index,
                 focused_si,
                 workflow_name,
+                cursor_task_id,
             } => {
-                self.enter_workflow_launch_confirm(ws_index, focused_si, workflow_name);
+                self.enter_workflow_launch_confirm(
+                    ws_index,
+                    focused_si,
+                    workflow_name,
+                    cursor_task_id,
+                );
             }
             SubmitAction::LaunchWorkflow {
                 ws_index,
                 workflow_name,
                 slots,
                 goal,
+                cursor_task_id,
             } => {
-                self.launch_workflow(ws_index, &workflow_name, slots, goal);
+                // migrate-tui-local Issue G: UI A-f launches now
+                // carry the cursor's task scope (captured at
+                // observation time in `open_workflow_launch` per
+                // Issue I). When the cursor was on a tasked
+                // session or `Cursor::Task`, the daemon records
+                // the participant's task_id at spawn time —
+                // matching the MCP-launched path. When the
+                // cursor was workspace-scope (no task), this is
+                // None and the controller's existing-slot
+                // inheritance fallback still applies (Issue I
+                // completes the Issue G threading for the UI
+                // path).
+                self.launch_workflow(
+                    ws_index,
+                    &workflow_name,
+                    slots,
+                    goal,
+                    cursor_task_id,
+                );
             }
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
@@ -9076,34 +9620,6 @@ impl App {
         // workflow meta.
         let session_uid = new_session_uid();
         let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
-        let (program, args) = match crate::mcp_config::build_args(
-            crate::mcp_config::SpawnTarget::TuiLocal,
-            &workflow::toml_schema::Engine::ClaudeCode,
-            &session_uid,
-            None,
-            cloned_transcript_id.as_deref(),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                if let Some(c) = cloned.as_ref() {
-                    // A seeded launch CANNOT fall back to plain `claude`
-                    // (no `--resume`) — that would leave the TUI bound
-                    // to the seed transcript while the live agent runs
-                    // with none of the seeded context. Cleanup + fail.
-                    Self::cleanup_failed_clone(c);
-                    self.set_status_msg(&format!(
-                        "Seeded launch aborted (could not configure agent): {e}"
-                    ));
-                    return;
-                }
-                // Unseeded fallback preserved — original behavior when
-                // MCP config writing fails (agent runs without MCP).
-                (
-                    "claude".to_string(),
-                    vec!["--dangerously-skip-permissions".to_string()],
-                )
-            }
-        };
         // For a seeded Claude session, the JSONL is already on disk and
         // `--resume` keeps writing to it — there's no "new file" for the
         // detector to find, so leave `pending_jsonl_files = None`
@@ -9121,6 +9637,16 @@ impl App {
         // workspace and the TUI's view share an identity.
         let workspace_id_pre = new_workspace_id();
 
+        // migrate-tui-local Issue 3: seeded clones already
+        // have a transcript_id at construction (the clone's
+        // id); the JSONL is on disk and claude --resume keeps
+        // writing to it, so the path is deterministic and we
+        // can hand it to the daemon up front. Plain A-n spawns
+        // (no seed) leave transcript_path None — the post-spawn
+        // detector handles the fresh transcript.
+        let pre_spawn_transcript = cloned_transcript_id.as_deref().and_then(|sid| {
+            pre_spawn_transcript_path("claude", &worktree_path, sid)
+        });
         let s = match self.try_spawn_via_daemon(
             &session_uid,
             &workspace_id_pre,
@@ -9143,6 +9669,7 @@ impl App {
             None,
             None,
             &active_host,
+            pre_spawn_transcript.as_deref(),
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -9155,25 +9682,18 @@ impl App {
                 ));
                 return;
             }
-            None => match self.spawn_agent_session(
-                "claude",
-                &session_uid,
-                &program,
-                &args,
-                cols,
-                rows,
-                Some(worktree_path.clone()),
-                Default::default(),
-            ) {
-                Ok(s) => s,
-                Err(_) => {
-                    if let Some(c) = cloned.as_ref() {
-                        Self::cleanup_failed_clone(c);
-                    }
-                    self.set_status_msg("Spawn failed");
-                    return;
+            None => {
+                // Unreachable post-migrate-tui-local: "claude" is
+                // daemon-eligible, so try_spawn_via_daemon never
+                // returns None here. Surface loudly if it does.
+                if let Some(c) = cloned.as_ref() {
+                    Self::cleanup_failed_clone(c);
                 }
-            },
+                self.set_status_msg(
+                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
+                );
+                return;
+            }
         };
 
         let ts = TerminalSession {
@@ -9256,6 +9776,9 @@ impl App {
             None => return,
         };
         let (cols, rows) = self.last_term_size;
+        // migrate-tui-local: capture active_host snapshot up front
+        // and route the local-claude branch through the daemon.
+        let active_host = self.active_host.clone();
         let ws = &self.workspaces[wi];
 
         if !ws.sessions.is_empty() {
@@ -9267,10 +9790,15 @@ impl App {
             return;
         }
 
-        let ts = if let Some(vm) = ws.worker_vm.clone().filter(|s| !s.is_empty()) {
-            let zone = ws
-                .worker_zone
-                .clone()
+        // Borrow `ws` only for the snapshots needed below the
+        // dispatch — `try_spawn_via_daemon` reborrows `self`.
+        let worker_vm = ws.worker_vm.clone().filter(|s| !s.is_empty());
+        let worker_zone = ws.worker_zone.clone();
+        let worktree_path = ws.worktree_path.clone();
+        let workspace_id = ws.id.clone();
+
+        let ts = if let Some(vm) = worker_vm {
+            let zone = worker_zone
                 .unwrap_or_else(|| self.config.gcp_zone.clone());
             let args = vec![
                 "compute".to_string(),
@@ -9285,33 +9813,62 @@ impl App {
             Session::new("gcloud", &args, cols, rows, None, Default::default(), None)
                 .ok()
                 .map(|s| make_simple_session("ssh", "bash", s, None))
-        } else if let Some(wt) = ws.worktree_path.clone() {
-            let session_uid = new_session_uid();
-            let (program, args) = crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::TuiLocal,
-                &workflow::toml_schema::Engine::ClaudeCode,
-                &session_uid,
-                None,
-                None,
-            )
-            .unwrap_or_else(|_| (
-                "claude".to_string(),
-                vec!["--dangerously-skip-permissions".to_string()],
-            ));
-            let pending = Self::list_jsonl_files(&wt);
-            self.spawn_agent_session(
-                "claude",
-                &session_uid,
-                &program,
-                &args,
-                cols,
-                rows,
-                Some(wt),
-                Default::default(),
-            )
-            .ok()
-            .map(|s| make_simple_session_with_uid(session_uid, "claude", "claude", s, Some(pending)))
+        } else if let Some(wt) = worktree_path {
+            // migrate-tui-local Issue C: the local-claude branch
+            // sends the workspace's local-filesystem worktree
+            // (and per-session MCP config under `~/.cm/mcp/...`)
+            // to the daemon. A non-local active host would route
+            // those at a daemon that can't read them. The
+            // cloud-VM branch above and the bash-fallback below
+            // don't talk to the daemon, so the guard scopes to
+            // this arm only.
+            if let Err(e) = guard_local_host_only(&active_host, "A-a attach-active") {
+                self.set_status_msg(&format!("{}", e));
+                None
+            } else {
+                let session_uid = new_session_uid();
+                let pending = Self::list_jsonl_files(&wt);
+                match self.try_spawn_via_daemon(
+                    &session_uid,
+                    &workspace_id,
+                    &wt,
+                    "claude",
+                    "claude",
+                    None,
+                    cols,
+                    rows,
+                    None,
+                    None,
+                    None,
+                    &active_host,
+                    // attach_active is a fresh spawn — post-spawn
+                    // detector will discover the transcript path.
+                    None,
+                ) {
+                    Some(Ok(s)) => Some(make_simple_session_with_uid(
+                        session_uid,
+                        "claude",
+                        "claude",
+                        s,
+                        Some(pending),
+                    )),
+                    Some(Err(e)) => {
+                        self.set_status_msg(&format!("Attach (daemon spawn): {}", e));
+                        None
+                    }
+                    None => {
+                        self.set_status_msg(
+                            "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
+                        );
+                        None
+                    }
+                }
+            }
         } else {
+            // No worktree + no VM: bash-only fallback for orphan
+            // workspaces. Stays local because the daemon needs a
+            // worktree-bound workspace to auto-register on
+            // start_session.
             Session::new("/bin/bash", &[], cols, rows, None, Default::default(), None)
                 .ok()
                 .map(|s| make_simple_session("bash", "bash", s, None))
@@ -9464,59 +10021,56 @@ impl App {
         // sidebar grouping but no workflow context).
         let session_uid_pre = new_session_uid();
         let cloned_transcript_id = cloned.as_ref().map(|c| c.transcript_id.clone());
-
-        // Build args, refusing to fall back to plain claude/codex
-        // (without `--resume`/`resume`) for seeded launches — the
-        // resume flag IS the wiring that connects the seed transcript
-        // to the live agent. Without it the TUI binds to the seed file
-        // while the agent has none of the context.
-        let build = |engine: Engine, fallback_prog: &str, fallback_args: Vec<String>| {
-            crate::mcp_config::build_args(
-                crate::mcp_config::SpawnTarget::TuiLocal,
-                &engine,
-                &session_uid_pre,
-                None,
-                cloned_transcript_id.as_deref(),
-            )
-            .or_else(|e| {
-                if cloned.is_some() {
-                    Err(e)
-                } else {
-                    Ok((fallback_prog.to_string(), fallback_args))
-                }
-            })
-        };
-        // Slice 10c-e-3: opt-in daemon spawn for A-s. Try the
-        // daemon path FIRST (when opt-in is on AND we have a
-        // worktree). On `None` (opt-in off or unsupported type),
-        // fall through to the existing local spawn unchanged.
+        // migrate-tui-local: A-s spawns route through the daemon
+        // for all three engines (claude / codex / bash). Workspaces
+        // here always have a worktree (the cloud / VM branch above
+        // already early-returned), so the `wt.is_none()` arm
+        // surfaces a developer-visible error rather than fall back
+        // to local PTY spawn.
         let workspace_id = self.workspaces[ws_index].id.clone();
-        let daemon_attempt = match (wt.as_deref(), &session_type) {
-            (Some(wt_path), _) => self.try_spawn_via_daemon(
-                &session_uid_pre,
-                &workspace_id,
-                wt_path,
-                session_type,
-                session_type,
-                cloned_transcript_id.as_deref(),
-                cols,
-                rows,
-                // Sub-2a Finding #1: A-s spawns a session under
-                // an existing task — pass the task_id through
-                // so the daemon's DaemonSession.task_id is
-                // populated at spawn time, not left None.
-                task_id.as_deref(),
-                // A-s spawns a session under an existing task,
-                // but workflow membership is decided later (when
-                // the user runs A-f on it). No workflow context
-                // at spawn time.
-                None,
-                None,
-                &active_host,
-            ),
-            _ => None,
+        let Some(wt_path) = wt.as_deref() else {
+            if let Some(c) = cloned.as_ref() {
+                Self::cleanup_failed_clone(c);
+            }
+            self.set_status_msg(
+                "A-s spawn: workspace has no worktree — daemon spawn requires one",
+            );
+            return;
         };
-        let result = match daemon_attempt {
+        // migrate-tui-local Issue 3: seeded Claude A-s spawns
+        // know the transcript_id (cloned id) at construction;
+        // hand its deterministic path to the daemon so
+        // resolve_authorized_session resolves immediately. The
+        // codex seed produces a fresh rollout id post-resume —
+        // pre_spawn_transcript_path correctly returns None for
+        // codex, so the post-spawn detector continues to
+        // handle that case.
+        let pre_spawn_transcript = cloned_transcript_id.as_deref().and_then(|sid| {
+            pre_spawn_transcript_path(session_type, wt_path, sid)
+        });
+        let result: anyhow::Result<Session> = match self.try_spawn_via_daemon(
+            &session_uid_pre,
+            &workspace_id,
+            wt_path,
+            session_type,
+            session_type,
+            cloned_transcript_id.as_deref(),
+            cols,
+            rows,
+            // Sub-2a Finding #1: A-s spawns a session under
+            // an existing task — pass the task_id through
+            // so the daemon's DaemonSession.task_id is
+            // populated at spawn time, not left None.
+            task_id.as_deref(),
+            // A-s spawns a session under an existing task,
+            // but workflow membership is decided later (when
+            // the user runs A-f on it). No workflow context
+            // at spawn time.
+            None,
+            None,
+            &active_host,
+            pre_spawn_transcript.as_deref(),
+        ) {
             Some(Ok(s)) => Ok(s),
             Some(Err(e)) => {
                 if let Some(c) = cloned.as_ref() {
@@ -9528,59 +10082,16 @@ impl App {
                 ));
                 return;
             }
-            None => match session_type {
-                "claude" => match build(
-                    Engine::ClaudeCode,
-                    "claude",
-                    vec!["--dangerously-skip-permissions".to_string()],
-                ) {
-                    Ok((program, args)) => self.spawn_agent_session(
-                        "claude",
-                        &session_uid_pre,
-                        &program,
-                        &args,
-                        cols,
-                        rows,
-                        wt,
-                        Default::default(),
-                    ),
-                    Err(e) => {
-                        if let Some(c) = cloned.as_ref() {
-                            Self::cleanup_failed_clone(c);
-                        }
-                        self.set_status_msg(&format!(
-                            "Seeded launch aborted (could not configure agent): {e}"
-                        ));
-                        return;
-                    }
-                },
-                "codex" => match build(
-                    Engine::Codex,
-                    "codex",
-                    vec!["--yolo".to_string()],
-                ) {
-                    Ok((program, args)) => self.spawn_agent_session(
-                        "codex",
-                        &session_uid_pre,
-                        &program,
-                        &args,
-                        cols,
-                        rows,
-                        wt,
-                        Default::default(),
-                    ),
-                    Err(e) => {
-                        if let Some(c) = cloned.as_ref() {
-                            Self::cleanup_failed_clone(c);
-                        }
-                        self.set_status_msg(&format!(
-                            "Seeded launch aborted (could not configure agent): {e}"
-                        ));
-                        return;
-                    }
-                },
-                _ => Session::new("/bin/bash", &[], cols, rows, wt, Default::default(), None),
-            },
+            None => {
+                if let Some(c) = cloned.as_ref() {
+                    Self::cleanup_failed_clone(c);
+                }
+                self.set_status_msg(&format!(
+                    "Unsupported session_type '{}' for daemon spawn",
+                    session_type
+                ));
+                return;
+            }
         };
         match result {
             Ok(s) => {
@@ -9649,49 +10160,79 @@ impl App {
         prompt: String,
     ) {
         let (cols, rows) = self.last_term_size;
+        // migrate-tui-local Issue B: cloud-pull A-l always
+        // materializes the resumed workspace from a locally-
+        // pulled worktree onto the local filesystem. Pin the
+        // host snapshot to `HostId::local()` — NOT
+        // `self.active_host` — so a concurrent A-H cycle between
+        // pull-start and PullComplete can't send the local
+        // filesystem path to a remote daemon (and tag the new
+        // workspace with the wrong host_id).
+        let host_snapshot = cm_daemon::host_id::HostId::local();
+        let workspace_id_pre = new_workspace_id();
         // Pre-generate the session UID so the per-session MCP config
         // bakes the matching CM_TUI_SESSION_ID. Without this, a pulled
         // session can spawn but its agent has no MCP config and any
         // tool call would fail auth as `not_found`.
         let session_uid = new_session_uid();
-        let (program, args) = match crate::mcp_config::build_args(
-            crate::mcp_config::SpawnTarget::TuiLocal,
-            &workflow::toml_schema::Engine::ClaudeCode,
-            &session_uid,
-            None,
-            Some(session_id.as_str()),
-        ) {
-            Ok(v) => v,
-            Err(_) => (
-                "claude".to_string(),
-                vec![
-                    "--dangerously-skip-permissions".to_string(),
-                    "--resume".to_string(),
-                    session_id.clone(),
-                ],
-            ),
-        };
 
-        match self.spawn_agent_session(
-            "claude",
+        // migrate-tui-local: route the resume through
+        // `try_spawn_via_daemon` with `--resume <session_id>`
+        // threaded as `resume_session_id`. The daemon then spawns
+        // `claude --resume <id>` and registers the session in
+        // `state.sessions` with the resumed transcript bound at
+        // spawn time — no post-spawn `/resume` workaround.
+        //
+        // migrate-tui-local Issue 3: we already know the
+        // transcript_id (session_id) AND the worktree, so the
+        // claude transcript path is deterministic — hand it to
+        // the daemon up front so `resolve_authorized_session`
+        // resolves immediately for MCP `read_session_output`.
+        let pre_spawn_transcript =
+            pre_spawn_transcript_path("claude", &worktree_path, session_id.as_str());
+        let new_sess = match self.try_spawn_via_daemon(
             &session_uid,
-            &program,
-            &args,
+            &workspace_id_pre,
+            &worktree_path,
+            "claude",
+            "claude",
+            Some(session_id.as_str()),
             cols,
             rows,
-            Some(worktree_path.clone()),
-            Default::default(),
+            task_id.as_deref(),
+            None,
+            None,
+            &host_snapshot,
+            pre_spawn_transcript.as_deref(),
         ) {
-            Ok(s) => {
-                let mut ts = make_simple_session_with_uid(
-                    session_uid,
-                    "claude",
-                    "claude",
-                    s,
-                    None,
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                self.set_status_msg(&format!("Resume (daemon spawn): {}", e));
+                return;
+            }
+            None => {
+                self.set_status_msg(
+                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
                 );
-                ts.transcript_id = Some(session_id.clone());
-                ts.task_id = task_id.clone();
+                return;
+            }
+        };
+
+        {
+            let mut ts = make_simple_session_with_uid(
+                session_uid,
+                "claude",
+                "claude",
+                new_sess,
+                None,
+            );
+            ts.transcript_id = Some(session_id.clone());
+            ts.task_id = task_id.clone();
+            // migrate-tui-local Issue B: tag with the local host
+            // snapshot (same value used in the daemon dial above).
+            // A concurrent A-H cycle MUST NOT influence the new
+            // local workspace's host_id.
+            ts.host_id = host_snapshot.clone();
 
                 // If we have a task_id, find the TaskEntry and its (cloud)
                 // workspace; replace that workspace with a local one.
@@ -9703,69 +10244,68 @@ impl App {
                             .position(|t| t.task_id.as_deref() == Some(id))
                     });
 
-                let local_ws = Workspace {
-                    id: new_workspace_id(),
-                    name: task_id
-                        .as_deref()
-                        .and_then(|id| {
-                            self.tasks
-                                .iter()
-                                .find(|t| t.task_id.as_deref() == Some(id))
-                                .map(|t| t.name.clone())
-                        })
-                        .unwrap_or_else(|| prompt.chars().take(60).collect()),
-                    is_closed: false,
-                    is_cloud: false,
-                    repo_url: Some(repo_url.clone()),
-                    worktree_path: Some(worktree_path.clone()),
-                    main_repo_path: Some(main_repo.clone()),
-                    worker_vm: None,
-                    worker_zone: None,
-                    sessions: vec![ts],
-                    tombstones: Vec::new(),
-                    is_pushing: false,
-                };
-                let ws_id = local_ws.id.clone();
+            // migrate-tui-local: workspace id was pre-generated
+            // above so the daemon auto-registered it on
+            // start_session; carry the same value through here.
+            let local_ws = Workspace {
+                id: workspace_id_pre,
+                name: task_id
+                    .as_deref()
+                    .and_then(|id| {
+                        self.tasks
+                            .iter()
+                            .find(|t| t.task_id.as_deref() == Some(id))
+                            .map(|t| t.name.clone())
+                    })
+                    .unwrap_or_else(|| prompt.chars().take(60).collect()),
+                is_closed: false,
+                is_cloud: false,
+                repo_url: Some(repo_url.clone()),
+                worktree_path: Some(worktree_path.clone()),
+                main_repo_path: Some(main_repo.clone()),
+                worker_vm: None,
+                worker_zone: None,
+                sessions: vec![ts],
+                tombstones: Vec::new(),
+                is_pushing: false,
+            };
+            let ws_id = local_ws.id.clone();
 
-                if let Some(ti) = target_ti {
-                    // Remove the old (cloud) workspace if one was linked.
-                    if let Some(old_id) = self.tasks[ti].workspace_id.clone() {
-                        self.workspaces.retain(|w| w.id != old_id);
-                    }
-                    self.tasks[ti].is_cloud = false;
-                    self.tasks[ti].session_id = Some(session_id);
-                    self.tasks[ti].workspace_id = Some(ws_id.clone());
-                } else {
-                    // No matching task — create one.
-                    self.tasks.push(TaskEntry {
-                        task_id,
-                        name: local_ws.name.clone(),
-                        api_status: TaskStatus::Running,
-                        repo_url: Some(repo_url),
-                        prompt: Some(prompt),
-                        wip_branch: None,
-                        session_id: Some(session_id),
-                        blocked_at: None,
-                        is_cloud: false,
-                        workspace_id: Some(ws_id.clone()),
-                        project: None,
-                        parent_task_id: None,
-                        worktree_mode: WorktreeMode::Inherit,
-                        metadata: None,
-                    });
+            if let Some(ti) = target_ti {
+                // Remove the old (cloud) workspace if one was linked.
+                if let Some(old_id) = self.tasks[ti].workspace_id.clone() {
+                    self.workspaces.retain(|w| w.id != old_id);
                 }
-                self.workspaces.push(local_ws);
-                let new_wi = self.workspaces.len() - 1;
-                self.cursor = Cursor::Session(new_wi, 0);
-                self.save_session_manifest();
-                // Sub-2a Finding #1: a resume_locally may have
-                // inserted a new TaskEntry above.
-                self.push_state_to_daemon();
-                self.set_status_msg("Resumed locally");
+                self.tasks[ti].is_cloud = false;
+                self.tasks[ti].session_id = Some(session_id);
+                self.tasks[ti].workspace_id = Some(ws_id.clone());
+            } else {
+                // No matching task — create one.
+                self.tasks.push(TaskEntry {
+                    task_id,
+                    name: local_ws.name.clone(),
+                    api_status: TaskStatus::Running,
+                    repo_url: Some(repo_url),
+                    prompt: Some(prompt),
+                    wip_branch: None,
+                    session_id: Some(session_id),
+                    blocked_at: None,
+                    is_cloud: false,
+                    workspace_id: Some(ws_id.clone()),
+                    project: None,
+                    parent_task_id: None,
+                    worktree_mode: WorktreeMode::Inherit,
+                    metadata: None,
+                });
             }
-            Err(e) => {
-                self.set_status_msg(&format!("Resume failed: {}", e));
-            }
+            self.workspaces.push(local_ws);
+            let new_wi = self.workspaces.len() - 1;
+            self.cursor = Cursor::Session(new_wi, 0);
+            self.save_session_manifest();
+            // Sub-2a Finding #1: a resume_locally may have
+            // inserted a new TaskEntry above.
+            self.push_state_to_daemon();
+            self.set_status_msg("Resumed locally");
         }
     }
 
@@ -10124,118 +10664,125 @@ impl App {
         worktree::setup_worktree(&main_repo, &worktree_path);
 
         let (cols, rows) = self.last_term_size;
-        // Pre-generate UID + route through the shared MCP config helper
-        // so the planning-launched agent gets `--mcp-config` + matching
-        // CM_TUI_SESSION_ID — the Phase 1 "MCP-everywhere" invariant.
+        // migrate-tui-local: pre-generate UID + workspace id so the
+        // daemon can auto-register the workspace at start_session.
+        // Route the spawn through the daemon RPC so the planning-
+        // launched agent's session lands in state.sessions, not
+        // state.tui_sessions.
         let session_uid = new_session_uid();
-        let (program, args) = crate::mcp_config::build_args(
-            crate::mcp_config::SpawnTarget::TuiLocal,
-            &workflow::toml_schema::Engine::ClaudeCode,
-            &session_uid,
-            None,
-            None,
-        )
-        .unwrap_or_else(|_| (
-            "claude".to_string(),
-            vec!["--dangerously-skip-permissions".to_string()],
-        ));
+        let workspace_id_pre = new_workspace_id();
         let pending = Self::list_jsonl_files(&worktree_path);
 
-        match self.spawn_agent_session(
-            "claude",
+        let new_sess = match self.try_spawn_via_daemon(
             &session_uid,
-            &program,
-            &args,
+            &workspace_id_pre,
+            &worktree_path,
+            "claude",
+            slug,
+            None,
             cols,
             rows,
-            Some(worktree_path.clone()),
-            Default::default(),
+            Some(task_id),
+            None,
+            None,
+            &active_host,
+            // launch_from_plan is a fresh spawn — post-spawn
+            // detector will discover the transcript path.
+            None,
         ) {
-            Ok(s) => {
-                let branch = format!("cm/{}", slug);
-                let mut ts = make_simple_session_with_uid(
-                    session_uid,
-                    slug,
-                    "claude",
-                    s,
-                    Some(pending),
-                );
-                ts.task_id = Some(task_id.to_string());
-                if !prompt.trim().is_empty() {
-                    ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
-                        prompt.to_string(),
-                        false,
-                        Duration::from_secs(1),
-                        Duration::from_secs(2),
-                        Duration::from_secs(60),
-                    ));
-                }
-
-                let ws = Workspace {
-                    id: new_workspace_id(),
-                    name: slug.to_string(),
-                    is_closed: false,
-                    is_cloud: false,
-                    repo_url: Some(repo_url.clone()),
-                    worktree_path: Some(worktree_path),
-                    main_repo_path: Some(main_repo),
-                    worker_vm: None,
-                    worker_zone: None,
-                    sessions: vec![ts],
-                    tombstones: Vec::new(),
-                    is_pushing: false,
-                };
-                let ws_id = ws.id.clone();
-                self.workspaces.push(ws);
-                let new_wi = self.workspaces.len() - 1;
-
-                self.tasks.push(TaskEntry {
-                    task_id: Some(task_id.to_string()),
-                    name: slug.to_string(),
-                    api_status: TaskStatus::Running,
-                    repo_url: Some(repo_url.clone()),
-                    prompt: Some(prompt.to_string()),
-                    wip_branch: Some(branch.clone()),
-                    session_id: None,
-                    blocked_at: None,
-                    is_cloud: false,
-                    workspace_id: Some(ws_id),
-                    // Pin project synchronously so subtask inheritance
-                    // works before the next reconcile pass — without
-                    // this, an agent calling `create_subtask` in the
-                    // first second sees `project: None` on the parent
-                    // and writes `project = NULL` to the API, which
-                    // the planning refresh then filters out.
-                    project: Some(project.to_string()),
-                    // Sub-2a Finding #2: pin the parent edge from
-                    // the launch action so the first
-                    // `push_task_tree_to_daemon` publishes the
-                    // correct subtask edge — pre-fix this was
-                    // `None` and the daemon saw the subtask as
-                    // top-level until reconcile patched it.
-                    parent_task_id: parent_task_id.map(str::to_string),
-                    worktree_mode: WorktreeMode::Inherit,
-                    metadata: None,
-                });
-
-                self.cursor = Cursor::Session(new_wi, 0);
-                self.view_mode = ViewMode::Sessions;
-
-                let mut fields = std::collections::HashMap::new();
-                fields.insert("status".to_string(), serde_json::Value::String("running".to_string()));
-                fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
-                self.backend.update_plan_task(task_id.to_string(), fields);
-                self.save_session_manifest();
-                // Sub-2a Finding #1: launch added a TaskEntry —
-                // refresh daemon's tree so any agent that spawns
-                // off this task immediately authorizes correctly.
-                self.push_state_to_daemon();
-                self.set_status_msg("Task launched");
-            }
-            Err(e) => {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 self.set_status_msg(&format!("Launch: {}", e));
+                return;
             }
+            None => {
+                self.set_status_msg(
+                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
+                );
+                return;
+            }
+        };
+
+        let branch = format!("cm/{}", slug);
+        let mut ts = make_simple_session_with_uid(
+            session_uid,
+            slug,
+            "claude",
+            new_sess,
+            Some(pending),
+        );
+        ts.task_id = Some(task_id.to_string());
+        ts.host_id = active_host.clone();
+        if !prompt.trim().is_empty() {
+            ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
+                prompt.to_string(),
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+            ));
         }
+
+        let ws = Workspace {
+            id: workspace_id_pre,
+            name: slug.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: Some(repo_url.clone()),
+            worktree_path: Some(worktree_path),
+            main_repo_path: Some(main_repo),
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![ts],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        };
+        let ws_id = ws.id.clone();
+        self.workspaces.push(ws);
+        let new_wi = self.workspaces.len() - 1;
+
+        self.tasks.push(TaskEntry {
+            task_id: Some(task_id.to_string()),
+            name: slug.to_string(),
+            api_status: TaskStatus::Running,
+            repo_url: Some(repo_url.clone()),
+            prompt: Some(prompt.to_string()),
+            wip_branch: Some(branch.clone()),
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: Some(ws_id),
+            // Pin project synchronously so subtask inheritance
+            // works before the next reconcile pass — without
+            // this, an agent calling `create_subtask` in the
+            // first second sees `project: None` on the parent
+            // and writes `project = NULL` to the API, which
+            // the planning refresh then filters out.
+            project: Some(project.to_string()),
+            // Sub-2a Finding #2: pin the parent edge from
+            // the launch action so the first
+            // `push_task_tree_to_daemon` publishes the
+            // correct subtask edge — pre-fix this was
+            // `None` and the daemon saw the subtask as
+            // top-level until reconcile patched it.
+            parent_task_id: parent_task_id.map(str::to_string),
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+
+        self.cursor = Cursor::Session(new_wi, 0);
+        self.view_mode = ViewMode::Sessions;
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("status".to_string(), serde_json::Value::String("running".to_string()));
+        fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
+        self.backend.update_plan_task(task_id.to_string(), fields);
+        self.save_session_manifest();
+        // Sub-2a Finding #1: launch added a TaskEntry —
+        // refresh daemon's tree so any agent that spawns
+        // off this task immediately authorizes correctly.
+        self.push_state_to_daemon();
+        self.set_status_msg("Task launched");
     }
 
     /// Open workspaces the planning picker can target. Skips closed workspaces
@@ -10294,105 +10841,109 @@ impl App {
         // this, a session launched into an existing workspace can't call
         // any orchestration tool.
         let session_uid = new_session_uid();
-        let (program, args) = crate::mcp_config::build_args(
-            crate::mcp_config::SpawnTarget::TuiLocal,
-            &workflow::toml_schema::Engine::ClaudeCode,
-            &session_uid,
-            None,
-            None,
-        )
-        .unwrap_or_else(|_| (
-            "claude".to_string(),
-            vec!["--dangerously-skip-permissions".to_string()],
-        ));
         let pending = Self::list_jsonl_files(&worktree_path);
-        match self.spawn_agent_session(
-            "claude",
+        let workspace_id_owned = workspace_id.to_string();
+        let new_sess = match self.try_spawn_via_daemon(
             &session_uid,
-            &program,
-            &args,
+            &workspace_id_owned,
+            &worktree_path,
+            "claude",
+            task_title,
+            None,
             cols,
             rows,
-            Some(worktree_path),
-            Default::default(),
+            Some(task_id),
+            None,
+            None,
+            &active_host,
+            // launch_into_workspace is a fresh spawn — post-
+            // spawn detector handles the transcript path.
+            None,
         ) {
-            Ok(s) => {
-                let mut ts = make_simple_session_with_uid(
-                    session_uid,
-                    task_title,
-                    "claude",
-                    s,
-                    Some(pending),
-                );
-                ts.task_id = Some(task_id.to_string());
-                if !prompt.trim().is_empty() {
-                    ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
-                        prompt.to_string(),
-                        false,
-                        Duration::from_secs(1),
-                        Duration::from_secs(2),
-                        Duration::from_secs(60),
-                    ));
-                }
-                let si = self.workspaces[wi].sessions.len();
-                self.workspaces[wi].sessions.push(ts);
-
-                // The task may be in backlog (not yet in self.tasks because
-                // reconcile only pulls running/blocked). Upsert a stub with
-                // the workspace binding set; a later reconcile will fill in
-                // the remaining API fields without clobbering workspace_id.
-                if let Some(task) = self
-                    .tasks
-                    .iter_mut()
-                    .find(|t| t.task_id.as_deref() == Some(task_id))
-                {
-                    task.workspace_id = Some(workspace_id.to_string());
-                } else {
-                    self.tasks.push(TaskEntry {
-                        task_id: Some(task_id.to_string()),
-                        name: task_title.to_string(),
-                        api_status: TaskStatus::Running,
-                        repo_url: Some(task_repo_url.to_string()),
-                        prompt: Some(prompt.to_string()),
-                        wip_branch: None,
-                        session_id: None,
-                        blocked_at: None,
-                        is_cloud: false,
-                        workspace_id: Some(workspace_id.to_string()),
-                        // Same race fix as `launch_from_plan` — pin the
-                        // project synchronously from the planning row so
-                        // an early `create_subtask` inherits it.
-                        project: Some(project.to_string()),
-                        // Sub-2a Finding #2: pin the parent edge so the
-                        // first `push_task_tree_to_daemon` publishes the
-                        // correct subtask edge — pre-fix `None` here
-                        // showed the subtask as top-level on the daemon
-                        // until reconcile patched it.
-                        parent_task_id: parent_task_id.map(str::to_string),
-                        worktree_mode: WorktreeMode::Inherit,
-                        metadata: None,
-                    });
-                }
-                self.cursor = Cursor::Session(wi, si);
-                self.view_mode = ViewMode::Sessions;
-
-                let mut fields = std::collections::HashMap::new();
-                fields.insert(
-                    "status".to_string(),
-                    serde_json::Value::String("running".to_string()),
-                );
-                self.backend
-                    .update_plan_task(task_id.to_string(), fields);
-                self.save_session_manifest();
-                // Sub-2a Finding #1: same as `launch_from_plan`,
-                // a launch may have inserted a new TaskEntry.
-                self.push_state_to_daemon();
-                self.set_status_msg("Task launched into workspace");
-            }
-            Err(e) => {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 self.set_status_msg(&format!("Launch: {}", e));
+                return;
             }
+            None => {
+                self.set_status_msg(
+                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
+                );
+                return;
+            }
+        };
+        let mut ts = make_simple_session_with_uid(
+            session_uid,
+            task_title,
+            "claude",
+            new_sess,
+            Some(pending),
+        );
+        ts.task_id = Some(task_id.to_string());
+        ts.host_id = active_host.clone();
+        if !prompt.trim().is_empty() {
+            ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
+                prompt.to_string(),
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+            ));
         }
+        let si = self.workspaces[wi].sessions.len();
+        self.workspaces[wi].sessions.push(ts);
+
+        // The task may be in backlog (not yet in self.tasks because
+        // reconcile only pulls running/blocked). Upsert a stub with
+        // the workspace binding set; a later reconcile will fill in
+        // the remaining API fields without clobbering workspace_id.
+        if let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+        {
+            task.workspace_id = Some(workspace_id.to_string());
+        } else {
+            self.tasks.push(TaskEntry {
+                task_id: Some(task_id.to_string()),
+                name: task_title.to_string(),
+                api_status: TaskStatus::Running,
+                repo_url: Some(task_repo_url.to_string()),
+                prompt: Some(prompt.to_string()),
+                wip_branch: None,
+                session_id: None,
+                blocked_at: None,
+                is_cloud: false,
+                workspace_id: Some(workspace_id.to_string()),
+                // Same race fix as `launch_from_plan` — pin the
+                // project synchronously from the planning row so
+                // an early `create_subtask` inherits it.
+                project: Some(project.to_string()),
+                // Sub-2a Finding #2: pin the parent edge so the
+                // first `push_task_tree_to_daemon` publishes the
+                // correct subtask edge — pre-fix `None` here
+                // showed the subtask as top-level on the daemon
+                // until reconcile patched it.
+                parent_task_id: parent_task_id.map(str::to_string),
+                worktree_mode: WorktreeMode::Inherit,
+                metadata: None,
+            });
+        }
+        self.cursor = Cursor::Session(wi, si);
+        self.view_mode = ViewMode::Sessions;
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "status".to_string(),
+            serde_json::Value::String("running".to_string()),
+        );
+        self.backend
+            .update_plan_task(task_id.to_string(), fields);
+        self.save_session_manifest();
+        // Sub-2a Finding #1: same as `launch_from_plan`,
+        // a launch may have inserted a new TaskEntry.
+        self.push_state_to_daemon();
+        self.set_status_msg("Task launched into workspace");
     }
 
     /// Clear a task's workspace binding. Task status is left alone.
@@ -10753,7 +11304,7 @@ impl App {
                 InputMode::WorkflowPicker { names, selected, .. } => {
                     self.draw_workflow_picker(frame, area, names, *selected);
                 }
-                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot, goal } => {
+                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot, goal, .. } => {
                     self.draw_workflow_launch(
                         frame,
                         area,
@@ -11792,9 +12343,26 @@ impl App {
 impl App {
     /// Open the launch modal for a workflow, prefilled for the focused session.
     fn open_workflow_launch(&mut self) {
-        let (wi, focused_si) = match self.cursor.clone() {
-            Cursor::Session(wi, si) => (wi, Some(si)),
-            Cursor::Workspace(wi) => (wi, None),
+        // migrate-tui-local Issue I: capture the cursor's task
+        // scope alongside the workspace/session position. The
+        // launching task_id threads through the modal → submit
+        // action → `App::launch_workflow` → controller →
+        // daemon `start_session` so a UI A-f on a tasked cursor
+        // records `DaemonSession.task_id` for fresh
+        // participants. Pre-fix only `(ws_idx, focused_si)` was
+        // carried and the task scope was lost.
+        let (wi, focused_si, cursor_task_id) = match self.cursor.clone() {
+            Cursor::Session(wi, si) => {
+                // A focused session may itself be tagged with a
+                // task — capture that as the launching scope.
+                let task = self
+                    .workspaces
+                    .get(wi)
+                    .and_then(|w| w.sessions.get(si))
+                    .and_then(|ts| ts.task_id.clone());
+                (wi, Some(si), task)
+            }
+            Cursor::Workspace(wi) => (wi, None, None),
             Cursor::Task { ws_idx, task_id } => {
                 // Focus on the first running session of the task so the
                 // launch modal can prefill a reasonable worker slot.
@@ -11806,7 +12374,7 @@ impl App {
                             .iter()
                             .position(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
                     });
-                (ws_idx, si)
+                (ws_idx, si, Some(task_id))
             }
         };
         if wi >= self.workspaces.len() {
@@ -11832,7 +12400,12 @@ impl App {
                 ));
             }
             WorkflowLaunchRouting::LaunchOnly(only) => {
-                self.enter_workflow_launch_confirm(wi, focused_si, only);
+                self.enter_workflow_launch_confirm(
+                    wi,
+                    focused_si,
+                    only,
+                    cursor_task_id,
+                );
             }
             WorkflowLaunchRouting::OpenPicker(names) => {
                 self.input_mode = InputMode::WorkflowPicker {
@@ -11840,6 +12413,7 @@ impl App {
                     focused_si,
                     names,
                     selected: 0,
+                    cursor_task_id,
                 };
             }
         }
@@ -11848,11 +12422,17 @@ impl App {
     /// Build the per-role slot list for `wf_name` and enter the launch-confirm
     /// modal. Called both from the single-workflow fast path and after the
     /// user picks a workflow in `WorkflowPicker`.
+    ///
+    /// migrate-tui-local Issue I: `cursor_task_id` carries the
+    /// launching task scope into the confirm modal so the
+    /// downstream `SubmitAction::LaunchWorkflow` handler can
+    /// forward it into `App::launch_workflow`.
     fn enter_workflow_launch_confirm(
         &mut self,
         wi: usize,
         focused_si: Option<usize>,
         wf_name: String,
+        cursor_task_id: Option<String>,
     ) {
         let Some(wf) = self.workflows.get(&wf_name).cloned() else {
             self.set_status_msg(&format!(
@@ -11912,6 +12492,7 @@ impl App {
             slots,
             active_slot: 0,
             goal: String::new(),
+            cursor_task_id,
         };
     }
 
@@ -11920,15 +12501,23 @@ impl App {
     /// `workflow::controller::WorkflowControllerCtx::launch_workflow`; this is
     /// a thin dispatcher matching the F7 pattern (build the controller's
     /// reference bag, run it, apply the resulting actions).
+    ///
+    /// migrate-tui-local Issue G: `launching_task_id` is the task
+    /// the workflow descends from. UI `A-f` launches pass `None`
+    /// (workspace-scope); `start_workflow_run` passes the MCP-
+    /// supplied task. The controller threads this into
+    /// `spawn_workflow_session` so the daemon records
+    /// `DaemonSession.task_id` for fresh participants.
     fn launch_workflow(
         &mut self,
         ws_index: usize,
         workflow_name: &str,
         slots: Vec<WorkflowSlotChoice>,
         goal: Option<String>,
+        launching_task_id: Option<String>,
     ) {
-        self.run_workflow_controller(|ctx| {
-            ctx.launch_workflow(ws_index, workflow_name, slots, goal)
+        self.run_workflow_controller(move |ctx| {
+            ctx.launch_workflow(ws_index, workflow_name, slots, goal, launching_task_id)
         });
     }
 
@@ -11995,7 +12584,15 @@ impl App {
             return Err("workflow has no roles".into());
         }
         let count_before = self.workflow_runs.len();
-        self.launch_workflow(ws_index, workflow_name, slots, goal);
+        // migrate-tui-local Issue G: thread the launching
+        // task_id into launch_workflow so the controller's
+        // `spawn_workflow_session` can pass it down to the
+        // daemon helper. Pre-fix the daemon recorded
+        // `DaemonSession.task_id = None` for fresh participants;
+        // the launching agent's descendant-scope auth then
+        // rejected `list_sessions` / `read_session_output` /
+        // `send_input` against them.
+        self.launch_workflow(ws_index, workflow_name, slots, goal, task_id.clone());
         if self.workflow_runs.len() == count_before {
             return Err(self
                 .status_msg
@@ -12007,6 +12604,26 @@ impl App {
         // task_id. Same-pass: also bind every participant session in
         // this run to that task. Both are required for downstream
         // descendant auth.
+        //
+        // migrate-tui-local Issue G note: the fresh-participant
+        // case is now covered at spawn time — `task_id` was
+        // threaded into `launch_workflow` → controller →
+        // `spawn_workflow_session` → daemon `start_session`, so
+        // `DaemonSession.task_id` is recorded BEFORE the launching
+        // agent's next auth check. The loop below is still
+        // load-bearing for two cases the spawn-time path can't
+        // reach:
+        //   1. The `WorkflowRun.task_id` field on the run row
+        //      (workflow-level, not session-level).
+        //   2. Existing-slot participants — they were daemon-
+        //      spawned earlier (A-n/A-s) with whatever their
+        //      original task_id was. The loop overrides their
+        //      `TerminalSession.task_id` to the launching task
+        //      for sidebar grouping. The daemon-side
+        //      `DaemonSession.task_id` for those existing
+        //      participants stays at its original value — that's
+        //      a pre-existing TUI/daemon divergence; no `set_task_id`
+        //      RPC exists today.
         let run_idx = self.workflow_runs.len() - 1;
         let run_id = self.workflow_runs[run_idx].run_id.clone();
         if let Some(tid) = task_id.as_deref() {
@@ -17735,6 +18352,7 @@ mod input_handler_tests {
                 slots: &mut slots,
                 active_slot: &mut active,
                 goal: &mut goal,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Down),
@@ -17756,6 +18374,7 @@ mod input_handler_tests {
                 slots: &mut slots,
                 active_slot: &mut active,
                 goal: &mut goal,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Backspace),
@@ -17776,6 +18395,7 @@ mod input_handler_tests {
                 slots: &mut slots,
                 active_slot: &mut active,
                 goal: &mut goal,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -17786,6 +18406,7 @@ mod input_handler_tests {
                 workflow_name,
                 slots: launched_slots,
                 goal,
+                cursor_task_id: _,
             }) => {
                 assert_eq!(ws_index, 5);
                 assert_eq!(workflow_name, "feedback");
@@ -17808,6 +18429,7 @@ mod input_handler_tests {
                 slots: &mut slots,
                 active_slot: &mut active,
                 goal: &mut goal,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -17827,6 +18449,7 @@ mod input_handler_tests {
                 focused_si: None,
                 names: &names,
                 selected: &mut selected,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Char('j')),
@@ -17845,6 +18468,7 @@ mod input_handler_tests {
                 focused_si: Some(2),
                 names: &names,
                 selected: &mut selected,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -17854,6 +18478,7 @@ mod input_handler_tests {
                 ws_index,
                 focused_si,
                 workflow_name,
+                cursor_task_id: _,
             }) => {
                 assert_eq!(ws_index, 7);
                 assert_eq!(focused_si, Some(2));
@@ -17873,6 +18498,7 @@ mod input_handler_tests {
                 focused_si: None,
                 names: &names,
                 selected: &mut selected,
+                cursor_task_id: None,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -18896,8 +19522,11 @@ mod slice_12e_tests {
             );
         }
         // And the call sites pass &active_host (the snapshot).
+        // migrate-tui-local Issue 3: a `transcript_path` arg
+        // follows `&active_host,` now, so the needle is the
+        // snapshot reference alone (with trailing comma).
         assert!(
-            src.contains("&active_host,\n        ) {"),
+            src.contains("&active_host,"),
             "create_local_session must pass &active_host to \
              try_spawn_via_daemon",
         );
@@ -19168,59 +19797,57 @@ mod slice_12e_tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        // Structural pin: the interim fail-fast guard at the
-        // top of the function.
+        // migrate-tui-local: fresh-slot spawns now route
+        // through the daemon RPC (no more interim
+        // local-only fail-fast). The body MUST call the
+        // shared `try_spawn_via_daemon_with_deps` helper
+        // and tag the new TerminalSession with
+        // `self.active_host`.
         assert!(
-            body.contains(
-                "self.active_host != cm_daemon::host_id::HostId::local()",
-            ),
-            "spawn_workflow_session must fail fast when \
-             active_host is non-local (12e-r4 F1.3 interim); \
+            body.contains("try_spawn_via_daemon_with_deps("),
+            "spawn_workflow_session must call \
+             try_spawn_via_daemon_with_deps so the fresh \
+             participant is daemon-owned (migrate-tui-local); \
              body:\n{}",
             body,
         );
         assert!(
-            body.contains("A-f workflow launch on non-local active_host"),
-            "fail-fast log message must clearly name the \
-             unsupported case",
-        );
-
-        // The tag MUST be HostId::local() — the truthful
-        // signal at this slice. Pre-r4 it was
-        // `self.active_host.clone()` even though the spawn
-        // was always local.
-        assert!(
-            body.contains("host_id: cm_daemon::host_id::HostId::local()"),
-            "spawn_workflow_session MUST tag with \
-             HostId::local() (the truthful signal) until the \
-             follow-up slice adds controller-side daemon-spawn \
-             plumbing; body:\n{}",
+            body.contains("host_id: self.active_host.clone()"),
+            "spawn_workflow_session MUST tag the new \
+             TerminalSession with `self.active_host.clone()` \
+             — same value used to dial the daemon — so per-\
+             session RPCs target the correct daemon; body:\n{}",
             body,
         );
-        // And explicitly NOT active_host (regression pin —
-        // pre-r4 form).
+        // Regression pin: the pre-migrate fail-fast guard +
+        // mistagged HostId::local() literal MUST be gone.
         assert!(
-            !body.contains("host_id: self.active_host.clone()"),
-            "spawn_workflow_session MUST NOT tag with \
-             self.active_host while the spawn is still \
-             local-only (the round-3 form left the session \
-             mistagged remote/local-mismatch); body:\n{}",
+            !body.contains("self.active_host != cm_daemon::host_id::HostId::local()"),
+            "migrate-tui-local removed the interim non-local \
+             fail-fast; body still contains it:\n{}",
+            body,
+        );
+        assert!(
+            !body.contains("host_id: cm_daemon::host_id::HostId::local()"),
+            "migrate-tui-local removed the literal \
+             HostId::local() tag (the spawn now routes to \
+             active_host); body:\n{}",
             body,
         );
 
-        // Ctx-field pin (the controller carries active_host)
-        // — kept around for the future-spawn-routing fix.
+        // Ctx-field pin (the controller still carries
+        // active_host — the daemon-spawn helper reads it).
         assert!(
             ctrl.contains(
                 "pub active_host: cm_daemon::host_id::HostId",
             ),
             "WorkflowControllerCtx must continue to carry an \
-             active_host field — the future daemon-spawn \
-             plumbing reads it",
+             active_host field — the daemon-spawn helper \
+             reads it",
         );
 
-        // App-side caller snapshots active_host and passes it
-        // through (round-3 invariant; still required).
+        // App-side caller still snapshots active_host before
+        // constructing the ctx (round-3 invariant).
         let app = include_str!("app.rs");
         assert!(
             app.contains(
@@ -19265,13 +19892,21 @@ mod slice_12e_tests {
             norm_body,
         );
 
-        // Locate try_spawn_via_daemon body.
-        let sig = "pub fn try_spawn_via_daemon(";
-        let start = src.find(sig).expect("must find sig");
+        // migrate-tui-local: the daemon-routing body moved
+        // from `App::try_spawn_via_daemon` (which is now a
+        // thin wrapper) to the free helper
+        // `try_spawn_via_daemon_with_deps`. Inspect the free
+        // helper's body for the normalize-once / consult-
+        // internal-everywhere invariants.
+        let sig = "pub(crate) fn try_spawn_via_daemon_with_deps(";
+        let start = src.find(sig).expect(
+            "try_spawn_via_daemon_with_deps free helper must exist",
+        );
         let rest = &src[start..];
         let end = rest[1..]
-            .find("\n    pub fn ")
-            .or_else(|| rest[1..].find("\n    fn "))
+            .find("\npub ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .or_else(|| rest[1..].find("\nimpl "))
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -19282,7 +19917,7 @@ mod slice_12e_tests {
             body.contains(
                 "let internal_session_type = normalize_session_type_to_internal(session_type)",
             ),
-            "try_spawn_via_daemon must call \
+            "try_spawn_via_daemon_with_deps must call \
              normalize_session_type_to_internal ONCE at the \
              top and capture as `internal_session_type` \
              (12e-r5 F2); body:\n{}",
@@ -19310,10 +19945,7 @@ mod slice_12e_tests {
         );
 
         // Regression pin: no raw-`session_type` consumer
-        // remains for the cap-lookup. (The argv and wire
-        // matches already moved to `internal_session_type`
-        // explicitly above; this pins the cap-lookup site
-        // specifically, since that was the F2 regression.)
+        // remains for the cap-lookup.
         assert!(
             !body.contains("memory_cap_for(session_type)"),
             "memory_cap_for MUST NOT use the raw session_type \
@@ -19332,12 +19964,15 @@ mod slice_12e_tests {
     #[test]
     fn mcp_start_session_claude_code_uses_claude_memory_cap_env_vars() {
         let src = include_str!("app.rs");
-        let sig = "pub fn try_spawn_via_daemon(";
+        // migrate-tui-local: inspect the free helper, not the
+        // App method (which is now a thin wrapper).
+        let sig = "pub(crate) fn try_spawn_via_daemon_with_deps(";
         let start = src.find(sig).expect("must find sig");
         let rest = &src[start..];
         let end = rest[1..]
-            .find("\n    pub fn ")
-            .or_else(|| rest[1..].find("\n    fn "))
+            .find("\npub ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .or_else(|| rest[1..].find("\nimpl "))
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -19727,8 +20362,11 @@ mod slice_12e_tests {
         let guard_idx = body
             .find("guard_local_host_only(")
             .expect("guard call not found");
+        // migrate-tui-local: spawn_restored_session became a
+        // `&self` method so it can route claude/codex through the
+        // daemon RPC. Call shape moved from `Self::…(` to `self.…(`.
         let spawn_idx = body
-            .find("Self::spawn_restored_session(")
+            .find("self.spawn_restored_session(")
             .expect("spawn_restored_session call not found");
         assert!(
             guard_idx < spawn_idx,
@@ -20048,15 +20686,18 @@ remote_socket = "/remote/manager.sock"
         // Ordering: guard MUST precede the workspace lookup
         // + any spawn work. The guard short-circuits the
         // function on non-local active_host.
+        // migrate-tui-local: the spawn call shape moved from
+        // `self.spawn_agent_session(` (local PTY) to
+        // `self.try_spawn_via_daemon(` (daemon RPC).
         let guard_idx = body
             .find("guard_local_host_only(")
             .expect("guard call not found");
         let spawn_idx = body
-            .find("self.spawn_agent_session(")
-            .expect("spawn_agent_session call not found");
+            .find("self.try_spawn_via_daemon(")
+            .expect("try_spawn_via_daemon call not found");
         assert!(
             guard_idx < spawn_idx,
-            "guard must precede spawn_agent_session",
+            "guard must precede try_spawn_via_daemon",
         );
     }
 
@@ -20412,6 +21053,1847 @@ tls_fingerprint = "deadbeef"
             app.host_pool.for_host(&cm_daemon::host_id::HostId::local()).is_ok(),
             "host_pool MUST contain the local host that \
              active_host points to",
+        );
+    }
+}
+
+/// migrate-tui-local acceptance tests. Source-text pins for the
+/// named criteria in `doc/migrate-tui-local-spawn-decision.md`:
+/// every TuiLocal call site in production code is gone; spawn
+/// sites that previously called `spawn_agent_session` (the
+/// local-PTY path) now call `try_spawn_via_daemon`
+/// (or `try_spawn_via_daemon_with_deps` for the controller /
+/// free-function callers).
+#[cfg(test)]
+mod migrate_tui_local_tests {
+    /// T_migrate_no_tuilocal_sites_remain: no non-test code in
+    /// `tui/src/app.rs` or `tui/src/workflow/controller.rs`
+    /// references `SpawnTarget::TuiLocal`. Test fixtures may
+    /// still use the variant; the enum value stays in place
+    /// for future cloud-worker use.
+    #[test]
+    fn t_migrate_no_tuilocal_sites_remain() {
+        let app_src = include_str!("app.rs");
+        let ctrl_src = include_str!("workflow/controller.rs");
+
+        // Strip `#[cfg(test)]` test modules + the inline
+        // `mod tests` blocks so the scan is production-only.
+        // We walk the source and exclude any line inside an
+        // `#[cfg(test)] mod ...` block (depth-tracked).
+        let prod_only = |src: &str| -> String {
+            let mut out = String::new();
+            let mut in_test_mod = false;
+            let mut depth = 0i32;
+            for line in src.lines() {
+                if !in_test_mod {
+                    // Heuristic: a line that contains
+                    // `#[cfg(test)]` marks the START of a
+                    // test region. The next `mod ` (or `{`)
+                    // begins a brace-tracked block.
+                    if line.contains("#[cfg(test)]") {
+                        in_test_mod = true;
+                        // Don't include the attribute line.
+                        continue;
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+                } else {
+                    // Track braces inside the test block.
+                    let opens = line.matches('{').count() as i32;
+                    let closes = line.matches('}').count() as i32;
+                    depth += opens - closes;
+                    if depth <= 0 {
+                        in_test_mod = false;
+                        depth = 0;
+                    }
+                }
+            }
+            out
+        };
+
+        let app_prod = prod_only(app_src);
+        let ctrl_prod = prod_only(ctrl_src);
+
+        // The doc-comment + decision-doc references to
+        // `SpawnTarget::TuiLocal` ARE allowed (we keep them
+        // as historical context). The pin is on actual call
+        // sites — lines that pass the variant to a function.
+        let bad_pattern = "crate::mcp_config::SpawnTarget::TuiLocal,";
+        assert!(
+            !app_prod.contains(bad_pattern),
+            "tui/src/app.rs production code MUST NOT pass \
+             `crate::mcp_config::SpawnTarget::TuiLocal,` to \
+             any build_args call site — migrate-tui-local \
+             routes every spawn through SpawnTarget::Daemon.",
+        );
+        assert!(
+            !ctrl_prod.contains(bad_pattern),
+            "tui/src/workflow/controller.rs production code \
+             MUST NOT pass \
+             `crate::mcp_config::SpawnTarget::TuiLocal,` to \
+             any build_args call site.",
+        );
+    }
+
+    /// T_migrate_a_n_session_is_daemon_owned: the A-n /
+    /// `create_local_session` flow routes the spawn through
+    /// `try_spawn_via_daemon` (which produces a daemon-owned
+    /// session registered in `state.sessions`). Pin the
+    /// structural shape — the call exists and is reached on
+    /// the happy path.
+    #[test]
+    fn t_migrate_a_n_session_is_daemon_owned() {
+        let src = include_str!("app.rs");
+        let sig = "fn create_local_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("self.try_spawn_via_daemon("),
+            "create_local_session MUST call \
+             self.try_spawn_via_daemon to spawn the A-n \
+             session daemon-side; body:\n{}",
+            body,
+        );
+        // And the local-PTY fallback (spawn_agent_session) is
+        // either gone or only the "unreachable" branch.
+        assert!(
+            !body.contains("self.spawn_agent_session("),
+            "create_local_session MUST NOT call \
+             self.spawn_agent_session — migrate-tui-local \
+             removed the local-PTY fallback for the A-n \
+             daemon-eligible 'claude' path; body:\n{}",
+            body,
+        );
+    }
+
+    /// T_migrate_manifest_restore_produces_daemon_owned:
+    /// `spawn_restored_session` (the manifest-restore path)
+    /// routes claude/codex restores through the daemon RPC.
+    #[test]
+    fn t_migrate_manifest_restore_produces_daemon_owned() {
+        let src = include_str!("app.rs");
+        let sig = "fn spawn_restored_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("self.try_spawn_via_daemon("),
+            "spawn_restored_session MUST route claude/codex \
+             through self.try_spawn_via_daemon so restored \
+             sessions are daemon-owned; body:\n{}",
+            body,
+        );
+    }
+
+    /// T_migrate_workflow_respawn_produces_daemon_owned:
+    /// `respawn_existing_with_workflow_mcp` (the workflow
+    /// respawn lifecycle) routes through the daemon RPC.
+    #[test]
+    fn t_migrate_workflow_respawn_produces_daemon_owned() {
+        let src = include_str!("app.rs");
+        let sig = "pub(crate) fn respawn_existing_with_workflow_mcp(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .or_else(|| rest[1..].find("\nimpl "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("try_spawn_via_daemon_with_deps("),
+            "respawn_existing_with_workflow_mcp MUST call \
+             the daemon-routed spawn helper so the workflow \
+             role's replacement participant lands in \
+             state.sessions with workflow context bound at \
+             spawn time; body:\n{}",
+            body,
+        );
+        // Pin that kill-before-swap ordering remains.
+        let kill_idx = body
+            .find("kill_daemon_session_if_attached(host_pool, ts)")
+            .expect("kill_daemon_session_if_attached(host_pool, ts) call missing");
+        let swap_idx = body
+            .find("ts.session = new_sess")
+            .expect("ts.session = new_sess assignment missing");
+        assert!(
+            kill_idx < swap_idx,
+            "kill_daemon_session_if_attached MUST precede \
+             `ts.session = new_sess` (orphan-prevention \
+             ordering preserved across migrate-tui-local)",
+        );
+    }
+
+    /// T_migrate_spawn_resumed_session_passes_resume_arg:
+    /// `spawn_resumed_session` (A-l cloud-pull resume) calls
+    /// `try_spawn_via_daemon` with the session_id passed as
+    /// the `resume_session_id` argument. The daemon then
+    /// spawns `claude --resume <id>` so the daemon-registered
+    /// session's transcript_id matches the resumed id at
+    /// registration time.
+    #[test]
+    fn t_migrate_spawn_resumed_session_passes_resume_arg() {
+        let src = include_str!("app.rs");
+        let sig = "fn spawn_resumed_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        // Daemon-routed.
+        assert!(
+            body.contains("self.try_spawn_via_daemon("),
+            "spawn_resumed_session MUST call \
+             self.try_spawn_via_daemon (migrate-tui-local); \
+             body:\n{}",
+            body,
+        );
+        // Threads `Some(session_id.as_str())` as the resume
+        // argument.
+        assert!(
+            body.contains("Some(session_id.as_str())"),
+            "spawn_resumed_session MUST thread \
+             `Some(session_id.as_str())` to \
+             try_spawn_via_daemon's resume_session_id slot so \
+             the daemon spawns `claude --resume <id>` (no \
+             post-spawn /resume workaround); body:\n{}",
+            body,
+        );
+    }
+
+    /// T_migrate_bash_session_is_daemon_owned: A-s spawning a
+    /// `bash` session also routes through the daemon (the
+    /// daemon-side `is_valid_session_type` already accepts
+    /// "bash"; daemon's `mcp_config::build_args` maps
+    /// "bash" → ("/bin/bash", [])). `spawn_session_on_workspace`
+    /// passes session_type unchanged to try_spawn_via_daemon,
+    /// so bash is daemon-eligible too.
+    #[test]
+    fn t_migrate_bash_session_is_daemon_owned() {
+        let src = include_str!("app.rs");
+        // try_spawn_via_daemon_with_deps explicitly handles
+        // "bash" in its argv match — that's where bash gets
+        // its daemon eligibility.
+        let sig = "pub(crate) fn try_spawn_via_daemon_with_deps(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .or_else(|| rest[1..].find("\nimpl "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("\"bash\" => Ok((\"/bin/bash\".to_string(), Vec::new())),"),
+            "try_spawn_via_daemon_with_deps must accept \
+             session_type=\"bash\" and produce \
+             (\"/bin/bash\", []) argv so A-s bash sessions \
+             route through the daemon; body:\n{}",
+            body,
+        );
+
+        // And `spawn_session_on_workspace` passes
+        // session_type verbatim — i.e. it routes ALL types
+        // through try_spawn_via_daemon (no special-case for
+        // bash).
+        let sig2 = "fn spawn_session_on_workspace(";
+        let start2 = src.find(sig2).expect("must find sig2");
+        let rest2 = &src[start2..];
+        let end2 = rest2[1..]
+            .find("\n    fn ")
+            .or_else(|| rest2[1..].find("\n    pub fn "))
+            .or_else(|| rest2[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest2.len());
+        let body2 = &rest2[..end2];
+        assert!(
+            body2.contains("self.try_spawn_via_daemon("),
+            "spawn_session_on_workspace MUST call \
+             self.try_spawn_via_daemon for every session_type \
+             (claude / codex / bash); body:\n{}",
+            body2,
+        );
+    }
+
+    /// T_migrate_cross_route_refusal_unreachable_or_removed:
+    /// the daemon's "TUI-owned, can't be proxied" Conflict
+    /// refusal in `return_auth_error_if_denied_with_state` is
+    /// gone. The associated "post-Phase-1 cross-route work"
+    /// doc-comment is also removed.
+    #[test]
+    fn t_migrate_cross_route_refusal_unreachable_or_removed() {
+        let methods_src = include_str!("../../daemon/src/control/methods.rs");
+        assert!(
+            !methods_src.contains("is TUI-owned; the daemon does not"),
+            "daemon's cross-route refusal Conflict error MUST \
+             be removed post-migrate-tui-local — every \
+             session is now daemon-owned so the branch is \
+             unreachable",
+        );
+        assert!(
+            !methods_src.contains("post-Phase-1 cross-route"),
+            "daemon's `post-Phase-1 cross-route` doc-comment \
+             MUST be removed post-migrate-tui-local",
+        );
+    }
+
+    // ============================================================
+    // Reviewer-surfaced regressions
+    //
+    // These pins close the three correctness gaps the reviewer
+    // flagged after the initial migration landed:
+    //   1. manifest restore conflicting with surviving daemon
+    //      sessions — restore now attaches to live UIDs.
+    //   2. workflow env block dropped in the shared spawn helper
+    //      — `CM_WORKFLOW_RUN_ID` + `CM_ROLE` now land in the
+    //      spawned MCP server's env.
+    //   3. `transcript_path` hardcoded to None for resume/restore
+    //      — the helper accepts and forwards a caller-supplied
+    //      path so `resolve_authorized_session` resolves
+    //      immediately for already-known transcripts.
+    // ============================================================
+
+    /// `spawn_restored_session` must consult the live-daemon-UID
+    /// set: when the entry's UID is already in the daemon's
+    /// registry, route through the attach helper (no
+    /// `start_session`); otherwise fall through to the daemon-
+    /// spawn path. Pre-fix the restore unconditionally called
+    /// `start_session` and the daemon's collision guard dropped
+    /// the survivor.
+    #[test]
+    fn t_migrate_manifest_restore_attaches_to_live_daemon_session() {
+        let src = include_str!("app.rs");
+
+        // The function signature MUST accept the live UID set.
+        let sig = "fn spawn_restored_session(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let body_open = rest.find('{').expect("body open brace");
+        let after_sig = &rest[..body_open];
+        assert!(
+            after_sig.contains("live_daemon_uids: &std::collections::HashSet<String>")
+                || after_sig.contains("live_daemon_uids: &HashSet<String>"),
+            "spawn_restored_session must accept the live-daemon-UID \
+             set so it can dispatch attach-vs-spawn (Issue 1); \
+             signature header:\n{}",
+            after_sig,
+        );
+
+        // Bound the body and verify both branches exist.
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Attach branch: `live_daemon_uids.contains(...)` gate
+        // followed by a call to the attach helper.
+        let gate_idx = body
+            .find("live_daemon_uids.contains(")
+            .expect("missing live_daemon_uids.contains() guard");
+        let attach_idx = body
+            .find("try_attach_via_daemon_with_deps(")
+            .expect("missing try_attach_via_daemon_with_deps() call");
+        let spawn_idx = body
+            .find("self.try_spawn_via_daemon(")
+            .expect("missing self.try_spawn_via_daemon() fallback");
+        assert!(
+            gate_idx < attach_idx,
+            "the live-UID gate MUST precede the attach call (Issue 1); \
+             gate at {}, attach at {}, body:\n{}",
+            gate_idx,
+            attach_idx,
+            body,
+        );
+        assert!(
+            attach_idx < spawn_idx,
+            "the attach branch MUST appear before the spawn fallback so \
+             the attach path wins when the UID is live (Issue 1); attach at \
+             {}, spawn at {}, body:\n{}",
+            attach_idx,
+            spawn_idx,
+            body,
+        );
+
+        // restore_sessions probes the daemon ONCE up front via
+        // `rpc_list_session_uids` and threads the set through.
+        let restore_src_idx = src.find("fn restore_sessions(").expect("restore_sessions exists");
+        let restore_rest = &src[restore_src_idx..];
+        let restore_end = restore_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| restore_rest[1..].find("\n    pub fn "))
+            .or_else(|| restore_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(restore_rest.len());
+        let restore_body = &restore_rest[..restore_end];
+        assert!(
+            restore_body.contains("rpc_list_session_uids("),
+            "restore_sessions MUST probe the daemon via \
+             rpc_list_session_uids before the spawn loop \
+             (Issue 1); restore_sessions body excerpt:\n{}",
+            &restore_body[..restore_body.len().min(2000)],
+        );
+        assert!(
+            restore_body.contains("let live_daemon_uids:"),
+            "restore_sessions MUST bind the probe result as \
+             `live_daemon_uids` (Issue 1); restore_sessions body \
+             excerpt:\n{}",
+            &restore_body[..restore_body.len().min(2000)],
+        );
+
+        // And `attach_existing` exists on ClientSession with the
+        // expected shape.
+        let cs_src = include_str!("client_session.rs");
+        assert!(
+            cs_src.contains("pub fn attach_existing("),
+            "ClientSession::attach_existing must exist so the \
+             restore path can skip start_session (Issue 1)",
+        );
+        // And the daemon-list probe helper exists on the wire.
+        assert!(
+            cs_src.contains("pub fn rpc_list_session_uids("),
+            "rpc_list_session_uids must exist so restore can \
+             probe the daemon (Issue 1)",
+        );
+    }
+
+    /// The shared `try_spawn_via_daemon_with_deps` helper must
+    /// wire `workflow_run_id` / `workflow_role` into the
+    /// `mcp_config::build_args` workflow argument so the spawned
+    /// MCP server receives `CM_WORKFLOW_RUN_ID` + `CM_ROLE` in its
+    /// env. Pre-fix the helper passed `None` to build_args and
+    /// `workflow_transition` / `workflow_done` from a respawned
+    /// workflow participant fell through unknown.
+    #[test]
+    fn t_migrate_workflow_respawn_passes_workflow_env() {
+        let src = include_str!("app.rs");
+
+        // Locate the helper body.
+        let sig = "pub(crate) fn try_spawn_via_daemon_with_deps(";
+        let start = src.find(sig).expect("must find sig");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .or_else(|| rest[1..].find("\nimpl "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // The helper MUST construct a WorkflowMeta from the
+        // (workflow_run_id, workflow_role) tuple and pass it to
+        // build_args.
+        assert!(
+            body.contains("crate::mcp_config::WorkflowMeta { run_id, role }"),
+            "try_spawn_via_daemon_with_deps MUST construct a \
+             WorkflowMeta from the workflow_run_id/workflow_role \
+             pair (Issue 2); body excerpt:\n{}",
+            &body[..body.len().min(2000)],
+        );
+        // And the build_args calls MUST forward `workflow_meta`
+        // (NOT `None`) so build_env puts CM_WORKFLOW_RUN_ID +
+        // CM_ROLE into the MCP server's env.
+        let claude_call_idx = body
+            .find("Engine::ClaudeCode,")
+            .expect("missing Engine::ClaudeCode arm");
+        let codex_call_idx = body
+            .find("Engine::Codex,")
+            .expect("missing Engine::Codex arm");
+        // After each engine line, check that `workflow_meta.clone()` (NOT `None`) appears.
+        let claude_slice = &body[claude_call_idx..claude_call_idx + 300];
+        let codex_slice = &body[codex_call_idx..codex_call_idx + 300];
+        assert!(
+            claude_slice.contains("workflow_meta.clone()"),
+            "Engine::ClaudeCode build_args call MUST pass \
+             `workflow_meta.clone()` to build_args (Issue 2); \
+             pre-fix it passed `None` and CM_WORKFLOW_RUN_ID was \
+             dropped from the env; slice:\n{}",
+            claude_slice,
+        );
+        assert!(
+            codex_slice.contains("workflow_meta.clone()"),
+            "Engine::Codex build_args call MUST pass \
+             `workflow_meta.clone()` to build_args (Issue 2); \
+             slice:\n{}",
+            codex_slice,
+        );
+
+        // build_env (in mcp_config) sets CM_WORKFLOW_RUN_ID +
+        // CM_ROLE when WorkflowMeta is Some. Pin that contract
+        // hasn't drifted.
+        let mcp_src = include_str!("mcp_config.rs");
+        assert!(
+            mcp_src.contains("CM_WORKFLOW_RUN_ID"),
+            "mcp_config::build_env must set CM_WORKFLOW_RUN_ID \
+             so the spawned MCP server reads it from env",
+        );
+        assert!(
+            mcp_src.contains("CM_ROLE"),
+            "mcp_config::build_env must set CM_ROLE so the \
+             spawned MCP server reads it from env",
+        );
+    }
+
+    /// `spawn_resumed_session` (A-l cloud-pull resume) and
+    /// `spawn_restored_session` (manifest restore for known
+    /// transcript_ids) MUST thread the pre-known transcript path
+    /// to the daemon (not `None`), so the daemon's
+    /// `resolve_authorized_session` resolves immediately and MCP
+    /// `read_session_output` can read the restored transcript.
+    #[test]
+    fn t_migrate_resume_path_registers_transcript_with_daemon() {
+        let src = include_str!("app.rs");
+
+        // pre_spawn_transcript_path helper exists with the
+        // claude-deterministic-path semantics.
+        assert!(
+            src.contains("fn pre_spawn_transcript_path("),
+            "pre_spawn_transcript_path helper must exist so \
+             resume/restore sites can pass the daemon a known \
+             path at spawn time (Issue 3)",
+        );
+
+        // spawn_resumed_session body computes the path and
+        // threads it.
+        let sig = "fn spawn_resumed_session(";
+        let start = src.find(sig).expect("must find spawn_resumed_session");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("let pre_spawn_transcript ="),
+            "spawn_resumed_session MUST compute `pre_spawn_transcript` \
+             before try_spawn_via_daemon (Issue 3); body excerpt:\n{}",
+            &body[..body.len().min(1500)],
+        );
+        assert!(
+            body.contains("pre_spawn_transcript_path(\"claude\", &worktree_path,"),
+            "spawn_resumed_session MUST call pre_spawn_transcript_path \
+             with \"claude\" + worktree + session_id (Issue 3); body \
+             excerpt:\n{}",
+            &body[..body.len().min(1500)],
+        );
+        assert!(
+            body.contains("pre_spawn_transcript.as_deref()"),
+            "spawn_resumed_session MUST thread the computed \
+             transcript path through to try_spawn_via_daemon \
+             (Issue 3); body excerpt:\n{}",
+            &body[..body.len().min(1500)],
+        );
+
+        // spawn_restored_session for known transcript_ids does
+        // the same.
+        let sig2 = "fn spawn_restored_session(";
+        let start2 = src.find(sig2).expect("must find spawn_restored_session");
+        let rest2 = &src[start2..];
+        let end2 = rest2[1..]
+            .find("\n    fn ")
+            .or_else(|| rest2[1..].find("\n    pub fn "))
+            .or_else(|| rest2[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest2.len());
+        let body2 = &rest2[..end2];
+        assert!(
+            body2.contains("pre_spawn_transcript_path(&entry.session_type"),
+            "spawn_restored_session MUST call pre_spawn_transcript_path \
+             with the entry's session_type when the manifest entry has a \
+             known transcript_id (Issue 3); body excerpt:\n{}",
+            &body2[..body2.len().min(1500)],
+        );
+        assert!(
+            body2.contains("pre_spawn_transcript.as_deref()"),
+            "spawn_restored_session MUST thread the computed path \
+             through to BOTH the attach and spawn branches (Issue \
+             3); body excerpt:\n{}",
+            &body2[..body2.len().min(1500)],
+        );
+
+        // The helper's signature MUST end with the transcript_path arg.
+        let helper_sig_idx = src
+            .find("pub(crate) fn try_spawn_via_daemon_with_deps(")
+            .expect("helper must exist");
+        let helper_rest = &src[helper_sig_idx..];
+        let helper_open = helper_rest.find('{').expect("helper body open");
+        let helper_header = &helper_rest[..helper_open];
+        assert!(
+            helper_header.contains("transcript_path: Option<&str>"),
+            "try_spawn_via_daemon_with_deps MUST accept a \
+             `transcript_path: Option<&str>` argument (Issue 3); \
+             signature header:\n{}",
+            helper_header,
+        );
+
+        // And the helper forwards it (not `None`) into the
+        // ClientSessionConfig.
+        let helper_end = helper_rest[1..]
+            .find("\npub ")
+            .or_else(|| helper_rest[1..].find("\nfn "))
+            .or_else(|| helper_rest[1..].find("\nimpl "))
+            .map(|i| 1 + i)
+            .unwrap_or(helper_rest.len());
+        let helper_body = &helper_rest[..helper_end];
+        assert!(
+            !helper_body.contains("transcript_path: None,"),
+            "try_spawn_via_daemon_with_deps MUST NOT hardcode \
+             `transcript_path: None` in the ClientSessionConfig \
+             — that was the Issue 3 regression. The helper must \
+             forward the caller-supplied `transcript_path` arg.",
+        );
+        assert!(
+            helper_body.contains("transcript_path,\n        workflow_run_id,")
+                || helper_body.contains("transcript_path,"),
+            "try_spawn_via_daemon_with_deps MUST forward \
+             `transcript_path` into the ClientSessionConfig \
+             (Issue 3)",
+        );
+    }
+
+    /// migrate-tui-local Issue A: the live-daemon-UID probe MUST
+    /// filter out rows backed only by `state.tui_sessions`. Pre-
+    /// fix the probe took the unfiltered `list_sessions` array
+    /// (which mixes daemon-owned + TUI-pushed snapshot rows), so
+    /// a stale snapshot row from a previous TUI process tricked
+    /// `spawn_restored_session` into the attach branch; the
+    /// attach RPC then failed (no live PTY behind the snapshot)
+    /// and the manifest entry was silently dropped.
+    ///
+    /// Pinned via two complementary checks:
+    ///   1. `rpc_list_session_uids` passes
+    ///      `{ "daemon_owned_only": true }` so the daemon-side
+    ///      filter fires.
+    ///   2. The daemon's `list_sessions` handler honors
+    ///      `daemon_owned_only` and short-circuits before the
+    ///      TUI-snapshot loop when set.
+    #[test]
+    fn t_migrate_restore_probe_excludes_tui_session_rows() {
+        // 1. TUI-side: rpc_list_session_uids passes the filter
+        // flag.
+        let cs_src = include_str!("client_session.rs");
+        let helper_idx = cs_src
+            .find("pub fn rpc_list_session_uids(")
+            .expect("rpc_list_session_uids must exist");
+        let helper_rest = &cs_src[helper_idx..];
+        let helper_end = helper_rest[1..]
+            .find("\npub ")
+            .or_else(|| helper_rest[1..].find("\nfn "))
+            .map(|i| 1 + i)
+            .unwrap_or(helper_rest.len());
+        let helper_body = &helper_rest[..helper_end];
+        assert!(
+            helper_body.contains("\"daemon_owned_only\": true"),
+            "rpc_list_session_uids MUST pass \
+             `{{ \"daemon_owned_only\": true }}` to list_sessions \
+             (Issue A) so stale tui_sessions snapshot rows from a \
+             prior TUI process don't show up as attachable. \
+             body:\n{}",
+            helper_body,
+        );
+
+        // 2. Daemon-side: list_sessions handler honors the flag.
+        let methods_src = include_str!("../../daemon/src/control/methods.rs");
+        // The flag MUST exist on the params struct.
+        assert!(
+            methods_src.contains("daemon_owned_only: bool"),
+            "daemon's ListSessionsParams MUST carry a \
+             `daemon_owned_only: bool` field (Issue A)",
+        );
+        // And the handler MUST short-circuit before the
+        // state.tui_sessions loop when the flag is set.
+        let handler_idx = methods_src
+            .find("pub fn list_sessions(")
+            .expect("daemon list_sessions handler must exist");
+        let handler_rest = &methods_src[handler_idx..];
+        let handler_end = handler_rest[1..]
+            .find("\npub fn ")
+            .or_else(|| handler_rest[1..].find("\nfn "))
+            .map(|i| 1 + i)
+            .unwrap_or(handler_rest.len());
+        let handler_body = &handler_rest[..handler_end];
+        // Find the short-circuit gate AND the tui_sessions loop.
+        let gate_idx = handler_body
+            .find("if p.daemon_owned_only")
+            .expect("missing `if p.daemon_owned_only` gate");
+        let tui_loop_idx = handler_body
+            .find("for (uid, snap) in state.tui_sessions.iter()")
+            .expect("missing tui_sessions loop");
+        assert!(
+            gate_idx < tui_loop_idx,
+            "the `daemon_owned_only` short-circuit MUST precede \
+             the state.tui_sessions loop (Issue A); gate at {}, \
+             loop at {}",
+            gate_idx,
+            tui_loop_idx,
+        );
+        // And the short-circuit MUST early-return.
+        let gate_slice = &handler_body[gate_idx..tui_loop_idx];
+        assert!(
+            gate_slice.contains("return Ok(Value::Array(sessions))"),
+            "the daemon_owned_only branch MUST early-return the \
+             daemon-owned rows before falling into the \
+             state.tui_sessions loop; gate-to-loop slice:\n{}",
+            gate_slice,
+        );
+    }
+
+    /// migrate-tui-local Issue B: `spawn_resumed_session`
+    /// always materializes a local replacement workspace from a
+    /// locally-pulled worktree. The daemon spawn + TerminalSession
+    /// host tag MUST be pinned to `HostId::local()` — NOT
+    /// `self.active_host`. Otherwise a concurrent A-H cycle
+    /// between pull-start and PullComplete sends the local
+    /// filesystem path to a remote daemon and mistags the new
+    /// workspace.
+    #[test]
+    fn t_migrate_spawn_resumed_session_pins_local_host() {
+        let src = include_str!("app.rs");
+        let sig = "fn spawn_resumed_session(";
+        let start = src.find(sig).expect("must find spawn_resumed_session");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // The host snapshot MUST be HostId::local(), not
+        // self.active_host.
+        assert!(
+            body.contains("let host_snapshot = cm_daemon::host_id::HostId::local();"),
+            "spawn_resumed_session MUST pin its host snapshot to \
+             `HostId::local()` because the cloud-pull replacement \
+             workspace is always local-side (Issue B); body \
+             excerpt:\n{}",
+            &body[..body.len().min(2000)],
+        );
+        // And MUST NOT bind `self.active_host` to the host
+        // snapshot — that's the pre-fix race-prone form.
+        assert!(
+            !body.contains("let active_host = self.active_host.clone();"),
+            "spawn_resumed_session MUST NOT snapshot \
+             `self.active_host` (Issue B regression pin) — a \
+             concurrent A-H cycle between pull-start and \
+             PullComplete would otherwise mistag the new local \
+             workspace. body excerpt:\n{}",
+            &body[..body.len().min(2000)],
+        );
+        // And the daemon dial + ts.host_id assignment MUST use
+        // host_snapshot.
+        assert!(
+            body.contains("&host_snapshot,"),
+            "spawn_resumed_session MUST pass `&host_snapshot` to \
+             try_spawn_via_daemon (Issue B); body excerpt:\n{}",
+            &body[..body.len().min(2000)],
+        );
+        assert!(
+            body.contains("ts.host_id = host_snapshot.clone();"),
+            "spawn_resumed_session MUST tag the new \
+             TerminalSession with `host_snapshot` (Issue B); body \
+             excerpt:\n{}",
+            &body[..body.len().min(2000)],
+        );
+        // Doc-comment pin: the why is on-record so a future
+        // refactor doesn't reintroduce the active_host form.
+        assert!(
+            body.contains("cloud-pull"),
+            "spawn_resumed_session MUST document why the host is \
+             pinned local (cloud-pull replacement workspace is \
+             always local-side, Issue B); body excerpt:\n{}",
+            &body[..body.len().min(2000)],
+        );
+    }
+
+    /// migrate-tui-local Issue C: every daemon-routed spawn site
+    /// that builds local-only paths (worktree from local
+    /// filesystem, `~/.cm/mcp/...` config) MUST gate on
+    /// `guard_local_host_only` BEFORE the
+    /// `try_spawn_via_daemon` / `try_spawn_via_daemon_with_deps`
+    /// call. Pre-fix four sites slipped through the migration
+    /// and silently sent local paths to remote daemons when the
+    /// user cycled `A-H` away from `local`.
+    ///
+    /// Pin: in each function's body, `guard_local_host_only(`
+    /// must appear AND precede the daemon-spawn call.
+    #[test]
+    fn t_migrate_local_only_paths_guard_active_host() {
+        let app_src = include_str!("app.rs");
+        let ctrl_src = include_str!("workflow/controller.rs");
+
+        // (source, function name, spawn-call needle, src for
+        // error messages).
+        let sites: &[(&str, &str, &str)] = &[
+            // app.rs: restore_tombstones_for_workspace.
+            ("fn restore_tombstones_for_workspace(", "restore_tombstones_for_workspace", "self.try_spawn_via_daemon("),
+            // app.rs: resurrect_designer_sessions_for_workspace.
+            ("fn resurrect_designer_sessions_for_workspace(", "resurrect_designer_sessions_for_workspace", "self.try_spawn_via_daemon("),
+            // app.rs: attach_active.
+            ("fn attach_active(&mut self)", "attach_active", "self.try_spawn_via_daemon("),
+        ];
+        for (sig, name, spawn_needle) in sites {
+            let start = app_src.find(sig).unwrap_or_else(|| {
+                panic!("{}: function signature {:?} not found", name, sig)
+            });
+            let rest = &app_src[start..];
+            let end = rest[1..]
+                .find("\n    fn ")
+                .or_else(|| rest[1..].find("\n    pub fn "))
+                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .map(|i| 1 + i)
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            let guard_idx = body.find("guard_local_host_only(").unwrap_or_else(|| {
+                panic!(
+                    "{} MUST call guard_local_host_only(...) (Issue C); \
+                     body excerpt:\n{}",
+                    name,
+                    &body[..body.len().min(1500)],
+                )
+            });
+            let spawn_idx = body.find(spawn_needle).unwrap_or_else(|| {
+                panic!(
+                    "{} expected to contain {:?}; body excerpt:\n{}",
+                    name,
+                    spawn_needle,
+                    &body[..body.len().min(1500)],
+                )
+            });
+            assert!(
+                guard_idx < spawn_idx,
+                "{}: guard_local_host_only at byte {} MUST precede \
+                 the daemon-spawn call at byte {} (Issue C); body \
+                 excerpt:\n{}",
+                name,
+                guard_idx,
+                spawn_idx,
+                &body[..body.len().min(1500)],
+            );
+        }
+
+        // workflow/controller.rs: spawn_workflow_session.
+        let sig = "fn spawn_workflow_session(";
+        let start = ctrl_src.find(sig).expect("spawn_workflow_session must exist");
+        let rest = &ctrl_src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        let guard_idx = body
+            .find("crate::app::guard_local_host_only(")
+            .expect(
+                "spawn_workflow_session MUST call \
+                 crate::app::guard_local_host_only — same helper \
+                 every other entry point uses, no hand-rolled \
+                 fail-fast (Issue C)",
+            );
+        let spawn_idx = body
+            .find("try_spawn_via_daemon_with_deps(")
+            .expect("spawn_workflow_session must call the helper");
+        assert!(
+            guard_idx < spawn_idx,
+            "controller's spawn_workflow_session: guard at byte {} \
+             MUST precede try_spawn_via_daemon_with_deps at byte \
+             {} (Issue C)",
+            guard_idx,
+            spawn_idx,
+        );
+    }
+
+    /// migrate-tui-local Issue D: when `spawn_restored_session`
+    /// takes the ATTACH branch (daemon already has the UID), the
+    /// daemon-side `DaemonSession` may be missing the manifest's
+    /// `transcript_path` / workflow tags (e.g. the post-spawn
+    /// detector hadn't fired before the original TUI exited).
+    /// The shared `try_attach_via_daemon_with_deps` helper MUST
+    /// push those fields via the existing setter RPCs after the
+    /// attach succeeds — otherwise `resolve_authorized_session`
+    /// keeps returning `pending` and MCP `read_session_output`
+    /// fails.
+    ///
+    /// `task_id` has no setter and is intentionally not pushed
+    /// (the daemon preserves it across TUI restart since
+    /// `state.sessions` is daemon-owned).
+    #[test]
+    fn t_migrate_attach_branch_pushes_manifest_metadata() {
+        let src = include_str!("app.rs");
+        let sig = "pub(crate) fn try_attach_via_daemon_with_deps(";
+        let start = src.find(sig).expect("must find try_attach_via_daemon_with_deps");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .or_else(|| rest[1..].find("\nimpl "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // After the attach call, the helper must invoke the
+        // existing setter RPCs.
+        let attach_idx = body
+            .find("Session::new_attached_existing(")
+            .expect("attach RPC call site missing");
+        let set_transcript_idx = body
+            .find("rpc_set_transcript_path(")
+            .expect(
+                "try_attach_via_daemon_with_deps MUST call \
+                 rpc_set_transcript_path after attach (Issue D)",
+            );
+        let set_workflow_idx = body
+            .find("rpc_set_workflow_context(")
+            .expect(
+                "try_attach_via_daemon_with_deps MUST call \
+                 rpc_set_workflow_context after attach (Issue D)",
+            );
+        assert!(
+            attach_idx < set_transcript_idx,
+            "rpc_set_transcript_path MUST be invoked AFTER the \
+             attach call (Issue D); attach at {}, push at {}",
+            attach_idx,
+            set_transcript_idx,
+        );
+        assert!(
+            attach_idx < set_workflow_idx,
+            "rpc_set_workflow_context MUST be invoked AFTER the \
+             attach call (Issue D); attach at {}, push at {}",
+            attach_idx,
+            set_workflow_idx,
+        );
+
+        // Transcript-path push: conditional, gated on Some so
+        // the daemon's existing value isn't clobbered (Issue D).
+        let set_tp_slice =
+            &body[set_transcript_idx.saturating_sub(200)..set_transcript_idx];
+        assert!(
+            set_tp_slice.contains("if let Some(tp) = transcript_path"),
+            "rpc_set_transcript_path MUST be gated on \
+             `transcript_path.is_some()` so the daemon's existing \
+             value isn't clobbered with None (Issue D); slice:\n{}",
+            set_tp_slice,
+        );
+
+        // migrate-tui-local Issue E: workflow-context push must
+        // cover BOTH the set direction `(Some, Some)` AND the
+        // clear direction `(None, None)`. Pre-fix only `(Some,
+        // Some)` pushed and stale daemon-side workflow tags
+        // kept authorizing workflow operations against the
+        // wrong (Detached/Done) run. Half-tagged inputs MUST
+        // early-skip and log — daemon contract rejects partial
+        // tuples.
+        //
+        // Pin shape: the push lives inside a `match
+        // (workflow_run_id, workflow_role)` whose set/clear
+        // arms call `rpc_set_workflow_context` and whose `_`
+        // arm logs + skips.
+        let wf_match_idx = body
+            .find("match (workflow_run_id, workflow_role)")
+            .expect(
+                "try_attach_via_daemon_with_deps MUST dispatch \
+                 the workflow push via `match (workflow_run_id, \
+                 workflow_role)` (Issue E)",
+            );
+        // Slice from the match through the rpc_set call (gives
+        // us all four arms — they're packed tight).
+        let wf_match_end = body[wf_match_idx..]
+            .find("}\n    }\n")
+            .map(|i| wf_match_idx + i + 8)
+            .unwrap_or(body.len());
+        let wf_match_slice = &body[wf_match_idx..wf_match_end];
+        assert!(
+            wf_match_slice.contains("(Some(_), Some(_)) | (None, None)"),
+            "the workflow match MUST include both the set arm \
+             `(Some(_), Some(_))` AND the clear arm `(None, \
+             None)` so a `restore_sessions` untag (manifest \
+             None, daemon Some) clears the stale tags (Issue \
+             E); slice:\n{}",
+            wf_match_slice,
+        );
+        // Half-tagged arm: must NOT push, must log.
+        assert!(
+            wf_match_slice.contains("_ =>"),
+            "the workflow match MUST have a half-tagged catch-\
+             all arm that skips the push (Issue E); slice:\n{}",
+            wf_match_slice,
+        );
+        // Count: rpc_set_workflow_context must appear ONCE
+        // inside the match (in the set/clear arm). The catch-
+        // all arm must NOT call the setter.
+        let push_count = wf_match_slice.matches("rpc_set_workflow_context(").count();
+        assert_eq!(
+            push_count, 1,
+            "rpc_set_workflow_context MUST be invoked exactly \
+             once inside the workflow match — only the \
+             (Some,Some)|(None,None) arm pushes; the half-tagged \
+             arm logs and skips (Issue E). got count: {}",
+            push_count,
+        );
+        // The half-tagged arm carries a skip-and-log message —
+        // pin its presence so future refactors can't silently
+        // swallow the half-tagged signal.
+        let half_marker = body[wf_match_idx..]
+            .find("half-tagged workflow state");
+        assert!(
+            half_marker.is_some(),
+            "the half-tagged catch-all arm MUST log \
+             `half-tagged workflow state` so an operator can \
+             diagnose a corrupted manifest entry (Issue E); \
+             slice:\n{}",
+            wf_match_slice,
+        );
+    }
+
+    /// migrate-tui-local Issue F: the live-daemon-UID set
+    /// returned by `rpc_list_session_uids` is a snapshot. The
+    /// daemon's session can exit between the probe and the
+    /// `session.attach` call. Pre-fix the attach branch used
+    /// `result.ok()?` on the attach result, so an attach Err
+    /// would `return None` and silently drop the manifest entry
+    /// from `ws.sessions` — a subsequent save then lost it
+    /// permanently.
+    ///
+    /// Required shape: in `spawn_restored_session`, the
+    /// attach-Err case must fall through to the spawn helper
+    /// with the same args (the daemon raced into a "no live
+    /// session for this UID" state, so respawn is the right
+    /// next step). And that Err case must be STRUCTURALLY
+    /// DISTINCT from the "UID not in live set" arm — the test
+    /// pin counts both arms separately so a future refactor
+    /// that collapses them into the bare `result.ok()?` form
+    /// trips this test.
+    #[test]
+    fn t_migrate_attach_failure_falls_back_to_spawn() {
+        let src = include_str!("app.rs");
+        let sig = "fn spawn_restored_session(";
+        let start = src.find(sig).expect("must find spawn_restored_session");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .or_else(|| rest[1..].find("\n    pub fn "))
+            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // The attach result must be bound (not stored directly
+        // as the function-level `result` via the previous
+        // `if/else`-yielded shape — that shape can't fall
+        // through to spawn on attach Err).
+        let attach_call_idx = body
+            .find("Some(try_attach_via_daemon_with_deps(")
+            .expect(
+                "spawn_restored_session MUST wrap the attach \
+                 call in `Some(try_attach_via_daemon_with_deps(\
+                 ...))` so the attach Err can be matched and \
+                 fallen-through (Issue F)",
+            );
+        let match_idx = body
+            .find("match attach_result {")
+            .expect(
+                "spawn_restored_session MUST dispatch attach \
+                 outcome via `match attach_result {` so the Err \
+                 arm can fall back to spawn (Issue F)",
+            );
+        assert!(
+            attach_call_idx < match_idx,
+            "the attach call MUST precede the match on its \
+             result (Issue F); attach at {}, match at {}",
+            attach_call_idx,
+            match_idx,
+        );
+
+        // The attach-failure arm (`Some(Err(...))`) MUST call
+        // `self.try_spawn_via_daemon(` — not just propagate
+        // Err. The "UID not in live set" arm (`None`) also
+        // calls the same helper, but in a separate match arm.
+        // Count: spawn helper called TWICE inside the match —
+        // once per non-Ok arm.
+        let match_end = body[match_idx..]
+            .find("\n        } else {")
+            .map(|i| match_idx + i)
+            .unwrap_or(body.len());
+        let match_slice = &body[match_idx..match_end];
+        let spawn_calls = match_slice.matches("self.try_spawn_via_daemon(").count();
+        assert_eq!(
+            spawn_calls, 2,
+            "spawn_restored_session's attach-result match MUST \
+             call `self.try_spawn_via_daemon(` in TWO separate \
+             arms — `Some(Err(...))` (attach raced) and `None` \
+             (UID not in live set). Pre-fix the Err arm used \
+             `result.ok()?` and dropped the manifest entry. \
+             got count: {}\n\nmatch slice:\n{}",
+            spawn_calls,
+            match_slice,
+        );
+
+        // Both non-Ok arms must be structurally present.
+        assert!(
+            match_slice.contains("Some(Err(attach_err)) =>")
+                || match_slice.contains("Some(Err(e)) =>"),
+            "spawn_restored_session MUST have an explicit \
+             `Some(Err(...))` arm that falls back to spawn \
+             (Issue F); match slice:\n{}",
+            match_slice,
+        );
+        assert!(
+            match_slice.contains("None =>"),
+            "spawn_restored_session MUST keep the explicit \
+             `None =>` arm so the 'UID not in live set' path \
+             stays structurally distinct from the attach-Err \
+             arm (Issue F); match slice:\n{}",
+            match_slice,
+        );
+
+        // The attach-Err arm logs the race — a future
+        // refactor that silently swallows the Err would trip
+        // this pin. Doc-comment pin: 'fall back' or
+        // 'fall-through' phrasing on the rationale.
+        assert!(
+            match_slice.contains("falling back to start_session")
+                || match_slice.contains("fallback to spawn")
+                || match_slice.contains("retrying as spawn"),
+            "the attach-Err arm MUST log the race so an \
+             operator can see the recovery happened (Issue F); \
+             match slice:\n{}",
+            match_slice,
+        );
+    }
+
+    /// migrate-tui-local Issue G: fresh workflow participants are
+    /// now daemon-spawned. The daemon's descendant-scope auth
+    /// (`list_sessions` / `read_session_output` / `send_input` /
+    /// `workflow_transition`) consults `DaemonSession.task_id`,
+    /// so it MUST be recorded at spawn time — not patched
+    /// post-hoc on `TerminalSession` only.
+    ///
+    /// Required shape (Approach a — spawn-time threading):
+    ///   1. `controller::launch_workflow` accepts a
+    ///      `launching_task_id: Option<String>` argument.
+    ///   2. `controller::launch_workflow`'s `inherit_task_id`
+    ///      lets `launching_task_id` override the existing-slot
+    ///      fallback (so an all-fresh tasked launch carries the
+    ///      task scope down).
+    ///   3. `spawn_workflow_session` passes the resolved
+    ///      task_id to `try_spawn_via_daemon_with_deps` (already
+    ///      in place pre-migration; this pin keeps it in place).
+    ///   4. `App::launch_workflow` accepts + forwards the
+    ///      launching_task_id; `start_workflow_run` passes the
+    ///      MCP-supplied task_id through.
+    ///   5. The post-hoc retag at the App's `start_workflow_run`
+    ///      site stays (still load-bearing for the WorkflowRun
+    ///      row + existing-slot participants) and is documented
+    ///      with a comment explaining the TUI/daemon split.
+    #[test]
+    fn t_migrate_workflow_respawn_task_id_reaches_daemon() {
+        let app_src = include_str!("app.rs");
+        let ctrl_src = include_str!("workflow/controller.rs");
+
+        // 1. controller::launch_workflow signature has the new
+        // arg.
+        let ctrl_sig_idx = ctrl_src
+            .find("pub fn launch_workflow(")
+            .expect("controller::launch_workflow must exist");
+        let ctrl_rest = &ctrl_src[ctrl_sig_idx..];
+        let ctrl_body_open = ctrl_rest
+            .find('{')
+            .expect("launch_workflow body open brace");
+        let ctrl_header = &ctrl_rest[..ctrl_body_open];
+        assert!(
+            ctrl_header.contains("launching_task_id: Option<String>"),
+            "controller::launch_workflow MUST accept \
+             `launching_task_id: Option<String>` (Issue G); \
+             signature header:\n{}",
+            ctrl_header,
+        );
+
+        // 2. inherit_task_id uses launching_task_id as the
+        // override (launching beats inherit).
+        let ctrl_end = ctrl_rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| ctrl_rest[1..].find("\n    fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(ctrl_rest.len());
+        let ctrl_body = &ctrl_rest[..ctrl_end];
+        assert!(
+            ctrl_body.contains("launching_task_id.clone().or_else("),
+            "controller::launch_workflow MUST let \
+             `launching_task_id` take precedence over the \
+             existing-slot inheritance (`launching_task_id.clone().or_else(...)`); \
+             body excerpt:\n{}",
+            &ctrl_body[..ctrl_body.len().min(2000)],
+        );
+
+        // 3. spawn_workflow_session forwards task_id to the
+        // daemon helper.
+        let spawn_idx = ctrl_src
+            .find("fn spawn_workflow_session(")
+            .expect("spawn_workflow_session must exist");
+        let spawn_rest = &ctrl_src[spawn_idx..];
+        let spawn_end = spawn_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| spawn_rest[1..].find("\n    pub fn "))
+            .or_else(|| spawn_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(spawn_rest.len());
+        let spawn_body = &spawn_rest[..spawn_end];
+        let helper_call_idx = spawn_body
+            .find("try_spawn_via_daemon_with_deps(")
+            .expect("spawn_workflow_session must call the helper");
+        // The helper's argv list contains task_id.as_deref().
+        // Slice from the call to its closing paren so we
+        // inspect the actual args.
+        let helper_call_end = spawn_body[helper_call_idx..]
+            .find(") {")
+            .map(|i| helper_call_idx + i)
+            .unwrap_or(spawn_body.len());
+        let helper_args = &spawn_body[helper_call_idx..helper_call_end];
+        assert!(
+            helper_args.contains("task_id.as_deref()"),
+            "spawn_workflow_session MUST pass \
+             `task_id.as_deref()` to try_spawn_via_daemon_with_deps \
+             so the daemon's DaemonSession.task_id is recorded \
+             at spawn time (Issue G); helper-args slice:\n{}",
+            helper_args,
+        );
+
+        // 4. App::launch_workflow accepts + forwards
+        // launching_task_id.
+        let app_sig_idx = app_src
+            .find("fn launch_workflow(\n        &mut self,")
+            .expect("App::launch_workflow must exist");
+        let app_rest = &app_src[app_sig_idx..];
+        let app_end = app_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| app_rest[1..].find("\n    pub fn "))
+            .or_else(|| app_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(app_rest.len());
+        let app_body = &app_rest[..app_end];
+        assert!(
+            app_body.contains("launching_task_id: Option<String>"),
+            "App::launch_workflow MUST accept \
+             `launching_task_id: Option<String>` (Issue G); \
+             body excerpt:\n{}",
+            app_body,
+        );
+        assert!(
+            app_body.contains(
+                "ctx.launch_workflow(ws_index, workflow_name, slots, goal, launching_task_id)",
+            ),
+            "App::launch_workflow MUST forward \
+             `launching_task_id` to the controller's \
+             launch_workflow (Issue G); body excerpt:\n{}",
+            app_body,
+        );
+
+        // start_workflow_run threads its task_id through.
+        let swr_idx = app_src
+            .find("pub fn start_workflow_run(")
+            .expect("start_workflow_run must exist");
+        let swr_rest = &app_src[swr_idx..];
+        let swr_end = swr_rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| swr_rest[1..].find("\n    fn "))
+            .or_else(|| swr_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(swr_rest.len());
+        let swr_body = &swr_rest[..swr_end];
+        assert!(
+            swr_body.contains(
+                "self.launch_workflow(ws_index, workflow_name, slots, goal, task_id.clone())",
+            ),
+            "start_workflow_run MUST pass `task_id.clone()` to \
+             self.launch_workflow so the launching task scope \
+             reaches the controller (Issue G); body excerpt:\n{}",
+            &swr_body[..swr_body.len().min(2000)],
+        );
+
+        // migrate-tui-local Issue I supersedes the Issue G
+        // "UI passes None" pin: the UI launch now threads the
+        // cursor-captured task scope (`cursor_task_id`), which
+        // is `Some(_)` when the cursor was on a tasked session
+        // / Cursor::Task at A-f time, and `None` otherwise.
+        // Pin the variable-by-name presence in the handler.
+        assert!(
+            app_src.contains("cursor_task_id,\n                );"),
+            "the UI `SubmitAction::LaunchWorkflow` handler MUST \
+             pass `cursor_task_id` to self.launch_workflow \
+             (Issue I — completes the Issue G threading for the \
+             UI path)",
+        );
+
+        // 5. The post-hoc retag site is annotated with the
+        // TUI/daemon split rationale.
+        assert!(
+            swr_body.contains("migrate-tui-local Issue G note"),
+            "the post-hoc retag in start_workflow_run MUST \
+             carry an `Issue G note` comment documenting the \
+             TUI/daemon split (fresh participants covered at \
+             spawn, existing participants still TUI-only); \
+             body excerpt:\n{}",
+            &swr_body[..swr_body.len().min(2000)],
+        );
+    }
+
+    /// migrate-tui-local Issue H: A-s spawns bash sessions
+    /// daemon-owned, so the restore paths MUST also route bash
+    /// through the daemon. Pre-fix the restore paths gated the
+    /// daemon branch on `"claude" | "codex"` and fell back to
+    /// `Session::new("/bin/bash", ...)` for bash — producing a
+    /// local TUI-owned session and, when the daemon survived
+    /// the restart, a UID collision against the still-live
+    /// daemon bash session.
+    ///
+    /// Pinned at both restore sites: the match arm INCLUDES
+    /// `"bash"` alongside `"claude" | "codex"`, and there is NO
+    /// `Session::new("/bin/bash"` inside either restore function
+    /// for the daemon-eligible branch (the cloud-VM bash SSH
+    /// case at the top of `spawn_restored_session` is a
+    /// distinct branch that stays — `gcloud compute ssh ... -t
+    /// '... tmux ...'`).
+    #[test]
+    fn t_migrate_bash_restore_routes_through_daemon() {
+        let src = include_str!("app.rs");
+
+        // 1. spawn_restored_session: the daemon-routed `else if`
+        // includes "bash".
+        let spawn_idx = src
+            .find("fn spawn_restored_session(")
+            .expect("spawn_restored_session must exist");
+        let spawn_rest = &src[spawn_idx..];
+        let spawn_end = spawn_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| spawn_rest[1..].find("\n    pub fn "))
+            .or_else(|| spawn_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(spawn_rest.len());
+        let spawn_body = &spawn_rest[..spawn_end];
+        assert!(
+            spawn_body.contains(
+                "matches!(entry.session_type.as_str(), \"claude\" | \"codex\" | \"bash\")",
+            ),
+            "spawn_restored_session's daemon-routed arm MUST \
+             include `\"bash\"` alongside `\"claude\" | \
+             \"codex\"` (Issue H); body excerpt:\n{}",
+            &spawn_body[..spawn_body.len().min(2000)],
+        );
+
+        // 2. restore_tombstones_for_workspace: the match arm
+        // includes "bash".
+        let tomb_idx = src
+            .find("fn restore_tombstones_for_workspace(")
+            .expect("restore_tombstones_for_workspace must exist");
+        let tomb_rest = &src[tomb_idx..];
+        let tomb_end = tomb_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| tomb_rest[1..].find("\n    pub fn "))
+            .or_else(|| tomb_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(tomb_rest.len());
+        let tomb_body = &tomb_rest[..tomb_end];
+        assert!(
+            tomb_body.contains("\"claude\" | \"codex\" | \"bash\""),
+            "restore_tombstones_for_workspace's match arm MUST \
+             include `\"bash\"` alongside `\"claude\" | \
+             \"codex\"` (Issue H); body excerpt:\n{}",
+            &tomb_body[..tomb_body.len().min(2000)],
+        );
+
+        // 3. Neither restore function spawns local bash for the
+        // daemon-eligible branch. The cloud-VM SSH branch at
+        // the top of spawn_restored_session uses
+        // `Session::new("gcloud", ...)` (not "/bin/bash"), so
+        // searching for `Session::new("/bin/bash"` catches only
+        // the regression form. The lingering `_ =>
+        // Session::new("/bin/bash", ...)` defensive fallback in
+        // restore_tombstones_for_workspace is reachable ONLY
+        // for unknown session_types (claude/codex/bash all
+        // route through the daemon arm above); leave it as
+        // defense-in-depth but pin that bash itself doesn't
+        // reach it.
+        //
+        // Use a co-location check: every `Session::new(\"/bin/bash\"`
+        // in a restore function must be the `_ =>` defensive
+        // catch-all (not the bash arm). We assert via an
+        // arm-ordering pin — `"bash"` matches the daemon arm
+        // BEFORE any `_ =>` falls through.
+        let bash_arm_idx = tomb_body
+            .find("\"claude\" | \"codex\" | \"bash\"")
+            .expect("daemon arm must mention bash");
+        let catchall_idx = tomb_body.find("_ => Session::new(");
+        if let Some(co) = catchall_idx {
+            assert!(
+                bash_arm_idx < co,
+                "the bash daemon arm MUST precede the `_ => \
+                 Session::new(...)` catch-all so bash routes \
+                 through the daemon (Issue H); bash arm at {}, \
+                 catch-all at {}",
+                bash_arm_idx,
+                co,
+            );
+        }
+
+        // spawn_restored_session: post-Issue-H the only
+        // bash-via-Session::new path inside the function is the
+        // explicit cloud-VM SSH branch (which uses "gcloud",
+        // not "/bin/bash"). Confirm that no `Session::new("/bin/bash"`
+        // is reached for entries whose session_type would match
+        // the daemon arm — the surviving `else { ... }` falls
+        // through to Session::new("/bin/bash", ...) but is only
+        // reachable for unknown types since claude/codex/bash
+        // all match the daemon arm above. Pin the arm-ordering.
+        let bash_arm_in_spawn = spawn_body
+            .find("matches!(entry.session_type.as_str(), \"claude\" | \"codex\" | \"bash\")")
+            .expect("daemon arm in spawn_restored_session");
+        if let Some(local_bash_idx) = spawn_body.find("Session::new(\"/bin/bash\"") {
+            assert!(
+                bash_arm_in_spawn < local_bash_idx,
+                "the bash daemon arm MUST precede any local \
+                 /bin/bash fallback in spawn_restored_session \
+                 (Issue H); daemon arm at {}, local-bash at {}",
+                bash_arm_in_spawn,
+                local_bash_idx,
+            );
+        }
+    }
+
+    /// migrate-tui-local Issue I: UI A-f launches MUST thread
+    /// the cursor's task scope through to `App::launch_workflow`
+    /// so the daemon records `DaemonSession.task_id` for fresh
+    /// participants. Pre-fix the handler hardcoded `None`, so
+    /// an A-f on a `Cursor::Task` (tasked planning workspace,
+    /// or tasked focused session) silently lost the task scope
+    /// and reproduced the Issue G failure for the UI path.
+    ///
+    /// Pinned at four points:
+    ///   1. `InputMode::WorkflowLaunchConfirm` carries a
+    ///      `cursor_task_id` field.
+    ///   2. `InputMode::WorkflowPicker` carries a
+    ///      `cursor_task_id` field.
+    ///   3. `open_workflow_launch` captures
+    ///      `cursor_task_id` from `Cursor::Task { task_id, .. }`.
+    ///   4. The `SubmitAction::LaunchWorkflow` handler at the
+    ///      App level passes the captured value to
+    ///      `self.launch_workflow(...)` — NOT a hardcoded
+    ///      `None`.
+    #[test]
+    fn t_migrate_workflow_ui_launch_threads_cursor_task_id() {
+        let src = include_str!("app.rs");
+
+        // 1. & 2. InputMode variants carry the field.
+        assert!(
+            src.contains(
+                "    /// Picking which workflow to launch when more than one is defined.\n    WorkflowPicker {",
+            ),
+            "WorkflowPicker variant doc-comment marker must exist",
+        );
+        // Both variants should be followed by a `cursor_task_id`
+        // field declaration. Search both variant bodies.
+        let picker_idx = src
+            .find("WorkflowPicker {\n        ws_index: usize,")
+            .expect("WorkflowPicker variant must exist");
+        let picker_end = src[picker_idx..]
+            .find("    },\n")
+            .map(|i| picker_idx + i + 6)
+            .unwrap_or(src.len());
+        let picker_body = &src[picker_idx..picker_end];
+        assert!(
+            picker_body.contains("cursor_task_id: Option<String>"),
+            "InputMode::WorkflowPicker MUST carry \
+             `cursor_task_id: Option<String>` (Issue I); \
+             variant body:\n{}",
+            picker_body,
+        );
+
+        let confirm_idx = src
+            .find("WorkflowLaunchConfirm {\n        ws_index: usize,")
+            .expect("WorkflowLaunchConfirm variant must exist");
+        let confirm_end = src[confirm_idx..]
+            .find("    },\n")
+            .map(|i| confirm_idx + i + 6)
+            .unwrap_or(src.len());
+        let confirm_body = &src[confirm_idx..confirm_end];
+        assert!(
+            confirm_body.contains("cursor_task_id: Option<String>"),
+            "InputMode::WorkflowLaunchConfirm MUST carry \
+             `cursor_task_id: Option<String>` (Issue I); \
+             variant body:\n{}",
+            confirm_body,
+        );
+
+        // 3. open_workflow_launch captures cursor_task_id from
+        // Cursor::Task.
+        let open_idx = src
+            .find("fn open_workflow_launch(&mut self)")
+            .expect("open_workflow_launch must exist");
+        let open_rest = &src[open_idx..];
+        let open_end = open_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| open_rest[1..].find("\n    pub fn "))
+            .or_else(|| open_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(open_rest.len());
+        let open_body = &open_rest[..open_end];
+        // Three-arm destructure (Session/Workspace/Task) — all
+        // three branches must yield a (wi, focused_si,
+        // cursor_task_id) triple.
+        assert!(
+            open_body.contains("let (wi, focused_si, cursor_task_id)"),
+            "open_workflow_launch MUST bind a three-arm \
+             `(wi, focused_si, cursor_task_id)` tuple from the \
+             cursor (Issue I); body excerpt:\n{}",
+            &open_body[..open_body.len().min(2000)],
+        );
+        // The Cursor::Task arm yields Some(task_id) for the
+        // task scope.
+        assert!(
+            open_body.contains("Cursor::Task { ws_idx, task_id }")
+                && open_body.contains("(ws_idx, si, Some(task_id))"),
+            "the Cursor::Task arm of open_workflow_launch MUST \
+             yield `Some(task_id)` so the daemon records the \
+             task scope (Issue I); body excerpt:\n{}",
+            &open_body[..open_body.len().min(2000)],
+        );
+
+        // 4. SubmitAction::LaunchWorkflow handler forwards
+        // cursor_task_id (not None).
+        //
+        // Find the App-level handler block for
+        // SubmitAction::LaunchWorkflow.
+        let handler_idx = src
+            .find("SubmitAction::LaunchWorkflow {\n                ws_index,")
+            .expect("LaunchWorkflow handler must exist");
+        let handler_rest = &src[handler_idx..];
+        let handler_end = handler_rest
+            .find("\n            SubmitAction::MarkActiveDone")
+            .map(|i| i)
+            .unwrap_or(handler_rest.len().min(2000));
+        let handler_body = &handler_rest[..handler_end];
+        assert!(
+            handler_body.contains("cursor_task_id,"),
+            "the SubmitAction::LaunchWorkflow destructure MUST \
+             pull out `cursor_task_id` (Issue I); handler \
+             body:\n{}",
+            handler_body,
+        );
+        // The forward to self.launch_workflow MUST carry
+        // cursor_task_id (NOT a hardcoded None).
+        assert!(
+            handler_body.contains(
+                "self.launch_workflow(\n                    ws_index,\n                    &workflow_name,\n                    slots,\n                    goal,\n                    cursor_task_id,",
+            ),
+            "the SubmitAction::LaunchWorkflow handler MUST \
+             forward `cursor_task_id` (NOT a hardcoded `None`) \
+             to self.launch_workflow (Issue I); handler \
+             body:\n{}",
+            handler_body,
+        );
+        // Regression pin: the pre-fix `None` hardcode is gone.
+        // Assemble the needle dynamically so the test file's
+        // include_str!(...) read doesn't self-match the literal.
+        let pre_fix_needle = format!(
+            "{}({}, &workflow_name, slots, goal, None)",
+            "self.launch_workflow", "ws_index",
+        );
+        assert!(
+            !src.contains(&pre_fix_needle),
+            "the pre-fix hardcoded-None call to \
+             self.launch_workflow MUST be removed (Issue I)",
+        );
+
+        // SubmitAction::EnterWorkflowLaunchConfirm + LaunchWorkflow
+        // variants carry the cursor_task_id field on the wire.
+        assert!(
+            src.contains("EnterWorkflowLaunchConfirm {\n        ws_index: usize,\n        focused_si: Option<usize>,\n        workflow_name: String,\n        /// migrate-tui-local Issue I"),
+            "SubmitAction::EnterWorkflowLaunchConfirm MUST \
+             carry a `cursor_task_id` field (Issue I)",
+        );
+        assert!(
+            src.contains("LaunchWorkflow {\n        ws_index: usize,\n        workflow_name: String,\n        slots: Vec<WorkflowSlotChoice>,\n        goal: Option<String>,\n        /// migrate-tui-local Issue I"),
+            "SubmitAction::LaunchWorkflow MUST carry a \
+             `cursor_task_id` field (Issue I)",
+        );
+    }
+
+    /// migrate-tui-local Issue J: the attach branch of
+    /// `spawn_restored_session` MUST NOT prime
+    /// `pending_jsonl_files` for the restored session. The
+    /// daemon's transcript binding survived the TUI restart, so
+    /// the Codex rebind detector at `app.rs::6203` would
+    /// otherwise treat an unrelated rollout JSONL created
+    /// elsewhere on the system as a rebind candidate and
+    /// overwrite the legitimate transcript_id.
+    ///
+    /// Pinned by four properties:
+    ///   1. A `RestoreOutcome` enum exists with `Attached` and
+    ///      `Spawned` variants.
+    ///   2. `spawn_restored_session` returns
+    ///      `Option<(TerminalSession, RestoreOutcome)>` so the
+    ///      caller can observe the outcome.
+    ///   3. The attach-success arm sets
+    ///      `outcome = RestoreOutcome::Attached` BEFORE
+    ///      yielding the Session.
+    ///   4. The `pending` computation is gated on the outcome:
+    ///      Attached → `None` (no priming); Spawned → the
+    ///      pre-fix Codex baseline / empty-Vec logic applies.
+    #[test]
+    fn t_migrate_attach_branch_skips_codex_jsonl_rebind() {
+        let src = include_str!("app.rs");
+
+        // 1. RestoreOutcome enum exists with both variants.
+        let enum_idx = src
+            .find("pub(crate) enum RestoreOutcome {")
+            .expect(
+                "RestoreOutcome enum MUST exist with pub(crate) \
+                 visibility (Issue J)",
+            );
+        let enum_rest = &src[enum_idx..];
+        let enum_end = enum_rest
+            .find('}')
+            .map(|i| i + 1)
+            .unwrap_or(enum_rest.len());
+        let enum_body = &enum_rest[..enum_end];
+        assert!(
+            enum_body.contains("Attached,"),
+            "RestoreOutcome MUST declare `Attached` variant \
+             (Issue J); body:\n{}",
+            enum_body,
+        );
+        assert!(
+            enum_body.contains("Spawned,"),
+            "RestoreOutcome MUST declare `Spawned` variant \
+             (Issue J); body:\n{}",
+            enum_body,
+        );
+
+        // 2. spawn_restored_session signature returns the
+        // tuple.
+        let fn_idx = src
+            .find("fn spawn_restored_session(")
+            .expect("spawn_restored_session must exist");
+        let fn_rest = &src[fn_idx..];
+        let body_open = fn_rest.find('{').expect("body open brace");
+        let header = &fn_rest[..body_open];
+        assert!(
+            header.contains("-> Option<(TerminalSession, RestoreOutcome)>"),
+            "spawn_restored_session MUST return \
+             `Option<(TerminalSession, RestoreOutcome)>` so the \
+             caller observes the attach-vs-spawn outcome (Issue \
+             J); signature header:\n{}",
+            header,
+        );
+
+        // 3. The attach-success arm sets outcome = Attached.
+        let body_end = fn_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| fn_rest[1..].find("\n    pub fn "))
+            .or_else(|| fn_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(fn_rest.len());
+        let body = &fn_rest[..body_end];
+        assert!(
+            body.contains("outcome = RestoreOutcome::Attached;"),
+            "the attach-success arm of spawn_restored_session \
+             MUST set `outcome = RestoreOutcome::Attached;` \
+             (Issue J); body excerpt:\n{}",
+            &body[..body.len().min(2500)],
+        );
+        // Ordering: the outcome flip must precede the Codex
+        // primer evaluation. Find the attach-success block and
+        // the primer match.
+        let attach_set_idx = body
+            .find("outcome = RestoreOutcome::Attached;")
+            .expect("outcome flip presence already asserted");
+        let primer_idx = body
+            .find("let pending = match outcome {")
+            .expect(
+                "the `pending` computation MUST be a `match \
+                 outcome` block so the attach arm can return \
+                 None (Issue J)",
+            );
+        assert!(
+            attach_set_idx < primer_idx,
+            "the attach-success outcome flip MUST execute \
+             BEFORE the `pending` computation reads it (Issue \
+             J); attach-set at {}, primer at {}",
+            attach_set_idx,
+            primer_idx,
+        );
+
+        // 4. The Attached arm yields None, the Spawned arm
+        // keeps the pre-fix logic.
+        let primer_rest = &body[primer_idx..];
+        let primer_end = primer_rest
+            .find("};\n")
+            .map(|i| i + 3)
+            .unwrap_or(primer_rest.len());
+        let primer_block = &primer_rest[..primer_end];
+        assert!(
+            primer_block.contains("RestoreOutcome::Attached => None,"),
+            "the `pending` match's Attached arm MUST yield \
+             `None` so no JSONL rebind priming happens on the \
+             attach path (Issue J); primer block:\n{}",
+            primer_block,
+        );
+        assert!(
+            primer_block.contains("RestoreOutcome::Spawned =>"),
+            "the `pending` match MUST keep the Spawned arm so \
+             fresh start_session restores still prime the \
+             rebind window (Issue J); primer block:\n{}",
+            primer_block,
+        );
+        // The Spawned arm preserves the pre-fix behaviors:
+        // codex_resume_baseline for transcript_id-Some, and
+        // Some(Vec::new()) for claude|codex without a
+        // transcript yet.
+        assert!(
+            primer_block.contains("codex_resume_baseline"),
+            "the Spawned arm MUST preserve the \
+             `codex_resume_baseline` priming for fresh codex \
+             resumes (Issue J); primer block:\n{}",
+            primer_block,
+        );
+        assert!(
+            primer_block.contains("Some(Vec::new())"),
+            "the Spawned arm MUST preserve the empty-Vec \
+             priming for fresh claude/codex spawns (Issue J); \
+             primer block:\n{}",
+            primer_block,
+        );
+
+        // Caller-side: restore_sessions destructures the tuple.
+        let restore_idx = src
+            .find("fn restore_sessions(")
+            .expect("restore_sessions must exist");
+        let restore_rest = &src[restore_idx..];
+        let restore_end = restore_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| restore_rest[1..].find("\n    pub fn "))
+            .or_else(|| restore_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(restore_rest.len());
+        let restore_body = &restore_rest[..restore_end];
+        assert!(
+            restore_body
+                .contains("if let Some((ts, _outcome)) = self.spawn_restored_session("),
+            "restore_sessions MUST destructure the \
+             `(TerminalSession, RestoreOutcome)` tuple returned \
+             by spawn_restored_session (Issue J); restore_sessions \
+             body excerpt:\n{}",
+            &restore_body[..restore_body.len().min(2000)],
+        );
+    }
+
+    /// migrate-tui-local Issue K: the tombstone-restore daemon-
+    /// spawn call MUST pass the tombstone's user-visible label
+    /// (`&tomb.label`) as the daemon label arg — NOT
+    /// `session_type`. The daemon stores its own copy from
+    /// `start_session`'s `label` field and surfaces it via MCP
+    /// `list_sessions`. Pre-fix the same `session_type` value
+    /// went into both the type slot AND the label slot, so
+    /// restored tombstones showed up daemon-side labelled
+    /// `claude` / `codex` / `bash` instead of `reviewer` /
+    /// `planner` / etc.
+    #[test]
+    fn t_migrate_tombstone_restore_uses_label_not_session_type() {
+        let src = include_str!("app.rs");
+
+        // Bound the tombstone-restore function body.
+        let fn_idx = src
+            .find("fn restore_tombstones_for_workspace(")
+            .expect("restore_tombstones_for_workspace must exist");
+        let fn_rest = &src[fn_idx..];
+        let fn_end = fn_rest[1..]
+            .find("\n    fn ")
+            .or_else(|| fn_rest[1..].find("\n    pub fn "))
+            .or_else(|| fn_rest[1..].find("\n    pub(crate) fn "))
+            .map(|i| 1 + i)
+            .unwrap_or(fn_rest.len());
+        let body = &fn_rest[..fn_end];
+
+        // Locate the daemon-spawn call inside the function and
+        // inspect its argv list.
+        let call_idx = body
+            .find("self.try_spawn_via_daemon(")
+            .expect(
+                "restore_tombstones_for_workspace MUST call \
+                 self.try_spawn_via_daemon (post-migrate-tui-local)",
+            );
+        let call_end = body[call_idx..]
+            .find(") {")
+            .map(|i| call_idx + i)
+            .unwrap_or(body.len());
+        let call_args = &body[call_idx..call_end];
+
+        // The label arg MUST be `&tomb.label` — the tombstone's
+        // user-visible label, not the session_type discriminator.
+        assert!(
+            call_args.contains("&tomb.label,"),
+            "the tombstone-restore daemon spawn MUST pass \
+             `&tomb.label` as the label arg so the daemon's \
+             stored title matches the user-visible label (Issue \
+             K); call args:\n{}",
+            call_args,
+        );
+
+        // Regression: the pre-fix shape passed `session_type` in
+        // both consecutive slots (type AND label). The label
+        // arg must NOT appear immediately after the type arg as
+        // a duplicated `session_type,` line.
+        //
+        // Slice just past the type arg (the first `session_type,`
+        // line) and check the next non-whitespace token is NOT
+        // another `session_type,`.
+        let type_slot_idx = call_args
+            .find("session_type,\n")
+            .expect("call must pass session_type as the type arg");
+        let post_type = &call_args[type_slot_idx + "session_type,\n".len()..];
+        // The next non-whitespace token must be the label arg
+        // — currently `&tomb.label,`. A regression that puts
+        // `session_type,` back in would fail this pin.
+        let trimmed = post_type.trim_start();
+        assert!(
+            !trimmed.starts_with("session_type,"),
+            "regression pin: the label slot in the tombstone-\
+             restore daemon spawn MUST NOT be `session_type,` \
+             (Issue K — that was the pre-fix bug that made \
+             restored sessions show up as `claude`/`codex`/\
+             `bash` daemon-side); call args:\n{}",
+            call_args,
+        );
+        assert!(
+            trimmed.starts_with("&tomb.label,"),
+            "the label slot MUST be `&tomb.label,` immediately \
+             after the type slot (Issue K); post-type slice \
+             head:\n{}",
+            &trimmed[..trimmed.len().min(200)],
         );
     }
 }
