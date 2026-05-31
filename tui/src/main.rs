@@ -145,6 +145,19 @@ fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Physically wipe the screen before the first draw. EnterAlternateScreen
+    // normally clears the alt buffer, but if the previous process exited
+    // without running the LeaveAlternateScreen cleanup (panic/SIGKILL), the
+    // terminal is already in the alt buffer and re-entering is a no-op on many
+    // terminals — leaving the old frame on screen. ratatui's diff renderer
+    // can't fix that: its previous buffer starts empty, so blank cells in the
+    // first frame are never emitted and pre-existing content bleeds through
+    // (ghosted sidebar, shell scrollback, desktop). terminal.clear() emits a
+    // real ESC[2J and resets the previous buffer to force a full first repaint.
+    // (The Clear *widget* in App::draw can't do this — it only wipes cells
+    // ratatui itself drew in a prior frame, not pre-existing screen content.)
+    terminal.clear()?;
+
     let result = run(&mut terminal, config);
 
     // Restore terminal.
