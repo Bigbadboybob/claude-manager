@@ -846,6 +846,8 @@ def create_subtask(
             sessions spawn in the parent's worktree directory.
             "branch" — new worktree branched off the parent's
             wip_branch with name `cm-sub/<slug-chain>-<short_id>`.
+            "in-place" — spawn directly in the parent's MAIN repo
+            checkout: no new worktree, no new branch.
         project: Optional explicit project; defaults to the parent's
             project.
 

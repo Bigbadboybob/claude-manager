@@ -845,6 +845,12 @@ struct CreateSubtaskParams {
     name: String,
     #[serde(default)]
     prompt: Option<String>,
+    /// One of:
+    ///   - `"inherit"` (default): share the parent's worktree.
+    ///   - `"branch"`: new worktree off the parent's branch, named
+    ///     `cm-sub/<slug-chain>-<short_id>`.
+    ///   - `"in-place"`: spawn directly in the parent's MAIN repo checkout
+    ///     — no new worktree, no new branch.
     #[serde(default = "default_subtask_worktree_mode")]
     worktree_mode: String,
     #[serde(default)]
@@ -858,11 +864,11 @@ fn default_subtask_worktree_mode() -> String {
 pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
     let p: CreateSubtaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
-    if !matches!(p.worktree_mode.as_str(), "inherit" | "branch") {
+    if !matches!(p.worktree_mode.as_str(), "inherit" | "branch" | "in-place") {
         return Err((
             ErrorCode::InvalidParams,
             format!(
-                "worktree_mode must be 'inherit' or 'branch', got '{}'",
+                "worktree_mode must be 'inherit', 'branch', or 'in-place', got '{}'",
                 p.worktree_mode
             ),
         ));
@@ -966,6 +972,17 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     } else {
         None
     };
+    // In-place mode: the subtask runs directly in the parent's MAIN repo
+    // checkout — no worktree, no branch. Resolve that path upfront so the
+    // worktree-production step below is infallible.
+    let in_place_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "in-place" {
+        Some(parent_main_repo.clone().ok_or((
+            ErrorCode::Conflict,
+            "parent workspace has no main_repo_path; cannot launch in-place".into(),
+        ))?)
+    } else {
+        None
+    };
     // Resolve the parent's actual branch UPFRONT. Tasks launched into
     // existing workspaces commonly have `wip_branch: None` because
     // the system never had reason to set it; the source of truth in
@@ -1012,6 +1029,17 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
         // base-branch problem.
         "inherit" => parent_branch_resolved.clone(),
         "branch" => Some(format!("cm-sub/{}-{}", slug_chain, request_short_id)),
+        // In-place: the session runs in the MAIN repo checkout, NOT the
+        // parent's worktree — so its branch is the main repo's CURRENT
+        // branch, not `parent_branch_resolved` (which could be the parent's
+        // `cm/...` worktree branch). Reading it from `in_place_main_repo`
+        // mirrors the planning launch path (app.rs `launch_from_plan`).
+        // Recording the parent's branch here would mislead branch-mode
+        // grandchildren (wrong fork base) and let reconcile mis-map this
+        // task onto a `cm/...` worktree dir after a manifest loss.
+        "in-place" => in_place_main_repo
+            .as_deref()
+            .and_then(cm_daemon::worktree::worktree_current_branch),
         _ => None,
     };
 
@@ -1102,6 +1130,34 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             };
             app.workspaces.push(new_ws);
             (worktree_path, new_ws_id)
+        }
+        "in-place" => {
+            // No worktree, no branch — the subtask's cwd IS the parent's
+            // main repo. We still register a SEPARATE workspace (distinct
+            // id) pointing at the main repo, rather than reusing the
+            // parent's workspace the way "inherit" does: the common case
+            // is a subtask of a *worktree-backed* parent that wants to run
+            // in the main repo instead. Setting `worktree_path` ==
+            // `main_repo_path` makes `Workspace::is_in_place()` true, so
+            // teardown (delete, mark_subtask_done) never touches git.
+            let main_repo = in_place_main_repo.expect("validated above");
+            let new_ws_id = crate::app::new_workspace_id();
+            let new_ws = Workspace {
+                id: new_ws_id.clone(),
+                name: leaf_slug.clone(),
+                is_closed: false,
+                is_cloud: false,
+                repo_url: Some(parent_repo_url.clone()),
+                worktree_path: Some(main_repo.clone()),
+                main_repo_path: Some(main_repo.clone()),
+                worker_vm: None,
+                worker_zone: None,
+                sessions: vec![],
+                tombstones: vec![],
+                is_pushing: false,
+            };
+            app.workspaces.push(new_ws);
+            (main_repo, new_ws_id)
         }
         _ => unreachable!(),
     };
@@ -1324,8 +1380,11 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     // `mark_subtask_done` again to retry — the worktree is stranded.
     //
     // Worktree removal is gated by `close_worktree && was_branch_mode`.
-    // Inherit-mode subtasks share the parent's worktree — there's
-    // nothing of theirs to remove. Branch-mode + close_worktree=false
+    // Inherit-mode AND in-place subtasks have nothing of their own to
+    // remove — inherit shares the parent's worktree, and in-place runs in
+    // the main repo (its `worktree_path == main_repo_path`). Only `branch`
+    // mode owns a dedicated worktree, so only it ever reaches the removal
+    // path. Branch-mode + close_worktree=false
     // leaves the worktree on disk so the user can keep working in it
     // after the agent marks done (e.g. for a manual review pass).
     // `cleanup_outcome` is the precheck verdict:
@@ -1355,15 +1414,25 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
                 ws_id, p.task_id
             ),
         ))?;
-        // The "already cleaned up" signal: Phase 2 sets
-        // `worktree_path = None` (and `is_closed = true`) only after
-        // a successful `git worktree remove`. So a workspace whose
-        // `worktree_path` is None on entry to this method means the
-        // remove already happened — fall through to Phase 3 to
-        // (re)try the API mark-done. We deliberately don't require
-        // `is_closed` here too; a single signal is enough and easier
-        // to reason about.
-        if app.workspaces[wi].worktree_path.is_none() {
+        // Hard safety net: an in-place workspace's `worktree_path` IS the
+        // main repo checkout (`worktree_path == main_repo_path`). Running
+        // `git worktree remove` on it would destroy the user's main
+        // working tree. This must hold even if `was_branch_mode` is true
+        // here — e.g. a stale API `worktree_mode = "branch"` overwrote the
+        // local `InPlace` on reconcile (app.rs `parse_worktree_mode`). The
+        // path-equality check is authoritative regardless of the label, so
+        // we never trust `worktree_mode` alone to gate destruction.
+        if app.workspaces[wi].is_in_place() {
+            None
+        } else if app.workspaces[wi].worktree_path.is_none() {
+            // The "already cleaned up" signal: Phase 2 sets
+            // `worktree_path = None` (and `is_closed = true`) only after
+            // a successful `git worktree remove`. So a workspace whose
+            // `worktree_path` is None on entry to this method means the
+            // remove already happened — fall through to Phase 3 to
+            // (re)try the API mark-done. We deliberately don't require
+            // `is_closed` here too; a single signal is enough and easier
+            // to reason about.
             already_done = true;
             None
         } else {

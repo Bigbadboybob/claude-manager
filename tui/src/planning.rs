@@ -320,6 +320,9 @@ pub enum PlanAction {
         /// descendant-task auth walk could not authorize a
         /// parent → subtask action.
         parent_task_id: Option<String>,
+        /// `true` when the branch field held the `.` sentinel: launch
+        /// in-place in the main repo (no worktree, no branch).
+        in_place: bool,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -2285,10 +2288,15 @@ impl PlanningView {
                                 &task.title,
                             );
                             let slug = task.slug.clone();
-                            let branch = if branch_text.trim().is_empty() {
+                            // Branch field: "." → in-place (main repo, no
+                            // worktree/branch); "" → new worktree from HEAD;
+                            // other → new worktree from that base branch.
+                            let trimmed = branch_text.trim();
+                            let in_place = trimmed == ".";
+                            let branch = if trimmed.is_empty() || in_place {
                                 None
                             } else {
-                                Some(branch_text.trim().to_string())
+                                Some(trimmed.to_string())
                             };
                             let task_id = task.id.clone();
                             let parent_task_id = task.parent_task_id.clone();
@@ -2302,6 +2310,7 @@ impl PlanningView {
                                 task_id,
                                 // Sub-2a Finding #2: see LaunchTaskIntoWorkspace.
                                 parent_task_id,
+                                in_place,
                             };
                         }
                     }
@@ -4024,7 +4033,13 @@ impl PlanningView {
         frame.render_widget(block, dialog);
 
         let display_name: String = task_name.chars().take((w as usize).saturating_sub(10)).collect();
-        let branch_hint = if branch_text.is_empty() { "main" } else { "" };
+        let branch_hint = if branch_text.trim() == "." {
+            "  in-place (main repo, no worktree)"
+        } else if branch_text.is_empty() {
+            "main"
+        } else {
+            ""
+        };
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("    Task: ", Style::default().fg(Color::DarkGray)),
@@ -4573,6 +4588,72 @@ mod tests {
                 "expected LaunchTask, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// The `.` sentinel in the LaunchConfirm branch field launches
+    /// in-place: `in_place: true`, `branch: None`. Empty branch stays
+    /// `in_place: false`.
+    #[test]
+    fn launch_confirm_dot_branch_sets_in_place() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mk = || {
+            let mut view = PlanningView::new();
+            let mut pd = make_project("repo", "git@example.com:org/repo.git");
+            pd.tasks.push(PlanTask {
+                id: "top-id".to_string(),
+                slug: "toplevel".to_string(),
+                title: "Top".to_string(),
+                status: PlanStatus::Backlog,
+                difficulty: None,
+                depends: vec![],
+                branch: None,
+                created: None,
+                description: String::new(),
+                prompt: String::new(),
+                source: "user".to_string(),
+                is_cloud: false,
+                repo_url: "git@example.com:org/repo.git".to_string(),
+                parent_task_id: None,
+            });
+            view.project_data.push(pd);
+            view.projects = view
+                .project_data
+                .iter()
+                .map(|pd| pd.project.clone())
+                .collect();
+            view
+        };
+
+        // "." → in-place.
+        let mut view = mk();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: ".".to_string(),
+        };
+        match view.handle_event(&enter) {
+            PlanAction::LaunchTask { in_place, branch, .. } => {
+                assert!(in_place, "`.` must launch in-place");
+                assert!(branch.is_none(), "in-place carries no branch");
+            }
+            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        // empty → normal worktree launch.
+        let mut view = mk();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: String::new(),
+        };
+        match view.handle_event(&enter) {
+            PlanAction::LaunchTask { in_place, .. } => {
+                assert!(!in_place, "empty branch is not in-place");
+            }
+            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
         }
     }
 

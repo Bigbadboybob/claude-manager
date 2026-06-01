@@ -374,6 +374,23 @@ pub struct Workspace {
     pub is_pushing: bool,
 }
 
+impl Workspace {
+    /// True when this workspace runs *in-place* — its working directory
+    /// IS the main repo checkout (no dedicated git worktree, no
+    /// `cm/<slug>` branch). The marker is `worktree_path == main_repo_path`
+    /// (both `Some` and equal); in-place launches set them to the same
+    /// `PathBuf` so the equality holds byte-for-byte and round-trips
+    /// through the manifest. Destructive cleanup (worktree remove, branch
+    /// delete, cloud push) MUST consult this before touching git — those
+    /// ops would otherwise damage the user's main repo.
+    pub(crate) fn is_in_place(&self) -> bool {
+        matches!(
+            (&self.worktree_path, &self.main_repo_path),
+            (Some(wt), Some(main)) if wt == main
+        )
+    }
+}
+
 /// A task tracked in the planning/API layer. Pure metadata — no execution
 /// state. `workspace_id` points at the Workspace this task has been launched
 /// into (None when still in backlog / never launched).
@@ -400,11 +417,13 @@ pub struct TaskEntry {
     /// tree. Set when an agent calls `create_subtask` or when the user
     /// creates a subtask in the planning view.
     pub parent_task_id: Option<String>,
-    /// Worktree behavior for subtasks. Only meaningful when
-    /// `parent_task_id` is set:
+    /// Worktree behavior:
     ///   - "inherit" (default): sessions spawn in the parent's worktree.
     ///   - "branch": a new worktree is created off the parent's branch
     ///     with name `cm-sub/<slug-chain>-<short_id>`.
+    ///   - "in-place": sessions spawn directly in the MAIN repo checkout —
+    ///     no worktree, no branch. Also set on top-level tasks launched
+    ///     in-place from the planning view.
     pub worktree_mode: WorktreeMode,
     /// Free-form JSONB bag mirrored from the API row. Skills attach
     /// structured context here — currently `metadata.resume.*` for the
@@ -442,6 +461,12 @@ pub enum WorktreeMode {
     #[default]
     Inherit,
     Branch,
+    /// Sessions spawn directly in the parent's MAIN repo checkout — no
+    /// new worktree, no new branch. The wire value is hyphenated
+    /// (`"in-place"`), so pin it explicitly: the enum's `lowercase`
+    /// rename would otherwise emit `"inplace"`.
+    #[serde(rename = "in-place")]
+    InPlace,
 }
 
 /// Parse the API's `worktree_mode` string into the enum. Unknown values
@@ -451,6 +476,7 @@ pub enum WorktreeMode {
 pub fn parse_worktree_mode(s: &str) -> WorktreeMode {
     match s {
         "branch" => WorktreeMode::Branch,
+        "in-place" => WorktreeMode::InPlace,
         _ => WorktreeMode::Inherit,
     }
 }
@@ -460,6 +486,7 @@ impl WorktreeMode {
         match self {
             WorktreeMode::Inherit => "inherit",
             WorktreeMode::Branch => "branch",
+            WorktreeMode::InPlace => "in-place",
         }
     }
 }
@@ -1750,6 +1777,10 @@ pub(crate) enum SubmitAction {
         branch: Option<String>,
         idle_timeout_secs: u16,
         seed_from: Option<String>,
+        /// `true` when the branch field held the `.` sentinel: launch
+        /// in-place in the main repo (no worktree, no branch). `branch`
+        /// is `None` in that case.
+        in_place: bool,
     },
     SpawnSessionOnWorkspace {
         workspace_id: String,
@@ -2176,7 +2207,13 @@ pub(crate) fn handle_new_session(
         }
         KeyCode::Enter => {
             if !state.label_text.trim().is_empty() {
-                let branch = if state.branch_text.trim().is_empty() {
+                // Branch field semantics:
+                //   "."   → in-place: run in the main repo, no worktree/branch.
+                //   ""    → new worktree, branch `cm/<slug>` from HEAD.
+                //   other → new worktree from that base branch.
+                let trimmed = state.branch_text.trim();
+                let in_place = trimmed == ".";
+                let branch = if trimmed.is_empty() || in_place {
                     None
                 } else {
                     Some(state.branch_text.clone())
@@ -2191,6 +2228,7 @@ pub(crate) fn handle_new_session(
                     branch,
                     idle_timeout_secs: timeout,
                     seed_from: state.seed_from.clone(),
+                    in_place,
                 })
             } else {
                 InputOutcome::Consumed
@@ -7878,6 +7916,7 @@ impl App {
                     autostart,
                     task_id,
                     parent_task_id,
+                    in_place,
                 } => {
                     self.launch_from_plan(
                         &project,
@@ -7887,6 +7926,7 @@ impl App {
                         autostart,
                         &task_id,
                         parent_task_id.as_deref(),
+                        in_place,
                     );
                     return true;
                 }
@@ -8591,6 +8631,7 @@ impl App {
                 branch,
                 idle_timeout_secs,
                 seed_from,
+                in_place,
             } => {
                 self.create_local_session(
                     &repo_url,
@@ -8598,6 +8639,7 @@ impl App {
                     branch.as_deref(),
                     idle_timeout_secs,
                     seed_from.as_deref(),
+                    in_place,
                 );
             }
             SubmitAction::SpawnSessionOnWorkspace {
@@ -9454,6 +9496,7 @@ impl App {
         start_branch: Option<&str>,
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
+        in_place: bool,
     ) {
         // 12e-r2 F1: snapshot active_host ONCE at the top of
         // the user action. Pass it through to `try_spawn_via_daemon`
@@ -9499,14 +9542,25 @@ impl App {
             }
         }
 
-        let worktree_path = match worktree::create_worktree(&main_repo, &slug, start_branch) {
-            Ok(p) => p,
-            Err(e) => {
-                self.set_status_msg(&format!("Worktree: {}", e));
-                return;
+        // In-place: the working directory IS the main checkout. Skip BOTH
+        // `create_worktree` (would mint a `cm/<slug>` branch + worktree dir)
+        // AND `setup_worktree` (would re-run `setup_worktree.sh` against the
+        // live repo). Cloning `main_repo` keeps `worktree_path` byte-equal to
+        // `main_repo_path` so `Workspace::is_in_place()` is true.
+        let worktree_path = if in_place {
+            main_repo.clone()
+        } else {
+            match worktree::create_worktree(&main_repo, &slug, start_branch) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.set_status_msg(&format!("Worktree: {}", e));
+                    return;
+                }
             }
         };
-        worktree::setup_worktree(&main_repo, &worktree_path);
+        if !in_place {
+            worktree::setup_worktree(&main_repo, &worktree_path);
+        }
 
         // If the user picked a snapshot, materialize it into the new
         // worktree's expected paths before we spawn. The returned id is
@@ -10323,6 +10377,12 @@ impl App {
         }
 
         let ws_id = self.workspaces[wi].id.clone();
+        // In-place workspaces have NO dedicated worktree or branch — their
+        // `worktree_path` IS the main repo. Skipping git teardown for them
+        // is the whole point of this guard: `git worktree remove` would
+        // target the main checkout, and `git branch -D` would delete the
+        // repo's live branch (e.g. `main`).
+        let in_place = self.workspaces[wi].is_in_place();
         let worktree_path = self.workspaces[wi].worktree_path.clone();
         let main_repo_path = self.workspaces[wi].main_repo_path.clone();
         let bound_task_ids: Vec<String> = self
@@ -10345,27 +10405,39 @@ impl App {
         // with a recoverable state (worktree still on disk, branches
         // intact, API rows intact) than to half-cleanup. The status
         // bar shows the git error so the user knows what's wrong.
-        if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo_path) {
-            if let Err(e) = worktree::remove_worktree(repo, wt) {
-                self.set_status_msg(&format!(
-                    "Workspace delete aborted: git worktree remove failed: {}",
-                    e
-                ));
-                return;
+        //
+        // In-place workspaces skip this entirely: there's no worktree to
+        // remove (it's the main repo). The rest of the cleanup (API task
+        // deletion, session kills, row removal) still runs unconditionally
+        // below — we just never touch git.
+        if !in_place {
+            if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo_path) {
+                if let Err(e) = worktree::remove_worktree(repo, wt) {
+                    self.set_status_msg(&format!(
+                        "Workspace delete aborted: git worktree remove failed: {}",
+                        e
+                    ));
+                    return;
+                }
             }
         }
-        if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo_path) {
-            let _ = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["branch", "-D", branch])
-                .output();
-            if !bound_task_ids.is_empty() {
+        // Branch deletion: skipped for in-place. An in-place task's
+        // `wip_branch` is the repo's real current branch (e.g. `main`),
+        // not a `cm/<slug>` throwaway — deleting it would be catastrophic.
+        if !in_place {
+            if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo_path) {
                 let _ = std::process::Command::new("git")
                     .arg("-C")
                     .arg(repo)
-                    .args(["push", "origin", "--delete", branch])
+                    .args(["branch", "-D", branch])
                     .output();
+                if !bound_task_ids.is_empty() {
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["push", "origin", "--delete", branch])
+                        .output();
+                }
             }
         }
 
@@ -10410,6 +10482,14 @@ impl App {
         }
         if self.workspaces[wi].is_pushing {
             self.set_status_msg("Push already in progress");
+            return;
+        }
+        // In-place workspaces have no dedicated worktree to upload — their
+        // path IS the main repo. Pushing would convert the main checkout
+        // into a cloud workspace (clearing the local row), which is
+        // confusing and almost never intended. Block it explicitly.
+        if self.workspaces[wi].is_in_place() {
+            self.set_status_msg("Can't push an in-place workspace (no worktree to upload)");
             return;
         }
         let worktree_path = match &self.workspaces[wi].worktree_path {
@@ -10534,6 +10614,10 @@ impl App {
         // daemon's auth walk can't authorize parent → subtask
         // until the next reconcile patches it.
         parent_task_id: Option<&str>,
+        // `true` when the launch form's branch field held the `.`
+        // sentinel: run in the main repo in-place (no worktree, no
+        // `cm/<slug>` branch).
+        in_place: bool,
     ) {
         // 12e-r7 F2: planning A-l from the planning view
         // creates a worktree + spawns a session. Same shape
@@ -10564,15 +10648,24 @@ impl App {
             }
         };
 
-        let worktree_path = match worktree::create_worktree(&main_repo, slug, start_branch) {
-            Ok(p) => p,
-            Err(e) => {
-                self.set_status_msg(&format!("Worktree: {}", e));
-                return;
+        // In-place: cwd IS the main checkout — skip worktree + setup (see
+        // `create_local_session` for the rationale). Cloning keeps
+        // `worktree_path` byte-equal to `main_repo_path`.
+        let worktree_path = if in_place {
+            main_repo.clone()
+        } else {
+            match worktree::create_worktree(&main_repo, slug, start_branch) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.set_status_msg(&format!("Worktree: {}", e));
+                    return;
+                }
             }
         };
 
-        worktree::setup_worktree(&main_repo, &worktree_path);
+        if !in_place {
+            worktree::setup_worktree(&main_repo, &worktree_path);
+        }
 
         let (cols, rows) = self.last_term_size;
         // migrate-tui-local: pre-generate UID + workspace id so the
@@ -10614,7 +10707,17 @@ impl App {
             }
         };
 
-        let branch = format!("cm/{}", slug);
+        // For a normal launch the WIP branch is the freshly-created
+        // `cm/<slug>`. For in-place there's no new branch — record the main
+        // repo's ACTUAL current branch (e.g. `main`), or `None` on detached
+        // HEAD. This value is never a `cm/*` name, so `recover_worktree_path`
+        // returns `None` for it and reconcile can't mis-map an in-place task
+        // onto a `<repo>-<slug>` worktree dir.
+        let branch: Option<String> = if in_place {
+            worktree::worktree_current_branch(&main_repo)
+        } else {
+            Some(format!("cm/{}", slug))
+        };
         let mut ts = make_simple_session_with_uid(
             session_uid,
             slug,
@@ -10658,7 +10761,7 @@ impl App {
             api_status: TaskStatus::Running,
             repo_url: Some(repo_url.clone()),
             prompt: Some(prompt.to_string()),
-            wip_branch: Some(branch.clone()),
+            wip_branch: branch.clone(),
             session_id: None,
             blocked_at: None,
             is_cloud: false,
@@ -10677,7 +10780,11 @@ impl App {
             // `None` and the daemon saw the subtask as
             // top-level until reconcile patched it.
             parent_task_id: parent_task_id.map(str::to_string),
-            worktree_mode: WorktreeMode::Inherit,
+            worktree_mode: if in_place {
+                WorktreeMode::InPlace
+            } else {
+                WorktreeMode::Inherit
+            },
             metadata: None,
         });
 
@@ -10686,7 +10793,28 @@ impl App {
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("status".to_string(), serde_json::Value::String("running".to_string()));
-        fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
+        // Only write `wip_branch` when there's a real branch. In-place on a
+        // detached HEAD yields `None` — writing a bogus value would confuse
+        // reconcile and cleanup.
+        if let Some(b) = branch {
+            fields.insert("wip_branch".to_string(), serde_json::Value::String(b));
+        }
+        // Persist `worktree_mode = "in-place"` so the API row matches the
+        // local TaskEntry. Without this, reconcile (which copies the API's
+        // `worktree_mode` back into the local entry at `reconcile_tasks`)
+        // would overwrite the local `InPlace` with whatever the row was
+        // created with — and a stale `"branch"` would make
+        // `mark_subtask_done` treat the in-place workspace (whose
+        // `worktree_path == main_repo_path`) as a removable worktree. Only
+        // written for in-place launches: a normal launch leaves the row's
+        // mode untouched (it created a real `cm/<slug>` worktree, and the
+        // `mark_subtask_done` is_in_place() guard handles any drift anyway).
+        if in_place {
+            fields.insert(
+                "worktree_mode".to_string(),
+                serde_json::Value::String(WorktreeMode::InPlace.as_wire().to_string()),
+            );
+        }
         self.backend.update_plan_task(task_id.to_string(), fields);
         self.save_session_manifest();
         // Sub-2a Finding #1: launch added a TaskEntry —
@@ -11375,7 +11503,9 @@ impl App {
         let branch_cursor = if active_field == 2 { cursor } else { "" };
         let timeout_cursor = if active_field == 3 { cursor } else { "" };
 
-        let branch_hint = if branch_text.is_empty() && active_field != 2 {
+        let branch_hint = if branch_text.trim() == "." {
+            "  in-place (main repo, no worktree)"
+        } else if branch_text.is_empty() && active_field != 2 {
             "main"
         } else {
             ""
@@ -16018,6 +16148,63 @@ mod activity_summary_tests {
 }
 
 #[cfg(test)]
+mod worktree_mode_tests {
+    //! Pins the in-place launch primitives: the `WorktreeMode` wire
+    //! round-trip and the `Workspace::is_in_place()` marker that every
+    //! destructive-cleanup guard keys off.
+    use super::{parse_worktree_mode, Workspace, WorktreeMode};
+    use std::path::PathBuf;
+
+    #[test]
+    fn worktree_mode_wire_round_trip() {
+        assert_eq!(parse_worktree_mode("inherit"), WorktreeMode::Inherit);
+        assert_eq!(parse_worktree_mode("branch"), WorktreeMode::Branch);
+        assert_eq!(parse_worktree_mode("in-place"), WorktreeMode::InPlace);
+        // Unknown / future values fall back to the safe default.
+        assert_eq!(parse_worktree_mode("inplace"), WorktreeMode::Inherit);
+        assert_eq!(parse_worktree_mode("garbage"), WorktreeMode::Inherit);
+
+        assert_eq!(WorktreeMode::Inherit.as_wire(), "inherit");
+        assert_eq!(WorktreeMode::Branch.as_wire(), "branch");
+        assert_eq!(WorktreeMode::InPlace.as_wire(), "in-place");
+
+        // Full round trip through the wire form.
+        for m in [WorktreeMode::Inherit, WorktreeMode::Branch, WorktreeMode::InPlace] {
+            assert_eq!(parse_worktree_mode(m.as_wire()), m);
+        }
+    }
+
+    fn ws(worktree: Option<&str>, main: Option<&str>) -> Workspace {
+        Workspace {
+            id: "w".into(),
+            name: "w".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: worktree.map(PathBuf::from),
+            main_repo_path: main.map(PathBuf::from),
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        }
+    }
+
+    #[test]
+    fn is_in_place_truth_table() {
+        // Equal paths → in-place.
+        assert!(ws(Some("/repo"), Some("/repo")).is_in_place());
+        // Different paths (normal worktree) → not in-place.
+        assert!(!ws(Some("/repo-worktree"), Some("/repo")).is_in_place());
+        // Either side missing (e.g. cloud workspace) → not in-place.
+        assert!(!ws(None, Some("/repo")).is_in_place());
+        assert!(!ws(Some("/repo"), None).is_in_place());
+        assert!(!ws(None, None).is_in_place());
+    }
+}
+
+#[cfg(test)]
 mod entry_matches_delivery_tests {
     //! Regression coverage for the workflow-binding path that broke
     //! during the overnight cleanup orchestration. Each `parse_entries`
@@ -16327,12 +16514,71 @@ mod input_handler_tests {
                 branch,
                 idle_timeout_secs,
                 seed_from,
+                in_place,
             }) => {
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
                 assert_eq!(branch.as_deref(), Some("feat/x"));
                 assert_eq!(idle_timeout_secs, 10);
                 assert!(seed_from.is_none());
+                assert!(!in_place, "a real branch must not be in-place");
+            }
+            other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
+        }
+    }
+
+    /// The `.` sentinel in the branch field flips to in-place: no worktree,
+    /// no branch. A leading-dot path like `./foo` must NOT be treated as the
+    /// sentinel (it's a real, if unusual, branch name).
+    #[test]
+    fn new_session_dot_branch_sets_in_place() {
+        for raw in ["."] {
+            let (mut label, mut branch, mut timeout, mut repo, mut active) =
+                new_session_state("my-task", raw, "10", "https://github.com/a/b", 1);
+            let outcome = handle_new_session(
+                NewSessionMut {
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: &mut None,
+                    active_field: &mut active,
+                },
+                ctx_no_repos(),
+                &key(KeyCode::Enter),
+            );
+            match outcome {
+                InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                    branch, in_place, ..
+                }) => {
+                    assert!(in_place, "branch {raw:?} should be in-place");
+                    assert!(branch.is_none(), "in-place must carry no branch");
+                }
+                other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
+            }
+        }
+
+        // Negative: `./foo` is a real branch name, never in-place.
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("my-task", "./foo", "10", "https://github.com/a/b", 1);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut None,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                branch, in_place, ..
+            }) => {
+                assert!(!in_place);
+                assert_eq!(branch.as_deref(), Some("./foo"));
             }
             other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
         }
