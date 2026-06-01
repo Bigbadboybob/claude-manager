@@ -57,17 +57,37 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::state::DaemonState;
 use crate::workflow::transcript::read_first_line;
 
-/// Detector poll interval. 500ms matches the TUI's drain loop
-/// cadence; Claude/Codex typically write their first transcript
-/// line within 1-3s of spawn so a 500ms poll is plenty.
+/// Detector poll interval for the first [`FAST_POLL_WINDOW`].
+/// 500ms matches the TUI's drain loop cadence; Claude/Codex
+/// usually write their first transcript line within 1-3s of
+/// spawn so a tight poll binds the common case immediately.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Hard ceiling. If the detector doesn't see a transcript within
-/// this window the agent is either not engine-instrumented (bash)
-/// or is hung pre-first-write. Either way, polling forever isn't
-/// useful — log and exit. The agent / TUI can push a path
-/// explicitly later via `session.set_transcript_path`.
-pub const MAX_DURATION: Duration = Duration::from_secs(60);
+/// After [`FAST_POLL_WINDOW`] without a transcript, back off to
+/// this slower cadence. Codex (0.132+) writes its rollout only
+/// once the first user turn is recorded, which can be well past
+/// the 1-3s typical case if the injected prompt is slow to submit
+/// or the agent cold-starts after a version update. We keep
+/// polling (cheaply) rather than giving up — a session that
+/// binds late should still bind, not wedge in `pending` forever.
+pub const SLOW_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long to poll at the fast [`POLL_INTERVAL`] before backing
+/// off to [`SLOW_POLL_INTERVAL`].
+pub const FAST_POLL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Backstop ceiling. The detector keeps polling (with backoff)
+/// until it binds, the session vanishes, or this elapses. It is
+/// deliberately generous: the old 60s ceiling permanently wedged
+/// any session whose engine wrote its transcript late (slow
+/// cold-start, deferred-until-first-turn rollout), since the
+/// detector never retried after giving up. The only sessions that
+/// reach this backstop are ones that never produce a transcript at
+/// all (e.g. a `bash` session, or an agent that started but never
+/// ran a turn) — for those, polling longer wouldn't help, so we
+/// exit and log. A caller can still push a path explicitly via
+/// `session.set_transcript_path`.
+pub const MAX_DURATION: Duration = Duration::from_secs(60 * 60);
 
 /// Snapshot the set of `*.jsonl` stems currently in the Claude
 /// transcript directory for `worktree_path`. Returns an empty
@@ -491,9 +511,10 @@ fn run_detector(
     loop {
         if started.elapsed() > MAX_DURATION {
             eprintln!(
-                "cm-daemon: transcript detector for {} ({:?}) timed out after {:?} \
-                 — the agent will stay in `pending` until a caller pushes \
-                 session.set_transcript_path explicitly",
+                "cm-daemon: transcript detector for {} ({:?}) gave up after {:?} \
+                 without ever seeing a transcript — the agent likely never ran a \
+                 turn (no rollout written). It will stay `pending` until a caller \
+                 pushes session.set_transcript_path explicitly",
                 session_uid, engine, MAX_DURATION,
             );
             return DetectorOutcome::Timeout;
@@ -566,7 +587,15 @@ fn run_detector(
             session.transcript_path = Some(path_str);
             return DetectorOutcome::Bound;
         }
-        std::thread::sleep(POLL_INTERVAL);
+        // Tight poll for the first minute (binds the common case
+        // within a couple seconds), then back off so a long-lived
+        // pending session isn't a hot 500ms loop until the backstop.
+        let interval = if started.elapsed() < FAST_POLL_WINDOW {
+            POLL_INTERVAL
+        } else {
+            SLOW_POLL_INTERVAL
+        };
+        std::thread::sleep(interval);
     }
 }
 

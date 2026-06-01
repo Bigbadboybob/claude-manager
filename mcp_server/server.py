@@ -818,7 +818,16 @@ async def wait_for_session_idle(
         state = resolved.get("state", "pending")
         if state == "exited":
             return {"idle": True, "timed_out": False, "state": state}
-        if bool(resolved.get("idle", False)):
+        # Only a READY session (transcript bound) can be "done with its
+        # turn". A `pending` session reports idle=True as soon as its PTY
+        # is quiet — but quiet-and-pending means the agent hasn't started
+        # a turn yet (e.g. transcript not bound, or it never ran one), NOT
+        # that it finished. Returning here would make the caller read
+        # empty output and conclude the agent is done when it never began.
+        # Require state=="ready" so a still-pending session keeps polling
+        # until it binds (the detector self-heals late transcripts) or the
+        # deadline is hit (surfacing the stuck session as timed_out).
+        if state == "ready" and bool(resolved.get("idle", False)):
             return {"idle": True, "timed_out": False, "state": state}
         if time.monotonic() >= deadline:
             return {"idle": False, "timed_out": True, "state": state}
