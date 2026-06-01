@@ -31,6 +31,7 @@ mod workflow_watch;
 
 use std::io;
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -158,6 +159,20 @@ fn main() -> anyhow::Result<()> {
     // ratatui itself drew in a prior frame, not pre-existing screen content.)
     terminal.clear()?;
 
+    // Redirect stderr to a log file for the lifetime of the alt screen.
+    // ratatui owns the terminal and assumes it is the only writer — but
+    // ~60 `eprintln!` calls fire from background reconnect/watch threads
+    // (push_worker, manifest_watch, workflow_watch) at arbitrary times.
+    // Each writes raw text straight onto the alt screen, which both shows
+    // garbage AND desyncs ratatui's previous-buffer model (a stray line can
+    // scroll the screen, after which every incremental diff paints at the
+    // wrong offset — the scattered-character + bleed-through artifacts that
+    // never self-heal because the diff only repaints cells it thinks
+    // changed). Pointing fd 2 at a file removes the whole class at the
+    // source, including stderr from dependencies we don't control.
+    // Diagnostics (and panic backtraces) are preserved in ~/.cm/cm-tui.log.
+    let saved_stderr = redirect_stderr_to_log();
+
     let result = run(&mut terminal, config);
 
     // Restore terminal.
@@ -171,7 +186,56 @@ fn main() -> anyhow::Result<()> {
     )?;
     terminal.show_cursor()?;
 
+    // Restore the real stderr BEFORE returning so a fatal error from
+    // `run()` (printed by main's `Termination` impl) reaches the user's
+    // terminal instead of vanishing into the log.
+    if let Some(saved) = saved_stderr {
+        restore_stderr(saved);
+    }
+
     result
+}
+
+/// Point the process's stderr (fd 2) at `~/.cm/cm-tui.log`, returning the
+/// saved original fd so [`restore_stderr`] can put it back on exit.
+/// Returns `None` (leaving stderr untouched) if the redirect can't be set
+/// up — a missing `$HOME` or an unwritable `~/.cm` is non-fatal; the only
+/// cost is that stray `eprintln!`s keep corrupting the screen, the exact
+/// pre-existing behavior.
+fn redirect_stderr_to_log() -> Option<OwnedFd> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::PathBuf::from(home).join(".cm");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("cm-tui.log"))
+        .ok()?;
+    // SAFETY: dup/dup2 on STDERR_FILENO and a live file fd. `saved` is an
+    // independent dup of the original stderr; `file`'s fd is dup2'd onto
+    // fd 2, so fd 2 keeps its own reference to the open file description
+    // and `file` is free to drop afterwards.
+    let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+    if saved < 0 {
+        return None;
+    }
+    let rc = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
+    if rc < 0 {
+        unsafe { libc::close(saved) };
+        return None;
+    }
+    Some(unsafe { OwnedFd::from_raw_fd(saved) })
+}
+
+/// Restore the original stderr saved by [`redirect_stderr_to_log`].
+fn restore_stderr(saved: OwnedFd) {
+    let fd = saved.into_raw_fd();
+    // SAFETY: `fd` is the saved original stderr; dup2 it back onto fd 2 and
+    // drop the now-redundant copy.
+    unsafe {
+        libc::dup2(fd, libc::STDERR_FILENO);
+        libc::close(fd);
+    }
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> anyhow::Result<()> {
@@ -186,6 +250,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
 
             if let CrosstermEvent::Resize(_cols, _rows) = event {
                 app.needs_redraw = true;
+                // Force a full repaint after a resize. ratatui clears on a
+                // dimension change, but a same-size SIGWINCH (font/zoom
+                // change, some multiplexers) leaves its buffers untouched
+                // and the screen can desync — wipe unconditionally.
+                app.force_clear = true;
                 break;
             }
 
@@ -240,6 +309,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();
         if app.needs_redraw && now.duration_since(last_draw) >= Duration::from_millis(8) {
+            // Consume a pending full-repaint request (resize / A-r refresh).
+            // terminal.clear() emits ESC[2J and resets ratatui's previous
+            // buffer, so the draw below repaints every cell — curing any
+            // diff-model desync. Cheap because it only fires on explicit
+            // request, never in steady state.
+            if app.force_clear {
+                terminal.clear()?;
+                app.force_clear = false;
+            }
             let t = Instant::now();
             terminal.draw(|frame| {
                 let area = frame.area();

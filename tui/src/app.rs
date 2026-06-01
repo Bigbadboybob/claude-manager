@@ -3055,6 +3055,15 @@ pub struct App {
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
     pub needs_redraw: bool,
+    /// Request a physical screen wipe (`terminal.clear()` → ESC[2J +
+    /// reset of ratatui's previous buffer) before the next draw. ratatui's
+    /// incremental diff only repaints cells it believes changed, so once
+    /// its previous-buffer model desyncs from the physical screen (e.g. a
+    /// same-dimension SIGWINCH, or any residual corruption) the artifacts
+    /// don't self-heal. The main loop consumes this flag to force a full
+    /// repaint. Set on resize and on the `A-r` refresh (the user's manual
+    /// "fix my screen" escape hatch).
+    pub force_clear: bool,
     input_mode: InputMode,
     start_time: Instant,
     sessions_restored: bool,
@@ -3459,6 +3468,7 @@ impl App {
             connected: false,
             status_msg: None,
             needs_redraw: true,
+            force_clear: false,
             input_mode: InputMode::Normal,
             start_time: Instant::now(),
             sessions_restored: false,
@@ -8011,7 +8021,11 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
-                        self.set_status_msg("Refreshing...");
+                        // Also force a full physical repaint — A-r doubles
+                        // as the "fix my screen" recovery if ratatui's diff
+                        // model ever desyncs from the terminal.
+                        self.force_clear = true;
+                        self.set_status_msg("Refreshing + redrawing...");
                         return true;
                     }
                     KeyCode::Char('e') => {
