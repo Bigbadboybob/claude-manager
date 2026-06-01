@@ -1178,6 +1178,19 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     // call below fires FIRST so any existing daemon-side child
     // is reaped before we start the replacement.
     let session_type_str = engine.as_session_type();
+    // Mint a FRESH uid for the replacement session rather than
+    // reusing `ts.uid`. `kill_session` (daemon) only SIGKILLs and
+    // defers registry removal to the reaper's on-exit callback, so
+    // the uid stays in `state.sessions` for a beat after the kill
+    // RPC returns. An immediate `start_session` reusing that same
+    // uid loses the race and hits the daemon's collision guard
+    // (`Conflict`, methods.rs start_session) — the spawn fails, the
+    // swap below never runs, and `ts.session` is left holding the
+    // just-killed Session. The foreground then renders a dead PTY
+    // and drops every keystroke (frozen pane). A new uid sidesteps
+    // the kill-then-reuse race entirely. `ts.uid` is updated to
+    // match after the successful swap (see below).
+    let new_uid = new_session_uid();
     App::kill_daemon_session_if_attached(host_pool, ts);
     // migrate-tui-local Issue 3: workflow respawn with a known
     // transcript_id (the role's current session_id) lets us
@@ -1192,7 +1205,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         host_pool,
         config,
         cap_status,
-        &ts.uid,
+        &new_uid,
         workspace_id,
         wt,
         session_type_str,
@@ -1228,6 +1241,18 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     // (respawn_calls_kill_daemon_before_session_swap) still
     // matches because the kill call precedes this assignment.
     ts.session = new_sess;
+    // Adopt the replacement session's fresh uid as this
+    // TerminalSession's identity. The new daemon session is
+    // registered under `new_uid` (the returned Session's
+    // `daemon_session_uid` equals it), and the MCP config baked
+    // into the spawn sets `CM_TUI_SESSION_ID = new_uid`. The
+    // descendant-scope auth check compares `ts.uid == caller_uid`
+    // (the agent's CM_TUI_SESSION_ID), so without this update the
+    // respawned agent's `workflow_transition` / `workflow_done`
+    // calls would fail auth. The workflow RoleBinding captures
+    // `ts.session.daemon_session_uid` after this respawn returns,
+    // so it picks up the new uid as well.
+    ts.uid = new_uid;
     if session_id.is_some() {
         ts.transcript_id = session_id.map(|s| s.to_string());
         ts.pending_jsonl_files = match engine {
@@ -1243,6 +1268,12 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     ts.pending_enter = None;
     ts.last_delivery = None;
     ts.status = SessionStatus::Idle;
+    // Kick a resize so the freshly-resumed agent (e.g. `claude
+    // --resume`) repaints right away. The new Session's terminal
+    // grid starts blank; the Resize msg drives a SIGWINCH to the
+    // daemon PTY, prompting an immediate redraw instead of leaving
+    // the pane blank until the agent's next spontaneous output.
+    ts.session.resize(cols, rows);
     None
 }
 
@@ -18809,6 +18840,71 @@ mod respawn_kills_daemon_session_tests {
              drops the old daemon-attached Session (detach-only Drop) BEFORE the \
              explicit kill RPC fires, leaving an orphan daemon PTY child.\n\nFunction body:\n{}",
             kill_idx, swap_idx, body
+        );
+    }
+
+    /// Regression pin for the review-workflow PTY-freeze bug: the
+    /// respawn must spawn the replacement under a FRESH uid, not
+    /// reuse `ts.uid`. `kill_session` defers daemon registry
+    /// removal to the reaper, so reusing the just-killed uid races
+    /// the daemon's `start_session` collision guard (`Conflict`),
+    /// the spawn fails, the `ts.session` swap never runs, and the
+    /// foreground PTY is left attached to a dead session — frozen,
+    /// no input. A fresh uid removes the race. The `ts.uid` field
+    /// must then be re-pointed at the new uid so descendant-scope
+    /// MCP auth (`ts.uid == caller_uid`) keeps matching the
+    /// respawned agent's `CM_TUI_SESSION_ID`.
+    #[test]
+    fn respawn_uses_fresh_uid_not_reused_to_avoid_kill_then_reuse_collision() {
+        let body = respawn_body();
+        let mint_idx = body.find("let new_uid = new_session_uid();").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must mint a fresh uid \
+                 (`let new_uid = new_session_uid();`) for the replacement \
+                 session instead of reusing `ts.uid`. Reusing the just-killed \
+                 uid races the daemon's start_session collision guard and \
+                 freezes the foreground PTY.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let kill_idx = body
+            .find("kill_daemon_session_if_attached(host_pool, ts)")
+            .expect("kill call must exist");
+        assert!(
+            mint_idx < kill_idx,
+            "the fresh uid must be minted before the kill so kill-uid and \
+             start-uid are guaranteed distinct",
+        );
+        assert!(
+            body.contains("&new_uid,"),
+            "the daemon spawn must be passed `&new_uid` (the fresh uid), not \
+             `&ts.uid`, so the new daemon session registers under a uid the \
+             just-killed one can't collide with.\n\nFunction body:\n{}",
+            body,
+        );
+        assert!(
+            !body.contains("&ts.uid,"),
+            "respawn must NOT pass `&ts.uid` to the spawn — that reintroduces \
+             the kill-then-reuse collision freeze.\n\nFunction body:\n{}",
+            body,
+        );
+        let adopt_idx = body.find("ts.uid = new_uid;").unwrap_or_else(|| {
+            panic!(
+                "after swapping `ts.session`, respawn must adopt the fresh uid \
+                 (`ts.uid = new_uid;`) so descendant-scope MCP auth \
+                 (`ts.uid == caller_uid`) matches the respawned agent's \
+                 CM_TUI_SESSION_ID.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let swap_idx = body
+            .find("ts.session = new_sess")
+            .expect("swap must exist");
+        assert!(
+            swap_idx < adopt_idx,
+            "`ts.uid = new_uid` must come AFTER `ts.session = new_sess` — the \
+             uid is adopted only once the swap succeeds (error paths keep the \
+             old identity for the still-old session).",
         );
     }
 }
