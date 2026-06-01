@@ -4243,6 +4243,94 @@ struct McpStartSessionParams {
     task_id: Option<String>,
 }
 
+/// Kitty keyboard Enter (CSI 13 u). Codex enables the kitty keyboard
+/// protocol at startup, which encodes Enter as this sequence rather than
+/// raw `\r`/`\n`. Mirrors the TUI's `enter_bytes_for_mode` kitty arm.
+const CODEX_KITTY_ENTER: &[u8] = b"\x1b[13u";
+
+/// Wait after spawn before writing a codex prompt body, so codex finishes
+/// enabling its kitty + bracketed-paste modes (observed ~1.3-1.8s
+/// post-startup in codex-tui.log). Held a bit above that for margin; this
+/// is the most likely value to need tuning if the prompt still doesn't
+/// submit on a slow cold-start — the delivery log line below reports the
+/// actual elapsed time to guide it.
+const CODEX_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Gap between the body and the trailing Enter, so codex consumes the
+/// paste and treats the Enter as a distinct keystroke (not paste tail).
+/// Mirrors the TUI's separate deferred-Enter write.
+const CODEX_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Wrap a prompt body in bracketed-paste markers (`\x1b[200~ … \x1b[201~`)
+/// when it spans multiple lines — matches the TUI's
+/// `format_body_for_delivery`. Without this, codex submits at the first
+/// newline, mangling a multi-line prompt. Single-line bodies go raw.
+/// Codex 0.132 always enables BRACKETED_PASTE, so (unlike the TUI) we
+/// don't gate on a live terminal mode the daemon can't read.
+fn codex_paste_payload(body: &str) -> Vec<u8> {
+    if body.contains('\n') {
+        let mut out = Vec::with_capacity(body.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(body.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        body.as_bytes().to_vec()
+    }
+}
+
+/// Deliver a `start_session` prompt to a codex session on a detached
+/// thread: settle, write the bracketed body, gap, write the kitty Enter.
+/// Async so `mcp_start_session` returns promptly (stays under the Python
+/// MCP 30s call timeout). The daemon can't read codex's live terminal
+/// mode (no `Term`), so this assumes the modes codex 0.132 always enables;
+/// see the constants above. Write failures are logged, not fatal — the
+/// session is already registered and the caller has its uid.
+fn spawn_codex_prompt_delivery(
+    handle: crate::session::InputHandle,
+    session_uid: String,
+    prompt: String,
+) {
+    let _ = std::thread::Builder::new()
+        .name(format!("cm-daemon-codex-prompt-{}", session_uid))
+        .spawn(move || {
+            std::thread::sleep(CODEX_PROMPT_SETTLE);
+            let body = prompt.trim_end_matches(['\r', '\n']);
+            let payload = codex_paste_payload(body);
+            let bracketed = payload.len() != body.len();
+            if let Err(e) = handle.write_and_stamp(&payload) {
+                eprintln!(
+                    "cm-daemon: codex prompt body write failed for {}: {}",
+                    session_uid, e
+                );
+                return;
+            }
+            std::thread::sleep(CODEX_ENTER_GAP);
+            if let Err(e) = handle.write_and_stamp(CODEX_KITTY_ENTER) {
+                eprintln!(
+                    "cm-daemon: codex prompt Enter write failed for {}: {}",
+                    session_uid, e
+                );
+                return;
+            }
+            // Positive delivery log (the failure mode this fix targets is
+            // "writes succeed but codex never submits" — invisible without
+            // this line). If the session stays `pending` after this logs,
+            // the bytes landed but the timing/encoding assumption was wrong
+            // (tune CODEX_PROMPT_SETTLE / the kitty sequence), rather than a
+            // write error or a missing delivery.
+            eprintln!(
+                "cm-daemon: codex prompt delivered for {}: settle={}ms gap={}ms \
+                 body={}B bracketed={} + kitty-Enter(CSI 13 u)",
+                session_uid,
+                CODEX_PROMPT_SETTLE.as_millis(),
+                CODEX_ENTER_GAP.as_millis(),
+                body.len(),
+                bracketed,
+            );
+        });
+}
+
 pub fn mcp_start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -4646,28 +4734,34 @@ pub fn mcp_start_session(
     // Sub-2b-3 review-fix #2: deliver `prompt` if supplied.
     // Pre-fix this was logged-and-dropped — silent contract
     // break with the Python MCP tool which advertises prompt
-    // delivery. Now we look up the new session's InputHandle
-    // and write the prompt + trailing newline through the
-    // shared `write_and_stamp` helper (same path used by the
-    // attach-stream Input frame handler). Newline appended
-    // when missing so the receiving agent sees a complete
-    // submission (matches the TUI's `submit=true` shape on
-    // `send_input`).
+    // delivery. Look up the new session's InputHandle and
+    // write the prompt through the shared `write_and_stamp`
+    // helper (same path the attach-stream Input frame handler
+    // uses).
     //
-    // **No quiet-wait gating yet**: the TUI's existing
-    // `PendingWrite::wait_for_quiet` machinery isn't
-    // relocated daemon-side. For sub-2b-3 the prompt goes
-    // straight to the PTY post-spawn; the agent buffers
-    // appropriately. A future slice can add a daemon-side
-    // pending-prompt queue if races with engine startup
-    // become observable.
+    // Engine-specific submission:
+    //   - claude-code / bash: body + `\n`, synchronous, with
+    //     kill-on-failure (no half-initialized session).
+    //   - codex: a bare `\n` does NOT submit codex's
+    //     kitty-keyboard TUI, and a multi-line body without
+    //     bracketed paste submits at the first newline. The
+    //     daemon has no `Term` to read codex's live mode, so it
+    //     delivers asynchronously assuming codex's always-on
+    //     modes (bracketed paste + kitty Enter) with a settle/
+    //     gap delay — see `spawn_codex_prompt_delivery`. This
+    //     is the daemon-side stand-in for the TUI's mode-aware
+    //     `PendingWrite::wait_for_quiet` drainer, which isn't
+    //     relocated daemon-side.
     if let Some(prompt) = p.prompt.as_deref() {
         if !prompt.is_empty() {
             let handle_opt = {
                 let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                state.sessions.get(&session_uid).map(|s| s.input_handle())
+                state
+                    .sessions
+                    .get(&session_uid)
+                    .map(|s| (s.input_handle(), s.session_type == "codex"))
             };
-            let Some(handle) = handle_opt else {
+            let Some((handle, is_codex)) = handle_opt else {
                 // Session disappeared between spawn and prompt
                 // delivery — exceptional but possible (fast-
                 // exit reaper removed the registry entry).
@@ -4685,29 +4779,42 @@ pub fn mcp_start_session(
                     ),
                 ));
             };
-            let mut payload = prompt.as_bytes().to_vec();
-            if !payload.ends_with(b"\n") {
-                payload.push(b'\n');
-            }
-            if let Err(e) = handle.write_and_stamp(&payload) {
-                // Sub-2b-3 review-8 #1: kill the just-spawned
-                // session and surface the error. Pre-fix
-                // a write failure logged + returned `ok`,
-                // leaving a half-initialized session with no
-                // delivered prompt — the caller has no way
-                // to know the prompt didn't land. Removing
-                // the session from the registry drops the
-                // DaemonSession, which SIGKILLs the child via
-                // its pidfd-based Drop.
-                let err_msg = format!(
-                    "mcp_start_session: prompt-delivery write failed for '{}': {}; \
-                     session was killed (review-8 #1 — no half-initialized sessions)",
-                    session_uid, e,
+            if is_codex {
+                // Codex (0.132+) runs a kitty-keyboard TUI: a bare newline
+                // in its composer does NOT submit, and a multi-line body
+                // delivered without bracketed-paste markers splits into
+                // premature submissions. The TUI handles this via its
+                // mode-aware drainer; the daemon has no `Term` to read the
+                // live terminal mode, so we deliver asynchronously assuming
+                // the modes codex always enables (BRACKETED_PASTE + kitty),
+                // with a timing gap so they're active before the bytes land.
+                // See `spawn_codex_prompt_delivery`. Returns immediately; the
+                // transcript detector binds once codex runs the turn.
+                spawn_codex_prompt_delivery(
+                    handle,
+                    session_uid.clone(),
+                    prompt.to_string(),
                 );
-                let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                let _ = state.sessions.remove(&session_uid);
-                drop(state);
-                return Err((ErrorCode::Internal, err_msg));
+            } else {
+                // claude-code / bash: body + newline, synchronous, with
+                // kill-on-failure so no half-initialized session lingers
+                // (Sub-2b-3 review-8 #1). A failed write removes the session
+                // from the registry, whose Drop SIGKILLs the child.
+                let mut payload = prompt.as_bytes().to_vec();
+                if !payload.ends_with(b"\n") {
+                    payload.push(b'\n');
+                }
+                if let Err(e) = handle.write_and_stamp(&payload) {
+                    let err_msg = format!(
+                        "mcp_start_session: prompt-delivery write failed for '{}': {}; \
+                         session was killed (review-8 #1 — no half-initialized sessions)",
+                        session_uid, e,
+                    );
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = state.sessions.remove(&session_uid);
+                    drop(state);
+                    return Err((ErrorCode::Internal, err_msg));
+                }
             }
         }
     }
@@ -4808,6 +4915,28 @@ mod tests {
     use super::*;
     use crate::manifest::ManifestWorkspace;
     use tempfile::TempDir;
+
+    /// Multi-line codex prompt bodies must be wrapped in bracketed-paste
+    /// markers — otherwise codex submits at the first newline and mangles
+    /// the prompt. Single-line bodies go raw.
+    #[test]
+    fn codex_paste_payload_wraps_multiline_only() {
+        let multi = codex_paste_payload("line one\nline two");
+        assert_eq!(multi, b"\x1b[200~line one\nline two\x1b[201~");
+
+        let single = codex_paste_payload("just one line");
+        assert_eq!(single, b"just one line");
+    }
+
+    /// The codex submit keystroke is the kitty-encoded Enter (CSI 13 u),
+    /// not a bare `\n`/`\r` — codex 0.132's kitty-keyboard TUI ignores the
+    /// latter, so the prompt never submits.
+    #[test]
+    fn codex_kitty_enter_is_csi_13u() {
+        assert_eq!(CODEX_KITTY_ENTER, b"\x1b[13u");
+        assert_ne!(CODEX_KITTY_ENTER, b"\n");
+        assert_ne!(CODEX_KITTY_ENTER, b"\r");
+    }
 
     /// Sub-2b-3 review-10: pin the watcher-startup
     /// hard-cap resolution. Pre-fix the watcher-startup
