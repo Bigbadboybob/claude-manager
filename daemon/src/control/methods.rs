@@ -1701,6 +1701,22 @@ pub fn list_sessions(
             "state": state_str,
             "idle": idle,
             "managed_by_uid": session.managed_by_uid,
+            // Adoption metadata (Part 1): lets the TUI surface
+            // agent-spawned sessions in the sidebar, grouped under their
+            // task/workspace. All already live on `DaemonSession`;
+            // `worktree_path` is joined from the daemon manifest so the
+            // TUI can build/restore a workspace for the adopted session.
+            // Additive — older TUI consumers ignore unknown fields, and a
+            // newer TUI treats them as Optional.
+            "workspace_id": session.workspace_id,
+            "task_id": session.task_id,
+            "workflow_run_id": session.workflow_run_id,
+            "workflow_role": session.workflow_role,
+            "worktree_path": state
+                .workspaces
+                .get(&session.workspace_id)
+                .and_then(|w| w.worktree_path.as_ref())
+                .map(|p| p.display().to_string()),
         }));
     }
     // TUI-owned sessions (post-Phase-1 unified view, fixes review

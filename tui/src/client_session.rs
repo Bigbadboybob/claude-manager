@@ -819,6 +819,77 @@ pub fn rpc_list_session_uids(
     Ok(out)
 }
 
+/// Summary of a daemon-owned session, parsed from `list_sessions`. Used
+/// by the TUI's adoption pass (`App::adopt_untracked_daemon_sessions`) to
+/// surface agent-spawned ("phantom") sessions in the sidebar. Fields
+/// beyond uid/label/type are `Option` so an older daemon (pre Part-1
+/// adoption metadata) still parses — the TUI then degrades to a synthetic
+/// per-session workspace instead of grouping by `workspace_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonSessionSummary {
+    pub session_uid: String,
+    pub label: String,
+    /// Wire session type ("claude-code" / "codex" / "bash").
+    pub session_type: String,
+    /// `Some` = agent-spawned via mcp_start_session; `None` = TUI-/
+    /// operator-spawned. The adoption pass only adopts `Some`.
+    pub managed_by_uid: Option<String>,
+    pub workspace_id: Option<String>,
+    pub task_id: Option<String>,
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
+    pub worktree_path: Option<String>,
+}
+
+/// Parse one `list_sessions` array entry into a [`DaemonSessionSummary`].
+/// Returns `None` if the entry lacks a `session_uid`. Split out so the
+/// adoption-pass tests can exercise parsing without a live daemon.
+pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonSessionSummary> {
+    let session_uid = entry.get("session_uid").and_then(|v| v.as_str())?.to_string();
+    let str_field = |k: &str| {
+        entry
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    Some(DaemonSessionSummary {
+        session_uid,
+        label: str_field("label").unwrap_or_default(),
+        session_type: str_field("type").unwrap_or_default(),
+        managed_by_uid: str_field("managed_by_uid"),
+        workspace_id: str_field("workspace_id"),
+        task_id: str_field("task_id"),
+        workflow_run_id: str_field("workflow_run_id"),
+        workflow_role: str_field("workflow_role"),
+        worktree_path: str_field("worktree_path"),
+    })
+}
+
+/// List daemon-owned sessions with the metadata the TUI needs to adopt
+/// (surface) agent-spawned sessions into the sidebar. Mirrors
+/// [`rpc_list_session_uids`] (same `daemon_owned_only: true` filter, which
+/// excludes stale `tui_sessions` snapshot rows) but returns full summaries.
+/// Operator-only on the daemon side.
+pub fn rpc_list_daemon_sessions(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+) -> anyhow::Result<Vec<DaemonSessionSummary>> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "list_sessions".into(),
+        params: serde_json::json!({ "daemon_owned_only": true }),
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp
+        .result
+        .context("list_sessions response missing result")?;
+    let arr = result
+        .as_array()
+        .context("list_sessions result not an array")?;
+    Ok(arr.iter().filter_map(parse_daemon_session_summary).collect())
+}
+
 /// `session.set_transcript_path` RPC. Sub-2b-1 review #1: the
 /// TUI's transcript-discovery detector (the
 /// `pending_jsonl_files` → `transcript_id` binding in
@@ -1038,6 +1109,39 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc as StdArc, Mutex};
     use tempfile::TempDir;
+
+    /// `parse_daemon_session_summary` reads the full adoption metadata from
+    /// a new daemon, tolerates a partial entry from an old daemon (missing
+    /// fields → None), and rejects an entry with no `session_uid`.
+    #[test]
+    fn parse_daemon_session_summary_full_partial_and_missing() {
+        let full = serde_json::json!({
+            "session_uid": "ts-1", "label": "worker", "type": "codex",
+            "managed_by_uid": "ts-parent", "workspace_id": "ws-9",
+            "task_id": "task-9", "workflow_run_id": "wf-1",
+            "workflow_role": "worker", "worktree_path": "/home/u/.cm/worktrees/x",
+        });
+        let s = parse_daemon_session_summary(&full).expect("entry has uid");
+        assert_eq!(s.session_uid, "ts-1");
+        assert_eq!(s.session_type, "codex");
+        assert_eq!(s.managed_by_uid.as_deref(), Some("ts-parent"));
+        assert_eq!(s.workspace_id.as_deref(), Some("ws-9"));
+        assert_eq!(s.task_id.as_deref(), Some("task-9"));
+        assert_eq!(s.worktree_path.as_deref(), Some("/home/u/.cm/worktrees/x"));
+
+        // Old daemon: only the original list_sessions fields present.
+        let partial = serde_json::json!({
+            "session_uid": "ts-2", "label": "w", "type": "claude-code",
+        });
+        let s2 = parse_daemon_session_summary(&partial).expect("entry has uid");
+        assert_eq!(s2.session_uid, "ts-2");
+        assert!(s2.workspace_id.is_none());
+        assert!(s2.managed_by_uid.is_none());
+        assert!(s2.worktree_path.is_none());
+
+        // No uid → not a session entry.
+        assert!(parse_daemon_session_summary(&serde_json::json!({ "label": "x" })).is_none());
+    }
 
     /// Spin up an in-process daemon listening on a tempdir socket,
     /// pre-populating `DaemonState.workspaces` with a single

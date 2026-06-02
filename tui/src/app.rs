@@ -3119,6 +3119,9 @@ pub struct App {
     pub planning: PlanningView,
     pub should_quit: bool,
     pub last_term_size: (u16, u16),
+    /// Throttle for `adopt_untracked_daemon_sessions`; bounds the
+    /// `list_sessions` RPC frequency in the main tick.
+    pub last_adopt_scan: Option<Instant>,
     pub config: Config,
     pub backend: BackendHandle,
     pub connected: bool,
@@ -3532,6 +3535,7 @@ impl App {
             planning: PlanningView::new(),
             should_quit: false,
             last_term_size: (80, 24),
+            last_adopt_scan: None,
             config,
             backend,
             connected: false,
@@ -4416,6 +4420,209 @@ impl App {
         // (full-replace semantics — see
         // `rpc_tui_update_sessions_snapshot_full_replace`).
         self.push_state_to_daemon();
+        // Part 1: surface agent-spawned ("phantom") daemon sessions that
+        // aren't in the restored manifest (e.g. an agent spawned a worker
+        // while the TUI was down). Runs after restore so manifest-restored
+        // sessions are already tracked and won't be double-adopted.
+        self.adopt_untracked_daemon_sessions();
+    }
+
+    /// Throttled entry point for daemon-session adoption, called from the
+    /// main tick. Bounds the `list_sessions` RPC to once per
+    /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
+    pub fn maybe_adopt_daemon_sessions(&mut self) {
+        const ADOPT_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        if let Some(last) = self.last_adopt_scan {
+            if now.duration_since(last) < ADOPT_SCAN_INTERVAL {
+                return;
+            }
+        }
+        self.last_adopt_scan = Some(now);
+        self.adopt_untracked_daemon_sessions();
+    }
+
+    /// Surface agent-spawned ("phantom") daemon sessions in the sidebar.
+    ///
+    /// MCP `start_session` registers a session only in the daemon's
+    /// `state.sessions`; it never reaches the TUI via `manifest.watch`
+    /// (which broadcasts `state.workspaces`, not `state.sessions`), so the
+    /// TUI never learns about it. This pass polls the daemon, attaches each
+    /// agent-spawned session the TUI doesn't already track, and places it
+    /// into the matching workspace (by `workspace_id`) so it shows up
+    /// grouped under its task like a manually-launched session.
+    ///
+    /// Best-effort and local-host only; any RPC/attach error is skipped.
+    /// Reuses the restore-path attach machinery
+    /// (`try_attach_via_daemon_with_deps`) wholesale.
+    fn adopt_untracked_daemon_sessions(&mut self) {
+        let Some(socket) = self
+            .host_pool
+            .for_host(&cm_daemon::host_id::HostId::local())
+            .ok()
+            .and_then(|h| h.socket_path())
+        else {
+            return;
+        };
+        let summaries = match crate::client_session::rpc_list_daemon_sessions(
+            &socket,
+            crate::daemon_launch::operator_token(),
+        ) {
+            Ok(s) => s,
+            Err(_) => return, // best-effort; matches restore_sessions posture
+        };
+
+        // Decide adoptees under an immutable borrow, then mutate.
+        //   - `managed_by_uid.is_some()`: agent-spawned only. TUI-/operator-
+        //     spawned sessions are `None` and are excluded (they're already
+        //     tracked anyway, but this is the authoritative gate).
+        //   - not already tracked in any workspace.
+        let tracked: std::collections::HashSet<&str> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
+            .collect();
+        let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
+        drop(tracked);
+        if adoptees.is_empty() {
+            return;
+        }
+
+        let (cols, rows) = self.last_term_size;
+        let mut adopted_any = false;
+        for s in adoptees {
+            // worktree: daemon-reported > matching workspace's > temp_dir.
+            // Must end up `Some` on the workspace so the restore-path attach
+            // branch re-attaches it after a TUI restart.
+            let worktree: PathBuf = s
+                .worktree_path
+                .clone()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    s.workspace_id.as_deref().and_then(|wid| {
+                        self.workspaces
+                            .iter()
+                            .find(|w| w.id.as_str() == wid)
+                            .and_then(|w| w.worktree_path.clone())
+                    })
+                })
+                .unwrap_or_else(std::env::temp_dir);
+
+            // Target workspace: the existing one matching the daemon's
+            // `workspace_id` (groups the session under the same task as the
+            // spawning agent), else a fresh synthetic workspace.
+            let target_ws_id: String = match s
+                .workspace_id
+                .as_deref()
+                .filter(|wid| self.workspaces.iter().any(|w| w.id.as_str() == *wid))
+            {
+                Some(wid) => wid.to_string(),
+                None => {
+                    let new_id = new_workspace_id();
+                    self.workspaces.push(Workspace {
+                        id: new_id.clone(),
+                        name: format!("agent: {}", s.label),
+                        is_closed: false,
+                        is_cloud: false,
+                        repo_url: None,
+                        worktree_path: Some(worktree.clone()),
+                        main_repo_path: None,
+                        worker_vm: None,
+                        worker_zone: None,
+                        sessions: Vec::new(),
+                        tombstones: Vec::new(),
+                        is_pushing: false,
+                    });
+                    new_id
+                }
+            };
+
+            // Attach to the existing daemon session (uid-only; the daemon
+            // already owns argv/env/cwd). Transcript binding is deferred —
+            // the attach-stream replays the PTY ring buffer, so the session
+            // is live + visible without it.
+            let session = match try_attach_via_daemon_with_deps(
+                &self.host_pool,
+                &s.session_uid,
+                &target_ws_id,
+                &worktree,
+                &s.session_type,
+                &s.label,
+                cols,
+                rows,
+                s.task_id.as_deref(),
+                s.workflow_run_id.as_deref(),
+                s.workflow_role.as_deref(),
+                &cm_daemon::host_id::HostId::local(),
+                None,
+            ) {
+                Ok(sess) => sess,
+                // TOCTOU: the session exited between list and attach. Skip
+                // (do NOT spawn — the TUI doesn't own this session).
+                Err(_) => continue,
+            };
+
+            let ts = TerminalSession {
+                uid: s.session_uid.clone(),
+                label: s.label.clone(),
+                session_type: normalize_session_type_to_internal(&s.session_type).to_string(),
+                session,
+                status: SessionStatus::Running,
+                last_write_at: None,
+                transcript_id: None,
+                generation: 0,
+                // Attach path skips the post-spawn JSONL rebind primer
+                // (mirrors `RestoreOutcome::Attached`).
+                pending_jsonl_files: None,
+                // VISIBLE by default — the whole point of adoption is that
+                // agent-spawned sessions show up on screen.
+                hidden: false,
+                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+                burst_threshold: 0,
+                pending_prompt: None,
+                pending_clear: None,
+                workflow_run_id: s.workflow_run_id.clone(),
+                workflow_role: s.workflow_role.clone(),
+                last_delivery: None,
+                task_id: s.task_id.clone(),
+                notify_on_idle: false,
+                pending_enter: None,
+                created_at: Instant::now(),
+                managed_by_uid: s.managed_by_uid.clone(),
+                seeded_from_snapshot: None,
+                preserved_last_exit: None,
+                host_id: cm_daemon::host_id::HostId::local(),
+            };
+            if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == target_ws_id) {
+                w.sessions.push(ts);
+                adopted_any = true;
+            }
+        }
+
+        if adopted_any {
+            // Persist (round-trips to tui-sessions.json so the adopted
+            // session re-attaches on restart via the restore path) and push
+            // the updated state to the daemon.
+            self.save_session_manifest();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Select which daemon-session summaries the adoption pass should take:
+    /// agent-spawned (`managed_by_uid.is_some()` — TUI/operator spawns are
+    /// `None`) and not already tracked in any TUI workspace. Pure (no
+    /// `self`) so the gate + dedup is unit-testable without a live daemon.
+    fn select_daemon_adoptees(
+        summaries: Vec<crate::client_session::DaemonSessionSummary>,
+        tracked_uids: &std::collections::HashSet<&str>,
+    ) -> Vec<crate::client_session::DaemonSessionSummary> {
+        summaries
+            .into_iter()
+            .filter(|s| {
+                s.managed_by_uid.is_some()
+                    && !tracked_uids.contains(s.session_uid.as_str())
+            })
+            .collect()
     }
 
 
@@ -16144,6 +16351,53 @@ mod activity_summary_tests {
         assert!(s.contains("task=1914682b"), "{s}");
         // Full UUID must not bleed through — the column would overflow.
         assert!(!s.contains("20ba036427bc"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod adopt_daemon_session_tests {
+    //! Pins the adoption gate that surfaces agent-spawned ("phantom")
+    //! daemon sessions in the sidebar: only `managed_by_uid.is_some()`
+    //! (agent-spawned) AND not-already-tracked sessions are adopted.
+    use super::App;
+    use crate::client_session::DaemonSessionSummary;
+    use std::collections::HashSet;
+
+    fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
+        DaemonSessionSummary {
+            session_uid: uid.to_string(),
+            label: "w".to_string(),
+            session_type: "claude-code".to_string(),
+            managed_by_uid: managed_by_uid.map(str::to_string),
+            workspace_id: None,
+            task_id: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            worktree_path: None,
+        }
+    }
+
+    #[test]
+    fn adopts_only_agent_spawned_and_untracked() {
+        let tracked: HashSet<&str> = ["already-here"].into_iter().collect();
+        let summaries = vec![
+            summary("agent-1", Some("ts-parent")), // adopt
+            summary("operator-1", None),           // skip: not agent-spawned
+            summary("already-here", Some("ts-parent")), // skip: already tracked
+        ];
+        let picked = App::select_daemon_adoptees(summaries, &tracked);
+        let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
+        assert_eq!(uids, vec!["agent-1"]);
+    }
+
+    #[test]
+    fn managed_by_none_is_never_adopted() {
+        let tracked: HashSet<&str> = HashSet::new();
+        let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked);
+        assert!(
+            picked.is_empty(),
+            "TUI/operator-spawned sessions (managed_by_uid None) must not be adopted"
+        );
     }
 }
 

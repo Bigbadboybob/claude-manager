@@ -298,6 +298,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.drain_manifest_watch_events();
         log_slow_phase("drain_manifest_watch_events", t.elapsed());
 
+        // Part 1: periodically surface agent-spawned ("phantom") daemon
+        // sessions in the sidebar. Self-throttled to ~5s (the daemon never
+        // broadcasts these, so a poll is required). No-op in legacy
+        // single-process mode (no local daemon socket).
+        let t = Instant::now();
+        app.maybe_adopt_daemon_sessions();
+        log_slow_phase("maybe_adopt_daemon_sessions", t.elapsed());
+
         // 11d: drain WorkflowWatchEvent frames from the
         // events.subscribe consumer. Same shape as the
         // manifest_watch drain — single-thread apply under the
