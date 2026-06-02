@@ -32,14 +32,27 @@ mod dirs {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
-/// Half-period of the attention blink driven by `notify_user`. The indicator
-/// of a session with a pending alert alternates between a bright glyph and its
-/// normal indicator every `ALERT_BLINK_INTERVAL_MS`.
-const ALERT_BLINK_INTERVAL_MS: u128 = 450;
-/// Glyph shown on the "on" phase of an alert blink (a filled circle, rendered
-/// bright yellow + bold so it reads as "look at me" against the steady
-/// green-spinner / white-dot indicators around it).
-const ALERT_GLYPH: &str = "\u{25cf}";
+/// Frame duration of the `notify_user` attention animation — the "rainbow
+/// heartbeat". A session with a pending alert advances one frame every
+/// `ALERT_FRAME_MS`, pulsing its glyph small→large while the color cycles
+/// through the rainbow so it pops against the steady green-spinner / white-dot
+/// indicators around it.
+const ALERT_FRAME_MS: u128 = 120;
+/// Glyph pulse — the bead grows then shrinks. 6 frames.
+const ALERT_PULSE: &[&str] = &["\u{00b7}", "\u{2022}", "\u{25cf}", "\u{25c9}", "\u{25cf}", "\u{2022}"];
+/// Rainbow the alert color cycles through, one step per frame. 7 colors —
+/// coprime with the 6-frame pulse, so the glyph size and color never re-lock
+/// into a short loop (full repeat period is lcm(6,7)=42 frames ≈ 5s), keeping
+/// the bead visually lively the whole time it's pending.
+const ALERT_RAINBOW: &[Color] = &[
+    Color::Rgb(255, 70, 70),   // red
+    Color::Rgb(255, 140, 0),   // orange
+    Color::Rgb(255, 225, 50),  // yellow
+    Color::Rgb(90, 230, 90),   // green
+    Color::Rgb(60, 220, 220),  // cyan
+    Color::Rgb(90, 150, 255),  // blue
+    Color::Rgb(225, 90, 230),  // magenta
+];
 /// Width of the Sessions-view sidebar in cells. The terminal panel takes the
 /// remaining width minus its own border (see `SIDEBAR_WIDTH + 2` in main.rs
 /// when sizing the PTY).
@@ -3363,11 +3376,11 @@ pub struct App {
     /// blinking sidebar indicator, and it's cleared the moment the user
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
-    /// Last alert blink phase (0/1) we forced a redraw for. An alerting
-    /// session is usually idle (no PTY output → no redraws), so the blink
-    /// can't ride the normal event-driven repaint; `tick_alerts` flips
-    /// `needs_redraw` whenever this phase changes so the icon keeps pulsing.
-    last_alert_blink_phase: u8,
+    /// Last alert animation frame we forced a redraw for. An alerting session
+    /// is usually idle (no PTY output → no redraws), so the heartbeat can't
+    /// ride the normal event-driven repaint; `tick_alerts` flips `needs_redraw`
+    /// whenever this frame index advances so the icon keeps animating.
+    last_alert_frame: u64,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -3622,7 +3635,7 @@ impl App {
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
-            last_alert_blink_phase: 0,
+            last_alert_frame: 0,
         }
     }
 
@@ -3836,17 +3849,22 @@ impl App {
         SPINNER_FRAMES[idx]
     }
 
-    /// Current phase (0 or 1) of the attention blink, derived from the same
-    /// monotonic clock the spinner uses so the whole sidebar animates off one
-    /// time source.
-    fn alert_blink_phase(&self) -> u8 {
-        ((self.start_time.elapsed().as_millis() / ALERT_BLINK_INTERVAL_MS) % 2) as u8
+    /// Current animation frame of the alert heartbeat — a monotonic counter
+    /// off the same clock the spinner uses. Drives both the glyph/color pick
+    /// and the redraw trigger in `tick_alerts`.
+    fn alert_frame(&self) -> u64 {
+        (self.start_time.elapsed().as_millis() / ALERT_FRAME_MS) as u64
     }
 
-    /// True on the "bright" half of the blink — render `ALERT_GLYPH` then;
-    /// otherwise fall through to the session's normal indicator.
-    fn alert_blink_on(&self) -> bool {
-        self.alert_blink_phase() == 0
+    /// Glyph + style for an alerting session's indicator at the current frame:
+    /// a bold bead that pulses small→large while its color cycles through the
+    /// rainbow. Fully replaces the normal status indicator while the alert is
+    /// pending — the animation *is* the signal.
+    fn alert_indicator(&self) -> (&'static str, Style) {
+        let f = self.alert_frame() as usize;
+        let glyph = ALERT_PULSE[f % ALERT_PULSE.len()];
+        let color = ALERT_RAINBOW[f % ALERT_RAINBOW.len()];
+        (glyph, Style::default().fg(color).add_modifier(Modifier::BOLD))
     }
 
     /// True iff the session with this uid has a pending `notify_user` alert.
@@ -3871,9 +3889,9 @@ impl App {
         if self.alerts.is_empty() {
             return;
         }
-        let phase = self.alert_blink_phase();
-        if phase != self.last_alert_blink_phase {
-            self.last_alert_blink_phase = phase;
+        let frame = self.alert_frame();
+        if frame != self.last_alert_frame {
+            self.last_alert_frame = frame;
             self.needs_redraw = true;
         }
     }
@@ -12378,21 +12396,15 @@ impl App {
                             }
                         }
                     };
-                    // notify_user attention blink: on the "bright" half of the
-                    // cycle override whatever the session would normally show
-                    // (including a hidden session's blank) with the alert glyph
+                    // notify_user attention animation: while an alert is
+                    // pending, the rainbow-heartbeat bead takes over the icon
+                    // cell entirely (overriding even a hidden session's blank)
                     // — the whole point is to grab the eye regardless of status.
-                    let (indicator, indicator_style) =
-                        if self.session_has_alert(&ts.uid) && self.alert_blink_on() {
-                            (
-                                ALERT_GLYPH,
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        } else {
-                            (indicator, indicator_style)
-                        };
+                    let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+                        self.alert_indicator()
+                    } else {
+                        (indicator, indicator_style)
+                    };
 
                     // Role badge for workflow-participant sessions, e.g.
                     // "[worker] " / "[reviewer] " / "[manager] ". Phase 6
@@ -12509,17 +12521,11 @@ impl App {
                         ts.workflow_run_id.as_deref() == Some(run_id.as_str())
                             && self.session_has_alert(&ts.uid)
                     });
-                    let (agg_indicator, agg_style) =
-                        if agg_alerting && self.alert_blink_on() {
-                            (
-                                ALERT_GLYPH,
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        } else {
-                            (agg_indicator, agg_style)
-                        };
+                    let (agg_indicator, agg_style) = if agg_alerting {
+                        self.alert_indicator()
+                    } else {
+                        (agg_indicator, agg_style)
+                    };
                     let name = run
                         .map(|r| r.workflow_name.clone())
                         .unwrap_or_else(|| "workflow".into());
