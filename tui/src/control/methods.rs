@@ -697,6 +697,31 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
 }
 
 // ---------------------------------------------------------------------------
+// notify_user
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct NotifyUserParams {
+    #[serde(default)]
+    message: String,
+}
+
+/// Raise an attention alert on the *calling* session: fire a desktop
+/// notification and start the session's sidebar indicator blinking until the
+/// user selects that session's row. Self-targeting by design — the caller is
+/// the session that wants the user — so there's no cross-session authorization
+/// to do beyond confirming the caller is a live (non-tombstoned) session.
+pub fn notify_user(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    let p: NotifyUserParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let (wi, si) = find_live_session(&app.workspaces, caller_uid)
+        .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+    let label = app.workspaces[wi].sessions[si].label.clone();
+    app.raise_alert(caller_uid, &label, &p.message);
+    Ok(json!({ "ok": true }))
+}
+
+// ---------------------------------------------------------------------------
 // kill_session
 // ---------------------------------------------------------------------------
 

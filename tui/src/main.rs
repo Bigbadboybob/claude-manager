@@ -314,6 +314,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.drain_workflow_watch_events();
         log_slow_phase("drain_workflow_watch_events", t.elapsed());
 
+        // notify_user attention alerts: clear any whose session the user just
+        // selected (and reap dead ones), then drive the blink by forcing a
+        // redraw on each phase flip. Both no-op cheaply when no alert is
+        // pending, which is the overwhelmingly common case.
+        app.reap_and_clear_alerts();
+        app.tick_alerts();
+
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();
         if app.needs_redraw && now.duration_since(last_draw) >= Duration::from_millis(8) {

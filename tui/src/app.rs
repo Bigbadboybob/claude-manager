@@ -32,6 +32,14 @@ mod dirs {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
+/// Half-period of the attention blink driven by `notify_user`. The indicator
+/// of a session with a pending alert alternates between a bright glyph and its
+/// normal indicator every `ALERT_BLINK_INTERVAL_MS`.
+const ALERT_BLINK_INTERVAL_MS: u128 = 450;
+/// Glyph shown on the "on" phase of an alert blink (a filled circle, rendered
+/// bright yellow + bold so it reads as "look at me" against the steady
+/// green-spinner / white-dot indicators around it).
+const ALERT_GLYPH: &str = "\u{25cf}";
 /// Width of the Sessions-view sidebar in cells. The terminal panel takes the
 /// remaining width minus its own border (see `SIDEBAR_WIDTH + 2` in main.rs
 /// when sizing the PTY).
@@ -1002,6 +1010,26 @@ fn notify_session_idle(label: &str) {
     });
 }
 
+/// Fire a desktop notification raised by an agent calling the `notify_user`
+/// MCP tool. Same detached-thread, swallow-errors discipline as
+/// `notify_session_idle`. `message` is the agent-supplied reason; when empty
+/// we fall back to a generic line so the notification still says something
+/// useful.
+pub(crate) fn notify_user_alert(label: &str, message: &str) {
+    let label = label.to_string();
+    let body = if message.trim().is_empty() {
+        format!("{} needs your attention", label)
+    } else {
+        format!("{}: {}", label, message)
+    };
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary("Claude Manager")
+            .body(&body)
+            .show();
+    });
+}
+
 /// Generate a fresh workspace id. Not cryptographic — just collision-avoidance
 /// across the user's manifest via nanosecond timestamp.
 pub(crate) fn new_workspace_id() -> String {
@@ -1389,6 +1417,14 @@ fn activity_summary_for(
         "kill_session" => {
             let target = params.get("session_uid").and_then(V::as_str).unwrap_or("?");
             Some(format!("kill_session({})", short(target)))
+        }
+        "notify_user" => {
+            let msg = params.get("message").and_then(V::as_str).unwrap_or("");
+            if msg.trim().is_empty() {
+                Some("notify_user".to_string())
+            } else {
+                Some(format!("notify_user({:?})", snippet(msg)))
+            }
         }
         "start_session" => {
             let label = params.get("label").and_then(V::as_str).unwrap_or("?");
@@ -3320,6 +3356,18 @@ pub struct App {
     /// edits (typing inside the dialog) don't. Used as the
     /// second half of the Clear-on-transition gate.
     last_drawn_input_disc: Option<std::mem::Discriminant<InputMode>>,
+    /// Pending attention alerts raised by the `notify_user` MCP tool,
+    /// keyed by the alerting session's uid → the agent-supplied message.
+    /// Transient + in-memory only (never persisted to the manifest): an
+    /// alert is the live "this session wants you" signal that drives the
+    /// blinking sidebar indicator, and it's cleared the moment the user
+    /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
+    alerts: HashMap<String, String>,
+    /// Last alert blink phase (0/1) we forced a redraw for. An alerting
+    /// session is usually idle (no PTY output → no redraws), so the blink
+    /// can't ride the normal event-driven repaint; `tick_alerts` flips
+    /// `needs_redraw` whenever this phase changes so the icon keeps pulsing.
+    last_alert_blink_phase: u8,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -3573,6 +3621,8 @@ impl App {
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
+            alerts: HashMap::new(),
+            last_alert_blink_phase: 0,
         }
     }
 
@@ -3784,6 +3834,82 @@ impl App {
         let elapsed = self.start_time.elapsed().as_millis();
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
+    }
+
+    /// Current phase (0 or 1) of the attention blink, derived from the same
+    /// monotonic clock the spinner uses so the whole sidebar animates off one
+    /// time source.
+    fn alert_blink_phase(&self) -> u8 {
+        ((self.start_time.elapsed().as_millis() / ALERT_BLINK_INTERVAL_MS) % 2) as u8
+    }
+
+    /// True on the "bright" half of the blink — render `ALERT_GLYPH` then;
+    /// otherwise fall through to the session's normal indicator.
+    fn alert_blink_on(&self) -> bool {
+        self.alert_blink_phase() == 0
+    }
+
+    /// True iff the session with this uid has a pending `notify_user` alert.
+    pub(crate) fn session_has_alert(&self, uid: &str) -> bool {
+        self.alerts.contains_key(uid)
+    }
+
+    /// Record an attention alert for `uid` and fire the desktop notification.
+    /// Called by the `notify_user` control-socket handler. Idempotent on the
+    /// uid — a second alert just overwrites the message and re-notifies.
+    pub(crate) fn raise_alert(&mut self, uid: &str, label: &str, message: &str) {
+        self.alerts.insert(uid.to_string(), message.to_string());
+        notify_user_alert(label, message);
+        self.needs_redraw = true;
+    }
+
+    /// Drive the blink: when any alert is pending, force a redraw on each phase
+    /// flip so the indicator keeps pulsing even while the alerting session is
+    /// idle. Cheap no-op when `alerts` is empty (the common case). Called once
+    /// per main-loop iteration.
+    pub fn tick_alerts(&mut self) {
+        if self.alerts.is_empty() {
+            return;
+        }
+        let phase = self.alert_blink_phase();
+        if phase != self.last_alert_blink_phase {
+            self.last_alert_blink_phase = phase;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Clear an alert once the user selects its session, and reap alerts whose
+    /// session no longer exists (so a dead uid can't keep the blink — and thus
+    /// the forced redraws — alive forever). Called once per main-loop iteration;
+    /// gated on a non-empty `alerts` map so it's free in the common case.
+    pub fn reap_and_clear_alerts(&mut self) {
+        if self.alerts.is_empty() {
+            return;
+        }
+        // Clear-on-focus: the chosen semantics are "selecting the session's
+        // sidebar row counts as focusing it" (attach selects first, so it's
+        // covered too). Resolve the uid first and drop the workspaces borrow
+        // before mutating `alerts`.
+        let selected = cursor_selected_session_uid(&self.cursor, &self.workspaces)
+            .map(str::to_string);
+        if let Some(uid) = selected {
+            if self.alerts.remove(&uid).is_some() {
+                self.needs_redraw = true;
+            }
+        }
+        // Reap alerts for sessions that have since gone away.
+        if !self.alerts.is_empty() {
+            let live: HashSet<&str> = self
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.sessions.iter().map(|ts| ts.uid.as_str()))
+                .collect();
+            let before = self.alerts.len();
+            self.alerts.retain(|uid, _| live.contains(uid.as_str()));
+            if self.alerts.len() != before {
+                self.needs_redraw = true;
+            }
+        }
     }
 
     pub fn is_input_mode(&self) -> bool {
@@ -7072,6 +7198,7 @@ impl App {
             "create_subtask" => methods::create_subtask(self, caller, &req.params),
             "list_subtasks" => methods::list_subtasks(self, caller, &req.params),
             "mark_subtask_done" => methods::mark_subtask_done(self, caller, &req.params),
+            "notify_user" => methods::notify_user(self, caller, &req.params),
             other => Err((
                 ErrorCode::UnknownMethod,
                 format!("unknown method: {}", other),
@@ -12251,6 +12378,21 @@ impl App {
                             }
                         }
                     };
+                    // notify_user attention blink: on the "bright" half of the
+                    // cycle override whatever the session would normally show
+                    // (including a hidden session's blank) with the alert glyph
+                    // — the whole point is to grab the eye regardless of status.
+                    let (indicator, indicator_style) =
+                        if self.session_has_alert(&ts.uid) && self.alert_blink_on() {
+                            (
+                                ALERT_GLYPH,
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            (indicator, indicator_style)
+                        };
 
                     // Role badge for workflow-participant sessions, e.g.
                     // "[worker] " / "[reviewer] " / "[manager] ". Phase 6
@@ -12359,6 +12501,25 @@ impl App {
                         Some(r) => aggregate_indicator(r, ws, spinner),
                         None => ("\u{25cf}", Style::default().fg(Color::DarkGray)),
                     };
+                    // If any participant of this workflow has a pending alert,
+                    // blink the group header too (the participant rows blink
+                    // individually, but the header keeps the signal visible
+                    // when the group reads as one unit).
+                    let agg_alerting = ws.sessions.iter().any(|ts| {
+                        ts.workflow_run_id.as_deref() == Some(run_id.as_str())
+                            && self.session_has_alert(&ts.uid)
+                    });
+                    let (agg_indicator, agg_style) =
+                        if agg_alerting && self.alert_blink_on() {
+                            (
+                                ALERT_GLYPH,
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            (agg_indicator, agg_style)
+                        };
                     let name = run
                         .map(|r| r.workflow_name.clone())
                         .unwrap_or_else(|| "workflow".into());
@@ -14196,6 +14357,23 @@ pub(crate) fn log_tick(run_id: &str, msg: &str) {
     }
 }
 
+/// Uid of the session the cursor currently selects, if it's on a session row
+/// that resolves to a live session. This is the clear-on-focus target for
+/// `notify_user` alerts (`reap_and_clear_alerts`). Pure so it can be
+/// unit-tested without standing up a full `App`.
+fn cursor_selected_session_uid<'a>(
+    cursor: &Cursor,
+    workspaces: &'a [Workspace],
+) -> Option<&'a str> {
+    match cursor {
+        Cursor::Session(wi, si) => workspaces
+            .get(*wi)
+            .and_then(|ws| ws.sessions.get(*si))
+            .map(|ts| ts.uid.as_str()),
+        _ => None,
+    }
+}
+
 fn aggregate_indicator(
     run: &WorkflowRun,
     ws: &Workspace,
@@ -15677,6 +15855,36 @@ mod rotation_binding_tests {
             tombstones: vec![],
             is_pushing: false,
         }
+    }
+
+    #[test]
+    fn cursor_selected_session_uid_resolves_session_cursor() {
+        // Clear-on-focus depends on this mapping cursor → uid: it's the
+        // uid whose pending notify_user alert gets cleared.
+        let mut s0 = ts_with(None, None);
+        s0.uid = "uid-0".into();
+        let mut s1 = ts_with(None, None);
+        s1.uid = "uid-1".into();
+        let workspaces = vec![ws_with(vec![s0, s1])];
+
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Session(0, 1), &workspaces),
+            Some("uid-1"),
+        );
+        // A non-session cursor selects nothing — no alert should clear.
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Workspace(0), &workspaces),
+            None,
+        );
+        // Out-of-range indices resolve to None rather than panicking.
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Session(0, 9), &workspaces),
+            None,
+        );
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Session(5, 0), &workspaces),
+            None,
+        );
     }
 
     #[test]

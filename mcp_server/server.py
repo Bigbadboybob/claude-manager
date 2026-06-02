@@ -477,6 +477,28 @@ def send_input(session_uid: str, text: str, submit: bool = True) -> dict:
 
 
 @mcp.tool()
+def notify_user(message: str = "") -> dict:
+    """Alert the user that you need their attention.
+
+    Fires a desktop notification and makes the icon next to YOUR session
+    blink in the TUI sidebar. The blink stops once the user selects your
+    session. Use this when you're blocked on the user — a question, a
+    decision, an approval, or "I'm done, come look" — and don't want to
+    sit idle unnoticed.
+
+    Args:
+        message: Short reason shown in the notification (e.g. "need your
+            decision on the migration approach"). Optional; if omitted the
+            notification just says your session needs attention.
+
+    This only ever pings the user about your own session, so — unlike the
+    session-spawning / killing tools — you do NOT need to ask first. Just
+    call it when you genuinely need the user.
+    """
+    return control_client.call("notify_user", {"message": message})
+
+
+@mcp.tool()
 def kill_session(session_uid: str) -> dict:
     """Close a session you can see. The PTY is torn down and a tombstone
     is recorded so `read_session_output` still works for the closed
