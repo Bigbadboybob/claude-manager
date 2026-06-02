@@ -4243,31 +4243,32 @@ struct McpStartSessionParams {
     task_id: Option<String>,
 }
 
-/// Kitty keyboard Enter (CSI 13 u). Codex enables the kitty keyboard
-/// protocol at startup, which encodes Enter as this sequence rather than
-/// raw `\r`/`\n`. Mirrors the TUI's `enter_bytes_for_mode` kitty arm.
-const CODEX_KITTY_ENTER: &[u8] = b"\x1b[13u";
+/// Kitty keyboard Enter (CSI 13 u). codex and claude-code both enable the
+/// kitty keyboard protocol at startup, which encodes Enter as this sequence
+/// rather than raw `\r`/`\n`. Mirrors the TUI's `enter_bytes_for_mode`
+/// kitty arm. (Verified: a bare `\n` submits neither agent's composer.)
+const AGENT_KITTY_ENTER: &[u8] = b"\x1b[13u";
 
-/// Wait after spawn before writing a codex prompt body, so codex finishes
-/// enabling its kitty + bracketed-paste modes (observed ~1.3-1.8s
-/// post-startup in codex-tui.log). Held a bit above that for margin; this
-/// is the most likely value to need tuning if the prompt still doesn't
-/// submit on a slow cold-start — the delivery log line below reports the
-/// actual elapsed time to guide it.
-const CODEX_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+/// Wait after spawn before writing the prompt body, so the agent finishes
+/// enabling its kitty + bracketed-paste modes (codex enabled them ~1.3-1.8s
+/// post-startup in codex-tui.log; claude-code is similar). Held a bit above
+/// that for margin; this is the most likely value to need tuning if the
+/// prompt still doesn't submit on a slow cold-start — the delivery log line
+/// below reports the actual elapsed time to guide it.
+const AGENT_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
 
-/// Gap between the body and the trailing Enter, so codex consumes the
+/// Gap between the body and the trailing Enter, so the agent consumes the
 /// paste and treats the Enter as a distinct keystroke (not paste tail).
 /// Mirrors the TUI's separate deferred-Enter write.
-const CODEX_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+const AGENT_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Wrap a prompt body in bracketed-paste markers (`\x1b[200~ … \x1b[201~`)
 /// when it spans multiple lines — matches the TUI's
-/// `format_body_for_delivery`. Without this, codex submits at the first
-/// newline, mangling a multi-line prompt. Single-line bodies go raw.
-/// Codex 0.132 always enables BRACKETED_PASTE, so (unlike the TUI) we
+/// `format_body_for_delivery`. Without this, the agent submits at the first
+/// newline, mangling a multi-line prompt. Single-line bodies go raw. codex
+/// and claude-code always enable BRACKETED_PASTE, so (unlike the TUI) we
 /// don't gate on a live terminal mode the daemon can't read.
-fn codex_paste_payload(body: &str) -> Vec<u8> {
+fn agent_paste_payload(body: &str) -> Vec<u8> {
     if body.contains('\n') {
         let mut out = Vec::with_capacity(body.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
@@ -4279,52 +4280,53 @@ fn codex_paste_payload(body: &str) -> Vec<u8> {
     }
 }
 
-/// Deliver a `start_session` prompt to a codex session on a detached
-/// thread: settle, write the bracketed body, gap, write the kitty Enter.
-/// Async so `mcp_start_session` returns promptly (stays under the Python
-/// MCP 30s call timeout). The daemon can't read codex's live terminal
-/// mode (no `Term`), so this assumes the modes codex 0.132 always enables;
-/// see the constants above. Write failures are logged, not fatal — the
-/// session is already registered and the caller has its uid.
-fn spawn_codex_prompt_delivery(
+/// Deliver a `start_session` prompt to a kitty-TUI agent (codex or
+/// claude-code) on a detached thread: settle, write the bracketed body,
+/// gap, write the kitty Enter. Async so `mcp_start_session` returns
+/// promptly (stays under the Python MCP 30s call timeout). The daemon
+/// can't read the agent's live terminal mode (no `Term`), so this assumes
+/// the modes codex/claude-code always enable; see the constants above.
+/// Write failures are logged, not fatal — the session is already
+/// registered and the caller has its uid.
+fn spawn_agent_prompt_delivery(
     handle: crate::session::InputHandle,
     session_uid: String,
     prompt: String,
 ) {
     let _ = std::thread::Builder::new()
-        .name(format!("cm-daemon-codex-prompt-{}", session_uid))
+        .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
-            std::thread::sleep(CODEX_PROMPT_SETTLE);
+            std::thread::sleep(AGENT_PROMPT_SETTLE);
             let body = prompt.trim_end_matches(['\r', '\n']);
-            let payload = codex_paste_payload(body);
+            let payload = agent_paste_payload(body);
             let bracketed = payload.len() != body.len();
             if let Err(e) = handle.write_and_stamp(&payload) {
                 eprintln!(
-                    "cm-daemon: codex prompt body write failed for {}: {}",
+                    "cm-daemon: agent prompt body write failed for {}: {}",
                     session_uid, e
                 );
                 return;
             }
-            std::thread::sleep(CODEX_ENTER_GAP);
-            if let Err(e) = handle.write_and_stamp(CODEX_KITTY_ENTER) {
+            std::thread::sleep(AGENT_ENTER_GAP);
+            if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
                 eprintln!(
-                    "cm-daemon: codex prompt Enter write failed for {}: {}",
+                    "cm-daemon: agent prompt Enter write failed for {}: {}",
                     session_uid, e
                 );
                 return;
             }
             // Positive delivery log (the failure mode this fix targets is
-            // "writes succeed but codex never submits" — invisible without
-            // this line). If the session stays `pending` after this logs,
-            // the bytes landed but the timing/encoding assumption was wrong
-            // (tune CODEX_PROMPT_SETTLE / the kitty sequence), rather than a
-            // write error or a missing delivery.
+            // "writes succeed but the agent never submits" — invisible
+            // without this line). If the session stays `pending` after this
+            // logs, the bytes landed but the timing/encoding assumption was
+            // wrong (tune AGENT_PROMPT_SETTLE / the kitty sequence), rather
+            // than a write error or a missing delivery.
             eprintln!(
-                "cm-daemon: codex prompt delivered for {}: settle={}ms gap={}ms \
+                "cm-daemon: agent prompt delivered for {}: settle={}ms gap={}ms \
                  body={}B bracketed={} + kitty-Enter(CSI 13 u)",
                 session_uid,
-                CODEX_PROMPT_SETTLE.as_millis(),
-                CODEX_ENTER_GAP.as_millis(),
+                AGENT_PROMPT_SETTLE.as_millis(),
+                AGENT_ENTER_GAP.as_millis(),
                 body.len(),
                 bracketed,
             );
@@ -4748,7 +4750,7 @@ pub fn mcp_start_session(
     //     daemon has no `Term` to read codex's live mode, so it
     //     delivers asynchronously assuming codex's always-on
     //     modes (bracketed paste + kitty Enter) with a settle/
-    //     gap delay — see `spawn_codex_prompt_delivery`. This
+    //     gap delay — see `spawn_agent_prompt_delivery`. This
     //     is the daemon-side stand-in for the TUI's mode-aware
     //     `PendingWrite::wait_for_quiet` drainer, which isn't
     //     relocated daemon-side.
@@ -4759,9 +4761,19 @@ pub fn mcp_start_session(
                 state
                     .sessions
                     .get(&session_uid)
-                    .map(|s| (s.input_handle(), s.session_type == "codex"))
+                    .map(|s| {
+                        // codex AND claude-code both run kitty-keyboard
+                        // TUIs that need the bracketed-paste + kitty-Enter
+                        // treatment (verified: a bare `\n` submits neither).
+                        // bash is a real shell — `\n` is the correct submit.
+                        let is_tui_agent = matches!(
+                            s.session_type.as_str(),
+                            "codex" | "claude-code"
+                        );
+                        (s.input_handle(), is_tui_agent)
+                    })
             };
-            let Some((handle, is_codex)) = handle_opt else {
+            let Some((handle, is_tui_agent)) = handle_opt else {
                 // Session disappeared between spawn and prompt
                 // delivery — exceptional but possible (fast-
                 // exit reaper removed the registry entry).
@@ -4779,18 +4791,19 @@ pub fn mcp_start_session(
                     ),
                 ));
             };
-            if is_codex {
-                // Codex (0.132+) runs a kitty-keyboard TUI: a bare newline
-                // in its composer does NOT submit, and a multi-line body
-                // delivered without bracketed-paste markers splits into
+            if is_tui_agent {
+                // codex and claude-code both run kitty-keyboard TUIs: a bare
+                // newline in the composer does NOT submit, and a multi-line
+                // body delivered without bracketed-paste markers splits into
                 // premature submissions. The TUI handles this via its
                 // mode-aware drainer; the daemon has no `Term` to read the
                 // live terminal mode, so we deliver asynchronously assuming
-                // the modes codex always enables (BRACKETED_PASTE + kitty),
-                // with a timing gap so they're active before the bytes land.
-                // See `spawn_codex_prompt_delivery`. Returns immediately; the
-                // transcript detector binds once codex runs the turn.
-                spawn_codex_prompt_delivery(
+                // the modes these agents always enable (BRACKETED_PASTE +
+                // kitty), with a timing gap so they're active before the
+                // bytes land. See `spawn_agent_prompt_delivery`. Returns
+                // immediately; the transcript detector binds once the agent
+                // runs the turn.
+                spawn_agent_prompt_delivery(
                     handle,
                     session_uid.clone(),
                     prompt.to_string(),
@@ -4916,26 +4929,26 @@ mod tests {
     use crate::manifest::ManifestWorkspace;
     use tempfile::TempDir;
 
-    /// Multi-line codex prompt bodies must be wrapped in bracketed-paste
-    /// markers — otherwise codex submits at the first newline and mangles
-    /// the prompt. Single-line bodies go raw.
+    /// Multi-line agent prompt bodies must be wrapped in bracketed-paste
+    /// markers — otherwise the agent (codex / claude-code) submits at the
+    /// first newline and mangles the prompt. Single-line bodies go raw.
     #[test]
-    fn codex_paste_payload_wraps_multiline_only() {
-        let multi = codex_paste_payload("line one\nline two");
+    fn agent_paste_payload_wraps_multiline_only() {
+        let multi = agent_paste_payload("line one\nline two");
         assert_eq!(multi, b"\x1b[200~line one\nline two\x1b[201~");
 
-        let single = codex_paste_payload("just one line");
+        let single = agent_paste_payload("just one line");
         assert_eq!(single, b"just one line");
     }
 
-    /// The codex submit keystroke is the kitty-encoded Enter (CSI 13 u),
-    /// not a bare `\n`/`\r` — codex 0.132's kitty-keyboard TUI ignores the
-    /// latter, so the prompt never submits.
+    /// The agent submit keystroke is the kitty-encoded Enter (CSI 13 u),
+    /// not a bare `\n`/`\r` — codex's and claude-code's kitty-keyboard TUIs
+    /// ignore the latter, so the prompt never submits.
     #[test]
-    fn codex_kitty_enter_is_csi_13u() {
-        assert_eq!(CODEX_KITTY_ENTER, b"\x1b[13u");
-        assert_ne!(CODEX_KITTY_ENTER, b"\n");
-        assert_ne!(CODEX_KITTY_ENTER, b"\r");
+    fn agent_kitty_enter_is_csi_13u() {
+        assert_eq!(AGENT_KITTY_ENTER, b"\x1b[13u");
+        assert_ne!(AGENT_KITTY_ENTER, b"\n");
+        assert_ne!(AGENT_KITTY_ENTER, b"\r");
     }
 
     /// Sub-2b-3 review-10: pin the watcher-startup
