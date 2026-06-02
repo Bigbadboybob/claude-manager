@@ -2407,6 +2407,7 @@ mod tests {
             goal: None,
             role_plans: Default::default(),
             rejected_findings: Vec::new(),
+            nudge_assistant_count: None,
         }
     }
 

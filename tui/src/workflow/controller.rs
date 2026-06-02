@@ -1052,6 +1052,19 @@ impl<'a> WorkflowControllerCtx<'a> {
                 /// event already.
                 reason: String,
             },
+            /// Idle-nudge backstop: the active role completed a turn but
+            /// has NO static `on_idle` transition and didn't advance the
+            /// workflow with a dynamic tool call. Re-deliver its own
+            /// activation prompt (self-targeted: `to == from == role`).
+            /// `guard_count` is the role's assistant-turn count at fire
+            /// time, persisted to `nudge_assistant_count` for parity with
+            /// the daemon poller's debounce. Mirror of
+            /// `cm_daemon::workflow::poller::Decision::Nudge`.
+            Nudge {
+                run_id: String,
+                role: String,
+                guard_count: usize,
+            },
         }
         let mut decisions: Vec<Decision> = Vec::new();
         // 11g-2: per-tick snapshot of drained events per run. On
@@ -1362,37 +1375,75 @@ impl<'a> WorkflowControllerCtx<'a> {
                         ),
                     );
                     if will_fire {
-                        if let Some(t) = wf.static_transition_on_idle(active) {
-                            // 10d-2c-2-2-b (2c-2-3 bundle): per-run
-                            // ownership gate. If the active role's
-                            // session is daemon-spawned
-                            // (`daemon_session_uid.is_some()`), the
-                            // daemon's `cm-workflow-poller` thread
-                            // fires the static `on_idle` — see
-                            // `cm_daemon::workflow::poller::daemon_owns_run`.
-                            // TUI staying out avoids a same-tick
-                            // double-fire on state.json. Both sides
-                            // consult the equivalent condition from
-                            // their authoritative source
-                            // (`daemon_session_uid` for TUI,
-                            // `state.sessions` membership for daemon).
-                            if self.workspaces[ti].sessions[si]
-                                .session
-                                .daemon_session_uid
-                                .is_some()
-                            {
-                                log_tick(
-                                    &run_id,
-                                    "skipping static on_idle: daemon owns \
-                                     this run's active role session — \
-                                     daemon poller fires",
-                                );
-                            } else {
-                                decisions.push(Decision::ActivateStatic {
-                                    run_id: run_id.clone(),
-                                    to: t.to.clone(),
-                                    from: active.to_string(),
-                                });
+                        // 10d-2c-2-2-b (2c-2-3 bundle): per-run
+                        // ownership gate. If the active role's session
+                        // is daemon-spawned (`daemon_session_uid.is_some()`),
+                        // the daemon's `cm-workflow-poller` thread fires
+                        // (static on_idle AND the idle-nudge backstop) —
+                        // see `cm_daemon::workflow::poller`. TUI staying
+                        // out avoids a same-tick double-fire on state.json.
+                        let daemon_owns = self.workspaces[ti].sessions[si]
+                            .session
+                            .daemon_session_uid
+                            .is_some();
+                        match wf.static_transition_on_idle(active) {
+                            Some(t) => {
+                                if daemon_owns {
+                                    log_tick(
+                                        &run_id,
+                                        "skipping static on_idle: daemon owns \
+                                         this run's active role session — \
+                                         daemon poller fires",
+                                    );
+                                } else {
+                                    decisions.push(Decision::ActivateStatic {
+                                        run_id: run_id.clone(),
+                                        to: t.to.clone(),
+                                        from: active.to_string(),
+                                    });
+                                }
+                            }
+                            None => {
+                                // No static hand-off: the role was meant
+                                // to advance the workflow via a dynamic
+                                // tool call and didn't. Idle-nudge backstop
+                                // (mirror of the daemon poller's nudge
+                                // branch) — re-deliver its own prompt,
+                                // debounced + capped.
+                                if daemon_owns {
+                                    log_tick(
+                                        &run_id,
+                                        "skipping idle nudge: daemon owns \
+                                         this run's active role session — \
+                                         daemon poller nudges",
+                                    );
+                                } else {
+                                    let run = &self.workflow_runs[idx];
+                                    if run.nudge_assistant_count == Some(current_count) {
+                                        log_tick(
+                                            &run_id,
+                                            "idle nudge debounced: already \
+                                             nudged at this assistant-turn count",
+                                        );
+                                    } else if run
+                                        .trailing_activation_streak(active)
+                                        .saturating_sub(1)
+                                        >= cm_daemon::workflow::MAX_CONSECUTIVE_IDLE_NUDGES
+                                    {
+                                        log_tick(
+                                            &run_id,
+                                            "idle nudge exhausted: max \
+                                             consecutive nudges reached for \
+                                             this stuck stretch — leaving idle",
+                                        );
+                                    } else {
+                                        decisions.push(Decision::Nudge {
+                                            run_id: run_id.clone(),
+                                            role: active.to_string(),
+                                            guard_count: current_count,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -1425,6 +1476,7 @@ impl<'a> WorkflowControllerCtx<'a> {
                 Decision::ActivateStatic { run_id, .. }
                 | Decision::ActivateDynamic { run_id, .. }
                 | Decision::Done { run_id, .. }
+                | Decision::Nudge { run_id, .. }
                 | Decision::Skip { run_id, .. } => run_id,
             };
             if failed_runs.contains(decision_run_id) {
@@ -1448,6 +1500,33 @@ impl<'a> WorkflowControllerCtx<'a> {
                         &to,
                         TriggerKind::StaticIdle { from_role: from },
                         None,
+                        &mut actions,
+                        None,
+                    );
+                }
+                Decision::Nudge { run_id, role, guard_count } => {
+                    // Persist the debounce marker to disk BEFORE firing,
+                    // so fire_transition's `modify` (which reloads from
+                    // disk) carries it back into `self.workflow_runs` —
+                    // parity with the daemon poller's persist-then-fire.
+                    // (The TUI path also gets a synchronous start-count
+                    // baseline bump from `activate_role`, which debounces
+                    // on its own; the marker is belt-and-suspenders.)
+                    let gc = guard_count;
+                    let _ = workflow::run::modify(&run_id, move |r| {
+                        r.nudge_assistant_count = Some(gc);
+                    });
+                    // Self-targeted re-activation: to == from == role.
+                    // Supply the DISTINCT idle-nudge prompt as
+                    // `supplied_prompt` so fire_transition delivers it
+                    // verbatim (overriding the role's own template — see
+                    // its `supplied_prompt.or(default_template)`), rather
+                    // than re-sending the role's activation prompt.
+                    self.fire_transition(
+                        &run_id,
+                        &role,
+                        TriggerKind::StaticIdle { from_role: role.clone() },
+                        Some(cm_daemon::workflow::IDLE_NUDGE_PROMPT.to_string()),
                         &mut actions,
                         None,
                     );
@@ -2926,6 +3005,113 @@ mod tests {
                 post.iteration, 1,
                 "iteration must not advance: gate skipped, no \
                  close_active_role mutation",
+            );
+        });
+    }
+
+    /// Idle-nudge backstop (TUI mirror of the daemon poller's nudge):
+    /// a TUI-owned active role that is idle but has NO static on_idle
+    /// transition gets a self-targeted re-activation (its own prompt,
+    /// re-delivered), and the debounce guard is persisted so it can't
+    /// burst. Here the active role is `reviewer`, which has no outgoing
+    /// transition in the feedback def.
+    #[test]
+    fn tui_idle_nudge_fires_for_role_without_on_idle_transition() {
+        with_temp_home(|| {
+            let run_id = "wf_tui_idle_nudge";
+            let home =
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).expect("mkdir wt");
+            let wt_str = wt.to_str().unwrap();
+            let encoded = wt_str.replace('/', "-").replace('.', "-");
+            let proj = home.join(format!(".claude/projects/{}", encoded));
+            std::fs::create_dir_all(&proj).expect("mkdir proj");
+            std::fs::write(
+                proj.join("sid-reviewer.jsonl"),
+                r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"prose, no tool call"}]}}"##,
+            )
+            .expect("write transcript");
+
+            let mut run = make_run(run_id, "feedback", "reviewer");
+            run.role_sessions
+                .get_mut("reviewer")
+                .unwrap()
+                .current_session_id = Some("sid-reviewer".to_string());
+            workflow::run::save(&run).expect("seed run");
+            let mut runs = vec![run];
+
+            // reviewer session is NOT daemon-owned → TUI handles the
+            // nudge (daemon_session_uid left None by stub_session).
+            let reviewer_session = stub_session(
+                "reviewer",
+                "claude-code",
+                run_id,
+                "reviewer",
+                Some("sid-reviewer"),
+            );
+            let mut workspaces =
+                vec![workspace_with(vec![reviewer_session], Some(wt.clone()))];
+
+            // worker → reviewer on idle; reviewer has NO outgoing
+            // transition, so an idle reviewer hits the nudge path.
+            let mut roles = BTreeMap::new();
+            roles.insert(
+                "worker".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            roles.insert(
+                "reviewer".to_string(),
+                role_with(Engine::ClaudeCode, Context::Persistent),
+            );
+            let wf = make_workflow(
+                "feedback",
+                roles,
+                vec!["worker".to_string(), "reviewer".to_string()],
+                vec![Transition {
+                    from: "worker".to_string(),
+                    on: TriggerOn::Idle,
+                    to: "reviewer".to_string(),
+                }],
+            );
+            let mut workflows = HashMap::new();
+            workflows.insert("feedback".to_string(), wf);
+
+            let mut dummy = dummy_cap_state();
+            {
+                let mut ctx = WorkflowControllerCtx {
+                    workflow_runs: &mut runs,
+                    workspaces: &mut workspaces,
+                    workflows: &workflows,
+                    last_term_size: (80, 24),
+                    config: &dummy.config,
+                    cap_status: &dummy.cap_status,
+                    kill_tx: &dummy.kill_tx,
+                    pending_workflow_events: &mut dummy.pending_events,
+                    host_pool: &dummy.host_pool,
+                    active_host: cm_daemon::host_id::HostId::local(),
+                };
+                let _ = ctx.tick();
+            }
+
+            let post = workflow::run::load_one(run_id).expect("post load");
+            // Self-targeted: the active role is unchanged.
+            assert_eq!(post.active_role.as_deref(), Some("reviewer"));
+            // Debounce guard persisted at the live assistant-turn count.
+            assert_eq!(
+                post.nudge_assistant_count,
+                Some(1),
+                "nudge must persist the debounce guard; got {:?}",
+                post.nudge_assistant_count,
+            );
+            // The re-activation appended a second reviewer history entry
+            // (initial activation + this nudge).
+            let reviewer_entries =
+                post.history.iter().filter(|h| h.role == "reviewer").count();
+            assert_eq!(
+                reviewer_entries, 2,
+                "nudge re-activates the same role; got history {:?}",
+                post.history,
             );
         });
     }

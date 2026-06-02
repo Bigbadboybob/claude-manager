@@ -11468,6 +11468,7 @@ mod tests {
             // Our specific run must not appear in decisions.
             let saw_our_run = decisions.iter().any(|d| match d {
                 crate::workflow::poller::Decision::Skip { run_id, .. }
+                | crate::workflow::poller::Decision::Nudge { run_id, .. }
                 | crate::workflow::poller::Decision::ActivateStatic {
                     run_id,
                     ..
