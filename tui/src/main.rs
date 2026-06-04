@@ -240,6 +240,23 @@ fn restore_stderr(saved: OwnedFd) {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> anyhow::Result<()> {
     let mut app = App::new(config);
+
+    // Seed the real terminal-panel size BEFORE the loop's first
+    // `maybe_restore_sessions` runs. Restore sizes each attached/respawned
+    // session's PTY from `app.last_term_size`; left at the `(80,24)`
+    // `App::new` default, every restored session's replayed scrollback is
+    // laid out for 80 columns and renders garbled in the real (wider)
+    // terminal. Mirror the draw's panel computation exactly
+    // (`area.width - (SIDEBAR_WIDTH + 2)`, `area.height - 3`). Pre-fix this
+    // was masked because restore only ran after the first `TasksUpdated`,
+    // i.e. after a draw had already set the real size.
+    if let Ok(size) = terminal.size() {
+        app.last_term_size = (
+            size.width.saturating_sub(SIDEBAR_WIDTH + 2),
+            size.height.saturating_sub(3),
+        );
+    }
+
     let mut last_draw = std::time::Instant::now();
 
     loop {
