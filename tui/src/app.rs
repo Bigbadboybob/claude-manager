@@ -4172,6 +4172,21 @@ impl App {
 
     /// Save session manifest to disk.
     pub(crate) fn save_session_manifest(&self) {
+        // Refuse to persist before the on-disk manifest has been hydrated
+        // into `self.workspaces` by `restore_sessions`. This writer does a
+        // FULL REPLACE of `~/.cm/tui-sessions.json` from `self.workspaces`
+        // (no merge with disk), so a save while that map is still a partial
+        // startup view — empty, or only the live agent sessions adoption
+        // surfaced — silently drops every workspace/session not yet
+        // restored. That is exactly the "lost sessions / lost workspaces on
+        // restart" clobber: adoption (or any RPC-triggered save) firing
+        // before restore overwrote a 14-workspace manifest down to the
+        // 3 live agent sessions. `maybe_restore_sessions` flips
+        // `sessions_restored` to true before `restore_sessions` runs its own
+        // internal save, so the hydrated write still goes through.
+        if !self.sessions_restored {
+            return;
+        }
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
             let mut entries: Vec<ManifestEntry> = ws
@@ -4325,6 +4340,34 @@ impl App {
                 Manifest::default()
             }
         }
+    }
+
+    /// Hydrate `self.workspaces` from the on-disk manifest exactly once,
+    /// decoupled from the cloud/planning API. Driven from the main loop.
+    ///
+    /// Restore was historically gated on the first
+    /// `BackendEvent::TasksUpdated`, which only fires after a successful
+    /// `list_tasks` API round-trip (see `backend::do_refresh`). In the
+    /// common pure-local case — or whenever the API host is slow/unreachable
+    /// (e.g. a failing remote host) — that event never arrives, so the
+    /// manifest sat intact on disk while `self.workspaces` stayed empty.
+    /// With the `save_session_manifest` / adoption guards in place that would
+    /// block persistence indefinitely; without them, adoption clobbered the
+    /// manifest (the "lost sessions on restart" bug). The manifest is a
+    /// local file, so its restore must not depend on the API at all.
+    ///
+    /// Idempotent via `sessions_restored`; cheap to call every tick. Sets the
+    /// flag *before* delegating so `restore_sessions`' own internal
+    /// `save_session_manifest` / adoption (which run at its tail) are not
+    /// blocked by the guards above. All prerequisites — `host_pool`,
+    /// `workflow_runs`, and the daemon socket — are ready by the time the
+    /// main loop first turns (loaded in `App::new` / `ensure_daemon_at_startup`).
+    pub fn maybe_restore_sessions(&mut self) {
+        if self.sessions_restored {
+            return;
+        }
+        self.sessions_restored = true;
+        self.restore_sessions();
     }
 
     /// Restore workspaces + sessions from the manifest. Runs after an
@@ -4575,6 +4618,16 @@ impl App {
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
+        // Never adopt before the manifest is restored. Against an empty
+        // `self.workspaces` every manifest-backed daemon session looks
+        // "untracked", so adoption would mint duplicate workspaces and
+        // trigger a full-replace `save_session_manifest` that clobbers the
+        // on-disk manifest. `maybe_restore_sessions` runs first in the main
+        // loop; this guard is defense-in-depth (and pairs with the guard in
+        // `save_session_manifest`).
+        if !self.sessions_restored {
+            return;
+        }
         const ADOPT_SCAN_INTERVAL: Duration = Duration::from_secs(5);
         let now = Instant::now();
         if let Some(last) = self.last_adopt_scan {
@@ -7068,10 +7121,12 @@ impl App {
             match event {
                 BackendEvent::TasksUpdated(tasks) => {
                     self.reconcile_tasks(tasks);
-                    if !self.sessions_restored {
-                        self.sessions_restored = true;
-                        self.restore_sessions();
-                    }
+                    // Fallback restore trigger. The main loop now calls
+                    // `maybe_restore_sessions` every tick (decoupled from the
+                    // API), so by the time the first tasks fetch lands this is
+                    // normally a no-op. Kept so a code path that drives
+                    // `drain_backend_events` without the loop still hydrates.
+                    self.maybe_restore_sessions();
                 }
                 BackendEvent::Connected => {
                     self.connected = true;
@@ -21282,6 +21337,14 @@ remote_socket = "/remote/manager.sock"
 
         // Now drive a save_session_manifest. The remote entry
         // MUST round-trip back to disk.
+        //
+        // `save_session_manifest` no-ops until `sessions_restored` is set
+        // (the guard that prevents the "lost sessions on restart" clobber).
+        // Production reaches restore via `maybe_restore_sessions`, which sets
+        // the flag; this test calls `restore_sessions` directly, so set it
+        // explicitly here — otherwise the save is skipped and this test would
+        // pass spuriously off the still-present original file.
+        app.sessions_restored = true;
         app.save_session_manifest();
 
         // Re-load and verify the remote entry is intact.
@@ -21348,6 +21411,127 @@ remote_socket = "/remote/manager.sock"
             remote_entry.seeded_from_snapshot,
         );
         assert_eq!(reloaded_remote.host_id, remote_entry.host_id);
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        drop(guard);
+    }
+
+    /// Regression: `save_session_manifest` MUST NOT overwrite the on-disk
+    /// manifest before `restore_sessions` has hydrated `self.workspaces`.
+    ///
+    /// This is the "lost sessions / lost workspaces on restart" bug. On
+    /// startup `self.workspaces` is empty (or holds only the live agent
+    /// sessions adoption surfaced); because the writer does a FULL REPLACE,
+    /// any save before restore clobbered the real manifest down to that
+    /// partial view. The guard turns such a save into a no-op until
+    /// `sessions_restored` is set (by `maybe_restore_sessions`).
+    #[test]
+    fn save_session_manifest_noops_before_restore_so_manifest_is_not_clobbered() {
+        use cm_daemon::manifest::{Manifest, ManifestWorkspace};
+
+        let guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).expect("create .cm");
+
+        // A real, multi-workspace manifest already on disk — the state a
+        // restart must preserve.
+        let mut workspaces = HashMap::new();
+        for id in ["ws-keep-1", "ws-keep-2"] {
+            workspaces.insert(
+                id.to_string(),
+                ManifestWorkspace {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: None,
+                    main_repo_path: None,
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: vec![],
+                    tombstones: vec![],
+                },
+            );
+        }
+        let on_disk = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: Some("task".to_string()),
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&on_disk).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // App::new must NOT have restored yet — restore is driven from the
+        // main loop via `maybe_restore_sessions`.
+        assert!(!app.sessions_restored, "fresh App must not be pre-restored");
+
+        // Mimic the clobber trigger: a single fresh workspace lands in live
+        // state (as adoption would mint) and a save fires BEFORE restore.
+        app.workspaces.push(Workspace {
+            id: "ws-fresh-adopted".into(),
+            name: "agent: phantom".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        });
+        app.save_session_manifest();
+
+        // The on-disk manifest MUST be untouched — the two real workspaces
+        // survive, the phantom did NOT replace them.
+        let reloaded: Manifest = serde_json::from_str(
+            &std::fs::read_to_string(cm_dir.join("tui-sessions.json")).expect("read"),
+        )
+        .expect("parse");
+        assert!(
+            reloaded.workspaces.contains_key("ws-keep-1")
+                && reloaded.workspaces.contains_key("ws-keep-2"),
+            "pre-restore save clobbered the manifest: {:?}",
+            reloaded.workspaces.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            !reloaded.workspaces.contains_key("ws-fresh-adopted"),
+            "pre-restore save must be a no-op, not a partial write",
+        );
+
+        // After the flag flips (what `maybe_restore_sessions` does), saves
+        // resume and persist live state.
+        app.sessions_restored = true;
+        app.save_session_manifest();
+        let reloaded2: Manifest = serde_json::from_str(
+            &std::fs::read_to_string(cm_dir.join("tui-sessions.json")).expect("read2"),
+        )
+        .expect("parse2");
+        assert!(
+            reloaded2.workspaces.contains_key("ws-fresh-adopted"),
+            "post-restore save must persist live workspaces",
+        );
 
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },

@@ -298,6 +298,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.drain_manifest_watch_events();
         log_slow_phase("drain_manifest_watch_events", t.elapsed());
 
+        // Hydrate self.workspaces from the on-disk manifest as early as
+        // possible, independent of the cloud/planning API. MUST run before
+        // adoption below: adoption + the full-replace manifest save would
+        // otherwise clobber the (not-yet-loaded) manifest down to just the
+        // live agent sessions — the "lost sessions on restart" bug.
+        // Idempotent (self-guards on `sessions_restored`), so cheap per tick.
+        let t = Instant::now();
+        app.maybe_restore_sessions();
+        log_slow_phase("maybe_restore_sessions", t.elapsed());
+
         // Part 1: periodically surface agent-spawned ("phantom") daemon
         // sessions in the sidebar. Self-throttled to ~5s (the daemon never
         // broadcasts these, so a poll is required). No-op in legacy
