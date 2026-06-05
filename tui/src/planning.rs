@@ -181,6 +181,21 @@ enum VisibleRowKind {
 
 /// Slug at a visible row, regardless of layout vs. synthetic origin.
 /// Returns `None` for non-task layout items (Separator/Empty/Header).
+/// Truncate `s` to at most `max` display bytes with a trailing "...",
+/// cutting on a char boundary so multibyte chars (e.g. '≤') never panic.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let take = max.saturating_sub(3);
+    let truncated: String = s
+        .char_indices()
+        .take_while(|(i, c)| i + c.len_utf8() <= take)
+        .map(|(_, c)| c)
+        .collect();
+    format!("{}...", truncated)
+}
+
 fn visible_row_slug(row: &VisibleRow) -> Option<&str> {
     match &row.kind {
         VisibleRowKind::Layout { item: GridItem::Task(slug), .. } => Some(slug.as_str()),
@@ -784,8 +799,21 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
         let (user_tasks, claude_tasks): (Vec<_>, Vec<_>) = missing
             .into_iter()
             .partition(|t| t.source != "claude");
-        for t in user_tasks { layout.columns[0].push(GridItem::Task(t.slug.clone())); }
-        for t in claude_tasks { layout.columns[0].push(GridItem::Task(t.slug.clone())); }
+        // Insert after the last NON-EMPTY cell, not the raw vector end:
+        // trailing `Empty` placeholders would otherwise push new tasks
+        // below blank space, off the bottom of the visible column.
+        let col = &mut layout.columns[0];
+        let mut at = col.iter()
+            .rposition(|item| !matches!(item, GridItem::Empty))
+            .map_or(0, |i| i + 1);
+        for t in user_tasks {
+            col.insert(at, GridItem::Task(t.slug.clone()));
+            at += 1;
+        }
+        for t in claude_tasks {
+            col.insert(at, GridItem::Task(t.slug.clone()));
+            at += 1;
+        }
     }
     layout.columns.retain(|col| !col.is_empty());
 }
@@ -3405,9 +3433,7 @@ impl PlanningView {
                     let claude_prefix = if is_claude { "[C] " } else { "" };
                     let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/ + claude_prefix.len();
                     let max_title = width.saturating_sub(prefix_len + count_suffix.len());
-                    let title_display = if title_str.len() > max_title {
-                        format!("{}...", &title_str[..max_title.saturating_sub(3)])
-                    } else { title_str.to_string() };
+                    let title_display = truncate_with_ellipsis(&title_str, max_title);
 
                     let mut spans = Vec::new();
                     if !indent.is_empty() {
@@ -3462,7 +3488,7 @@ impl PlanningView {
                     };
                     let max_text = width.saturating_sub(1);
                     let display = if text.len() > max_text {
-                        format!("{}...", &text[..max_text.saturating_sub(3)])
+                        truncate_with_ellipsis(&text, max_text)
                     } else {
                         text.clone()
                     };
@@ -3575,9 +3601,7 @@ impl PlanningView {
                         };
                         let claude_prefix = if is_claude { "[C] " } else { "" };
                         let max_title = (inner.width as usize).saturating_sub(5 + claude_prefix.len());
-                        let title_display = if title_str.len() > max_title {
-                            format!("{}...", &title_str[..max_title.saturating_sub(3)])
-                        } else { title_str.to_string() };
+                        let title_display = truncate_with_ellipsis(&title_str, max_title);
 
                         let mut spans = vec![
                             Span::styled(format!(" {} ", indicator), indicator_style),
@@ -3620,7 +3644,7 @@ impl PlanningView {
                         };
                         let max_text = (inner.width as usize).saturating_sub(2);
                         let display = if text.len() > max_text {
-                            format!("{}...", &text[..max_text.saturating_sub(3)])
+                            truncate_with_ellipsis(&text, max_text)
                         } else {
                             text.clone()
                         };
@@ -3982,7 +4006,7 @@ impl PlanningView {
         lines.push(row("+ New workspace (create worktree)", 0));
         for (i, c) in candidates.iter().enumerate() {
             let label = if c.name.len() > (w as usize).saturating_sub(8) {
-                format!("{}...", &c.name[..(w as usize).saturating_sub(11)])
+                truncate_with_ellipsis(&c.name, (w as usize).saturating_sub(8))
             } else {
                 c.name.clone()
             };
