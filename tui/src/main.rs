@@ -300,6 +300,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.drain_planning_events();
         log_slow_phase("drain_planning_events", t.elapsed());
 
+        // If we came up without a control plane (another TUI owned
+        // tui.sock), keep retrying the bind so we self-heal the instant
+        // the conflicting instance exits. Cheap no-op once bound.
+        let t = Instant::now();
+        app.maybe_rebind_control_socket();
+        log_slow_phase("maybe_rebind_control_socket", t.elapsed());
+
         let t = Instant::now();
         app.drain_control_events();
         log_slow_phase("drain_control_events", t.elapsed());

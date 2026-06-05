@@ -354,6 +354,16 @@ const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// pathological bursts get spread across ticks.
 const TERMINAL_DRAIN_BUDGET: Duration = Duration::from_millis(50);
 
+/// How often a TUI that failed to bind the control socket (`tui.sock`)
+/// re-attempts the bind while running degraded. Short enough that recovery
+/// feels instant once the conflicting instance exits, long enough that a
+/// persistent conflict (e.g. an orphaned older TUI a user forgot to kill)
+/// doesn't spin. See `App::maybe_rebind_control_socket`. The scenario this
+/// guards: rebuild + relaunch where the old TUI lingers, keeps `tui.sock`,
+/// and the fresh TUI would otherwise run silently with no control plane —
+/// every MCP/agent call routing to the stale binary instead.
+const CONTROL_REBIND_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Per-file cap on `~/.cm/workflow-runs/<run-id>/tick.log`. When `log_tick`
 /// is about to write and the file is at or over this size, it truncates and
 /// starts fresh (with a marker line). Generous because these logs are useful
@@ -3270,6 +3280,21 @@ pub struct App {
     /// main loop and dispatched to method handlers. The server thread
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
     control_queue: crate::control::queue::Queue,
+    /// Whether THIS TUI currently owns the control socket (`tui.sock`).
+    /// False when another instance held it at bind time. Drives the
+    /// degraded-mode banner in the status bar and gates the rebind retry.
+    control_bound: bool,
+    /// PID of the instance that owns the control socket when we don't
+    /// (read from the `<sock>.owner` sidecar; `None` when the holder
+    /// predates the sidecar or is gone). Surfaced in the banner so the
+    /// user knows exactly which process to kill.
+    control_conflict_pid: Option<u32>,
+    /// Resolved control-socket path, cached so the rebind retry and the
+    /// owner-PID lookup don't re-read the environment each tick.
+    control_socket_path: std::path::PathBuf,
+    /// Next instant at which `maybe_rebind_control_socket` re-attempts the
+    /// bind while degraded. Throttles retries to `CONTROL_REBIND_INTERVAL`.
+    control_rebind_at: Instant,
     /// Phase 6 activity feed: ring buffer of agent-initiated mutations
     /// surfaced over the MCP control socket. Read-only methods (list_*,
     /// get_*, ping, read_session_output) are intentionally excluded —
@@ -3494,15 +3519,33 @@ impl App {
             .collect();
         // Start the control socket. Failures aren't fatal — the TUI runs
         // fine without it; only MCP-driven control becomes unavailable.
+        // When another instance already owns the socket we DON'T steal it
+        // (that would clobber a legit second TUI); instead we record the
+        // degraded state, surface a banner, and retry the bind each tick
+        // (`maybe_rebind_control_socket`) so this instance self-heals the
+        // moment the holder exits.
         let control_queue = crate::control::queue::Queue::new();
-        match crate::control::server::start(control_queue.clone()) {
-            Ok(path) => {
-                eprintln!("control socket bound at {}", path.display());
-            }
-            Err(e) => {
-                eprintln!("control socket failed to start: {}", e);
-            }
-        }
+        let control_socket_path = crate::control::server::default_socket_path();
+        let (control_bound, control_conflict_pid) =
+            match crate::control::server::start(control_queue.clone()) {
+                Ok(path) => {
+                    eprintln!("control socket bound at {}", path.display());
+                    (true, None)
+                }
+                Err(e) => {
+                    let owner = crate::control::server::read_owner_pid(&control_socket_path);
+                    eprintln!(
+                        "control socket NOT bound ({}) — running WITHOUT a control plane; \
+                         MCP/agent control won't reach this instance{}. Retrying every {}s.",
+                        e,
+                        owner
+                            .map(|p| format!(" (held by PID {p})"))
+                            .unwrap_or_default(),
+                        CONTROL_REBIND_INTERVAL.as_secs(),
+                    );
+                    (false, owner)
+                }
+            };
         // Memory-cap preflight: run once at startup, cache the result.
         // Subsequent `spawn_agent_session` calls consult this synchronously
         // — no per-spawn probing.
@@ -3662,6 +3705,10 @@ impl App {
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
             control_queue,
+            control_bound,
+            control_conflict_pid,
+            control_socket_path,
+            control_rebind_at: Instant::now() + CONTROL_REBIND_INTERVAL,
             activity_log,
             activity_visible: false,
             memory_cap_status,
@@ -7265,6 +7312,50 @@ impl App {
                 }
                 BackendEvent::PlanTaskDeleted(id) => {
                     self.planning.on_task_deleted(&id);
+                }
+            }
+        }
+    }
+
+    /// While running without a control plane (another instance owned
+    /// `tui.sock` at our startup), periodically re-attempt the bind. The
+    /// moment the conflicting instance exits — releasing the socket — this
+    /// succeeds and the TUI regains its MCP/agent control plane, clearing
+    /// the degraded-mode banner. No-op (one cheap branch) once bound, which
+    /// is the overwhelmingly common case. Throttled to
+    /// `CONTROL_REBIND_INTERVAL`.
+    ///
+    /// A failed retry is cheap: `server::start` connect-probes the existing
+    /// socket and returns before binding (no listener thread spawned), so
+    /// repeated attempts against a still-live holder don't leak resources.
+    pub fn maybe_rebind_control_socket(&mut self) {
+        if self.control_bound {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.control_rebind_at {
+            return;
+        }
+        self.control_rebind_at = now + CONTROL_REBIND_INTERVAL;
+        match crate::control::server::start(self.control_queue.clone()) {
+            Ok(path) => {
+                eprintln!(
+                    "control socket bound at {} (recovered — prior holder exited)",
+                    path.display()
+                );
+                self.control_bound = true;
+                self.control_conflict_pid = None;
+                self.needs_redraw = true;
+            }
+            Err(_) => {
+                // Still held (or a transient bind failure). Refresh the
+                // owner PID in case the holder changed since last check so
+                // the banner always names the current squatter.
+                let owner =
+                    crate::control::server::read_owner_pid(&self.control_socket_path);
+                if owner != self.control_conflict_pid {
+                    self.control_conflict_pid = owner;
+                    self.needs_redraw = true;
                 }
             }
         }
@@ -12815,6 +12906,40 @@ impl App {
     }
 
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
+        // Degraded-mode banner. When this TUI doesn't own the control
+        // socket it has NO MCP/agent control plane — `start_session`,
+        // `send_input`, `start_workflow` etc. all route to whichever
+        // instance does own it (or fail). That used to surface only as a
+        // line in cm-tui.log; make it impossible to miss by taking over the
+        // status bar with a red banner naming the PID to kill. Self-clears
+        // once `maybe_rebind_control_socket` reclaims the socket.
+        if !self.control_bound {
+            let msg = match self.control_conflict_pid {
+                Some(pid) => format!(
+                    " \u{26a0} NO CONTROL PLANE — tui.sock held by another TUI (PID {pid}); \
+                     MCP/agent control won't reach here. Run `kill {pid}`, then restart this TUI. ",
+                ),
+                None => " \u{26a0} NO CONTROL PLANE — tui.sock held by another instance; \
+                     MCP/agent control won't reach here. Quit the other TUI, then restart this one. "
+                    .to_string(),
+            };
+            // Truncate to the bar width, then pad so the red field spans it.
+            let mut text: String = msg.chars().take(area.width as usize).collect();
+            let used = text.chars().count() as u16;
+            if used < area.width {
+                text.push_str(&" ".repeat((area.width - used) as usize));
+            }
+            let line = Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
         let running = self
             .tasks
             .iter()
