@@ -17,7 +17,7 @@ engine = "codex"
 context = "fresh"
 activation_prompt = """Can you review unstaged changes.
 
-Only report findings you're at least 80% confident are real issues. Always surface security or correctness bugs. Consolidate similar findings into one. Prioritize real bugs over style nitpicks.
+Report a finding only when you're at least 80% confident it's a real issue AND it actually matters — a correctness bug, security issue, data-loss risk, or behavior regression. Always surface those. Skip style, naming, formatting, micro-optimizations, and speculative refactors; don't report something just because it could be marginally cleaner. Consolidate similar findings into one. If nothing material stands out, say so briefly rather than padding with minor notes.
 
 {{ rejected_findings }}"""
 
