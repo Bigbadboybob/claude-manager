@@ -337,6 +337,23 @@ impl PendingWrite {
 /// Interval between filesystem checks for session_id detection.
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Wall-clock budget for a single `drain_terminal_events` pass. The PTY
+/// reader threads push an unbounded stream of events (one `Wakeup` per
+/// output batch — kHz under heavy output) into per-session channels; the
+/// drain used to empty every channel completely in one tick. A session
+/// flooding output (most visibly the burst right after `start_workflow`
+/// spawns fresh agents) could then hold the main loop inside this single
+/// phase for tens of seconds. Because the loop reaches `drain_control_events`
+/// only *after* this phase returns, any control request queued during the
+/// stall isn't answered until it ends — blowing the control server's 30s
+/// reply timeout (MCP `start_workflow` would report "main loop did not reply
+/// within timeout") and freezing the UI meanwhile. Capping the drain keeps
+/// the loop cycling; events left unread stay in their channels and are
+/// picked up on the next tick (~1ms later). 50ms is comfortably above a
+/// normal tick's full drain, so steady state never hits the cap — only
+/// pathological bursts get spread across ticks.
+const TERMINAL_DRAIN_BUDGET: Duration = Duration::from_millis(50);
+
 /// Per-file cap on `~/.cm/workflow-runs/<run-id>/tick.log`. When `log_tick`
 /// is about to write and the file is at or over this size, it truncates and
 /// starts fresh (with a marker line). Generous because these logs are useful
@@ -6552,10 +6569,25 @@ impl App {
         // broadcast (which arrives via a separate channel) is
         // suppressed.
         let mut cap_kill_notes: Vec<String> = Vec::new();
+        // Bound how long this pass spends draining PTY events so a flooding
+        // session can't starve the rest of the main loop (control queue, UI).
+        // See `TERMINAL_DRAIN_BUDGET`. Once the deadline passes, sessions not
+        // yet reached skip their event drain this tick but still run their
+        // (cheap, O(1)-ish) idle-detection and pending-write logic below;
+        // unread events wait for the next tick.
+        let drain_deadline = now + TERMINAL_DRAIN_BUDGET;
+        let mut drain_over_budget = false;
         for (wi, ws) in self.workspaces.iter_mut().enumerate() {
             for (si, ts) in ws.sessions.iter_mut().enumerate() {
                 let is_focused = focused_idx == Some((wi, si));
-                while let Ok(event) = ts.session.event_rx.try_recv() {
+                // `drain_over_budget` short-circuits the event drain for this
+                // and every later session once the per-tick budget is spent.
+                let mut drained_this_session: usize = 0;
+                while !drain_over_budget {
+                    let event = match ts.session.event_rx.try_recv() {
+                        Ok(event) => event,
+                        Err(_) => break,
+                    };
                     match event {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
                             ts.session.exited = true;
@@ -6639,6 +6671,14 @@ impl App {
                             }
                         }
                         _ => {}
+                    }
+                    drained_this_session += 1;
+                    // Check the wall-clock budget periodically rather than per
+                    // event — `Instant::now()` on every iteration would add
+                    // measurable overhead under kHz wakeup floods, which is the
+                    // exact case this guard exists to bound.
+                    if drained_this_session % 256 == 0 && Instant::now() >= drain_deadline {
+                        drain_over_budget = true;
                     }
                 }
 
