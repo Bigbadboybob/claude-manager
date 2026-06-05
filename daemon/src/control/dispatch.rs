@@ -3347,6 +3347,78 @@ mod tests {
         let _ = worktree; // hold dir alive
     }
 
+    /// fix-narrow-prompt: a child spawned via `mcp_start_session`
+    /// inherits the CALLER's live PTY size, not the daemon's 80×24
+    /// `start_session` serde default. Pre-fix the MCP spawn path
+    /// never threaded cols/rows into the delegated `start_session`,
+    /// so agent-spawned claude/codex sessions always opened at
+    /// 80×24 — the "super narrow window" the operator saw no matter
+    /// how wide their terminal was.
+    #[test]
+    fn mcp_start_session_inherits_caller_pty_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.insert(
+                "ws-mcp".into(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-mcp".into(),
+                    worktree_path: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                },
+            );
+            s.task_tree.insert("task-self".into(), None);
+        }
+        // Caller spawned at a distinctive WIDE size — deliberately
+        // nothing like the 80×24 default the buggy path produced.
+        let mut sp = crate::session::SpawnParams::new(
+            "ts-caller-wide",
+            "caller",
+            "/bin/sleep",
+        );
+        sp.args = vec!["30".into()];
+        sp.workspace_id = "ws-mcp".into();
+        sp.task_id = Some("task-self".into());
+        sp.cols = 203;
+        sp.rows = 51;
+        let session = crate::session::DaemonSession::spawn(sp).unwrap();
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("ts-caller-wide".into(), session);
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "mcp_start_session",
+                serde_json::json!({ "type": "bash", "label": "child-pane" }),
+                "ts-caller-wide",
+            ),
+        ).into_response();
+        assert!(resp.ok, "spawn must succeed: {:?}", resp.error);
+        let new_uid = resp.result.expect("result body")["session_uid"]
+            .as_str()
+            .expect("session_uid in response")
+            .to_string();
+        let s = state.lock().unwrap();
+        let sess = s.sessions.get(&new_uid).expect("new session in registry");
+        assert_eq!(
+            (sess.last_cols, sess.last_rows),
+            (203, 51),
+            "child must inherit the caller's PTY size, not the 80×24 default",
+        );
+        drop(s);
+        // Cleanup.
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "kill_session",
+                serde_json::json!({ "session_uid": &new_uid }),
+            ),
+        );
+    }
+
     // ============================================================
     // Sub-2b-3 review fixes
     // ============================================================

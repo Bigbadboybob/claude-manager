@@ -889,6 +889,17 @@ pub struct DaemonSession {
     pub memory_cap_soft_bytes: Option<u64>,
     pub memory_cap_hard_bytes: Option<u64>,
     pub cgroup_prefix: Option<PathBuf>,
+    /// Last-known PTY window size (cols × rows). Seeded from
+    /// `SpawnParams` at spawn time and updated by
+    /// [`resize`](Self::resize) on every inbound attach-stream
+    /// Resize frame. Read by `mcp_start_session` so an
+    /// agent-spawned child PTY inherits the *caller's current*
+    /// terminal width rather than falling back to the 80×24 serde
+    /// default — that default was why MCP-spawned claude/codex
+    /// sessions opened in a too-narrow window. See
+    /// `control::methods::mcp_start_session`.
+    pub last_cols: u16,
+    pub last_rows: u16,
     /// 10d-2c-1 review round-5 (F1): workflow context for the
     /// auth check on `workflow_transition` / `workflow_done`.
     /// Populated at spawn from
@@ -1098,6 +1109,12 @@ struct PendingSessionInner {
     memory_cap_soft_bytes: Option<u64>,
     memory_cap_hard_bytes: Option<u64>,
     cgroup_prefix: Option<PathBuf>,
+    /// Initial PTY size carried from `SpawnParams` through
+    /// `arm_reaper` onto the `DaemonSession`'s `last_cols`/
+    /// `last_rows` so the spawn-time width is the inheritance
+    /// baseline until the first attach Resize frame updates it.
+    cols: u16,
+    rows: u16,
     /// 10d-2c-1 review round-5 (F1): carried through from
     /// SpawnParams onto the final DaemonSession.
     workflow_run_id: Option<String>,
@@ -1383,6 +1400,8 @@ impl PendingSession {
                 memory_cap_soft_bytes: params.memory_cap_soft_bytes,
                 memory_cap_hard_bytes: params.memory_cap_hard_bytes,
                 cgroup_prefix: params.cgroup_prefix,
+                cols: params.cols,
+                rows: params.rows,
                 // 10d-2c-1 review round-5 (F1): workflow context
                 // carried through to the final DaemonSession.
                 workflow_run_id: params.workflow_run_id,
@@ -1439,6 +1458,8 @@ impl PendingSession {
             memory_cap_soft_bytes,
             memory_cap_hard_bytes,
             cgroup_prefix,
+            cols,
+            rows,
             workflow_run_id,
             workflow_role,
             last_activity_at,
@@ -1516,6 +1537,8 @@ impl PendingSession {
             memory_cap_soft_bytes,
             memory_cap_hard_bytes,
             cgroup_prefix,
+            last_cols: cols,
+            last_rows: rows,
             // 10d-2c-1 review round-5 (F1): workflow context lands
             // on the final DaemonSession; auth via
             // `lookup_session_any` reads it from here.
@@ -1682,6 +1705,13 @@ impl DaemonSession {
     /// correctness bug.
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
         use portable_pty::PtySize;
+        // Track the latest requested size so `mcp_start_session`
+        // can hand a child PTY the caller's *current* width. Stamp
+        // the intent even if the TIOCSWINSZ below errors (rare;
+        // only when the master fd is gone) — a child inheriting
+        // the last commanded size is still closer than 80×24.
+        self.last_cols = cols;
+        self.last_rows = rows;
         self._master
             .resize(PtySize {
                 cols,

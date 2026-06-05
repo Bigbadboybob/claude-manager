@@ -4419,6 +4419,8 @@ pub fn mcp_start_session(
         caller_task_id,
         working_dir,
         cap_inherit,
+        caller_cols,
+        caller_rows,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
@@ -4551,11 +4553,20 @@ pub fn mcp_start_session(
                 ));
             }
         };
+        // Inherit the caller's current PTY width so the child opens
+        // at the same size the operator is actually looking at, not
+        // the 80×24 serde default `start_session` would otherwise
+        // apply (the "super narrow window" bug for MCP-spawned
+        // claude/codex sessions). `last_cols`/`last_rows` are seeded
+        // at the caller's spawn and kept live by attach Resize
+        // frames, so even after a terminal resize the child matches.
         (
             target_workspace_id,
             caller.task_id.clone(),
             wt,
             cap_inherit,
+            caller.last_cols,
+            caller.last_rows,
         )
     };
 
@@ -4726,6 +4737,12 @@ pub fn mcp_start_session(
     );
     full_params.insert("env".into(), Value::Object(env_obj));
     full_params.insert("session_type".into(), Value::String(p.type_.clone()));
+    // Width inheritance (see the caller-resolution block above):
+    // pass the caller's live PTY size through so the delegated
+    // `start_session` opens the child at that size instead of its
+    // 80×24 serde fallback.
+    full_params.insert("cols".into(), Value::Number(caller_cols.into()));
+    full_params.insert("rows".into(), Value::Number(caller_rows.into()));
     if let Some(cuid) = caller_uid {
         full_params.insert("managed_by_uid".into(), Value::String(cuid.to_string()));
     }
