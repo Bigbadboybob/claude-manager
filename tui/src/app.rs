@@ -1009,10 +1009,11 @@ fn make_simple_session_with_uid(
     }
 }
 
-/// Fire a desktop notification announcing that a session went idle. Spawned
-/// onto a detached thread so a slow/blocked dbus call can't stall the UI loop.
-/// Errors are intentionally swallowed — a missing notification daemon is not
-/// a reason to surface anything to the user.
+/// Fire a desktop notification announcing that a session went idle, and play a
+/// short sound alongside it. Spawned onto a detached thread so a slow/blocked
+/// dbus call (or the ~1s sound playback) can't stall the UI loop. Errors are
+/// intentionally swallowed — a missing notification daemon or audio device is
+/// not a reason to surface anything to the user.
 fn notify_session_idle(label: &str) {
     let label = label.to_string();
     std::thread::spawn(move || {
@@ -1020,6 +1021,7 @@ fn notify_session_idle(label: &str) {
             .summary("Claude Manager")
             .body(&format!("Session idle: {}", label))
             .show();
+        play_notification_sound();
     });
 }
 
@@ -1040,7 +1042,34 @@ pub(crate) fn notify_user_alert(label: &str, message: &str) {
             .summary("Claude Manager")
             .body(&body)
             .show();
+        play_notification_sound();
     });
+}
+
+/// Best-effort: play a short notification sound. Called from the detached
+/// notification thread, so the blocking playback (~1s) never touches the UI
+/// loop. We don't rely on the notification daemon honoring sound hints (dunst
+/// and others ignore them), so we play the sound ourselves via whichever
+/// PipeWire/PulseAudio player is on PATH. Every failure is swallowed.
+fn play_notification_sound() {
+    use std::process::{Command, Stdio};
+    const SOUND: &str = "/usr/share/sounds/freedesktop/stereo/window-attention.oga";
+    if !std::path::Path::new(SOUND).exists() {
+        return;
+    }
+    // Try players in turn; `.status()` waits (reaping the child) and returns
+    // Err only when the binary is absent, so we fall through to the next.
+    for player in ["paplay", "pw-play"] {
+        let played = Command::new(player)
+            .arg(SOUND)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if played.is_ok() {
+            return;
+        }
+    }
 }
 
 /// Generate a fresh workspace id. Not cryptographic — just collision-avoidance
