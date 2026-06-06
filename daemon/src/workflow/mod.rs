@@ -30,6 +30,7 @@
 pub mod events;
 pub mod history;
 pub mod poller;
+pub mod pty_tracker;
 pub mod run;
 pub mod spawn;
 pub mod template;

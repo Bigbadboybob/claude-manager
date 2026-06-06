@@ -69,6 +69,20 @@ ureq = { version = "3", features = ["json"] }
 # pulls in, so the dep graph stays single-version.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1"
+# Phase 1 of doc/daemon-side-workflow-orchestration.md: the daemon must
+# track each owned session's terminal mode (bracketed-paste + kitty
+# keyboard) to deliver workflow activation prompts headlessly with the
+# SAME Enter encoding / body framing the TUI drainer derives at fire time.
+# The TUI reads the mode from an alacritty `Term` fed by the PTY stream
+# (`*session.term.lock().mode()`); the daemon reproduces that exact state by
+# driving the same parser over its `PtyByteFanout` bytes (see
+# `workflow::pty_tracker`). Same version the TUI pins so both crates use one
+# parser — parity is structural, not a re-implementation. NOTE: this is the
+# first use of the `Term` grid in the daemon (the earlier comment on
+# `portable-pty` above explains why PTY *spawn* deliberately avoided it);
+# here we need the grid solely as a mode sink, with a `VoidListener` and no
+# `EventLoop`.
+alacritty_terminal = "0.25"
 
 [dev-dependencies]
 tempfile = "3"

@@ -6094,13 +6094,9 @@ impl App {
                             // entry per 50ms keeps the in-memory window
                             // bounded to ~40 entries even for the chattiest
                             // sessions without changing observed behavior.
-                            let should_record = ts.session.wakeup_times.last().map_or(
-                                true,
-                                |last| now.duration_since(*last) >= Duration::from_millis(50),
-                            );
-                            if should_record {
-                                ts.session.wakeup_times.push(now);
-                            }
+                            // The recording rule lives in `record_wakeup` so
+                            // the daemon-side tracker can pin the same logic.
+                            record_wakeup(&mut ts.session.wakeup_times, now);
                         }
                         TermEvent::ClipboardStore(_, text) => {
                             // Forward OSC 52 clipboard store to the outer terminal.
@@ -6141,9 +6137,7 @@ impl App {
                 let idle_window = Duration::from_secs(idle_secs);
 
                 // Prune old wakeups outside the longer window.
-                ts.session
-                    .wakeup_times
-                    .retain(|t| now.duration_since(*t) < idle_window);
+                prune_wakeups(&mut ts.session.wakeup_times, now, idle_window);
 
                 // Detect idle/active for sessions with a local terminal.
                 // Freeze while user is typing to avoid flicker from echo.
@@ -13694,6 +13688,33 @@ impl App {
 
 /// Compute the workflow-level aggregate indicator.
 /// Running = any participant session active; Idle = none active; plus Paused/Done.
+/// Coalesce window for output wakeups: alacritty fires one `Wakeup` per
+/// PTY-output batch (kHz under heavy output), so we record at most one
+/// timestamp per 50ms. Pulled out as a named constant so the daemon-side
+/// tracker (`cm_daemon::workflow::pty_tracker`) can pin the same value via the
+/// parity test — coalescing shifts the quiet boundary, so both sides must
+/// agree on the interval.
+const WAKEUP_COALESCE: Duration = Duration::from_millis(50);
+
+/// Record an output wakeup at `now`, coalescing to one entry per
+/// [`WAKEUP_COALESCE`]. Extracted from the main-loop `TermEvent::Wakeup`
+/// handler so the recording rule is a single pure function shared by
+/// production and the daemon-parity test.
+fn record_wakeup(wakeups: &mut Vec<Instant>, now: Instant) {
+    let should_record = wakeups
+        .last()
+        .map_or(true, |last| now.duration_since(*last) >= WAKEUP_COALESCE);
+    if should_record {
+        wakeups.push(now);
+    }
+}
+
+/// Drop wakeups older than `window` relative to `now`. Extracted from the
+/// main-loop per-tick prune so the rule is shared with the daemon-parity test.
+fn prune_wakeups(wakeups: &mut Vec<Instant>, now: Instant, window: Duration) {
+    wakeups.retain(|t| now.duration_since(*t) < window);
+}
+
 /// Core readiness predicate for a queued PendingWrite. Pure over inputs so
 /// the semantics can be unit-tested without a real PTY.
 fn pending_write_ready(wakeups: &[Instant], pw: &PendingWrite, now: Instant) -> bool {
@@ -15100,6 +15121,184 @@ mod body_delivery_tests {
         let out = format_body_for_delivery(body, mode);
         let expected = format!("\x1b[200~{}\x1b[201~", body);
         assert_eq!(out, expected.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod pty_tracker_parity {
+    //! Phase 1 acceptance test for `doc/daemon-side-workflow-orchestration.md`:
+    //! replaying a recorded PTY byte stream through the daemon-side tracker
+    //! (`cm_daemon::workflow::pty_tracker`) yields the SAME quiet-window and
+    //! keyboard-mode decisions the TUI drainer computes for the same bytes.
+    //!
+    //! Two genuinely independent implementations are pinned equal:
+    //!   - keyboard mode: the daemon drives its own alacritty `Term`; the
+    //!     reference here drives a second `Term` configured the way
+    //!     `tui/src/session.rs` configures the live session term
+    //!     (`kitty_keyboard = true`). The shared parser makes mode parity
+    //!     structural, but the test still guards the daemon's config + feed
+    //!     wiring (drop `kitty_keyboard` and DISAMBIGUATE never sets -> fail).
+    //!   - quiet timing: the daemon's `quiet_for` (its own `record_wakeup` +
+    //!     `is_quiet`) vs the TUI drainer's `pending_write_ready` over a
+    //!     reference wakeup ring built with the TUI's own `record_wakeup` /
+    //!     `prune_wakeups`. These are separate code paths in the two crates.
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use cm_daemon::workflow::pty_tracker as dpt;
+
+    struct Dims;
+    impl Dimensions for Dims {
+        fn total_lines(&self) -> usize {
+            24
+        }
+        fn screen_lines(&self) -> usize {
+            24
+        }
+        fn columns(&self) -> usize {
+            80
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Batch {
+        t_ms: u64,
+        bytes: String,
+        #[allow(dead_code)]
+        note: Option<String>,
+    }
+
+    /// (relative-ms, observed bytes). `<ESC>` in the committed fixture stands
+    /// for the 0x1b control byte (JSON strings can't carry it literally).
+    fn load_fixture() -> Vec<(u64, Vec<u8>)> {
+        let raw = include_str!("testdata/pty_parity_stream.json");
+        let batches: Vec<Batch> =
+            serde_json::from_str(raw).expect("fixture is valid JSON");
+        batches
+            .into_iter()
+            .map(|b| (b.t_ms, b.bytes.replace("<ESC>", "\u{1b}").into_bytes()))
+            .collect()
+    }
+
+    /// A `Term` configured the way the live TUI session term is
+    /// (`tui/src/session.rs`: `kitty_keyboard = true`), so its `mode()` is the
+    /// exact source the TUI drainer reads at fire time.
+    fn reference_term() -> Term<VoidListener> {
+        let mut config = TermConfig::default();
+        config.kitty_keyboard = true;
+        Term::new(config, &Dims, VoidListener)
+    }
+
+    /// A `PendingWrite` whose floor/deadline gates are neutralised so
+    /// `pending_write_ready` reduces to the bare quiet predicate (no wakeup
+    /// within `window`) — the same thing the daemon's `quiet_for` computes.
+    fn neutral_pw(base: Instant, window: Duration) -> PendingWrite {
+        PendingWrite {
+            text: String::new(),
+            submit: false,
+            earliest_deliver_at: base,
+            require_quiet: window,
+            hard_deadline: base + Duration::from_secs(86_400),
+        }
+    }
+
+    #[test]
+    fn daemon_tracker_matches_tui_drainer_decisions() {
+        let fixture = load_fixture();
+        assert!(!fixture.is_empty(), "fixture must not be empty");
+        let base = Instant::now();
+
+        let mut daemon = dpt::PtyModeTracker::new();
+        let mut ref_term = reference_term();
+        let mut ref_proc = Processor::<StdSyncHandler>::new();
+        let mut ref_wakeups: Vec<Instant> = Vec::new();
+
+        // A multi-line body so the bracketed-paste framing branch is exercised
+        // at every mode checkpoint.
+        let sample_body = "review the diff\n\n- step one\n- step two";
+        let idle_window = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS as u64);
+
+        for i in 0..fixture.len() {
+            let (t_ms, bytes) = &fixture[i];
+            let at = base + Duration::from_millis(*t_ms);
+
+            // Feed both implementations the same batch, in lockstep.
+            daemon.feed(bytes, at);
+            ref_proc.advance(&mut ref_term, bytes);
+            record_wakeup(&mut ref_wakeups, at);
+            // Mirror the production TUI's per-tick prune; decision-invariant for
+            // quiet windows <= idle_window, and exercises the shared helper.
+            prune_wakeups(&mut ref_wakeups, at, idle_window);
+
+            // --- keyboard-mode decision parity ---
+            let dmode = daemon.term_mode();
+            let rmode = *ref_term.mode();
+            assert_eq!(
+                dmode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+                rmode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+                "kitty/DISAMBIGUATE diverged after t={}ms",
+                t_ms
+            );
+            assert_eq!(
+                dmode.contains(TermMode::BRACKETED_PASTE),
+                rmode.contains(TermMode::BRACKETED_PASTE),
+                "bracketed-paste diverged after t={}ms",
+                t_ms
+            );
+            // Derived decisions: Enter encoding + body framing, daemon impl vs
+            // TUI impl (distinct functions in the two crates).
+            assert_eq!(
+                dpt::enter_bytes_for_mode(dmode),
+                enter_bytes_for_mode(rmode),
+                "Enter encoding diverged after t={}ms",
+                t_ms
+            );
+            assert_eq!(daemon.enter_bytes(), enter_bytes_for_mode(rmode));
+            assert_eq!(
+                dpt::format_body_for_delivery(sample_body, dmode),
+                format_body_for_delivery(sample_body, rmode),
+                "body framing diverged after t={}ms",
+                t_ms
+            );
+
+            // --- quiet-window decision parity over [t_i, next_t) ---
+            // Probe only at now >= the latest observed output, the realistic
+            // regime delivery runs in (no future wakeups to reason about).
+            let end_ms = if i + 1 < fixture.len() {
+                fixture[i + 1].0
+            } else {
+                t_ms + 4000
+            };
+            let mut probe = *t_ms;
+            while probe < end_ms {
+                let now = base + Duration::from_millis(probe);
+                for win_secs in [1u64, 2] {
+                    let window = Duration::from_secs(win_secs);
+                    let pw = neutral_pw(base, window);
+                    assert_eq!(
+                        daemon.quiet_for(window, now),
+                        pending_write_ready(&ref_wakeups, &pw, now),
+                        "quiet decision diverged: window={}s probe={}ms",
+                        win_secs,
+                        probe
+                    );
+                }
+                probe += 25;
+            }
+        }
+
+        // The fixture must drive non-trivial transitions, otherwise the parity
+        // above is vacuous: both bits ON mid-stream, both OFF at the end.
+        assert!(
+            !daemon.term_mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "fixture should leave kitty mode OFF at the end"
+        );
+        assert!(
+            !daemon.term_mode().contains(TermMode::BRACKETED_PASTE),
+            "fixture should leave bracketed paste OFF at the end"
+        );
     }
 }
 

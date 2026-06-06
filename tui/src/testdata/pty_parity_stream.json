@@ -1,0 +1,9 @@
+[
+  { "t_ms": 0,    "note": "enable bracketed paste + push kitty keyboard, first output burst", "bytes": "<ESC>[?2004h<ESC>[>1uhello world\r\n" },
+  { "t_ms": 20,   "note": "sub-50ms follow-up output -> coalesced into the t=0 wakeup", "bytes": "more output streaming in" },
+  { "t_ms": 120,  "note": "partial CSI: escape sequence intentionally split across batches", "bytes": "<ESC>[" },
+  { "t_ms": 160,  "note": "completes <ESC>[?2004l from the previous batch -> bracketed paste OFF (kitty still on)", "bytes": "?2004l" },
+  { "t_ms": 500,  "note": "lone spinner tick after a gap", "bytes": "spinner tick .\r" },
+  { "t_ms": 1600, "note": "pop kitty keyboard (DISAMBIGUATE off) + final output", "bytes": "<ESC>[<udone\r\n" },
+  { "t_ms": 1630, "note": "trailing output within 50ms of t=1600 -> coalesced; makes the tail quiet-sweep depend on coalescing", "bytes": "tail bytes" }
+]
