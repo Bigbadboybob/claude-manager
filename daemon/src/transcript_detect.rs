@@ -455,18 +455,23 @@ pub fn spawn_queued_detector(
     engine: DetectorEngine,
     worktree_path: PathBuf,
     existing: Vec<String>,
-    ticket: crate::state::WorktreeSpawnTicket,
+    ticket: Option<crate::state::WorktreeSpawnTicket>,
     spawn_fn: DetectorSpawnFn,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let thread_name = format!("cm-daemon-transcript-detect-{}", session_uid);
     let body: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
-        // `ticket` lives until the closure exits — Drop
-        // calls `signal_done(seq)`. The caller already
-        // called `wait_for_turn` before launching us,
-        // so this thread doesn't need to wait — it
-        // just runs the detector and lets Drop release
-        // the slot. A panic anywhere in the body still
-        // releases via Drop.
+        // `ticket` lives until the closure exits — its Drop calls
+        // `signal_done(seq)` to release the worktree slot. The caller already
+        // called `wait_for_turn` before launching us, so this thread doesn't
+        // wait — it runs the detector and lets Drop release the slot. A panic
+        // anywhere in the body still releases via Drop.
+        //
+        // P-B: `ticket` is `Option` so a caller whose `wait_for_turn` TIMED
+        // OUT (and already dropped its slot) can still arm the detector
+        // UNSERIALIZED with `None`. Dropping `None` is a no-op — the detector
+        // runs for liveness (accepting the small cross-bind risk the timeout
+        // path already documents) rather than being skipped entirely, which
+        // would wedge the role with no transcript_path.
         let _hold_ticket = ticket;
         let _ = run_detector_sync(state, session_uid, engine, worktree_path, existing);
     });
@@ -725,7 +730,7 @@ mod tests {
             DetectorEngine::ClaudeCode,
             std::path::PathBuf::from("/tmp/wt-x"),
             Vec::new(),
-            ticket,
+            Some(ticket),
             failing,
         );
         let err = result.expect_err("must propagate spawn failure");

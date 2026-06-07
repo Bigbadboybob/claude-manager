@@ -546,8 +546,38 @@ pub const WORKFLOW_EVENTS_BUFFER: usize = 32;
 /// outstanding [`WorkflowEventSubscriptionGuard`]. Same shape as
 /// `ManifestWatcherInner` — see that type's docs (in
 /// `daemon/src/manifest.rs`) for the design rationale.
+/// A message delivered to an `events.subscribe` subscriber. The watcher
+/// carries two kinds of live update:
+///   - [`WorkflowWatchMsg::Event`] — a `workflow_transition` / `workflow_done`
+///     / `workflow_reject_finding` event (the original broadcast payload).
+///   - [`WorkflowWatchMsg::Snapshot`] — a full `WorkflowRun` state snapshot,
+///     broadcast when a run is CREATED (P-3) so already-subscribed clients fold
+///     the new run into their view immediately, without waiting for a
+///     reconnect. The subscriber stream maps this to the same
+///     `WorkflowEventStateSnapshot` frame the initial subscription sends, so
+///     the TUI's existing `apply_workflow_watch_snapshot` path handles it with
+///     no client-side change.
+pub enum WorkflowWatchMsg {
+    Event(Event),
+    Snapshot(Box<run::WorkflowRun>),
+}
+
+impl WorkflowWatchMsg {
+    /// Test helper: unwrap the `Event` variant. Most existing tests broadcast
+    /// only events and assert on their fields; this keeps them terse.
+    #[cfg(test)]
+    pub(crate) fn expect_event(self) -> Event {
+        match self {
+            WorkflowWatchMsg::Event(e) => e,
+            WorkflowWatchMsg::Snapshot(r) => {
+                panic!("expected Event, got Snapshot for run {}", r.run_id)
+            }
+        }
+    }
+}
+
 pub struct WorkflowEventWatcherInner {
-    subscribers: Mutex<HashMap<u64, mpsc::SyncSender<Event>>>,
+    subscribers: Mutex<HashMap<u64, mpsc::SyncSender<WorkflowWatchMsg>>>,
     next_id: AtomicU64,
 }
 
@@ -619,7 +649,9 @@ impl WorkflowEventWatcher {
     /// eagerly unsubscribes even though the receiver is still
     /// alive. The 11b `events.subscribe` RPC handle ties both
     /// together so this can't be fumbled by accident.
-    pub fn subscribe(&self) -> (mpsc::Receiver<Event>, WorkflowEventSubscriptionGuard) {
+    pub fn subscribe(
+        &self,
+    ) -> (mpsc::Receiver<WorkflowWatchMsg>, WorkflowEventSubscriptionGuard) {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(WORKFLOW_EVENTS_BUFFER);
         self.inner
@@ -644,6 +676,27 @@ impl WorkflowEventWatcher {
     /// of `Event`'s `String`/`Value` fields). Matches
     /// `ManifestWatcher::broadcast`'s diff-per-subscriber clone.
     pub fn broadcast(&self, event: Event) {
+        self.broadcast_msg(|| WorkflowWatchMsg::Event(event.clone()));
+    }
+
+    /// P-3: broadcast a full run-state SNAPSHOT to every live subscriber.
+    /// Called by `start_workflow` right after the new run is persisted, so a
+    /// client that subscribed BEFORE the launch (e.g. the launching TUI itself,
+    /// or any other observer) folds the new run into its view immediately —
+    /// `events.subscribe` otherwise only sends snapshots at subscription time,
+    /// leaving a freshly-created run invisible until reconnect. The subscriber
+    /// stream maps this to a `WorkflowEventStateSnapshot` frame, which the TUI
+    /// already handles via `apply_workflow_watch_snapshot`.
+    pub fn broadcast_snapshot(&self, run: run::WorkflowRun) {
+        let boxed = Box::new(run);
+        self.broadcast_msg(|| WorkflowWatchMsg::Snapshot(boxed.clone()));
+    }
+
+    /// Shared fan-out: build a fresh message per subscriber (via `make`) and
+    /// `try_send` it, reaping Full/Disconnected senders. `try_send` is
+    /// load-bearing — a blocking `send` would freeze the broadcaster (and
+    /// whichever lock the caller holds) on a slow subscriber.
+    fn broadcast_msg(&self, make: impl Fn() -> WorkflowWatchMsg) {
         let mut subs = self
             .inner
             .subscribers
@@ -651,7 +704,7 @@ impl WorkflowEventWatcher {
             .unwrap_or_else(|p| p.into_inner());
         let dead: Vec<u64> = subs
             .iter()
-            .filter_map(|(id, tx)| match tx.try_send(event.clone()) {
+            .filter_map(|(id, tx)| match tx.try_send(make()) {
                 Ok(()) => None,
                 Err(_) => Some(*id),
             })
@@ -1869,9 +1922,44 @@ mod tests {
         watcher.broadcast(ev.clone());
         let got = rx
             .recv_timeout(std::time::Duration::from_millis(100))
-            .expect("subscriber must receive broadcast event");
+            .expect("subscriber must receive broadcast event")
+            .expect_event();
         assert_eq!(got.id, "e1");
         assert_eq!(got.run_id, "r1");
+    }
+
+    /// P-3 — `broadcast_snapshot` reaches a subscriber that subscribed BEFORE
+    /// the run existed, as a `Snapshot` message carrying the full run. This is
+    /// the watcher-level guarantee behind criterion #4: a run created by
+    /// `start_workflow` is pushed to existing subscribers (the launching TUI)
+    /// without a reconnect, instead of being invisible until resubscribe.
+    #[test]
+    fn broadcast_snapshot_reaches_existing_subscriber_with_full_run() {
+        let watcher = WorkflowEventWatcher::new();
+        let (rx, _guard) = watcher.subscribe();
+        let run = run::WorkflowRun::new(
+            "wf-new".to_string(),
+            "feedback".to_string(),
+            "task-key".to_string(),
+            std::collections::BTreeMap::new(),
+            "worker".to_string(),
+            std::collections::BTreeMap::new(),
+            Some("the goal".to_string()),
+            std::collections::BTreeMap::new(),
+            0,
+        );
+        watcher.broadcast_snapshot(run);
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("subscriber must receive the creation snapshot");
+        match msg {
+            WorkflowWatchMsg::Snapshot(got) => {
+                assert_eq!(got.run_id, "wf-new");
+                assert_eq!(got.workflow_name, "feedback");
+                assert_eq!(got.goal.as_deref(), Some("the goal"));
+            }
+            WorkflowWatchMsg::Event(_) => panic!("expected Snapshot, got Event"),
+        }
     }
 
     /// T2 — broadcast IS post-write contract. The broadcaster
@@ -2029,7 +2117,8 @@ mod tests {
         for _ in 0..3 {
             let ev = rx
                 .recv_timeout(std::time::Duration::from_millis(100))
-                .expect("each broadcast must arrive");
+                .expect("each broadcast must arrive")
+                .expect_event();
             got_ids.push(ev.id);
         }
         assert_eq!(

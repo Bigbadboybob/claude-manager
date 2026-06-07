@@ -125,7 +125,29 @@ where
         }
 
         ActivationPhase::Rendered => {
-            if pa.needs_fresh_reset {
+            if pa.is_initial {
+                // Phase 4: the run's initial activation. `WorkflowRun::new`
+                // already seeded the worker's `HistoryEntry` (iteration 1,
+                // `TriggerKind::Initial`), so this is DELIVERY-ONLY: never
+                // append a second worker row (acceptance #2). Best-effort patch
+                // the existing entry's `session_id` from the (possibly
+                // now-known) binding, then advance straight to delivery.
+                run::modify(ctx.run_id, |r| {
+                    let sid = r
+                        .role_sessions
+                        .get(&role)
+                        .and_then(|b| b.current_session_id.clone());
+                    if let Some(h) = r.history.iter_mut().rev().find(|h| h.role == role) {
+                        if h.session_id.is_none() {
+                            h.session_id = sid;
+                        }
+                    }
+                    if let Some(pa) = r.pending_activation.as_mut() {
+                        pa.phase = ActivationPhase::Appended;
+                    }
+                })?;
+                Ok(FinalizeStep::Advanced(ActivationPhase::Appended))
+            } else if pa.needs_fresh_reset {
                 // Step 2: fresh reset, gated on PTY-quiet. Snapshot BEFORE
                 // /clear, send the /clear body, then reset baseline + clear sid
                 // + persist the snapshot/phase in one flock modify.
@@ -270,6 +292,11 @@ where
 /// `prior_activations` (0 = first activation -> `activation_prompt`). Rendered
 /// against the PRE-reset, PRE-append run snapshot via `DaemonWorkflowResolver`.
 fn render_activation(ctx: &FinalizeCtx, run: &WorkflowRun, pa: &run::PendingActivation) -> String {
+    // P5: a goal-only initial prompt is delivered verbatim (template braces in
+    // the goal must NOT be expanded/mangled), matching the TUI.
+    if pa.verbatim {
+        return pa.raw_prompt.clone();
+    }
     let prior_activations = run
         .history
         .iter()
@@ -502,7 +529,9 @@ to = "manager"
             iteration,
             trigger,
             raw_prompt: raw_prompt.to_string(),
+            verbatim: false,
             needs_fresh_reset,
+            is_initial: false,
             phase: ActivationPhase::Queued,
             rendered_prompt: None,
             pre_clear_snapshot: None,
@@ -636,6 +665,44 @@ to = "manager"
         assert_eq!(body, "do this\nand that", "trailing newline stripped before framing");
         assert!(!body.ends_with('\n'));
         assert_eq!(writes[1], b"\r".to_vec(), "Enter is a separate keystroke");
+    }
+
+    // ---- P5: goal-only initial prompt delivered verbatim -----------------
+
+    #[test]
+    fn verbatim_initial_prompt_skips_templating() {
+        let _g = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let wt = home.path().join("wt");
+        let wf = workflow();
+        let mut roles = BTreeMap::new();
+        roles.insert("worker".to_string(), RoleBinding {
+            session_label: "worker".into(),
+            current_session_id: None,
+            daemon_session_uid: Some("uid-worker".into()),
+        });
+        let mut run = WorkflowRun::new(
+            "wf-verbatim".into(), "test-wf".into(), wt.to_str().unwrap().into(),
+            roles, "worker".into(), BTreeMap::new(), Some("g".into()), BTreeMap::new(), 0,
+        );
+        // A goal containing literal template braces — must NOT be expanded.
+        run.pending_activation = Some(PendingActivation {
+            activation_id: 1, target_role: "worker".into(), iteration: 1,
+            trigger: TriggerKind::Initial,
+            raw_prompt: "implement {{ roles.worker.last_message }} literally".into(),
+            verbatim: true, needs_fresh_reset: false, is_initial: true,
+            phase: ActivationPhase::Queued, rendered_prompt: None,
+            pre_clear_snapshot: None, enter_fire_at_ms: None,
+        });
+        run::save(&run).unwrap();
+        let _ = advance_finalization(&ctx("wf-verbatim", &wf, &wt, 1, 0), &PtyModeTracker::new(), |_| Ok(())).unwrap();
+        let rendered = run::load_one("wf-verbatim").unwrap().pending_activation.unwrap().rendered_prompt.unwrap();
+        assert_eq!(
+            rendered, "implement {{ roles.worker.last_message }} literally",
+            "verbatim goal: template braces left untouched"
+        );
+        std::env::remove_var("HOME");
     }
 
     // ---- Render-before-append: first vs subsequent template --------------

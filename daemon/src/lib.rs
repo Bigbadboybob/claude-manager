@@ -351,6 +351,35 @@ pub fn run() -> anyhow::Result<()> {
     // env-injection step can read it (mcp_server_path /
     // api_url / api_token).
     initial_state.config = daemon_config;
+    // Phase 4 §B2: load the BASE workflow definitions from the daemon's own
+    // `workflows_dir` so a daemon with NO TUI can still drive runs headlessly
+    // (and a restart re-reads them, so the poller never wedges on
+    // `NoWorkflowDefinition`). The TUI's `workflow.update_definitions` push
+    // feeds a separate OVERRIDE layer that lookups consult first. Falls back to
+    // the conventional `workflows_dir()` resolution when the config field is
+    // empty. Best-effort: a missing dir / parse error just leaves the base
+    // empty (logged), so the daemon still starts.
+    {
+        let dir = if initial_state.config.workflows_dir.trim().is_empty() {
+            workflow::toml_schema::workflows_dir()
+        } else {
+            std::path::PathBuf::from(&initial_state.config.workflows_dir)
+        };
+        let (defs, errors) = workflow::toml_schema::load_all(&dir);
+        for (path, err) in &errors {
+            eprintln!(
+                "cm-daemon: skipping workflow def {}: {}",
+                path.display(),
+                err
+            );
+        }
+        eprintln!(
+            "cm-daemon: loaded {} base workflow definition(s) from {}",
+            defs.len(),
+            dir.display()
+        );
+        initial_state.base_workflow_definitions = defs;
+    }
     // The path the TUI dials for a dedicated attach connection.
     // For Phase 1 (Unix socket only), the attach connection lands
     // on the same listener as the control connection — the
@@ -454,28 +483,30 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    // 10d-2c-2-2-a: spawn the workflow on_idle poller. 2c-2-2-a's
-    // gate is hard-coded to "TUI owns" so this is a no-op behavior
-    // change — the loop runs and produces decisions but every
-    // decision is `Skip{TuiOwns}`. 2c-2-2-b flips the gate.
+    // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
+    // since Phase 4 (the TUI is a pure observer). It fires transitions,
+    // delivers activation prompts, and runs finalization/fresh-respawn for
+    // every daemon-owned run.
     //
-    // Failure to spawn the poller thread is logged-and-continued,
-    // not fatal: the daemon's core dispatch path doesn't depend on
-    // polling, and TUI-driven static `on_idle` still works for
-    // opt-in-off sessions. Matches the `spawn_watcher` pattern
-    // (slice 10d-memory-cap-relocation): transient resource
-    // pressure during startup shouldn't crash the daemon.
+    // Phase 4: poller-spawn failure is now FATAL. Pre-Phase-4 it was
+    // log-and-continue because the TUI still drove static `on_idle` for
+    // opt-in-off sessions — but that residual is gone. With no poller, the
+    // daemon would keep accepting `start_workflow` and returning run ids while
+    // NOTHING delivers prompts or fires transitions: a silently-dead workflow
+    // engine. Fail closed instead, so the operator sees the failure at startup
+    // rather than discovering frozen runs later.
     let poller = std::sync::Arc::new(
         workflow::poller::WorkflowPoller::new(std::sync::Arc::clone(&state)),
     );
-    if let Err(e) = poller.start() {
-        eprintln!(
-            "cm-daemon: workflow poller thread spawn failed: {}; \
-             daemon continuing without workflow polling (TUI-driven \
-             static on_idle still works for opt-in-off sessions)",
+    poller.start().map_err(|e| {
+        anyhow::anyhow!(
+            "cm-daemon: workflow poller thread spawn failed: {}; refusing to \
+             start — the poller is the daemon's only workflow driver, so a \
+             daemon without it would accept start_workflow but never advance \
+             any run",
             e,
-        );
-    }
+        )
+    })?;
 
     for incoming in listener.incoming() {
         match incoming {

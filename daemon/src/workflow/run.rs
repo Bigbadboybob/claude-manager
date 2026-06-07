@@ -195,8 +195,21 @@ pub struct PendingActivation {
     /// RAW supplied prompt (empty for static fires; the MCP `prompt` otherwise).
     /// Rendered at finalization with the empty -> activation-template fallback.
     pub raw_prompt: String,
+    /// Phase 4 (P5): deliver `raw_prompt` VERBATIM (skip template rendering).
+    /// Set for a goal-only initial activation (no role `activation_prompt`), so
+    /// a goal containing literal `{{ }}` is not mangled — matching the TUI's
+    /// goal-verbatim path.
+    #[serde(default)]
+    pub verbatim: bool,
     /// Whether the target role is `Context::Fresh` (needs `/clear` + rebind).
     pub needs_fresh_reset: bool,
+    /// Phase 4: the run's INITIAL activation (the worker at launch). The initial
+    /// `HistoryEntry` (iteration 1, `TriggerKind::Initial`) is already seeded by
+    /// [`WorkflowRun::new`], so finalization is DELIVERY-ONLY — it renders +
+    /// delivers the worker's initial prompt and patches the existing entry's
+    /// `session_id`, but never appends a second worker row (acceptance #2).
+    #[serde(default)]
+    pub is_initial: bool,
     /// Finalization phase; advanced + persisted step by step.
     pub phase: ActivationPhase,
     /// The rendered activation prompt, frozen at finalization step 1 so a crash

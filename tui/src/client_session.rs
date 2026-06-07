@@ -523,7 +523,32 @@ fn next_request_id() -> String {
 /// On `Response::ok = false`, surfaces an anyhow error carrying
 /// the daemon's error code + message so callers don't have to
 /// unpack the envelope themselves.
+/// Default per-RPC read timeout. Most RPCs respond in well under a second; the
+/// timeout exists so the main thread can't block forever against an
+/// unresponsive (e.g. ssh-tunneled) daemon.
+const DEFAULT_RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// P-3b: read timeout for the `start_workflow` RPC specifically. The daemon
+/// serializes each participant's transcript-detector binding (the cross-bind
+/// fix), waiting up to the per-role slot timeout
+/// (`SLOT_WAIT_TIMEOUT_DEFAULT_MS` = 20s) before spawning the next role. A
+/// feedback-style 3-role launch can therefore legitimately hold the response
+/// open well past the default 5s. Size this safely ABOVE the daemon's bounded
+/// worst case (roughly roles × 20s): 150s covers up to ~7 roles with margin, so
+/// the client never gives up while the daemon is still mid-launch and reports a
+/// false "launch failed". The daemon saves+broadcasts the run only on FULL
+/// success (atomic), so even a give-up can't leave a half-launched run visible.
+pub const START_WORKFLOW_RPC_READ_TIMEOUT: Duration = Duration::from_secs(150);
+
 fn rpc_round_trip(daemon_socket: &Path, req: &Request) -> anyhow::Result<Response> {
+    rpc_round_trip_with_read_timeout(daemon_socket, req, DEFAULT_RPC_READ_TIMEOUT)
+}
+
+fn rpc_round_trip_with_read_timeout(
+    daemon_socket: &Path,
+    req: &Request,
+    read_timeout: Duration,
+) -> anyhow::Result<Response> {
     let mut stream = UnixStream::connect(daemon_socket)
         .with_context(|| format!("dial daemon socket {}", daemon_socket.display()))?;
     // Without these the read blocks the main thread forever when the
@@ -533,7 +558,7 @@ fn rpc_round_trip(daemon_socket: &Path, req: &Request) -> anyhow::Result<Respons
     // replies; the 12e-perf reachability cache can't help because
     // it only registers on a real failure.
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(read_timeout))
         .context("set rpc read timeout")?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -976,6 +1001,55 @@ pub struct TuiSessionSnapshotPush<'a> {
 /// at TUI startup (after the TOML load). The map is small and
 /// rarely changes — replace-not-merge mirrors
 /// `tui.update_sessions_snapshot` semantics.
+/// Phase 4 §D: launch a workflow on the daemon. The daemon spawns the
+/// participants, writes the initial state.json, and drives the run via its
+/// poller; the TUI observes the result through `workflow_watch` /
+/// `manifest.watch`. Returns the new run_id. The `worktree`/`workspace_id` are
+/// passed explicitly (Operator caller) since the TUI knows the focused
+/// workspace.
+pub fn rpc_start_workflow(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    workflow_name: &str,
+    worktree: &str,
+    workspace_id: &str,
+    goal: Option<&str>,
+    task_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut params = serde_json::json!({
+        "workflow_name": workflow_name,
+        "worktree": worktree,
+        "workspace_id": workspace_id,
+    });
+    if let Some(g) = goal {
+        params["goal"] = serde_json::Value::String(g.to_string());
+    }
+    if let Some(t) = task_id {
+        params["task_id"] = serde_json::Value::String(t.to_string());
+    }
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "start_workflow".into(),
+        params,
+    };
+    // P-3b: use the longer start_workflow timeout — the daemon may serialize
+    // per-role detector binding for several roles before responding.
+    let resp = rpc_round_trip_with_read_timeout(
+        daemon_socket,
+        &req,
+        START_WORKFLOW_RPC_READ_TIMEOUT,
+    )?;
+    let run_id = resp
+        .result
+        .as_ref()
+        .and_then(|v| v.get("run_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("start_workflow: response missing run_id"))?
+        .to_string();
+    Ok(run_id)
+}
+
 pub fn rpc_workflow_update_definitions(
     daemon_socket: &Path,
     operator_token_id: &str,
@@ -1038,6 +1112,90 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc as StdArc, Mutex};
     use tempfile::TempDir;
+
+    /// P-3b: the start_workflow timeout must comfortably exceed the daemon's
+    /// bounded worst case so A-f never falsely reports "launch failed" while the
+    /// daemon is still serializing per-role detector binding. Worst case ≈
+    /// roles × `SLOT_WAIT_TIMEOUT_DEFAULT_MS` (20s); 150s covers ~7 roles. This
+    /// guards against someone shrinking it back toward the 5s default.
+    #[test]
+    fn start_workflow_rpc_timeout_exceeds_daemon_worst_case() {
+        let slot = std::time::Duration::from_millis(
+            cm_daemon::control::methods::SLOT_WAIT_TIMEOUT_DEFAULT_MS,
+        );
+        // Headroom for a comfortably-larger-than-3-role feedback launch.
+        assert!(
+            START_WORKFLOW_RPC_READ_TIMEOUT >= slot * 6,
+            "start_workflow RPC timeout {:?} must exceed roles×slot ({:?}×6)",
+            START_WORKFLOW_RPC_READ_TIMEOUT,
+            slot,
+        );
+        assert!(
+            START_WORKFLOW_RPC_READ_TIMEOUT > DEFAULT_RPC_READ_TIMEOUT,
+            "must be longer than the default per-RPC timeout",
+        );
+    }
+
+    /// P-3b: a response that arrives AFTER the default 5s window must still be
+    /// received when the caller uses a longer read timeout — and must fail with
+    /// a short one. Proves the timeout is what gates the round-trip, so a slow
+    /// (multi-role) launch isn't killed by the client. Uses a small delay
+    /// (300ms) against short (100ms) vs long (5s) timeouts to stay fast.
+    #[test]
+    fn rpc_round_trip_honors_read_timeout_for_slow_response() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("slow.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Mock daemon: read the request, sleep 300ms, write an OK response.
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ = cm_daemon::control::wire::read_request(&mut stream);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let resp = Response {
+                    id: "x".into(),
+                    ok: true,
+                    result: Some(serde_json::json!({"run_id": "wf_slow"})),
+                    error: None,
+                };
+                let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                let _ = stream.flush();
+            }
+        });
+
+        let req = Request {
+            id: next_request_id(),
+            caller: Caller::operator("op"),
+            method: "ping".into(),
+            params: serde_json::json!({}),
+        };
+
+        // Short timeout (< 300ms response delay) → fails.
+        let short = rpc_round_trip_with_read_timeout(
+            &sock,
+            &req,
+            std::time::Duration::from_millis(100),
+        );
+        assert!(short.is_err(), "100ms timeout must trip on a 300ms response");
+
+        // Long timeout (>> delay) → succeeds, like the start_workflow path.
+        let long = rpc_round_trip_with_read_timeout(
+            &sock,
+            &req,
+            std::time::Duration::from_secs(5),
+        );
+        let resp = long.expect("5s timeout must receive the 300ms-delayed response");
+        assert_eq!(resp.result.unwrap()["run_id"], "wf_slow");
+
+        drop(handle);
+    }
 
     /// Spin up an in-process daemon listening on a tempdir socket,
     /// pre-populating `DaemonState.workspaces` with a single

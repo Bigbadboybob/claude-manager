@@ -271,6 +271,28 @@ pub struct WorkflowPoller {
     /// Phase 3: PTY-quiet window (ms) the delivery drainer requires before
     /// writing a body. Production = 2000; tests set 0 to bypass the gate.
     finalize_quiet_ms: AtomicU64,
+    /// P-A (criterion #4): per-run hash of the last broadcast snapshot. The
+    /// poller reads every run from disk each tick, so broadcasting a fresh
+    /// snapshot whenever a run's serialized form changes makes ALL daemon-driven
+    /// progress (poller- AND handler-initiated: transitions, history growth,
+    /// terminal status) reach observing TUIs over the broadcast plane — the
+    /// only channel a remote observer has, and what criterion #4 ("render
+    /// correctly from broadcasts alone") requires. Dedup avoids re-broadcasting
+    /// unchanged runs every tick.
+    last_broadcast_hashes: Mutex<std::collections::HashMap<String, u64>>,
+}
+
+/// P-2: extract a Codex session id from its rollout transcript path. The Codex
+/// canonical id is the first-line `payload.id` (the rollout *filename* is a
+/// timestamped name that is NOT the id), and `transcript.rs::find_codex_file`
+/// looks files up by that id — so the run binding must store it, not the file
+/// stem. Best-effort: `None` if the file is unreadable or lacks `payload.id`.
+fn codex_session_id_from_path(path: &Path) -> Option<String> {
+    let first = crate::workflow::transcript::read_first_line(path)?;
+    let v: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    v.pointer("/payload/id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 impl WorkflowPoller {
@@ -288,6 +310,7 @@ impl WorkflowPoller {
             finalize_trackers: Mutex::new(std::collections::HashMap::new()),
             finalize_gap_ms: AtomicU64::new(crate::workflow::finalize::DEFAULT_ENTER_GAP_MS),
             finalize_quiet_ms: AtomicU64::new(2_000),
+            last_broadcast_hashes: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -398,6 +421,13 @@ impl WorkflowPoller {
     ///    `workflow_transition` calls — the same handler MCP
     ///    callers use.
     pub fn poll_once(&self) -> Vec<Decision> {
+        // Phase 4 (P1): bridge each daemon-launched participant's detected
+        // transcript sid into its run binding's `current_session_id`, so the
+        // idle gate has a transcript to read. Must run BEFORE the gate
+        // evaluation + drain. The TUI's `sync_role_session_ids` does the
+        // equivalent for TUI-spawned sessions.
+        self.sync_role_session_ids();
+
         // Phase 1: collect snapshots under the lock. Pure read.
         let snapshots = {
             let s = self.state.lock().unwrap();
@@ -465,7 +495,56 @@ impl WorkflowPoller {
             self.drain_finalizations();
         }
 
+        // P-A (criterion #4): push fresh snapshots for any run whose state
+        // changed this tick so observing TUIs render the advance (active_role,
+        // history, terminal status) from broadcasts alone — no reconnect, no
+        // local-disk reload (which a remote observer can't do).
+        self.broadcast_changed_snapshots();
+
         decisions
+    }
+
+    /// Broadcast a state snapshot for every run whose serialized form changed
+    /// since the last broadcast. Single chokepoint: the poller re-reads all
+    /// runs from disk each tick, so this captures BOTH poller-driven advances
+    /// (transitions, finalization) AND handler-driven mutations
+    /// (`workflow_transition` / `workflow_done` writing state.json). Dedup by
+    /// hash keeps the steady state quiet — a run that didn't change isn't
+    /// re-broadcast. A run that vanished from disk has its hash reaped so a
+    /// future re-creation with the same id still broadcasts.
+    fn broadcast_changed_snapshots(&self) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let runs = crate::workflow::run::load_all();
+        let watcher = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.workflow_event_watcher.clone()
+        };
+        let mut hashes = self
+            .last_broadcast_hashes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        for run in runs {
+            seen.insert(run.run_id.clone());
+            // Hash the serialized run; serialization is deterministic for an
+            // unchanged on-disk run (the poller doesn't rewrite unchanged runs),
+            // so the hash is stable until a real state change.
+            let serialized = match serde_json::to_string(&run) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut hasher = DefaultHasher::new();
+            serialized.hash(&mut hasher);
+            let h = hasher.finish();
+            if hashes.get(&run.run_id) == Some(&h) {
+                continue; // unchanged — already broadcast
+            }
+            hashes.insert(run.run_id.clone(), h);
+            watcher.broadcast_snapshot(run);
+        }
+        hashes.retain(|id, _| seen.contains(id));
     }
 
     /// Advance every daemon-owned run's `pending_activation` to completion (or
@@ -474,6 +553,89 @@ impl WorkflowPoller {
     /// its `PtyByteFanout` (lazily, cached by uid), and drives
     /// [`finalize::advance_finalization`] — porting `submit_prompt`'s body/Enter
     /// separation and engine-correct Enter encoding into the daemon.
+    /// Phase 4 (P1): bind a daemon-launched participant's `current_session_id`
+    /// from its session's detected transcript path. A `start_workflow`-spawned
+    /// session stores `current_session_id: None`; the per-session transcript
+    /// detector sets `DaemonSession.transcript_path` once the agent writes its
+    /// first transcript, but nothing bridged that into the run binding — so the
+    /// initial worker's idle gate read `None` -> `NoTranscriptId` forever and
+    /// `worker -> reviewer` never fired headlessly.
+    ///
+    /// This is the daemon analog of the TUI's `sync_role_session_ids()`. It
+    /// SKIPS a role that is mid-fresh-reset (a `pending_activation` targeting it
+    /// with `needs_fresh_reset`), because the fresh path's `RebindPending`
+    /// discovery owns that role's sid (binding from the now-stale pre-`/clear`
+    /// `transcript_path` would rebind to the wrong file). Persistent roles never
+    /// `/clear`, so their `transcript_path` stays valid for the whole run.
+    fn sync_role_session_ids(&self) {
+        let bindings: Vec<(String, String, String)> = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut out = Vec::new();
+            for run in crate::workflow::run::load_all().iter().filter(|r| r.is_active()) {
+                for (role, b) in &run.role_sessions {
+                    if b.current_session_id.is_some() {
+                        continue;
+                    }
+                    // Let the fresh-reset RebindPending path own a fresh role's sid.
+                    let fresh_in_flight = run
+                        .pending_activation
+                        .as_ref()
+                        .map_or(false, |pa| pa.target_role == *role && pa.needs_fresh_reset);
+                    if fresh_in_flight {
+                        continue;
+                    }
+                    let Some(uid) = b.daemon_session_uid.as_deref() else {
+                        continue;
+                    };
+                    let Some(session) = state.sessions.get(uid) else {
+                        continue;
+                    };
+                    let Some(tp) = session.transcript_path.as_deref() else {
+                        continue;
+                    };
+                    // P-2: the canonical session id is engine-specific. For
+                    // Claude it's the transcript file's stem (`<sid>.jsonl`).
+                    // For Codex the rollout filename is NOT the id — the id is
+                    // the first-line `payload.id`, which `transcript.rs` keys
+                    // its lookups off (`find_codex_file`). Binding the filename
+                    // stem for a Codex role would make every later transcript
+                    // read miss and idle/message polling stall.
+                    let sid = if session.session_type == "codex" {
+                        codex_session_id_from_path(std::path::Path::new(tp))
+                    } else {
+                        std::path::Path::new(tp)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
+                    };
+                    if let Some(sid) = sid {
+                        out.push((run.run_id.clone(), role.clone(), sid));
+                    }
+                }
+            }
+            out
+        };
+        for (run_id, role, sid) in bindings {
+            let _ = crate::workflow::run::modify(&run_id, |r| {
+                if let Some(b) = r.role_sessions.get_mut(&role) {
+                    if b.current_session_id.is_none() {
+                        b.current_session_id = Some(sid.clone());
+                    }
+                }
+                // Patch the role's latest history entry's pending session_id too
+                // (e.g. the initial worker entry seeded with sid unknown).
+                if let Some(h) = r
+                    .history
+                    .iter_mut()
+                    .rev()
+                    .find(|h| h.role == role && h.session_id.is_none())
+                {
+                    h.session_id = Some(sid.clone());
+                }
+            });
+        }
+    }
+
     fn drain_finalizations(&self) {
         struct Work {
             run_id: String,
@@ -509,7 +671,7 @@ impl WorkflowPoller {
                     if !state.sessions.contains_key(&uid) {
                         return None;
                     }
-                    let workflow = state.workflow_definitions.get(&run.workflow_name).cloned()?;
+                    let workflow = state.workflow_definition(&run.workflow_name).cloned()?;
                     // Worktree via the active (== target) role's bound session.
                     let ws_id = run
                         .active_role
@@ -1016,7 +1178,7 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
                 .get(workspace_lookup_key)
                 .and_then(|ws| ws.worktree_path.clone());
 
-            let workflow = state.workflow_definitions.get(&run.workflow_name).cloned();
+            let workflow = state.workflow_definition(&run.workflow_name).cloned();
 
             TickSnapshot {
                 run_id: run.run_id.clone(),
@@ -1897,6 +2059,122 @@ mod tests {
         }
     }
 
+    /// Phase 4 (P1) acceptance — the heart of the phase. A run LAUNCHED by
+    /// `start_workflow` (no pre-seeded `current_session_id`) drives
+    /// worker -> reviewer -> manager to completion headlessly. Before the
+    /// `sync_role_session_ids` bridge this WEDGED: the initial worker's sid was
+    /// never bound, so the idle gate read `NoTranscriptId` forever and
+    /// `worker -> reviewer` never fired. Agents are simulated by writing
+    /// transcripts + setting `DaemonSession.transcript_path` (what the detector
+    /// does for a real agent).
+    #[test]
+    fn start_workflow_drives_worker_reviewer_manager_headlessly_without_seeded_sid() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", tmp.path());
+        let home = tmp.path();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let encoded = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        let proj = home.join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-1".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-1".to_string(), ws);
+            // All-claude feedback (reviewer fresh) — simplest transcript dir.
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+            roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+            roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+            s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
+                name: "feedback".to_string(), description: String::new(), roles,
+                role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
+                transitions: vec![
+                    Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() },
+                    Transition { from: "reviewer".into(), on: TriggerOn::Idle, to: "manager".into() },
+                ],
+            });
+        }
+
+        crate::control::methods::set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+        crate::control::methods::set_disable_workflow_detector_for_test(true);
+        let resp = crate::control::methods::start_workflow(
+            &state,
+            &crate::control::protocol::Caller::operator("op"),
+            &serde_json::json!({ "workflow_name": "feedback", "goal": "do it", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1" }),
+        ).expect("start_workflow ok");
+        crate::control::methods::set_spawn_program_override_for_test(None);
+        crate::control::methods::set_disable_workflow_detector_for_test(false);
+        let run_id = resp["run_id"].as_str().unwrap().to_string();
+
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
+        let worker_uid = run.role_sessions["worker"].daemon_session_uid.clone().unwrap();
+        let reviewer_uid = run.role_sessions["reviewer"].daemon_session_uid.clone().unwrap();
+        // Crucially: NO current_session_id seeded.
+        assert!(run.role_sessions.values().all(|b| b.current_session_id.is_none()));
+
+        let write_turn = |sid: &str, text: &str| {
+            std::fs::write(
+                proj.join(format!("{}.jsonl", sid)),
+                format!(r#"{{"type":"assistant","message":{{"role":"assistant","stop_reason":"end_turn","content":[{{"type":"text","text":"{}"}}]}}}}"#, text),
+            ).unwrap();
+        };
+        let set_tp = |uid: &str, sid: &str| {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut(uid).unwrap().transcript_path =
+                Some(proj.join(format!("{}.jsonl", sid)).to_str().unwrap().to_string());
+        };
+
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        poller.set_finalize_timing_for_test(0, 0);
+
+        // Tick 1: the worker's is_initial activation finalizes (delivery-only).
+        poller.poll_once();
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
+        assert_eq!(run.history.iter().filter(|h| h.role == "worker").count(), 1);
+        assert!(run.pending_activation.is_none());
+
+        // The worker produces its first turn (transcript + detector binding).
+        write_turn("wsid", "worker did the work");
+        set_tp(&worker_uid, "wsid");
+
+        // Tick 2: sync binds the worker's sid, the gate fires worker->reviewer,
+        // and the fresh reviewer finalizes to rebind-pending.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
+        assert_eq!(
+            run.role_sessions["worker"].current_session_id.as_deref(),
+            Some("wsid"),
+            "P1: worker sid bridged from transcript_path (was the wedge)"
+        );
+        assert_eq!(run.active_role.as_deref(), Some("reviewer"), "worker->reviewer fired headlessly");
+
+        // The (fresh) reviewer produces its turn — a NEW transcript discovery rebinds.
+        write_turn("rsid", "reviewer found a bug");
+
+        // Tick 3: reviewer rebind-pending discovery binds rsid.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
+        assert_eq!(run.role_sessions["reviewer"].current_session_id.as_deref(), Some("rsid"));
+
+        // Tick 4: reviewer goes idle (its turn) -> reviewer->manager fires.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
+        assert_eq!(run.active_role.as_deref(), Some("manager"), "reviewer->manager fired headlessly");
+
+        // Full chain in history: worker(Initial) -> reviewer -> manager.
+        let roles: Vec<&str> = run.history.iter().map(|h| h.role.as_str()).collect();
+        assert_eq!(roles, vec!["worker", "reviewer", "manager"], "history records the full chain");
+        assert!(matches!(run.history[0].trigger, crate::workflow::run::TriggerKind::Initial));
+        let _ = reviewer_uid;
+    }
+
     /// Phase 3 headless end-to-end (doc/daemon-side-workflow-orchestration.md):
     /// a daemon-owned worker goes idle, `poll_once` fires worker->reviewer, and
     /// the delivery drainer (same `poll_once`) resets the FRESH reviewer,
@@ -2110,7 +2388,8 @@ mod tests {
             r.pending_activation = Some(PendingActivation {
                 activation_id: 2, target_role: "reviewer".to_string(), iteration: 2,
                 trigger: TriggerKind::StaticIdle { from_role: "worker".to_string() },
-                raw_prompt: String::new(), needs_fresh_reset: true,
+                raw_prompt: String::new(), verbatim: false, needs_fresh_reset: true,
+                is_initial: false,
                 phase: ActivationPhase::Queued, rendered_prompt: None,
                 pre_clear_snapshot: None, enter_fire_at_ms: None,
             });
@@ -2582,6 +2861,226 @@ mod tests {
                 } if run_id == "r-no-def"
             ),
             "expected Skip{{NoWorkflowDefinition}}, got {:?}",
+            decisions[0],
+        );
+    }
+
+    /// P-2 — a Codex role's `current_session_id` must bind the rollout's
+    /// first-line `payload.id`, NOT the transcript filename stem. The Codex
+    /// rollout file is named with a timestamp/uuid that is not the canonical
+    /// id, and `transcript.rs` looks Codex files up by `payload.id`; binding
+    /// the stem makes every later read miss and the role's idle gate stall.
+    /// Mutation check: swapping `codex_session_id_from_path` back to
+    /// `file_stem()` makes this assert the wrong (filename) id and fail.
+    #[test]
+    fn sync_binds_codex_role_to_payload_id_not_filename_stem() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", tmp.path());
+        let home = tmp.path();
+
+        // A Codex rollout file whose NAME differs from its payload.id.
+        let roll_dir = home.join(".codex/sessions/2026/06/06");
+        std::fs::create_dir_all(&roll_dir).unwrap();
+        let roll_path = roll_dir.join("rollout-2026-06-06T00-00-00-deadbeef.jsonl");
+        std::fs::write(
+            &roll_path,
+            "{\"payload\":{\"id\":\"codex-canonical-xyz\"}}\n",
+        )
+        .unwrap();
+        let filename_stem =
+            roll_path.file_stem().unwrap().to_str().unwrap().to_string();
+        assert_ne!(filename_stem, "codex-canonical-xyz", "fixture must differ");
+
+        let state = make_state_with_one_active_run("r-codex");
+        {
+            let mut s = state.lock().unwrap();
+            // A daemon-owned codex worker with NO current_session_id yet, but a
+            // transcript_path pointing at the rollout (what the detector sets).
+            let mut sp = SpawnParams::new("ts-codex-w", "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.session_type = "codex".to_string();
+            sp.workflow_run_id = Some("r-codex".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let mut ds = DaemonSession::spawn(sp).expect("spawn");
+            ds.transcript_path = Some(roll_path.to_str().unwrap().to_string());
+            s.sessions.insert("ts-codex-w".to_string(), ds);
+        }
+        // Bind the daemon uid to the role, current_session_id left None.
+        crate::workflow::run::modify("r-codex", |r| {
+            r.role_sessions.insert("worker".to_string(), RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: None,
+                daemon_session_uid: Some("ts-codex-w".to_string()),
+            });
+        })
+        .unwrap();
+
+        let poller = WorkflowPoller::new(state);
+        poller.sync_role_session_ids();
+
+        let run = crate::workflow::run::load_one("r-codex").unwrap();
+        assert_eq!(
+            run.role_sessions["worker"].current_session_id.as_deref(),
+            Some("codex-canonical-xyz"),
+            "Codex role must bind payload.id, not the filename stem",
+        );
+    }
+
+    /// P-A (criterion #4), daemon half: `poll_once` broadcasts a fresh snapshot
+    /// for a run whose state CHANGED since the last tick, and DEDUPS an
+    /// unchanged run (no re-broadcast every tick). This is what feeds an open
+    /// TUI observer the advance "from broadcasts alone"; the TUI half is
+    /// `observer_renders_full_workflow_advance_from_broadcast_snapshots` in the
+    /// tui crate.
+    #[test]
+    fn poll_once_broadcasts_snapshot_on_change_and_dedups() {
+        use crate::workflow::events::WorkflowWatchMsg;
+        let _guard = crate::test_support::env_lock();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp.path());
+
+        let state = make_state_with_one_active_run("r-bc");
+        let (rx, _sub) = {
+            let s = state.lock().unwrap();
+            s.workflow_event_watcher.subscribe()
+        };
+        let poller = WorkflowPoller::new(Arc::clone(&state));
+        poller.set_disable_apply_for_test(true);
+
+        // Tick 1: first observation → a snapshot for r-bc.
+        poller.poll_once();
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .expect("first poll must broadcast a creation/initial snapshot");
+        match msg {
+            WorkflowWatchMsg::Snapshot(run) => assert_eq!(run.run_id, "r-bc"),
+            WorkflowWatchMsg::Event(_) => panic!("expected Snapshot"),
+        }
+
+        // Tick 2: nothing changed on disk → DEDUP, no new broadcast.
+        poller.poll_once();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(),
+            "an unchanged run must NOT be re-broadcast every tick (dedup)",
+        );
+
+        // Mutate the run on disk, then tick 3 → a fresh snapshot reflecting it.
+        crate::workflow::run::modify("r-bc", |r| {
+            r.active_role = Some("reviewer".to_string());
+        })
+        .unwrap();
+        poller.poll_once();
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .expect("a changed run must be re-broadcast");
+        match msg {
+            WorkflowWatchMsg::Snapshot(run) => {
+                assert_eq!(run.active_role.as_deref(), Some("reviewer"));
+            }
+            WorkflowWatchMsg::Event(_) => panic!("expected Snapshot"),
+        }
+    }
+
+    /// Phase 4 acceptance #3 — the RESTART-RESUME leg. After a mid-run daemon
+    /// restart, the fresh process re-reads its base definitions from
+    /// `workflows_dir` (the exact `toml_schema::load_all` path lib.rs runs at
+    /// startup) into `base_workflow_definitions`. With the override layer EMPTY
+    /// (no TUI ever pushed `workflow.update_definitions`), an active run on disk
+    /// must resume WITHOUT `SkipReason::NoWorkflowDefinition` — the gate finds
+    /// the def via the base layer. This is the inverse of the R10 test above:
+    /// same active run, but a base def loaded from disk instead of nothing.
+    #[test]
+    fn restart_resumes_from_base_defs_without_no_workflow_definition() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp_home.path());
+        let home = _tmp_home.path();
+
+        // A worktree so the gate gets past NoWorktreePath and actually reaches
+        // the definition lookup.
+        let wt = home.join("wt-restart");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // Write a real workflow TOML into a workflows_dir and load it through
+        // the SAME loader lib.rs uses at startup. This is the "restart re-reads
+        // workflows_dir" step, not a hand-built in-memory def.
+        let wf_dir = home.join("workflows");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("feedback.toml"),
+            r#"name = "feedback"
+description = "test"
+role_order = ["worker", "reviewer"]
+
+[roles.worker]
+engine = "claude-code"
+context = "persistent"
+needs_mcp = false
+
+[roles.reviewer]
+engine = "claude-code"
+context = "persistent"
+activation_prompt = "review"
+needs_mcp = false
+
+[[transitions]]
+from = "worker"
+on = "idle"
+to = "reviewer"
+"#,
+        )
+        .unwrap();
+        let (base_defs, errs) = crate::workflow::toml_schema::load_all(&wf_dir);
+        assert!(errs.is_empty(), "feedback.toml should parse: {:?}", errs);
+        assert!(base_defs.contains_key("feedback"));
+
+        // A "fresh" daemon: base defs populated from disk, override layer EMPTY.
+        let state = make_state_with_one_active_run("r-restart");
+        {
+            let mut s = state.lock().unwrap();
+            assert!(
+                s.workflow_definitions.is_empty(),
+                "override layer must be empty — proving resume comes from BASE",
+            );
+            s.base_workflow_definitions = base_defs;
+
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+
+            let mut sp = crate::session::SpawnParams::new(
+                "ts-worker-restart",
+                "worker",
+                "/bin/sleep",
+            );
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.workflow_run_id = Some("r-restart".to_string());
+            sp.workflow_role = Some("worker".to_string());
+            let ds: DaemonSession =
+                crate::session::DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker-restart".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-restart", "worker", "ts-worker-restart");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1);
+        // The decisive assertion: NOT NoWorkflowDefinition. The worker has no
+        // transcript bound, so the gate skips later on NoTranscriptId — but it
+        // got PAST the definition lookup, which is the resume guarantee.
+        assert!(
+            !matches!(
+                &decisions[0],
+                Decision::Skip { reason: SkipReason::NoWorkflowDefinition, .. }
+            ),
+            "restart must resume from base defs, not skip on \
+             NoWorkflowDefinition; got {:?}",
             decisions[0],
         );
     }

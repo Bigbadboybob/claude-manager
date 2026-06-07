@@ -51,6 +51,26 @@ fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
     Some(home.join(".cm/mcp").join(session_uid))
 }
 
+/// Workflow participant identity threaded into the MCP server's config `env`
+/// block. Mirrors `tui/src/mcp_config.rs::WorkflowMeta`.
+///
+/// ## Why this MUST live in the MCP config env (not just the agent's env)
+///
+/// `workflow_transition` / `workflow_done` / `workflow_reject_finding` read
+/// `CM_WORKFLOW_RUN_ID` + `CM_ROLE` from `os.environ` and hard-fail when
+/// absent (mcp_server/server.py). The MCP server is a *child of the agent
+/// process* (`claude` / `codex`), and Claude Code does NOT reliably propagate
+/// the agent's parent env to its MCP children (documented at
+/// `tui/src/mcp_config.rs`). So setting these on the agent's own
+/// `spawn_params.env` is insufficient — they must be written into the MCP
+/// server's config `env` block, which is the only env the child is guaranteed
+/// to receive. Without this, every daemon-launched reviewer/manager fails to
+/// transition or finish and the headless run stalls.
+pub struct WorkflowMeta<'a> {
+    pub run_id: &'a str,
+    pub role: &'a str,
+}
+
 /// Build the env block injected into the MCP server child.
 /// Mirrors `tui/src/mcp_config.rs::build_env` for
 /// `SpawnTarget::Daemon` (the only target relevant here — agents
@@ -71,7 +91,10 @@ fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
 ///     controller stays TUI-side until slice 10d-workflow-
 ///     controller relocates it, so daemon-spawned agents need
 ///     both sockets in flight.
-pub fn build_env(session_uid: &str) -> BTreeMap<String, String> {
+pub fn build_env(
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
     env.insert(
@@ -82,6 +105,13 @@ pub fn build_env(session_uid: &str) -> BTreeMap<String, String> {
         "CM_TUI_SOCKET".into(),
         absolutized_socket_or_raw(&crate::default_tui_socket_path()),
     );
+    // Workflow participant identity — see `WorkflowMeta`. Must be in the MCP
+    // server's config env (this block), NOT just the agent's process env,
+    // because the MCP child doesn't inherit the agent's env.
+    if let Some(wf) = workflow {
+        env.insert("CM_WORKFLOW_RUN_ID".into(), wf.run_id.to_string());
+        env.insert("CM_ROLE".into(), wf.role.to_string());
+    }
     env
 }
 
@@ -91,10 +121,35 @@ fn absolutized_socket_or_raw(p: &Path) -> String {
         .unwrap_or_else(|_| p.to_string_lossy().into_owned())
 }
 
-/// Write the per-session Claude MCP config JSON. Returns the
-/// path the caller threads through `--mcp-config <path>`.
-pub fn write_claude_mcp_config(session_uid: &str) -> std::io::Result<PathBuf> {
-    let server = crate::workflow::spawn::mcp_server_path().ok_or_else(|| {
+/// Resolve the path to `mcp_server/server.py`, PREFERRING the daemon's
+/// configured `mcp_server_path` (from `daemon.toml`) when set.
+///
+/// P-2: the env/repo-relative `spawn::mcp_server_path()` fallback does NOT
+/// resolve on a configured remote deployment like cm-manager (`/opt/cm-daemon`,
+/// no repo tree, daemon process may lack `CM_MCP_SERVER`). Since this phase's
+/// whole point is headless execution there, a participant whose MCP config
+/// pointed at a missing/empty server path could never start its MCP server and
+/// so could never call `workflow_transition` / `workflow_done`. Threading the
+/// configured path through fixes that; the env/repo resolution stays as the
+/// local-workstation fallback.
+fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf> {
+    server_path_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(crate::workflow::spawn::mcp_server_path)
+}
+
+/// Write the per-session Claude MCP config JSON. Returns the path the caller
+/// threads through `--mcp-config <path>`. `server_path_override` (the daemon's
+/// configured `mcp_server_path`) wins over env/repo resolution — see
+/// [`resolve_server_path`].
+pub fn write_claude_mcp_config(
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+    server_path_override: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let server = resolve_server_path(server_path_override).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "could not locate mcp_server/server.py",
@@ -105,7 +160,7 @@ pub fn write_claude_mcp_config(session_uid: &str) -> std::io::Result<PathBuf> {
     })?;
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
-    let env = build_env(session_uid);
+    let env = build_env(session_uid, workflow);
     let config = json!({
         "mcpServers": {
             "claude-manager": {
@@ -131,11 +186,15 @@ fn escape_toml(s: &str) -> String {
 /// Returns a flat `[..., "-c", "k=v", ...]` list ready to splice
 /// into argv. Codex doesn't take a per-session config file —
 /// everything is inline.
-pub fn codex_overrides(session_uid: &str) -> Vec<String> {
-    let server = crate::workflow::spawn::mcp_server_path()
+pub fn codex_overrides(
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+    server_path_override: Option<&str>,
+) -> Vec<String> {
+    let server = resolve_server_path(server_path_override)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    let env = build_env(session_uid);
+    let env = build_env(session_uid, workflow);
     let env_toml = env
         .iter()
         .map(|(k, v)| format!("{}=\"{}\"", k, escape_toml(v)))
@@ -165,10 +224,12 @@ pub fn codex_overrides(session_uid: &str) -> Vec<String> {
 pub fn build_args(
     session_type: &str,
     session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+    server_path_override: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>)> {
     match session_type {
         "claude-code" => {
-            let cfg = write_claude_mcp_config(session_uid)?;
+            let cfg = write_claude_mcp_config(session_uid, workflow, server_path_override)?;
             let mut args = Vec::new();
             args.push("--dangerously-skip-permissions".to_string());
             args.push("--mcp-config".to_string());
@@ -182,7 +243,7 @@ pub fn build_args(
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
             args.push("check_for_update_on_startup=false".into());
-            args.extend(codex_overrides(session_uid));
+            args.extend(codex_overrides(session_uid, workflow, server_path_override));
             Ok(("codex".to_string(), args))
         }
         "bash" => {
@@ -325,7 +386,7 @@ mod tests {
         // `workflow_transition` / `workflow_done` /
         // `create_subtask` / etc. The Python resolver routes
         // per-method via DAEMON_METHODS.
-        let env = build_env("ts-abc-1");
+        let env = build_env("ts-abc-1", None);
         assert_eq!(env.get("CM_TUI_SESSION_ID").map(String::as_str), Some("ts-abc-1"));
         let daemon = env.get("CM_DAEMON_SOCKET").expect("daemon socket present");
         assert!(!daemon.is_empty(), "daemon socket must be a non-empty path");
@@ -343,7 +404,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("bash", "ts-bash-1").expect("ok");
+        let (prog, args) = build_args("bash", "ts-bash-1", None, None).expect("ok");
         assert_eq!(prog, "/bin/bash");
         assert!(args.is_empty(), "bash spawns raw with no args");
     }
@@ -353,7 +414,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("claude-code", "ts-claude-1").expect("ok");
+        let (prog, args) = build_args("claude-code", "ts-claude-1", None, None).expect("ok");
         assert_eq!(prog, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         let mcp_idx = args
@@ -392,7 +453,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("codex", "ts-codex-1").expect("ok");
+        let (prog, args) = build_args("codex", "ts-codex-1", None, None).expect("ok");
         assert_eq!(prog, "codex");
         assert!(
             args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
@@ -466,12 +527,120 @@ mod tests {
         );
     }
 
+    /// P-CRIT regression — a daemon-launched WORKFLOW PARTICIPANT's Claude MCP
+    /// config env block MUST carry `CM_WORKFLOW_RUN_ID` + `CM_ROLE`, otherwise
+    /// the reviewer/manager's `workflow_transition` / `workflow_done` calls
+    /// hard-fail ("CM_WORKFLOW_RUN_ID is not set") and the headless run stalls.
+    /// The MCP server is a child of the agent and does NOT inherit the agent's
+    /// env — so these must be in the config block, not just `spawn_params.env`.
+    /// (TUI analog: `tui/src/mcp_config.rs::build_env_includes_workflow_meta`.)
+    #[test]
+    fn build_args_claude_workflow_participant_carries_run_id_and_role() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let meta = WorkflowMeta { run_id: "wf_42", role: "reviewer" };
+        let (_prog, args) =
+            build_args("claude-code", "ts-wf-1", Some(&meta), None).expect("ok");
+        let mcp_idx = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config present");
+        let cfg_path = &args[mcp_idx + 1];
+        let content = std::fs::read_to_string(cfg_path).expect("config readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("json");
+        let env = &parsed["mcpServers"]["claude-manager"]["env"];
+        assert_eq!(
+            env["CM_WORKFLOW_RUN_ID"], "wf_42",
+            "MCP config env MUST carry the run id (P-CRIT)",
+        );
+        assert_eq!(
+            env["CM_ROLE"], "reviewer",
+            "MCP config env MUST carry the role (P-CRIT)",
+        );
+    }
+
+    /// P-2: when the daemon's configured `mcp_server_path` is passed, the
+    /// generated participant config MUST point Claude's MCP server at THAT path
+    /// (preferred over env/repo resolution) — otherwise a headless run on a
+    /// configured remote daemon (cm-manager, /opt/cm-daemon) writes a config
+    /// pointing at a non-existent repo-relative path and can't start its MCP
+    /// server. The configured path need not exist on disk for the writer to
+    /// honor it (the remote deployment's path won't exist on the test box).
+    #[test]
+    fn write_claude_config_prefers_configured_server_path() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let configured = "/opt/cm-daemon/mcp_server/server.py";
+        let cfg = write_claude_mcp_config("ts-cfg", None, Some(configured))
+            .expect("writes config using configured path");
+        let content = std::fs::read_to_string(&cfg).expect("config readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("json");
+        let args = &parsed["mcpServers"]["claude-manager"]["args"];
+        assert_eq!(
+            args[0], configured,
+            "claude MCP config must use the configured server path (P-2): {:?}",
+            args,
+        );
+    }
+
+    /// P-2 (Codex): the inline `-c mcp_servers.claude-manager.args` override
+    /// must also use the configured server path.
+    #[test]
+    fn codex_overrides_prefer_configured_server_path() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let configured = "/opt/cm-daemon/mcp_server/server.py";
+        let args = codex_overrides("ts-cfg", None, Some(configured));
+        assert!(
+            args.iter().any(|a| a.contains(&format!("args=[\"{}\"]", configured))),
+            "codex overrides must use the configured server path (P-2): {:?}",
+            args,
+        );
+    }
+
+    /// P-CRIT regression for the Codex engine — the inline `-c` overrides that
+    /// register the MCP server must put `CM_WORKFLOW_RUN_ID` + `CM_ROLE` into
+    /// the server's env, same rationale as the Claude case.
+    #[test]
+    fn build_args_codex_workflow_participant_carries_run_id_and_role() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let meta = WorkflowMeta { run_id: "wf_99", role: "manager" };
+        let (_prog, args) =
+            build_args("codex", "ts-wf-codex", Some(&meta), None).expect("ok");
+        assert!(
+            args.iter().any(|a| a.contains("CM_WORKFLOW_RUN_ID=\"wf_99\"")),
+            "codex overrides must register the run id in the MCP env: {:?}",
+            args,
+        );
+        assert!(
+            args.iter().any(|a| a.contains("CM_ROLE=\"manager\"")),
+            "codex overrides must register the role in the MCP env: {:?}",
+            args,
+        );
+    }
+
+    /// Non-workflow daemon sessions (the `mcp_start_session` path) pass `None`
+    /// and must NOT carry workflow vars — they aren't participants.
+    #[test]
+    fn build_env_without_workflow_meta_omits_run_id_and_role() {
+        let env = build_env("ts-plain", None);
+        assert!(env.get("CM_WORKFLOW_RUN_ID").is_none());
+        assert!(env.get("CM_ROLE").is_none());
+    }
+
     #[test]
     fn build_args_unsupported_type_errors() {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let err = build_args("gcloud", "ts-x").expect_err("must reject");
+        let err = build_args("gcloud", "ts-x", None, None).expect_err("must reject");
         assert!(
             err.to_string().contains("claude-code | codex | bash"),
             "error must list supported types: {}",

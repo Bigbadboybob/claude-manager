@@ -263,7 +263,7 @@ pub struct EventsSubscribeHandle {
     /// [`crate::workflow::events::WorkflowEventWatcher::subscribe`].
     /// Capacity is `WORKFLOW_EVENTS_BUFFER` (32). Drop on slow
     /// consumer handled by `try_send` in the broadcaster.
-    pub event_rx: mpsc::Receiver<crate::workflow::events::Event>,
+    pub event_rx: mpsc::Receiver<crate::workflow::events::WorkflowWatchMsg>,
     /// RAII guard: drop reaps the subscriber slot immediately
     /// without waiting for the next broadcast's `try_send`
     /// failure. Same shape as `ManifestWatchHandle::guard` (10e-b
@@ -456,6 +456,14 @@ pub fn dispatch_request(
         "stop_workflow" => {
             DispatchOutcome::Done(dispatch_stop_workflow(state, req))
         }
+        // Phase 4 §D: daemon-side `start_workflow` (relocated from the TUI
+        // socket). Operator (TUI `A-f`, explicit worktree) + Session (MCP
+        // agent, worktree from caller workspace) callers. Spawns participants,
+        // writes state.json, sets the worker's initial pending activation; the
+        // poller drives the rest headlessly.
+        "start_workflow" => {
+            DispatchOutcome::Done(dispatch_start_workflow(state, req))
+        }
 
         // Sub-2b-3: `mcp_start_session` — Python MCP tool's
         // minimal-shape entry point. Daemon resolves
@@ -572,6 +580,24 @@ fn dispatch_resolve_authorized_session(
 /// only (Operator callers should use full-shape `start_session`).
 /// Caller extraction passes the uid into the method body for
 /// context resolution (workspace_id / working_dir / task_id).
+fn dispatch_start_workflow(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    // P4: validate the operator token for Operator callers (who may pass an
+    // explicit worktree). Session callers are confined to their own
+    // workspace/task tree inside `methods::start_workflow`.
+    if matches!(req.caller, Caller::Operator(_)) {
+        if let Err(msg) = operator::validate_operator(&req.caller) {
+            return Response::err(req.id.clone(), ErrorCode::Unauthorized, msg);
+        }
+    }
+    match methods::start_workflow(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 fn dispatch_mcp_start_session(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
@@ -1294,12 +1320,12 @@ mod tests {
         let state = make_state();
         // Slice 10d-mcp-surface wired list_sessions; sub-2b-2
         // wired propose_task; 10d-2b wired workflow_transition /
-        // workflow_done. Pick a still-deferred workflow lifecycle
-        // method (`start_workflow` — deferred to 10d-2d per
-        // NOTES.md) to exercise the deferred-arm fallback.
+        // workflow_done; Phase 4 wired start_workflow. Pick a
+        // still-deferred method (`create_subtask` — still
+        // TUI-routed) to exercise the deferred-arm fallback.
         let resp = dispatch_request(
             &state,
-            &session_request("start_workflow", serde_json::Value::Null, "ts-x"),
+            &session_request("create_subtask", serde_json::Value::Null, "ts-x"),
         ).into_response();
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
@@ -5276,7 +5302,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket,
+            Some(ticket),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector thread");
         let dispatch_elapsed = dispatch_started.elapsed();
@@ -5370,7 +5396,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket,
+            Some(ticket),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector thread");
         // Simulate the engine writing its transcript a bit
@@ -5477,7 +5503,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket_a,
+            Some(ticket_a),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector A");
         crate::transcript_detect::spawn_queued_detector(
@@ -5486,7 +5512,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket_b,
+            Some(ticket_b),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector B");
         // Drop B's file FIRST, then A's. Without
@@ -5748,7 +5774,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket_a,
+            Some(ticket_a),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector A");
         // Drop A from registry — detector will observe gone.
@@ -5770,7 +5796,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket_b,
+            Some(ticket_b),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector B");
         // Drop a transcript file for B to find.
@@ -5948,7 +5974,7 @@ mod tests {
             crate::transcript_detect::DetectorEngine::ClaudeCode,
             worktree.clone(),
             Vec::new(),
-            ticket_claude,
+            Some(ticket_claude),
             crate::transcript_detect::default_detector_spawn_fn(),
         ).expect("spawn detector");
         // Now: caller bound to the worktree, spawns a BASH

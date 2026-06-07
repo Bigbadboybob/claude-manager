@@ -1217,6 +1217,21 @@ impl PendingSession {
         // the var were unset.
         cmd.env("CM_OPERATOR_TOKEN", "");
         cmd.env("CM_DAEMON_TOKEN", "");
+        // P-1: workflow context vars are PARTICIPANT-ONLY. A genuine workflow
+        // participant gets `CM_WORKFLOW_RUN_ID` / `CM_ROLE` via `params.env`
+        // (set in the loop above). Every OTHER daemon-spawned session must NOT
+        // carry them — and crucially must not INHERIT a stale value from the
+        // daemon process's own env (e.g. a `cm-daemon` launched from inside a
+        // workflow participant's shell, or a test runner that is itself a
+        // workflow session). Without this strip such a non-participant child
+        // would advertise a run it isn't part of. `env_remove` (not `env(k,"")`)
+        // so the key is truly absent, matching the participant-only contract.
+        // Mirrors the operator/daemon-token scrub directly above.
+        for key in ["CM_WORKFLOW_RUN_ID", "CM_ROLE"] {
+            if !params.env.contains_key(key) {
+                cmd.env_remove(key);
+            }
+        }
         if let Some(wd) = &params.working_dir {
             cmd.cwd(wd);
         }

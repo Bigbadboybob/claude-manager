@@ -558,15 +558,13 @@ def start_workflow(
     task_id: str,
     workflow_name: str,
     goal: str = "",
-    role_sessions: dict[str, str] | None = None,
 ) -> dict:
     """Launch a workflow on a task you have authority over.
 
-    The caller is the orchestrator — NOT a participant. By default,
-    workflow participants are spawned as fresh sessions with their
-    TOML-declared engine. Pass `role_sessions` to bind specific roles
-    to existing sessions instead (only valid for `persistent`-context
-    roles; `fresh` roles must always spawn anew). Use
+    The caller is the orchestrator — NOT a participant. The daemon spawns
+    every workflow participant as a FRESH session with its TOML-declared
+    engine, writes the initial state, and drives the run to completion via
+    its poller (it keeps running even with no TUI attached). Use
     `get_workflow_state` and `read_session_output` to observe progress;
     the existing `workflow_transition` / `workflow_done` tools are for
     participants, not orchestrators.
@@ -576,13 +574,8 @@ def start_workflow(
             descendant in the parent_task_id tree.
         workflow_name: Workflow definition name (e.g. "feedback").
         goal: Optional initial goal string passed to the worker's
-            activation prompt template ({{ goal }}).
-        role_sessions: Optional map of role name → existing
-            `session_uid`. Each referenced session must live in the
-            target task's workspace and be in the caller's auth scope.
-            The role must be `persistent`-context and its declared
-            engine must match the session's engine. Roles not in this
-            map are spawned fresh as usual.
+            activation prompt template ({{ goal }}), or delivered verbatim
+            when the worker role has no activation_prompt.
 
     Returns: {"run_id": "<id>"}.
 
@@ -591,9 +584,15 @@ def start_workflow(
     params: dict = {"task_id": task_id, "workflow_name": workflow_name}
     if goal:
         params["goal"] = goal
-    if role_sessions:
-        params["role_sessions"] = role_sessions
-    return control_client.call("start_workflow", params)
+    # P-3c: the daemon serializes each participant's transcript-detector binding
+    # (the cross-bind fix), waiting up to ~20s/role before spawning the next, so
+    # a normal 3-role feedback launch can exceed the default 30s control_client
+    # timeout. Use the same generous budget the TUI uses (client_session.rs's
+    # START_WORKFLOW_RPC_READ_TIMEOUT = 150s) so the MCP launch path doesn't
+    # spuriously report a transport timeout while the daemon goes on to create
+    # the run (which would look like a failed launch + trigger duplicate
+    # retries). The daemon saves+broadcasts the run only on full success.
+    return control_client.call("start_workflow", params, timeout=150.0)
 
 
 @mcp.tool()

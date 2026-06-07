@@ -6773,7 +6773,10 @@ impl App {
             "send_input" => methods::send_input(self, caller, &req.params),
             "kill_session" => methods::kill_session(self, caller, &req.params),
             "start_session" => methods::start_session(self, caller, &req.params),
-            "start_workflow" => methods::start_workflow(self, caller, &req.params),
+            // Phase 4 §D: start_workflow relocated to the daemon socket; the TUI
+            // no longer launches workflows (the MCP tool + A-f both route to the
+            // daemon). The catch-all returns UnknownMethod if anything still
+            // dials the TUI for it.
             "stop_workflow" => methods::stop_workflow(self, caller, &req.params),
             "get_workflow_state" => methods::get_workflow_state(self, caller, &req.params),
             "list_workflows" => methods::list_workflows(self, caller, &req.params),
@@ -7114,19 +7117,17 @@ impl App {
                 crate::workflow_watch::WorkflowWatchEvent::Snapshot(run) => {
                     self.apply_workflow_watch_snapshot(run);
                 }
-                crate::workflow_watch::WorkflowWatchEvent::Event(event) => {
-                    // 11g-1: push the channel event into the per-run
-                    // buffer. File-tail in the controller's tick
-                    // remains the production source of truth through
-                    // 11g-1; the buffer populates in parallel so
-                    // 11g-2 can flip the controller to consume from
-                    // it. Per-run deque preserves the daemon's
-                    // broadcast order (= events.jsonl append order
-                    // by Option B post-fsync ordering).
-                    self.pending_workflow_events
-                        .entry(event.run_id.clone())
-                        .or_default()
-                        .push_back(event);
+                crate::workflow_watch::WorkflowWatchEvent::Event(_event) => {
+                    // P-A: the local controller that used to DRAIN
+                    // `pending_workflow_events` (its tick) was deleted for
+                    // criterion #5, so accumulating events here would grow an
+                    // unbounded buffer nothing reads. Run STATE now arrives
+                    // authoritatively via `Snapshot` frames
+                    // (`broadcast_changed_snapshots` on the daemon), which
+                    // already reflect every transition/done the events
+                    // describe. So an event is now purely a redraw nudge — we
+                    // do NOT buffer it. (The buffer helpers remain as tested
+                    // utilities but have no production producer.)
                     self.needs_redraw = true;
                 }
             }
@@ -7171,28 +7172,30 @@ impl App {
             .push_front(event);
     }
 
-    /// 11d: apply a snapshot frame from `events.subscribe`. The
-    /// daemon's `WorkflowRun` is authoritative for the post-
-    /// (re)subscribe view; the TUI's local state-machine driver
-    /// (controller) holds in-memory continuations the daemon
-    /// doesn't see (e.g. activation-prompt scheduling). The
-    /// conservative-merge rule: ONLY insert when local has no
-    /// entry; do NOT overwrite when both sides have one — the
-    /// local entry has already absorbed live diffs that the
-    /// daemon's snapshot may not reflect yet. This mirrors
-    /// 10e-c r1 F1's conservative-merge for manifest snapshots.
+    /// Apply a snapshot frame from `events.subscribe`. The daemon's
+    /// `WorkflowRun` is the AUTHORITATIVE source of run state — the TUI is a
+    /// pure observer (Phase 4 §E; the local state-machine controller was
+    /// deleted for criterion #5).
+    ///
+    /// **P-A (criterion #4):** this UPDATES an existing run, it does not just
+    /// insert-when-absent. The old conservative-merge ("never overwrite; the
+    /// local entry already absorbed live diffs the controller holds") was
+    /// correct only while the TUI drove runs locally. With the controller gone
+    /// the TUI holds NO live diffs the daemon doesn't, so refusing to overwrite
+    /// froze every run at its creation snapshot — active_role, history, and
+    /// terminal status never advanced without a reconnect. The daemon poller
+    /// broadcasts a fresh snapshot on every state change
+    /// (`broadcast_changed_snapshots`), so adopting it wholesale is how
+    /// progress renders "from broadcasts alone."
     pub(crate) fn apply_workflow_watch_snapshot(
         &mut self,
         run: cm_daemon::workflow::run::WorkflowRun,
     ) {
-        let already_present = self
-            .workflow_runs
-            .iter()
-            .any(|r| r.run_id == run.run_id);
-        if !already_present {
-            self.workflow_runs.push(run);
-            self.needs_redraw = true;
+        match self.workflow_runs.iter_mut().find(|r| r.run_id == run.run_id) {
+            Some(slot) => *slot = run,
+            None => self.workflow_runs.push(run),
         }
+        self.needs_redraw = true;
     }
 
     /// 10e-c r1 F1: apply a post-(re)connect snapshot.
@@ -7320,14 +7323,161 @@ impl App {
                 // hasn't loaded; future divergence cases). No
                 // panic, no log, no toast.
             }
-            ManifestDiff::Added { .. }
-            | ManifestDiff::Updated { .. }
-            | ManifestDiff::Tombstoned { .. } => {
-                // 10e-c scope: only Exited carries the named-
-                // criterion field (memory_cap_kill). Other
-                // variants land in future slices' consumers.
+            ManifestDiff::Added { uid, entry }
+            | ManifestDiff::Updated { uid, entry } => {
+                // Option B (criterion #4): adopt daemon-launched WORKFLOW
+                // PARTICIPANTS into the sidebar from broadcasts. The helper is
+                // deliberately scoped to entries carrying `workflow_run_id` —
+                // those are daemon-created in Phase 4 and have NO locally-built
+                // TerminalSession, so adopting them can't duplicate or race the
+                // TUI-local row creation that A-n/A-s/mcp_start_session use.
+                // Non-workflow daemon sessions keep their existing behavior
+                // (the broader manifest-sync consumer stays deferred — 10e-d/10f).
+                self.adopt_daemon_workflow_participant(&uid, &entry);
+            }
+            ManifestDiff::Tombstoned { .. } => {
+                // Session removal reaches the TUI via `Exited` (and the
+                // attach-stream teardown); tombstone is a no-op here.
             }
         }
+    }
+
+    /// Option B (criterion #4): adopt a daemon-launched workflow PARTICIPANT
+    /// into `workspaces[*].sessions` from a manifest `Added`/`Updated`
+    /// broadcast, so it renders as a selectable + attachable row under its
+    /// workflow header without a reconnect. Bounded + safe:
+    ///   - Only entries with a `workflow_run_id` are adopted (Phase-4 daemon
+    ///     participants; the TUI never builds these locally, so no dup/race).
+    ///   - R5: an untracked workspace is a silent no-op.
+    ///   - Idempotent: a uid already present is a no-op (covers duplicate Added
+    ///     / Updated diffs).
+    ///   - Attaches to the LOCAL daemon's existing PTY by uid (the A-f / MCP
+    ///     launch + acceptance case); a failed attach logs and skips rather than
+    ///     panicking, so a headless / racing teardown can't crash the observer.
+    pub(crate) fn adopt_daemon_workflow_participant(
+        &mut self,
+        uid: &str,
+        entry: &serde_json::Value,
+    ) {
+        let run_id = match entry.get("workflow_run_id").and_then(|v| v.as_str()) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => return, // not a workflow participant — leave to existing paths
+        };
+        let ws_id = match entry.get("workspace_id").and_then(|v| v.as_str()) {
+            Some(w) if !w.is_empty() => w.to_string(),
+            _ => return,
+        };
+        let role = entry
+            .get("workflow_role")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let label = entry
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("participant")
+            .to_string();
+        let session_type = entry
+            .get("session_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("claude-code")
+            .to_string();
+        let task_id = entry
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // R5: untracked workspace → silent no-op.
+        let ws_idx = match self.workspaces.iter().position(|w| w.id == ws_id) {
+            Some(i) => i,
+            None => return,
+        };
+        // Idempotent: already present → no-op (duplicate Added / an Updated for
+        // a row we already adopted).
+        if self.workspaces[ws_idx].sessions.iter().any(|s| s.uid == uid) {
+            return;
+        }
+
+        // TODO(Phase 5 — remote enablement on cm-manager): adoption is
+        // hard-coded to the LOCAL host. The per-host manifest-watch consumer
+        // thread knows which host produced this diff (`spawn_per_host`'s
+        // `host.id`), but `ManifestEvent::Diff` doesn't yet carry it, so a
+        // workflow launched on a REMOTE active host would try to attach the
+        // remote uid on the local daemon, fail, and skip the row (the run still
+        // completes headlessly — the observer just lacks panes). Threading the
+        // producing host id through the manifest event (and using it for both
+        // `host_pool.for_host` and `ts.host_id`) is the clean fix; it's deferred
+        // to Phase 5 (the doc scopes remote enablement there) rather than
+        // half-wiring the host plane now. The local path — default mode, and
+        // what criterion #4 + the tests exercise — is correct.
+        let host_id = cm_daemon::host_id::HostId::local();
+        let socket = match self
+            .host_pool
+            .for_host(&host_id)
+            .ok()
+            .and_then(|h| h.socket_path())
+        {
+            Some(s) => s,
+            None => return,
+        };
+        let (cols, rows) = self.last_term_size;
+        let worktree = self.workspaces[ws_idx].worktree_path.clone();
+        let working_dir: &Path = worktree.as_deref().unwrap_or_else(|| Path::new("/"));
+
+        let config = crate::client_session::ClientSessionConfig {
+            daemon_socket: &socket,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid,
+            workspace_id: &ws_id,
+            label: &label,
+            session_type: &session_type,
+            // attach_existing ignores argv/env — the daemon already owns the PTY.
+            argv: &[],
+            working_dir,
+            env: std::collections::BTreeMap::new(),
+            cols,
+            rows,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: worktree.as_deref(),
+            task_id: task_id.as_deref(),
+            transcript_path: None,
+            workflow_run_id: Some(run_id.as_str()),
+            workflow_role: role.as_deref(),
+        };
+        let session = match crate::session::Session::new_attached_existing(config) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: failed to adopt workflow participant {} ({}): {} \
+                     — skipping row (will appear on next reconnect)",
+                    uid, label, e
+                );
+                return;
+            }
+        };
+        // The `entry`/config carry the daemon WIRE type ("claude-code"), but the
+        // TerminalSession stores the INTERNAL vocabulary ("claude"/"codex"/"bash")
+        // that the rest of the TUI matches on (transcript handling, type-specific
+        // rendering). Normalize before storing — otherwise an adopted Claude row
+        // is mislabeled "claude-code" and every `"claude"` match misses it, so
+        // the sidebar does NOT render correctly. Same mapping the normal spawn
+        // path applies.
+        let internal_type = normalize_session_type_to_internal(&session_type).to_string();
+        let mut ts = make_simple_session_with_uid(
+            uid.to_string(),
+            &label,
+            &internal_type,
+            session,
+            None,
+        );
+        ts.workflow_run_id = Some(run_id);
+        ts.workflow_role = role;
+        ts.task_id = task_id;
+        ts.host_id = host_id;
+        self.workspaces[ws_idx].sessions.push(ts);
+        self.needs_redraw = true;
     }
 
     pub fn drain_planning_events(&mut self) {
@@ -8676,7 +8826,7 @@ impl App {
             SubmitAction::LaunchWorkflow {
                 ws_index,
                 workflow_name,
-                slots,
+                slots: _slots,
                 goal,
                 cursor_task_id,
             } => {
@@ -8692,10 +8842,14 @@ impl App {
                 // inheritance fallback still applies (Issue I
                 // completes the Issue G threading for the UI
                 // path).
-                self.launch_workflow(
+                // Phase 4 §D/§E: A-f launches through the daemon's
+                // `start_workflow` RPC (same path as the MCP tool). The daemon
+                // spawns the participants, writes state.json, and drives the run
+                // headlessly; the TUI observes it via `workflow_watch` /
+                // `manifest.watch`. The TUI no longer spawns or drives locally.
+                self.launch_workflow_via_daemon(
                     ws_index,
                     &workflow_name,
-                    slots,
                     goal,
                     cursor_task_id,
                 );
@@ -12330,47 +12484,20 @@ impl App {
             return;
         };
 
-        let ws = &self.workspaces[wi];
+        // Phase 4 §D (P-C): the daemon spawns every participant FRESH with its
+        // TOML-declared engine and does NOT honor existing-session or alternate-
+        // engine selection. So we no longer present a chooser — each role gets a
+        // single fixed fresh slot (its TOML engine). The modal shows the roles
+        // informationally; `focused_si` (the old focused-session-as-worker
+        // binding) is intentionally ignored.
+        let _ = focused_si;
         let mut slots = Vec::new();
-        for (idx, role_name) in wf.role_order.iter().enumerate() {
+        for role_name in wf.role_order.iter() {
             let role = &wf.roles[role_name];
-            let is_fresh = matches!(role.context, workflow::toml_schema::Context::Fresh);
-
-            let mut options: Vec<WorkflowSlotSource> = Vec::new();
-            if !is_fresh {
-                for si in 0..ws.sessions.len() {
-                    let ts = &ws.sessions[si];
-                    if ts.workflow_run_id.is_some() {
-                        continue;
-                    }
-                    options.push(WorkflowSlotSource::Existing(si));
-                }
-            }
-            options.push(WorkflowSlotSource::New(Engine::ClaudeCode));
-            options.push(WorkflowSlotSource::New(Engine::Codex));
-
-            let initial = if idx == 0
-                && focused_si.is_some()
-                && !is_fresh
-                && options
-                    .iter()
-                    .any(|o| matches!(o, WorkflowSlotSource::Existing(si) if Some(*si) == focused_si))
-            {
-                options
-                    .iter()
-                    .position(|o| matches!(o, WorkflowSlotSource::Existing(si) if Some(*si) == focused_si))
-                    .unwrap()
-            } else {
-                options
-                    .iter()
-                    .position(|o| matches!(o, WorkflowSlotSource::New(e) if *e == role.engine))
-                    .unwrap_or(options.len() - 1)
-            };
-
             slots.push(WorkflowSlotChoice {
                 role: role_name.clone(),
-                options,
-                option_index: initial,
+                options: vec![WorkflowSlotSource::New(role.engine.clone())],
+                option_index: 0,
             });
         }
         self.input_mode = InputMode::WorkflowLaunchConfirm {
@@ -12391,209 +12518,60 @@ impl App {
     ///
     /// migrate-tui-local Issue G: `launching_task_id` is the task
     /// the workflow descends from. UI `A-f` launches pass `None`
-    /// (workspace-scope); `start_workflow_run` passes the MCP-
-    /// supplied task. The controller threads this into
-    /// `spawn_workflow_session` so the daemon records
-    /// `DaemonSession.task_id` for fresh participants.
-    fn launch_workflow(
-        &mut self,
-        ws_index: usize,
-        workflow_name: &str,
-        slots: Vec<WorkflowSlotChoice>,
-        goal: Option<String>,
-        launching_task_id: Option<String>,
-    ) {
-        self.run_workflow_controller(move |ctx| {
-            ctx.launch_workflow(ws_index, workflow_name, slots, goal, launching_task_id)
-        });
-    }
-
-    /// Programmatic workflow launch used by the `start_workflow` MCP
-    /// tool. Builds default slots (all roles get a freshly-spawned
-    /// session per their TOML-declared engine) and routes through the
-    /// existing `launch_workflow` UI path. Returns the new run's id.
-    ///
-    /// The MCP path differs from the UI path in two important ways:
-    ///   1. The agent provides the target `task_id`; we set it on the
-    ///      new `WorkflowRun` so descendant auth (in `methods.rs`) can
-    ///      evaluate against a real task id rather than the workflow's
-    ///      `task_key` (which is a workspace key, not a task id).
-    ///   2. All slots are fresh-new, so participants would otherwise
-    ///      have `task_id: None`. We override each participant's task
-    ///      binding to match the launching task — without this, every
-    ///      session-management call from the launching agent (list,
-    ///      read_session_output, send_input, kill) would fail the
-    ///      descendant check on participants and return unauthorized.
-    pub fn start_workflow_run(
+    /// Phase 4 §D/§E: launch a workflow through the daemon. Resolves the focused
+    /// workspace's worktree + the active host's daemon socket, then calls the
+    /// daemon `start_workflow` RPC (the daemon spawns participants, writes
+    /// state.json, and drives the run). The TUI observes the result via
+    /// `workflow_watch` / `manifest.watch` — it does not spawn or drive locally.
+    pub(crate) fn launch_workflow_via_daemon(
         &mut self,
         ws_index: usize,
         workflow_name: &str,
         goal: Option<String>,
         task_id: Option<String>,
-        existing_role_sessions: std::collections::BTreeMap<String, usize>,
-    ) -> Result<String, String> {
-        let wf = self
-            .workflows
-            .get(workflow_name)
-            .cloned()
-            .ok_or_else(|| format!("workflow not found: {}", workflow_name))?;
-        if ws_index >= self.workspaces.len() {
-            return Err(format!("workspace index {} out of range", ws_index));
-        }
-        // Reject any role name in existing_role_sessions that isn't a
-        // role of this workflow — surfaces typos at the MCP boundary
-        // instead of silently falling back to a fresh spawn.
-        for role in existing_role_sessions.keys() {
-            if !wf.roles.contains_key(role) {
-                return Err(format!(
-                    "role '{}' is not declared in workflow '{}'",
-                    role, workflow_name
-                ));
-            }
-        }
-        let slots: Vec<WorkflowSlotChoice> = wf
-            .role_order
-            .iter()
-            .filter_map(|role_name| {
-                let role = wf.roles.get(role_name)?;
-                let source = match existing_role_sessions.get(role_name) {
-                    Some(si) => WorkflowSlotSource::Existing(*si),
-                    None => WorkflowSlotSource::New(role.engine.clone()),
-                };
-                Some(WorkflowSlotChoice {
-                    role: role_name.clone(),
-                    options: vec![source],
-                    option_index: 0,
-                })
-            })
-            .collect();
-        if slots.is_empty() {
-            return Err("workflow has no roles".into());
-        }
-        let count_before = self.workflow_runs.len();
-        // migrate-tui-local Issue G: thread the launching
-        // task_id into launch_workflow so the controller's
-        // `spawn_workflow_session` can pass it down to the
-        // daemon helper. Pre-fix the daemon recorded
-        // `DaemonSession.task_id = None` for fresh participants;
-        // the launching agent's descendant-scope auth then
-        // rejected `list_sessions` / `read_session_output` /
-        // `send_input` against them.
-        self.launch_workflow(ws_index, workflow_name, slots, goal, task_id.clone());
-        if self.workflow_runs.len() == count_before {
-            return Err(self
-                .status_msg
-                .as_ref()
-                .map(|(s, _)| s.clone())
-                .unwrap_or_else(|| "launch failed".into()));
-        }
-        // Pull the run we just pushed and stamp it with the launching
-        // task_id. Same-pass: also bind every participant session in
-        // this run to that task. Both are required for downstream
-        // descendant auth.
-        //
-        // migrate-tui-local Issue G note: the fresh-participant
-        // case is now covered at spawn time — `task_id` was
-        // threaded into `launch_workflow` → controller →
-        // `spawn_workflow_session` → daemon `start_session`, so
-        // `DaemonSession.task_id` is recorded BEFORE the launching
-        // agent's next auth check. The loop below is still
-        // load-bearing for two cases the spawn-time path can't
-        // reach:
-        //   1. The `WorkflowRun.task_id` field on the run row
-        //      (workflow-level, not session-level).
-        //   2. Existing-slot participants — they were daemon-
-        //      spawned earlier (A-n/A-s) with whatever their
-        //      original task_id was. The loop overrides their
-        //      `TerminalSession.task_id` to the launching task
-        //      for sidebar grouping. The daemon-side
-        //      `DaemonSession.task_id` for those existing
-        //      participants stays at its original value — that's
-        //      a pre-existing TUI/daemon divergence; no `set_task_id`
-        //      RPC exists today.
-        let run_idx = self.workflow_runs.len() - 1;
-        let run_id = self.workflow_runs[run_idx].run_id.clone();
-        if let Some(tid) = task_id.as_deref() {
-            self.workflow_runs[run_idx].task_id = Some(tid.to_string());
-            // Walk every workspace + session; tag participants of this
-            // run so they descend from the launching task.
-            for ws in &mut self.workspaces {
-                for ts in &mut ws.sessions {
-                    if ts.workflow_run_id.as_deref() == Some(run_id.as_str()) {
-                        ts.task_id = Some(tid.to_string());
-                    }
-                }
-            }
-            // 10d-2c-1 review round-6 (F1): targeted modify so a
-            // race with a daemon-side transition mutation can't
-            // clobber the daemon's active_role / iteration
-            // advance. TUI is authoritative for task_id binding;
-            // daemon doesn't touch it.
-            let tid_owned = tid.to_string();
-            let updated = workflow::run::modify(&run_id, move |r| {
-                r.task_id = Some(tid_owned);
-            });
-            if let Ok(updated) = updated {
-                self.workflow_runs[run_idx] = updated;
-            }
-            self.save_session_manifest();
-        }
-
-        // Deliver the initial activation prompt. `launch_workflow`
-        // creates the run + spawns participant sessions but never
-        // queues an initial prompt — that's by design for UI launches,
-        // where the user types into the worker themselves. For MCP
-        // launches there's no human typing, so without this the worker
-        // sits idle, the on_idle gate never fires, and the workflow
-        // does nothing.
-        //
-        // Strategy: prefer the initial role's `activation_prompt`
-        // template (rendered with the workflow context, including
-        // `{{ goal }}`) if defined. Otherwise deliver `goal` directly
-        // as the worker's first user turn — both shipped workflows
-        // (feedback, review) leave the initial role's
-        // `activation_prompt` unset because they expect the user to
-        // type the goal in.
-        if let Some(initial_role) = self.workflow_runs[run_idx].active_role.clone() {
-            self.deliver_initial_workflow_prompt(&run_id, &initial_role, ws_index);
-        }
-        Ok(run_id)
-    }
-
-    /// Build a `WorkflowControllerCtx` borrowing this `App`'s workflow
-    /// state, run a controller method via `f`, then dispatch the
-    /// returned actions back through `App` (status bar, manifest
-    /// persistence). Borrows split here so the closure has a `&mut`
-    /// view of just the controller-relevant fields; status_msg and
-    /// manifest writes happen on the App after the borrow ends.
-    fn run_workflow_controller<F>(&mut self, f: F)
-    where
-        F: FnOnce(&mut workflow::controller::WorkflowControllerCtx<'_>) -> Vec<workflow::controller::WorkflowAction>,
-    {
-        let last_term_size = self.last_term_size;
-        let actions = {
-            // 12e-r3 F1: snapshot active_host before building
-            // the ctx — same snapshot-once-at-top pattern as
-            // the other A-* user-action handlers. The
-            // controller uses this for fresh-slot workflow
-            // participant spawns.
-            let active_host = self.active_host.clone();
-            let mut ctx = workflow::controller::WorkflowControllerCtx {
-                workflow_runs: &mut self.workflow_runs,
-                workspaces: &mut self.workspaces,
-                workflows: &self.workflows,
-                last_term_size,
-                config: &self.config,
-                cap_status: &self.memory_cap_status,
-                kill_tx: &self.memory_kill_tx,
-                pending_workflow_events: &mut self.pending_workflow_events,
-                host_pool: &self.host_pool,
-                active_host,
-            };
-            f(&mut ctx)
+    ) {
+        let Some(ws) = self.workspaces.get(ws_index) else {
+            self.set_status_msg("launch: invalid workspace");
+            return;
         };
-        self.apply_workflow_actions(actions);
+        let workspace_id = ws.id.clone();
+        let Some(worktree) = ws.worktree_path.as_ref().map(|p| p.display().to_string())
+        else {
+            self.set_status_msg("launch: workspace has no worktree");
+            return;
+        };
+        let host_id = self.active_host.clone();
+        let daemon_socket = match self.host_pool.for_host(&host_id) {
+            Ok(h) => match h.socket_path() {
+                Some(p) => p,
+                None => {
+                    self.set_status_msg("launch: daemon has no socket path");
+                    return;
+                }
+            },
+            Err(e) => {
+                self.set_status_msg(&format!("launch: daemon unavailable: {e}"));
+                return;
+            }
+        };
+        match crate::client_session::rpc_start_workflow(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            workflow_name,
+            &worktree,
+            &workspace_id,
+            goal.as_deref(),
+            task_id.as_deref(),
+        ) {
+            Ok(run_id) => {
+                self.set_status_msg(&format!("Launched {} ({})", workflow_name, run_id))
+            }
+            Err(e) => self.set_status_msg(&format!("launch failed: {e}")),
+        }
     }
+
+
+
 
     /// Apply each `WorkflowAction` the controller emitted. One arm per
     /// variant — same one-line dispatcher pattern F4's
@@ -12611,20 +12589,6 @@ impl App {
         }
     }
 
-    /// Deliver the very first activation prompt to the initial role's
-    /// session in a freshly-launched workflow. Called only by the MCP
-    /// launch path (`start_workflow_run`); UI launches don't need this
-    /// because the user types directly into the session.
-    fn deliver_initial_workflow_prompt(
-        &mut self,
-        run_id: &str,
-        role_name: &str,
-        ws_index: usize,
-    ) {
-        self.run_workflow_controller(|ctx| {
-            ctx.deliver_initial_workflow_prompt(run_id, role_name, ws_index)
-        });
-    }
 
     /// Called once per main loop iteration. Drives transitions for each
     /// active workflow run. Real implementation lives in
@@ -12632,30 +12596,11 @@ impl App {
     /// thin dispatcher: build the controller's reference bag, run it,
     /// apply the resulting actions.
     pub fn tick_workflows(&mut self) {
-        // Run the controller FIRST so daemon-written events
-        // (workflow_done, workflow_transition) are consumed and
-        // their effects (events_offset advance, history append)
-        // are persisted to state.json before reconcile drops the
-        // run.
-        //
-        // 10d-3 r1 round-2 ordering fix: an earlier draft ran
-        // reconcile pre-tick on the theory that "controller
-        // shouldn't tick on corpses." That was eager for Done
-        // runs — the controller needs to consume the
-        // `workflow_done` event from events.jsonl and advance
-        // events_offset before cleanup removes the run; otherwise
-        // the daemon's workflow_done is silently dropped on the
-        // floor. The controller already filters non-Running runs
-        // in its own decision logic, so the "wasted tick on a
-        // Detached run" cost is one disk read + a status check —
-        // negligible compared to losing events.
-        //
-        // Detached / missing runs: no event to drain — cleanup
-        //   simply removes them.
-        // Done runs: controller drains workflow_done → state.json
-        //   reflects offset advance → reconcile then removes the
-        //   in-mem run.
-        self.run_workflow_controller(|ctx| ctx.tick());
+        // Phase 4 §E: the TUI is a pure OBSERVER — the daemon poller drives every
+        // run (decisions, delivery, history append). The TUI no longer ticks a
+        // controller; run state arrives via `workflow_watch` (events.subscribe +
+        // state.json reload). This pass only reconciles stopped/finished runs
+        // out of the in-memory observer view.
         self.reconcile_stopped_workflow_runs();
     }
 
@@ -15801,46 +15746,418 @@ mod pending_workflow_events_tests {
     /// helpers above (T_g1b/T_g1d) cover the take/requeue
     /// halves.
     ///
-    /// Mutation-verifiable: remove the `push_back` call in the
-    /// drain's Event arm and this test fails (buffer stays
-    /// empty after drain).
+    /// P-A: an incoming `Event` is now a redraw nudge ONLY — it must NOT
+    /// accumulate into `pending_workflow_events`. The local controller that
+    /// used to drain that buffer was deleted for criterion #5, so buffering
+    /// here would grow unbounded with nothing reading it. Run STATE arrives via
+    /// `Snapshot` frames instead (see
+    /// `apply_workflow_watch_snapshot_updates_existing_run`).
     #[test]
-    fn drain_workflow_watch_events_pushes_into_per_run_buffer() {
+    fn drain_workflow_watch_events_does_not_buffer_events() {
         let mut app = build_app_for_buffer_tests();
         let (tx, rx) = std::sync::mpsc::channel::<
             crate::workflow_watch::WorkflowWatchEvent,
         >();
-        // Replace the real receiver. Drop the production one
-        // (its consumer thread keeps running but feeds nothing).
         app.workflow_watch_rx = Some(rx);
 
         let run_id = "wf_g1f";
-        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
-            make_event("ev-1", run_id),
-        ))
-        .expect("send 1");
-        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
-            make_event("ev-2", run_id),
-        ))
-        .expect("send 2");
-        tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
-            make_event("ev-3", run_id),
-        ))
-        .expect("send 3");
+        for id in ["ev-1", "ev-2", "ev-3"] {
+            tx.send(crate::workflow_watch::WorkflowWatchEvent::Event(
+                make_event(id, run_id),
+            ))
+            .expect("send");
+        }
 
         app.drain_workflow_watch_events();
 
-        let drained = app.take_pending_workflow_events(run_id);
-        let ids: Vec<&str> = drained.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["ev-1", "ev-2", "ev-3"],
-            "drain must populate the per-run buffer in send order",
+        assert!(
+            app.take_pending_workflow_events(run_id).is_empty(),
+            "Events must NOT be buffered now that nothing drains them",
         );
         assert!(
             app.needs_redraw,
-            "drain must set needs_redraw on each Event",
+            "drain still sets needs_redraw on each Event",
         );
+    }
+
+    /// P-A (criterion #4) — the decisive regression test. A run ALREADY in
+    /// `self.workflow_runs` must have its `active_role`, `history`, and terminal
+    /// `status` UPDATED from a later snapshot. Before the fix
+    /// `apply_workflow_watch_snapshot` refused to overwrite an existing run
+    /// (the stale "controller absorbed live diffs" rule), so a daemon-driven
+    /// run stayed frozen at its creation snapshot — failing "sidebar + history
+    /// render correctly from broadcasts alone." This test FAILS against the old
+    /// insert-only body and passes against the overwrite body.
+    #[test]
+    fn apply_workflow_watch_snapshot_updates_existing_run() {
+        use std::collections::BTreeMap;
+        let mut app = build_app_for_buffer_tests();
+
+        let run_id = "wf_obs";
+        // Creation snapshot: active worker, single seeded history entry, Running.
+        let initial = cm_daemon::workflow::run::WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".into(),
+            "ws-1".into(),
+            BTreeMap::new(),
+            "worker".into(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            0,
+        );
+        let initial_history_len = initial.history.len();
+        app.apply_workflow_watch_snapshot(initial.clone());
+        assert_eq!(app.workflow_runs.len(), 1, "creation snapshot inserts");
+        assert_eq!(app.workflow_runs[0].active_role.as_deref(), Some("worker"));
+
+        // A LATER snapshot: workflow advanced to manager, history grew, Done.
+        let mut later = initial;
+        later.active_role = Some("manager".into());
+        later.status = cm_daemon::workflow::RunStatus::Done;
+        // Append a couple of history entries (clone the seeded one to keep the
+        // shape valid without hand-building HistoryEntry fields).
+        let extra = later.history[0].clone();
+        later.history.push(extra.clone());
+        later.history.push(extra);
+
+        app.apply_workflow_watch_snapshot(later);
+
+        assert_eq!(app.workflow_runs.len(), 1, "same run_id updates in place, no dup");
+        let r = &app.workflow_runs[0];
+        assert_eq!(
+            r.active_role.as_deref(),
+            Some("manager"),
+            "active_role must advance from the later snapshot",
+        );
+        assert!(
+            matches!(r.status, cm_daemon::workflow::RunStatus::Done),
+            "terminal status must render from the later snapshot",
+        );
+        assert_eq!(
+            r.history.len(),
+            initial_history_len + 2,
+            "history growth must render from the later snapshot",
+        );
+    }
+
+    /// P-A end-to-end OBSERVER test (the verification gap the reviewer called
+    /// out): an open TUI consuming the broadcast plane via the REAL
+    /// `drain_workflow_watch_events` path must see a daemon-driven run advance
+    /// worker -> reviewer -> manager to completion — active_role transitions,
+    /// history grows, terminal status renders — WITHOUT a reconnect. This is
+    /// the TUI half of "render correctly from broadcasts alone"; the daemon
+    /// half (the poller pushing a fresh snapshot on each change) is
+    /// `broadcast_snapshot_reaches_existing_subscriber_with_full_run` +
+    /// `broadcast_changed_snapshots` in cm-daemon. Each stage arrives as a
+    /// `Snapshot` frame on the watch channel, exactly as the daemon emits.
+    #[test]
+    fn observer_renders_full_workflow_advance_from_broadcast_snapshots() {
+        use std::collections::BTreeMap;
+        let mut app = build_app_for_buffer_tests();
+        let (tx, rx) = std::sync::mpsc::channel::<
+            crate::workflow_watch::WorkflowWatchEvent,
+        >();
+        app.workflow_watch_rx = Some(rx);
+
+        let run_id = "wf_adv";
+        let base = cm_daemon::workflow::run::WorkflowRun::new(
+            run_id.to_string(),
+            "feedback".into(),
+            "ws-1".into(),
+            BTreeMap::new(),
+            "worker".into(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            0,
+        );
+
+        // Helper: emit a snapshot of `base` mutated to a given (role, status,
+        // history_len), then drain the channel and return the observed run.
+        let send = |app: &mut App,
+                    tx: &std::sync::mpsc::Sender<crate::workflow_watch::WorkflowWatchEvent>,
+                    role: &str,
+                    status: cm_daemon::workflow::RunStatus,
+                    hist_len: usize| {
+            let mut snap = base.clone();
+            snap.active_role = Some(role.to_string());
+            snap.status = status;
+            while snap.history.len() < hist_len {
+                let e = snap.history[0].clone();
+                snap.history.push(e);
+            }
+            tx.send(crate::workflow_watch::WorkflowWatchEvent::Snapshot(snap))
+                .expect("send snapshot");
+            app.drain_workflow_watch_events();
+        };
+
+        use cm_daemon::workflow::RunStatus;
+
+        // Stage 1: creation — worker active, Running.
+        send(&mut app, &tx, "worker", RunStatus::Running, 1);
+        assert_eq!(app.workflow_runs.len(), 1);
+        assert_eq!(app.workflow_runs[0].active_role.as_deref(), Some("worker"));
+        assert!(matches!(app.workflow_runs[0].status, RunStatus::Running));
+
+        // Stage 2: worker -> reviewer, history grew.
+        send(&mut app, &tx, "reviewer", RunStatus::Running, 2);
+        assert_eq!(app.workflow_runs.len(), 1, "no duplicate run");
+        assert_eq!(app.workflow_runs[0].active_role.as_deref(), Some("reviewer"));
+        assert_eq!(app.workflow_runs[0].history.len(), 2);
+
+        // Stage 3: reviewer -> manager.
+        send(&mut app, &tx, "manager", RunStatus::Running, 3);
+        assert_eq!(app.workflow_runs[0].active_role.as_deref(), Some("manager"));
+        assert_eq!(app.workflow_runs[0].history.len(), 3);
+
+        // Stage 4: completion — terminal status renders.
+        send(&mut app, &tx, "manager", RunStatus::Done, 3);
+        assert!(
+            matches!(app.workflow_runs[0].status, RunStatus::Done),
+            "terminal Done must render from the final broadcast",
+        );
+    }
+
+    fn test_workspace(id: &str, worktree: std::path::PathBuf) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(worktree),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: Vec::new(),
+            tombstones: Vec::new(),
+            is_pushing: false,
+        }
+    }
+
+    /// Option B (criterion #4): the consumer's bounded-scope + safety guards,
+    /// all deterministic (no daemon). `adopt_daemon_workflow_participant` must:
+    /// (1) ignore non-workflow entries (no `workflow_run_id`) — those keep their
+    /// existing TUI-local / deferred-sync behavior; (2) no-op for an untracked
+    /// workspace (R5); (3) fail gracefully (no row, no panic) when the daemon
+    /// can't be attached. Together these prove the adopt arm can't duplicate
+    /// locally-created rows, can't crash the observer, and stays scoped.
+    #[test]
+    fn adopt_daemon_workflow_participant_guards() {
+        let mut app = build_app_for_buffer_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        app.workspaces.push(test_workspace("ws-g", tmp.path().to_path_buf()));
+
+        // (1) Non-workflow entry → no adoption.
+        app.adopt_daemon_workflow_participant(
+            "ts-a",
+            &serde_json::json!({"workspace_id": "ws-g", "session_type": "claude-code"}),
+        );
+        assert!(app.workspaces[0].sessions.is_empty(), "non-workflow entry must not adopt");
+
+        // (2) Workflow entry, UNTRACKED workspace → R5 no-op.
+        app.adopt_daemon_workflow_participant(
+            "ts-b",
+            &serde_json::json!({
+                "workspace_id": "ws-untracked", "workflow_run_id": "wf",
+                "workflow_role": "worker", "session_type": "claude-code"
+            }),
+        );
+        assert!(app.workspaces[0].sessions.is_empty(), "untracked workspace must no-op (R5)");
+
+        // (3) Workflow entry, tracked workspace, but no daemon to attach →
+        //     graceful (no row, no panic).
+        app.adopt_daemon_workflow_participant(
+            "ts-c",
+            &serde_json::json!({
+                "workspace_id": "ws-g", "workflow_run_id": "wf",
+                "workflow_role": "worker", "session_type": "claude-code"
+            }),
+        );
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "attach failure (no daemon) must be graceful — no row",
+        );
+    }
+
+    /// Option B (criterion #4) — the end-to-end proof the reviewer asked for: a
+    /// daemon-launched workflow PARTICIPANT appears as a selectable, attachable
+    /// session row under its workflow header purely from the manifest broadcast
+    /// stream (no manual refresh). Drives a REAL in-process daemon: spawn a
+    /// participant session, then feed the consumer the `Added` entry (the exact
+    /// shape `start_session` broadcasts) and assert a tagged row materializes.
+    /// Idempotent: a second identical `Added` does not duplicate.
+    #[test]
+    fn adopt_daemon_workflow_participant_renders_row_from_broadcast_e2e() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let sock = home.join(".cm/daemon.sock");
+
+        // In-process daemon on the App's default local socket path.
+        let mut state_inner = cm_daemon::state::DaemonState::new();
+        state_inner.attach_addr = sock.to_string_lossy().into_owned();
+        state_inner.workspaces.insert(
+            "ws-e2e".into(),
+            cm_daemon::manifest::ManifestWorkspace {
+                id: "ws-e2e".into(),
+                name: "e2e".into(),
+                is_closed: false,
+                is_cloud: false,
+                worktree_path: Some(wt.clone()),
+                main_repo_path: None,
+                repo_url: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let state = std::sync::Arc::new(std::sync::Mutex::new(state_inner));
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+        let dstate = state.clone();
+        let dstop = stop.clone();
+        let dhandle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let st = dstate.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            let req = match cm_daemon::control::wire::read_request(&mut stream) {
+                                Ok(Some(r)) => r,
+                                _ => return,
+                            };
+                            use cm_daemon::control::dispatch::DispatchOutcome::*;
+                            match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Done(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                                }
+                                AttachStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_attach_stream(&mut stream, st, handle);
+                                    }
+                                }
+                                ManifestWatchStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_manifest_watch_stream(&mut stream, handle);
+                                    }
+                                }
+                                EventsSubscribeStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_events_subscribe_stream(&mut stream, handle);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Build the App so its default host_pool dials `sock`. `CM_DAEMON_SOCKET`
+        // is read first by `default_socket_path` (ahead of HOME), so point it at
+        // the test socket; restore both afterward.
+        let orig_home = std::env::var_os("HOME");
+        let orig_sock = std::env::var_os("CM_DAEMON_SOCKET");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("CM_DAEMON_SOCKET", &sock);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces.push(test_workspace("ws-e2e", wt.clone()));
+
+        // Spawn a real participant session on the daemon (creates the uid the
+        // consumer will attach to).
+        let uid = new_session_uid();
+        let argv = vec!["/bin/bash".to_string()];
+        let cfg = crate::client_session::ClientSessionConfig {
+            daemon_socket: &sock,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid: &uid,
+            workspace_id: "ws-e2e",
+            label: "reviewer",
+            session_type: "claude-code",
+            argv: &argv,
+            working_dir: &wt,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: Some(&wt),
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: Some("wf_e2e"),
+            workflow_role: Some("reviewer"),
+        };
+        crate::client_session::rpc_start_session_full(&cfg).expect("daemon spawns participant");
+
+        // Feed the consumer the Added entry exactly as start_session broadcasts.
+        let entry = serde_json::json!({
+            "uid": uid,
+            "workspace_id": "ws-e2e",
+            "label": "reviewer",
+            "session_type": "claude-code",
+            "workflow_run_id": "wf_e2e",
+            "workflow_role": "reviewer",
+            "task_id": serde_json::Value::Null,
+        });
+        app.adopt_daemon_workflow_participant(&uid, &entry);
+        // Idempotent: a duplicate Added must not add a second row.
+        app.adopt_daemon_workflow_participant(&uid, &entry);
+
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-e2e").unwrap();
+        let rows: Vec<&TerminalSession> =
+            ws.sessions.iter().filter(|s| s.uid == uid).collect();
+        assert_eq!(rows.len(), 1, "exactly one participant row from the broadcast (idempotent)");
+        let row = rows[0];
+        assert_eq!(row.workflow_run_id.as_deref(), Some("wf_e2e"), "row tagged with its run");
+        assert_eq!(row.workflow_role.as_deref(), Some("reviewer"), "row tagged with its role");
+        // Must-fix #1: the wire type "claude-code" must be normalized to the
+        // INTERNAL "claude" on the row, or every `"claude"` match (transcript
+        // handling, type-specific rendering) misses it.
+        assert_eq!(
+            row.session_type, "claude",
+            "adopted claude-code participant must store internal type 'claude'",
+        );
+
+        // Cleanup.
+        let _ = crate::client_session::rpc_kill_session(&sock, crate::daemon_launch::operator_token(), &uid);
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match orig_sock {
+            Some(s) => unsafe { std::env::set_var("CM_DAEMON_SOCKET", s) },
+            None => unsafe { std::env::remove_var("CM_DAEMON_SOCKET") },
+        }
     }
 }
 
@@ -19896,96 +20213,6 @@ mod slice_12e_tests {
         drop(guard);
     }
 
-    /// 12e-r4 F1.3 (workflow fresh slot — interim fail-fast):
-    /// `spawn_workflow_session` is local-only at this slice.
-    /// When `active_host != HostId::local()`, the function
-    /// MUST return `None` (signaling spawn failure) with a
-    /// clear log message instead of silently spawning local
-    /// and tagging the session with the non-local
-    /// active_host. Pre-r4 the call tagged with active_host
-    /// while spawning local — every downstream per-session
-    /// RPC routed to a daemon that had no record of the UID.
-    ///
-    /// Real fix (deferred): route the spawn through
-    /// `try_spawn_via_daemon`. Structural pin below ensures
-    /// the interim guard stays in place; runtime check
-    /// exercises the actual fail-fast.
-    #[test]
-    fn workflow_fresh_slot_actually_spawns_on_active_host() {
-        let ctrl = include_str!("workflow/controller.rs");
-
-        // Locate spawn_workflow_session.
-        let sig = "fn spawn_workflow_session(";
-        let start = ctrl.find(sig).expect("must find sig");
-        let rest = &ctrl[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-
-        // migrate-tui-local: fresh-slot spawns now route
-        // through the daemon RPC (no more interim
-        // local-only fail-fast). The body MUST call the
-        // shared `try_spawn_via_daemon_with_deps` helper
-        // and tag the new TerminalSession with
-        // `self.active_host`.
-        assert!(
-            body.contains("try_spawn_via_daemon_with_deps("),
-            "spawn_workflow_session must call \
-             try_spawn_via_daemon_with_deps so the fresh \
-             participant is daemon-owned (migrate-tui-local); \
-             body:\n{}",
-            body,
-        );
-        assert!(
-            body.contains("host_id: self.active_host.clone()"),
-            "spawn_workflow_session MUST tag the new \
-             TerminalSession with `self.active_host.clone()` \
-             — same value used to dial the daemon — so per-\
-             session RPCs target the correct daemon; body:\n{}",
-            body,
-        );
-        // Regression pin: the pre-migrate fail-fast guard +
-        // mistagged HostId::local() literal MUST be gone.
-        assert!(
-            !body.contains("self.active_host != cm_daemon::host_id::HostId::local()"),
-            "migrate-tui-local removed the interim non-local \
-             fail-fast; body still contains it:\n{}",
-            body,
-        );
-        assert!(
-            !body.contains("host_id: cm_daemon::host_id::HostId::local()"),
-            "migrate-tui-local removed the literal \
-             HostId::local() tag (the spawn now routes to \
-             active_host); body:\n{}",
-            body,
-        );
-
-        // Ctx-field pin (the controller still carries
-        // active_host — the daemon-spawn helper reads it).
-        assert!(
-            ctrl.contains(
-                "pub active_host: cm_daemon::host_id::HostId",
-            ),
-            "WorkflowControllerCtx must continue to carry an \
-             active_host field — the daemon-spawn helper \
-             reads it",
-        );
-
-        // App-side caller still snapshots active_host before
-        // constructing the ctx (round-3 invariant).
-        let app = include_str!("app.rs");
-        assert!(
-            app.contains(
-                "// 12e-r3 F1: snapshot active_host before building\n            // the ctx",
-            ),
-            "App's launch_workflow path must snapshot \
-             active_host once before constructing the ctx",
-        );
-    }
 
     /// 12e-r4 F1.1 / 12e-r5 F2: `try_spawn_via_daemon` MUST
     /// accept the design-doc-correct wire vocabulary
@@ -21963,7 +22190,6 @@ mod migrate_tui_local_tests {
     #[test]
     fn t_migrate_local_only_paths_guard_active_host() {
         let app_src = include_str!("app.rs");
-        let ctrl_src = include_str!("workflow/controller.rs");
 
         // (source, function name, spawn-call needle, src for
         // error messages).
@@ -22015,36 +22241,8 @@ mod migrate_tui_local_tests {
             );
         }
 
-        // workflow/controller.rs: spawn_workflow_session.
-        let sig = "fn spawn_workflow_session(";
-        let start = ctrl_src.find(sig).expect("spawn_workflow_session must exist");
-        let rest = &ctrl_src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-        let guard_idx = body
-            .find("crate::app::guard_local_host_only(")
-            .expect(
-                "spawn_workflow_session MUST call \
-                 crate::app::guard_local_host_only — same helper \
-                 every other entry point uses, no hand-rolled \
-                 fail-fast (Issue C)",
-            );
-        let spawn_idx = body
-            .find("try_spawn_via_daemon_with_deps(")
-            .expect("spawn_workflow_session must call the helper");
-        assert!(
-            guard_idx < spawn_idx,
-            "controller's spawn_workflow_session: guard at byte {} \
-             MUST precede try_spawn_via_daemon_with_deps at byte \
-             {} (Issue C)",
-            guard_idx,
-            spawn_idx,
-        );
+        // Phase 4 §E: controller's spawn_workflow_session is deleted — the
+        // daemon spawns workflow participants now (see daemon start_workflow).
     }
 
     /// migrate-tui-local Issue D: when `spawn_restored_session`
@@ -22305,181 +22503,6 @@ mod migrate_tui_local_tests {
         );
     }
 
-    /// migrate-tui-local Issue G: fresh workflow participants are
-    /// now daemon-spawned. The daemon's descendant-scope auth
-    /// (`list_sessions` / `read_session_output` / `send_input` /
-    /// `workflow_transition`) consults `DaemonSession.task_id`,
-    /// so it MUST be recorded at spawn time — not patched
-    /// post-hoc on `TerminalSession` only.
-    ///
-    /// Required shape (Approach a — spawn-time threading):
-    ///   1. `controller::launch_workflow` accepts a
-    ///      `launching_task_id: Option<String>` argument.
-    ///   2. `controller::launch_workflow`'s `inherit_task_id`
-    ///      lets `launching_task_id` override the existing-slot
-    ///      fallback (so an all-fresh tasked launch carries the
-    ///      task scope down).
-    ///   3. `spawn_workflow_session` passes the resolved
-    ///      task_id to `try_spawn_via_daemon_with_deps` (already
-    ///      in place pre-migration; this pin keeps it in place).
-    ///   4. `App::launch_workflow` accepts + forwards the
-    ///      launching_task_id; `start_workflow_run` passes the
-    ///      MCP-supplied task_id through.
-    ///   5. The post-hoc retag at the App's `start_workflow_run`
-    ///      site stays (still load-bearing for the WorkflowRun
-    ///      row + existing-slot participants) and is documented
-    ///      with a comment explaining the TUI/daemon split.
-    #[test]
-    fn t_migrate_workflow_respawn_task_id_reaches_daemon() {
-        let app_src = include_str!("app.rs");
-        let ctrl_src = include_str!("workflow/controller.rs");
-
-        // 1. controller::launch_workflow signature has the new
-        // arg.
-        let ctrl_sig_idx = ctrl_src
-            .find("pub fn launch_workflow(")
-            .expect("controller::launch_workflow must exist");
-        let ctrl_rest = &ctrl_src[ctrl_sig_idx..];
-        let ctrl_body_open = ctrl_rest
-            .find('{')
-            .expect("launch_workflow body open brace");
-        let ctrl_header = &ctrl_rest[..ctrl_body_open];
-        assert!(
-            ctrl_header.contains("launching_task_id: Option<String>"),
-            "controller::launch_workflow MUST accept \
-             `launching_task_id: Option<String>` (Issue G); \
-             signature header:\n{}",
-            ctrl_header,
-        );
-
-        // 2. inherit_task_id uses launching_task_id as the
-        // override (launching beats inherit).
-        let ctrl_end = ctrl_rest[1..]
-            .find("\n    pub fn ")
-            .or_else(|| ctrl_rest[1..].find("\n    fn "))
-            .map(|i| 1 + i)
-            .unwrap_or(ctrl_rest.len());
-        let ctrl_body = &ctrl_rest[..ctrl_end];
-        assert!(
-            ctrl_body.contains("launching_task_id.clone().or_else("),
-            "controller::launch_workflow MUST let \
-             `launching_task_id` take precedence over the \
-             existing-slot inheritance (`launching_task_id.clone().or_else(...)`); \
-             body excerpt:\n{}",
-            &ctrl_body[..ctrl_body.len().min(2000)],
-        );
-
-        // 3. spawn_workflow_session forwards task_id to the
-        // daemon helper.
-        let spawn_idx = ctrl_src
-            .find("fn spawn_workflow_session(")
-            .expect("spawn_workflow_session must exist");
-        let spawn_rest = &ctrl_src[spawn_idx..];
-        let spawn_end = spawn_rest[1..]
-            .find("\n    fn ")
-            .or_else(|| spawn_rest[1..].find("\n    pub fn "))
-            .or_else(|| spawn_rest[1..].find("\n    pub(crate) fn "))
-            .map(|i| 1 + i)
-            .unwrap_or(spawn_rest.len());
-        let spawn_body = &spawn_rest[..spawn_end];
-        let helper_call_idx = spawn_body
-            .find("try_spawn_via_daemon_with_deps(")
-            .expect("spawn_workflow_session must call the helper");
-        // The helper's argv list contains task_id.as_deref().
-        // Slice from the call to its closing paren so we
-        // inspect the actual args.
-        let helper_call_end = spawn_body[helper_call_idx..]
-            .find(") {")
-            .map(|i| helper_call_idx + i)
-            .unwrap_or(spawn_body.len());
-        let helper_args = &spawn_body[helper_call_idx..helper_call_end];
-        assert!(
-            helper_args.contains("task_id.as_deref()"),
-            "spawn_workflow_session MUST pass \
-             `task_id.as_deref()` to try_spawn_via_daemon_with_deps \
-             so the daemon's DaemonSession.task_id is recorded \
-             at spawn time (Issue G); helper-args slice:\n{}",
-            helper_args,
-        );
-
-        // 4. App::launch_workflow accepts + forwards
-        // launching_task_id.
-        let app_sig_idx = app_src
-            .find("fn launch_workflow(\n        &mut self,")
-            .expect("App::launch_workflow must exist");
-        let app_rest = &app_src[app_sig_idx..];
-        let app_end = app_rest[1..]
-            .find("\n    fn ")
-            .or_else(|| app_rest[1..].find("\n    pub fn "))
-            .or_else(|| app_rest[1..].find("\n    pub(crate) fn "))
-            .map(|i| 1 + i)
-            .unwrap_or(app_rest.len());
-        let app_body = &app_rest[..app_end];
-        assert!(
-            app_body.contains("launching_task_id: Option<String>"),
-            "App::launch_workflow MUST accept \
-             `launching_task_id: Option<String>` (Issue G); \
-             body excerpt:\n{}",
-            app_body,
-        );
-        assert!(
-            app_body.contains(
-                "ctx.launch_workflow(ws_index, workflow_name, slots, goal, launching_task_id)",
-            ),
-            "App::launch_workflow MUST forward \
-             `launching_task_id` to the controller's \
-             launch_workflow (Issue G); body excerpt:\n{}",
-            app_body,
-        );
-
-        // start_workflow_run threads its task_id through.
-        let swr_idx = app_src
-            .find("pub fn start_workflow_run(")
-            .expect("start_workflow_run must exist");
-        let swr_rest = &app_src[swr_idx..];
-        let swr_end = swr_rest[1..]
-            .find("\n    pub fn ")
-            .or_else(|| swr_rest[1..].find("\n    fn "))
-            .or_else(|| swr_rest[1..].find("\n    pub(crate) fn "))
-            .map(|i| 1 + i)
-            .unwrap_or(swr_rest.len());
-        let swr_body = &swr_rest[..swr_end];
-        assert!(
-            swr_body.contains(
-                "self.launch_workflow(ws_index, workflow_name, slots, goal, task_id.clone())",
-            ),
-            "start_workflow_run MUST pass `task_id.clone()` to \
-             self.launch_workflow so the launching task scope \
-             reaches the controller (Issue G); body excerpt:\n{}",
-            &swr_body[..swr_body.len().min(2000)],
-        );
-
-        // migrate-tui-local Issue I supersedes the Issue G
-        // "UI passes None" pin: the UI launch now threads the
-        // cursor-captured task scope (`cursor_task_id`), which
-        // is `Some(_)` when the cursor was on a tasked session
-        // / Cursor::Task at A-f time, and `None` otherwise.
-        // Pin the variable-by-name presence in the handler.
-        assert!(
-            app_src.contains("cursor_task_id,\n                );"),
-            "the UI `SubmitAction::LaunchWorkflow` handler MUST \
-             pass `cursor_task_id` to self.launch_workflow \
-             (Issue I — completes the Issue G threading for the \
-             UI path)",
-        );
-
-        // 5. The post-hoc retag site is annotated with the
-        // TUI/daemon split rationale.
-        assert!(
-            swr_body.contains("migrate-tui-local Issue G note"),
-            "the post-hoc retag in start_workflow_run MUST \
-             carry an `Issue G note` comment documenting the \
-             TUI/daemon split (fresh participants covered at \
-             spawn, existing participants still TUI-only); \
-             body excerpt:\n{}",
-            &swr_body[..swr_body.len().min(2000)],
-        );
-    }
 
     /// migrate-tui-local Issue H: A-s spawns bash sessions
     /// daemon-owned, so the restore paths MUST also route bash
@@ -22722,15 +22745,16 @@ mod migrate_tui_local_tests {
              body:\n{}",
             handler_body,
         );
-        // The forward to self.launch_workflow MUST carry
-        // cursor_task_id (NOT a hardcoded None).
+        // Phase 4 §E: the handler routes to the daemon
+        // (`launch_workflow_via_daemon`) and MUST still forward
+        // `cursor_task_id` (NOT a hardcoded None).
         assert!(
             handler_body.contains(
-                "self.launch_workflow(\n                    ws_index,\n                    &workflow_name,\n                    slots,\n                    goal,\n                    cursor_task_id,",
+                "self.launch_workflow_via_daemon(\n                    ws_index,\n                    &workflow_name,\n                    goal,\n                    cursor_task_id,",
             ),
             "the SubmitAction::LaunchWorkflow handler MUST \
              forward `cursor_task_id` (NOT a hardcoded `None`) \
-             to self.launch_workflow (Issue I); handler \
+             to self.launch_workflow_via_daemon (Phase 4); handler \
              body:\n{}",
             handler_body,
         );
@@ -22738,13 +22762,12 @@ mod migrate_tui_local_tests {
         // Assemble the needle dynamically so the test file's
         // include_str!(...) read doesn't self-match the literal.
         let pre_fix_needle = format!(
-            "{}({}, &workflow_name, slots, goal, None)",
-            "self.launch_workflow", "ws_index",
+            "{}({}, &workflow_name, goal, None)",
+            "self.launch_workflow_via_daemon", "ws_index",
         );
         assert!(
             !src.contains(&pre_fix_needle),
-            "the pre-fix hardcoded-None call to \
-             self.launch_workflow MUST be removed (Issue I)",
+            "the pre-fix hardcoded-None call MUST be removed (Issue I / Phase 4)",
         );
 
         // SubmitAction::EnterWorkflowLaunchConfirm + LaunchWorkflow

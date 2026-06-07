@@ -241,7 +241,7 @@ pub fn handle_events_subscribe_stream(
     // Live loop with heartbeat-on-timeout.
     loop {
         match event_rx.recv_timeout(heartbeat_interval) {
-            Ok(event) => {
+            Ok(crate::workflow::events::WorkflowWatchMsg::Event(event)) => {
                 let payload = match serde_json::to_value(&event) {
                     Ok(v) => v,
                     Err(e) => {
@@ -262,6 +262,34 @@ pub fn handle_events_subscribe_stream(
                     eprintln!(
                         "cm-daemon: events.subscribe event write \
                          error: {} (client disconnected)",
+                        e,
+                    );
+                    return;
+                }
+            }
+            // P-3: a run-creation snapshot pushed mid-stream. Emit it as the
+            // same `WorkflowEventStateSnapshot` frame the initial subscription
+            // sends so the client folds the new run in without a reconnect.
+            Ok(crate::workflow::events::WorkflowWatchMsg::Snapshot(run)) => {
+                let payload = match serde_json::to_value(&*run) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "cm-daemon: events.subscribe snapshot serialize \
+                             failed: {} (run {:?}) — dropping subscriber",
+                            e, run.run_id,
+                        );
+                        return;
+                    }
+                };
+                let frame = StreamFrame::workflow_event_state_snapshot(
+                    request_id.clone(),
+                    payload,
+                );
+                if let Err(e) = wire::write_stream_frame(stream, &frame) {
+                    eprintln!(
+                        "cm-daemon: events.subscribe mid-stream snapshot \
+                         write error: {} (client disconnected)",
                         e,
                     );
                     return;
@@ -2931,7 +2959,8 @@ mod tests {
             .expect(
                 "subscribe-before-snapshot MUST deliver \
                  post-release broadcasts to the receiver",
-            );
+            )
+            .expect_event();
         assert_eq!(event.id, "e-post-release");
 
         match orig_home {

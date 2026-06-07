@@ -1021,7 +1021,29 @@ pub(crate) fn start_session_with_spawn_fn(
     // means session-removal paths don't need explicit cleanup.
     session.watcher_handle = watcher_handle;
     state.sessions.insert(session_uid.clone(), session);
+    // Option B (criterion #4): broadcast a manifest `Added` so live
+    // `manifest.watch` subscribers can render the new session — symmetric with
+    // the `Exited` broadcast in `handle_session_exit`. The TUI's consumer adopts
+    // workflow-participant rows from this (daemon-launched participants have no
+    // locally-created TerminalSession otherwise). The `entry` carries exactly
+    // what the TUI needs to build + group a row: uid, workspace, label,
+    // session_type, and the workflow tags. Clone the watcher Arc out so the
+    // broadcast runs after the state lock drops (matches `Exited`'s shape).
+    let added_watcher = Arc::clone(&state.manifest_watcher);
+    let added_entry = json!({
+        "uid": session_uid,
+        "workspace_id": p.workspace_id,
+        "label": p.label,
+        "session_type": p.session_type,
+        "workflow_run_id": p.workflow_run_id,
+        "workflow_role": p.workflow_role,
+        "task_id": p.task_id,
+    });
     drop(state);
+    added_watcher.broadcast(crate::manifest::ManifestDiff::Added {
+        uid: session_uid.clone(),
+        entry: added_entry,
+    });
 
     // Echo VERIFIED cgroup_path back to the TUI (slice
     // 10c-e-3b-fix4a). The path comes from the
@@ -2424,6 +2446,494 @@ pub fn workflow_update_definitions(
     }))
 }
 
+#[derive(Deserialize)]
+struct StartWorkflowParams {
+    workflow_name: String,
+    #[serde(default)]
+    goal: Option<String>,
+    /// Explicit worktree path (Operator/TUI path). When absent, resolved from
+    /// the Session caller's workspace.
+    #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    task_key: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+/// Phase 4 §D: daemon-side `start_workflow`. Spawns each role's participant
+/// session (fresh) via the in-process `start_session` path, writes the initial
+/// `state.json` (`WorkflowRun::new` seeds the worker's iteration-1
+/// `TriggerKind::Initial` entry), and records the worker's INITIAL pending
+/// activation (`is_initial` — delivery-only, never appends a second worker row).
+/// The poller drives every hand-off from there, so the run completes with or
+/// without a TUI attached. Worktree resolution: an explicit `worktree` param
+/// (TUI `A-f` / Operator) takes precedence, else the Session caller's workspace.
+pub fn start_workflow(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    use crate::workflow::run::{MessageBaseline, RoleBinding};
+    use crate::workflow::toml_schema::Engine;
+
+    let p: StartWorkflowParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("start_workflow params: {}", e)))?;
+    if p.workflow_name.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "start_workflow: 'workflow_name' is required".into()));
+    }
+
+    let caller_uid: Option<String> = match caller {
+        Caller::Session(s) => Some(s.session_uid.clone()),
+        Caller::Operator(_) => None,
+    };
+
+    // Resolve the definition (two-layer) + worktree/workspace under the lock.
+    // P-3: also resolve the memory cap each participant should inherit. Caps are
+    // a CALLER-supplied policy (the TUI computes soft/hard bytes + cgroup_prefix
+    // and they ride a session's start_session params); there is no daemon-side
+    // cap config. So:
+    //   - Session caller (an agent launching a sub-workflow): inherit the
+    //     CALLER session's cap, exactly as `mcp_start_session` does, so workflow
+    //     participants are capped like every other descendant spawn.
+    //   - Operator/headless caller (no caller session): there is NO cap source
+    //     today — participants run UNCAPPED. This is stated explicitly rather
+    //     than dropped silently; capping the headless operator-launched case
+    //     needs a daemon.toml cap-policy field (a follow-up, out of this phase's
+    //     acceptance criteria). See the `participant_cap` resolution below.
+    let (wf, worktree, workspace_id, task_id, participant_cap) = {
+        let state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
+        let wf = state.workflow_definition(&p.workflow_name).cloned().ok_or((
+            ErrorCode::NotFound,
+            format!(
+                "start_workflow: workflow definition '{}' not loaded (base or override)",
+                p.workflow_name
+            ),
+        ))?;
+        // P4 scope: an Operator (TUI) passes an explicit worktree (token already
+        // validated at dispatch). A Session caller is CONFINED to its own
+        // session's workspace — any client-supplied `worktree`/`workspace_id` is
+        // ignored, so an agent can't launch participants in an arbitrary tree.
+        let mut participant_cap: Option<(u64, u64, String)> = None;
+        let (worktree, workspace_id, task_id) = match caller_uid.as_deref() {
+            None => {
+                let wt = p.worktree.clone().ok_or((
+                    ErrorCode::InvalidParams,
+                    "start_workflow: Operator caller must pass `worktree`".into(),
+                ))?;
+                // Operator/headless: no caller session → no inherited cap.
+                (wt, p.workspace_id.clone().unwrap_or_default(), p.task_id.clone())
+            }
+            Some(cuid) => {
+                let c = state.sessions.get(cuid).ok_or((
+                    ErrorCode::Unauthorized,
+                    format!("start_workflow: caller session '{}' not in registry", cuid),
+                ))?;
+                // P-3: inherit the caller session's cap (all-or-nothing triple,
+                // like `mcp_start_session`). A capped agent's sub-workflow gets
+                // capped participants; an uncapped caller leaves participants
+                // uncapped (None).
+                participant_cap = match (
+                    c.memory_cap_soft_bytes,
+                    c.memory_cap_hard_bytes,
+                    c.cgroup_prefix.clone(),
+                ) {
+                    (Some(soft), Some(hard), Some(prefix)) => {
+                        Some((soft, hard, prefix.to_string_lossy().into_owned()))
+                    }
+                    _ => None,
+                };
+                let own_task = c.task_id.clone();
+                // A client-supplied task_id must be self-or-descendant of the
+                // caller's own task; otherwise default to the caller's task.
+                let task_id = match p.task_id.clone() {
+                    Some(req_task) => {
+                        let ok = own_task.as_deref().map_or(false, |own| {
+                            crate::control::auth::task_is_self_or_descendant_of(
+                                &state.task_tree,
+                                &req_task,
+                                own,
+                            )
+                        });
+                        if !ok {
+                            return Err((
+                                ErrorCode::Unauthorized,
+                                format!(
+                                    "start_workflow: task '{}' is not the caller's task or a descendant",
+                                    req_task
+                                ),
+                            ));
+                        }
+                        Some(req_task)
+                    }
+                    None => own_task.clone(),
+                };
+                // P-B: a DESCENDANT task (≠ caller's own) with its own
+                // (branch-mode) worktree must spawn THERE, not in the caller's
+                // worktree. Resolve via `task_workspaces` exactly like
+                // mcp_start_session; own-task / no-task uses the caller's
+                // workspace.
+                let descendant = task_id
+                    .as_deref()
+                    .filter(|req| own_task.as_deref() != Some(*req));
+                let ws_id = match descendant {
+                    Some(req_task) => state.task_workspaces.get(req_task).cloned().ok_or((
+                        ErrorCode::NotFound,
+                        format!(
+                            "start_workflow: descendant task '{}' has no bound workspace \
+                             (the TUI must push task.update_tree with workspace_id)",
+                            req_task
+                        ),
+                    ))?,
+                    None => c.workspace_id.clone(),
+                };
+                let wt = state
+                    .workspaces
+                    .get(&ws_id)
+                    .and_then(|w| w.worktree_path.clone())
+                    .ok_or((
+                        ErrorCode::InvalidParams,
+                        format!("start_workflow: no worktree for workspace '{}'", ws_id),
+                    ))?;
+                (wt.to_string_lossy().into_owned(), ws_id, task_id)
+            }
+        };
+        (wf, worktree, workspace_id, task_id, participant_cap)
+    };
+
+    // Finding 1: generate the run_id SERVER-SIDE — NEVER honor a caller-supplied
+    // id, or a Session RPC could reuse an active run's id and clobber its
+    // state.json on `run::save`. Defensively regenerate on the (astronomically
+    // unlikely) collision with an existing run rather than overwrite it.
+    let run_id = {
+        let mut id = crate::workflow::run::new_run_id();
+        let mut tries = 0;
+        while crate::workflow::run::load_one(&id).is_some() && tries < 8 {
+            id = crate::workflow::run::new_run_id();
+            tries += 1;
+        }
+        if crate::workflow::run::load_one(&id).is_some() {
+            return Err((
+                ErrorCode::Internal,
+                "start_workflow: could not allocate a unique run_id".into(),
+            ));
+        }
+        id
+    };
+    let task_key = p.task_key.clone().unwrap_or_else(|| workspace_id.clone());
+    let cols = p.cols.unwrap_or(80);
+    let rows = p.rows.unwrap_or(24);
+    let goal = p.goal.clone().unwrap_or_default();
+
+    // Finding 1: track spawned participants so a partial-launch failure cleans
+    // them up — no orphaned sessions left running without a valid run.
+    let mut spawned_uids: Vec<String> = Vec::new();
+    let cleanup_spawned = |uids: &[String]| {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        for uid in uids {
+            // DaemonSession's pidfd-based Drop SIGKILLs the child on removal.
+            state.sessions.remove(uid);
+        }
+    };
+
+    // Spawn each role fresh, in role_order, via the in-process start_session.
+    let mut role_sessions: std::collections::BTreeMap<String, RoleBinding> = std::collections::BTreeMap::new();
+    let mut role_baselines: std::collections::BTreeMap<String, MessageBaseline> = std::collections::BTreeMap::new();
+    // P-2: the configured `mcp_server_path` (daemon.toml) is the AUTHORITATIVE
+    // location for the MCP server on a headless/remote deployment (cm-manager,
+    // /opt/cm-daemon) where the repo-relative fallback doesn't resolve. Thread
+    // it into each participant's MCP config writer so they can actually start
+    // their MCP server and call workflow_transition/workflow_done.
+    let configured_mcp_server_path: Option<String> = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let p = st.config.mcp_server_path.clone();
+        if p.trim().is_empty() { None } else { Some(p) }
+    };
+    for role_name in &wf.role_order {
+        let Some(role) = wf.roles.get(role_name) else { continue };
+        let session_type = match role.engine {
+            Engine::ClaudeCode => "claude-code",
+            Engine::Codex => "codex",
+        };
+        let uid = new_daemon_minted_session_uid();
+        // P-3: the cap for THIS participant. Prefer the caller session's
+        // inherited cap (Session caller); otherwise fall back to the
+        // per-engine CONFIGURED cap (Operator/headless launch — the always-on
+        // host this phase targets). Resolved per-role since the configured cap
+        // is keyed by engine/session_type.
+        let role_cap: Option<(u64, u64, String)> = participant_cap
+            .clone()
+            .or_else(|| resolve_configured_participant_cap(session_type));
+        // P-CRIT: thread the workflow participant identity into BOTH the MCP
+        // config writer (so CM_WORKFLOW_RUN_ID/CM_ROLE land in the MCP server's
+        // config env block — the only env the MCP child reliably inherits) and
+        // the agent's own env below. Setting it on the agent env alone is NOT
+        // enough: workflow_transition/workflow_done read it from the MCP
+        // server's os.environ, and that child doesn't inherit the agent's env.
+        let wf_meta = crate::mcp_config::WorkflowMeta {
+            run_id: &run_id,
+            role: role_name,
+        };
+        let (program, argv_tail) =
+            match resolve_workflow_spawn_program(
+                session_type,
+                &uid,
+                Some(&wf_meta),
+                configured_mcp_server_path.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup_spawned(&spawned_uids);
+                    return Err((ErrorCode::Internal, format!("start_workflow build_args({}): {}", role_name, e)));
+                }
+            };
+        // P-3 enforcement: when a cap is inherited, wrap the argv in
+        // `systemd-run --scope` with the memory limits — exactly as
+        // `mcp_start_session` does — so the participant actually runs under the
+        // ceiling, not just records it. Skipped under the test spawn override
+        // (deterministic `/bin/sleep`, no user-systemd dependency).
+        let (program, argv_tail) = match &role_cap {
+            Some((soft, hard, prefix)) if !workflow_spawn_override_active() => {
+                let cap_spec = crate::mcp_config::CapSpec {
+                    soft_bytes: *soft,
+                    hard_bytes: *hard,
+                    session_uid: &uid,
+                    cgroup_prefix: std::path::Path::new(prefix),
+                };
+                let (wp, wa, _cgroup) =
+                    crate::mcp_config::wrap_with_systemd_run(&program, &argv_tail, Some(&cap_spec));
+                (wp, wa)
+            }
+            _ => (program, argv_tail),
+        };
+        let mut argv = Vec::with_capacity(argv_tail.len() + 1);
+        argv.push(program);
+        argv.extend(argv_tail);
+        let env_obj: serde_json::Map<String, Value> = crate::mcp_config::build_env(&uid, Some(&wf_meta))
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+        let mut full = serde_json::Map::new();
+        full.insert("uid".into(), Value::String(uid.clone()));
+        full.insert("workspace_id".into(), Value::String(workspace_id.clone()));
+        full.insert("label".into(), Value::String(role_name.clone()));
+        full.insert("argv".into(), Value::Array(argv.into_iter().map(Value::String).collect()));
+        full.insert("working_dir".into(), Value::String(worktree.clone()));
+        full.insert("worktree_path".into(), Value::String(worktree.clone()));
+        full.insert("env".into(), Value::Object(env_obj));
+        full.insert("session_type".into(), Value::String(session_type.to_string()));
+        full.insert("workflow_run_id".into(), Value::String(run_id.clone()));
+        full.insert("workflow_role".into(), Value::String(role_name.clone()));
+        if let Some(tid) = task_id.clone() {
+            full.insert("task_id".into(), Value::String(tid));
+        }
+        // P-3: pass the inherited cap (Session-caller path) so each participant
+        // is spawned under the same memory ceiling as every other session.
+        // `start_session` then verifies the child landed in the systemd-run
+        // `cm-sess-*.scope` we wrapped it into (above). None (Operator/headless)
+        // → uncapped, as documented. Under the test spawn override there is no
+        // real scope, so we skip the cap KEYS (start_session's cgroup verify
+        // would reject the fake `/bin/sleep`) — the threading decision is still
+        // captured below for assertions.
+        #[cfg(test)]
+        CAPTURED_PARTICIPANT_CAP
+            .with(|c| c.borrow_mut().push((uid.clone(), role_cap.clone())));
+        if !workflow_spawn_override_active() {
+            if let Some((soft, hard, ref prefix)) = role_cap {
+                full.insert("memory_cap_bytes".into(), Value::Number(soft.into()));
+                full.insert("memory_cap_hard_bytes".into(), Value::Number(hard.into()));
+                full.insert("cgroup_prefix".into(), Value::String(prefix.clone()));
+            }
+        }
+        full.insert("cols".into(), Value::Number(cols.into()));
+        full.insert("rows".into(), Value::Number(rows.into()));
+        // P-A: SERIALIZE each participant's snapshot+spawn+detect through the
+        // worktree spawn queue (mirrors mcp_start_session). Two claude roles
+        // (worker, manager) share one transcript dir; without serialization
+        // their detectors each diff against a stale pre-snapshot taken before
+        // the other's transcript appears and can cross-bind. By enqueueing +
+        // waiting BEFORE the snapshot, role B's snapshot isn't taken until role
+        // A's detector has bound (so A's transcript is excluded from B's diff).
+        let wt_path = std::path::Path::new(&worktree).to_path_buf();
+        let detector_engine = if workflow_detector_disabled() {
+            None
+        } else {
+            crate::transcript_detect::DetectorEngine::from_session_type(session_type)
+        };
+        let ticket = match detector_engine {
+            Some(_) => {
+                let queue_arc = workflow_spawn_queue(state_arc, &wt_path);
+                let seq = queue_arc.enqueue();
+                let ticket = crate::state::WorktreeSpawnTicket::new(queue_arc.clone(), seq);
+                // Bounded wait — a slow/non-writing prior detector shouldn't
+                // block the launch forever. On timeout, drop the slot and arm
+                // this role's detector unserialized (best-effort): correctness
+                // for the common (transcript-on-startup) case, liveness for the
+                // pathological one.
+                if queue_arc.wait_for_turn_timeout(seq, slot_wait_timeout()).is_err() {
+                    eprintln!(
+                        "cm-daemon: start_workflow: spawn-queue wait timed out for role {} \
+                         — arming detector unserialized (best-effort)",
+                        role_name
+                    );
+                    drop(ticket);
+                    None
+                } else {
+                    Some(ticket)
+                }
+            }
+            None => None,
+        };
+        // Snapshot AFTER the wait so prior roles' bound transcripts are excluded.
+        let pre_snapshot: Vec<String> = match detector_engine {
+            Some(crate::transcript_detect::DetectorEngine::ClaudeCode) => {
+                crate::transcript_detect::snapshot_claude_transcript_ids(&wt_path)
+            }
+            Some(crate::transcript_detect::DetectorEngine::Codex) => {
+                crate::transcript_detect::snapshot_codex_transcript_ids(&wt_path)
+            }
+            None => Vec::new(),
+        };
+        #[cfg(test)]
+        record_spawn_snapshot_for_test(&uid, &pre_snapshot);
+        if let Err((c, m)) = start_session(state_arc, &Value::Object(full)) {
+            cleanup_spawned(&spawned_uids);
+            return Err((c, format!("start_workflow spawn {}: {}", role_name, m)));
+        }
+        spawned_uids.push(uid.clone());
+        // P-B: arm the detector whenever this engine needs one — INCLUDING the
+        // timeout case where `ticket` is None (serialization lost, but the role
+        // still needs its transcript bound or the run wedges). Passing the
+        // `Option<ticket>` straight through means None → unserialized arm
+        // (best-effort), matching the timeout comment's stated intent. The old
+        // `if let (Some(engine), Some(ticket))` guard SKIPPED the detector on
+        // None, leaving the participant with no transcript_path forever.
+        if let Some(engine) = detector_engine {
+            // P-B: FAIL CLOSED on detector-thread spawn failure — a participant
+            // with no detector never gets `transcript_path`, so
+            // `sync_role_session_ids` can't bind `current_session_id` and the
+            // run wedges after returning a run_id (forbidden by headless #1/#3).
+            // Mirror `start_session`'s fail-closed contract: error + cleanup the
+            // sessions spawned so far, rather than returning success with a dead
+            // role.
+            if let Err(e) = crate::transcript_detect::spawn_queued_detector(
+                state_arc.clone(),
+                uid.clone(),
+                engine,
+                wt_path.clone(),
+                pre_snapshot,
+                ticket,
+                workflow_detector_spawn_fn(),
+            ) {
+                cleanup_spawned(&spawned_uids);
+                return Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "start_workflow: transcript detector spawn failed for role '{}' \
+                         (uid {}): {} — refusing to return a run with an undetectable \
+                         participant that would wedge headlessly",
+                        role_name, uid, e
+                    ),
+                ));
+            }
+        }
+        role_sessions.insert(role_name.clone(), RoleBinding {
+            session_label: role_name.clone(),
+            current_session_id: None,
+            daemon_session_uid: Some(uid),
+        });
+        role_baselines.insert(role_name.clone(), MessageBaseline::default());
+    }
+
+    let initial_role = wf.role_order.first().cloned().ok_or((
+        ErrorCode::InvalidParams,
+        "start_workflow: workflow has no roles".into(),
+    ))?;
+
+    let mut run = crate::workflow::run::WorkflowRun::new(
+        run_id.clone(),
+        p.workflow_name.clone(),
+        task_key,
+        role_sessions,
+        initial_role.clone(),
+        role_baselines,
+        if goal.is_empty() { None } else { Some(goal.clone()) },
+        std::collections::BTreeMap::new(),
+        0,
+    );
+    if let Some(tid) = task_id.clone() {
+        run.task_id = Some(tid);
+    }
+
+    // Worker's INITIAL activation: delivery-only. With an `activation_prompt`,
+    // raw_prompt is that template (rendered at finalization); otherwise it's the
+    // goal delivered VERBATIM (no templating, so literal braces survive) —
+    // mirrors the TUI's prepare_initial_prompt.
+    // P-4: a WHITESPACE-only `activation_prompt` is treated as absent — the old
+    // `prepare_initial_prompt` filtered whitespace before the presence check, so
+    // a role with `activation_prompt = "   "` and a real goal must deliver the
+    // GOAL (verbatim), not a blank template. Without this filter the
+    // whitespace template would be "present", and the empty-`raw_prompt` skip
+    // below wouldn't apply (raw_prompt = "   " ≠ empty after the goal fallback
+    // is bypassed), so the worker would silently never receive the goal.
+    let initial_activation_prompt = wf
+        .roles
+        .get(&initial_role)
+        .and_then(|r| r.activation_prompt.clone())
+        .filter(|p| !p.trim().is_empty());
+    let verbatim = initial_activation_prompt.is_none();
+    let raw_prompt = initial_activation_prompt.unwrap_or_else(|| goal.clone());
+    // P-4: if the initial activation would be BLANK — no/whitespace-only
+    // activation_prompt AND an empty goal → empty `raw_prompt` — do NOT queue
+    // it. `finalize.rs` does `unwrap_or_default()` + presses Enter, so an empty
+    // raw_prompt submits a whitespace turn to the fresh worker. The old
+    // `prepare_initial_prompt` returned `None` and skipped queuing here; mirror
+    // that. The worker still spawns + is active; the user drives it manually.
+    // Feedback mode is unaffected (its worker's raw_prompt = the non-empty goal).
+    if raw_prompt.trim().is_empty() {
+        run.pending_activation = None;
+    } else {
+        run.pending_activation = Some(crate::workflow::run::PendingActivation {
+            activation_id: 1,
+            target_role: initial_role.clone(),
+            iteration: 1,
+            trigger: crate::workflow::run::TriggerKind::Initial,
+            raw_prompt,
+            verbatim,
+            needs_fresh_reset: false,
+            is_initial: true,
+            phase: crate::workflow::run::ActivationPhase::Queued,
+            rendered_prompt: None,
+            pre_clear_snapshot: None,
+            enter_fire_at_ms: None,
+        });
+    }
+    if let Err(e) = crate::workflow::run::save(&run) {
+        cleanup_spawned(&spawned_uids);
+        return Err((ErrorCode::Internal, format!("start_workflow save run: {}", e)));
+    }
+    let watcher = {
+        let mut state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
+        state.workflow_runs.insert(run_id.clone(), run.clone());
+        state.workflow_event_watcher.clone()
+    };
+    // P-3: broadcast the newly-created run as a state snapshot so clients that
+    // subscribed BEFORE this launch (the launching TUI itself, plus any other
+    // observer) fold it into their view immediately — `events.subscribe`
+    // otherwise only emits snapshots at subscription time, leaving a fresh run
+    // invisible/uncontrollable until reconnect (criterion #4). The watcher Arc
+    // is cloned out above so this runs lock-free.
+    watcher.broadcast_snapshot(run);
+
+    Ok(json!({ "run_id": run_id }))
+}
+
 // ============================================================
 // 10d-2c-3a: list_workflows + get_workflow_state
 // ============================================================
@@ -3359,7 +3869,7 @@ pub fn workflow_transition(
         let wf_name = crate::workflow::run::load_one(&p.run_id).map(|r| r.workflow_name);
         let state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
         wf_name
-            .and_then(|name| state.workflow_definitions.get(&name))
+            .and_then(|name| state.workflow_definition(&name))
             .and_then(|wf| wf.roles.get(&p.to))
             .map(|r| matches!(r.context, crate::workflow::toml_schema::Context::Fresh))
             .unwrap_or(false)
@@ -3534,7 +4044,9 @@ pub fn workflow_transition(
                 iteration: run.iteration,
                 trigger: pa_trigger,
                 raw_prompt: pa_raw_prompt.clone(),
+                verbatim: false,
                 needs_fresh_reset: to_role_is_fresh,
+                is_initial: false,
                 phase: crate::workflow::run::ActivationPhase::Queued,
                 rendered_prompt: None,
                 pre_clear_snapshot: None,
@@ -4630,8 +5142,22 @@ pub fn mcp_start_session(
     // Writes the per-session claude.json (claude) or builds
     // codex overrides (codex). Bash gets `/bin/bash` with no
     // args.
-    let (program, argv_tail) = crate::mcp_config::build_args(&p.type_, &session_uid)
-        .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
+    // `mcp_start_session` agents are NOT workflow participants — no workflow
+    // meta. (start_workflow is the only path that passes `Some(WorkflowMeta)`.)
+    // P-2: still prefer the configured `mcp_server_path` so MCP-spawned agents
+    // on a configured remote daemon find server.py too.
+    let configured_mcp_server_path: Option<String> = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let p = st.config.mcp_server_path.clone();
+        if p.trim().is_empty() { None } else { Some(p) }
+    };
+    let (program, argv_tail) = crate::mcp_config::build_args(
+        &p.type_,
+        &session_uid,
+        None,
+        configured_mcp_server_path.as_deref(),
+    )
+    .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
 
     // Sub-2b-3 review-fix #1: wrap argv with systemd-run when
     // the caller carries a cap. Mirrors the TUI's
@@ -4658,8 +5184,9 @@ pub fn mcp_start_session(
     argv.push(final_program);
     argv.extend(final_argv_tail);
 
-    // Build env: daemon-injected pins plus nothing else.
-    let env_map = crate::mcp_config::build_env(&session_uid);
+    // Build env: daemon-injected pins plus nothing else (no workflow meta —
+    // mcp_start_session agents aren't workflow participants).
+    let env_map = crate::mcp_config::build_env(&session_uid, None);
     let env_obj: serde_json::Map<String, Value> = env_map
         .into_iter()
         .map(|(k, v)| (k, Value::String(v)))
@@ -4820,7 +5347,7 @@ pub fn mcp_start_session(
             engine,
             working_dir.clone(),
             detector_snapshot,
-            ticket,
+            Some(ticket),
             crate::transcript_detect::default_detector_spawn_fn(),
         ) {
             let err_msg = format!(
@@ -4839,6 +5366,101 @@ pub fn mcp_start_session(
     Ok(start_result)
 }
 
+/// P-3: parse `"6G" | "512M" | "1024K" | "67108864"` into a byte count.
+/// Suffixes are powers of 2 (K/M/G/T), same as systemd's `MemoryHigh=`. Mirrors
+/// `tui/src/memory_cap.rs::parse_bytes` — configured cap values routinely carry
+/// suffixes, so a plain `u64` parse would reject `6G` and fall through to
+/// uncapped (P-3a bug).
+fn parse_cap_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let last = bytes[bytes.len() - 1];
+    let (num_str, multiplier) = match last {
+        b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
+        b'M' | b'm' => (&s[..s.len() - 1], 1024u64 * 1024),
+        b'G' | b'g' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
+        b'T' | b't' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (s, 1u64),
+    };
+    let n: u64 = num_str.trim().parse().ok()?;
+    n.checked_mul(multiplier)
+}
+
+/// P-3: resolve the CONFIGURED per-engine memory cap for a daemon-launched
+/// workflow participant, for the case where there is no caller session to
+/// inherit from (an Operator/headless launch — the always-on host this phase
+/// exists for). Mirrors the TUI's two halves:
+///   - soft/hard bytes from `CM_SESSION_MEM_SOFT_<KEY>` /
+///     `CM_SESSION_MEM_HARD_<KEY>`, where `<KEY>` is the uppercased INTERNAL cap
+///     key — the wire `session_type` is normalized first
+///     (`claude-code` → `claude`, `codex` → `codex`), matching
+///     `tui/src/app.rs::normalize_session_type_to_internal` +
+///     `Config::memory_cap_for`. Values are suffix-aware (`6G`); both must be
+///     set with hard >= soft. (P-3a: the prior code looked up the bogus
+///     `CM_SESSION_MEM_SOFT_CLAUDE-CODE` and used a plain `u64` parse, so a real
+///     `CLAUDE`/`6G` config never matched → silently uncapped.)
+///   - `cgroup_prefix` computed from the daemon's uid (same formula as
+///     `tui/src/preflight.rs`).
+///
+/// Graceful degradation: the env vars are the operator's explicit opt-in, but
+/// if the predicted `app.slice` cgroup directory doesn't exist (no running user
+/// manager — caps genuinely can't apply on this host), return `None` and log,
+/// so a misconfigured host runs UNCAPPED rather than failing every workflow
+/// launch at `start_session`'s cgroup-scope verification. On a real systemd
+/// host (cm-manager) the directory exists and the cap applies.
+fn resolve_configured_participant_cap(session_type: &str) -> Option<(u64, u64, String)> {
+    // Normalize wire vocabulary → internal cap key (P-3a). bash/unknown → never
+    // capped (parity with the TUI: `claude-code`→`claude`, `codex`→`codex`).
+    let cap_key = match session_type {
+        "claude-code" | "claude" => "claude",
+        "codex" => "codex",
+        _ => return None,
+    };
+    let upper = cap_key.to_uppercase();
+    let soft = std::env::var(format!("CM_SESSION_MEM_SOFT_{}", upper))
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let hard = std::env::var(format!("CM_SESSION_MEM_HARD_{}", upper))
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let soft_bytes = parse_cap_bytes(&soft)?;
+    let hard_bytes = parse_cap_bytes(&hard)?;
+    if hard_bytes < soft_bytes {
+        eprintln!(
+            "cm-daemon: configured cap for '{}' is misconfigured (hard {} < soft {}); \
+             running participant uncapped",
+            session_type, hard_bytes, soft_bytes
+        );
+        return None;
+    }
+    let uid = unsafe { libc::getuid() };
+    #[allow(unused_mut)]
+    let mut prefix = std::path::PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service/app.slice",
+        uid, uid
+    ));
+    // Test seam: point the cgroup prefix at a real temp dir so the `is_dir`
+    // graceful-degradation gate can be exercised without /sys/fs/cgroup.
+    #[cfg(test)]
+    if let Some(ov) = CONFIGURED_CAP_PREFIX_OVERRIDE.with(|c| c.borrow().clone()) {
+        prefix = std::path::PathBuf::from(ov);
+    }
+    if !prefix.is_dir() {
+        eprintln!(
+            "cm-daemon: CM_SESSION_MEM_*_{} set but predicted cgroup prefix {} is \
+             absent (no user manager?) — running participant UNCAPPED rather than \
+             failing the launch",
+            upper,
+            prefix.display()
+        );
+        return None;
+    }
+    Some((soft_bytes, hard_bytes, prefix.to_string_lossy().into_owned()))
+}
+
 /// Sub-2b-3 review-fix #1: cap-inherit triple cloned out of the
 /// caller's `DaemonSession` under the state lock and used after
 /// the lock drops to wrap the child's argv. All three fields
@@ -4854,6 +5476,234 @@ struct InheritedCap {
 /// `tui/src/app.rs::new_session_uid` so the validator in
 /// `is_valid_session_uid` accepts it. Per-process counter +
 /// monotonic nanos.
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, `start_workflow`'s per-role spawn uses this
+    /// (program, args) instead of building the real `claude`/`codex` argv, so
+    /// tests spawn a lightweight program (e.g. `/bin/sleep`) deterministically
+    /// without depending on the agent binaries.
+    static SPAWN_PROGRAM_OVERRIDE: std::cell::RefCell<Option<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_spawn_program_override_for_test(prog: Option<(String, Vec<String>)>) {
+    SPAWN_PROGRAM_OVERRIDE.with(|c| *c.borrow_mut() = prog);
+}
+
+/// Resolve the (program, argv_tail) for a workflow participant. Honors the
+/// test-only spawn override; otherwise builds the real engine argv.
+fn resolve_workflow_spawn_program(
+    session_type: &str,
+    uid: &str,
+    workflow: Option<&crate::mcp_config::WorkflowMeta>,
+    server_path_override: Option<&str>,
+) -> std::io::Result<(String, Vec<String>)> {
+    #[cfg(test)]
+    {
+        // P-CRIT verification seam: record the workflow meta start_workflow
+        // threads in here, BEFORE the spawn override short-circuits. This
+        // proves the run_id/role reach the MCP-config writer (build_args) for
+        // each role — the exact link that was missing — even when a test uses
+        // the /bin/sleep override to avoid spawning real agents.
+        CAPTURED_WORKFLOW_META.with(|c| {
+            c.borrow_mut().push((
+                uid.to_string(),
+                workflow.map(|w| (w.run_id.to_string(), w.role.to_string())),
+            ))
+        });
+        if let Some(ov) = SPAWN_PROGRAM_OVERRIDE.with(|c| c.borrow().clone()) {
+            return Ok(ov);
+        }
+    }
+    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-role `(uid, Option<(run_id, role)>)` captured by
+    /// `resolve_workflow_spawn_program`. The P-CRIT test asserts every workflow
+    /// participant carries `Some((run_id, role))`.
+    static CAPTURED_WORKFLOW_META: std::cell::RefCell<Vec<(String, Option<(String, String)>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_captured_workflow_meta_for_test(
+) -> Vec<(String, Option<(String, String)>)> {
+    CAPTURED_WORKFLOW_META.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// P-3 seam: per-role `(uid, inherited cap triple)` captured by
+    /// `start_workflow`. Lets a test assert the cap THREADING decision
+    /// (which participants get which cap) without depending on a working
+    /// user-systemd instance for `start_session`'s cgroup-scope verification.
+    static CAPTURED_PARTICIPANT_CAP: std::cell::RefCell<Vec<(String, Option<(u64, u64, String)>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_captured_participant_caps_for_test(
+) -> Vec<(String, Option<(u64, u64, String)>)> {
+    CAPTURED_PARTICIPANT_CAP.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// P-3 seam: override the computed cgroup prefix in
+    /// `resolve_configured_participant_cap` so tests can exercise the
+    /// configured-cap path without a real `/sys/fs/cgroup` hierarchy.
+    static CONFIGURED_CAP_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_configured_cap_prefix_override_for_test(prefix: Option<String>) {
+    CONFIGURED_CAP_PREFIX_OVERRIDE.with(|c| *c.borrow_mut() = prefix);
+}
+
+/// Get-or-create the per-worktree spawn queue (serializes snapshot+spawn+detect
+/// so participants in one worktree don't cross-bind transcripts — P-A).
+fn workflow_spawn_queue(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    working_dir: &std::path::Path,
+) -> Arc<crate::state::WorktreeSpawnQueue> {
+    let registry_arc = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.worktree_spawn_queues.clone()
+    };
+    let mut registry = registry_arc.lock().unwrap_or_else(|p| p.into_inner());
+    registry
+        .entry(working_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(crate::state::WorktreeSpawnQueue::new()))
+        .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: pre-snapshots recorded per participant uid by the
+    /// `start_workflow` spawn loop, so the serialization invariant (role B's
+    /// snapshot taken AFTER role A's detector bound) is observable.
+    static SPAWN_SNAPSHOTS: std::cell::RefCell<Vec<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Test seam: when set, `start_workflow` uses [`test_detector_spawn_fn`].
+    static USE_TEST_DETECTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: when set, `start_workflow` skips detector arming entirely (for
+    /// tests that drive sids manually and don't want the spawn-queue wait).
+    static DISABLE_WORKFLOW_DETECTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam (P-B): when set, the detector-spawn factory returns a closure
+    /// that always fails — so a test can assert `start_workflow` FAILS CLOSED
+    /// (errors + cleans up the spawned sessions) on detector-thread spawn
+    /// failure rather than returning a run with an undetectable participant.
+    static USE_FAILING_DETECTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_failing_detector_for_test(failing: bool) {
+    USE_FAILING_DETECTOR.with(|c| c.set(failing));
+}
+
+#[cfg(test)]
+pub(crate) fn set_disable_workflow_detector_for_test(disabled: bool) {
+    DISABLE_WORKFLOW_DETECTOR.with(|c| c.set(disabled));
+}
+
+#[cfg(test)]
+fn workflow_detector_disabled() -> bool {
+    DISABLE_WORKFLOW_DETECTOR.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+fn workflow_detector_disabled() -> bool {
+    false
+}
+
+/// True when a test has installed the spawn-program override (deterministic
+/// `/bin/sleep` spawn). P-3: the systemd-run cap wrap is skipped in that case so
+/// cap-threading tests don't depend on a working user-systemd instance; the cap
+/// METADATA still rides `full` so the spawned session records it.
+#[cfg(test)]
+fn workflow_spawn_override_active() -> bool {
+    SPAWN_PROGRAM_OVERRIDE.with(|c| c.borrow().is_some())
+}
+
+#[cfg(not(test))]
+fn workflow_spawn_override_active() -> bool {
+    false
+}
+
+#[cfg(test)]
+static TEST_DETECTOR_WORKTREE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn record_spawn_snapshot_for_test(uid: &str, snapshot: &[String]) {
+    SPAWN_SNAPSHOTS.with(|c| c.borrow_mut().push((uid.to_string(), snapshot.to_vec())));
+}
+
+#[cfg(test)]
+pub(crate) fn take_spawn_snapshots_for_test() -> Vec<(String, Vec<String>)> {
+    SPAWN_SNAPSHOTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(crate) fn enable_test_detector(worktree: Option<std::path::PathBuf>) {
+    USE_TEST_DETECTOR.with(|c| c.set(worktree.is_some()));
+    *TEST_DETECTOR_WORKTREE.lock().unwrap() = worktree;
+}
+
+/// Detector-spawn factory used by `start_workflow`. Production uses the real
+/// thread spawner; tests can substitute a deterministic detector that writes a
+/// transcript (after a delay) so the serialization invariant is observable.
+fn workflow_detector_spawn_fn() -> crate::transcript_detect::DetectorSpawnFn {
+    #[cfg(test)]
+    {
+        if USE_FAILING_DETECTOR.with(|c| c.get()) {
+            return Box::new(|_name, _body| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "injected detector-thread spawn failure (P-B test)",
+                ))
+            });
+        }
+        if USE_TEST_DETECTOR.with(|c| c.get()) {
+            return test_detector_spawn_fn();
+        }
+    }
+    crate::transcript_detect::default_detector_spawn_fn()
+}
+
+/// Deterministic test detector: spawns a thread that (1) sleeps so a
+/// non-serialized next-role snapshot is taken BEFORE this write, (2) writes a
+/// `<uid>.jsonl` transcript into the test worktree's claude dir, then (3) runs
+/// the real detector body (which binds it + drops the queue ticket). With the
+/// serialized fix, role B waits for this to finish, so B's snapshot includes
+/// role A's transcript; without it, B's snapshot is empty.
+#[cfg(test)]
+fn test_detector_spawn_fn() -> crate::transcript_detect::DetectorSpawnFn {
+    Box::new(|name: String, body: Box<dyn FnOnce() + Send + 'static>| {
+        let uid = name
+            .strip_prefix("cm-daemon-transcript-detect-")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let wt = TEST_DETECTOR_WORKTREE.lock().unwrap().clone();
+        std::thread::Builder::new().name(name).spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if let (Some(wt), Some(home)) = (wt, std::env::var_os("HOME")) {
+                let enc = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+                let dir = std::path::PathBuf::from(home).join(format!(".claude/projects/{}", enc));
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(
+                    dir.join(format!("{}.jsonl", uid)),
+                    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}}\n",
+                );
+            }
+            body();
+        })
+    })
+}
+
 fn new_daemon_minted_session_uid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5122,6 +5972,49 @@ mod tests {
             "error should hint at the auto-register field: {}",
             err.1
         );
+    }
+
+    /// Option B (criterion #4): a successful `start_session` broadcasts a
+    /// manifest `Added` carrying the session's uid + workspace + label +
+    /// session_type + workflow tags, so a live `manifest.watch` subscriber (the
+    /// launching TUI) can adopt a daemon-launched participant row from
+    /// broadcasts alone — symmetric with the existing `Exited` broadcast.
+    #[test]
+    fn start_session_broadcasts_manifest_added_with_workflow_tags() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-add", &dir);
+        let (rx, _guard) = {
+            let s = state.lock().unwrap();
+            s.manifest_watcher.subscribe()
+        };
+        let uid = fresh_test_uid();
+        let params = json!({
+            "uid": uid,
+            "workspace_id": "ws-add",
+            "label": "reviewer",
+            "argv": ["/bin/bash"],
+            "working_dir": dir.path().display().to_string(),
+            "session_type": "claude-code",
+            "workflow_run_id": "wf_add",
+            "workflow_role": "reviewer",
+        });
+        start_session(&state, &params).expect("spawn ok");
+
+        let diff = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("start_session must broadcast a manifest Added");
+        match diff {
+            crate::manifest::ManifestDiff::Added { uid: u, entry } => {
+                assert_eq!(u, uid);
+                assert_eq!(entry["workspace_id"], "ws-add");
+                assert_eq!(entry["label"], "reviewer");
+                assert_eq!(entry["session_type"], "claude-code");
+                assert_eq!(entry["workflow_run_id"], "wf_add");
+                assert_eq!(entry["workflow_role"], "reviewer");
+            }
+            other => panic!("expected ManifestDiff::Added, got {:?}", other),
+        }
+        kill_all_sessions(&state);
     }
 
     #[test]
@@ -6003,18 +6896,20 @@ mod tests {
             env.get("CM_TUI_SESSION_ID").copied(),
             Some(uid.as_str()),
         );
-        // Workflow context vars: NOT injected when params
-        // carry none. These vars aren't inherited from the
-        // test parent env (the test runner doesn't set
-        // CM_WORKFLOW_RUN_ID or CM_ROLE), so the negative
-        // assertion is meaningful here.
+        // Workflow context vars are PARTICIPANT-ONLY. This spawn carries no
+        // workflow params, so the child must have neither var — even when the
+        // suite is run from INSIDE a workflow participant session (the daemon
+        // process then has CM_WORKFLOW_RUN_ID/CM_ROLE in its env and children
+        // would otherwise inherit them). `DaemonSession::spawn` strips both for
+        // non-participants (see the participant-only scrub in session.rs), so
+        // this negative assertion holds regardless of who runs the suite.
         assert!(
             !env.contains_key("CM_WORKFLOW_RUN_ID"),
-            "non-workflow spawn MUST NOT inject CM_WORKFLOW_RUN_ID",
+            "non-workflow spawn MUST NOT carry CM_WORKFLOW_RUN_ID (no inject, no inherit)",
         );
         assert!(
             !env.contains_key("CM_ROLE"),
-            "non-workflow spawn MUST NOT inject CM_ROLE",
+            "non-workflow spawn MUST NOT carry CM_ROLE (no inject, no inherit)",
         );
     }
 
@@ -9639,6 +10534,961 @@ mod tests {
         });
     }
 
+    /// Phase 4 §B2: the TUI's `update_definitions` push only replaces the
+    /// OVERRIDE layer — it must never clear the daemon-loaded BASE layer. An
+    /// override shadows the base; an empty push (TUI reconnect) leaves the base
+    /// intact, so `workflow_definition()` still resolves it headlessly.
+    #[test]
+    fn update_definitions_replaces_override_only_base_survives() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let mk = |order: Vec<&str>| {
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role {
+                    engine: Engine::ClaudeCode, context: Context::Persistent,
+                    activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false,
+                });
+                Workflow {
+                    name: "feedback".to_string(), description: String::new(), roles,
+                    role_order: order.iter().map(|s| s.to_string()).collect(),
+                    transitions: vec![],
+                }
+            };
+            // Seed the BASE layer (as startup would from workflows_dir).
+            {
+                let mut s = state.lock().unwrap();
+                s.base_workflow_definitions.insert("feedback".to_string(), mk(vec!["base"]));
+            }
+            // Base resolves when no override.
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(s.workflow_definition("feedback").unwrap().role_order, vec!["base".to_string()]);
+            }
+            // A TUI push (override) shadows the base.
+            let mut map = std::collections::HashMap::new();
+            map.insert("feedback".to_string(), mk(vec!["override"]));
+            workflow_update_definitions(&state, &json!({"workflows": map})).expect("push ok");
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(s.workflow_definition("feedback").unwrap().role_order, vec!["override".to_string()]);
+            }
+            // An empty push (TUI reconnect) clears ONLY the override — base survives.
+            workflow_update_definitions(
+                &state,
+                &json!({"workflows": std::collections::HashMap::<String, crate::workflow::toml_schema::Workflow>::new()}),
+            ).expect("empty push ok");
+            {
+                let s = state.lock().unwrap();
+                assert!(s.workflow_definitions.is_empty(), "override cleared");
+                assert_eq!(
+                    s.workflow_definition("feedback").unwrap().role_order,
+                    vec!["base".to_string()],
+                    "base survives the override clear"
+                );
+            }
+        });
+    }
+
+    /// Phase 4 §D acceptance #2 + #3 (launch): daemon-side `start_workflow`
+    /// spawns participants, writes state.json with EXACTLY ONE worker entry
+    /// (iteration 1, `Initial`) + an `is_initial` delivery-only pending
+    /// activation, and resolves the definition from the BASE layer (NO TUI
+    /// override — headless). Uses a lightweight `/bin/sleep` spawn override so
+    /// the test doesn't depend on the `claude`/`codex` binaries.
+    #[test]
+    fn start_workflow_creates_daemon_driven_run_single_initial_entry() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                // BASE layer only — no TUI override.
+                s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
+                    name: "feedback".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
+                    transitions: vec![
+                        Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() },
+                        Transition { from: "reviewer".into(), on: TriggerOn::Idle, to: "manager".into() },
+                    ],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "feedback",
+                "goal": "implement the feature",
+                "worktree": wt.to_str().unwrap(),
+                "workspace_id": "ws-1",
+            })).expect("start_workflow ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let run_id = resp["run_id"].as_str().unwrap().to_string();
+            let run = crate::workflow::run::load_one(&run_id).expect("run saved");
+
+            // Criterion #2: exactly ONE worker history entry, iteration 1, Initial.
+            assert_eq!(run.history.len(), 1, "only the seeded initial entry");
+            assert_eq!(run.history[0].role, "worker");
+            assert_eq!(run.history[0].iteration, 1);
+            assert!(matches!(run.history[0].trigger, crate::workflow::run::TriggerKind::Initial));
+            // Initial activation is delivery-only.
+            let pa = run.pending_activation.as_ref().expect("initial pending activation");
+            assert!(pa.is_initial);
+            assert_eq!(pa.target_role, "worker");
+            assert!(!pa.raw_prompt.is_empty(), "worker gets the goal as its initial prompt");
+            assert_eq!(run.active_role.as_deref(), Some("worker"));
+            // All three participants spawned + registered, bound by daemon uid.
+            {
+                let s = state.lock().unwrap();
+                for role in ["worker", "reviewer", "manager"] {
+                    let uid = run.role_sessions[role].daemon_session_uid.as_ref()
+                        .unwrap_or_else(|| panic!("{role} has no daemon_session_uid"));
+                    assert!(s.sessions.contains_key(uid), "{role} session registered");
+                    assert!(run.role_sessions[role].current_session_id.is_none(), "{role} sid discovered later");
+                }
+            }
+
+            // Drive the initial delivery headlessly: the poller finalizes the
+            // worker's is_initial activation (delivery-only) — it must NOT append
+            // a second worker row.
+            let poller = crate::workflow::poller::WorkflowPoller::new(std::sync::Arc::clone(&state));
+            poller.set_finalize_timing_for_test(0, 0);
+            poller.poll_once();
+            let run = crate::workflow::run::load_one(&run_id).unwrap();
+            assert_eq!(
+                run.history.iter().filter(|h| h.role == "worker").count(),
+                1,
+                "initial delivery patches, never appends a 2nd worker entry"
+            );
+            assert!(run.pending_activation.is_none(), "initial activation finalized to Done");
+        });
+    }
+
+    /// P-CRIT — the daemon must thread each participant's workflow identity
+    /// (run_id + role) into the MCP-config writer, so `CM_WORKFLOW_RUN_ID` /
+    /// `CM_ROLE` land in the MCP server's config env block. WITHOUT this the
+    /// reviewer/manager's `workflow_transition` / `workflow_done` calls
+    /// hard-fail ("CM_WORKFLOW_RUN_ID is not set") and the headless run stalls
+    /// — a regression the poller tests CANNOT catch because they bypass the
+    /// real MCP server. This locks the daemon-side half of the chain: every
+    /// role reaches `resolve_workflow_spawn_program` with `Some((run_id,
+    /// role))` (the build_args writer then emits the env — see
+    /// `mcp_config::build_args_claude_workflow_participant_carries_run_id_and_role`).
+    /// Mutation check: passing `None` at the spawn site makes this fail.
+    #[test]
+    fn start_workflow_threads_workflow_meta_into_mcp_config_for_every_role() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt-meta");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
+                    name: "feedback".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
+                    transitions: vec![
+                        Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() },
+                        Transition { from: "reviewer".into(), on: TriggerOn::Idle, to: "manager".into() },
+                    ],
+                });
+            }
+            let _ = take_captured_workflow_meta_for_test(); // clear any prior capture
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "feedback",
+                "goal": "implement the feature",
+                "worktree": wt.to_str().unwrap(),
+                "workspace_id": "ws-1",
+            })).expect("start_workflow ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+            let run_id = resp["run_id"].as_str().unwrap().to_string();
+
+            let captured = take_captured_workflow_meta_for_test();
+            // One capture per role, all carrying Some((this run_id, the role)).
+            let mut by_role: std::collections::BTreeMap<String, String> = Default::default();
+            for (_uid, meta) in &captured {
+                let (rid, role) = meta.as_ref().expect(
+                    "every workflow participant MUST carry Some(WorkflowMeta) — \
+                     None means CM_WORKFLOW_RUN_ID/CM_ROLE never reach the MCP \
+                     server and workflow_transition/workflow_done hard-fail",
+                );
+                assert_eq!(rid, &run_id, "meta run_id must match the launched run");
+                by_role.insert(role.clone(), rid.clone());
+            }
+            assert_eq!(
+                by_role.keys().cloned().collect::<Vec<_>>(),
+                vec!["manager".to_string(), "reviewer".to_string(), "worker".to_string()],
+                "all three roles threaded their identity into the MCP config writer",
+            );
+        });
+    }
+
+    /// Phase 4 (P4 scope): a Session caller is CONFINED to its own session's
+    /// workspace — a client-supplied `worktree`/`workspace_id` override is
+    /// ignored, so an agent can't launch participants in an arbitrary tree.
+    #[test]
+    fn start_workflow_session_caller_confined_to_own_workspace() {
+        use crate::session::{DaemonSession, SpawnParams};
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("caller-wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-own".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-own".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                // A caller session bound to ws-own.
+                let mut sp = SpawnParams::new("ts-caller", "caller", "/bin/sleep");
+                sp.args = vec!["120".to_string()];
+                sp.workspace_id = "ws-own".to_string();
+                s.sessions.insert("ts-caller".to_string(), DaemonSession::spawn(sp).expect("spawn"));
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            // The agent tries to override worktree/workspace — must be ignored.
+            let resp = start_workflow(
+                &state,
+                &Caller::session("ts-caller"),
+                &json!({ "workflow_name": "solo", "worktree": "/evil/path", "workspace_id": "evil-ws" }),
+            ).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+            let run_id = resp["run_id"].as_str().unwrap().to_string();
+            let run = crate::workflow::run::load_one(&run_id).unwrap();
+            assert_eq!(run.task_key, "ws-own", "confined to caller's workspace, not the override");
+        });
+    }
+
+    /// Phase 4 (P-B): a Session caller launching a workflow on a DESCENDANT
+    /// task that has its own (branch-mode) worktree spawns participants THERE,
+    /// not in the caller's worktree (resolved via `task_workspaces`).
+    #[test]
+    fn start_workflow_descendant_task_spawns_in_its_own_worktree() {
+        use crate::session::{DaemonSession, SpawnParams};
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt_parent = home.join("parent-wt");
+            let wt_child = home.join("child-wt");
+            std::fs::create_dir_all(&wt_parent).unwrap();
+            std::fs::create_dir_all(&wt_child).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                for (id, wt) in [("ws-parent", &wt_parent), ("ws-child", &wt_child)] {
+                    let mut ws = crate::manifest::ManifestWorkspace::default();
+                    ws.id = id.to_string();
+                    ws.worktree_path = Some(wt.clone());
+                    s.workspaces.insert(id.to_string(), ws);
+                }
+                s.task_tree.insert("task-parent".to_string(), None);
+                s.task_tree.insert("task-child".to_string(), Some("task-parent".to_string()));
+                s.task_workspaces.insert("task-child".to_string(), "ws-child".to_string());
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                // Caller bound to the PARENT task/workspace.
+                let mut sp = SpawnParams::new("ts-caller", "caller", "/bin/sleep");
+                sp.args = vec!["120".to_string()];
+                sp.workspace_id = "ws-parent".to_string();
+                sp.task_id = Some("task-parent".to_string());
+                s.sessions.insert("ts-caller".to_string(), DaemonSession::spawn(sp).expect("spawn"));
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::session("ts-caller"), &json!({
+                "workflow_name": "solo", "task_id": "task-child",
+            })).expect("ok");
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            assert_eq!(run.task_key, "ws-child", "descendant task's own workspace, not the parent's");
+            assert_eq!(run.task_id.as_deref(), Some("task-child"));
+        });
+    }
+
+    /// Phase 4 (P-A): two claude roles share one worktree's transcript dir, so
+    /// their detectors must be SERIALIZED or they cross-bind. With the
+    /// wait_for_turn fix, role B's pre-snapshot is taken only AFTER role A's
+    /// detector bound — so it INCLUDES A's transcript and B can't bind it.
+    /// Deterministic via the test detector (writes its transcript after a delay,
+    /// so an un-serialized B snapshots empty). Fails pre-fix, passes post-fix.
+    #[test]
+    fn start_workflow_serializes_same_worktree_detectors() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("two".to_string(), Workflow {
+                    name: "two".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "manager".into()], transitions: vec![],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            enable_test_detector(Some(wt.clone()));
+            let _ = take_spawn_snapshots_for_test();
+
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "two", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("ok");
+
+            enable_test_detector(None);
+            set_spawn_program_override_for_test(None);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            let worker_uid = run.role_sessions["worker"].daemon_session_uid.clone().unwrap();
+            let manager_uid = run.role_sessions["manager"].daemon_session_uid.clone().unwrap();
+
+            let snaps = take_spawn_snapshots_for_test();
+            let worker_snap = snaps.iter().find(|(u, _)| *u == worker_uid).map(|(_, s)| s.clone()).expect("worker recorded");
+            let manager_snap = snaps.iter().find(|(u, _)| *u == manager_uid).map(|(_, s)| s.clone()).expect("manager recorded");
+            assert!(worker_snap.is_empty(), "worker is first; empty pre-snapshot");
+            assert!(
+                manager_snap.contains(&worker_uid),
+                "P-A: manager's pre-snapshot must include the worker's transcript \
+                 (serialized via the spawn queue); got {:?}",
+                manager_snap,
+            );
+        });
+    }
+
+    /// P-B (timeout branch): when the spawn-queue wait TIMES OUT, the role's
+    /// detector is still armed UNSERIALIZED (ticket = None) — it must NOT be
+    /// skipped. The old `if let (Some(engine), Some(ticket))` guard skipped the
+    /// detector entirely on a None ticket, leaving the participant with no
+    /// `transcript_path` so `sync_role_session_ids` could never bind its sid and
+    /// the run wedged after returning a run_id. Here we pre-occupy the worktree
+    /// queue (never released) so the worker's wait times out, then assert the
+    /// detector STILL ran and bound the transcript. Mutation: restoring the
+    /// `Some(ticket)` guard makes `transcript_path` stay None and this fails.
+    #[test]
+    fn start_workflow_timeout_still_arms_detector_unserialized() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            // Pre-occupy the worktree spawn queue with a seq that is NEVER
+            // released, so the worker's `wait_for_turn_timeout` is guaranteed to
+            // time out (→ ticket None → unserialized arm path).
+            let queue = workflow_spawn_queue(&state, &wt);
+            let _blocking_seq = queue.enqueue(); // held forever, never signal_done
+
+            let _wait_guard = set_slot_wait_timeout_for_test(std::time::Duration::from_millis(60));
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            enable_test_detector(Some(wt.clone()));
+
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("start_workflow returns despite the queue timeout");
+
+            enable_test_detector(None);
+            set_spawn_program_override_for_test(None);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            let worker_uid = run.role_sessions["worker"].daemon_session_uid.clone().unwrap();
+
+            // The detector (armed despite the timeout) writes + binds the
+            // transcript within ~1s. Poll for transcript_path becoming Some.
+            let mut bound = false;
+            for _ in 0..60 {
+                {
+                    let s = state.lock().unwrap();
+                    if let Some(sess) = s.sessions.get(&worker_uid) {
+                        if sess.transcript_path.is_some() {
+                            bound = true;
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                bound,
+                "P-B: detector must be armed UNSERIALIZED on queue timeout and \
+                 bind transcript_path (old guard skipped it → would wedge)",
+            );
+        });
+    }
+
+    /// P-B (fail-closed branch): if the detector THREAD fails to spawn,
+    /// `start_workflow` must FAIL CLOSED — return an error AND clean up the
+    /// sessions spawned so far — rather than returning success with a
+    /// participant that has no detector (which wedges headlessly). Mirrors
+    /// `mcp_start_session`'s fail-closed contract.
+    #[test]
+    fn start_workflow_fails_closed_on_detector_thread_spawn_failure() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            let sessions_before = { state.lock().unwrap().sessions.len() };
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_failing_detector_for_test(true);
+
+            let result = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            }));
+
+            set_failing_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            assert!(result.is_err(), "must FAIL CLOSED on detector spawn failure");
+            let (_code, msg) = result.unwrap_err();
+            assert!(
+                msg.contains("transcript detector spawn failed"),
+                "error must name the cause: {}",
+                msg,
+            );
+            // Cleanup: the spawned worker session must be removed (no orphan).
+            let sessions_after = { state.lock().unwrap().sessions.len() };
+            assert_eq!(
+                sessions_after, sessions_before,
+                "spawned sessions must be cleaned up on fail-closed (no orphans)",
+            );
+            // P-3b atomicity: a FAILED launch must leave NO run on disk — the run
+            // is saved only AFTER all participants spawn. This is what makes the
+            // generous client RPC timeout safe: a client give-up can never
+            // correspond to a half-launched, persisted run.
+            assert!(
+                crate::workflow::run::load_all().is_empty(),
+                "fail-closed launch must persist no run (atomic save-at-end)",
+            );
+        });
+    }
+
+    /// P-3a: the directly-tested resolver — a "claude-code" wire type with
+    /// `CM_SESSION_MEM_SOFT_CLAUDE=6G` (+ matching hard) must resolve a non-None
+    /// cap with the correct suffix-parsed byte value. This is the assertion that
+    /// would have caught both P-3a bugs (wrong env-var key + non-suffix parse).
+    #[test]
+    fn resolve_configured_cap_normalizes_type_and_parses_suffix() {
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path().join("app.slice");
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::env::set_var("CM_SESSION_MEM_SOFT_CLAUDE", "6G");
+        std::env::set_var("CM_SESSION_MEM_HARD_CLAUDE", "8G");
+        set_configured_cap_prefix_override_for_test(Some(prefix.to_string_lossy().into_owned()));
+
+        // Wire type "claude-code" → key "claude" → CM_SESSION_MEM_*_CLAUDE.
+        let cap = resolve_configured_participant_cap("claude-code");
+
+        set_configured_cap_prefix_override_for_test(None);
+        std::env::remove_var("CM_SESSION_MEM_SOFT_CLAUDE");
+        std::env::remove_var("CM_SESSION_MEM_HARD_CLAUDE");
+
+        assert_eq!(
+            cap,
+            Some((
+                6u64 * 1024 * 1024 * 1024,
+                8u64 * 1024 * 1024 * 1024,
+                prefix.to_string_lossy().into_owned(),
+            )),
+            "claude-code must look up _CLAUDE and parse 6G/8G suffixes",
+        );
+        // bash is never capped.
+        assert_eq!(resolve_configured_participant_cap("bash"), None);
+    }
+
+    #[test]
+    fn parse_cap_bytes_handles_suffixes_and_plain() {
+        assert_eq!(parse_cap_bytes("6G"), Some(6u64 * 1024 * 1024 * 1024));
+        assert_eq!(parse_cap_bytes("512M"), Some(512u64 * 1024 * 1024));
+        assert_eq!(parse_cap_bytes("1024K"), Some(1024u64 * 1024));
+        assert_eq!(parse_cap_bytes("67108864"), Some(67108864));
+        assert_eq!(parse_cap_bytes("6g"), Some(6u64 * 1024 * 1024 * 1024));
+        assert_eq!(parse_cap_bytes("garbage"), None);
+        assert_eq!(parse_cap_bytes(""), None);
+    }
+
+    /// P-4: when the initial role has NO activation_prompt AND the goal is
+    /// empty, the initial activation must NOT be queued — otherwise finalize
+    /// would `unwrap_or_default()` + press Enter, submitting a blank turn to the
+    /// fresh worker. The run is still created and active; the user drives it.
+    #[test]
+    fn start_workflow_empty_prompt_and_goal_skips_initial_activation() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                // No activation_prompt on the initial role.
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            // No "goal" key → empty goal.
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            assert!(
+                run.pending_activation.is_none(),
+                "P-4: blank prompt + empty goal must NOT queue an initial activation (no blank turn)",
+            );
+            // Run is still created + active — only the auto-delivery is skipped.
+            assert_eq!(run.active_role.as_deref(), Some("worker"));
+        });
+    }
+
+    /// P-4 companion: a non-empty goal (feedback-mode shape) STILL queues the
+    /// initial activation — the skip is narrow to the blank case.
+    #[test]
+    fn start_workflow_nonempty_goal_still_queues_initial_activation() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "do the thing", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            let pa = run.pending_activation.as_ref().expect("non-empty goal queues activation");
+            assert!(pa.is_initial);
+            assert_eq!(pa.raw_prompt, "do the thing");
+        });
+    }
+
+    /// P-4 edge (must-fix #2): a WHITESPACE-only `activation_prompt` must be
+    /// treated as absent, so with a real goal the worker still receives the
+    /// GOAL (verbatim) — NOT a blank template, and NOT a silent no-delivery.
+    /// Before the trim-filter, `activation_prompt = "   "` counted as present →
+    /// raw_prompt = "   " (non-empty) → queued a whitespace turn, OR if the goal
+    /// was the intended ask it never reached the worker.
+    #[test]
+    fn start_workflow_whitespace_prompt_falls_back_to_goal() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                // Whitespace-only activation_prompt on the initial role.
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("   ".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "real goal", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            let pa = run
+                .pending_activation
+                .as_ref()
+                .expect("whitespace prompt + real goal must still queue the GOAL");
+            assert!(pa.verbatim, "whitespace prompt → treated as absent → goal delivered verbatim");
+            assert_eq!(pa.raw_prompt, "real goal");
+        });
+    }
+
+    /// P-4 edge: whitespace prompt AND empty goal → still skipped (no blank turn).
+    #[test]
+    fn start_workflow_whitespace_prompt_and_empty_goal_skips() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("  \n ".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            assert!(
+                run.pending_activation.is_none(),
+                "whitespace prompt + empty goal must skip (no blank turn)",
+            );
+        });
+    }
+
+    /// P-3 (parity): a Session caller that is itself memory-capped launches
+    /// participants that INHERIT its cap — they must not run uncapped. Asserts
+    /// (via the threading-capture seam) that the worker's spawn carried the
+    /// caller's (soft, hard, cgroup_prefix) triple. Enforcement itself
+    /// (systemd-run wrap + start_session's cgroup-scope verify) is start_session's
+    /// existing, separately-tested job and needs real user-systemd — so this
+    /// test verifies the daemon-side THREADING decision, which is the fix.
+    #[test]
+    fn start_workflow_session_caller_participants_inherit_cap() {
+        use crate::session::{DaemonSession, SpawnParams};
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let cgroup = home.join("cg");
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-cap".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-cap".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                // A capped caller session bound to ws-cap.
+                let mut sp = SpawnParams::new("ts-capped-caller", "caller", "/bin/sleep");
+                sp.args = vec!["120".to_string()];
+                sp.workspace_id = "ws-cap".to_string();
+                let mut ds = DaemonSession::spawn(sp).expect("spawn caller");
+                ds.memory_cap_soft_bytes = Some(100 * 1024 * 1024);
+                ds.memory_cap_hard_bytes = Some(200 * 1024 * 1024);
+                ds.cgroup_prefix = Some(cgroup.clone());
+                s.sessions.insert("ts-capped-caller".to_string(), ds);
+            }
+            let _ = take_captured_participant_caps_for_test(); // clear prior
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let _resp = start_workflow(&state, &Caller::session("ts-capped-caller"), &json!({
+                "workflow_name": "solo", "goal": "g",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let caps = take_captured_participant_caps_for_test();
+            assert_eq!(caps.len(), 1, "one participant");
+            let (_uid, cap) = &caps[0];
+            assert_eq!(
+                cap.as_ref(),
+                Some(&(
+                    100 * 1024 * 1024u64,
+                    200 * 1024 * 1024u64,
+                    cgroup.to_string_lossy().into_owned(),
+                )),
+                "P-3: participant must inherit the caller's (soft, hard, cgroup) cap",
+            );
+        });
+    }
+
+    /// P-3 (headless config path): an OPERATOR (headless) caller has no caller
+    /// session to inherit from, so participants take the per-engine CONFIGURED
+    /// cap (`CM_SESSION_MEM_SOFT_/HARD_<TYPE>` + computed cgroup prefix). With
+    /// the cap env set and the cgroup prefix present, the participant's spawn
+    /// carries the configured cap — this is the always-on-host case the phase
+    /// targets. (Capture-seam assertion; enforcement is start_session's job.)
+    #[test]
+    fn start_workflow_operator_caller_participants_take_configured_cap() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            // A real temp dir standing in for the app.slice cgroup prefix.
+            let fake_cgroup = home.join("app.slice");
+            std::fs::create_dir_all(&fake_cgroup).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-op".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-op".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            // P-3a: the wire type "claude-code" must normalize to the internal
+            // key "claude" → CM_SESSION_MEM_SOFT_CLAUDE (NOT _CLAUDE-CODE), and
+            // the suffix-aware parser must accept "6G". (env_lock held by
+            // with_temp_home.)
+            std::env::set_var("CM_SESSION_MEM_SOFT_CLAUDE", "6G");
+            std::env::set_var("CM_SESSION_MEM_HARD_CLAUDE", "8G");
+            set_configured_cap_prefix_override_for_test(Some(fake_cgroup.to_string_lossy().into_owned()));
+            let _ = take_captured_participant_caps_for_test();
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+
+            let _resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-op",
+            })).expect("ok");
+
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+            set_configured_cap_prefix_override_for_test(None);
+            std::env::remove_var("CM_SESSION_MEM_SOFT_CLAUDE");
+            std::env::remove_var("CM_SESSION_MEM_HARD_CLAUDE");
+
+            let caps = take_captured_participant_caps_for_test();
+            assert_eq!(caps.len(), 1);
+            let (_uid, cap) = &caps[0];
+            assert_eq!(
+                cap.as_ref(),
+                Some(&(
+                    6u64 * 1024 * 1024 * 1024,
+                    8u64 * 1024 * 1024 * 1024,
+                    fake_cgroup.to_string_lossy().into_owned(),
+                )),
+                "P-3a: 'claude-code' participant must resolve CM_SESSION_MEM_*_CLAUDE \
+                 with suffix-parsed bytes (6G), not the bogus _CLAUDE-CODE / plain parse",
+            );
+        });
+    }
+
+    /// P-3: with NO cap configured (no caller session, no `CM_SESSION_MEM_*`
+    /// env), an Operator-launched participant runs UNCAPPED — graceful, not a
+    /// failed launch. Pins that the configured path is opt-in.
+    #[test]
+    fn start_workflow_operator_caller_participants_are_uncapped() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-op".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-op".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            // Hermetic: ensure no configured cap is in scope (env_lock held).
+            std::env::remove_var("CM_SESSION_MEM_SOFT_CLAUDE");
+            std::env::remove_var("CM_SESSION_MEM_HARD_CLAUDE");
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-op",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            let worker_uid = run.role_sessions["worker"].daemon_session_uid.clone().unwrap();
+            let s = state.lock().unwrap();
+            let worker = s.sessions.get(&worker_uid).expect("worker session");
+            assert!(
+                worker.memory_cap_soft_bytes.is_none() && worker.cgroup_prefix.is_none(),
+                "headless operator participants are uncapped (documented gap; \
+                 needs a daemon.toml cap policy to change)",
+            );
+        });
+    }
+
+    /// Phase 4 (finding 1): a caller-supplied `run_id` is IGNORED — the daemon
+    /// always allocates server-side, so a Session RPC can't reuse an active
+    /// run's id and clobber its state.json.
+    #[test]
+    fn start_workflow_ignores_caller_run_id_and_never_clobbers() {
+        use crate::workflow::run::{RoleBinding, WorkflowRun};
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            // Pre-seed a victim run that must NOT be clobbered.
+            let mut victim_roles = BTreeMap::new();
+            victim_roles.insert("worker".to_string(), RoleBinding { session_label: "worker".into(), current_session_id: Some("victim-sid".into()), daemon_session_uid: None });
+            let victim = WorkflowRun::new("wf_victim".into(), "solo".into(), "ws-1".into(), victim_roles, "worker".into(), BTreeMap::new(), Some("victim goal".into()), BTreeMap::new(), 0);
+            crate::workflow::run::save(&victim).unwrap();
+
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+                "run_id": "wf_victim", "goal": "new run",
+            })).expect("ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+
+            let new_id = resp["run_id"].as_str().unwrap();
+            assert_ne!(new_id, "wf_victim", "caller-supplied run_id ignored");
+            // Victim untouched.
+            let after = crate::workflow::run::load_one("wf_victim").unwrap();
+            assert_eq!(after.goal.as_deref(), Some("victim goal"));
+            assert_eq!(after.role_sessions["worker"].current_session_id.as_deref(), Some("victim-sid"));
+        });
+    }
+
     /// Malformed params surface as InvalidParams.
     #[test]
     fn workflow_update_definitions_malformed_params_rejected() {
@@ -10556,7 +12406,8 @@ mod tests {
             // Event delivered to subscriber AFTER disk write.
             let received = rx
                 .recv_timeout(std::time::Duration::from_millis(200))
-                .expect("subscriber must receive after disk write");
+                .expect("subscriber must receive after disk write")
+                .expect_event();
             assert_eq!(received.id, "ev-optb-1");
         });
     }

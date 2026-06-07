@@ -419,6 +419,16 @@ pub struct DaemonState {
     /// daemon's static-idle gate.
     pub workflow_definitions: HashMap<String, crate::workflow::toml_schema::Workflow>,
 
+    /// Phase 4 (doc/daemon-side-workflow-orchestration.md §B2): the BASE layer
+    /// of workflow definitions, loaded from the daemon's own `workflows_dir`
+    /// (`config.workflows_dir`) at startup. `workflow_definitions` above is the
+    /// OVERRIDE layer fed by the TUI's `workflow.update_definitions` push.
+    /// Lookups check override first, then base (see [`Self::workflow_definition`]),
+    /// so a daemon with NO TUI still has definitions to drive headless runs, and
+    /// a TUI reconnect (which `clear()`s the override) can never wipe the base.
+    pub base_workflow_definitions:
+        HashMap<String, crate::workflow::toml_schema::Workflow>,
+
     /// 10e-a: in-memory broadcaster for `manifest.watch` subscribers.
     /// The reaper's `on_exit` callback (see
     /// `crate::control::methods::start_session`) populates
@@ -522,6 +532,7 @@ impl Default for DaemonState {
             tui_sessions_pushed: false,
             workflow_runs: HashMap::new(),
             workflow_definitions: HashMap::new(),
+            base_workflow_definitions: HashMap::new(),
             manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),
             workflow_event_watcher: Arc::new(
                 crate::workflow::events::WorkflowEventWatcher::new(),
@@ -534,6 +545,21 @@ impl Default for DaemonState {
 impl DaemonState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Phase 4 §B2: resolve a workflow definition by name through the two-layer
+    /// model — the TUI-pushed OVERRIDE layer (`workflow_definitions`) first,
+    /// then the daemon's own BASE layer loaded from `workflows_dir`
+    /// (`base_workflow_definitions`). This is the single lookup the poller,
+    /// `start_workflow`, and `get_workflow_state` use, so a locally-edited TOML
+    /// overrides the deployed base while the base survives a TUI reconnect.
+    pub fn workflow_definition(
+        &self,
+        name: &str,
+    ) -> Option<&crate::workflow::toml_schema::Workflow> {
+        self.workflow_definitions
+            .get(name)
+            .or_else(|| self.base_workflow_definitions.get(name))
     }
 
     /// Populate `workspaces` and `bindings` from

@@ -140,6 +140,12 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # both paths produce byte-identical mutations (fire-output
     # parity test pins this).
     "stop_workflow",
+    # Phase 4 (doc/daemon-side-workflow-orchestration.md §D): start_workflow
+    # relocated from the TUI socket to the daemon. The daemon now spawns
+    # participants, writes the initial state.json, and drives the run headlessly
+    # via its poller (matching dispatch arm: daemon/src/control/dispatch.rs
+    # "start_workflow"). Operator + Session callable.
+    "start_workflow",
     # 10e-b: manifest.watch — TUI subscribes to daemon-side
     # manifest diffs (ManifestSnapshot frame followed by
     # ManifestDiff stream frames). Operator-only at the dispatch
