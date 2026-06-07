@@ -217,14 +217,23 @@ impl Default for PtyModeTracker {
 }
 
 /// Attach a [`PtyModeTracker`] to a live [`PtyByteFanout`]: subscribe to the
-/// session's output, then feed each delivered chunk into the tracker on a
-/// background thread (stamping `Instant::now()` as the observation time). The
-/// returned handle is shared with the feeder thread; callers read mode/quiet
-/// state through it. The thread exits when the fanout closes (child exit), so
-/// the handle stops updating but stays readable.
+/// session's output, SYNCHRONOUSLY seed the tracker with the fanout's replay
+/// (the current ring contents), then feed each subsequent chunk on a background
+/// thread (stamping `Instant::now()`). The returned handle is shared with the
+/// feeder thread; callers read mode/quiet state through it. The thread exits
+/// when the fanout closes (child exit), so the handle stops updating but stays
+/// readable.
 ///
-/// Phase 1 wiring only — nothing consumes this yet; Phase 3's delivery drainer
-/// will own the handle for each daemon-driven participant.
+/// The synchronous seed is load-bearing for the delivery drainer. `subscribe()`
+/// enqueues the replay inline (before it returns), but draining it on the
+/// background thread leaves a window where the drainer's FIRST
+/// `advance_finalization` read sees a brand-new tracker: an empty wakeup ring
+/// (`quiet_for` falsely reports QUIET) and a default `TermMode` (raw `\r`
+/// instead of the live kitty `CSI 13u`). Against a codex reviewer in kitty mode
+/// that raw `\r` lands as a literal and the prompt/`/clear` never submits — the
+/// same non-submission failure the Phase 2 body/Enter split fixed. Draining the
+/// replay here, before returning, guarantees the first read sees the real
+/// terminal mode AND a correctly-stamped recent wakeup.
 pub fn spawn_for_fanout(
     fanout: &Arc<PtyByteFanout>,
     cols: usize,
@@ -232,11 +241,20 @@ pub fn spawn_for_fanout(
 ) -> Arc<Mutex<PtyModeTracker>> {
     let rx = fanout.subscribe();
     let tracker = Arc::new(Mutex::new(PtyModeTracker::with_size(cols, rows)));
+    // Seed synchronously: drain every chunk already queued (the replay the
+    // subscribe enqueued inline, plus any live push that raced in). `try_recv`
+    // is non-blocking, so this returns as soon as the channel is momentarily
+    // empty; the feeder thread below picks up everything after.
+    {
+        let mut t = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        while let Ok(chunk) = rx.try_recv() {
+            t.feed(&chunk, Instant::now());
+        }
+    }
     let feeder = Arc::clone(&tracker);
     thread::spawn(move || {
-        // The first item is the fanout's replay (current ring contents); we
-        // stamp all of it with the spawn-time "now". Subsequent items are live
-        // pushes. On `Disconnected` (fanout closed) the loop ends.
+        // Live pushes after the synchronous seed. On `Disconnected` (fanout
+        // closed) the loop ends.
         while let Ok(chunk) = rx.recv() {
             let now = Instant::now();
             let mut t = feeder.lock().unwrap_or_else(|p| p.into_inner());
@@ -249,6 +267,36 @@ pub fn spawn_for_fanout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// First-use race regression: a tracker created over a fanout whose replay
+    /// buffer ALREADY carries kitty-mode-enabling output must, on its FIRST read
+    /// (no separate feed, no sleep), report the kitty Enter encoding and NOT be
+    /// falsely quiet — i.e. `spawn_for_fanout` seeded the replay synchronously
+    /// before returning. Deterministic: no timing sleeps; the seed happens
+    /// inline, so the lock immediately observes the real mode + a recent wakeup.
+    #[test]
+    fn spawn_for_fanout_seeds_replay_synchronously() {
+        let fanout = Arc::new(PtyByteFanout::new(4096));
+        // Pre-load the ring as if the codex reviewer had already enabled kitty
+        // keyboard + bracketed paste during startup.
+        fanout.push(b"\x1b[?2004h\x1b[>1ustartup banner...");
+
+        let tracker = spawn_for_fanout(&fanout, 80, 24);
+        let t = tracker.lock().unwrap_or_else(|p| p.into_inner());
+
+        // FIRST read — real mode captured from the replay, NOT the default.
+        assert!(
+            t.term_mode().contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "kitty mode must be seeded synchronously"
+        );
+        assert_eq!(t.enter_bytes(), b"\x1b[13u", "live kitty Enter, not raw \\r");
+        assert!(t.bracketed_paste(), "bracketed paste seeded synchronously");
+        // And the replay stamped a recent wakeup, so it is NOT falsely quiet.
+        assert!(
+            !t.quiet_for(Duration::from_secs(2), Instant::now()),
+            "replay must stamp a recent wakeup — not falsely quiet on first read"
+        );
+    }
 
     /// `\x1b[?2004h` enables bracketed paste; `\x1b[>1u` pushes the kitty
     /// keyboard mode whose flag bit 1 is DISAMBIGUATE_ESC_CODES.

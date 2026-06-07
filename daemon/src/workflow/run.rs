@@ -36,7 +36,7 @@ pub enum RunStatus {
 ///
 /// The `serialize_trigger_wire_shape` test in this module pins the JSON
 /// for every variant — update it deliberately when the schema changes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerKind {
     /// The role that started the run (no prior role).
@@ -140,6 +140,83 @@ pub struct RejectedFinding {
     pub iteration: u32,
 }
 
+/// Finalization phase of a daemon-driven activation hand-off, persisted on
+/// [`PendingActivation`] so a daemon restart mid-finalization resumes from the
+/// recorded step (Phase 3 of `doc/daemon-side-workflow-orchestration.md`).
+///
+/// Order (persistent roles skip `ClearBodySent` and `RebindPending`):
+/// `Queued` -> `Rendered` -> [`ClearBodySent`] -> `Appended` -> `BodySent`
+/// -> [`RebindPending`] -> `Done`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationPhase {
+    /// Recorded by `workflow_transition`; nothing rendered/delivered yet.
+    Queued,
+    /// Activation prompt rendered + frozen onto the record (step 1). Rendered
+    /// from the PRE-reset, PRE-append run snapshot.
+    Rendered,
+    /// FRESH only: `/clear` body written, role baseline reset to zero,
+    /// `current_session_id` cleared, pre-`/clear` listing snapshot stored; the
+    /// `/clear` Enter is pending (fires after the deferred gap).
+    ClearBodySent,
+    /// The incoming role's `HistoryEntry` has been appended (counts from step 3,
+    /// `session_id` = stable sid for persistent / pending for fresh). The prompt
+    /// body has NOT been written yet.
+    Appended,
+    /// Prompt body written (step 5); the prompt Enter is pending (deferred gap).
+    BodySent,
+    /// FRESH only: prompt Enter fired, awaiting sid discovery (step 6). The idle
+    /// gate stays inert (`NoTranscriptId`) until `current_session_id` rebinds.
+    RebindPending,
+    /// Finalization complete.
+    Done,
+}
+
+/// Durable record of an in-flight activation hand-off, recorded by
+/// `workflow_transition` in the same flock mutation that advances `active_role`
+/// and consumed by the daemon delivery drainer. Carries everything finalization
+/// needs to render the prompt and reconstruct the incoming role's history entry
+/// WITHOUT re-reading `events.jsonl`, so it survives a daemon restart
+/// mid-finalization. Additive (`#[serde(default)]` on the run field), so older
+/// state.json files deserialize with `None`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingActivation {
+    /// Monotonic-within-run id (the post-mutation `iteration`); the history
+    /// idempotency guard keys on `(role, iteration)`.
+    pub activation_id: u64,
+    /// Incoming (to) role.
+    pub target_role: String,
+    /// Post-mutation iteration captured in the transition closure.
+    pub iteration: u32,
+    /// Trigger/history metadata, used to reconstruct the `HistoryEntry`'s
+    /// `TriggerKind` at finalization (never re-read from events): `StaticIdle`
+    /// for poller fires, `McpTransition { prompt, event_id }` for MCP fires.
+    pub trigger: TriggerKind,
+    /// RAW supplied prompt (empty for static fires; the MCP `prompt` otherwise).
+    /// Rendered at finalization with the empty -> activation-template fallback.
+    pub raw_prompt: String,
+    /// Whether the target role is `Context::Fresh` (needs `/clear` + rebind).
+    pub needs_fresh_reset: bool,
+    /// Finalization phase; advanced + persisted step by step.
+    pub phase: ActivationPhase,
+    /// The rendered activation prompt, frozen at finalization step 1 so a crash
+    /// after the append resumes delivery from the frozen text rather than
+    /// re-rendering against now-larger history.
+    #[serde(default)]
+    pub rendered_prompt: Option<String>,
+    /// FRESH rebind key: the pre-`/clear` transcript-dir listing snapshot,
+    /// filled at the reset. Discovery diffs against it; persisting it lets a
+    /// restart in `RebindPending` resume discovery.
+    #[serde(default)]
+    pub pre_clear_snapshot: Option<Vec<String>>,
+    /// Unix-ms deadline after which the currently-pending Enter keystroke
+    /// (`/clear`'s in `ClearBodySent`, the prompt's in `BodySent`) should fire.
+    /// The Enter ENCODING is NOT frozen — it is recomputed from the live
+    /// terminal mode at fire time. Persisted so a restart mid-gap still fires.
+    #[serde(default)]
+    pub enter_fire_at_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowRun {
     pub run_id: String,
@@ -191,6 +268,13 @@ pub struct WorkflowRun {
     /// nits round after round.
     #[serde(default)]
     pub rejected_findings: Vec<RejectedFinding>,
+    /// In-flight activation hand-off the daemon delivery drainer is finalizing.
+    /// Recorded by `workflow_transition` alongside the close/iteration/active_role
+    /// mutation; cleared when finalization reaches `ActivationPhase::Done` (or
+    /// rolled back if the event append exhausts). `None` when no hand-off is
+    /// mid-flight. Additive — older state.json files deserialize to `None`.
+    #[serde(default)]
+    pub pending_activation: Option<PendingActivation>,
 }
 
 impl WorkflowRun {
@@ -241,6 +325,7 @@ impl WorkflowRun {
             goal,
             role_plans,
             rejected_findings: Vec::new(),
+            pending_activation: None,
         }
     }
 

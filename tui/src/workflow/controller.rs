@@ -1198,7 +1198,52 @@ impl<'a> WorkflowControllerCtx<'a> {
                             .get("trigger")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
-                        if let Some(from) = from_opt {
+                        // Phase 3 (doc/daemon-side-workflow-orchestration.md)
+                        // double-drive gate. The daemon poller fires this
+                        // transition (writing the "daemon"-source event the TUI
+                        // is tailing here) and its delivery drainer finalizes
+                        // the hand-off: renders, runs /clear, submits the
+                        // prompt, AND appends the incoming role's history entry.
+                        // For a daemon-owned run the TUI must therefore decline
+                        // to drive the DYNAMIC path too — not just the
+                        // static-idle arm (~1379). Otherwise the run gets a
+                        // double prompt / double /clear, and the TUI's append
+                        // (which passes text_messages_at_start=0) can win the
+                        // race and corrupt a persistent role's baseline.
+                        // Ownership signal = the target role binding carries a
+                        // `daemon_session_uid` (same signal `daemon_owns_run`
+                        // and the static arm use). Observe (reload state.json)
+                        // + Skip, exactly like the daemon-routed RejectFinding
+                        // arm below — preserving the no-double-drive migration
+                        // invariant (doc rollout §"no double-drive").
+                        let daemon_owns = self.workflow_runs[idx]
+                            .role_sessions
+                            .get(&to)
+                            .map(|b| b.daemon_session_uid.is_some())
+                            .unwrap_or(false);
+                        if daemon_owns {
+                            if let Some(reloaded) =
+                                crate::workflow::run::load_one(&run_id)
+                            {
+                                self.workflow_runs[idx] = reloaded;
+                            }
+                            log_tick(
+                                &run_id,
+                                &format!(
+                                    "skipping dynamic activation for role {:?}: \
+                                     daemon owns this run — daemon drainer \
+                                     delivers + appends (no double-drive)",
+                                    to,
+                                ),
+                            );
+                            decisions.push(Decision::Skip {
+                                run_id: run_id.clone(),
+                                reason: format!(
+                                    "daemon-owned run: drainer delivers role {:?}",
+                                    to,
+                                ),
+                            });
+                        } else if let Some(from) = from_opt {
                             decisions.push(Decision::ActivateDynamic {
                                 run_id: run_id.clone(),
                                 to,
@@ -2930,14 +2975,20 @@ mod tests {
         });
     }
 
-    /// F3 — TUI tail processing a daemon-source event whose
-    /// `args.trigger == "static_idle"` records the history entry
-    /// with `TriggerKind::StaticIdle{from_role}`, NOT
-    /// `TriggerKind::McpTransition`. Pre-fix all daemon-source
-    /// events landed as McpTransition, mis-tagging poller-driven
-    /// idle fires.
+    /// Phase 3 (reviewer High #1 — double-drive regression). For a DAEMON-OWNED
+    /// run (the active/target role binding carries a `daemon_session_uid`), the
+    /// daemon poller fires the transition and its delivery drainer finalizes the
+    /// hand-off — rendering, /clear, submitting the prompt, AND appending the
+    /// incoming role's history entry. The TUI tail, processing the same
+    /// daemon-source event, must DECLINE to drive on the dynamic path too (not
+    /// just the static-idle arm): it must NOT deliver and NOT append, or the run
+    /// gets a double prompt and a persistent-role baseline race.
+    ///
+    /// This test used to assert the OPPOSITE (the TUI appending the entry) —
+    /// that was exactly the double-drive bug. Daemon-side trigger tagging is now
+    /// covered by `cm_daemon::workflow::finalize` tests.
     #[test]
-    fn tui_tail_records_static_idle_trigger_from_daemon_poller_event() {
+    fn tui_declines_to_drive_daemon_owned_run_on_dynamic_path() {
         with_temp_home(|| {
             let run_id = "wf_f3_static_idle_history";
             let run = make_run(run_id, "feedback", "worker");
@@ -3018,28 +3069,24 @@ mod tests {
                 let _ = ctx.tick();
             }
 
-            // History should have an entry for "reviewer" with
-            // `TriggerKind::StaticIdle{from_role: "worker"}`.
+            // The TUI declined: NO reviewer history entry was appended (the
+            // daemon drainer owns that), and active_role/iteration were not
+            // advanced by the TUI. Exactly-once delivery: the daemon does the
+            // one delivery+append; the TUI does zero.
             let post = workflow::run::load_one(run_id).expect("post load");
-            let reviewer_entry = post
-                .history
-                .iter()
-                .rev()
-                .find(|h| h.role == "reviewer")
-                .expect("reviewer history entry");
-            match &reviewer_entry.trigger {
-                workflow::run::TriggerKind::StaticIdle { from_role } => {
-                    assert_eq!(
-                        from_role, "worker",
-                        "StaticIdle.from_role should be worker, got {:?}",
-                        from_role,
-                    );
-                }
-                other => panic!(
-                    "expected TriggerKind::StaticIdle, got {:?}",
-                    other,
-                ),
-            }
+            assert!(
+                post.history.iter().all(|h| h.role != "reviewer"),
+                "TUI must NOT append a reviewer entry for a daemon-owned run \
+                 (daemon drainer does); history={:?}",
+                post.history.iter().map(|h| &h.role).collect::<Vec<_>>(),
+            );
+
+            // And it did not queue a delivery to the reviewer's PTY.
+            let reviewer = &workspaces[0].sessions[1];
+            assert!(
+                reviewer.pending_prompt.is_none() && reviewer.pending_clear.is_none(),
+                "TUI must NOT queue a prompt/clear for a daemon-owned run",
+            );
         });
     }
 
@@ -3193,7 +3240,7 @@ mod tests {
                     assistant_count: 1,
                 },
             );
-            let run = WorkflowRun::new(
+            let mut run = WorkflowRun::new(
                 "wf-parity".to_string(),
                 "feedback".to_string(),
                 "/parity".to_string(),
@@ -3204,6 +3251,23 @@ mod tests {
                 BTreeMap::new(),
                 0,
             );
+            // `this_turn` slices the role's assistant messages from its latest
+            // history entry's `text_messages_at_start`. Set it to 1 so this_turn
+            // drops "answer one" and keeps "answer two" — a meaningful slice
+            // that diverges if either resolver mis-reads the offset.
+            run.history[0].text_messages_at_start = 1;
+            // Populate rejected_findings so `{{ rejected_findings }}` is
+            // non-empty (the daemon resolver must override the empty default).
+            run.rejected_findings.push(workflow::run::RejectedFinding {
+                text: "stop flagging the unused import".to_string(),
+                recorded_at: 0,
+                iteration: 1,
+            });
+            run.rejected_findings.push(workflow::run::RejectedFinding {
+                text: "the TODO comment is intentional".to_string(),
+                recorded_at: 0,
+                iteration: 1,
+            });
 
             let mut role_engines = BTreeMap::new();
             role_engines.insert("worker".to_string(), Engine::ClaudeCode);
@@ -3234,6 +3298,11 @@ mod tests {
                 "{{ roles.worker.last_message }}",
                 "{{ goal }}",
                 "review: {{ roles.worker.last_message }} ({{ goal }})",
+                // Phase 3 parity additions: this_turn (sliced from the
+                // activation's text_messages_at_start) and rejected_findings.
+                "{{ roles.worker.this_turn }}",
+                "{{ rejected_findings }}",
+                "turn: {{ roles.worker.this_turn }} | rejected: {{ rejected_findings }}",
             ] {
                 let tui_out = workflow::template::render(tpl, &tui_resolver);
                 let dae_out = workflow::template::render(tpl, &dae_resolver);

@@ -28,6 +28,7 @@
 //! follows.
 
 pub mod events;
+pub mod finalize;
 pub mod fresh_reset;
 pub mod history;
 pub mod poller;

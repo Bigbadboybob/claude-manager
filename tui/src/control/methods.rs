@@ -2338,6 +2338,7 @@ mod tests {
             goal: None,
             role_plans: Default::default(),
             rejected_findings: Vec::new(),
+            pending_activation: None,
         }
     }
 

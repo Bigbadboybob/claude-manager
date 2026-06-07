@@ -67,6 +67,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Wall-clock milliseconds since the Unix epoch. Used by the delivery drainer
+/// for the persisted deferred-Enter gap deadline (`enter_fire_at_ms`).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 use crate::control::protocol::Caller;
 use crate::state::DaemonState;
 use crate::workflow::run::WorkflowRun;
@@ -249,6 +258,19 @@ pub struct WorkflowPoller {
     /// never sets this.
     pre_apply_hook:
         Mutex<Option<Box<dyn Fn(&mut DaemonState) + Send + Sync>>>,
+    /// Phase 3: per-session terminal-mode/quiet trackers (Phase 1
+    /// `PtyModeTracker`), lazily attached to each owned session's
+    /// `PtyByteFanout` the first time the delivery drainer finalizes against
+    /// it. Keyed by session uid.
+    finalize_trackers:
+        Mutex<std::collections::HashMap<String, Arc<Mutex<crate::workflow::pty_tracker::PtyModeTracker>>>>,
+    /// Phase 3: deferred-Enter gap (ms) the delivery drainer uses between a
+    /// body write and its Enter. Production = `DEFAULT_ENTER_GAP_MS`; tests set
+    /// 0 for instant delivery.
+    finalize_gap_ms: AtomicU64,
+    /// Phase 3: PTY-quiet window (ms) the delivery drainer requires before
+    /// writing a body. Production = 2000; tests set 0 to bypass the gate.
+    finalize_quiet_ms: AtomicU64,
 }
 
 impl WorkflowPoller {
@@ -263,7 +285,17 @@ impl WorkflowPoller {
             panic_record: Arc::new(Mutex::new(None)),
             disable_apply_for_test: AtomicBool::new(false),
             pre_apply_hook: Mutex::new(None),
+            finalize_trackers: Mutex::new(std::collections::HashMap::new()),
+            finalize_gap_ms: AtomicU64::new(crate::workflow::finalize::DEFAULT_ENTER_GAP_MS),
+            finalize_quiet_ms: AtomicU64::new(2_000),
         }
+    }
+
+    /// Test-only: set the delivery drainer's deferred-Enter gap and PTY-quiet
+    /// window (both in ms). Tests pass `(0, 0)` for instant, gate-free delivery.
+    pub fn set_finalize_timing_for_test(&self, gap_ms: u64, quiet_ms: u64) {
+        self.finalize_gap_ms.store(gap_ms, Ordering::SeqCst);
+        self.finalize_quiet_ms.store(quiet_ms, Ordering::SeqCst);
     }
 
     /// Test-only setter. Skips the apply phase so callers can
@@ -425,9 +457,154 @@ impl WorkflowPoller {
                     }
                 }
             }
+            // Phase 3: complete in-flight hand-offs. Keyed off run state
+            // (`pending_activation`), gated on `daemon_owns_run`, idempotent —
+            // re-runs a half-finalized activation after a crash and never
+            // double-applies. Runs AFTER the fire loop so a just-fired
+            // transition's Queued record gets finalized starting this tick.
+            self.drain_finalizations();
         }
 
         decisions
+    }
+
+    /// Advance every daemon-owned run's `pending_activation` to completion (or
+    /// until it blocks on PTY-quiet / the Enter gap / sid rebind). For each, it
+    /// resolves the target role's owned session, attaches a `PtyModeTracker` to
+    /// its `PtyByteFanout` (lazily, cached by uid), and drives
+    /// [`finalize::advance_finalization`] — porting `submit_prompt`'s body/Enter
+    /// separation and engine-correct Enter encoding into the daemon.
+    fn drain_finalizations(&self) {
+        struct Work {
+            run_id: String,
+            uid: String,
+            worktree: std::path::PathBuf,
+            workflow: Workflow,
+            role_engines: BTreeMap<String, Engine>,
+        }
+        // Collect work + resolve session/worktree under the lock (pure read).
+        let work: Vec<Work> = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            crate::workflow::run::load_all()
+                .into_iter()
+                // Running AND not paused — NOT `is_active()`, which also
+                // matches Paused. A paused run (e.g. the user typed into the
+                // participant session) must NOT get /clear/body/Enter shoved
+                // into its PTY: that fights the user's input. Mirrors the
+                // poller gate's `snap.paused` skip and the TUI's
+                // `if paused { continue; }` short-circuit before delivery.
+                .filter(|run| {
+                    matches!(run.status, crate::workflow::run::RunStatus::Running)
+                        && !run.paused
+                        && run.pending_activation.is_some()
+                })
+                .filter(|run| daemon_owns_run(&state, run))
+                .filter_map(|run| {
+                    let pa = run.pending_activation.as_ref()?;
+                    let uid = run
+                        .role_sessions
+                        .get(&pa.target_role)?
+                        .daemon_session_uid
+                        .clone()?;
+                    if !state.sessions.contains_key(&uid) {
+                        return None;
+                    }
+                    let workflow = state.workflow_definitions.get(&run.workflow_name).cloned()?;
+                    // Worktree via the active (== target) role's bound session.
+                    let ws_id = run
+                        .active_role
+                        .as_deref()
+                        .and_then(|active| resolve_role_session_context(&state, &run, active))
+                        .map(|c| c.workspace_id);
+                    let key = ws_id.as_deref().unwrap_or(run.task_key.as_str());
+                    let worktree = state
+                        .workspaces
+                        .get(key)
+                        .and_then(|ws| ws.worktree_path.clone())?;
+                    let mut role_engines = BTreeMap::new();
+                    for role in workflow.roles.keys() {
+                        let st = resolve_role_session_type(&state, &run, role)
+                            .unwrap_or_else(|| "claude-code".to_string());
+                        role_engines.insert(role.clone(), engine_for_session_type(&st));
+                    }
+                    Some(Work {
+                        run_id: run.run_id.clone(),
+                        uid,
+                        worktree,
+                        workflow,
+                        role_engines,
+                    })
+                })
+                .collect()
+        };
+
+        let gap_ms = self.finalize_gap_ms.load(Ordering::SeqCst);
+        let quiet_ms = self.finalize_quiet_ms.load(Ordering::SeqCst);
+
+        for w in work {
+            // Clone the input handle + fanout out of state, drop the state lock
+            // before any PTY write (the lock contract from `DaemonSession`).
+            let handle_fanout = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state
+                    .sessions
+                    .get(&w.uid)
+                    .map(|s| (s.input_handle(), Arc::clone(&s.fanout)))
+            };
+            let Some((handle, fanout)) = handle_fanout else {
+                continue;
+            };
+            let tracker = self.tracker_for(&w.uid, &fanout);
+
+            // Advance until the run blocks or completes this tick.
+            loop {
+                let ctx = crate::workflow::finalize::FinalizeCtx {
+                    run_id: &w.run_id,
+                    workflow: &w.workflow,
+                    worktree: &w.worktree,
+                    role_engines: w.role_engines.clone(),
+                    now_ms: now_unix_ms(),
+                    now_instant: Instant::now(),
+                    gap_ms,
+                    quiet_window: Duration::from_millis(quiet_ms),
+                };
+                let guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+                let step = crate::workflow::finalize::advance_finalization(
+                    &ctx,
+                    &guard,
+                    |b| handle.write_and_stamp(b),
+                );
+                drop(guard);
+                match step {
+                    Ok(crate::workflow::finalize::FinalizeStep::Advanced(_)) => continue,
+                    Ok(_) => break,
+                    Err(e) => {
+                        eprintln!(
+                            "cm-daemon: finalize drainer error for run {}: {}",
+                            w.run_id, e
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get-or-create the per-session `PtyModeTracker`, attaching it to the
+    /// session's `PtyByteFanout` on first use so it observes the live terminal
+    /// mode + output-quiet timing.
+    fn tracker_for(
+        &self,
+        uid: &str,
+        fanout: &Arc<crate::session::PtyByteFanout>,
+    ) -> Arc<Mutex<crate::workflow::pty_tracker::PtyModeTracker>> {
+        let mut map = self.finalize_trackers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = map.get(uid) {
+            return Arc::clone(t);
+        }
+        let t = crate::workflow::pty_tracker::spawn_for_fanout(fanout, 80, 24);
+        map.insert(uid.to_string(), Arc::clone(&t));
+        t
     }
 
     /// 2c-2-2-b real evaluate. The hot path:
@@ -608,7 +785,13 @@ impl WorkflowPoller {
         run_id: &str,
         from_role: &str,
         to_role: &str,
-        rendered_prompt: &str,
+        // Phase 3: the poller no longer pre-renders the activation prompt into
+        // the transition. It records the RAW source on `pending_activation`
+        // (empty for static fires) and the finalization drainer renders ONCE,
+        // at finalization, from the pre-reset/pre-append snapshot. The Decision
+        // still carries the poll-time render for observability/tests, but it is
+        // NOT threaded into the hand-off — hence the leading underscore.
+        _rendered_prompt: &str,
     ) -> Result<(), String> {
         // 10d-2c-2-2-b F2 + F3:
         // - `expected_from`: snapshot's active_role. If state.json
@@ -630,7 +813,9 @@ impl WorkflowPoller {
             "run_id": run_id,
             "to": to_role,
             "role": from_role,
-            "prompt": rendered_prompt,
+            // Empty: static fires carry no prompt. Finalization falls back to
+            // the target role's (subsequent_)activation_prompt and renders it.
+            "prompt": "",
             "expected_from": from_role,
             "trigger": "static_idle",
         });
@@ -1108,6 +1293,38 @@ impl<'a> crate::workflow::template::RoleResolver for DaemonWorkflowResolver<'a> 
         .collect()
     }
 
+    /// `{{ roles.<role>.this_turn }}` — everything the role has said since its
+    /// most recent activation. Mirrors the TUI's `WorkflowResolver`
+    /// (`tui/src/workflow/controller.rs:298`): slice `list_messages` from the
+    /// role's latest history entry's `text_messages_at_start` (the text-bearing
+    /// count snapshotted at activation, NOT the `count_messages` turn count).
+    /// Without this override the default impl falls back to `assistant_messages`
+    /// (sliced by `role_baselines`), which is the LAUNCH offset, not the
+    /// per-activation offset — so the manager's prompt would surface the whole
+    /// run instead of just this round.
+    fn assistant_since_activation(&self, role: &str) -> Vec<String> {
+        let Some((engine, wt, sid)) = self.lookup(role) else {
+            return Vec::new();
+        };
+        let offset = self
+            .run
+            .history
+            .iter()
+            .rev()
+            .find(|h| h.role == role)
+            .map(|h| h.text_messages_at_start)
+            .unwrap_or(0);
+        crate::workflow::transcript::list_messages(
+            &engine,
+            wt,
+            sid,
+            crate::workflow::transcript::MessageKind::Assistant,
+        )
+        .into_iter()
+        .skip(offset)
+        .collect()
+    }
+
     fn prior_user_messages(&self, role: &str) -> Vec<String> {
         let Some((engine, wt, sid)) = self.lookup(role) else {
             return Vec::new();
@@ -1162,6 +1379,19 @@ impl<'a> crate::workflow::template::RoleResolver for DaemonWorkflowResolver<'a> 
 
     fn goal(&self) -> Option<String> {
         self.run.goal.clone()
+    }
+
+    /// `{{ rejected_findings }}` — the manager's dismissed findings, surfaced to
+    /// the reviewer so it stops re-raising them. Mirrors the TUI's
+    /// `WorkflowResolver` (`tui/src/workflow/controller.rs:380`). Without this
+    /// override the trait default returns empty, so the daemon-rendered reviewer
+    /// prompt would drop the `{{ rejected_findings }}` section entirely.
+    fn rejected_findings(&self) -> Vec<String> {
+        self.run
+            .rejected_findings
+            .iter()
+            .map(|r| r.text.clone())
+            .collect()
     }
 }
 
@@ -1665,6 +1895,255 @@ mod tests {
             }
             other => panic!("expected ActivateStatic, got {:?}", other),
         }
+    }
+
+    /// Phase 3 headless end-to-end (doc/daemon-side-workflow-orchestration.md):
+    /// a daemon-owned worker goes idle, `poll_once` fires worker->reviewer, and
+    /// the delivery drainer (same `poll_once`) resets the FRESH reviewer,
+    /// appends its history entry with both counts 0, delivers the rendered
+    /// prompt, and — after the reviewer produces a turn — rebinds the new
+    /// transcript. No TUI process anywhere.
+    #[test]
+    fn poll_once_finalizes_fresh_reviewer_headlessly_end_to_end() {
+        use crate::session::{DaemonSession, SpawnParams};
+        use crate::workflow::toml_schema::{Context, Role, Transition, TriggerOn, Workflow};
+
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp_home.path());
+        let home = _tmp_home.path();
+
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = home.join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        // Worker idle with one complete assistant turn -> gate fires.
+        std::fs::write(
+            proj.join("sid-worker.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"implemented the thing"}]}}"##,
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("rE2E");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), Role {
+                engine: Engine::ClaudeCode, context: Context::Persistent,
+                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false,
+            });
+            roles.insert("reviewer".to_string(), Role {
+                engine: Engine::ClaudeCode, context: Context::Fresh,
+                activation_prompt: Some("Review this: {{ roles.worker.last_message }}".to_string()),
+                subsequent_activation_prompt: None, needs_mcp: false,
+            });
+            // Manager exists so the reviewer HAS an on_idle transition — that
+            // way the reviewer's inert gate reports NoTranscriptId (sid unbound),
+            // not NoOnIdleTransition. Manager itself is never reached in this test.
+            roles.insert("manager".to_string(), Role {
+                engine: Engine::ClaudeCode, context: Context::Persistent,
+                activation_prompt: Some("decide".to_string()), subsequent_activation_prompt: None, needs_mcp: false,
+            });
+            s.workflow_definitions.insert("feedback".to_string(), Workflow {
+                name: "feedback".to_string(), description: String::new(), roles,
+                role_order: vec!["worker".to_string(), "reviewer".to_string(), "manager".to_string()],
+                transitions: vec![
+                    Transition { from: "worker".to_string(), on: TriggerOn::Idle, to: "reviewer".to_string() },
+                    Transition { from: "reviewer".to_string(), on: TriggerOn::Idle, to: "manager".to_string() },
+                ],
+            });
+
+            for (uid, role) in [("ts-worker", "worker"), ("ts-reviewer", "reviewer")] {
+                let mut sp = SpawnParams::new(uid, role, "/bin/sleep");
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "/tmp/wf-poller-test".to_string();
+                sp.session_type = "claude-code".to_string();
+                sp.workflow_run_id = Some("rE2E".to_string());
+                sp.workflow_role = Some(role.to_string());
+                let ds = DaemonSession::spawn(sp).expect("spawn /bin/sleep");
+                s.sessions.insert(uid.to_string(), ds);
+            }
+        }
+        bind_daemon_uid_to_role("rE2E", "worker", "ts-worker");
+        // Add the reviewer role binding (fresh, bound to its daemon session).
+        crate::workflow::run::modify("rE2E", |r| {
+            r.role_sessions.insert("reviewer".to_string(), RoleBinding {
+                session_label: "reviewer".to_string(),
+                current_session_id: Some("sid-reviewer-old".to_string()),
+                daemon_session_uid: Some("ts-reviewer".to_string()),
+            });
+        })
+        .unwrap();
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_finalize_timing_for_test(0, 0); // instant, gate-free delivery
+
+        // Tick 1: fire worker->reviewer, then finalize up to rebind-pending.
+        poller.poll_once();
+
+        let run = crate::workflow::run::load_one("rE2E").unwrap();
+        assert_eq!(run.active_role.as_deref(), Some("reviewer"), "transition fired");
+        let pa = run.pending_activation.as_ref().expect("finalizing");
+        assert_eq!(
+            pa.phase,
+            crate::workflow::run::ActivationPhase::RebindPending,
+            "delivered, awaiting rebind"
+        );
+        // Fresh reviewer history entry: both counts 0 (post-/clear, NOT worker's).
+        let entry = run.history.iter().rev().find(|h| h.role == "reviewer").unwrap();
+        assert_eq!(entry.assistant_count_at_start, 0);
+        assert_eq!(entry.text_messages_at_start, 0);
+        assert!(entry.session_id.is_none(), "session_id pending pre-rebind");
+        // current_session_id cleared by the fresh reset; gate inert.
+        assert!(run.role_sessions["reviewer"].current_session_id.is_none());
+        // The gate stays inert via NoTranscriptId (current_session_id unbound),
+        // NOT NoHistoryEntry — the history entry WAS appended this hand-off.
+        let decisions = poller.poll_once();
+        let reason = decisions.iter().find_map(|d| match d {
+            Decision::Skip { run_id, reason } if run_id == "rE2E" => Some(reason),
+            _ => None,
+        });
+        assert!(
+            matches!(reason, Some(SkipReason::NoTranscriptId)),
+            "gate inert via NoTranscriptId, never NoHistoryEntry; got {:?}",
+            reason
+        );
+
+        // The reviewer produces its turn (writes a NEW transcript).
+        std::fs::write(
+            proj.join("sid-reviewer-new.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"found a bug"}]}}"##,
+        )
+        .unwrap();
+
+        // Tick 2: discovery rebinds, patches the entry, finalization completes.
+        poller.poll_once();
+
+        let run = crate::workflow::run::load_one("rE2E").unwrap();
+        assert!(run.pending_activation.is_none(), "finalization done");
+        assert_eq!(
+            run.role_sessions["reviewer"].current_session_id.as_deref(),
+            Some("sid-reviewer-new"),
+            "rebound to the reviewer's NEW transcript"
+        );
+        let entry = run.history.iter().rev().find(|h| h.role == "reviewer").unwrap();
+        assert_eq!(entry.session_id.as_deref(), Some("sid-reviewer-new"), "entry patched");
+        // The reviewer's assistant turn count incremented past its (0) baseline.
+        assert!(
+            crate::workflow::transcript::assistant_turn_completed_since(
+                &Engine::ClaudeCode, &wt, "sid-reviewer-new", 0,
+            ),
+            "reviewer advanced a turn after receiving the prompt"
+        );
+    }
+
+    /// Phase 3 (reviewer High #2): the delivery drainer must NOT drive a
+    /// PAUSED run. `is_active()` returns true for Paused, but a paused run
+    /// (e.g. the user typed into the participant session) must not get
+    /// /clear/body/Enter shoved into its PTY. Asserts the pending_activation is
+    /// untouched while paused, then advances once unpaused.
+    #[test]
+    fn drain_finalizations_skips_paused_runs() {
+        use crate::session::{DaemonSession, SpawnParams};
+        use crate::workflow::run::{ActivationPhase, PendingActivation, TriggerKind};
+        use crate::workflow::toml_schema::{Context, Role, Transition, TriggerOn, Workflow};
+
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp_home.path());
+        let home = _tmp_home.path();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = home.join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("sid-rev.jsonl"), "").unwrap();
+
+        let state = make_state_with_one_active_run("rPause");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+            let mut roles = BTreeMap::new();
+            roles.insert("worker".to_string(), Role {
+                engine: Engine::ClaudeCode, context: Context::Persistent,
+                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false,
+            });
+            roles.insert("reviewer".to_string(), Role {
+                engine: Engine::ClaudeCode, context: Context::Fresh,
+                activation_prompt: Some("review".to_string()),
+                subsequent_activation_prompt: None, needs_mcp: false,
+            });
+            s.workflow_definitions.insert("feedback".to_string(), Workflow {
+                name: "feedback".to_string(), description: String::new(), roles,
+                role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                transitions: vec![Transition {
+                    from: "worker".to_string(), on: TriggerOn::Idle, to: "reviewer".to_string(),
+                }],
+            });
+            let mut sp = SpawnParams::new("ts-rev", "reviewer", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.session_type = "claude-code".to_string();
+            sp.workflow_run_id = Some("rPause".to_string());
+            sp.workflow_role = Some("reviewer".to_string());
+            s.sessions.insert("ts-rev".to_string(), DaemonSession::spawn(sp).expect("spawn"));
+        }
+        // Run mid-hand-off: active=reviewer, pending_activation Queued, PAUSED.
+        crate::workflow::run::modify("rPause", |r| {
+            r.active_role = Some("reviewer".to_string());
+            r.role_sessions.insert("reviewer".to_string(), RoleBinding {
+                session_label: "reviewer".to_string(),
+                current_session_id: Some("sid-rev".to_string()),
+                daemon_session_uid: Some("ts-rev".to_string()),
+            });
+            r.pending_activation = Some(PendingActivation {
+                activation_id: 2, target_role: "reviewer".to_string(), iteration: 2,
+                trigger: TriggerKind::StaticIdle { from_role: "worker".to_string() },
+                raw_prompt: String::new(), needs_fresh_reset: true,
+                phase: ActivationPhase::Queued, rendered_prompt: None,
+                pre_clear_snapshot: None, enter_fire_at_ms: None,
+            });
+            r.set_paused(true);
+        })
+        .unwrap();
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_finalize_timing_for_test(0, 0);
+
+        // Paused: drain must NOT advance the activation.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("rPause").unwrap();
+        assert_eq!(
+            run.pending_activation.as_ref().unwrap().phase,
+            ActivationPhase::Queued,
+            "drain must not touch a paused run"
+        );
+        assert_eq!(
+            run.role_sessions["reviewer"].current_session_id.as_deref(),
+            Some("sid-rev"),
+            "fresh reset must NOT have run while paused (sid intact)"
+        );
+
+        // Unpause: the next tick finalizes.
+        crate::workflow::run::modify("rPause", |r| r.set_paused(false)).unwrap();
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("rPause").unwrap();
+        assert_ne!(
+            run.pending_activation.as_ref().map(|p| p.phase.clone()),
+            Some(ActivationPhase::Queued),
+            "once unpaused, the drainer advances the activation"
+        );
     }
 
     /// Reviewer-fix: `poll_once` reads runs from **disk**

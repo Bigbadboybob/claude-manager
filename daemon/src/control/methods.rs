@@ -3344,6 +3344,31 @@ pub fn workflow_transition(
     //
     // `last_message` capture is NOT done here — needs session+
     // worktree lookup. Deferred to 10d-2c-2.
+    // Phase 3 (doc/daemon-side-workflow-orchestration.md): record a durable
+    // `pending_activation` on the run in the SAME flock mutation that advances
+    // `active_role`, so the daemon delivery drainer can finalize the hand-off
+    // (render prompt, fresh reset, append history, deliver) WITHOUT re-reading
+    // events.jsonl. Captured values for the closure:
+    //   - `to_role_is_fresh`: whether the incoming role is `Context::Fresh`
+    //     (drives the /clear + sid-rebind path). Looked up from the loaded
+    //     workflow definition; default false (persistent) if unavailable.
+    //   - `is_static_fire`: poller fires set trigger="static_idle" (Operator
+    //     caller); MCP fires don't. Selects StaticIdle vs McpTransition.
+    //   - the raw prompt / event id / target role for the record + trigger.
+    let to_role_is_fresh: bool = {
+        let wf_name = crate::workflow::run::load_one(&p.run_id).map(|r| r.workflow_name);
+        let state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
+        wf_name
+            .and_then(|name| state.workflow_definitions.get(&name))
+            .and_then(|wf| wf.roles.get(&p.to))
+            .map(|r| matches!(r.context, crate::workflow::toml_schema::Context::Fresh))
+            .unwrap_or(false)
+    };
+    let pa_raw_prompt = p.prompt.clone();
+    let pa_is_static = matches!(trigger_str, Some("static_idle"));
+    let pa_event_id = event.id.clone();
+    let pa_target_role = p.to.clone();
+
     let to_role = p.to.clone();
     let run_id_for_closure = p.run_id.clone();
     // 10d-2c-2-2-b F2: capture for closure use. Operator-callers
@@ -3475,6 +3500,9 @@ pub fn workflow_transition(
             // `close_active_role(None)` and the audit UI showed
             // `(active)` for what should have been a closed
             // role with its last message recorded.
+            // Phase 3: capture the pre-mutation active_role for the
+            // pending_activation trigger BEFORE `active_role` is reassigned.
+            let pa_from_role = run.active_role.clone().unwrap_or_default();
             run.close_active_role(captured_last_message_for_closure.clone());
             run.iteration += 1;
             run.active_role = Some(to_role);
@@ -3484,6 +3512,34 @@ pub fn workflow_transition(
             *captured_iteration_for_closure
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = run.iteration;
+            // Phase 3: record the durable pending-activation alongside the
+            // close/iteration/active_role mutation. NO history append, NO
+            // render here — finalization (the drainer) does both, reading this
+            // record. The TriggerKind is reconstructed from the persisted
+            // metadata, so a restart never re-reads events.jsonl.
+            let pa_trigger = if pa_is_static {
+                crate::workflow::run::TriggerKind::StaticIdle {
+                    from_role: pa_from_role.clone(),
+                }
+            } else {
+                crate::workflow::run::TriggerKind::McpTransition {
+                    from_role: pa_from_role.clone(),
+                    prompt: pa_raw_prompt.clone(),
+                    event_id: pa_event_id.clone(),
+                }
+            };
+            run.pending_activation = Some(crate::workflow::run::PendingActivation {
+                activation_id: run.iteration as u64,
+                target_role: pa_target_role.clone(),
+                iteration: run.iteration,
+                trigger: pa_trigger,
+                raw_prompt: pa_raw_prompt.clone(),
+                needs_fresh_reset: to_role_is_fresh,
+                phase: crate::workflow::run::ActivationPhase::Queued,
+                rendered_prompt: None,
+                pre_clear_snapshot: None,
+                enter_fire_at_ms: None,
+            });
             Ok(())
         },
     );
@@ -3591,6 +3647,13 @@ pub fn workflow_transition(
             if let Err(re) = crate::workflow::run::modify(&p.run_id, move |r| {
                 r.active_role = snap.active_role.clone();
                 r.iteration = snap.iteration;
+                // Phase 3: the mutation recorded `pending_activation` (a
+                // daemon-owned field), so the field-targeted rollback must
+                // restore it too — otherwise an exhausted append leaves an
+                // orphan record pointing at a role that is no longer active,
+                // which the drainer would deliver against. Restores the
+                // pre-mutation value (normally None).
+                r.pending_activation = snap.pending_activation.clone();
                 // 10d-2c-1 review round-13: `close_active_role`
                 // (called by the daemon's mutation just before
                 // setting `active_role = to`) set the last
@@ -8824,6 +8887,53 @@ mod tests {
                 "round-12 F1: TUI-owned role_sessions update must \
                  survive rollback (pre-fix it was clobbered by the \
                  wholesale snapshot restore)",
+            );
+        });
+    }
+
+    /// Phase 3 (doc/daemon-side-workflow-orchestration.md) — append-exhaustion
+    /// rollback must leave NO orphan `pending_activation`. The mutation records
+    /// a pending_activation in the same closure that advances active_role; if
+    /// the event append exhausts, the field-targeted rollback restores
+    /// active_role + iteration AND clears pending_activation. Otherwise the
+    /// drainer would deliver against a role that is no longer active.
+    #[test]
+    fn workflow_transition_rollback_clears_orphan_pending_activation() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_workflow_run("wf_pa_rollback", "worker");
+
+            let pre = crate::workflow::run::load_one("wf_pa_rollback").expect("pre load");
+            assert_eq!(pre.active_role.as_deref(), Some("worker"));
+            assert!(pre.pending_activation.is_none());
+
+            // Block the event write so the mutation rolls back.
+            let dir = crate::workflow::run::run_dir("wf_pa_rollback");
+            std::fs::create_dir_all(&dir).unwrap();
+            let events_path = crate::workflow::run::events_path("wf_pa_rollback");
+            std::fs::create_dir(&events_path).expect("events.jsonl as dir");
+
+            let err = workflow_transition(
+                &state,
+                &Caller::operator("op-test"),
+                &json!({
+                    "to": "reviewer",
+                    "prompt": "do the thing",
+                    "run_id": "wf_pa_rollback",
+                    "role": "worker",
+                }),
+            )
+            .expect_err("event write must fail after retries");
+            assert_eq!(err.0, ErrorCode::Internal);
+
+            let post = crate::workflow::run::load_one("wf_pa_rollback").expect("post load");
+            // active_role rolled back...
+            assert_eq!(post.active_role.as_deref(), Some("worker"));
+            // ...and NO orphan pending_activation left for the target role.
+            assert!(
+                post.pending_activation.is_none(),
+                "exhausted append must leave no orphan pending_activation; got {:?}",
+                post.pending_activation,
             );
         });
     }
