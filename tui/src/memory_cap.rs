@@ -9,9 +9,9 @@
 
 use std::path::PathBuf;
 
-/// Resolved memory limits for a single capped session. Constructed by
-/// `spawn_agent_session(...)` when *both* the user has configured a
-/// cap (via `CM_SESSION_MEM_SOFT_<TYPE>` / `CM_SESSION_MEM_HARD_<TYPE>`)
+/// Resolved memory limits for a single capped session. Constructed
+/// when *both* the user has configured a cap (via
+/// `CM_SESSION_MEM_SOFT_<TYPE>` / `CM_SESSION_MEM_HARD_<TYPE>`)
 /// *and* startup preflight succeeded. Passing `Some(MemoryCap)` to
 /// `Session::new` always means "wrap this spawn"; `None` always means
 /// "no wrap".

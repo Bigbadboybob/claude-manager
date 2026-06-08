@@ -2418,8 +2418,12 @@ pub fn tui_update_sessions_snapshot(
 #[derive(Deserialize)]
 struct WorkflowUpdateDefinitionsParams {
     /// Map keyed by workflow name (`Workflow::name`). Replace
-    /// semantics: the daemon's current map is cleared and
-    /// repopulated.
+    /// semantics, but only for the OVERRIDE layer: the daemon clears
+    /// and repopulates `state.workflow_definitions` (the TUI-pushed
+    /// override) — the `workflows_dir` BASE layer
+    /// (`state.base_workflow_definitions`, loaded at startup) is left
+    /// intact, so a TUI reconnect never clobbers definitions a
+    /// no-TUI daemon loaded for itself (Phase 4 two-layer lookup).
     workflows: std::collections::HashMap<
         String,
         crate::workflow::toml_schema::Workflow,

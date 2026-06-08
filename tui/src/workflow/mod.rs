@@ -24,6 +24,6 @@ pub mod controller;
 // callsites in `app.rs`, `agent/`, `agent_memory.rs`,
 // `control/methods.rs`, and friends.
 pub use cm_daemon::workflow::{
-    events, history, run, spawn, template, toml_schema, transcript,
+    history, run, spawn, template, toml_schema, transcript,
 };
-pub use cm_daemon::workflow::{RoleBinding, RunStatus, TriggerKind, Workflow, WorkflowRun};
+pub use cm_daemon::workflow::{RunStatus, Workflow, WorkflowRun};

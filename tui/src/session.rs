@@ -92,7 +92,7 @@ impl Session {
     /// a `systemd-run --user --scope` transient unit with the configured
     /// `MemoryHigh`/`MemoryMax` / `MemorySwapMax=0` properties. The
     /// caller is responsible for only passing `Some` when preflight
-    /// succeeded; see `App::spawn_agent_session`.
+    /// succeeded.
     pub fn new(
         shell: &str,
         args: &[String],
@@ -257,8 +257,8 @@ impl Session {
     ///
     /// `memory_cap` / `cgroup_path` are always `None` — the daemon
     /// owns memory-cap enforcement for daemon-attached sessions (a
-    /// 10c-d concern); the TUI's `spawn_agent_session` watcher
-    /// path is not exercised here.
+    /// 10c-d concern); the TUI's local cap-watcher path is not
+    /// exercised here.
     /// migrate-tui-local Issue 1: re-attach to an ALREADY-LIVE
     /// daemon-side session WITHOUT calling `start_session`.
     /// Manifest restore on TUI startup uses this when the daemon
@@ -487,79 +487,6 @@ impl alacritty_terminal::grid::Dimensions for TermSize {
     fn columns(&self) -> usize {
         self.columns
     }
-}
-
-/// Spawn an agent session with cap + env wrapping. The single helper
-/// every agent-spawning call site goes through (DESIGN_MEMORY_CAP.md
-/// § Code changes). Owns:
-///   1. `CM_TUI_SESSION_ID` env-population so the agent and any Bash
-///      tool it spawns see the value (today `mcp_config.rs:41-58`
-///      only injects it into the MCP child's env).
-///   2. Cap lookup against `Config::memory_cap_for(session_type)`,
-///      gated on preflight success.
-///   3. Watcher thread spawn when capped.
-///
-/// Tests and infra (`gcloud`, `/bin/bash`, `/bin/true`) bypass this
-/// helper and call `Session::new` directly with `memory_cap = None`.
-pub fn spawn_agent_session(
-    session_type: &str,
-    session_uid: &str,
-    program: &str,
-    args: &[String],
-    cols: u16,
-    rows: u16,
-    working_dir: Option<PathBuf>,
-    mut env: HashMap<String, String>,
-    config: &crate::config::Config,
-    cap_status: &crate::memory_cap::MemoryCapAvailability,
-    kill_tx: &mpsc::Sender<crate::session_watch::MemoryKillEvent>,
-) -> anyhow::Result<Session> {
-    // (1) Export CM_TUI_SESSION_ID into the agent's process env. The
-    // agent and any Bash tool inheriting env from it will now see the
-    // value, which is required for the agent to find its own
-    // ~/.cm/memory_kills/$CM_TUI_SESSION_ID.jsonl on a SIGKILL.
-    env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
-
-    // (2) Resolve the cap. Both the user-configured limits and
-    // preflight success are required.
-    let memory_cap = match (cap_status, config.memory_cap_for(session_type)) {
-        (
-            crate::memory_cap::MemoryCapAvailability::Available { cgroup_prefix },
-            Some((soft_bytes, hard_bytes)),
-        ) => Some(MemoryCap {
-            soft_bytes,
-            hard_bytes,
-            session_uid: session_uid.to_string(),
-            cgroup_prefix: cgroup_prefix.clone(),
-        }),
-        _ => None,
-    };
-
-    // (3) Spawn the PTY (with or without the systemd-run wrapper).
-    let cap_for_session = memory_cap.clone();
-    let session = Session::new(
-        program,
-        args,
-        cols,
-        rows,
-        working_dir,
-        env,
-        cap_for_session,
-    )?;
-
-    // (4) When capped, spawn the watcher. The thread terminates on
-    // its own when the cgroup goes away (last process exited).
-    if let (Some(cap), Some(cgroup_path)) = (memory_cap, session.cgroup_path.clone()) {
-        crate::session_watch::spawn_watcher(
-            cap.session_uid,
-            cgroup_path,
-            cap.soft_bytes,
-            cap.hard_bytes,
-            kill_tx.clone(),
-        );
-    }
-
-    Ok(session)
 }
 
 /// Process-wide monotonic counter for systemd scope unit names.
