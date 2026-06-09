@@ -12649,14 +12649,7 @@ impl App {
                             let max_name =
                                 (inner.width as usize).saturating_sub(8);
                             let full = format!("{} / {}", ws.name, ts.label);
-                            if full.len() > max_name {
-                                format!(
-                                    "{}...",
-                                    &full[..max_name.saturating_sub(3)]
-                                )
-                            } else {
-                                full
-                            }
+                            crate::planning::truncate_with_ellipsis(&full, max_name)
                         }
                         SidebarView::Task => {
                             // Indent levels (Phase 6 deepened by 2 cells per tier
@@ -12774,11 +12767,7 @@ impl App {
                         .map(|t| t.name.clone())
                         .unwrap_or_else(|| "task".into());
                     let max_name = (inner.width as usize).saturating_sub(4);
-                    let name = if name.len() > max_name {
-                        format!("{}...", &name[..max_name.saturating_sub(3)])
-                    } else {
-                        name
-                    };
+                    let name = crate::planning::truncate_with_ellipsis(&name, max_name);
                     // Style lives on the ListItem so selection highlight can
                     // override. Using Span::styled with a fixed color here
                     // would mask the base_style on selection.

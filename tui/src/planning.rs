@@ -183,7 +183,7 @@ enum VisibleRowKind {
 /// Returns `None` for non-task layout items (Separator/Empty/Header).
 /// Truncate `s` to at most `max` display bytes with a trailing "...",
 /// cutting on a char boundary so multibyte chars (e.g. '≤') never panic.
-fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+pub(crate) fn truncate_with_ellipsis(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -4079,6 +4079,31 @@ impl PlanningView {
             Line::from(""),
             Line::from(Span::styled("  Enter launch \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
         ]), inner);
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_with_ellipsis;
+
+    #[test]
+    fn truncates_on_char_boundary_with_multibyte() {
+        // Regression: byte-index slicing panicked when the cut landed
+        // inside a multibyte char (e.g. '≤' in a task name). Must never
+        // panic and must produce valid UTF-8.
+        let s = "Backtest: does AC-impact calib day-snapping (≤24h tail staleness) cost anything?";
+        for max in 0..s.len() + 2 {
+            let out = truncate_with_ellipsis(s, max);
+            assert!(out.is_char_boundary(0));
+            // round-trips as valid UTF-8 (String guarantees it; the point
+            // is that we got here without panicking)
+            let _ = out.chars().count();
+        }
+    }
+
+    #[test]
+    fn short_string_is_unchanged() {
+        assert_eq!(truncate_with_ellipsis("hi", 10), "hi");
     }
 }
 
