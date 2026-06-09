@@ -22,9 +22,11 @@
 #      terminal (we can't start the TUI from a script — it needs your tty).
 #
 # Usage:
-#   scripts/cm-redeploy          # interactive confirm
-#   scripts/cm-redeploy --yes    # skip confirm (CI / cron / autonomous use)
-#   scripts/cm-redeploy --dry    # show what would happen, don't kill anything
+#   scripts/cm-redeploy            # interactive confirm, local only
+#   scripts/cm-redeploy --yes      # skip confirm (CI / cron / autonomous use)
+#   scripts/cm-redeploy --dry      # show what would happen, don't kill anything
+#   scripts/cm-redeploy --manager  # ALSO deploy the built daemon to cm-manager
+#                                  # (restarts the prod daemon; confirms unless --yes)
 
 set -euo pipefail
 
@@ -35,12 +37,20 @@ DAEMON_BINARY="$REPO_ROOT/target/release/cm-daemon"
 TUI_BINARY="$REPO_ROOT/target/release/claude-manager-tui"
 DAEMON_LOG="$HOME/.cm/daemon.log"
 
+# Remote daemon host (the always-on cm-manager VM). Deploying there is
+# gated behind --manager because it restarts the prod cm-daemon, which
+# kills any sessions running on it. Resolved via ~/.ssh/config alias.
+MANAGER_SSH_HOST="cm-manager"
+MANAGER_REMOTE_BINARY="/opt/cm-daemon/cm-daemon"
+
 YES=0
 DRY=0
+MANAGER=0
 for arg in "$@"; do
     case "$arg" in
         --yes|-y) YES=1 ;;
         --dry|--dry-run) DRY=1 ;;
+        --manager|-m) MANAGER=1 ;;
         --help|-h)
             sed -n '3,30p' "$0"
             exit 0
@@ -65,6 +75,38 @@ fi
 if [ ! -x "$DAEMON_BINARY" ]; then
     echo "ERROR: daemon binary missing at $DAEMON_BINARY after build" >&2
     exit 1
+fi
+
+# Deploy to the remote manager daemon BEFORE the local-daemon freshness
+# check below (which may early-exit when the local daemon is already
+# current). The remote deploy depends only on the freshly-built binary,
+# not on local daemon state. Same arch (linux x86_64) as the VM.
+if [ "$MANAGER" = "1" ]; then
+    step "deploy daemon to $MANAGER_SSH_HOST"
+    if [ "$DRY" = "1" ]; then
+        echo "(dry-run: would scp $DAEMON_BINARY -> $MANAGER_SSH_HOST:$MANAGER_REMOTE_BINARY, then stop/cp/start cm-daemon)"
+    else
+        if [ "$YES" != "1" ]; then
+            echo "This restarts the PROD cm-daemon on $MANAGER_SSH_HOST — any sessions running there will die."
+            read -r -p "Deploy to $MANAGER_SSH_HOST? [y/N] " mc
+            case "$mc" in y|Y|yes|YES) ;; *) echo "skipping manager deploy"; MANAGER=0 ;; esac
+        fi
+        if [ "$MANAGER" = "1" ]; then
+            echo "scp -> $MANAGER_SSH_HOST:/tmp/cm-daemon-new"
+            scp -o ConnectTimeout=10 "$DAEMON_BINARY" "$MANAGER_SSH_HOST:/tmp/cm-daemon-new"
+            # stop before cp: can't overwrite a running binary ("Text file busy").
+            ssh -o ConnectTimeout=10 "$MANAGER_SSH_HOST" "bash -s" <<REMOTE
+set -e
+sudo systemctl stop cm-daemon
+sudo cp /tmp/cm-daemon-new "$MANAGER_REMOTE_BINARY"
+sudo systemctl start cm-daemon
+sleep 2
+echo "remote cm-daemon: \$(systemctl is-active cm-daemon)"
+ss -lx | grep -q daemon.sock && echo "remote socket: listening" || echo "remote socket: NOT LISTENING"
+REMOTE
+            echo "manager deploy done"
+        fi
+    fi
 fi
 
 DAEMON_BIN_MTIME=$(stat -c %Y "$DAEMON_BINARY")
