@@ -8356,10 +8356,25 @@ impl App {
             .workspaces
             .iter()
             .map(|w| {
-                let rank = self
-                    .first_task_for_ws(&w.id)
-                    .map(|t| status_rank(&self.task_status(t)))
-                    .unwrap_or(4);
+                let rank = match self.first_task_for_ws(&w.id) {
+                    Some(t) => status_rank(&self.task_status(t)),
+                    // No bound task: rank by the workspace's own session
+                    // activity, mirroring how `task_status` derives a bound
+                    // task's status. This makes a taskless workspace sort
+                    // identically to a task-bound one — an active (running)
+                    // session floats up alongside running tasks instead of
+                    // always sinking to the bottom. A sessionless taskless
+                    // workspace still ranks last (it's a fresh, empty slot).
+                    None => {
+                        if w.sessions.iter().any(|s| s.status == SessionStatus::Running) {
+                            status_rank(&TaskStatus::Running)
+                        } else if w.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
+                            status_rank(&TaskStatus::Blocked)
+                        } else {
+                            4
+                        }
+                    }
+                };
                 (w.id.clone(), rank)
             })
             .collect();
