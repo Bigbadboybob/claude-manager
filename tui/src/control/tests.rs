@@ -152,6 +152,71 @@ fn second_bind_replaces_stale_socket_file() {
 }
 
 #[test]
+fn bind_writes_owner_pid_sidecar_and_cleanup_removes_it() {
+    // The owner-PID sidecar lets a second TUI that loses the bind race
+    // name the holder in its degraded-mode banner ("kill <pid>"). On a
+    // successful bind we stamp our own PID; cleanup removes it.
+    let _g = crate::test_support::home_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("tui.sock");
+    let old = std::env::var_os("CM_TUI_SOCKET");
+    unsafe {
+        std::env::set_var("CM_TUI_SOCKET", &sock);
+    }
+
+    // Before binding, no holder is recorded.
+    assert_eq!(server::read_owner_pid(&sock), None);
+
+    let queue = Queue::new();
+    let path = server::start(queue.clone()).expect("server starts");
+
+    // After binding, the sidecar names this live process.
+    assert_eq!(
+        server::read_owner_pid(&path),
+        Some(std::process::id()),
+        "sidecar should name our PID after a successful bind"
+    );
+
+    // Cleanup removes the sidecar (and the socket).
+    server::cleanup(&path);
+    assert_eq!(
+        server::read_owner_pid(&path),
+        None,
+        "cleanup should remove the owner sidecar"
+    );
+
+    unsafe {
+        if let Some(o) = old {
+            std::env::set_var("CM_TUI_SOCKET", o);
+        } else {
+            std::env::remove_var("CM_TUI_SOCKET");
+        }
+    }
+}
+
+#[test]
+fn read_owner_pid_ignores_dead_pid() {
+    // A stale sidecar naming a dead/recycled PID must not be surfaced —
+    // we'd be telling the user to `kill` a PID that isn't the holder.
+    let _g = crate::test_support::home_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("tui.sock");
+    // Write a sidecar by hand for a PID that cannot be alive. PID 0 is
+    // never a normal user process and has no /proc/0 entry.
+    let sidecar = {
+        let mut s = sock.clone().into_os_string();
+        s.push(".owner");
+        std::path::PathBuf::from(s)
+    };
+    std::fs::write(&sidecar, "0").unwrap();
+    assert_eq!(
+        server::read_owner_pid(&sock),
+        None,
+        "a sidecar naming a non-live PID should read as None"
+    );
+}
+
+#[test]
 fn malformed_frame_returns_invalid_params() {
     let _g = crate::test_support::home_lock();
     let tmp = tempfile::tempdir().unwrap();

@@ -83,18 +83,33 @@ pub fn render<R: RoleResolver + ?Sized>(template: &str, resolver: &R) -> String 
     let mut out = String::with_capacity(template.len());
     let bytes = template.as_bytes();
     let mut i = 0;
+    // Start of the current run of literal (non-placeholder) bytes. We flush
+    // each run verbatim as a UTF-8 `&str` slice so multi-byte characters
+    // survive intact. The previous implementation pushed `bytes[i] as char`
+    // per byte, which Latin-1-expands every UTF-8 continuation byte into its
+    // own code point: a smart quote `“` (E2 80 9C) became `â` + U+0080 +
+    // U+009C, and an em-dash `—` (E2 80 94) became `â` + U+0080 + U+0094.
+    // That produced the visible `â` mojibake AND silent text loss — the
+    // C1 control characters (U+0080..U+009F) it synthesized include
+    // control-string introducers (OSC/APC/PM/SOS) that the worker's
+    // terminal swallows up to the next String Terminator, eating whole spans
+    // of a manager→worker directive. Slicing only ever happens at `{`/`}`
+    // (ASCII) boundaries, so every slice below is a valid char boundary.
+    let mut literal_start = 0;
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+        if bytes[i] == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             if let Some(close) = find_close(bytes, i + 2) {
-                let key = std::str::from_utf8(&bytes[i + 2..close]).unwrap_or("").trim();
+                out.push_str(&template[literal_start..i]);
+                let key = template[i + 2..close].trim();
                 out.push_str(&resolve(key, resolver));
                 i = close + 2;
+                literal_start = i;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
         i += 1;
     }
+    out.push_str(&template[literal_start..]);
     out
 }
 
@@ -371,6 +386,28 @@ mod tests {
     #[test]
     fn literal_braces_preserved() {
         assert_eq!(render("fn x() { return 1; }", &stub()), "fn x() { return 1; }");
+    }
+
+    /// Regression: a dynamic transition prompt (manager → worker) is rendered
+    /// through `render` before delivery to the worker's PTY. When the manager
+    /// pastes the reviewer's findings — which routinely contain smart quotes
+    /// and em-dashes — every non-ASCII byte must survive verbatim. The old
+    /// `bytes[i] as char` path Latin-1-expanded each UTF-8 byte, yielding `â`
+    /// mojibake plus C1 control characters that the terminal silently ate.
+    #[test]
+    fn literal_multibyte_utf8_preserved() {
+        let t = "Reviewer’s feedback: churn is charged “not by E_perm” — \
+                 fix the deadzone (x = 0 → 10 → 0).";
+        assert_eq!(render(t, &stub()), t);
+    }
+
+    /// Multi-byte characters on BOTH sides of a substitution survive, and the
+    /// substituted value (also possibly multi-byte) is spliced in cleanly.
+    #[test]
+    fn multibyte_around_substitution_preserved() {
+        // worker.last_message in the stub is "fixed".
+        let t = "“{{ roles.worker.last_message }}” — done ✅";
+        assert_eq!(render(t, &stub()), "“fixed” — done ✅");
     }
 
     #[test]

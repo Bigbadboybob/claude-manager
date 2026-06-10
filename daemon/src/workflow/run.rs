@@ -288,6 +288,21 @@ pub struct WorkflowRun {
     /// mid-flight. Additive — older state.json files deserialize to `None`.
     #[serde(default)]
     pub pending_activation: Option<PendingActivation>,
+    /// Idle-nudge backstop debounce (see the daemon poller / TUI
+    /// controller idle gate). A role with no static `on_idle` transition
+    /// is expected to advance the workflow via a dynamic tool call
+    /// (`workflow_transition` / `workflow_done`). If it instead ends a
+    /// turn with prose and *no* tool call, the gate re-delivers its
+    /// activation prompt. This records the active role's assistant-turn
+    /// count at the last such nudge, so the gate fires at most once per
+    /// genuinely new completed turn: it re-fires only when the live count
+    /// differs from this value. That closes the async history-append lag
+    /// window (where the start-count baseline is briefly stale) which
+    /// would otherwise let a self-targeted re-activation burst every
+    /// tick. `None` until the first nudge; never needs reset because a
+    /// persistent session's assistant count only grows.
+    #[serde(default)]
+    pub nudge_assistant_count: Option<usize>,
 }
 
 impl WorkflowRun {
@@ -339,6 +354,7 @@ impl WorkflowRun {
             role_plans,
             rejected_findings: Vec::new(),
             pending_activation: None,
+            nudge_assistant_count: None,
         }
     }
 
@@ -393,6 +409,22 @@ impl WorkflowRun {
             .last()
             .filter(|h| Some(&h.role) == self.active_role.as_ref())
             .map(|h| h.assistant_count_at_start)
+    }
+
+    /// Number of consecutive trailing history entries belonging to `role` —
+    /// how many times `role` has been activated in an unbroken run at the
+    /// tail of the history. The idle-nudge backstop uses this to cap how
+    /// many times it re-prompts a role that keeps ending its turn without
+    /// advancing the workflow: the first entry in the streak is the role's
+    /// legitimate activation, every additional one is a prior nudge, so
+    /// `streak - 1` is the nudge count for the current stuck stretch. The
+    /// streak resets naturally when a different role is activated.
+    pub fn trailing_activation_streak(&self, role: &str) -> usize {
+        self.history
+            .iter()
+            .rev()
+            .take_while(|h| h.role == role)
+            .count()
     }
 
     /// 10d-2c-1 review round-1 Option A: append a history entry

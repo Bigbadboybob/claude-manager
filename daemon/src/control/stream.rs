@@ -842,6 +842,13 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             s.sessions.insert("ts-resize".into(), session);
+            // Seeded from SpawnParams::new's 80×24 baseline.
+            let s0 = s.sessions.get("ts-resize").unwrap();
+            assert_eq!(
+                (s0.last_cols, s0.last_rows),
+                (80, 24),
+                "spawn-time size seeds last_cols/last_rows",
+            );
         }
 
         let (mut client, mut server) =
@@ -866,12 +873,26 @@ mod tests {
         // Allow the daemon a moment to process the resize, then
         // shut down cleanly.
         std::thread::sleep(Duration::from_millis(100));
+        // fix-narrow-prompt: the inbound Resize frame must also
+        // update the session's tracked size so a later
+        // `mcp_start_session` inherits the *current* width, not the
+        // stale spawn-time value. Assert the cell moved 80×24 →
+        // 120×40.
+        {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get("ts-resize").expect("session live");
+            assert_eq!(
+                (sess.last_cols, sess.last_rows),
+                (120, 40),
+                "resize frame must update tracked last_cols/last_rows",
+            );
+        }
         drop(client);
         let _ = handle.join();
         state.lock().unwrap().sessions.remove("ts-resize");
-        // No panic = pass. The ioctl actually firing is verified
-        // indirectly: a missing or broken resize would surface in
-        // the manual smoke test in slice 10c-e-3.
+        // The ioctl actually firing is verified indirectly: a
+        // missing or broken resize would surface in the manual
+        // smoke test in slice 10c-e-3.
     }
 
     // ===== Slice 10c-e-3b-fix3: per-session writer mutex + cap =====

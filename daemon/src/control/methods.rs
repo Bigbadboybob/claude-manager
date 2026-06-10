@@ -1723,6 +1723,22 @@ pub fn list_sessions(
             "state": state_str,
             "idle": idle,
             "managed_by_uid": session.managed_by_uid,
+            // Adoption metadata (Part 1): lets the TUI surface
+            // agent-spawned sessions in the sidebar, grouped under their
+            // task/workspace. All already live on `DaemonSession`;
+            // `worktree_path` is joined from the daemon manifest so the
+            // TUI can build/restore a workspace for the adopted session.
+            // Additive — older TUI consumers ignore unknown fields, and a
+            // newer TUI treats them as Optional.
+            "workspace_id": session.workspace_id,
+            "task_id": session.task_id,
+            "workflow_run_id": session.workflow_run_id,
+            "workflow_role": session.workflow_role,
+            "worktree_path": state
+                .workspaces
+                .get(&session.workspace_id)
+                .and_then(|w| w.worktree_path.as_ref())
+                .map(|p| p.display().to_string()),
         }));
     }
     // TUI-owned sessions (post-Phase-1 unified view, fixes review
@@ -4822,6 +4838,96 @@ struct McpStartSessionParams {
     task_id: Option<String>,
 }
 
+/// Kitty keyboard Enter (CSI 13 u). codex and claude-code both enable the
+/// kitty keyboard protocol at startup, which encodes Enter as this sequence
+/// rather than raw `\r`/`\n`. Mirrors the TUI's `enter_bytes_for_mode`
+/// kitty arm. (Verified: a bare `\n` submits neither agent's composer.)
+const AGENT_KITTY_ENTER: &[u8] = b"\x1b[13u";
+
+/// Wait after spawn before writing the prompt body, so the agent finishes
+/// enabling its kitty + bracketed-paste modes (codex enabled them ~1.3-1.8s
+/// post-startup in codex-tui.log; claude-code is similar). Held a bit above
+/// that for margin; this is the most likely value to need tuning if the
+/// prompt still doesn't submit on a slow cold-start — the delivery log line
+/// below reports the actual elapsed time to guide it.
+const AGENT_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Gap between the body and the trailing Enter, so the agent consumes the
+/// paste and treats the Enter as a distinct keystroke (not paste tail).
+/// Mirrors the TUI's separate deferred-Enter write.
+const AGENT_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Wrap a prompt body in bracketed-paste markers (`\x1b[200~ … \x1b[201~`)
+/// when it spans multiple lines — matches the TUI's
+/// `format_body_for_delivery`. Without this, the agent submits at the first
+/// newline, mangling a multi-line prompt. Single-line bodies go raw. codex
+/// and claude-code always enable BRACKETED_PASTE, so (unlike the TUI) we
+/// don't gate on a live terminal mode the daemon can't read.
+fn agent_paste_payload(body: &str) -> Vec<u8> {
+    if body.contains('\n') {
+        let mut out = Vec::with_capacity(body.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(body.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        body.as_bytes().to_vec()
+    }
+}
+
+/// Deliver a `start_session` prompt to a kitty-TUI agent (codex or
+/// claude-code) on a detached thread: settle, write the bracketed body,
+/// gap, write the kitty Enter. Async so `mcp_start_session` returns
+/// promptly (stays under the Python MCP 30s call timeout). The daemon
+/// can't read the agent's live terminal mode (no `Term`), so this assumes
+/// the modes codex/claude-code always enable; see the constants above.
+/// Write failures are logged, not fatal — the session is already
+/// registered and the caller has its uid.
+fn spawn_agent_prompt_delivery(
+    handle: crate::session::InputHandle,
+    session_uid: String,
+    prompt: String,
+) {
+    let _ = std::thread::Builder::new()
+        .name(format!("cm-daemon-agent-prompt-{}", session_uid))
+        .spawn(move || {
+            std::thread::sleep(AGENT_PROMPT_SETTLE);
+            let body = prompt.trim_end_matches(['\r', '\n']);
+            let payload = agent_paste_payload(body);
+            let bracketed = payload.len() != body.len();
+            if let Err(e) = handle.write_and_stamp(&payload) {
+                eprintln!(
+                    "cm-daemon: agent prompt body write failed for {}: {}",
+                    session_uid, e
+                );
+                return;
+            }
+            std::thread::sleep(AGENT_ENTER_GAP);
+            if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
+                eprintln!(
+                    "cm-daemon: agent prompt Enter write failed for {}: {}",
+                    session_uid, e
+                );
+                return;
+            }
+            // Positive delivery log (the failure mode this fix targets is
+            // "writes succeed but the agent never submits" — invisible
+            // without this line). If the session stays `pending` after this
+            // logs, the bytes landed but the timing/encoding assumption was
+            // wrong (tune AGENT_PROMPT_SETTLE / the kitty sequence), rather
+            // than a write error or a missing delivery.
+            eprintln!(
+                "cm-daemon: agent prompt delivered for {}: settle={}ms gap={}ms \
+                 body={}B bracketed={} + kitty-Enter(CSI 13 u)",
+                session_uid,
+                AGENT_PROMPT_SETTLE.as_millis(),
+                AGENT_ENTER_GAP.as_millis(),
+                body.len(),
+                bracketed,
+            );
+        });
+}
+
 pub fn mcp_start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -4892,6 +4998,8 @@ pub fn mcp_start_session(
         caller_task_id,
         working_dir,
         cap_inherit,
+        caller_cols,
+        caller_rows,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
@@ -5024,11 +5132,20 @@ pub fn mcp_start_session(
                 ));
             }
         };
+        // Inherit the caller's current PTY width so the child opens
+        // at the same size the operator is actually looking at, not
+        // the 80×24 serde default `start_session` would otherwise
+        // apply (the "super narrow window" bug for MCP-spawned
+        // claude/codex sessions). `last_cols`/`last_rows` are seeded
+        // at the caller's spawn and kept live by attach Resize
+        // frames, so even after a terminal resize the child matches.
         (
             target_workspace_id,
             caller.task_id.clone(),
             wt,
             cap_inherit,
+            caller.last_cols,
+            caller.last_rows,
         )
     };
 
@@ -5214,6 +5331,12 @@ pub fn mcp_start_session(
     );
     full_params.insert("env".into(), Value::Object(env_obj));
     full_params.insert("session_type".into(), Value::String(p.type_.clone()));
+    // Width inheritance (see the caller-resolution block above):
+    // pass the caller's live PTY size through so the delegated
+    // `start_session` opens the child at that size instead of its
+    // 80×24 serde fallback.
+    full_params.insert("cols".into(), Value::Number(caller_cols.into()));
+    full_params.insert("rows".into(), Value::Number(caller_rows.into()));
     if let Some(cuid) = caller_uid {
         full_params.insert("managed_by_uid".into(), Value::String(cuid.to_string()));
     }
@@ -5240,28 +5363,44 @@ pub fn mcp_start_session(
     // Sub-2b-3 review-fix #2: deliver `prompt` if supplied.
     // Pre-fix this was logged-and-dropped — silent contract
     // break with the Python MCP tool which advertises prompt
-    // delivery. Now we look up the new session's InputHandle
-    // and write the prompt + trailing newline through the
-    // shared `write_and_stamp` helper (same path used by the
-    // attach-stream Input frame handler). Newline appended
-    // when missing so the receiving agent sees a complete
-    // submission (matches the TUI's `submit=true` shape on
-    // `send_input`).
+    // delivery. Look up the new session's InputHandle and
+    // write the prompt through the shared `write_and_stamp`
+    // helper (same path the attach-stream Input frame handler
+    // uses).
     //
-    // **No quiet-wait gating yet**: the TUI's existing
-    // `PendingWrite::wait_for_quiet` machinery isn't
-    // relocated daemon-side. For sub-2b-3 the prompt goes
-    // straight to the PTY post-spawn; the agent buffers
-    // appropriately. A future slice can add a daemon-side
-    // pending-prompt queue if races with engine startup
-    // become observable.
+    // Engine-specific submission:
+    //   - claude-code / bash: body + `\n`, synchronous, with
+    //     kill-on-failure (no half-initialized session).
+    //   - codex: a bare `\n` does NOT submit codex's
+    //     kitty-keyboard TUI, and a multi-line body without
+    //     bracketed paste submits at the first newline. The
+    //     daemon has no `Term` to read codex's live mode, so it
+    //     delivers asynchronously assuming codex's always-on
+    //     modes (bracketed paste + kitty Enter) with a settle/
+    //     gap delay — see `spawn_agent_prompt_delivery`. This
+    //     is the daemon-side stand-in for the TUI's mode-aware
+    //     `PendingWrite::wait_for_quiet` drainer, which isn't
+    //     relocated daemon-side.
     if let Some(prompt) = p.prompt.as_deref() {
         if !prompt.is_empty() {
             let handle_opt = {
                 let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                state.sessions.get(&session_uid).map(|s| s.input_handle())
+                state
+                    .sessions
+                    .get(&session_uid)
+                    .map(|s| {
+                        // codex AND claude-code both run kitty-keyboard
+                        // TUIs that need the bracketed-paste + kitty-Enter
+                        // treatment (verified: a bare `\n` submits neither).
+                        // bash is a real shell — `\n` is the correct submit.
+                        let is_tui_agent = matches!(
+                            s.session_type.as_str(),
+                            "codex" | "claude-code"
+                        );
+                        (s.input_handle(), is_tui_agent)
+                    })
             };
-            let Some(handle) = handle_opt else {
+            let Some((handle, is_tui_agent)) = handle_opt else {
                 // Session disappeared between spawn and prompt
                 // delivery — exceptional but possible (fast-
                 // exit reaper removed the registry entry).
@@ -5279,29 +5418,43 @@ pub fn mcp_start_session(
                     ),
                 ));
             };
-            let mut payload = prompt.as_bytes().to_vec();
-            if !payload.ends_with(b"\n") {
-                payload.push(b'\n');
-            }
-            if let Err(e) = handle.write_and_stamp(&payload) {
-                // Sub-2b-3 review-8 #1: kill the just-spawned
-                // session and surface the error. Pre-fix
-                // a write failure logged + returned `ok`,
-                // leaving a half-initialized session with no
-                // delivered prompt — the caller has no way
-                // to know the prompt didn't land. Removing
-                // the session from the registry drops the
-                // DaemonSession, which SIGKILLs the child via
-                // its pidfd-based Drop.
-                let err_msg = format!(
-                    "mcp_start_session: prompt-delivery write failed for '{}': {}; \
-                     session was killed (review-8 #1 — no half-initialized sessions)",
-                    session_uid, e,
+            if is_tui_agent {
+                // codex and claude-code both run kitty-keyboard TUIs: a bare
+                // newline in the composer does NOT submit, and a multi-line
+                // body delivered without bracketed-paste markers splits into
+                // premature submissions. The TUI handles this via its
+                // mode-aware drainer; the daemon has no `Term` to read the
+                // live terminal mode, so we deliver asynchronously assuming
+                // the modes these agents always enable (BRACKETED_PASTE +
+                // kitty), with a timing gap so they're active before the
+                // bytes land. See `spawn_agent_prompt_delivery`. Returns
+                // immediately; the transcript detector binds once the agent
+                // runs the turn.
+                spawn_agent_prompt_delivery(
+                    handle,
+                    session_uid.clone(),
+                    prompt.to_string(),
                 );
-                let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                let _ = state.sessions.remove(&session_uid);
-                drop(state);
-                return Err((ErrorCode::Internal, err_msg));
+            } else {
+                // claude-code / bash: body + newline, synchronous, with
+                // kill-on-failure so no half-initialized session lingers
+                // (Sub-2b-3 review-8 #1). A failed write removes the session
+                // from the registry, whose Drop SIGKILLs the child.
+                let mut payload = prompt.as_bytes().to_vec();
+                if !payload.ends_with(b"\n") {
+                    payload.push(b'\n');
+                }
+                if let Err(e) = handle.write_and_stamp(&payload) {
+                    let err_msg = format!(
+                        "mcp_start_session: prompt-delivery write failed for '{}': {}; \
+                         session was killed (review-8 #1 — no half-initialized sessions)",
+                        session_uid, e,
+                    );
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = state.sessions.remove(&session_uid);
+                    drop(state);
+                    return Err((ErrorCode::Internal, err_msg));
+                }
             }
         }
     }
@@ -5725,6 +5878,28 @@ mod tests {
     use super::*;
     use crate::manifest::ManifestWorkspace;
     use tempfile::TempDir;
+
+    /// Multi-line agent prompt bodies must be wrapped in bracketed-paste
+    /// markers — otherwise the agent (codex / claude-code) submits at the
+    /// first newline and mangles the prompt. Single-line bodies go raw.
+    #[test]
+    fn agent_paste_payload_wraps_multiline_only() {
+        let multi = agent_paste_payload("line one\nline two");
+        assert_eq!(multi, b"\x1b[200~line one\nline two\x1b[201~");
+
+        let single = agent_paste_payload("just one line");
+        assert_eq!(single, b"just one line");
+    }
+
+    /// The agent submit keystroke is the kitty-encoded Enter (CSI 13 u),
+    /// not a bare `\n`/`\r` — codex's and claude-code's kitty-keyboard TUIs
+    /// ignore the latter, so the prompt never submits.
+    #[test]
+    fn agent_kitty_enter_is_csi_13u() {
+        assert_eq!(AGENT_KITTY_ENTER, b"\x1b[13u");
+        assert_ne!(AGENT_KITTY_ENTER, b"\n");
+        assert_ne!(AGENT_KITTY_ENTER, b"\r");
+    }
 
     /// Sub-2b-3 review-10: pin the watcher-startup
     /// hard-cap resolution. Pre-fix the watcher-startup
@@ -13275,6 +13450,7 @@ mod tests {
             // Our specific run must not appear in decisions.
             let saw_our_run = decisions.iter().any(|d| match d {
                 crate::workflow::poller::Decision::Skip { run_id, .. }
+                | crate::workflow::poller::Decision::Nudge { run_id, .. }
                 | crate::workflow::poller::Decision::ActivateStatic {
                     run_id,
                     ..

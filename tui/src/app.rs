@@ -32,6 +32,27 @@ mod dirs {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u128 = 80;
+/// Frame duration of the `notify_user` attention animation — the "rainbow
+/// heartbeat". A session with a pending alert advances one frame every
+/// `ALERT_FRAME_MS`, pulsing its glyph small→large while the color cycles
+/// through the rainbow so it pops against the steady green-spinner / white-dot
+/// indicators around it.
+const ALERT_FRAME_MS: u128 = 120;
+/// Glyph pulse — the bead grows then shrinks. 6 frames.
+const ALERT_PULSE: &[&str] = &["\u{00b7}", "\u{2022}", "\u{25cf}", "\u{25c9}", "\u{25cf}", "\u{2022}"];
+/// Rainbow the alert color cycles through, one step per frame. 7 colors —
+/// coprime with the 6-frame pulse, so the glyph size and color never re-lock
+/// into a short loop (full repeat period is lcm(6,7)=42 frames ≈ 5s), keeping
+/// the bead visually lively the whole time it's pending.
+const ALERT_RAINBOW: &[Color] = &[
+    Color::Rgb(255, 70, 70),   // red
+    Color::Rgb(255, 140, 0),   // orange
+    Color::Rgb(255, 225, 50),  // yellow
+    Color::Rgb(90, 230, 90),   // green
+    Color::Rgb(60, 220, 220),  // cyan
+    Color::Rgb(90, 150, 255),  // blue
+    Color::Rgb(225, 90, 230),  // magenta
+];
 /// Width of the Sessions-view sidebar in cells. The terminal panel takes the
 /// remaining width minus its own border (see `SIDEBAR_WIDTH + 2` in main.rs
 /// when sizing the PTY).
@@ -316,6 +337,33 @@ impl PendingWrite {
 /// Interval between filesystem checks for session_id detection.
 const SESSION_ID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Wall-clock budget for a single `drain_terminal_events` pass. The PTY
+/// reader threads push an unbounded stream of events (one `Wakeup` per
+/// output batch — kHz under heavy output) into per-session channels; the
+/// drain used to empty every channel completely in one tick. A session
+/// flooding output (most visibly the burst right after `start_workflow`
+/// spawns fresh agents) could then hold the main loop inside this single
+/// phase for tens of seconds. Because the loop reaches `drain_control_events`
+/// only *after* this phase returns, any control request queued during the
+/// stall isn't answered until it ends — blowing the control server's 30s
+/// reply timeout (MCP `start_workflow` would report "main loop did not reply
+/// within timeout") and freezing the UI meanwhile. Capping the drain keeps
+/// the loop cycling; events left unread stay in their channels and are
+/// picked up on the next tick (~1ms later). 50ms is comfortably above a
+/// normal tick's full drain, so steady state never hits the cap — only
+/// pathological bursts get spread across ticks.
+const TERMINAL_DRAIN_BUDGET: Duration = Duration::from_millis(50);
+
+/// How often a TUI that failed to bind the control socket (`tui.sock`)
+/// re-attempts the bind while running degraded. Short enough that recovery
+/// feels instant once the conflicting instance exits, long enough that a
+/// persistent conflict (e.g. an orphaned older TUI a user forgot to kill)
+/// doesn't spin. See `App::maybe_rebind_control_socket`. The scenario this
+/// guards: rebuild + relaunch where the old TUI lingers, keeps `tui.sock`,
+/// and the fresh TUI would otherwise run silently with no control plane —
+/// every MCP/agent call routing to the stale binary instead.
+const CONTROL_REBIND_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Per-file cap on `~/.cm/workflow-runs/<run-id>/tick.log`. When `log_tick`
 /// is about to write and the file is at or over this size, it truncates and
 /// starts fresh (with a marker line). Generous because these logs are useful
@@ -374,6 +422,23 @@ pub struct Workspace {
     pub is_pushing: bool,
 }
 
+impl Workspace {
+    /// True when this workspace runs *in-place* — its working directory
+    /// IS the main repo checkout (no dedicated git worktree, no
+    /// `cm/<slug>` branch). The marker is `worktree_path == main_repo_path`
+    /// (both `Some` and equal); in-place launches set them to the same
+    /// `PathBuf` so the equality holds byte-for-byte and round-trips
+    /// through the manifest. Destructive cleanup (worktree remove, branch
+    /// delete, cloud push) MUST consult this before touching git — those
+    /// ops would otherwise damage the user's main repo.
+    pub(crate) fn is_in_place(&self) -> bool {
+        matches!(
+            (&self.worktree_path, &self.main_repo_path),
+            (Some(wt), Some(main)) if wt == main
+        )
+    }
+}
+
 /// A task tracked in the planning/API layer. Pure metadata — no execution
 /// state. `workspace_id` points at the Workspace this task has been launched
 /// into (None when still in backlog / never launched).
@@ -400,11 +465,13 @@ pub struct TaskEntry {
     /// tree. Set when an agent calls `create_subtask` or when the user
     /// creates a subtask in the planning view.
     pub parent_task_id: Option<String>,
-    /// Worktree behavior for subtasks. Only meaningful when
-    /// `parent_task_id` is set:
+    /// Worktree behavior:
     ///   - "inherit" (default): sessions spawn in the parent's worktree.
     ///   - "branch": a new worktree is created off the parent's branch
     ///     with name `cm-sub/<slug-chain>-<short_id>`.
+    ///   - "in-place": sessions spawn directly in the MAIN repo checkout —
+    ///     no worktree, no branch. Also set on top-level tasks launched
+    ///     in-place from the planning view.
     pub worktree_mode: WorktreeMode,
     /// Free-form JSONB bag mirrored from the API row. Skills attach
     /// structured context here — currently `metadata.resume.*` for the
@@ -442,6 +509,12 @@ pub enum WorktreeMode {
     #[default]
     Inherit,
     Branch,
+    /// Sessions spawn directly in the parent's MAIN repo checkout — no
+    /// new worktree, no new branch. The wire value is hyphenated
+    /// (`"in-place"`), so pin it explicitly: the enum's `lowercase`
+    /// rename would otherwise emit `"inplace"`.
+    #[serde(rename = "in-place")]
+    InPlace,
 }
 
 /// Parse the API's `worktree_mode` string into the enum. Unknown values
@@ -451,6 +524,7 @@ pub enum WorktreeMode {
 pub fn parse_worktree_mode(s: &str) -> WorktreeMode {
     match s {
         "branch" => WorktreeMode::Branch,
+        "in-place" => WorktreeMode::InPlace,
         _ => WorktreeMode::Inherit,
     }
 }
@@ -460,6 +534,7 @@ impl WorktreeMode {
         match self {
             WorktreeMode::Inherit => "inherit",
             WorktreeMode::Branch => "branch",
+            WorktreeMode::InPlace => "in-place",
         }
     }
 }
@@ -961,10 +1036,11 @@ fn make_simple_session_with_uid(
     }
 }
 
-/// Fire a desktop notification announcing that a session went idle. Spawned
-/// onto a detached thread so a slow/blocked dbus call can't stall the UI loop.
-/// Errors are intentionally swallowed — a missing notification daemon is not
-/// a reason to surface anything to the user.
+/// Fire a desktop notification announcing that a session went idle, and play a
+/// short sound alongside it. Spawned onto a detached thread so a slow/blocked
+/// dbus call (or the ~1s sound playback) can't stall the UI loop. Errors are
+/// intentionally swallowed — a missing notification daemon or audio device is
+/// not a reason to surface anything to the user.
 fn notify_session_idle(label: &str) {
     let label = label.to_string();
     std::thread::spawn(move || {
@@ -972,7 +1048,55 @@ fn notify_session_idle(label: &str) {
             .summary("Claude Manager")
             .body(&format!("Session idle: {}", label))
             .show();
+        play_notification_sound();
     });
+}
+
+/// Fire a desktop notification raised by an agent calling the `notify_user`
+/// MCP tool. Same detached-thread, swallow-errors discipline as
+/// `notify_session_idle`. `message` is the agent-supplied reason; when empty
+/// we fall back to a generic line so the notification still says something
+/// useful.
+pub(crate) fn notify_user_alert(label: &str, message: &str) {
+    let label = label.to_string();
+    let body = if message.trim().is_empty() {
+        format!("{} needs your attention", label)
+    } else {
+        format!("{}: {}", label, message)
+    };
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary("Claude Manager")
+            .body(&body)
+            .show();
+        play_notification_sound();
+    });
+}
+
+/// Best-effort: play a short notification sound. Called from the detached
+/// notification thread, so the blocking playback (~1s) never touches the UI
+/// loop. We don't rely on the notification daemon honoring sound hints (dunst
+/// and others ignore them), so we play the sound ourselves via whichever
+/// PipeWire/PulseAudio player is on PATH. Every failure is swallowed.
+fn play_notification_sound() {
+    use std::process::{Command, Stdio};
+    const SOUND: &str = "/usr/share/sounds/freedesktop/stereo/window-attention.oga";
+    if !std::path::Path::new(SOUND).exists() {
+        return;
+    }
+    // Try players in turn; `.status()` waits (reaping the child) and returns
+    // Err only when the binary is absent, so we fall through to the next.
+    for player in ["paplay", "pw-play"] {
+        let played = Command::new(player)
+            .arg(SOUND)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if played.is_ok() {
+            return;
+        }
+    }
 }
 
 /// Generate a fresh workspace id. Not cryptographic — just collision-avoidance
@@ -1058,6 +1182,206 @@ pub(crate) fn collect_rotation_bindings(
     out
 }
 
+/// Kill the agent process inside `ts` and respawn it under the same PTY slot
+/// with workflow MCP config + resume args, so the role can call
+/// `workflow_transition` / `workflow_done`. The user-launched session was
+/// started without `--mcp-config`; this is what gives it the workflow tools.
+///
+/// `session_id` is optional: when present, the new agent is started with
+/// `--resume <sid>` and its transcript binding is preserved. When absent
+/// (e.g. an idle pane that hasn't produced a transcript yet), we still
+/// respawn so the new agent picks up the workflow env — it just starts
+/// fresh, and the watcher binds whatever sid the new agent writes. Without
+/// this respawn the agent's MCP subprocess never sees `CM_WORKFLOW_RUN_ID`,
+/// and every `workflow_transition` / `workflow_done` / `workflow_reject_finding`
+/// call from this role fails for the lifetime of the run.
+///
+/// Returns `None` on success, `Some(message)` on any failure (caller decides
+/// whether to surface to the status bar). On failure the existing `Session`
+/// is left untouched — we only swap if `Session::new` succeeds.
+pub(crate) fn respawn_existing_with_workflow_mcp(
+    ts: &mut TerminalSession,
+    engine: &workflow::toml_schema::Engine,
+    run_id: &str,
+    role: &str,
+    session_id: Option<&str>,
+    worktree: Option<&Path>,
+    cols: u16,
+    rows: u16,
+    config: &Config,
+    cap_status: &crate::memory_cap::MemoryCapAvailability,
+    host_pool: &crate::host_pool::HostPool,
+    workspace_id: &str,
+) -> Option<String> {
+    // 12e-r6 F2: fail fast on a non-local pinned host BEFORE
+    // any other work. The respawn would build local mcp_config
+    // paths + run `spawn_agent_session` (local PTY); the
+    // resulting Session would be local but get swapped in
+    // over a TerminalSession whose `host_id` points at a
+    // remote host. That mistag breaks every downstream
+    // per-session RPC route. Order matters: this guard runs
+    // BEFORE `kill_daemon_session_if_attached` so we don't
+    // tear down the original session for no reason.
+    if let Err(e) = guard_local_host_only(&ts.host_id, "workflow respawn") {
+        return Some(format!(
+            "Skipping respawn of {}: {}",
+            role, e
+        ));
+    }
+    let wt = match worktree {
+        Some(wt) => wt,
+        None => {
+            return Some(format!(
+                "Skipping reload of {}: worktree unknown — workflow MCP tools unavailable",
+                role
+            ));
+        }
+    };
+    // Snapshot pre-spawn transcript files so the watcher can identify the
+    // new one. For Codex this matters even with `--resume` because resume
+    // writes a fresh rollout id; for Claude it's only needed when we're
+    // spawning without `--resume` (no sid yet). Cheap to compute either
+    // way.
+    let pre_spawn_files = match engine {
+        workflow::toml_schema::Engine::ClaudeCode => App::list_jsonl_files(wt),
+        workflow::toml_schema::Engine::Codex => App::list_codex_sessions(wt),
+    };
+    // migrate-tui-local: route workflow respawn through the
+    // daemon RPC so the replacement participant lands in
+    // state.sessions (workflow context known at spawn time via
+    // workflow_run_id/workflow_role). The kill_daemon_session_if_attached
+    // call below fires FIRST so any existing daemon-side child
+    // is reaped before we start the replacement.
+    let session_type_str = engine.as_session_type();
+    // Mint a FRESH uid for the replacement session rather than
+    // reusing `ts.uid`. `kill_session` (daemon) only SIGKILLs and
+    // defers registry removal to the reaper's on-exit callback, so
+    // the uid stays in `state.sessions` for a beat after the kill
+    // RPC returns. An immediate `start_session` reusing that same
+    // uid loses the race and hits the daemon's collision guard
+    // (`Conflict`, methods.rs start_session) — the spawn fails, the
+    // swap below never runs, and `ts.session` is left holding the
+    // just-killed Session. The foreground then renders a dead PTY
+    // and drops every keystroke (frozen pane). A new uid sidesteps
+    // the kill-then-reuse race entirely. `ts.uid` is updated to
+    // match after the successful swap (see below).
+    let new_uid = new_session_uid();
+    App::kill_daemon_session_if_attached(host_pool, ts);
+    // migrate-tui-local Issue 3: workflow respawn with a known
+    // transcript_id (the role's current session_id) lets us
+    // hand the deterministic claude path to the daemon. For
+    // codex resumes a fresh rollout id is written post-spawn,
+    // so pre_spawn_transcript_path returns None and the post-
+    // spawn detector continues to handle that case.
+    let pre_spawn_transcript = session_id.and_then(|sid| {
+        pre_spawn_transcript_path(session_type_str, wt, sid)
+    });
+    let new_sess = match try_spawn_via_daemon_with_deps(
+        host_pool,
+        config,
+        cap_status,
+        &new_uid,
+        workspace_id,
+        wt,
+        session_type_str,
+        role,
+        session_id,
+        cols,
+        rows,
+        ts.task_id.as_deref(),
+        Some(run_id),
+        Some(role),
+        &ts.host_id,
+        pre_spawn_transcript.as_deref(),
+    ) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            return Some(format!(
+                "Reload failed for {}: {} — workflow MCP tools unavailable",
+                role, e
+            ));
+        }
+        None => {
+            return Some(format!(
+                "Reload failed for {}: try_spawn_via_daemon returned None for \
+                 daemon-eligible engine {:?}",
+                role, engine,
+            ));
+        }
+    };
+    // Swap the Session. migrate-tui-local: the explicit kill of
+    // the prior daemon-side child happened up-front (before
+    // try_spawn_via_daemon), so there's no detached-Drop window
+    // here. The structural pin
+    // (respawn_calls_kill_daemon_before_session_swap) still
+    // matches because the kill call precedes this assignment.
+    ts.session = new_sess;
+    // Adopt the replacement session's fresh uid as this
+    // TerminalSession's identity. The new daemon session is
+    // registered under `new_uid` (the returned Session's
+    // `daemon_session_uid` equals it), and the MCP config baked
+    // into the spawn sets `CM_TUI_SESSION_ID = new_uid`. The
+    // descendant-scope auth check compares `ts.uid == caller_uid`
+    // (the agent's CM_TUI_SESSION_ID), so without this update the
+    // respawned agent's `workflow_transition` / `workflow_done`
+    // calls would fail auth. The workflow RoleBinding captures
+    // `ts.session.daemon_session_uid` after this respawn returns,
+    // so it picks up the new uid as well.
+    ts.uid = new_uid;
+    if session_id.is_some() {
+        ts.transcript_id = session_id.map(|s| s.to_string());
+        ts.pending_jsonl_files = match engine {
+            workflow::toml_schema::Engine::ClaudeCode => None,
+            workflow::toml_schema::Engine::Codex => Some(pre_spawn_files),
+        };
+    } else {
+        ts.transcript_id = None;
+        ts.pending_jsonl_files = Some(pre_spawn_files);
+    }
+    ts.pending_prompt = None;
+    ts.pending_clear = None;
+    ts.pending_enter = None;
+    ts.last_delivery = None;
+    ts.status = SessionStatus::Idle;
+    // Kick a resize so the freshly-resumed agent (e.g. `claude
+    // --resume`) repaints right away. The new Session's terminal
+    // grid starts blank; the Resize msg drives a SIGWINCH to the
+    // daemon PTY, prompting an immediate redraw instead of leaving
+    // the pane blank until the agent's next spontaneous output.
+    ts.session.resize(cols, rows);
+    None
+}
+
+/// True if `entry` plausibly corresponds to a prompt delivery whose first
+/// 120 chars equal `prefix`. Three matching modes:
+///
+/// 1. **Plain typed input** — `display` carries the raw text directly.
+/// 2. **Legacy paste schema** — `pastedContents.<k>.content` holds the raw
+///    text; the parser concatenated those into `paste_content`.
+/// 3. **Post-2025 paste schema** — `pastedContents.<k>.contentHash` (a
+///    redacted reference) replaces `.content`. There's no text to match,
+///    but `display` becomes the placeholder `"[Pasted text #N +M lines]"`
+///    which is an unambiguous "something was pasted here" signal. The
+///    caller already constrains the entry to a specific project (worktree)
+///    and a 2-second window around the delivery timestamp, so accepting
+///    the placeholder still uniquely identifies the right session in
+///    practice.
+///
+/// Mode 3 is the fix for the overnight-cleanup workflow stall: every goal
+/// >5 lines triggered paste-redaction, the prefix never matched, and all
+/// 5 workflows got stuck on iteration 1 because their workers never got
+/// bound to their transcripts.
+pub(crate) fn entry_matches_delivery(
+    entry: &workflow::history::HistoryEntry,
+    prefix: &str,
+) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    entry.display.starts_with(prefix)
+        || entry.paste_content.starts_with(prefix)
+        || workflow::history::is_paste_placeholder(&entry.display)
+}
 
 /// Phase 6: format a `SystemTime` as `HH:MM:SS` in UTC. Used by the
 /// activity-feed renderer; UTC keeps the implementation tiny (no chrono /
@@ -1113,6 +1437,14 @@ fn activity_summary_for(
         "kill_session" => {
             let target = params.get("session_uid").and_then(V::as_str).unwrap_or("?");
             Some(format!("kill_session({})", short(target)))
+        }
+        "notify_user" => {
+            let msg = params.get("message").and_then(V::as_str).unwrap_or("");
+            if msg.trim().is_empty() {
+                Some("notify_user".to_string())
+            } else {
+                Some(format!("notify_user({:?})", snippet(msg)))
+            }
         }
         "start_session" => {
             let label = params.get("label").and_then(V::as_str).unwrap_or("?");
@@ -1501,6 +1833,10 @@ pub(crate) enum SubmitAction {
         branch: Option<String>,
         idle_timeout_secs: u16,
         seed_from: Option<String>,
+        /// `true` when the branch field held the `.` sentinel: launch
+        /// in-place in the main repo (no worktree, no branch). `branch`
+        /// is `None` in that case.
+        in_place: bool,
     },
     SpawnSessionOnWorkspace {
         workspace_id: String,
@@ -1927,7 +2263,13 @@ pub(crate) fn handle_new_session(
         }
         KeyCode::Enter => {
             if !state.label_text.trim().is_empty() {
-                let branch = if state.branch_text.trim().is_empty() {
+                // Branch field semantics:
+                //   "."   → in-place: run in the main repo, no worktree/branch.
+                //   ""    → new worktree, branch `cm/<slug>` from HEAD.
+                //   other → new worktree from that base branch.
+                let trimmed = state.branch_text.trim();
+                let in_place = trimmed == ".";
+                let branch = if trimmed.is_empty() || in_place {
                     None
                 } else {
                     Some(state.branch_text.clone())
@@ -1942,6 +2284,7 @@ pub(crate) fn handle_new_session(
                     branch,
                     idle_timeout_secs: timeout,
                     seed_from: state.seed_from.clone(),
+                    in_place,
                 })
             } else {
                 InputOutcome::Consumed
@@ -2832,11 +3175,23 @@ pub struct App {
     pub planning: PlanningView,
     pub should_quit: bool,
     pub last_term_size: (u16, u16),
+    /// Throttle for `adopt_untracked_daemon_sessions`; bounds the
+    /// `list_sessions` RPC frequency in the main tick.
+    pub last_adopt_scan: Option<Instant>,
     pub config: Config,
     pub backend: BackendHandle,
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
     pub needs_redraw: bool,
+    /// Request a physical screen wipe (`terminal.clear()` → ESC[2J +
+    /// reset of ratatui's previous buffer) before the next draw. ratatui's
+    /// incremental diff only repaints cells it believes changed, so once
+    /// its previous-buffer model desyncs from the physical screen (e.g. a
+    /// same-dimension SIGWINCH, or any residual corruption) the artifacts
+    /// don't self-heal. The main loop consumes this flag to force a full
+    /// repaint. Set on resize and on the `A-r` refresh (the user's manual
+    /// "fix my screen" escape hatch).
+    pub force_clear: bool,
     input_mode: InputMode,
     start_time: Instant,
     sessions_restored: bool,
@@ -2876,6 +3231,21 @@ pub struct App {
     /// main loop and dispatched to method handlers. The server thread
     /// pushes; the main loop pops + replies. See `tui/src/control/`.
     control_queue: crate::control::queue::Queue,
+    /// Whether THIS TUI currently owns the control socket (`tui.sock`).
+    /// False when another instance held it at bind time. Drives the
+    /// degraded-mode banner in the status bar and gates the rebind retry.
+    control_bound: bool,
+    /// PID of the instance that owns the control socket when we don't
+    /// (read from the `<sock>.owner` sidecar; `None` when the holder
+    /// predates the sidecar or is gone). Surfaced in the banner so the
+    /// user knows exactly which process to kill.
+    control_conflict_pid: Option<u32>,
+    /// Resolved control-socket path, cached so the rebind retry and the
+    /// owner-PID lookup don't re-read the environment each tick.
+    control_socket_path: std::path::PathBuf,
+    /// Next instant at which `maybe_rebind_control_socket` re-attempts the
+    /// bind while degraded. Throttles retries to `CONTROL_REBIND_INTERVAL`.
+    control_rebind_at: Instant,
     /// Phase 6 activity feed: ring buffer of agent-initiated mutations
     /// surfaced over the MCP control socket. Read-only methods (list_*,
     /// get_*, ping, read_session_output) are intentionally excluded —
@@ -3013,6 +3383,18 @@ pub struct App {
     /// edits (typing inside the dialog) don't. Used as the
     /// second half of the Clear-on-transition gate.
     last_drawn_input_disc: Option<std::mem::Discriminant<InputMode>>,
+    /// Pending attention alerts raised by the `notify_user` MCP tool,
+    /// keyed by the alerting session's uid → the agent-supplied message.
+    /// Transient + in-memory only (never persisted to the manifest): an
+    /// alert is the live "this session wants you" signal that drives the
+    /// blinking sidebar indicator, and it's cleared the moment the user
+    /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
+    alerts: HashMap<String, String>,
+    /// Last alert animation frame we forced a redraw for. An alerting session
+    /// is usually idle (no PTY output → no redraws), so the heartbeat can't
+    /// ride the normal event-driven repaint; `tick_alerts` flips `needs_redraw`
+    /// whenever this frame index advances so the icon keeps animating.
+    last_alert_frame: u64,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -3080,15 +3462,33 @@ impl App {
             .collect();
         // Start the control socket. Failures aren't fatal — the TUI runs
         // fine without it; only MCP-driven control becomes unavailable.
+        // When another instance already owns the socket we DON'T steal it
+        // (that would clobber a legit second TUI); instead we record the
+        // degraded state, surface a banner, and retry the bind each tick
+        // (`maybe_rebind_control_socket`) so this instance self-heals the
+        // moment the holder exits.
         let control_queue = crate::control::queue::Queue::new();
-        match crate::control::server::start(control_queue.clone()) {
-            Ok(path) => {
-                eprintln!("control socket bound at {}", path.display());
-            }
-            Err(e) => {
-                eprintln!("control socket failed to start: {}", e);
-            }
-        }
+        let control_socket_path = crate::control::server::default_socket_path();
+        let (control_bound, control_conflict_pid) =
+            match crate::control::server::start(control_queue.clone()) {
+                Ok(path) => {
+                    eprintln!("control socket bound at {}", path.display());
+                    (true, None)
+                }
+                Err(e) => {
+                    let owner = crate::control::server::read_owner_pid(&control_socket_path);
+                    eprintln!(
+                        "control socket NOT bound ({}) — running WITHOUT a control plane; \
+                         MCP/agent control won't reach this instance{}. Retrying every {}s.",
+                        e,
+                        owner
+                            .map(|p| format!(" (held by PID {p})"))
+                            .unwrap_or_default(),
+                        CONTROL_REBIND_INTERVAL.as_secs(),
+                    );
+                    (false, owner)
+                }
+            };
         // Memory-cap preflight: run once at startup, cache the result.
         // Subsequent `spawn_agent_session` calls consult this synchronously
         // — no per-spawn probing.
@@ -3228,11 +3628,13 @@ impl App {
             planning: PlanningView::new(),
             should_quit: false,
             last_term_size: (80, 24),
+            last_adopt_scan: None,
             config,
             backend,
             connected: false,
             status_msg: None,
             needs_redraw: true,
+            force_clear: false,
             input_mode: InputMode::Normal,
             start_time: Instant::now(),
             sessions_restored: false,
@@ -3246,6 +3648,10 @@ impl App {
             pending_rotations: Vec::new(),
             mouse_capture_enabled: true,
             control_queue,
+            control_bound,
+            control_conflict_pid,
+            control_socket_path,
+            control_rebind_at: Instant::now() + CONTROL_REBIND_INTERVAL,
             activity_log,
             activity_visible: false,
             memory_cap_status,
@@ -3263,6 +3669,8 @@ impl App {
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
+            alerts: HashMap::new(),
+            last_alert_frame: 0,
         }
     }
 
@@ -3442,6 +3850,87 @@ impl App {
         let elapsed = self.start_time.elapsed().as_millis();
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
+    }
+
+    /// Current animation frame of the alert heartbeat — a monotonic counter
+    /// off the same clock the spinner uses. Drives both the glyph/color pick
+    /// and the redraw trigger in `tick_alerts`.
+    fn alert_frame(&self) -> u64 {
+        (self.start_time.elapsed().as_millis() / ALERT_FRAME_MS) as u64
+    }
+
+    /// Glyph + style for an alerting session's indicator at the current frame:
+    /// a bold bead that pulses small→large while its color cycles through the
+    /// rainbow. Fully replaces the normal status indicator while the alert is
+    /// pending — the animation *is* the signal.
+    fn alert_indicator(&self) -> (&'static str, Style) {
+        let f = self.alert_frame() as usize;
+        let glyph = ALERT_PULSE[f % ALERT_PULSE.len()];
+        let color = ALERT_RAINBOW[f % ALERT_RAINBOW.len()];
+        (glyph, Style::default().fg(color).add_modifier(Modifier::BOLD))
+    }
+
+    /// True iff the session with this uid has a pending `notify_user` alert.
+    pub(crate) fn session_has_alert(&self, uid: &str) -> bool {
+        self.alerts.contains_key(uid)
+    }
+
+    /// Record an attention alert for `uid` and fire the desktop notification.
+    /// Called by the `notify_user` control-socket handler. Idempotent on the
+    /// uid — a second alert just overwrites the message and re-notifies.
+    pub(crate) fn raise_alert(&mut self, uid: &str, label: &str, message: &str) {
+        self.alerts.insert(uid.to_string(), message.to_string());
+        notify_user_alert(label, message);
+        self.needs_redraw = true;
+    }
+
+    /// Drive the blink: when any alert is pending, force a redraw on each phase
+    /// flip so the indicator keeps pulsing even while the alerting session is
+    /// idle. Cheap no-op when `alerts` is empty (the common case). Called once
+    /// per main-loop iteration.
+    pub fn tick_alerts(&mut self) {
+        if self.alerts.is_empty() {
+            return;
+        }
+        let frame = self.alert_frame();
+        if frame != self.last_alert_frame {
+            self.last_alert_frame = frame;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Clear an alert once the user selects its session, and reap alerts whose
+    /// session no longer exists (so a dead uid can't keep the blink — and thus
+    /// the forced redraws — alive forever). Called once per main-loop iteration;
+    /// gated on a non-empty `alerts` map so it's free in the common case.
+    pub fn reap_and_clear_alerts(&mut self) {
+        if self.alerts.is_empty() {
+            return;
+        }
+        // Clear-on-focus: the chosen semantics are "selecting the session's
+        // sidebar row counts as focusing it" (attach selects first, so it's
+        // covered too). Resolve the uid first and drop the workspaces borrow
+        // before mutating `alerts`.
+        let selected = cursor_selected_session_uid(&self.cursor, &self.workspaces)
+            .map(str::to_string);
+        if let Some(uid) = selected {
+            if self.alerts.remove(&uid).is_some() {
+                self.needs_redraw = true;
+            }
+        }
+        // Reap alerts for sessions that have since gone away.
+        if !self.alerts.is_empty() {
+            let live: HashSet<&str> = self
+                .workspaces
+                .iter()
+                .flat_map(|ws| ws.sessions.iter().map(|ts| ts.uid.as_str()))
+                .collect();
+            let before = self.alerts.len();
+            self.alerts.retain(|uid, _| live.contains(uid.as_str()));
+            if self.alerts.len() != before {
+                self.needs_redraw = true;
+            }
+        }
     }
 
     pub fn is_input_mode(&self) -> bool {
@@ -3686,6 +4175,21 @@ impl App {
 
     /// Save session manifest to disk.
     pub(crate) fn save_session_manifest(&self) {
+        // Refuse to persist before the on-disk manifest has been hydrated
+        // into `self.workspaces` by `restore_sessions`. This writer does a
+        // FULL REPLACE of `~/.cm/tui-sessions.json` from `self.workspaces`
+        // (no merge with disk), so a save while that map is still a partial
+        // startup view — empty, or only the live agent sessions adoption
+        // surfaced — silently drops every workspace/session not yet
+        // restored. That is exactly the "lost sessions / lost workspaces on
+        // restart" clobber: adoption (or any RPC-triggered save) firing
+        // before restore overwrote a 14-workspace manifest down to the
+        // 3 live agent sessions. `maybe_restore_sessions` flips
+        // `sessions_restored` to true before `restore_sessions` runs its own
+        // internal save, so the hydrated write still goes through.
+        if !self.sessions_restored {
+            return;
+        }
         let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
         for ws in &self.workspaces {
             let mut entries: Vec<ManifestEntry> = ws
@@ -3839,6 +4343,34 @@ impl App {
                 Manifest::default()
             }
         }
+    }
+
+    /// Hydrate `self.workspaces` from the on-disk manifest exactly once,
+    /// decoupled from the cloud/planning API. Driven from the main loop.
+    ///
+    /// Restore was historically gated on the first
+    /// `BackendEvent::TasksUpdated`, which only fires after a successful
+    /// `list_tasks` API round-trip (see `backend::do_refresh`). In the
+    /// common pure-local case — or whenever the API host is slow/unreachable
+    /// (e.g. a failing remote host) — that event never arrives, so the
+    /// manifest sat intact on disk while `self.workspaces` stayed empty.
+    /// With the `save_session_manifest` / adoption guards in place that would
+    /// block persistence indefinitely; without them, adoption clobbered the
+    /// manifest (the "lost sessions on restart" bug). The manifest is a
+    /// local file, so its restore must not depend on the API at all.
+    ///
+    /// Idempotent via `sessions_restored`; cheap to call every tick. Sets the
+    /// flag *before* delegating so `restore_sessions`' own internal
+    /// `save_session_manifest` / adoption (which run at its tail) are not
+    /// blocked by the guards above. All prerequisites — `host_pool`,
+    /// `workflow_runs`, and the daemon socket — are ready by the time the
+    /// main loop first turns (loaded in `App::new` / `ensure_daemon_at_startup`).
+    pub fn maybe_restore_sessions(&mut self) {
+        if self.sessions_restored {
+            return;
+        }
+        self.sessions_restored = true;
+        self.restore_sessions();
     }
 
     /// Restore workspaces + sessions from the manifest. Runs after an
@@ -4078,6 +4610,219 @@ impl App {
         // (full-replace semantics — see
         // `rpc_tui_update_sessions_snapshot_full_replace`).
         self.push_state_to_daemon();
+        // Part 1: surface agent-spawned ("phantom") daemon sessions that
+        // aren't in the restored manifest (e.g. an agent spawned a worker
+        // while the TUI was down). Runs after restore so manifest-restored
+        // sessions are already tracked and won't be double-adopted.
+        self.adopt_untracked_daemon_sessions();
+    }
+
+    /// Throttled entry point for daemon-session adoption, called from the
+    /// main tick. Bounds the `list_sessions` RPC to once per
+    /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
+    pub fn maybe_adopt_daemon_sessions(&mut self) {
+        // Never adopt before the manifest is restored. Against an empty
+        // `self.workspaces` every manifest-backed daemon session looks
+        // "untracked", so adoption would mint duplicate workspaces and
+        // trigger a full-replace `save_session_manifest` that clobbers the
+        // on-disk manifest. `maybe_restore_sessions` runs first in the main
+        // loop; this guard is defense-in-depth (and pairs with the guard in
+        // `save_session_manifest`).
+        if !self.sessions_restored {
+            return;
+        }
+        const ADOPT_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        if let Some(last) = self.last_adopt_scan {
+            if now.duration_since(last) < ADOPT_SCAN_INTERVAL {
+                return;
+            }
+        }
+        self.last_adopt_scan = Some(now);
+        self.adopt_untracked_daemon_sessions();
+    }
+
+    /// Surface agent-spawned ("phantom") daemon sessions in the sidebar.
+    ///
+    /// MCP `start_session` registers a session only in the daemon's
+    /// `state.sessions`; it never reaches the TUI via `manifest.watch`
+    /// (which broadcasts `state.workspaces`, not `state.sessions`), so the
+    /// TUI never learns about it. This pass polls the daemon, attaches each
+    /// agent-spawned session the TUI doesn't already track, and places it
+    /// into the matching workspace (by `workspace_id`) so it shows up
+    /// grouped under its task like a manually-launched session.
+    ///
+    /// Best-effort and local-host only; any RPC/attach error is skipped.
+    /// Reuses the restore-path attach machinery
+    /// (`try_attach_via_daemon_with_deps`) wholesale.
+    fn adopt_untracked_daemon_sessions(&mut self) {
+        let Some(socket) = self
+            .host_pool
+            .for_host(&cm_daemon::host_id::HostId::local())
+            .ok()
+            .and_then(|h| h.socket_path())
+        else {
+            return;
+        };
+        let summaries = match crate::client_session::rpc_list_daemon_sessions(
+            &socket,
+            crate::daemon_launch::operator_token(),
+        ) {
+            Ok(s) => s,
+            Err(_) => return, // best-effort; matches restore_sessions posture
+        };
+
+        // Decide adoptees under an immutable borrow, then mutate.
+        //   - `managed_by_uid.is_some()`: agent-spawned only. TUI-/operator-
+        //     spawned sessions are `None` and are excluded (they're already
+        //     tracked anyway, but this is the authoritative gate).
+        //   - not already tracked in any workspace.
+        let tracked: std::collections::HashSet<&str> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
+            .collect();
+        let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
+        drop(tracked);
+        if adoptees.is_empty() {
+            return;
+        }
+
+        let (cols, rows) = self.last_term_size;
+        let mut adopted_any = false;
+        for s in adoptees {
+            // worktree: daemon-reported > matching workspace's > temp_dir.
+            // Must end up `Some` on the workspace so the restore-path attach
+            // branch re-attaches it after a TUI restart.
+            let worktree: PathBuf = s
+                .worktree_path
+                .clone()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    s.workspace_id.as_deref().and_then(|wid| {
+                        self.workspaces
+                            .iter()
+                            .find(|w| w.id.as_str() == wid)
+                            .and_then(|w| w.worktree_path.clone())
+                    })
+                })
+                .unwrap_or_else(std::env::temp_dir);
+
+            // Target workspace: the existing one matching the daemon's
+            // `workspace_id` (groups the session under the same task as the
+            // spawning agent), else a fresh synthetic workspace.
+            let target_ws_id: String = match s
+                .workspace_id
+                .as_deref()
+                .filter(|wid| self.workspaces.iter().any(|w| w.id.as_str() == *wid))
+            {
+                Some(wid) => wid.to_string(),
+                None => {
+                    let new_id = new_workspace_id();
+                    self.workspaces.push(Workspace {
+                        id: new_id.clone(),
+                        name: format!("agent: {}", s.label),
+                        is_closed: false,
+                        is_cloud: false,
+                        repo_url: None,
+                        worktree_path: Some(worktree.clone()),
+                        main_repo_path: None,
+                        worker_vm: None,
+                        worker_zone: None,
+                        sessions: Vec::new(),
+                        tombstones: Vec::new(),
+                        is_pushing: false,
+                    });
+                    new_id
+                }
+            };
+
+            // Attach to the existing daemon session (uid-only; the daemon
+            // already owns argv/env/cwd). Transcript binding is deferred —
+            // the attach-stream replays the PTY ring buffer, so the session
+            // is live + visible without it.
+            let session = match try_attach_via_daemon_with_deps(
+                &self.host_pool,
+                &s.session_uid,
+                &target_ws_id,
+                &worktree,
+                &s.session_type,
+                &s.label,
+                cols,
+                rows,
+                s.task_id.as_deref(),
+                s.workflow_run_id.as_deref(),
+                s.workflow_role.as_deref(),
+                &cm_daemon::host_id::HostId::local(),
+                None,
+            ) {
+                Ok(sess) => sess,
+                // TOCTOU: the session exited between list and attach. Skip
+                // (do NOT spawn — the TUI doesn't own this session).
+                Err(_) => continue,
+            };
+
+            let ts = TerminalSession {
+                uid: s.session_uid.clone(),
+                label: s.label.clone(),
+                session_type: normalize_session_type_to_internal(&s.session_type).to_string(),
+                session,
+                status: SessionStatus::Running,
+                last_write_at: None,
+                transcript_id: None,
+                generation: 0,
+                // Attach path skips the post-spawn JSONL rebind primer
+                // (mirrors `RestoreOutcome::Attached`).
+                pending_jsonl_files: None,
+                // VISIBLE by default — the whole point of adoption is that
+                // agent-spawned sessions show up on screen.
+                hidden: false,
+                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+                burst_threshold: 0,
+                pending_prompt: None,
+                pending_clear: None,
+                workflow_run_id: s.workflow_run_id.clone(),
+                workflow_role: s.workflow_role.clone(),
+                last_delivery: None,
+                task_id: s.task_id.clone(),
+                notify_on_idle: false,
+                pending_enter: None,
+                created_at: Instant::now(),
+                managed_by_uid: s.managed_by_uid.clone(),
+                seeded_from_snapshot: None,
+                preserved_last_exit: None,
+                host_id: cm_daemon::host_id::HostId::local(),
+            };
+            if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == target_ws_id) {
+                w.sessions.push(ts);
+                adopted_any = true;
+            }
+        }
+
+        if adopted_any {
+            // Persist (round-trips to tui-sessions.json so the adopted
+            // session re-attaches on restart via the restore path) and push
+            // the updated state to the daemon.
+            self.save_session_manifest();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Select which daemon-session summaries the adoption pass should take:
+    /// agent-spawned (`managed_by_uid.is_some()` — TUI/operator spawns are
+    /// `None`) and not already tracked in any TUI workspace. Pure (no
+    /// `self`) so the gate + dedup is unit-testable without a live daemon.
+    fn select_daemon_adoptees(
+        summaries: Vec<crate::client_session::DaemonSessionSummary>,
+        tracked_uids: &std::collections::HashSet<&str>,
+    ) -> Vec<crate::client_session::DaemonSessionSummary> {
+        summaries
+            .into_iter()
+            .filter(|s| {
+                s.managed_by_uid.is_some()
+                    && !tracked_uids.contains(s.session_uid.as_str())
+            })
+            .collect()
     }
 
 
@@ -5781,10 +6526,25 @@ impl App {
         // broadcast (which arrives via a separate channel) is
         // suppressed.
         let mut cap_kill_notes: Vec<String> = Vec::new();
+        // Bound how long this pass spends draining PTY events so a flooding
+        // session can't starve the rest of the main loop (control queue, UI).
+        // See `TERMINAL_DRAIN_BUDGET`. Once the deadline passes, sessions not
+        // yet reached skip their event drain this tick but still run their
+        // (cheap, O(1)-ish) idle-detection and pending-write logic below;
+        // unread events wait for the next tick.
+        let drain_deadline = now + TERMINAL_DRAIN_BUDGET;
+        let mut drain_over_budget = false;
         for (wi, ws) in self.workspaces.iter_mut().enumerate() {
             for (si, ts) in ws.sessions.iter_mut().enumerate() {
                 let is_focused = focused_idx == Some((wi, si));
-                while let Ok(event) = ts.session.event_rx.try_recv() {
+                // `drain_over_budget` short-circuits the event drain for this
+                // and every later session once the per-tick budget is spent.
+                let mut drained_this_session: usize = 0;
+                while !drain_over_budget {
+                    let event = match ts.session.event_rx.try_recv() {
+                        Ok(event) => event,
+                        Err(_) => break,
+                    };
                     match event {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
                             ts.session.exited = true;
@@ -5864,6 +6624,14 @@ impl App {
                             }
                         }
                         _ => {}
+                    }
+                    drained_this_session += 1;
+                    // Check the wall-clock budget periodically rather than per
+                    // event — `Instant::now()` on every iteration would add
+                    // measurable overhead under kHz wakeup floods, which is the
+                    // exact case this guard exists to bound.
+                    if drained_this_session % 256 == 0 && Instant::now() >= drain_deadline {
+                        drain_over_budget = true;
                     }
                 }
 
@@ -6368,10 +7136,12 @@ impl App {
             match event {
                 BackendEvent::TasksUpdated(tasks) => {
                     self.reconcile_tasks(tasks);
-                    if !self.sessions_restored {
-                        self.sessions_restored = true;
-                        self.restore_sessions();
-                    }
+                    // Fallback restore trigger. The main loop now calls
+                    // `maybe_restore_sessions` every tick (decoupled from the
+                    // API), so by the time the first tasks fetch lands this is
+                    // normally a no-op. Kept so a code path that drives
+                    // `drain_backend_events` without the loop still hydrates.
+                    self.maybe_restore_sessions();
                 }
                 BackendEvent::Connected => {
                     self.connected = true;
@@ -6441,6 +7211,50 @@ impl App {
                 }
                 BackendEvent::PlanTaskDeleted(id) => {
                     self.planning.on_task_deleted(&id);
+                }
+            }
+        }
+    }
+
+    /// While running without a control plane (another instance owned
+    /// `tui.sock` at our startup), periodically re-attempt the bind. The
+    /// moment the conflicting instance exits — releasing the socket — this
+    /// succeeds and the TUI regains its MCP/agent control plane, clearing
+    /// the degraded-mode banner. No-op (one cheap branch) once bound, which
+    /// is the overwhelmingly common case. Throttled to
+    /// `CONTROL_REBIND_INTERVAL`.
+    ///
+    /// A failed retry is cheap: `server::start` connect-probes the existing
+    /// socket and returns before binding (no listener thread spawned), so
+    /// repeated attempts against a still-live holder don't leak resources.
+    pub fn maybe_rebind_control_socket(&mut self) {
+        if self.control_bound {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.control_rebind_at {
+            return;
+        }
+        self.control_rebind_at = now + CONTROL_REBIND_INTERVAL;
+        match crate::control::server::start(self.control_queue.clone()) {
+            Ok(path) => {
+                eprintln!(
+                    "control socket bound at {} (recovered — prior holder exited)",
+                    path.display()
+                );
+                self.control_bound = true;
+                self.control_conflict_pid = None;
+                self.needs_redraw = true;
+            }
+            Err(_) => {
+                // Still held (or a transient bind failure). Refresh the
+                // owner PID in case the holder changed since last check so
+                // the banner always names the current squatter.
+                let owner =
+                    crate::control::server::read_owner_pid(&self.control_socket_path);
+                if owner != self.control_conflict_pid {
+                    self.control_conflict_pid = owner;
+                    self.needs_redraw = true;
                 }
             }
         }
@@ -6519,6 +7333,7 @@ impl App {
             "create_subtask" => methods::create_subtask(self, caller, &req.params),
             "list_subtasks" => methods::list_subtasks(self, caller, &req.params),
             "mark_subtask_done" => methods::mark_subtask_done(self, caller, &req.params),
+            "notify_user" => methods::notify_user(self, caller, &req.params),
             other => Err((
                 ErrorCode::UnknownMethod,
                 format!("unknown method: {}", other),
@@ -7423,10 +8238,25 @@ impl App {
             .workspaces
             .iter()
             .map(|w| {
-                let rank = self
-                    .first_task_for_ws(&w.id)
-                    .map(|t| status_rank(&self.task_status(t)))
-                    .unwrap_or(4);
+                let rank = match self.first_task_for_ws(&w.id) {
+                    Some(t) => status_rank(&self.task_status(t)),
+                    // No bound task: rank by the workspace's own session
+                    // activity, mirroring how `task_status` derives a bound
+                    // task's status. This makes a taskless workspace sort
+                    // identically to a task-bound one — an active (running)
+                    // session floats up alongside running tasks instead of
+                    // always sinking to the bottom. A sessionless taskless
+                    // workspace still ranks last (it's a fresh, empty slot).
+                    None => {
+                        if w.sessions.iter().any(|s| s.status == SessionStatus::Running) {
+                            status_rank(&TaskStatus::Running)
+                        } else if w.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
+                            status_rank(&TaskStatus::Blocked)
+                        } else {
+                            4
+                        }
+                    }
+                };
                 (w.id.clone(), rank)
             })
             .collect();
@@ -7550,6 +8380,7 @@ impl App {
                     autostart,
                     task_id,
                     parent_task_id,
+                    in_place,
                 } => {
                     self.launch_from_plan(
                         &project,
@@ -7559,6 +8390,7 @@ impl App {
                         autostart,
                         &task_id,
                         parent_task_id.as_deref(),
+                        in_place,
                     );
                     return true;
                 }
@@ -7724,7 +8556,11 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
-                        self.set_status_msg("Refreshing...");
+                        // Also force a full physical repaint — A-r doubles
+                        // as the "fix my screen" recovery if ratatui's diff
+                        // model ever desyncs from the terminal.
+                        self.force_clear = true;
+                        self.set_status_msg("Refreshing + redrawing...");
                         return true;
                     }
                     KeyCode::Char('e') => {
@@ -8259,6 +9095,7 @@ impl App {
                 branch,
                 idle_timeout_secs,
                 seed_from,
+                in_place,
             } => {
                 self.create_local_session(
                     &repo_url,
@@ -8266,6 +9103,7 @@ impl App {
                     branch.as_deref(),
                     idle_timeout_secs,
                     seed_from.as_deref(),
+                    in_place,
                 );
             }
             SubmitAction::SpawnSessionOnWorkspace {
@@ -9056,6 +9894,7 @@ impl App {
         start_branch: Option<&str>,
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
+        in_place: bool,
     ) {
         // 12e-r2 F1: snapshot active_host ONCE at the top of
         // the user action. Pass it through to `try_spawn_via_daemon`
@@ -9101,14 +9940,25 @@ impl App {
             }
         }
 
-        let worktree_path = match worktree::create_worktree(&main_repo, &slug, start_branch) {
-            Ok(p) => p,
-            Err(e) => {
-                self.set_status_msg(&format!("Worktree: {}", e));
-                return;
+        // In-place: the working directory IS the main checkout. Skip BOTH
+        // `create_worktree` (would mint a `cm/<slug>` branch + worktree dir)
+        // AND `setup_worktree` (would re-run `setup_worktree.sh` against the
+        // live repo). Cloning `main_repo` keeps `worktree_path` byte-equal to
+        // `main_repo_path` so `Workspace::is_in_place()` is true.
+        let worktree_path = if in_place {
+            main_repo.clone()
+        } else {
+            match worktree::create_worktree(&main_repo, &slug, start_branch) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.set_status_msg(&format!("Worktree: {}", e));
+                    return;
+                }
             }
         };
-        worktree::setup_worktree(&main_repo, &worktree_path);
+        if !in_place {
+            worktree::setup_worktree(&main_repo, &worktree_path);
+        }
 
         // If the user picked a snapshot, materialize it into the new
         // worktree's expected paths before we spawn. The returned id is
@@ -9925,6 +10775,12 @@ impl App {
         }
 
         let ws_id = self.workspaces[wi].id.clone();
+        // In-place workspaces have NO dedicated worktree or branch — their
+        // `worktree_path` IS the main repo. Skipping git teardown for them
+        // is the whole point of this guard: `git worktree remove` would
+        // target the main checkout, and `git branch -D` would delete the
+        // repo's live branch (e.g. `main`).
+        let in_place = self.workspaces[wi].is_in_place();
         let worktree_path = self.workspaces[wi].worktree_path.clone();
         let main_repo_path = self.workspaces[wi].main_repo_path.clone();
         let bound_task_ids: Vec<String> = self
@@ -9947,27 +10803,39 @@ impl App {
         // with a recoverable state (worktree still on disk, branches
         // intact, API rows intact) than to half-cleanup. The status
         // bar shows the git error so the user knows what's wrong.
-        if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo_path) {
-            if let Err(e) = worktree::remove_worktree(repo, wt) {
-                self.set_status_msg(&format!(
-                    "Workspace delete aborted: git worktree remove failed: {}",
-                    e
-                ));
-                return;
+        //
+        // In-place workspaces skip this entirely: there's no worktree to
+        // remove (it's the main repo). The rest of the cleanup (API task
+        // deletion, session kills, row removal) still runs unconditionally
+        // below — we just never touch git.
+        if !in_place {
+            if let (Some(ref wt), Some(ref repo)) = (&worktree_path, &main_repo_path) {
+                if let Err(e) = worktree::remove_worktree(repo, wt) {
+                    self.set_status_msg(&format!(
+                        "Workspace delete aborted: git worktree remove failed: {}",
+                        e
+                    ));
+                    return;
+                }
             }
         }
-        if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo_path) {
-            let _ = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["branch", "-D", branch])
-                .output();
-            if !bound_task_ids.is_empty() {
+        // Branch deletion: skipped for in-place. An in-place task's
+        // `wip_branch` is the repo's real current branch (e.g. `main`),
+        // not a `cm/<slug>` throwaway — deleting it would be catastrophic.
+        if !in_place {
+            if let (Some(ref branch), Some(ref repo)) = (&wip_branch, &main_repo_path) {
                 let _ = std::process::Command::new("git")
                     .arg("-C")
                     .arg(repo)
-                    .args(["push", "origin", "--delete", branch])
+                    .args(["branch", "-D", branch])
                     .output();
+                if !bound_task_ids.is_empty() {
+                    let _ = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["push", "origin", "--delete", branch])
+                        .output();
+                }
             }
         }
 
@@ -10012,6 +10880,14 @@ impl App {
         }
         if self.workspaces[wi].is_pushing {
             self.set_status_msg("Push already in progress");
+            return;
+        }
+        // In-place workspaces have no dedicated worktree to upload — their
+        // path IS the main repo. Pushing would convert the main checkout
+        // into a cloud workspace (clearing the local row), which is
+        // confusing and almost never intended. Block it explicitly.
+        if self.workspaces[wi].is_in_place() {
+            self.set_status_msg("Can't push an in-place workspace (no worktree to upload)");
             return;
         }
         let worktree_path = match &self.workspaces[wi].worktree_path {
@@ -10136,6 +11012,10 @@ impl App {
         // daemon's auth walk can't authorize parent → subtask
         // until the next reconcile patches it.
         parent_task_id: Option<&str>,
+        // `true` when the launch form's branch field held the `.`
+        // sentinel: run in the main repo in-place (no worktree, no
+        // `cm/<slug>` branch).
+        in_place: bool,
     ) {
         // 12e-r7 F2: planning A-l from the planning view
         // creates a worktree + spawns a session. Same shape
@@ -10166,15 +11046,24 @@ impl App {
             }
         };
 
-        let worktree_path = match worktree::create_worktree(&main_repo, slug, start_branch) {
-            Ok(p) => p,
-            Err(e) => {
-                self.set_status_msg(&format!("Worktree: {}", e));
-                return;
+        // In-place: cwd IS the main checkout — skip worktree + setup (see
+        // `create_local_session` for the rationale). Cloning keeps
+        // `worktree_path` byte-equal to `main_repo_path`.
+        let worktree_path = if in_place {
+            main_repo.clone()
+        } else {
+            match worktree::create_worktree(&main_repo, slug, start_branch) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.set_status_msg(&format!("Worktree: {}", e));
+                    return;
+                }
             }
         };
 
-        worktree::setup_worktree(&main_repo, &worktree_path);
+        if !in_place {
+            worktree::setup_worktree(&main_repo, &worktree_path);
+        }
 
         let (cols, rows) = self.last_term_size;
         // migrate-tui-local: pre-generate UID + workspace id so the
@@ -10216,7 +11105,17 @@ impl App {
             }
         };
 
-        let branch = format!("cm/{}", slug);
+        // For a normal launch the WIP branch is the freshly-created
+        // `cm/<slug>`. For in-place there's no new branch — record the main
+        // repo's ACTUAL current branch (e.g. `main`), or `None` on detached
+        // HEAD. This value is never a `cm/*` name, so `recover_worktree_path`
+        // returns `None` for it and reconcile can't mis-map an in-place task
+        // onto a `<repo>-<slug>` worktree dir.
+        let branch: Option<String> = if in_place {
+            worktree::worktree_current_branch(&main_repo)
+        } else {
+            Some(format!("cm/{}", slug))
+        };
         let mut ts = make_simple_session_with_uid(
             session_uid,
             slug,
@@ -10260,7 +11159,7 @@ impl App {
             api_status: TaskStatus::Running,
             repo_url: Some(repo_url.clone()),
             prompt: Some(prompt.to_string()),
-            wip_branch: Some(branch.clone()),
+            wip_branch: branch.clone(),
             session_id: None,
             blocked_at: None,
             is_cloud: false,
@@ -10279,7 +11178,11 @@ impl App {
             // `None` and the daemon saw the subtask as
             // top-level until reconcile patched it.
             parent_task_id: parent_task_id.map(str::to_string),
-            worktree_mode: WorktreeMode::Inherit,
+            worktree_mode: if in_place {
+                WorktreeMode::InPlace
+            } else {
+                WorktreeMode::Inherit
+            },
             metadata: None,
         });
 
@@ -10288,7 +11191,28 @@ impl App {
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("status".to_string(), serde_json::Value::String("running".to_string()));
-        fields.insert("wip_branch".to_string(), serde_json::Value::String(branch));
+        // Only write `wip_branch` when there's a real branch. In-place on a
+        // detached HEAD yields `None` — writing a bogus value would confuse
+        // reconcile and cleanup.
+        if let Some(b) = branch {
+            fields.insert("wip_branch".to_string(), serde_json::Value::String(b));
+        }
+        // Persist `worktree_mode = "in-place"` so the API row matches the
+        // local TaskEntry. Without this, reconcile (which copies the API's
+        // `worktree_mode` back into the local entry at `reconcile_tasks`)
+        // would overwrite the local `InPlace` with whatever the row was
+        // created with — and a stale `"branch"` would make
+        // `mark_subtask_done` treat the in-place workspace (whose
+        // `worktree_path == main_repo_path`) as a removable worktree. Only
+        // written for in-place launches: a normal launch leaves the row's
+        // mode untouched (it created a real `cm/<slug>` worktree, and the
+        // `mark_subtask_done` is_in_place() guard handles any drift anyway).
+        if in_place {
+            fields.insert(
+                "worktree_mode".to_string(),
+                serde_json::Value::String(WorktreeMode::InPlace.as_wire().to_string()),
+            );
+        }
         self.backend.update_plan_task(task_id.to_string(), fields);
         self.save_session_manifest();
         // Sub-2a Finding #1: launch added a TaskEntry —
@@ -10977,7 +11901,9 @@ impl App {
         let branch_cursor = if active_field == 2 { cursor } else { "" };
         let timeout_cursor = if active_field == 3 { cursor } else { "" };
 
-        let branch_hint = if branch_text.is_empty() && active_field != 2 {
+        let branch_hint = if branch_text.trim() == "." {
+            "  in-place (main repo, no worktree)"
+        } else if branch_text.is_empty() && active_field != 2 {
             "main"
         } else {
             ""
@@ -11516,6 +12442,15 @@ impl App {
                             }
                         }
                     };
+                    // notify_user attention animation: while an alert is
+                    // pending, the rainbow-heartbeat bead takes over the icon
+                    // cell entirely (overriding even a hidden session's blank)
+                    // — the whole point is to grab the eye regardless of status.
+                    let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+                        self.alert_indicator()
+                    } else {
+                        (indicator, indicator_style)
+                    };
 
                     // Role badge for workflow-participant sessions, e.g.
                     // "[worker] " / "[reviewer] " / "[manager] ". Phase 6
@@ -11545,14 +12480,7 @@ impl App {
                             let max_name =
                                 (inner.width as usize).saturating_sub(8);
                             let full = format!("{} / {}", ws.name, ts.label);
-                            if full.len() > max_name {
-                                format!(
-                                    "{}...",
-                                    &full[..max_name.saturating_sub(3)]
-                                )
-                            } else {
-                                full
-                            }
+                            crate::planning::truncate_with_ellipsis(&full, max_name)
                         }
                         SidebarView::Task => {
                             // Indent levels (Phase 6 deepened by 2 cells per tier
@@ -11624,6 +12552,19 @@ impl App {
                         Some(r) => aggregate_indicator(r, ws, spinner),
                         None => ("\u{25cf}", Style::default().fg(Color::DarkGray)),
                     };
+                    // If any participant of this workflow has a pending alert,
+                    // blink the group header too (the participant rows blink
+                    // individually, but the header keeps the signal visible
+                    // when the group reads as one unit).
+                    let agg_alerting = ws.sessions.iter().any(|ts| {
+                        ts.workflow_run_id.as_deref() == Some(run_id.as_str())
+                            && self.session_has_alert(&ts.uid)
+                    });
+                    let (agg_indicator, agg_style) = if agg_alerting {
+                        self.alert_indicator()
+                    } else {
+                        (agg_indicator, agg_style)
+                    };
                     let name = run
                         .map(|r| r.workflow_name.clone())
                         .unwrap_or_else(|| "workflow".into());
@@ -11657,11 +12598,7 @@ impl App {
                         .map(|t| t.name.clone())
                         .unwrap_or_else(|| "task".into());
                     let max_name = (inner.width as usize).saturating_sub(4);
-                    let name = if name.len() > max_name {
-                        format!("{}...", &name[..max_name.saturating_sub(3)])
-                    } else {
-                        name
-                    };
+                    let name = crate::planning::truncate_with_ellipsis(&name, max_name);
                     // Style lives on the ListItem so selection highlight can
                     // override. Using Span::styled with a fixed color here
                     // would mask the base_style on selection.
@@ -11789,6 +12726,40 @@ impl App {
     }
 
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
+        // Degraded-mode banner. When this TUI doesn't own the control
+        // socket it has NO MCP/agent control plane — `start_session`,
+        // `send_input`, `start_workflow` etc. all route to whichever
+        // instance does own it (or fail). That used to surface only as a
+        // line in cm-tui.log; make it impossible to miss by taking over the
+        // status bar with a red banner naming the PID to kill. Self-clears
+        // once `maybe_rebind_control_socket` reclaims the socket.
+        if !self.control_bound {
+            let msg = match self.control_conflict_pid {
+                Some(pid) => format!(
+                    " \u{26a0} NO CONTROL PLANE — tui.sock held by another TUI (PID {pid}); \
+                     MCP/agent control won't reach here. Run `kill {pid}`, then restart this TUI. ",
+                ),
+                None => " \u{26a0} NO CONTROL PLANE — tui.sock held by another instance; \
+                     MCP/agent control won't reach here. Quit the other TUI, then restart this one. "
+                    .to_string(),
+            };
+            // Truncate to the bar width, then pad so the red field spans it.
+            let mut text: String = msg.chars().take(area.width as usize).collect();
+            let used = text.chars().count() as u16;
+            if used < area.width {
+                text.push_str(&" ".repeat((area.width - used) as usize));
+            }
+            let line = Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
         let running = self
             .tasks
             .iter()
@@ -13249,6 +14220,23 @@ pub(crate) fn log_tick(run_id: &str, msg: &str) {
             );
         }
         let _ = writeln!(f, "{} {}", now, msg);
+    }
+}
+
+/// Uid of the session the cursor currently selects, if it's on a session row
+/// that resolves to a live session. This is the clear-on-focus target for
+/// `notify_user` alerts (`reap_and_clear_alerts`). Pure so it can be
+/// unit-tested without standing up a full `App`.
+fn cursor_selected_session_uid<'a>(
+    cursor: &Cursor,
+    workspaces: &'a [Workspace],
+) -> Option<&'a str> {
+    match cursor {
+        Cursor::Session(wi, si) => workspaces
+            .get(*wi)
+            .and_then(|ws| ws.sessions.get(*si))
+            .map(|ts| ts.uid.as_str()),
+        _ => None,
     }
 }
 
@@ -14914,6 +15902,36 @@ mod rotation_binding_tests {
     }
 
     #[test]
+    fn cursor_selected_session_uid_resolves_session_cursor() {
+        // Clear-on-focus depends on this mapping cursor → uid: it's the
+        // uid whose pending notify_user alert gets cleared.
+        let mut s0 = ts_with(None, None);
+        s0.uid = "uid-0".into();
+        let mut s1 = ts_with(None, None);
+        s1.uid = "uid-1".into();
+        let workspaces = vec![ws_with(vec![s0, s1])];
+
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Session(0, 1), &workspaces),
+            Some("uid-1"),
+        );
+        // A non-session cursor selects nothing — no alert should clear.
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Workspace(0), &workspaces),
+            None,
+        );
+        // Out-of-range indices resolve to None rather than panicking.
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Session(0, 9), &workspaces),
+            None,
+        );
+        assert_eq!(
+            cursor_selected_session_uid(&Cursor::Session(5, 0), &workspaces),
+            None,
+        );
+    }
+
+    #[test]
     fn binding_includes_non_workflow_claude_session() {
         // The fix: a regular pane (no workflow_run_id/role) with a
         // bound transcript_id must still appear in the rotation
@@ -15716,6 +16734,264 @@ mod activity_summary_tests {
     }
 }
 
+#[cfg(test)]
+mod adopt_daemon_session_tests {
+    //! Pins the adoption gate that surfaces agent-spawned ("phantom")
+    //! daemon sessions in the sidebar: only `managed_by_uid.is_some()`
+    //! (agent-spawned) AND not-already-tracked sessions are adopted.
+    use super::App;
+    use crate::client_session::DaemonSessionSummary;
+    use std::collections::HashSet;
+
+    fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
+        DaemonSessionSummary {
+            session_uid: uid.to_string(),
+            label: "w".to_string(),
+            session_type: "claude-code".to_string(),
+            managed_by_uid: managed_by_uid.map(str::to_string),
+            workspace_id: None,
+            task_id: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            worktree_path: None,
+        }
+    }
+
+    #[test]
+    fn adopts_only_agent_spawned_and_untracked() {
+        let tracked: HashSet<&str> = ["already-here"].into_iter().collect();
+        let summaries = vec![
+            summary("agent-1", Some("ts-parent")), // adopt
+            summary("operator-1", None),           // skip: not agent-spawned
+            summary("already-here", Some("ts-parent")), // skip: already tracked
+        ];
+        let picked = App::select_daemon_adoptees(summaries, &tracked);
+        let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
+        assert_eq!(uids, vec!["agent-1"]);
+    }
+
+    #[test]
+    fn managed_by_none_is_never_adopted() {
+        let tracked: HashSet<&str> = HashSet::new();
+        let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked);
+        assert!(
+            picked.is_empty(),
+            "TUI/operator-spawned sessions (managed_by_uid None) must not be adopted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worktree_mode_tests {
+    //! Pins the in-place launch primitives: the `WorktreeMode` wire
+    //! round-trip and the `Workspace::is_in_place()` marker that every
+    //! destructive-cleanup guard keys off.
+    use super::{parse_worktree_mode, Workspace, WorktreeMode};
+    use std::path::PathBuf;
+
+    #[test]
+    fn worktree_mode_wire_round_trip() {
+        assert_eq!(parse_worktree_mode("inherit"), WorktreeMode::Inherit);
+        assert_eq!(parse_worktree_mode("branch"), WorktreeMode::Branch);
+        assert_eq!(parse_worktree_mode("in-place"), WorktreeMode::InPlace);
+        // Unknown / future values fall back to the safe default.
+        assert_eq!(parse_worktree_mode("inplace"), WorktreeMode::Inherit);
+        assert_eq!(parse_worktree_mode("garbage"), WorktreeMode::Inherit);
+
+        assert_eq!(WorktreeMode::Inherit.as_wire(), "inherit");
+        assert_eq!(WorktreeMode::Branch.as_wire(), "branch");
+        assert_eq!(WorktreeMode::InPlace.as_wire(), "in-place");
+
+        // Full round trip through the wire form.
+        for m in [WorktreeMode::Inherit, WorktreeMode::Branch, WorktreeMode::InPlace] {
+            assert_eq!(parse_worktree_mode(m.as_wire()), m);
+        }
+    }
+
+    fn ws(worktree: Option<&str>, main: Option<&str>) -> Workspace {
+        Workspace {
+            id: "w".into(),
+            name: "w".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: worktree.map(PathBuf::from),
+            main_repo_path: main.map(PathBuf::from),
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        }
+    }
+
+    #[test]
+    fn is_in_place_truth_table() {
+        // Equal paths → in-place.
+        assert!(ws(Some("/repo"), Some("/repo")).is_in_place());
+        // Different paths (normal worktree) → not in-place.
+        assert!(!ws(Some("/repo-worktree"), Some("/repo")).is_in_place());
+        // Either side missing (e.g. cloud workspace) → not in-place.
+        assert!(!ws(None, Some("/repo")).is_in_place());
+        assert!(!ws(Some("/repo"), None).is_in_place());
+        assert!(!ws(None, None).is_in_place());
+    }
+}
+
+#[cfg(test)]
+mod entry_matches_delivery_tests {
+    //! Regression coverage for the workflow-binding path that broke
+    //! during the overnight cleanup orchestration. Each `parse_entries`
+    //! input below was copied verbatim from a real history.jsonl line
+    //! produced by the stuck workflow workers — this is the *exact*
+    //! data shape the production code has to handle.
+
+    use super::entry_matches_delivery;
+    use crate::workflow::history;
+
+    /// First 120 chars of the goal we delivered to the cli-cleanup worker.
+    /// That worker's actual transcript ended with `stop_reason: end_turn`
+    /// at 2026-05-09T04:36:18 — but the binding never landed because
+    /// neither `display` nor `paste_content` on the matching history
+    /// entry started with this prefix.
+    const CLEANUP_GOAL_PREFIX: &str =
+        "Fix two real bugs in the CLI in /home/lucas/.cm/worktrees/cm-sub-allow-claudes-to-spawn-and-manage-tasks-cleanup-cli";
+
+    /// Real production line from ~/.claude/history.jsonl on 2026-05-09 —
+    /// the one that left the cli-cleanup worker stuck on iteration 1.
+    /// `pastedContents` carries `contentHash` only; there is no `content`
+    /// field, so `paste_content` parses to "".
+    const REAL_POST_2025_PASTE_LINE: &str = r#"{"display":"[Pasted text #1 +11 lines]","pastedContents":{"1":{"id":1,"type":"text","contentHash":"d07c78137ebcc578"}},"timestamp":1778301350854,"project":"/home/lucas/.cm/worktrees/cm-sub-allow-claudes-to-spawn-and-manage-tasks-cleanup-cli-bucket-and-config-c316cc3","sessionId":"7cc30907-9cfd-458e-a9fa-896745af5b1a"}"#;
+
+    /// Pre-fix simulation: what the matcher used to look at — display +
+    /// paste_content prefix only. If THIS evaluates true on
+    /// `REAL_POST_2025_PASTE_LINE`, the bug never existed and our fix is
+    /// fixing nothing. (It MUST evaluate false to demonstrate the regression.)
+    fn pre_fix_match(entry: &history::HistoryEntry, prefix: &str) -> bool {
+        !prefix.is_empty()
+            && (entry.display.starts_with(prefix)
+                || entry.paste_content.starts_with(prefix))
+    }
+
+    #[test]
+    fn pre_fix_matcher_does_not_recover_post_2025_pastes() {
+        let entries = parse(REAL_POST_2025_PASTE_LINE);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+
+        // Confirm the parser produces the shape we expect: display is the
+        // placeholder, paste_content is empty.
+        assert_eq!(e.display, "[Pasted text #1 +11 lines]");
+        assert_eq!(e.paste_content, "");
+
+        // Old logic — the regression we're fixing. This MUST be false on
+        // the real production line, otherwise our fix is treating a non-bug.
+        assert!(
+            !pre_fix_match(e, CLEANUP_GOAL_PREFIX),
+            "pre-fix matcher should NOT have matched the post-2025 paste \
+             entry — that's exactly why all 5 cleanup workflows stalled. \
+             If this assertion fires, the diagnosis is wrong."
+        );
+    }
+
+    #[test]
+    fn post_fix_matcher_recovers_post_2025_pastes() {
+        let entries = parse(REAL_POST_2025_PASTE_LINE);
+        let e = &entries[0];
+
+        // New logic — the production code path. With the placeholder
+        // detector, the SAME real-world line now correlates.
+        assert!(
+            entry_matches_delivery(e, CLEANUP_GOAL_PREFIX),
+            "post-fix matcher must accept the post-2025 paste placeholder \
+             so resolve_pending_deliveries can bind the session"
+        );
+    }
+
+    #[test]
+    fn legacy_plain_typed_input_still_matches() {
+        // Pre-paste-redaction era: short typed prompts log raw text into
+        // `display`. Mustn't regress.
+        let line = r#"{"display":"Implement the feedback workflow","pastedContents":{},"timestamp":1,"project":"/p","sessionId":"s"}"#;
+        let e = &parse(line)[0];
+        assert!(entry_matches_delivery(e, "Implement the feedback"));
+    }
+
+    #[test]
+    fn legacy_paste_with_content_field_still_matches() {
+        // Pre-2025 paste schema where the raw text was inlined as
+        // `pastedContents.<k>.content`. Parser surfaces it via
+        // `paste_content`. Mustn't regress.
+        let line = r#"{"display":"[Pasted text #1 +3 lines]","pastedContents":{"1":{"id":1,"type":"text","content":"Fix the broken thing\nin the place\nthat is broken"}},"timestamp":1,"project":"/p","sessionId":"s"}"#;
+        let e = &parse(line)[0];
+        assert!(entry_matches_delivery(e, "Fix the broken"));
+    }
+
+    #[test]
+    fn empty_prefix_never_matches() {
+        // Defensive: a session with no recorded `last_delivery` (or one
+        // whose prefix was somehow trimmed to zero) must not bind to
+        // every history entry it sees.
+        let e = &parse(REAL_POST_2025_PASTE_LINE)[0];
+        assert!(!entry_matches_delivery(e, ""));
+    }
+
+    #[test]
+    fn typed_input_does_not_false_match_the_placeholder_text() {
+        // If a user literally types the placeholder string (improbable
+        // but possible), `display` matches by exact prefix, not the
+        // placeholder fallback. This covers a corner of the matching
+        // priority ordering — verifying both paths agree on this case.
+        let line = r#"{"display":"[Pasted text #1 +5 lines] is funny syntax","pastedContents":{},"timestamp":1,"project":"/p","sessionId":"s"}"#;
+        let e = &parse(line)[0];
+        assert!(entry_matches_delivery(e, "[Pasted text #1"));
+        // It also matches as a placeholder, which is fine — both paths
+        // agree on this entry. The test is documentation: don't try to
+        // "fix" the overlap; the matcher is intentionally OR-shaped.
+    }
+
+    /// Test helper: parse via the same parse_entries the production code
+    /// uses. We can't import it directly (private to history.rs) but a
+    /// single-line input through the public `HistoryWatcher::poll` is
+    /// awkward to set up. Instead, exercise the public path by writing
+    /// to a tempfile and reading back — but for these correlation tests
+    /// we only care about the parsed shape, so reuse the test-only
+    /// shim below that round-trips through a one-element vec.
+    fn parse(line: &str) -> Vec<history::HistoryEntry> {
+        // The simplest in-test parse path: use serde to project the raw
+        // JSON onto the same fields parse_entries extracts. We test
+        // parse_entries itself in workflow::history::tests; here we
+        // just need a constructor.
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+        let display = v.get("display").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let timestamp_ms = v.get("timestamp").and_then(|x| x.as_u64()).unwrap_or(0);
+        let project = v.get("project").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let session_id = v
+            .get("sessionId")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut paste_content = String::new();
+        if let Some(map) = v.get("pastedContents").and_then(|x| x.as_object()) {
+            for (_, val) in map {
+                if let Some(s) = val.get("content").and_then(|x| x.as_str()) {
+                    if !paste_content.is_empty() {
+                        paste_content.push('\n');
+                    }
+                    paste_content.push_str(s);
+                }
+            }
+        }
+        vec![history::HistoryEntry {
+            display,
+            timestamp_ms,
+            project,
+            session_id,
+            paste_content,
+        }]
+    }
+}
+
 /// Per-draw-section timing logger. Mirrors `main::log_slow_phase`
 /// but with a tighter 50ms threshold so sub-components of a slow
 /// `draw` phase get attributed individually (the main-loop
@@ -15872,12 +17148,71 @@ mod input_handler_tests {
                 branch,
                 idle_timeout_secs,
                 seed_from,
+                in_place,
             }) => {
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
                 assert_eq!(branch.as_deref(), Some("feat/x"));
                 assert_eq!(idle_timeout_secs, 10);
                 assert!(seed_from.is_none());
+                assert!(!in_place, "a real branch must not be in-place");
+            }
+            other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
+        }
+    }
+
+    /// The `.` sentinel in the branch field flips to in-place: no worktree,
+    /// no branch. A leading-dot path like `./foo` must NOT be treated as the
+    /// sentinel (it's a real, if unusual, branch name).
+    #[test]
+    fn new_session_dot_branch_sets_in_place() {
+        for raw in ["."] {
+            let (mut label, mut branch, mut timeout, mut repo, mut active) =
+                new_session_state("my-task", raw, "10", "https://github.com/a/b", 1);
+            let outcome = handle_new_session(
+                NewSessionMut {
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: &mut None,
+                    active_field: &mut active,
+                },
+                ctx_no_repos(),
+                &key(KeyCode::Enter),
+            );
+            match outcome {
+                InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                    branch, in_place, ..
+                }) => {
+                    assert!(in_place, "branch {raw:?} should be in-place");
+                    assert!(branch.is_none(), "in-place must carry no branch");
+                }
+                other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
+            }
+        }
+
+        // Negative: `./foo` is a real branch name, never in-place.
+        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            new_session_state("my-task", "./foo", "10", "https://github.com/a/b", 1);
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut None,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                branch, in_place, ..
+            }) => {
+                assert!(!in_place);
+                assert_eq!(branch.as_deref(), Some("./foo"));
             }
             other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
         }
@@ -18271,6 +19606,189 @@ context = "persistent"
     }
 }
 
+#[cfg(test)]
+mod respawn_kills_daemon_session_tests {
+    //! Slice 10d-memory-cap-relocation review finding.
+    //!
+    //! Pins the structural invariant the reviewer surfaced:
+    //! `respawn_existing_with_workflow_mcp` swaps a fresh
+    //! `Session` into a live `TerminalSession` slot via
+    //! `ts.session = new_sess`. For local-PTY sessions, dropping
+    //! the old `Session` closes its master fd and reaps the old
+    //! agent. For daemon-attached sessions, Drop is detach-only
+    //! by design (slice 10c-e-3b-fix2) — so without an explicit
+    //! `App::kill_daemon_session_if_attached` BEFORE the
+    //! assignment, the daemon's old PTY child stays alive while
+    //! a freshly-resumed agent starts in the same slot.
+    //! Duplicate live agents, transcript / worktree races.
+    //!
+    //! This is the same bug class as the round-33 finding 1
+    //! (`MCP kill_session` orphan) and the slice-10c-e-3b-fix2
+    //! teardown-paths sweep — a *missed call site* of the kill
+    //! helper. The pinning test guards against a future
+    //! refactor that re-removes the call.
+    //!
+    //! **Why a source-presence test rather than a behavioral
+    //! one**: `respawn_existing_with_workflow_mcp` calls
+    //! `crate::session::spawn_agent_session`, which spawns a
+    //! real PTY child running the agent binary. Driving that
+    //! end-to-end requires a real worktree, a live daemon, and
+    //! the agent binary on `$PATH` — far too heavy for a unit
+    //! test. The lower-cost behavioral coverage already exists
+    //! (`client_session::tests` verifies that
+    //! `kill_daemon_session_if_attached` actually removes the
+    //! daemon-side registry entry). What's missing — and what
+    //! this test adds — is the *call-site* pin: a future change
+    //! that re-introduces the bug by removing or reordering the
+    //! call will fail this test by name.
+
+    const APP_SRC: &str = include_str!("app.rs");
+
+    /// Locate the start of `pub(crate) fn respawn_existing_with_workflow_mcp`
+    /// in this file and return the function body — from the
+    /// `{` after the signature through the matching `}`. Used
+    /// to scope the structural assertions below to the body of
+    /// the function under test (not the whole file).
+    fn respawn_body() -> &'static str {
+        let sig_marker = "pub(crate) fn respawn_existing_with_workflow_mcp";
+        let sig_idx = APP_SRC
+            .find(sig_marker)
+            .expect("respawn_existing_with_workflow_mcp must exist in app.rs");
+        let from_sig = &APP_SRC[sig_idx..];
+
+        // Find the first `{` that opens the body (after the
+        // signature + return type). `signed -> Option<String> {`
+        let body_open = from_sig
+            .find('{')
+            .expect("function signature must be followed by an opening brace");
+        let body = &from_sig[body_open..];
+
+        // Find the matching closing brace by counting depth.
+        let mut depth = 0usize;
+        let mut end = body.len();
+        for (i, c) in body.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &body[..end]
+    }
+
+    /// The named acceptance test. The function must call
+    /// `kill_daemon_session_if_attached(ts)` before assigning
+    /// `ts.session = new_sess`. Without that ordering, a
+    /// daemon-attached session being respawned leaves a live
+    /// orphan on the daemon side.
+    #[test]
+    fn respawn_calls_kill_daemon_before_session_swap() {
+        let body = respawn_body();
+        // 12e: helper signature changed to take `&HostPool`
+        // first; the textual needle is the multi-arg call form.
+        let kill_idx = body.find("kill_daemon_session_if_attached(host_pool, ts)").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must call \
+                 App::kill_daemon_session_if_attached(host_pool, ts) before \
+                 swapping `ts.session`. For daemon-attached sessions, Drop is \
+                 detach-only — without the explicit kill, the daemon's old \
+                 PTY child outlives the swap and races the new agent. \
+                 Same bug class as round-33 finding 1 + the slice \
+                 10c-e-3b-fix2 teardown-paths sweep.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let swap_idx = body.find("ts.session = new_sess").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must assign \
+                 `ts.session = new_sess` to install the freshly-spawned \
+                 session. If the assignment shape has changed, update \
+                 this test's needle.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        assert!(
+            kill_idx < swap_idx,
+            "kill_daemon_session_if_attached(host_pool, ts) at byte {} must \
+             precede `ts.session = new_sess` at byte {} — otherwise the swap \
+             drops the old daemon-attached Session (detach-only Drop) BEFORE the \
+             explicit kill RPC fires, leaving an orphan daemon PTY child.\n\nFunction body:\n{}",
+            kill_idx, swap_idx, body
+        );
+    }
+
+    /// Regression pin for the review-workflow PTY-freeze bug: the
+    /// respawn must spawn the replacement under a FRESH uid, not
+    /// reuse `ts.uid`. `kill_session` defers daemon registry
+    /// removal to the reaper, so reusing the just-killed uid races
+    /// the daemon's `start_session` collision guard (`Conflict`),
+    /// the spawn fails, the `ts.session` swap never runs, and the
+    /// foreground PTY is left attached to a dead session — frozen,
+    /// no input. A fresh uid removes the race. The `ts.uid` field
+    /// must then be re-pointed at the new uid so descendant-scope
+    /// MCP auth (`ts.uid == caller_uid`) keeps matching the
+    /// respawned agent's `CM_TUI_SESSION_ID`.
+    #[test]
+    fn respawn_uses_fresh_uid_not_reused_to_avoid_kill_then_reuse_collision() {
+        let body = respawn_body();
+        let mint_idx = body.find("let new_uid = new_session_uid();").unwrap_or_else(|| {
+            panic!(
+                "respawn_existing_with_workflow_mcp must mint a fresh uid \
+                 (`let new_uid = new_session_uid();`) for the replacement \
+                 session instead of reusing `ts.uid`. Reusing the just-killed \
+                 uid races the daemon's start_session collision guard and \
+                 freezes the foreground PTY.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let kill_idx = body
+            .find("kill_daemon_session_if_attached(host_pool, ts)")
+            .expect("kill call must exist");
+        assert!(
+            mint_idx < kill_idx,
+            "the fresh uid must be minted before the kill so kill-uid and \
+             start-uid are guaranteed distinct",
+        );
+        assert!(
+            body.contains("&new_uid,"),
+            "the daemon spawn must be passed `&new_uid` (the fresh uid), not \
+             `&ts.uid`, so the new daemon session registers under a uid the \
+             just-killed one can't collide with.\n\nFunction body:\n{}",
+            body,
+        );
+        assert!(
+            !body.contains("&ts.uid,"),
+            "respawn must NOT pass `&ts.uid` to the spawn — that reintroduces \
+             the kill-then-reuse collision freeze.\n\nFunction body:\n{}",
+            body,
+        );
+        let adopt_idx = body.find("ts.uid = new_uid;").unwrap_or_else(|| {
+            panic!(
+                "after swapping `ts.session`, respawn must adopt the fresh uid \
+                 (`ts.uid = new_uid;`) so descendant-scope MCP auth \
+                 (`ts.uid == caller_uid`) matches the respawned agent's \
+                 CM_TUI_SESSION_ID.\n\nFunction body:\n{}",
+                body
+            )
+        });
+        let swap_idx = body
+            .find("ts.session = new_sess")
+            .expect("swap must exist");
+        assert!(
+            swap_idx < adopt_idx,
+            "`ts.uid = new_uid` must come AFTER `ts.session = new_sess` — the \
+             uid is adopted only once the swap succeeds (error paths keep the \
+             old identity for the still-old session).",
+        );
+    }
+}
+
 /// Slice 12e: A-H active-host cycling + new-session inheritance
 /// + multi-host sidebar grouping + per-session-host routing for
 /// the three `_if_attached` helpers.
@@ -19739,6 +21257,14 @@ remote_socket = "/remote/manager.sock"
 
         // Now drive a save_session_manifest. The remote entry
         // MUST round-trip back to disk.
+        //
+        // `save_session_manifest` no-ops until `sessions_restored` is set
+        // (the guard that prevents the "lost sessions on restart" clobber).
+        // Production reaches restore via `maybe_restore_sessions`, which sets
+        // the flag; this test calls `restore_sessions` directly, so set it
+        // explicitly here — otherwise the save is skipped and this test would
+        // pass spuriously off the still-present original file.
+        app.sessions_restored = true;
         app.save_session_manifest();
 
         // Re-load and verify the remote entry is intact.
@@ -19805,6 +21331,127 @@ remote_socket = "/remote/manager.sock"
             remote_entry.seeded_from_snapshot,
         );
         assert_eq!(reloaded_remote.host_id, remote_entry.host_id);
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        drop(guard);
+    }
+
+    /// Regression: `save_session_manifest` MUST NOT overwrite the on-disk
+    /// manifest before `restore_sessions` has hydrated `self.workspaces`.
+    ///
+    /// This is the "lost sessions / lost workspaces on restart" bug. On
+    /// startup `self.workspaces` is empty (or holds only the live agent
+    /// sessions adoption surfaced); because the writer does a FULL REPLACE,
+    /// any save before restore clobbered the real manifest down to that
+    /// partial view. The guard turns such a save into a no-op until
+    /// `sessions_restored` is set (by `maybe_restore_sessions`).
+    #[test]
+    fn save_session_manifest_noops_before_restore_so_manifest_is_not_clobbered() {
+        use cm_daemon::manifest::{Manifest, ManifestWorkspace};
+
+        let guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).expect("create .cm");
+
+        // A real, multi-workspace manifest already on disk — the state a
+        // restart must preserve.
+        let mut workspaces = HashMap::new();
+        for id in ["ws-keep-1", "ws-keep-2"] {
+            workspaces.insert(
+                id.to_string(),
+                ManifestWorkspace {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: None,
+                    main_repo_path: None,
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    sessions: vec![],
+                    tombstones: vec![],
+                },
+            );
+        }
+        let on_disk = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: Some("task".to_string()),
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&on_disk).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // App::new must NOT have restored yet — restore is driven from the
+        // main loop via `maybe_restore_sessions`.
+        assert!(!app.sessions_restored, "fresh App must not be pre-restored");
+
+        // Mimic the clobber trigger: a single fresh workspace lands in live
+        // state (as adoption would mint) and a save fires BEFORE restore.
+        app.workspaces.push(Workspace {
+            id: "ws-fresh-adopted".into(),
+            name: "agent: phantom".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        });
+        app.save_session_manifest();
+
+        // The on-disk manifest MUST be untouched — the two real workspaces
+        // survive, the phantom did NOT replace them.
+        let reloaded: Manifest = serde_json::from_str(
+            &std::fs::read_to_string(cm_dir.join("tui-sessions.json")).expect("read"),
+        )
+        .expect("parse");
+        assert!(
+            reloaded.workspaces.contains_key("ws-keep-1")
+                && reloaded.workspaces.contains_key("ws-keep-2"),
+            "pre-restore save clobbered the manifest: {:?}",
+            reloaded.workspaces.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            !reloaded.workspaces.contains_key("ws-fresh-adopted"),
+            "pre-restore save must be a no-op, not a partial write",
+        );
+
+        // After the flag flips (what `maybe_restore_sessions` does), saves
+        // resume and persist live state.
+        app.sessions_restored = true;
+        app.save_session_manifest();
+        let reloaded2: Manifest = serde_json::from_str(
+            &std::fs::read_to_string(cm_dir.join("tui-sessions.json")).expect("read2"),
+        )
+        .expect("parse2");
+        assert!(
+            reloaded2.workspaces.contains_key("ws-fresh-adopted"),
+            "post-restore save must persist live workspaces",
+        );
 
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },

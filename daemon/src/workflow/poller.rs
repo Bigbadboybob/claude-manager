@@ -111,6 +111,21 @@ pub enum Decision {
         to_role: String,
         rendered_prompt: String,
     },
+    /// Daemon-owned active role completed a turn but has NO static
+    /// `on_idle` transition — it was supposed to advance the workflow
+    /// with a dynamic tool call (`workflow_transition` / `workflow_done`)
+    /// and instead ended its turn with prose. The idle-nudge backstop
+    /// re-delivers its own activation prompt (a self-targeted
+    /// re-activation: `from == to == role`). `guard_count` is the role's
+    /// assistant-turn count at fire time, persisted to
+    /// `WorkflowRun::nudge_assistant_count` so the next tick debounces
+    /// until the role produces a genuinely new turn.
+    Nudge {
+        run_id: String,
+        role: String,
+        rendered_prompt: String,
+        guard_count: usize,
+    },
     /// Run was inspected but no fire — gate didn't favor daemon
     /// ownership, the agent isn't idle, or some precondition isn't
     /// met yet. Carries `reason` for log/test visibility.
@@ -142,6 +157,16 @@ pub enum SkipReason {
     /// Gate ran, idle predicate ran, but the agent isn't idle since
     /// baseline. Most common steady-state skip.
     NotIdle,
+    /// Active role has no static `on_idle` transition and is idle, but
+    /// the idle-nudge backstop already fired at this exact assistant-turn
+    /// count. Debounced so the async history-append lag window can't
+    /// burst duplicate self-targeted re-activations.
+    NudgeDebounced,
+    /// Active role has no static `on_idle` transition and is idle, but the
+    /// backstop has already re-prompted this stuck stretch
+    /// `MAX_CONSECUTIVE_IDLE_NUDGES` times. Give up and leave the run idle
+    /// for an operator to notice.
+    NudgeExhausted,
     /// Active role's session wasn't found in either
     /// `state.sessions` or `state.tui_sessions` (the gate
     /// couldn't determine ownership). Self-resolves once
@@ -466,25 +491,63 @@ impl WorkflowPoller {
         // assert the apply outcome separately via state inspection.
         if !self.disable_apply_for_test.load(Ordering::SeqCst) {
             for d in &decisions {
-                if let Decision::ActivateStatic {
-                    run_id,
-                    from_role,
-                    to_role,
-                    rendered_prompt,
-                } = d
-                {
-                    if let Err(e) = self.fire_static_transition(
+                match d {
+                    Decision::ActivateStatic {
                         run_id,
                         from_role,
                         to_role,
                         rendered_prompt,
-                    ) {
-                        eprintln!(
-                            "cm-daemon: workflow poller failed to fire static \
-                             transition for run={} from={} to={}: {}",
-                            run_id, from_role, to_role, e,
-                        );
+                    } => {
+                        if let Err(e) = self.fire_static_transition(
+                            run_id,
+                            from_role,
+                            to_role,
+                            rendered_prompt,
+                        ) {
+                            eprintln!(
+                                "cm-daemon: workflow poller failed to fire static \
+                                 transition for run={} from={} to={}: {}",
+                                run_id, from_role, to_role, e,
+                            );
+                        }
                     }
+                    Decision::Nudge {
+                        run_id,
+                        role,
+                        rendered_prompt,
+                        guard_count,
+                    } => {
+                        // Persist the debounce marker BEFORE firing so a
+                        // tick that races ahead of the async history
+                        // append still sees it and skips (else a burst of
+                        // duplicate self-re-activations). Skip the fire if
+                        // the marker didn't stick.
+                        if let Err(e) =
+                            self.persist_nudge_guard(run_id, *guard_count)
+                        {
+                            eprintln!(
+                                "cm-daemon: workflow poller failed to persist \
+                                 idle-nudge guard for run={} (skipping nudge to \
+                                 avoid a re-fire burst): {}",
+                                run_id, e,
+                            );
+                            continue;
+                        }
+                        // Self-targeted re-activation: from == to == role.
+                        if let Err(e) = self.fire_static_transition(
+                            run_id,
+                            role,
+                            role,
+                            rendered_prompt,
+                        ) {
+                            eprintln!(
+                                "cm-daemon: workflow poller failed to fire idle \
+                                 nudge for run={} role={}: {}",
+                                run_id, role, e,
+                            );
+                        }
+                    }
+                    Decision::Skip { .. } => {}
                 }
             }
             // Phase 3: complete in-flight hand-offs. Keyed off run state
@@ -810,12 +873,13 @@ impl WorkflowPoller {
                 reason: SkipReason::NoWorkflowDefinition,
             };
         };
-        let Some(transition) = wf.static_transition_on_idle(active) else {
-            return Decision::Skip {
-                run_id: snap.run_id.clone(),
-                reason: SkipReason::NoOnIdleTransition,
-            };
-        };
+        // NOTE: the static on_idle transition lookup is deferred to
+        // AFTER the idle predicate below (it used to early-return here
+        // with NoOnIdleTransition). A role with NO on_idle transition is
+        // supposed to advance the workflow via a dynamic tool call;
+        // detecting that it idled WITHOUT doing so (the nudge case) needs
+        // the same worktree/sid/baseline/idle checks as a normal fire, so
+        // we run those first and branch on the transition's presence last.
         let Some(worktree) = snap.worktree_path.as_deref() else {
             return Decision::Skip {
                 run_id: snap.run_id.clone(),
@@ -868,12 +932,72 @@ impl WorkflowPoller {
             };
         }
 
-        // Render activation prompt. Same shape as the TUI's
-        // `WorkflowResolver` path; uses
-        // `subsequent_activation_prompt` when the target role has
-        // prior activations in `run.history` (matches
+        // Idle fired. Branch on whether the active role has a static
+        // on_idle hand-off:
+        //   (a) Some(transition) → normal hand-off to transition.to.
+        //   (b) None → the role was meant to advance the workflow via a
+        //       dynamic tool call and didn't (it ended a turn with prose,
+        //       not a tool call). Nudge it (self-targeted: to == role)
+        //       with the distinct IDLE_NUDGE_PROMPT, debounced per
+        //       completed turn and capped per stuck stretch.
+        let transition = wf.static_transition_on_idle(active);
+        let to_role = transition
+            .map(|t| t.to.clone())
+            .unwrap_or_else(|| active.to_string());
+        let nudge_guard_count: Option<usize> = if transition.is_none() {
+            // The start-count baseline above lags in the async
+            // history-append window, so it can't carry the
+            // once-per-completed-turn guard; the persisted
+            // nudge_assistant_count can. Compare the live assistant-turn
+            // count (which includes tool-use turns — a monotonic marker,
+            // and notably a turn that ENDS in a workflow_done/transition
+            // tool call is not turn-complete, so this branch never runs
+            // for a role that did advance the workflow).
+            let current_count = crate::workflow::transcript::count_messages(
+                &engine,
+                worktree,
+                sid,
+                crate::workflow::transcript::MessageKind::Assistant,
+            );
+            if snap.run.nudge_assistant_count == Some(current_count) {
+                return Decision::Skip {
+                    run_id: snap.run_id.clone(),
+                    reason: SkipReason::NudgeDebounced,
+                };
+            }
+            if snap
+                .run
+                .trailing_activation_streak(active)
+                .saturating_sub(1)
+                >= crate::workflow::MAX_CONSECUTIVE_IDLE_NUDGES
+            {
+                return Decision::Skip {
+                    run_id: snap.run_id.clone(),
+                    reason: SkipReason::NudgeExhausted,
+                };
+            }
+            Some(current_count)
+        } else {
+            None
+        };
+
+        // For a nudge, return early with the DISTINCT idle-nudge prompt.
+        // We deliberately do NOT re-deliver the role's own activation
+        // prompt: the nudge names the stall and the one required action.
+        if let Some(guard_count) = nudge_guard_count {
+            return Decision::Nudge {
+                run_id: snap.run_id.clone(),
+                role: active.to_string(),
+                rendered_prompt: crate::workflow::IDLE_NUDGE_PROMPT.to_string(),
+                guard_count,
+            };
+        }
+
+        // Normal hand-off: render the target role's activation prompt.
+        // Same shape as the TUI's `WorkflowResolver` path; uses
+        // `subsequent_activation_prompt` when the target role has prior
+        // activations in `run.history` (matches
         // `tui/src/workflow/controller.rs:1687-1695`).
-        let to_role = transition.to.clone();
         let target_role_spec = match wf.roles.get(&to_role) {
             Some(r) => r,
             None => {
@@ -989,6 +1113,31 @@ impl WorkflowPoller {
         ) {
             Ok(_) => Ok(()),
             Err((code, msg)) => Err(format!("{:?}: {}", code, msg)),
+        }
+    }
+
+    /// Persist the idle-nudge debounce marker (`nudge_assistant_count`)
+    /// for `run_id` BEFORE the self-targeted re-activation fires. This is
+    /// a separate, synchronous `try_modify` (not threaded through
+    /// `workflow_transition`) so the next poll tick sees the marker even
+    /// if it runs before the async history-append for this nudge lands —
+    /// without it, the stale start-count baseline would re-fire the nudge
+    /// every tick until the append caught up. The closure never aborts,
+    /// so `Aborted` is uninhabited.
+    fn persist_nudge_guard(&self, run_id: &str, guard_count: usize) -> Result<(), String> {
+        let outcome = crate::workflow::run::try_modify::<_, std::convert::Infallible>(
+            run_id,
+            move |run| {
+                run.nudge_assistant_count = Some(guard_count);
+                Ok(())
+            },
+        );
+        match outcome {
+            crate::workflow::run::TryModifyOutcome::Ok(_) => Ok(()),
+            crate::workflow::run::TryModifyOutcome::Aborted(never) => match never {},
+            crate::workflow::run::TryModifyOutcome::Persist(e) => {
+                Err(format!("persist nudge guard: {:?}", e))
+            }
         }
     }
 
@@ -2425,6 +2574,172 @@ mod tests {
         );
     }
 
+    /// Idle-nudge backstop: a daemon-owned active role that is idle but
+    /// has NO static `on_idle` transition (the manager case) gets a
+    /// self-targeted `Nudge` re-activation instead of a silent
+    /// `NoOnIdleTransition` skip. Also pins the debounce (one nudge per
+    /// assistant-turn count) and the per-stretch cap.
+    #[test]
+    fn poll_once_nudges_idle_role_with_no_on_idle_transition() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+        let home = _tmp_home.path();
+
+        // Worktree + one complete assistant turn for "manager"
+        // (session id "sid-mgr"): count_messages → 1, baseline 0.
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let encoded = wt_str.replace('/', "-").replace('.', "-");
+        let proj = home.join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-mgr.jsonl"),
+            r##"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"verdict prose, no tool call"}]}}"##,
+        )
+        .unwrap();
+
+        // Run with a single "manager" role and NO transitions.
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "manager".to_string(),
+            RoleBinding {
+                session_label: "manager".to_string(),
+                current_session_id: Some("sid-mgr".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        let mut baselines = BTreeMap::new();
+        baselines.insert(
+            "manager".to_string(),
+            MessageBaseline { user_count: 0, assistant_count: 0 },
+        );
+        let run = WorkflowRun::new(
+            "rn1".to_string(),
+            "feedback".to_string(),
+            "/tmp/wf-poller-test".to_string(),
+            roles,
+            "manager".to_string(),
+            baselines,
+            None,
+            BTreeMap::new(),
+            0,
+        );
+        crate::workflow::run::save(&run).expect("save run");
+
+        let state = {
+            let mut s = DaemonState::default();
+            s.workflow_runs.insert("rn1".to_string(), run.clone());
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "/tmp/wf-poller-test".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("/tmp/wf-poller-test".to_string(), ws);
+
+            use crate::workflow::toml_schema::{Context, Role, Workflow};
+            let mut defroles = BTreeMap::new();
+            defroles.insert(
+                "manager".to_string(),
+                Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some("manager first".to_string()),
+                    subsequent_activation_prompt: Some("decide and CALL the tool".to_string()),
+                    needs_mcp: false,
+                },
+            );
+            s.workflow_definitions.insert(
+                "feedback".to_string(),
+                Workflow {
+                    name: "feedback".to_string(),
+                    description: String::new(),
+                    roles: defroles,
+                    role_order: vec!["manager".to_string()],
+                    transitions: vec![], // no on_idle hand-off → nudge path
+                },
+            );
+            let mut sp = crate::session::SpawnParams::new("ts-mgr", "manager", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "/tmp/wf-poller-test".to_string();
+            sp.session_type = "claude-code".to_string();
+            sp.workflow_run_id = Some("rn1".to_string());
+            sp.workflow_role = Some("manager".to_string());
+            let ds: DaemonSession = DaemonSession::spawn(sp).expect("spawn /bin/sleep");
+            s.sessions.insert("ts-mgr".to_string(), ds);
+            Arc::new(Mutex::new(s))
+        };
+        bind_daemon_uid_to_role("rn1", "manager", "ts-mgr");
+
+        let poller = WorkflowPoller::new(state);
+        poller.set_disable_apply_for_test(true);
+
+        // Phase 1: idle + no transition + never nudged → Nudge with the
+        // live assistant-turn count as the guard, re-delivering the
+        // role's subsequent_activation_prompt.
+        let decisions = poller.poll_once();
+        assert_eq!(decisions.len(), 1, "expected one decision, got {:?}", decisions);
+        match &decisions[0] {
+            Decision::Nudge { run_id, role, rendered_prompt, guard_count } => {
+                assert_eq!(run_id, "rn1");
+                assert_eq!(role, "manager");
+                assert_eq!(*guard_count, 1, "guard is the live assistant-turn count");
+                assert_eq!(
+                    rendered_prompt,
+                    crate::workflow::IDLE_NUDGE_PROMPT,
+                    "nudge delivers the distinct IDLE_NUDGE_PROMPT, not the \
+                     role's own activation prompt",
+                );
+            }
+            other => panic!("expected Nudge, got {:?}", other),
+        }
+
+        // Phase 2: persist the guard at the current count → debounced
+        // (the lag-window guard; no burst of duplicate nudges). Mutate
+        // the on-disk run in place so the daemon_session_uid binding
+        // (written by bind_daemon_uid_to_role) survives.
+        crate::workflow::run::modify("rn1", |r| {
+            r.nudge_assistant_count = Some(1);
+        })
+        .expect("set nudge guard");
+        let decisions = poller.poll_once();
+        assert!(
+            matches!(
+                decisions.as_slice(),
+                [Decision::Skip { reason: SkipReason::NudgeDebounced, .. }]
+            ),
+            "expected NudgeDebounced at the same count, got {:?}",
+            decisions,
+        );
+
+        // Phase 3: clear the guard but stack the history so the
+        // consecutive-nudge cap is hit → give up (NudgeExhausted).
+        crate::workflow::run::modify("rn1", |r| {
+            r.nudge_assistant_count = None;
+            for _ in 0..crate::workflow::MAX_CONSECUTIVE_IDLE_NUDGES {
+                r.activate_role(
+                    "manager".to_string(),
+                    crate::workflow::TriggerKind::StaticIdle {
+                        from_role: "manager".to_string(),
+                    },
+                    0,
+                    0,
+                );
+            }
+        })
+        .expect("stack history for cap");
+        let decisions = poller.poll_once();
+        assert!(
+            matches!(
+                decisions.as_slice(),
+                [Decision::Skip { reason: SkipReason::NudgeExhausted, .. }]
+            ),
+            "expected NudgeExhausted once the cap is reached, got {:?}",
+            decisions,
+        );
+    }
+
     /// Reviewer-fix: `poll_once` reads runs from **disk**
     /// (`workflow::run::load_all`), NOT from
     /// `state.workflow_runs`. Without this, TUI-launched runs
@@ -2488,6 +2803,7 @@ mod tests {
         // specific run_id is in the decision list is sufficient.
         let saw_our_run = decisions.iter().any(|d| match d {
             Decision::Skip { run_id, .. }
+            | Decision::Nudge { run_id, .. }
             | Decision::ActivateStatic { run_id, .. } => run_id == "r-disk-only",
         });
         assert!(
@@ -4187,7 +4503,9 @@ to = "reviewer"
         let our = decisions
             .iter()
             .find(|d| match d {
-                Decision::Skip { run_id, .. } | Decision::ActivateStatic { run_id, .. } => {
+                Decision::Skip { run_id, .. }
+                | Decision::Nudge { run_id, .. }
+                | Decision::ActivateStatic { run_id, .. } => {
                     run_id == "r-r5-untagged"
                 }
             })
@@ -4334,7 +4652,9 @@ to = "reviewer"
         let our_decision = decisions
             .iter()
             .find(|d| match d {
-                Decision::Skip { run_id, .. } | Decision::ActivateStatic { run_id, .. } => {
+                Decision::Skip { run_id, .. }
+                | Decision::Nudge { run_id, .. }
+                | Decision::ActivateStatic { run_id, .. } => {
                     run_id == "r-f3-drift"
                 }
             })

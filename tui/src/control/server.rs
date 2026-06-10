@@ -79,11 +79,47 @@ pub fn start(queue: Queue) -> std::io::Result<PathBuf> {
     }
 
     let listener = UnixListener::bind(&path)?;
+    // Record our PID next to the bound socket so a second TUI that loses
+    // the bind race can name us in its degraded-mode banner ("kill <pid>").
+    // Best-effort: a missing/unreadable sidecar just means the banner
+    // shows a generic message instead of a PID.
+    write_owner_pid(&path);
     let path_for_thread = path.clone();
     thread::Builder::new()
         .name("tui-control-socket".into())
         .spawn(move || accept_loop(listener, queue, path_for_thread))?;
     Ok(path)
+}
+
+/// Path of the PID sidecar that sits next to the control socket
+/// (`<sock>.owner`). The process that binds the socket writes its PID
+/// here; a would-be second instance reads it to identify who to kill.
+fn owner_pid_path(sock: &Path) -> PathBuf {
+    let mut s = sock.as_os_str().to_owned();
+    s.push(".owner");
+    PathBuf::from(s)
+}
+
+/// Best-effort: stamp our PID into the sidecar after a successful bind.
+fn write_owner_pid(sock: &Path) {
+    let _ = std::fs::write(owner_pid_path(sock), std::process::id().to_string());
+}
+
+/// Read the PID of the process that currently owns the control socket,
+/// if the sidecar exists, parses, and names a live process. Returns
+/// `None` when the holder predates this mechanism (e.g. an older binary
+/// that bound without writing the sidecar) or the file is stale — in
+/// which case callers fall back to a generic "another instance" message
+/// rather than naming a PID that may be wrong.
+pub fn read_owner_pid(sock: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(owner_pid_path(sock)).ok()?;
+    let pid = raw.trim().parse::<u32>().ok()?;
+    // Liveness guard: don't point the user at a dead/recycled PID.
+    if Path::new(&format!("/proc/{pid}")).exists() {
+        Some(pid)
+    } else {
+        None
+    }
 }
 
 fn accept_loop(listener: UnixListener, queue: Queue, _path: PathBuf) {
@@ -174,7 +210,10 @@ pub fn write_frame(stream: &mut impl Write, resp: &Response) -> std::io::Result<
     Ok(())
 }
 
-/// Best-effort socket cleanup at shutdown.
+/// Best-effort socket cleanup at shutdown. Removes both the socket and
+/// its PID sidecar so the next instance binds cleanly and no stale owner
+/// PID lingers.
 pub fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(owner_pid_path(path));
 }

@@ -477,6 +477,28 @@ def send_input(session_uid: str, text: str, submit: bool = True) -> dict:
 
 
 @mcp.tool()
+def notify_user(message: str = "") -> dict:
+    """Alert the user that you need their attention.
+
+    Fires a desktop notification and makes the icon next to YOUR session
+    blink in the TUI sidebar. The blink stops once the user selects your
+    session. Use this when you're blocked on the user — a question, a
+    decision, an approval, or "I'm done, come look" — and don't want to
+    sit idle unnoticed.
+
+    Args:
+        message: Short reason shown in the notification (e.g. "need your
+            decision on the migration approach"). Optional; if omitted the
+            notification just says your session needs attention.
+
+    This only ever pings the user about your own session, so — unlike the
+    session-spawning / killing tools — you do NOT need to ask first. Just
+    call it when you genuinely need the user.
+    """
+    return control_client.call("notify_user", {"message": message})
+
+
+@mcp.tool()
 def kill_session(session_uid: str) -> dict:
     """Close a session you can see. The PTY is torn down and a tombstone
     is recorded so `read_session_output` still works for the closed
@@ -817,7 +839,16 @@ async def wait_for_session_idle(
         state = resolved.get("state", "pending")
         if state == "exited":
             return {"idle": True, "timed_out": False, "state": state}
-        if bool(resolved.get("idle", False)):
+        # Only a READY session (transcript bound) can be "done with its
+        # turn". A `pending` session reports idle=True as soon as its PTY
+        # is quiet — but quiet-and-pending means the agent hasn't started
+        # a turn yet (e.g. transcript not bound, or it never ran one), NOT
+        # that it finished. Returning here would make the caller read
+        # empty output and conclude the agent is done when it never began.
+        # Require state=="ready" so a still-pending session keeps polling
+        # until it binds (the detector self-heals late transcripts) or the
+        # deadline is hit (surfacing the stuck session as timed_out).
+        if state == "ready" and bool(resolved.get("idle", False)):
             return {"idle": True, "timed_out": False, "state": state}
         if time.monotonic() >= deadline:
             return {"idle": False, "timed_out": True, "state": state}
@@ -845,6 +876,8 @@ def create_subtask(
             sessions spawn in the parent's worktree directory.
             "branch" — new worktree branched off the parent's
             wip_branch with name `cm-sub/<slug-chain>-<short_id>`.
+            "in-place" — spawn directly in the parent's MAIN repo
+            checkout: no new worktree, no new branch.
         project: Optional explicit project; defaults to the parent's
             project.
 

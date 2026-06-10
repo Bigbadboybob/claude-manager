@@ -134,7 +134,7 @@ pub struct PlanProject {
     pub repo_url: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum GridItem {
     Task(String),
     Separator,
@@ -181,6 +181,21 @@ enum VisibleRowKind {
 
 /// Slug at a visible row, regardless of layout vs. synthetic origin.
 /// Returns `None` for non-task layout items (Separator/Empty/Header).
+/// Truncate `s` to at most `max` display bytes with a trailing "...",
+/// cutting on a char boundary so multibyte chars (e.g. '≤') never panic.
+pub(crate) fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let take = max.saturating_sub(3);
+    let truncated: String = s
+        .char_indices()
+        .take_while(|(i, c)| i + c.len_utf8() <= take)
+        .map(|(_, c)| c)
+        .collect();
+    format!("{}...", truncated)
+}
+
 fn visible_row_slug(row: &VisibleRow) -> Option<&str> {
     match &row.kind {
         VisibleRowKind::Layout { item: GridItem::Task(slug), .. } => Some(slug.as_str()),
@@ -320,6 +335,9 @@ pub enum PlanAction {
         /// descendant-task auth walk could not authorize a
         /// parent → subtask action.
         parent_task_id: Option<String>,
+        /// `true` when the branch field held the `.` sentinel: launch
+        /// in-place in the main repo (no worktree, no branch).
+        in_place: bool,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -765,6 +783,15 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
             GridItem::Task(slug) => task_slugs.contains(slug.as_str()),
             GridItem::Separator | GridItem::Empty | GridItem::Header(_) => true,
         });
+        // Trim trailing Empty padding. Moving an item down past the end
+        // of a column (`A-J`/visual move) pushes a fresh Empty each time,
+        // and once the content below them is deleted those empties become
+        // a dead blank tail that grows without bound — new tasks then
+        // render dozens of rows below the last real item. Mid-column
+        // empties are deliberate spacing and stay.
+        while matches!(col.last(), Some(GridItem::Empty)) {
+            col.pop();
+        }
     }
     let mut in_layout: HashSet<String> = HashSet::new();
     for col in &layout.columns {
@@ -781,8 +808,21 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
         let (user_tasks, claude_tasks): (Vec<_>, Vec<_>) = missing
             .into_iter()
             .partition(|t| t.source != "claude");
-        for t in user_tasks { layout.columns[0].push(GridItem::Task(t.slug.clone())); }
-        for t in claude_tasks { layout.columns[0].push(GridItem::Task(t.slug.clone())); }
+        // Insert after the last NON-EMPTY cell, not the raw vector end:
+        // trailing `Empty` placeholders would otherwise push new tasks
+        // below blank space, off the bottom of the visible column.
+        let col = &mut layout.columns[0];
+        let mut at = col.iter()
+            .rposition(|item| !matches!(item, GridItem::Empty))
+            .map_or(0, |i| i + 1);
+        for t in user_tasks {
+            col.insert(at, GridItem::Task(t.slug.clone()));
+            at += 1;
+        }
+        for t in claude_tasks {
+            col.insert(at, GridItem::Task(t.slug.clone()));
+            at += 1;
+        }
     }
     layout.columns.retain(|col| !col.is_empty());
 }
@@ -2285,10 +2325,15 @@ impl PlanningView {
                                 &task.title,
                             );
                             let slug = task.slug.clone();
-                            let branch = if branch_text.trim().is_empty() {
+                            // Branch field: "." → in-place (main repo, no
+                            // worktree/branch); "" → new worktree from HEAD;
+                            // other → new worktree from that base branch.
+                            let trimmed = branch_text.trim();
+                            let in_place = trimmed == ".";
+                            let branch = if trimmed.is_empty() || in_place {
                                 None
                             } else {
-                                Some(branch_text.trim().to_string())
+                                Some(trimmed.to_string())
                             };
                             let task_id = task.id.clone();
                             let parent_task_id = task.parent_task_id.clone();
@@ -2302,6 +2347,7 @@ impl PlanningView {
                                 task_id,
                                 // Sub-2a Finding #2: see LaunchTaskIntoWorkspace.
                                 parent_task_id,
+                                in_place,
                             };
                         }
                     }
@@ -3396,9 +3442,7 @@ impl PlanningView {
                     let claude_prefix = if is_claude { "[C] " } else { "" };
                     let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/ + claude_prefix.len();
                     let max_title = width.saturating_sub(prefix_len + count_suffix.len());
-                    let title_display = if title_str.len() > max_title {
-                        format!("{}...", &title_str[..max_title.saturating_sub(3)])
-                    } else { title_str.to_string() };
+                    let title_display = truncate_with_ellipsis(&title_str, max_title);
 
                     let mut spans = Vec::new();
                     if !indent.is_empty() {
@@ -3453,7 +3497,7 @@ impl PlanningView {
                     };
                     let max_text = width.saturating_sub(1);
                     let display = if text.len() > max_text {
-                        format!("{}...", &text[..max_text.saturating_sub(3)])
+                        truncate_with_ellipsis(&text, max_text)
                     } else {
                         text.clone()
                     };
@@ -3566,9 +3610,7 @@ impl PlanningView {
                         };
                         let claude_prefix = if is_claude { "[C] " } else { "" };
                         let max_title = (inner.width as usize).saturating_sub(5 + claude_prefix.len());
-                        let title_display = if title_str.len() > max_title {
-                            format!("{}...", &title_str[..max_title.saturating_sub(3)])
-                        } else { title_str.to_string() };
+                        let title_display = truncate_with_ellipsis(&title_str, max_title);
 
                         let mut spans = vec![
                             Span::styled(format!(" {} ", indicator), indicator_style),
@@ -3611,7 +3653,7 @@ impl PlanningView {
                         };
                         let max_text = (inner.width as usize).saturating_sub(2);
                         let display = if text.len() > max_text {
-                            format!("{}...", &text[..max_text.saturating_sub(3)])
+                            truncate_with_ellipsis(&text, max_text)
                         } else {
                             text.clone()
                         };
@@ -3973,7 +4015,7 @@ impl PlanningView {
         lines.push(row("+ New workspace (create worktree)", 0));
         for (i, c) in candidates.iter().enumerate() {
             let label = if c.name.len() > (w as usize).saturating_sub(8) {
-                format!("{}...", &c.name[..(w as usize).saturating_sub(11)])
+                truncate_with_ellipsis(&c.name, (w as usize).saturating_sub(8))
             } else {
                 c.name.clone()
             };
@@ -4024,7 +4066,13 @@ impl PlanningView {
         frame.render_widget(block, dialog);
 
         let display_name: String = task_name.chars().take((w as usize).saturating_sub(10)).collect();
-        let branch_hint = if branch_text.is_empty() { "main" } else { "" };
+        let branch_hint = if branch_text.trim() == "." {
+            "  in-place (main repo, no worktree)"
+        } else if branch_text.is_empty() {
+            "main"
+        } else {
+            ""
+        };
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("    Task: ", Style::default().fg(Color::DarkGray)),
@@ -4040,6 +4088,31 @@ impl PlanningView {
             Line::from(""),
             Line::from(Span::styled("  Enter launch \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
         ]), inner);
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_with_ellipsis;
+
+    #[test]
+    fn truncates_on_char_boundary_with_multibyte() {
+        // Regression: byte-index slicing panicked when the cut landed
+        // inside a multibyte char (e.g. '≤' in a task name). Must never
+        // panic and must produce valid UTF-8.
+        let s = "Backtest: does AC-impact calib day-snapping (≤24h tail staleness) cost anything?";
+        for max in 0..s.len() + 2 {
+            let out = truncate_with_ellipsis(s, max);
+            assert!(out.is_char_boundary(0));
+            // round-trips as valid UTF-8 (String guarantees it; the point
+            // is that we got here without panicking)
+            let _ = out.chars().count();
+        }
+    }
+
+    #[test]
+    fn short_string_is_unchanged() {
+        assert_eq!(truncate_with_ellipsis("hi", 10), "hi");
     }
 }
 
@@ -4236,6 +4309,60 @@ mod tests {
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    #[test]
+    fn sync_layout_trims_trailing_empties_and_inserts_after_content() {
+        // Regression: repeated move-down-past-end (`A-J`) accumulates
+        // Empty padding; once the content below it disappears the column
+        // ends in a dead blank tail and newly synced (e.g. claude-
+        // proposed) tasks rendered dozens of rows below the last real
+        // item. The tail must be trimmed and new tasks must land
+        // directly after the last content cell.
+        let mut layout = GridLayout {
+            columns: vec![vec![
+                GridItem::Task("existing".to_string()),
+                GridItem::Empty, // mid-column spacing — must survive
+                GridItem::Task("kept".to_string()),
+                GridItem::Empty,
+                GridItem::Empty,
+                GridItem::Empty,
+            ]],
+        };
+        let mut proposed = make_task("c", "proposed", None);
+        proposed.source = "claude".to_string();
+        let tasks = vec![
+            make_task("a", "existing", None),
+            make_task("b", "kept", None),
+            proposed,
+        ];
+        sync_layout_with_tasks(&mut layout, &tasks);
+
+        assert_eq!(
+            layout.columns[0],
+            vec![
+                GridItem::Task("existing".to_string()),
+                GridItem::Empty,
+                GridItem::Task("kept".to_string()),
+                GridItem::Task("proposed".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn sync_layout_drops_column_reduced_to_empties() {
+        // A column whose tasks were all deleted, leaving only Empty
+        // padding, trims to nothing and is removed entirely.
+        let mut layout = GridLayout {
+            columns: vec![
+                vec![GridItem::Task("gone".to_string()), GridItem::Empty],
+                vec![GridItem::Task("alive".to_string())],
+            ],
+        };
+        let tasks = vec![make_task("a", "alive", None)];
+        sync_layout_with_tasks(&mut layout, &tasks);
+
+        assert_eq!(layout.columns, vec![vec![GridItem::Task("alive".to_string())]]);
     }
 
     #[test]
@@ -4573,6 +4700,72 @@ mod tests {
                 "expected LaunchTask, got {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    /// The `.` sentinel in the LaunchConfirm branch field launches
+    /// in-place: `in_place: true`, `branch: None`. Empty branch stays
+    /// `in_place: false`.
+    #[test]
+    fn launch_confirm_dot_branch_sets_in_place() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mk = || {
+            let mut view = PlanningView::new();
+            let mut pd = make_project("repo", "git@example.com:org/repo.git");
+            pd.tasks.push(PlanTask {
+                id: "top-id".to_string(),
+                slug: "toplevel".to_string(),
+                title: "Top".to_string(),
+                status: PlanStatus::Backlog,
+                difficulty: None,
+                depends: vec![],
+                branch: None,
+                created: None,
+                description: String::new(),
+                prompt: String::new(),
+                source: "user".to_string(),
+                is_cloud: false,
+                repo_url: "git@example.com:org/repo.git".to_string(),
+                parent_task_id: None,
+            });
+            view.project_data.push(pd);
+            view.projects = view
+                .project_data
+                .iter()
+                .map(|pd| pd.project.clone())
+                .collect();
+            view
+        };
+
+        // "." → in-place.
+        let mut view = mk();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: ".".to_string(),
+        };
+        match view.handle_event(&enter) {
+            PlanAction::LaunchTask { in_place, branch, .. } => {
+                assert!(in_place, "`.` must launch in-place");
+                assert!(branch.is_none(), "in-place carries no branch");
+            }
+            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        // empty → normal worktree launch.
+        let mut view = mk();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: String::new(),
+        };
+        match view.handle_event(&enter) {
+            PlanAction::LaunchTask { in_place, .. } => {
+                assert!(!in_place, "empty branch is not in-place");
+            }
+            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
         }
     }
 
