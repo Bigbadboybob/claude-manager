@@ -2527,7 +2527,7 @@ pub fn start_workflow(
     //     than dropped silently; capping the headless operator-launched case
     //     needs a daemon.toml cap-policy field (a follow-up, out of this phase's
     //     acceptance criteria). See the `participant_cap` resolution below.
-    let (wf, worktree, workspace_id, task_id, participant_cap) = {
+    let (wf, worktree, workspace_id, task_id, participant_cap, caller_size) = {
         let state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
         let wf = state.workflow_definition(&p.workflow_name).cloned().ok_or((
             ErrorCode::NotFound,
@@ -2541,6 +2541,13 @@ pub fn start_workflow(
         // session's workspace — any client-supplied `worktree`/`workspace_id` is
         // ignored, so an agent can't launch participants in an arbitrary tree.
         let mut participant_cap: Option<(u64, u64, String)> = None;
+        // Inherit the caller session's current PTY size for participants when
+        // the client didn't pass explicit cols/rows — same rationale as
+        // `mcp_start_session`'s caller-size inheritance: a serde-default 80×24
+        // participant renders "super narrow" in any full-size attach view.
+        // Operator/headless callers have no session to inherit from (the TUI
+        // passes its own size explicitly).
+        let mut caller_size: Option<(u16, u16)> = None;
         let (worktree, workspace_id, task_id) = match caller_uid.as_deref() {
             None => {
                 let wt = p.worktree.clone().ok_or((
@@ -2569,6 +2576,7 @@ pub fn start_workflow(
                     }
                     _ => None,
                 };
+                caller_size = Some((c.last_cols, c.last_rows));
                 let own_task = c.task_id.clone();
                 // A client-supplied task_id must be self-or-descendant of the
                 // caller's own task; otherwise default to the caller's task.
@@ -2624,7 +2632,7 @@ pub fn start_workflow(
                 (wt.to_string_lossy().into_owned(), ws_id, task_id)
             }
         };
-        (wf, worktree, workspace_id, task_id, participant_cap)
+        (wf, worktree, workspace_id, task_id, participant_cap, caller_size)
     };
 
     // Finding 1: generate the run_id SERVER-SIDE — NEVER honor a caller-supplied
@@ -2647,8 +2655,8 @@ pub fn start_workflow(
         id
     };
     let task_key = p.task_key.clone().unwrap_or_else(|| workspace_id.clone());
-    let cols = p.cols.unwrap_or(80);
-    let rows = p.rows.unwrap_or(24);
+    let cols = p.cols.or(caller_size.map(|s| s.0)).unwrap_or(80);
+    let rows = p.rows.or(caller_size.map(|s| s.1)).unwrap_or(24);
     let goal = p.goal.clone().unwrap_or_default();
 
     // Finding 1: track spawned participants so a partial-launch failure cleans

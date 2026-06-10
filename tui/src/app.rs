@@ -675,6 +675,12 @@ pub(crate) fn try_attach_via_daemon_with_deps(
         workflow_role,
     };
     let session = crate::session::Session::new_attached_existing(cs_config)?;
+    // Kick a resize so a session whose daemon PTY was spawned at a different
+    // size (e.g. an 80×24 headless workflow spawn) immediately matches this
+    // terminal and repaints — same rationale as the respawn-path kick. The
+    // attach itself never resizes the daemon PTY (it only sizes the local
+    // grid), so without this a small-spawned session renders cut off forever.
+    session.resize(cols, rows);
 
     // migrate-tui-local Issue D: the `session.attach` RPC only
     // takes `{ uid }` — the daemon doesn't read transcript_path
@@ -7989,6 +7995,10 @@ impl App {
         ts.workflow_role = role;
         ts.task_id = task_id;
         ts.host_id = host_id;
+        // Kick a resize so a participant spawned at a smaller PTY size (e.g.
+        // a headless launch before any TUI attached) immediately matches this
+        // terminal and repaints — same rationale as the respawn-path kick.
+        ts.session.resize(cols, rows);
         self.workspaces[ws_idx].sessions.push(ts);
         self.needs_redraw = true;
     }
@@ -13024,6 +13034,7 @@ impl App {
             &workspace_id,
             goal.as_deref(),
             task_id.as_deref(),
+            self.last_term_size,
         ) {
             Ok(run_id) => {
                 self.set_status_msg(&format!("Launched {} ({})", workflow_name, run_id))

@@ -1086,11 +1086,16 @@ pub fn rpc_start_workflow(
     workspace_id: &str,
     goal: Option<&str>,
     task_id: Option<&str>,
+    size: (u16, u16),
 ) -> anyhow::Result<String> {
+    // (cols, rows): participants spawn at the operator's terminal size instead
+    // of the daemon-side 80×24 default ("super narrow window" otherwise).
     let mut params = serde_json::json!({
         "workflow_name": workflow_name,
         "worktree": worktree,
         "workspace_id": workspace_id,
+        "cols": size.0,
+        "rows": size.1,
     });
     if let Some(g) = goal {
         params["goal"] = serde_json::Value::String(g.to_string());
