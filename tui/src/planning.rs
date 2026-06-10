@@ -134,7 +134,7 @@ pub struct PlanProject {
     pub repo_url: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum GridItem {
     Task(String),
     Separator,
@@ -783,6 +783,15 @@ fn sync_layout_with_tasks(layout: &mut GridLayout, tasks: &[PlanTask]) {
             GridItem::Task(slug) => task_slugs.contains(slug.as_str()),
             GridItem::Separator | GridItem::Empty | GridItem::Header(_) => true,
         });
+        // Trim trailing Empty padding. Moving an item down past the end
+        // of a column (`A-J`/visual move) pushes a fresh Empty each time,
+        // and once the content below them is deleted those empties become
+        // a dead blank tail that grows without bound — new tasks then
+        // render dozens of rows below the last real item. Mid-column
+        // empties are deliberate spacing and stay.
+        while matches!(col.last(), Some(GridItem::Empty)) {
+            col.pop();
+        }
     }
     let mut in_layout: HashSet<String> = HashSet::new();
     for col in &layout.columns {
@@ -4300,6 +4309,60 @@ mod tests {
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    #[test]
+    fn sync_layout_trims_trailing_empties_and_inserts_after_content() {
+        // Regression: repeated move-down-past-end (`A-J`) accumulates
+        // Empty padding; once the content below it disappears the column
+        // ends in a dead blank tail and newly synced (e.g. claude-
+        // proposed) tasks rendered dozens of rows below the last real
+        // item. The tail must be trimmed and new tasks must land
+        // directly after the last content cell.
+        let mut layout = GridLayout {
+            columns: vec![vec![
+                GridItem::Task("existing".to_string()),
+                GridItem::Empty, // mid-column spacing — must survive
+                GridItem::Task("kept".to_string()),
+                GridItem::Empty,
+                GridItem::Empty,
+                GridItem::Empty,
+            ]],
+        };
+        let mut proposed = make_task("c", "proposed", None);
+        proposed.source = "claude".to_string();
+        let tasks = vec![
+            make_task("a", "existing", None),
+            make_task("b", "kept", None),
+            proposed,
+        ];
+        sync_layout_with_tasks(&mut layout, &tasks);
+
+        assert_eq!(
+            layout.columns[0],
+            vec![
+                GridItem::Task("existing".to_string()),
+                GridItem::Empty,
+                GridItem::Task("kept".to_string()),
+                GridItem::Task("proposed".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn sync_layout_drops_column_reduced_to_empties() {
+        // A column whose tasks were all deleted, leaving only Empty
+        // padding, trims to nothing and is removed entirely.
+        let mut layout = GridLayout {
+            columns: vec![
+                vec![GridItem::Task("gone".to_string()), GridItem::Empty],
+                vec![GridItem::Task("alive".to_string())],
+            ],
+        };
+        let tasks = vec![make_task("a", "alive", None)];
+        sync_layout_with_tasks(&mut layout, &tasks);
+
+        assert_eq!(layout.columns, vec![vec![GridItem::Task("alive".to_string())]]);
     }
 
     #[test]
