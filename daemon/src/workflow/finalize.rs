@@ -278,13 +278,14 @@ where
             }
             write(pty_tracker::enter_bytes_for_mode(tracker.term_mode()))
                 .map_err(PersistError::Io)?;
-            // Reload the just-persisted record: `pa` was cloned before the
-            // Appended arm may have stored a discovery snapshot, so its
-            // `pre_clear_snapshot` can be stale-None here.
-            let has_snapshot = run::load_one(ctx.run_id)
-                .and_then(|r| r.pending_activation)
-                .map_or(false, |p| p.pre_clear_snapshot.is_some());
-            if pa.needs_fresh_reset || has_snapshot {
+            // `pa` was reloaded from disk at the top of THIS call — and the
+            // Appended arm (a SEPARATE prior call; `match pa.phase` runs one arm
+            // per call) already persisted any discovery snapshot before
+            // advancing to BodySent. So `pa.pre_clear_snapshot` is authoritative
+            // here, no extra reload needed. A snapshot means the sid still needs
+            // (re)binding: a fresh-reset role sets it at /clear; an unbound
+            // persistent Claude role sets it just before body delivery.
+            if pa.needs_fresh_reset || pa.pre_clear_snapshot.is_some() {
                 // Fresh reset, or an unbound persistent role's sid discovery:
                 // delivery done, but the record stays until the sid (re)binds
                 // (step 6). The idle gate is inert (NoTranscriptId) meanwhile.
