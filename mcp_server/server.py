@@ -10,7 +10,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from mcp.server.fastmcp import FastMCP
 
-from cli.planning_client import PlanningClient
+try:
+    from cli.planning_client import PlanningClient
+except ModuleNotFoundError:
+    # Headless/remote deployment (e.g. cm-manager: only `mcp_server/` is
+    # deployed under /opt/cm-daemon, so the repo `cli/` package isn't on the
+    # path). The PLANNING tools (propose_task, list_projects, ...) need
+    # PlanningClient; the WORKFLOW control tools (workflow_transition /
+    # workflow_done) and session tools do NOT. A top-level crash here used to
+    # take down the ENTIRE MCP server — so a headless workflow's manager role
+    # could never call workflow_done and every run wedged. Degrade instead:
+    # let the server start (workflow/session tools live), and surface a clear
+    # error only if a planning tool is actually invoked.
+    class PlanningClient:  # type: ignore[no-redef]
+        def __init__(self, *_a, **_k):
+            raise RuntimeError(
+                "planning tools are unavailable in this deployment: the `cli` "
+                "package is not installed alongside the MCP server "
+                "(headless/remote host). Workflow and session tools are unaffected."
+            )
+
 from mcp_server import control_client
 from mcp_server.transcripts import claude_code as transcripts_claude
 from mcp_server.transcripts import codex as transcripts_codex
@@ -153,8 +172,25 @@ def propose_task(
     # actual dial are bound to the same resolution.
     route = control_client.resolve_socket_route()
     if route.chose_daemon:
-        from cli.planning_client import _detect_repo_url
-        repo_url = _detect_repo_url()
+        try:
+            from cli.planning_client import _detect_repo_url
+        except ModuleNotFoundError:
+            return (
+                "propose_task unavailable: the `cli` package is not installed "
+                "alongside the MCP server (headless/remote host)."
+            )
+        try:
+            repo_url = _detect_repo_url()
+        except (RuntimeError, OSError) as e:
+            # _detect_repo_url shells out to `git remote get-url origin`; it
+            # raises RuntimeError when there's no origin remote and OSError
+            # (FileNotFoundError) when git is absent. Return a clear message
+            # instead of crashing the tool with an opaque traceback when the
+            # agent's cwd isn't a git repo with an origin.
+            return (
+                f"propose_task: could not detect the repo URL from the current "
+                f"directory (no git 'origin' remote?): {e}"
+            )
         params = {
             "project": project,
             "name": name,
@@ -830,12 +866,27 @@ async def wait_for_session_idle(
     """
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
+    resolved_once = False
     while True:
-        resolved = await asyncio.to_thread(
-            control_client.call,
-            "resolve_authorized_session",
-            {"session_uid": session_uid},
-        )
+        try:
+            resolved = await asyncio.to_thread(
+                control_client.call,
+                "resolve_authorized_session",
+                {"session_uid": session_uid},
+            )
+        except control_client.ControlError as e:
+            # The daemon evicts an exited session from its registry within a
+            # few seconds of child exit (no tombstone in
+            # resolve_authorized_session), so a session that resolved fine and
+            # then turns not_found has EXITED mid-wait. The eviction IS the
+            # exit signal — report it rather than letting not_found escape as
+            # a ControlError (which would crash the canonical "send_input then
+            # wait" helper exactly when the watched turn finishes by exiting).
+            # A uid that NEVER resolved is a genuine bad-uid error — re-raise.
+            if resolved_once and getattr(e, "code", None) == "not_found":
+                return {"idle": True, "timed_out": False, "state": "exited"}
+            raise
+        resolved_once = True
         state = resolved.get("state", "pending")
         if state == "exited":
             return {"idle": True, "timed_out": False, "state": state}

@@ -217,9 +217,12 @@ pub struct PendingActivation {
     /// re-rendering against now-larger history.
     #[serde(default)]
     pub rendered_prompt: Option<String>,
-    /// FRESH rebind key: the pre-`/clear` transcript-dir listing snapshot,
-    /// filled at the reset. Discovery diffs against it; persisting it lets a
-    /// restart in `RebindPending` resume discovery.
+    /// Sid-discovery key: a transcript-dir listing snapshot the
+    /// `RebindPending` discovery diffs against. Filled either at a fresh
+    /// role's reset (pre-`/clear`) or, for an UNBOUND persistent Claude role,
+    /// right before body delivery (the cross-bind fix: first activations bind
+    /// causally instead of via spawn-time detector timing). Persisting it
+    /// lets a restart in `RebindPending` resume discovery.
     #[serde(default)]
     pub pre_clear_snapshot: Option<Vec<String>>,
     /// Unix-ms deadline after which the currently-pending Enter keystroke
@@ -513,10 +516,16 @@ impl WorkflowRun {
         self.active_role = None;
         self.status = RunStatus::Done;
         self.done_reason = Some(reason);
+        // Drop any in-flight activation hand-off: a terminal run must carry no
+        // pending_activation, or it's a durable on-disk record pointing at a
+        // hand-off that will never complete (and that the drainer must never
+        // resume — see advance_finalization's status recheck).
+        self.pending_activation = None;
     }
 
     pub fn mark_detached(&mut self) {
         self.status = RunStatus::Detached;
+        self.pending_activation = None;
     }
 }
 

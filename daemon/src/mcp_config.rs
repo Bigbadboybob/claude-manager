@@ -140,6 +140,29 @@ fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf> {
         .or_else(crate::workflow::spawn::mcp_server_path)
 }
 
+/// Resolve the Python interpreter that runs `server.py`. Prefers a
+/// `.venv/bin/python` adjacent to the server (the cm-manager / any
+/// venv-based deployment layout — `/opt/cm-daemon/mcp_server/.venv/`), else
+/// falls back to bare `python`.
+///
+/// Why this exists: the MCP config used a hardcoded `command: "python"`, but
+/// cm-manager has NO `python` on PATH (only `python3` + the venv) — so the
+/// participant's MCP server silently failed to start and the manager role's
+/// `workflow_done` / `workflow_transition` calls returned "No such tool
+/// available", wedging every headless run on the manager (observed in the
+/// cm-manager e2e). Detecting the adjacent venv resolves it there while
+/// leaving the local-workstation `python` (e.g. a conda/pyenv shim that owns
+/// the `mcp` deps) untouched — local has no `.venv` next to server.py.
+fn resolve_python_interpreter(server: &std::path::Path) -> String {
+    if let Some(dir) = server.parent() {
+        let venv = dir.join(".venv/bin/python");
+        if venv.is_file() {
+            return venv.to_string_lossy().into_owned();
+        }
+    }
+    "python".to_string()
+}
+
 /// Write the per-session Claude MCP config JSON. Returns the path the caller
 /// threads through `--mcp-config <path>`. `server_path_override` (the daemon's
 /// configured `mcp_server_path`) wins over env/repo resolution — see
@@ -161,10 +184,11 @@ pub fn write_claude_mcp_config(
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
     let env = build_env(session_uid, workflow);
+    let python = resolve_python_interpreter(&server);
     let config = json!({
         "mcpServers": {
             "claude-manager": {
-                "command": "python",
+                "command": python,
                 "args": [server.to_string_lossy()],
                 "env": env,
             }
@@ -191,7 +215,12 @@ pub fn codex_overrides(
     workflow: Option<&WorkflowMeta>,
     server_path_override: Option<&str>,
 ) -> Vec<String> {
-    let server = resolve_server_path(server_path_override)
+    let server_path = resolve_server_path(server_path_override);
+    let python = server_path
+        .as_deref()
+        .map(resolve_python_interpreter)
+        .unwrap_or_else(|| "python".to_string());
+    let server = server_path
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let env = build_env(session_uid, workflow);
@@ -202,7 +231,10 @@ pub fn codex_overrides(
         .join(",");
     vec![
         "-c".into(),
-        r#"mcp_servers.claude-manager.command="python""#.into(),
+        format!(
+            r#"mcp_servers.claude-manager.command="{}""#,
+            escape_toml(&python)
+        ),
         "-c".into(),
         format!(
             r#"mcp_servers.claude-manager.args=["{}"]"#,
@@ -368,14 +400,15 @@ mod tests {
         }
     }
 
-    /// Shared lock — HOME mutation races between tests in this
-    /// module (and against any other module that mutates HOME).
+    /// Shared lock for tests that mutate the process-global HOME. Aliases the
+    /// crate-wide `test_support::env_lock` rather than declaring a private
+    /// mutex: ~30 other modules serialize HOME/env on that one lock, and a
+    /// second independent mutex here would let an mcp_config test flip HOME
+    /// concurrently with a poller/state/transcript test (the "two-mutex stomp"
+    /// test_support.rs explicitly warns against — the observed cm-daemon
+    /// test-ordering flake).
     fn home_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        crate::test_support::env_lock()
     }
 
     #[test]
@@ -396,6 +429,56 @@ mod tests {
             "sub-2c: tui socket must be a real path so the agent can \
              reach TUI-only methods (workflow_transition / workflow_done / \
              create_subtask / etc.) from the daemon-spawned session",
+        );
+    }
+
+    #[test]
+    fn resolve_python_prefers_adjacent_venv_else_bare_python() {
+        let dir = TempDir::new().unwrap();
+        let server = dir.path().join("server.py");
+        std::fs::write(&server, "").unwrap();
+        // No venv next to it (the local-workstation layout) → bare python.
+        assert_eq!(resolve_python_interpreter(&server), "python");
+
+        // A `.venv/bin/python` next to it (the cm-manager layout) → that path.
+        let venv_bin = dir.path().join(".venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        let venv_py = venv_bin.join("python");
+        std::fs::write(&venv_py, "").unwrap();
+        assert_eq!(
+            resolve_python_interpreter(&server),
+            venv_py.to_string_lossy(),
+            "must prefer the adjacent venv interpreter (cm-manager has no bare `python`)",
+        );
+    }
+
+    #[test]
+    fn claude_config_uses_adjacent_venv_python_when_present() {
+        let _g = home_lock();
+        let home = TempDir::new().unwrap();
+        let _h = HomeGuard::set(home.path());
+        // Server with an adjacent venv (mirrors /opt/cm-daemon/mcp_server).
+        let srv_dir = TempDir::new().unwrap();
+        let server = srv_dir.path().join("server.py");
+        std::fs::write(&server, "").unwrap();
+        let venv_bin = srv_dir.path().join(".venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        std::fs::write(venv_bin.join("python"), "").unwrap();
+
+        let path = write_claude_mcp_config(
+            "ts-venv-1",
+            None,
+            Some(server.to_str().unwrap()),
+        )
+        .expect("write config");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let cmd = cfg["mcpServers"]["claude-manager"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.ends_with("/.venv/bin/python"),
+            "command must be the adjacent venv python, got {cmd}",
         );
     }
 

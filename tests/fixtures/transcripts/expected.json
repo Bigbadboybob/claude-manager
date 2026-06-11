@@ -1,0 +1,10 @@
+{
+  "claude": {
+    "user": ["hello there", "second real prompt"],
+    "assistant": ["hi, how can I help?", "done"]
+  },
+  "codex": {
+    "user": ["add a smoke test"],
+    "assistant": ["added the smoke test"]
+  }
+}

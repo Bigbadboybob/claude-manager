@@ -187,13 +187,64 @@ pub fn check_session_caller(
         None => return AuthDecision::TargetNotInRegistry,
     };
 
-    match &caller.task_id {
+    caller_reaches_target(
+        state,
+        &caller.task_id,
+        &caller.workspace_id,
+        target.task_id.as_deref(),
+        &target.workspace_id,
+    )
+}
+
+/// Authorize a live `caller_uid` against a target that has EXITED — its
+/// identity comes from an [`crate::state::ExitedTombstone`] rather than a live
+/// `state.sessions` entry, since the session was removed from the registry on
+/// exit. Used by `resolve_authorized_session` / `list_sessions` so the SAME
+/// descendant-task / same-workspace scope rule applies to read-after-exit as to
+/// a live read (an agent must not read an out-of-scope session's final output
+/// just because it has since exited). The caller is still live; only the target
+/// identity is supplied explicitly.
+pub fn check_session_caller_for_exited(
+    state: &DaemonState,
+    caller_uid: &str,
+    target_uid: &str,
+    target_task_id: Option<&str>,
+    target_workspace_id: &str,
+) -> AuthDecision {
+    let caller = match state.sessions.get(caller_uid) {
+        Some(s) => s,
+        None => return AuthDecision::CallerNotInRegistry,
+    };
+    if caller_uid == target_uid {
+        return AuthDecision::Allow;
+    }
+    caller_reaches_target(
+        state,
+        &caller.task_id,
+        &caller.workspace_id,
+        target_task_id,
+        target_workspace_id,
+    )
+}
+
+/// Core scope rule shared by the live ([`check_session_caller`]) and exited
+/// ([`check_session_caller_for_exited`]) target paths: a tasked caller reaches
+/// any same-or-descendant task (no workspace constraint — branch-mode subtasks
+/// land in child workspaces); a taskless caller reaches the same workspace only.
+fn caller_reaches_target(
+    state: &DaemonState,
+    caller_task_id: &Option<String>,
+    caller_workspace_id: &str,
+    target_task_id: Option<&str>,
+    target_workspace_id: &str,
+) -> AuthDecision {
+    match caller_task_id {
         Some(caller_task) => {
             // Tasked caller — purely task-tree, no workspace
             // constraint (branch-mode subtasks land in child
             // workspaces). Target MUST have a task_id; a tasked
             // caller cannot reach a taskless target.
-            match &target.task_id {
+            match target_task_id {
                 Some(target_task) => {
                     if task_is_self_or_descendant_of(
                         &state.task_tree,
@@ -227,7 +278,7 @@ pub fn check_session_caller(
         None => {
             // Taskless caller (`A-n` shape) — same-workspace
             // rule. Mirrors TUI's `None => caller_wi == target_wi`.
-            if caller.workspace_id == target.workspace_id {
+            if caller_workspace_id == target_workspace_id {
                 AuthDecision::Allow
             } else {
                 AuthDecision::OutOfScope

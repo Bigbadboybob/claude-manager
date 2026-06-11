@@ -947,8 +947,8 @@ pub fn rpc_set_transcript_path(
 }
 
 /// 10d-2c-1 review round-5 (F1): push workflow context onto an
-/// already-spawned daemon session. Used by
-/// `controller::launch_workflow` after tagging a daemon-attached
+/// already-spawned daemon session. Used by the former TUI
+/// controller's launch after tagging a daemon-attached
 /// `TerminalSession` so the daemon's `DaemonSession` mirrors the
 /// TUI's view — without this RPC, `lookup_session_any` returns
 /// `(None, None)` for daemon-attached workflow participants and

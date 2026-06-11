@@ -2,8 +2,8 @@
 //! `doc/daemon-side-workflow-orchestration.md`).
 //!
 //! A `Context::Fresh` role (e.g. the feedback reviewer) is reset between
-//! activations so its agent starts from a clean transcript. The TUI does this
-//! in `reset_fresh_session` (`tui/src/workflow/controller.rs`): queue `/clear`
+//! activations so its agent starts from a clean transcript. The former TUI
+//! controller did this in `reset_fresh_session`: queue `/clear`
 //! (gated on PTY-quiet), reset the role's `MessageBaseline`, clear the bound
 //! `current_session_id`, and snapshot the transcript dir so the new file
 //! `/clear` rotates to can be picked up. The new sid is rebound LATER by the
@@ -96,7 +96,7 @@ pub fn rebind_landed(run: &WorkflowRun, role: &str) -> bool {
 /// Apply the fresh-reset run-state mutation under flock: reset the role's
 /// `MessageBaseline` to zero (so the resolver slices that role's messages from
 /// index 0) and clear `current_session_id` (so the idle gate goes inert).
-/// Mirrors the TUI's `RoleResetMutations` (`controller.rs` `reset_fresh_session`).
+/// Mirrors the former TUI controller's `RoleResetMutations` / `reset_fresh_session`.
 pub fn apply_reset_state(run_id: &str, role: &str) -> Result<WorkflowRun, PersistError> {
     let role = role.to_string();
     run::modify(run_id, move |r| {

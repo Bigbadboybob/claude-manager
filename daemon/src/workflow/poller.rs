@@ -2,8 +2,8 @@
 //!
 //! ## Why this exists
 //!
-//! Pre-2c-2-2, the static-`on_idle` polling lived in
-//! `tui/src/workflow/controller.rs::tick_local`. That meant
+//! Pre-2c-2-2, the static-`on_idle` polling lived in the TUI
+//! controller's `tick_local` (since removed). That meant
 //! daemon-spawned workflow participants needed the TUI to be running
 //! and the controller to be ticking before a transition could fire on
 //! a quiet agent turn. The dynamic path (`workflow_transition` MCP
@@ -452,6 +452,13 @@ impl WorkflowPoller {
         // evaluation + drain. The TUI's `sync_role_session_ids` does the
         // equivalent for TUI-spawned sessions.
         self.sync_role_session_ids();
+        // Reverse bridge: once a Claude role's sid is bound (the finalize
+        // drainer's deliver-then-discover — Claude participants get no
+        // spawn-time detector since the cross-bind fix), propagate the
+        // engine-derived transcript path onto the participant's
+        // `DaemonSession.transcript_path` so MCP `read_session_output` /
+        // `resolve_authorized_session` can serve it.
+        self.sync_participant_transcript_paths();
 
         // Phase 1: collect snapshots under the lock. Pure read.
         let snapshots = {
@@ -498,11 +505,16 @@ impl WorkflowPoller {
                         to_role,
                         rendered_prompt,
                     } => {
+                        // Empty prompt: a normal hand-off renders the TARGET
+                        // role's activation template at finalization, not the
+                        // poll-time `rendered_prompt` (kept on the Decision for
+                        // observability/tests only).
+                        let _ = rendered_prompt;
                         if let Err(e) = self.fire_static_transition(
                             run_id,
                             from_role,
                             to_role,
-                            rendered_prompt,
+                            "",
                         ) {
                             eprintln!(
                                 "cm-daemon: workflow poller failed to fire static \
@@ -696,6 +708,45 @@ impl WorkflowPoller {
                     h.session_id = Some(sid.clone());
                 }
             });
+        }
+    }
+
+    /// Reverse bridge of [`Self::sync_role_session_ids`]: for each active
+    /// run's bound Claude role, set the participant `DaemonSession`'s
+    /// `transcript_path` from `(worktree, sid)` when it's still unset. Claude
+    /// participants no longer get a spawn-time transcript detector (the
+    /// cross-bind fix — their sid binds causally at activation delivery), so
+    /// without this the MCP surface (`read_session_output`,
+    /// `resolve_authorized_session`) would have no path for them. Codex is
+    /// skipped: its detector still runs at spawn and owns the rollout path.
+    /// Idempotent; never overwrites an already-set path.
+    fn sync_participant_transcript_paths(&self) {
+        let runs = crate::workflow::run::load_all();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let crate::state::DaemonState { sessions, workspaces, .. } = &mut *state;
+        for run in runs.iter().filter(|r| r.is_active()) {
+            for b in run.role_sessions.values() {
+                let (Some(sid), Some(uid)) =
+                    (b.current_session_id.as_deref(), b.daemon_session_uid.as_deref())
+                else {
+                    continue;
+                };
+                let Some(session) = sessions.get_mut(uid) else { continue };
+                if session.transcript_path.is_some() || session.session_type == "codex" {
+                    continue;
+                }
+                let Some(worktree) = workspaces
+                    .get(&session.workspace_id)
+                    .and_then(|ws| ws.worktree_path.as_deref())
+                else {
+                    continue;
+                };
+                if let Some(p) =
+                    crate::workflow::transcript::claude_transcript_path(worktree, sid)
+                {
+                    session.transcript_path = Some(p.to_string_lossy().into_owned());
+                }
+            }
         }
     }
 
@@ -905,9 +956,8 @@ impl WorkflowPoller {
             .unwrap_or("claude-code");
         let engine = engine_for_session_type(session_type);
         // F1: read baseline from the most recent history entry
-        // for the active role — matches TUI's
-        // `tui/src/workflow/controller.rs:1087` use of
-        // `active_assistant_start_count()`. Pre-fix the daemon
+        // for the active role — matches the former TUI controller's
+        // use of `active_assistant_start_count()`. Pre-fix the daemon
         // read `role_baselines[active].assistant_count` (the
         // LAUNCH-time floor); after the 2nd+ activation that's
         // stale and the gate fires every tick.
@@ -996,8 +1046,8 @@ impl WorkflowPoller {
         // Normal hand-off: render the target role's activation prompt.
         // Same shape as the TUI's `WorkflowResolver` path; uses
         // `subsequent_activation_prompt` when the target role has prior
-        // activations in `run.history` (matches
-        // `tui/src/workflow/controller.rs:1687-1695`).
+        // activations in `run.history` (matches the former TUI
+        // controller's subsequent-activation selection).
         let target_role_spec = match wf.roles.get(&to_role) {
             Some(r) => r,
             None => {
@@ -1018,8 +1068,8 @@ impl WorkflowPoller {
             target_role_spec.activation_prompt.as_deref()
         };
         // F4: do NOT skip on missing-template or empty-rendered
-        // prompt. TUI's path `tui/src/workflow/controller.rs:2089`
-        // fires the transition either way: it just skips the
+        // prompt. The former TUI controller's path fired the
+        // transition either way: it just skipped the
         // PTY write when rendered is empty (and the TUI tail's
         // `template_source = if !supplied_prompt.is_empty()
         // { ... } else { default_template.unwrap_or_default() }`
@@ -1071,13 +1121,16 @@ impl WorkflowPoller {
         run_id: &str,
         from_role: &str,
         to_role: &str,
-        // Phase 3: the poller no longer pre-renders the activation prompt into
-        // the transition. It records the RAW source on `pending_activation`
-        // (empty for static fires) and the finalization drainer renders ONCE,
-        // at finalization, from the pre-reset/pre-append snapshot. The Decision
-        // still carries the poll-time render for observability/tests, but it is
-        // NOT threaded into the hand-off — hence the leading underscore.
-        _rendered_prompt: &str,
+        // The RAW prompt recorded on `pending_activation`. For a normal static
+        // hand-off this is EMPTY: the finalization drainer renders the target
+        // role's (subsequent_)activation_prompt ONCE, at finalization, from the
+        // pre-reset/pre-append snapshot (Phase 3 — never pre-rendered here). For
+        // a self-targeted idle NUDGE it is the distinct `IDLE_NUDGE_PROMPT`,
+        // which must be delivered verbatim rather than re-rendering the role's
+        // own activation prompt — passing it here is what makes the backstop
+        // deliver the pointed "you stalled, call exactly one tool" message
+        // instead of silently re-showing the role its normal prompt.
+        prompt: &str,
     ) -> Result<(), String> {
         // 10d-2c-2-2-b F2 + F3:
         // - `expected_from`: snapshot's active_role. If state.json
@@ -1099,9 +1152,12 @@ impl WorkflowPoller {
             "run_id": run_id,
             "to": to_role,
             "role": from_role,
-            // Empty: static fires carry no prompt. Finalization falls back to
-            // the target role's (subsequent_)activation_prompt and renders it.
-            "prompt": "",
+            // Empty for a normal hand-off (finalization renders the target's
+            // (subsequent_)activation_prompt); the IDLE_NUDGE_PROMPT for a
+            // self-targeted nudge so the backstop's distinct message lands.
+            // IDLE_NUDGE_PROMPT has no `{{ }}` placeholders, so the
+            // finalization render is a no-op and it is delivered verbatim.
+            "prompt": prompt,
             "expected_from": from_role,
             "trigger": "static_idle",
         });
@@ -1305,7 +1361,7 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
             // via TUI flows). TUI's `fire_transition` uses
             // the same approach:
             // `locate_workflow_session` → `workspaces[ti].worktree_path`
-            // at `tui/src/workflow/controller.rs:1709, 1724`.
+            // (the former TUI controller resolved it the same way).
             //
             // Round-5 F1 + review-round-5 F1: workspace
             // resolution via the shared helper's three-tier
@@ -1368,8 +1424,8 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
 /// `lookup_session_any` (auth path), not load-bearing for
 /// ownership.
 ///
-/// TUI's equivalent gate (`controller.rs:1121` skip when
-/// `session.daemon_session_uid.is_some()`) checks the SAME
+/// The former TUI controller's equivalent gate (skip when
+/// `session.daemon_session_uid.is_some()`) checked the SAME
 /// session-uid signal, just from a different angle. The
 /// two-poller agreement invariant rests on this signal
 /// alignment.
@@ -1605,8 +1661,9 @@ impl<'a> crate::workflow::template::RoleResolver for DaemonWorkflowResolver<'a> 
     }
 
     /// `{{ roles.<role>.this_turn }}` — everything the role has said since its
-    /// most recent activation. Mirrors the TUI's `WorkflowResolver`
-    /// (`tui/src/workflow/controller.rs:298`): slice `list_messages` from the
+    /// most recent activation. (The former TUI `WorkflowResolver` sliced this
+    /// identically — see `daemon_resolver_renders_all_template_shapes`.) Slice
+    /// `list_messages` from the
     /// role's latest history entry's `text_messages_at_start` (the text-bearing
     /// count snapshotted at activation, NOT the `count_messages` turn count).
     /// Without this override the default impl falls back to `assistant_messages`
@@ -1693,8 +1750,8 @@ impl<'a> crate::workflow::template::RoleResolver for DaemonWorkflowResolver<'a> 
     }
 
     /// `{{ rejected_findings }}` — the manager's dismissed findings, surfaced to
-    /// the reviewer so it stops re-raising them. Mirrors the TUI's
-    /// `WorkflowResolver` (`tui/src/workflow/controller.rs:380`). Without this
+    /// the reviewer so it stops re-raising them. (The former TUI
+    /// `WorkflowResolver` overrode this identically.) Without this
     /// override the trait default returns empty, so the daemon-rendered reviewer
     /// prompt would drop the `{{ rejected_findings }}` section entirely.
     fn rejected_findings(&self) -> Vec<String> {
@@ -2274,48 +2331,83 @@ mod tests {
                 format!(r#"{{"type":"assistant","message":{{"role":"assistant","stop_reason":"end_turn","content":[{{"type":"text","text":"{}"}}]}}}}"#, text),
             ).unwrap();
         };
-        let set_tp = |uid: &str, sid: &str| {
-            let mut s = state.lock().unwrap();
-            s.sessions.get_mut(uid).unwrap().transcript_path =
-                Some(proj.join(format!("{}.jsonl", sid)).to_str().unwrap().to_string());
-        };
 
         let poller = WorkflowPoller::new(Arc::clone(&state));
         poller.set_finalize_timing_for_test(0, 0);
 
-        // Tick 1: the worker's is_initial activation finalizes (delivery-only).
+        // Tick 1: the worker's is_initial activation delivers, then parks in
+        // RebindPending — cross-bind fix: an unbound Claude role's sid binds
+        // CAUSALLY via the drainer's deliver-then-discover snapshot diff (no
+        // spawn-time detector, no transcript_path seeding).
         poller.poll_once();
         let run = crate::workflow::run::load_one(&run_id).unwrap();
         assert_eq!(run.history.iter().filter(|h| h.role == "worker").count(), 1);
-        assert!(run.pending_activation.is_none());
+        assert_eq!(
+            run.pending_activation.as_ref().map(|p| p.phase.clone()),
+            Some(crate::workflow::run::ActivationPhase::RebindPending),
+            "initial activation awaits causal sid discovery"
+        );
 
-        // The worker produces its first turn (transcript + detector binding).
+        // The worker produces its first turn — discovery finds the NEW file.
         write_turn("wsid", "worker did the work");
-        set_tp(&worker_uid, "wsid");
 
-        // Tick 2: sync binds the worker's sid, the gate fires worker->reviewer,
-        // and the fresh reviewer finalizes to rebind-pending.
+        // Tick 2: drain discovery binds the worker's sid (no detector anywhere).
         poller.poll_once();
         let run = crate::workflow::run::load_one(&run_id).unwrap();
         assert_eq!(
             run.role_sessions["worker"].current_session_id.as_deref(),
             Some("wsid"),
-            "P1: worker sid bridged from transcript_path (was the wedge)"
+            "worker sid bound by deliver-then-discover (was the cross-bind wedge)"
         );
+        assert!(run.pending_activation.is_none());
+
+        // Tick 3: gate sees the worker's completed turn -> worker->reviewer
+        // fires; the fresh reviewer finalizes to rebind-pending. Also: the
+        // reverse bridge propagates the worker's transcript_path onto its
+        // DaemonSession (MCP read surface).
+        poller.poll_once();
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
         assert_eq!(run.active_role.as_deref(), Some("reviewer"), "worker->reviewer fired headlessly");
+        {
+            let s = state.lock().unwrap();
+            let tp = s.sessions[&worker_uid].transcript_path.clone();
+            assert_eq!(
+                tp.as_deref(),
+                proj.join("wsid.jsonl").to_str(),
+                "reverse bridge sets the worker's DaemonSession.transcript_path"
+            );
+        }
 
         // The (fresh) reviewer produces its turn — a NEW transcript discovery rebinds.
         write_turn("rsid", "reviewer found a bug");
 
-        // Tick 3: reviewer rebind-pending discovery binds rsid.
+        // Tick 4: reviewer rebind-pending discovery binds rsid.
         poller.poll_once();
         let run = crate::workflow::run::load_one(&run_id).unwrap();
         assert_eq!(run.role_sessions["reviewer"].current_session_id.as_deref(), Some("rsid"));
 
-        // Tick 4: reviewer goes idle (its turn) -> reviewer->manager fires.
+        // Tick 5: reviewer goes idle (its turn) -> reviewer->manager fires; the
+        // unbound persistent manager's activation ALSO parks in RebindPending
+        // (first-ever activation -> causal discovery, the exact case the
+        // detector race used to mis-bind).
         poller.poll_once();
         let run = crate::workflow::run::load_one(&run_id).unwrap();
         assert_eq!(run.active_role.as_deref(), Some("manager"), "reviewer->manager fired headlessly");
+        assert_eq!(
+            run.pending_activation.as_ref().map(|p| p.phase.clone()),
+            Some(crate::workflow::run::ActivationPhase::RebindPending),
+            "unbound persistent manager awaits causal sid discovery"
+        );
+
+        // The manager produces its turn; tick 6 binds it.
+        write_turn("msid", "manager decided");
+        poller.poll_once();
+        let run = crate::workflow::run::load_one(&run_id).unwrap();
+        assert_eq!(
+            run.role_sessions["manager"].current_session_id.as_deref(),
+            Some("msid"),
+            "persistent manager's first activation binds causally"
+        );
 
         // Full chain in history: worker(Initial) -> reviewer -> manager.
         let roles: Vec<&str> = run.history.iter().map(|h| h.role.as_str()).collect();
@@ -2737,6 +2829,63 @@ mod tests {
             ),
             "expected NudgeExhausted once the cap is reached, got {:?}",
             decisions,
+        );
+    }
+
+    /// The idle-nudge backstop must DELIVER the distinct `IDLE_NUDGE_PROMPT`,
+    /// not the role's own activation template. The bug: `fire_static_transition`
+    /// hardcoded `"prompt": ""`, so the nudge's `pending_activation.raw_prompt`
+    /// was empty and finalization fell back to the role's
+    /// (subsequent_)activation_prompt — defeating the backstop (a stuck manager
+    /// just got re-shown its review prompt instead of "you stalled, call exactly
+    /// one tool"). This drives the APPLY path (the prior nudge test runs under
+    /// disable_apply and only checks the Decision) and asserts the recorded
+    /// raw_prompt. Mutation check: reverting fire_static_transition to a
+    /// hardcoded empty prompt leaves raw_prompt empty and fails this.
+    #[test]
+    fn nudge_records_idle_nudge_prompt_as_raw_prompt() {
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let state = make_state_with_one_active_run("rNudgeApply");
+        let poller = WorkflowPoller::new(state);
+        // Self-targeted nudge: from == to == active role ("worker").
+        poller
+            .fire_static_transition(
+                "rNudgeApply",
+                "worker",
+                "worker",
+                crate::workflow::IDLE_NUDGE_PROMPT,
+            )
+            .expect("nudge fire ok");
+
+        let run = crate::workflow::run::load_one("rNudgeApply").unwrap();
+        let pa = run
+            .pending_activation
+            .expect("nudge records a pending_activation");
+        assert_eq!(
+            pa.raw_prompt,
+            crate::workflow::IDLE_NUDGE_PROMPT,
+            "the nudge must carry the distinct IDLE_NUDGE_PROMPT, not an empty \
+             prompt that finalization would replace with the role's own template",
+        );
+
+        // Contrast: the SAME fire shape with an empty prompt (a normal static
+        // hand-off) keeps raw_prompt empty, so finalization renders the target
+        // role's activation template. Same single-role run, so the target is
+        // the worker itself — what matters is prompt "" vs IDLE_NUDGE_PROMPT.
+        let state2 = make_state_with_one_active_run("rStaticApply");
+        let poller2 = WorkflowPoller::new(state2);
+        poller2
+            .fire_static_transition("rStaticApply", "worker", "worker", "")
+            .expect("static fire ok");
+        let run2 = crate::workflow::run::load_one("rStaticApply").unwrap();
+        assert_eq!(
+            run2.pending_activation.expect("static records pending").raw_prompt,
+            "",
+            "an empty-prompt fire must keep an empty raw_prompt (template-rendered \
+             at finalization), so the nudge fix doesn't leak into normal hand-offs",
         );
     }
 
@@ -3479,6 +3628,98 @@ to = "reviewer"
             rendered.contains("latest worker turn"),
             "template should embed the worker's last message: {:?}",
             rendered,
+        );
+    }
+
+    /// Comprehensive `DaemonWorkflowResolver` render coverage across every
+    /// template shape the activation prompts use: baseline-skipping
+    /// (`user[N]`/`assistant[N]`), the pre-baseline `prior_*` slices, the
+    /// `this_turn` slice (from the activation's `text_messages_at_start`),
+    /// `last_message`, `goal`, and `rejected_findings`. Migrated from the
+    /// now-deleted TUI `controller.rs` resolver-parity test: that test compared
+    /// the daemon resolver against a duplicate `WorkflowResolver` kept in the
+    /// TUI crate purely to be diffed here — dead code, since the TUI is a pure
+    /// observer and renders nothing. Asserting the daemon resolver's output
+    /// directly (it's the sole production resolver) preserves the coverage and
+    /// removes the duplicate.
+    #[test]
+    fn daemon_resolver_renders_all_template_shapes() {
+        let _guard = crate::test_support::env_lock();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp.path());
+        let wt = _tmp.path().join("wt-shapes");
+        std::fs::create_dir_all(&wt).unwrap();
+        let encoded = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        let proj = _tmp.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("sid-w.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first prompt\"}]}}\n\
+{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"answer one\"}]}}\n\
+{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second prompt\"}]}}\n\
+{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"answer two\"}]}}\n",
+        )
+        .unwrap();
+
+        let mut role_sessions = BTreeMap::new();
+        role_sessions.insert(
+            "worker".to_string(),
+            RoleBinding {
+                session_label: "worker".to_string(),
+                current_session_id: Some("sid-w".to_string()),
+                daemon_session_uid: None,
+            },
+        );
+        // Baseline skips the first user/assistant pair so prior_* vs current_*
+        // slicing is meaningfully exercised.
+        let mut baselines = BTreeMap::new();
+        baselines.insert(
+            "worker".to_string(),
+            MessageBaseline { user_count: 1, assistant_count: 1 },
+        );
+        let mut run = WorkflowRun::new(
+            "r-shapes".to_string(),
+            "feedback".to_string(),
+            "/tmp/wf-shapes".to_string(),
+            role_sessions,
+            "worker".to_string(),
+            baselines,
+            Some("the run goal".to_string()),
+            BTreeMap::new(),
+            0,
+        );
+        // this_turn slices from text_messages_at_start=1 → drops "answer one".
+        run.history[0].text_messages_at_start = 1;
+        run.rejected_findings.push(crate::workflow::run::RejectedFinding {
+            text: "stop flagging the unused import".to_string(),
+            recorded_at: 0,
+            iteration: 1,
+        });
+
+        let mut engines = BTreeMap::new();
+        engines.insert("worker".to_string(), Engine::ClaudeCode);
+        let resolver = DaemonWorkflowResolver {
+            run: &run,
+            worktree_path: Some(wt.as_path()),
+            role_engines: engines,
+        };
+        let r = |tpl: &str| crate::workflow::template::render(tpl, &resolver);
+
+        assert_eq!(r("{{ roles.worker.user[0] }}"), "second prompt", "post-baseline user");
+        assert_eq!(r("{{ roles.worker.assistant[0] }}"), "answer two", "post-baseline assistant");
+        assert_eq!(r("{{ roles.worker.prior_user[-1] }}"), "first prompt", "pre-baseline user");
+        assert_eq!(r("{{ roles.worker.prior_assistant[-1] }}"), "answer one", "pre-baseline assistant");
+        assert_eq!(r("{{ roles.worker.last_message }}"), "answer two", "last_message alias");
+        assert_eq!(r("{{ goal }}"), "the run goal");
+        assert_eq!(r("{{ roles.worker.this_turn }}"), "answer two", "this_turn sliced from text_messages_at_start");
+        assert!(
+            r("{{ rejected_findings }}").contains("stop flagging the unused import"),
+            "rejected_findings must surface the dismissed finding",
+        );
+        assert_eq!(
+            r("review: {{ roles.worker.last_message }} ({{ goal }})"),
+            "review: answer two (the run goal)",
+            "interpolation of multiple placeholders",
         );
     }
 

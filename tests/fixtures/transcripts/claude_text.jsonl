@@ -1,0 +1,6 @@
+{"type":"user","message":{"role":"user","content":"hello there"}}
+{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hi, how can I help?"}]}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"meta noise to skip"}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"result body"}]}}
+{"type":"user","message":{"role":"user","content":"second real prompt"}}
+{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}

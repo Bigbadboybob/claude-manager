@@ -181,7 +181,9 @@ pub fn snapshot_codex_transcript_ids(worktree_path: &Path) -> Vec<String> {
     let Some(wt_str) = worktree_path.to_str() else {
         return Vec::new();
     };
-    walk_codex(&sessions, wt_str, &mut out);
+    for root in codex_scan_roots(&sessions) {
+        walk_codex(&root, wt_str, &mut out);
+    }
     out.into_iter().map(|(_, id)| id).collect()
 }
 
@@ -197,7 +199,9 @@ pub fn detect_new_codex_id(
     }
     let wt_str = worktree_path.to_str()?;
     let mut found: Vec<(SystemTime, String)> = Vec::new();
-    walk_codex(&sessions, wt_str, &mut found);
+    for root in codex_scan_roots(&sessions) {
+        walk_codex(&root, wt_str, &mut found);
+    }
     found
         .into_iter()
         .filter(|(_, id)| !existing.iter().any(|e| e == id))
@@ -212,12 +216,77 @@ pub fn codex_transcript_path(transcript_id: &str) -> Option<PathBuf> {
     if !sessions.is_dir() {
         return None;
     }
+    // Common case (an active session): the id is in a recent date bucket.
+    for root in recent_codex_date_dirs(&sessions, RECENT_CODEX_BUCKETS) {
+        if let Some(hit) = find_codex_file(&root, transcript_id) {
+            return Some(hit);
+        }
+    }
+    // Not in a recent bucket (an older session, or an unrecognized layout) —
+    // fall back to a full walk so a known id is never left unresolved.
     find_codex_file(&sessions, transcript_id)
 }
 
 fn codex_sessions_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join(".codex/sessions"))
+}
+
+/// How many of the most-recent `YYYY/MM/DD` codex date buckets the detector
+/// scans per poll. >1 so a session spawned just before midnight whose rollout
+/// lands in the next day's bucket is still found within the ≤1h poll window
+/// (the buckets are re-resolved each poll). Scanning recent buckets instead of
+/// the entire `~/.codex/sessions` history bounds the per-poll cost: the old walk
+/// opened and read the first line of EVERY rollout file in all of codex history,
+/// once or twice per poll (~120–840 times across a session's detect window).
+const RECENT_CODEX_BUCKETS: usize = 3;
+
+/// The most-recent codex `YYYY/MM/DD` date-bucket dirs (newest last), capped at
+/// `keep`. Returns an empty vec when the layout under `sessions` isn't the
+/// expected numeric 3-level nesting — the caller then falls back to a full walk
+/// (correctness over the optimization). Only reads directory structure, never
+/// opens a rollout file, so it's cheap.
+fn recent_codex_date_dirs(sessions: &Path, keep: usize) -> Vec<PathBuf> {
+    fn numeric_subdirs(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).map_or(false, |s| {
+                    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
+            .collect()
+    }
+    let mut buckets: Vec<PathBuf> = Vec::new();
+    for y in numeric_subdirs(sessions) {
+        for m in numeric_subdirs(&y) {
+            for d in numeric_subdirs(&m) {
+                buckets.push(d);
+            }
+        }
+    }
+    // Lexicographic sort == chronological for zero-padded YYYY/MM/DD paths.
+    buckets.sort();
+    if buckets.len() > keep {
+        buckets.drain(0..buckets.len() - keep);
+    }
+    buckets
+}
+
+/// Roots to scan for codex detection: the recent date buckets, or the whole
+/// `sessions` dir when the date layout isn't recognized (correctness fallback).
+fn codex_scan_roots(sessions: &Path) -> Vec<PathBuf> {
+    let buckets = recent_codex_date_dirs(sessions, RECENT_CODEX_BUCKETS);
+    if buckets.is_empty() {
+        vec![sessions.to_path_buf()]
+    } else {
+        buckets
+    }
 }
 
 fn walk_codex(dir: &Path, wt_str: &str, out: &mut Vec<(SystemTime, String)>) {
@@ -646,6 +715,48 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    #[test]
+    fn recent_codex_date_dirs_keeps_newest_and_falls_back_on_odd_layout() {
+        let env = HomeEnv::make();
+        let sessions = env.path().join(".codex/sessions");
+        // Five date buckets across a month boundary; expect the 3 newest.
+        for (y, m, d) in [
+            ("2026", "05", "30"),
+            ("2026", "05", "31"),
+            ("2026", "06", "01"),
+            ("2026", "06", "10"),
+            ("2026", "06", "11"),
+        ] {
+            std::fs::create_dir_all(sessions.join(y).join(m).join(d)).unwrap();
+        }
+        let picked = recent_codex_date_dirs(&sessions, 3);
+        let names: Vec<String> = picked
+            .iter()
+            .map(|p| {
+                // last three path components: YYYY/MM/DD
+                let comps: Vec<_> = p.components().rev().take(3).collect();
+                format!(
+                    "{}/{}/{}",
+                    comps[2].as_os_str().to_string_lossy(),
+                    comps[1].as_os_str().to_string_lossy(),
+                    comps[0].as_os_str().to_string_lossy(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["2026/06/01", "2026/06/10", "2026/06/11"],
+            "must keep the 3 newest date buckets, newest last",
+        );
+
+        // Unrecognized (non-numeric) layout → empty, so codex_scan_roots falls
+        // back to the full `sessions` walk (correctness over the optimization).
+        let odd = env.path().join(".codex-odd");
+        std::fs::create_dir_all(odd.join("not-a-date")).unwrap();
+        assert!(recent_codex_date_dirs(&odd, 3).is_empty());
+        assert_eq!(codex_scan_roots(&odd), vec![odd.clone()]);
     }
 
     #[test]

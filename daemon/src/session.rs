@@ -907,8 +907,8 @@ pub struct DaemonSession {
     /// when the workflow is known up front, OR via the
     /// `session.set_workflow_context` RPC after-the-fact when
     /// the TUI launches a workflow on an already-spawned
-    /// daemon-attached session (the Existing-slot path in
-    /// `controller::launch_workflow`).
+    /// daemon-attached session (the Existing-slot path in the
+    /// former TUI controller's launch).
     ///
     /// `None` for non-workflow sessions — the auth check then
     /// rejects them, which is correct: a daemon-attached

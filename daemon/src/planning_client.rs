@@ -295,13 +295,15 @@ pub fn propose_task(
 ///
 /// `#[cfg(test)]` + `pub(crate)` so dispatch.rs tests can
 /// import it. Production builds don't compile this in.
+///
+/// Aliases the crate-wide `test_support::env_lock` instead of a private mutex:
+/// these tests mutate process-global HOME/env that ~30 other modules also
+/// serialize on that one lock. A second independent mutex here would reintroduce
+/// the "two-mutex stomp" (test_support.rs warns against it) where a
+/// planning_client test flips HOME/env concurrently with another module's test.
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+    crate::test_support::env_lock()
 }
 
 /// 12f F2 test helper: bind a one-shot HTTP stub on localhost

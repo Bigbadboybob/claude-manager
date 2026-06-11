@@ -1681,7 +1681,11 @@ enum InputMode {
     },
     /// Picking which workflow to launch when more than one is defined.
     WorkflowPicker {
-        ws_index: usize,
+        // Stable workspace id captured at modal-open. Re-resolved to a current
+        // index at use time (`resolve_workspace_by_id`) — a backend tick can
+        // reorder/remove `workspaces` while the modal is open, so a frozen raw
+        // index would target the wrong workspace.
+        ws_id: String,
         focused_si: Option<usize>,
         names: Vec<String>,
         selected: usize,
@@ -1697,7 +1701,9 @@ enum InputMode {
     },
     /// Confirming launch of a workflow on a workspace.
     WorkflowLaunchConfirm {
-        ws_index: usize,
+        // Stable workspace id (see `WorkflowPicker::ws_id`) — re-resolved to a
+        // current index at draw + launch time.
+        ws_id: String,
         workflow_name: String,
         /// One slot per role, in presentation order.
         slots: Vec<WorkflowSlotChoice>,
@@ -1899,7 +1905,7 @@ pub(crate) enum SubmitAction {
         name: String,
     },
     EnterWorkflowLaunchConfirm {
-        ws_index: usize,
+        ws_id: String,
         focused_si: Option<usize>,
         workflow_name: String,
         /// migrate-tui-local Issue I: launching task scope. See
@@ -1907,7 +1913,7 @@ pub(crate) enum SubmitAction {
         cursor_task_id: Option<String>,
     },
     LaunchWorkflow {
-        ws_index: usize,
+        ws_id: String,
         workflow_name: String,
         slots: Vec<WorkflowSlotChoice>,
         goal: Option<String>,
@@ -2186,7 +2192,7 @@ pub(crate) struct TaskSettingsMut<'a> {
 }
 
 pub(crate) struct WorkflowLaunchConfirmMut<'a> {
-    pub ws_index: usize,
+    pub ws_id: &'a str,
     pub workflow_name: &'a str,
     pub slots: &'a mut Vec<WorkflowSlotChoice>,
     pub active_slot: &'a mut usize,
@@ -2199,7 +2205,7 @@ pub(crate) struct WorkflowLaunchConfirmMut<'a> {
 }
 
 pub(crate) struct WorkflowPickerMut<'a> {
-    pub ws_index: usize,
+    pub ws_id: &'a str,
     pub focused_si: Option<usize>,
     pub names: &'a [String],
     pub selected: &'a mut usize,
@@ -2979,7 +2985,7 @@ pub(crate) fn handle_workflow_launch_confirm(
                 Some(goal_owned)
             };
             InputOutcome::Submit(SubmitAction::LaunchWorkflow {
-                ws_index: state.ws_index,
+                ws_id: state.ws_id.to_string(),
                 workflow_name: state.workflow_name.to_string(),
                 slots: state.slots.clone(),
                 goal: goal_opt,
@@ -3068,7 +3074,7 @@ pub(crate) fn handle_workflow_picker(
         KeyCode::Enter => match state.names.get(*state.selected).cloned() {
             Some(wf_name) => {
                 InputOutcome::Submit(SubmitAction::EnterWorkflowLaunchConfirm {
-                    ws_index: state.ws_index,
+                    ws_id: state.ws_id.to_string(),
                     focused_si: state.focused_si,
                     workflow_name: wf_name,
                     cursor_task_id: state.cursor_task_id.map(str::to_string),
@@ -8984,7 +8990,7 @@ impl App {
                 event,
             ),
             InputMode::WorkflowLaunchConfirm {
-                ws_index,
+                ws_id,
                 workflow_name,
                 slots,
                 active_slot,
@@ -8992,7 +8998,7 @@ impl App {
                 cursor_task_id,
             } => handle_workflow_launch_confirm(
                 WorkflowLaunchConfirmMut {
-                    ws_index: *ws_index,
+                    ws_id: ws_id.as_str(),
                     workflow_name: workflow_name.as_str(),
                     slots,
                     active_slot,
@@ -9003,14 +9009,14 @@ impl App {
                 event,
             ),
             InputMode::WorkflowPicker {
-                ws_index,
+                ws_id,
                 focused_si,
                 names,
                 selected,
                 cursor_task_id,
             } => handle_workflow_picker(
                 WorkflowPickerMut {
-                    ws_index: *ws_index,
+                    ws_id: ws_id.as_str(),
                     focused_si: *focused_si,
                     names,
                     selected,
@@ -9228,20 +9234,20 @@ impl App {
                 }
             }
             SubmitAction::EnterWorkflowLaunchConfirm {
-                ws_index,
+                ws_id,
                 focused_si,
                 workflow_name,
                 cursor_task_id,
             } => {
                 self.enter_workflow_launch_confirm(
-                    ws_index,
+                    ws_id,
                     focused_si,
                     workflow_name,
                     cursor_task_id,
                 );
             }
             SubmitAction::LaunchWorkflow {
-                ws_index,
+                ws_id,
                 workflow_name,
                 slots: _slots,
                 goal,
@@ -9265,7 +9271,7 @@ impl App {
                 // headlessly; the TUI observes it via `workflow_watch` /
                 // `manifest.watch`. The TUI no longer spawns or drives locally.
                 self.launch_workflow_via_daemon(
-                    ws_index,
+                    &ws_id,
                     &workflow_name,
                     goal,
                     cursor_task_id,
@@ -11778,11 +11784,11 @@ impl App {
                 InputMode::WorkflowPicker { names, selected, .. } => {
                     self.draw_workflow_picker(frame, area, names, *selected);
                 }
-                InputMode::WorkflowLaunchConfirm { ws_index, workflow_name, slots, active_slot, goal, .. } => {
+                InputMode::WorkflowLaunchConfirm { ws_id, workflow_name, slots, active_slot, goal, .. } => {
                     self.draw_workflow_launch(
                         frame,
                         area,
-                        *ws_index,
+                        ws_id,
                         workflow_name,
                         slots,
                         *active_slot,
@@ -12902,6 +12908,10 @@ impl App {
             self.set_status_msg("No workspace selected");
             return;
         }
+        // Capture the STABLE workspace id now; a backend tick can reorder/remove
+        // `workspaces` while the modal is open, so the launch/draw consumers
+        // re-resolve from this id rather than trusting a frozen raw index.
+        let ws_id = self.workspaces[wi].id.clone();
         // Same reason as `start_new_terminal_session`: workflow
         // participants are sibling sessions on the workspace, and a
         // push in flight will tombstone them on `PushComplete`.
@@ -12922,7 +12932,7 @@ impl App {
             }
             WorkflowLaunchRouting::LaunchOnly(only) => {
                 self.enter_workflow_launch_confirm(
-                    wi,
+                    ws_id,
                     focused_si,
                     only,
                     cursor_task_id,
@@ -12930,7 +12940,7 @@ impl App {
             }
             WorkflowLaunchRouting::OpenPicker(names) => {
                 self.input_mode = InputMode::WorkflowPicker {
-                    ws_index: wi,
+                    ws_id,
                     focused_si,
                     names,
                     selected: 0,
@@ -12950,7 +12960,7 @@ impl App {
     /// forward it into `App::launch_workflow`.
     fn enter_workflow_launch_confirm(
         &mut self,
-        wi: usize,
+        ws_id: String,
         focused_si: Option<usize>,
         wf_name: String,
         cursor_task_id: Option<String>,
@@ -12981,7 +12991,7 @@ impl App {
             });
         }
         self.input_mode = InputMode::WorkflowLaunchConfirm {
-            ws_index: wi,
+            ws_id,
             workflow_name: wf_name,
             slots,
             active_slot: 0,
@@ -12997,11 +13007,17 @@ impl App {
     /// `workflow_watch` / `manifest.watch` — it does not spawn or drive locally.
     pub(crate) fn launch_workflow_via_daemon(
         &mut self,
-        ws_index: usize,
+        ws_id: &str,
         workflow_name: &str,
         goal: Option<String>,
         task_id: Option<String>,
     ) {
+        // Re-resolve the stable id to a CURRENT index — a tick may have
+        // reordered/removed workspaces while the launch modal was open.
+        let Some(ws_index) = resolve_workspace_by_id(&self.workspaces, ws_id) else {
+            self.set_status_msg("launch: workspace no longer exists");
+            return;
+        };
         let Some(ws) = self.workspaces.get(ws_index) else {
             self.set_status_msg("launch: invalid workspace");
             return;
@@ -13918,12 +13934,16 @@ impl App {
         &self,
         frame: &mut Frame,
         area: Rect,
-        ws_index: usize,
+        ws_id: &str,
         workflow_name: &str,
         slots: &[WorkflowSlotChoice],
         active_slot: usize,
         goal: &str,
     ) {
+        // Re-resolve the stable id each draw — workspaces may have reordered
+        // since the modal opened (a frozen index would show the wrong name).
+        let ws_index = resolve_workspace_by_id(&self.workspaces, ws_id)
+            .unwrap_or(usize::MAX);
         let width = area.width.min(72).max(44);
         // +10 leaves room for the goal field row and the hint footer.
         let height = (slots.len() as u16 + 10).min(area.height.saturating_sub(2));
@@ -19213,7 +19233,7 @@ mod input_handler_tests {
         let mut goal = String::new();
         let outcome = handle_workflow_launch_confirm(
             WorkflowLaunchConfirmMut {
-                ws_index: 1,
+                ws_id: "ws-1",
                 workflow_name: "feedback",
                 slots: &mut slots,
                 active_slot: &mut active,
@@ -19235,7 +19255,7 @@ mod input_handler_tests {
         let mut goal = "ab".to_string();
         let outcome = handle_workflow_launch_confirm(
             WorkflowLaunchConfirmMut {
-                ws_index: 0,
+                ws_id: "ws-0",
                 workflow_name: "feedback",
                 slots: &mut slots,
                 active_slot: &mut active,
@@ -19256,7 +19276,7 @@ mod input_handler_tests {
         let mut goal = "  refactor the parser  ".to_string();
         let outcome = handle_workflow_launch_confirm(
             WorkflowLaunchConfirmMut {
-                ws_index: 5,
+                ws_id: "ws-5",
                 workflow_name: "feedback",
                 slots: &mut slots,
                 active_slot: &mut active,
@@ -19268,13 +19288,13 @@ mod input_handler_tests {
         );
         match outcome {
             InputOutcome::Submit(SubmitAction::LaunchWorkflow {
-                ws_index,
+                ws_id,
                 workflow_name,
                 slots: launched_slots,
                 goal,
                 cursor_task_id: _,
             }) => {
-                assert_eq!(ws_index, 5);
+                assert_eq!(ws_id, "ws-5");
                 assert_eq!(workflow_name, "feedback");
                 assert_eq!(launched_slots.len(), 1);
                 assert_eq!(goal.as_deref(), Some("refactor the parser"));
@@ -19290,7 +19310,7 @@ mod input_handler_tests {
         let mut goal = String::new();
         let outcome = handle_workflow_launch_confirm(
             WorkflowLaunchConfirmMut {
-                ws_index: 0,
+                ws_id: "ws-0",
                 workflow_name: "feedback",
                 slots: &mut slots,
                 active_slot: &mut active,
@@ -19311,7 +19331,7 @@ mod input_handler_tests {
         let mut selected = 1usize;
         let outcome = handle_workflow_picker(
             WorkflowPickerMut {
-                ws_index: 0,
+                ws_id: "ws-0",
                 focused_si: None,
                 names: &names,
                 selected: &mut selected,
@@ -19330,7 +19350,7 @@ mod input_handler_tests {
         let mut selected = 1usize;
         let outcome = handle_workflow_picker(
             WorkflowPickerMut {
-                ws_index: 7,
+                ws_id: "ws-7",
                 focused_si: Some(2),
                 names: &names,
                 selected: &mut selected,
@@ -19341,12 +19361,12 @@ mod input_handler_tests {
         );
         match outcome {
             InputOutcome::Submit(SubmitAction::EnterWorkflowLaunchConfirm {
-                ws_index,
+                ws_id,
                 focused_si,
                 workflow_name,
                 cursor_task_id: _,
             }) => {
-                assert_eq!(ws_index, 7);
+                assert_eq!(ws_id, "ws-7");
                 assert_eq!(focused_si, Some(2));
                 assert_eq!(workflow_name, "beta");
             }
@@ -19360,7 +19380,7 @@ mod input_handler_tests {
         let mut selected = 0usize;
         let outcome = handle_workflow_picker(
             WorkflowPickerMut {
-                ws_index: 0,
+                ws_id: "ws-0",
                 focused_si: None,
                 names: &names,
                 selected: &mut selected,
@@ -21926,14 +21946,14 @@ tls_fingerprint = "deadbeef"
 #[cfg(test)]
 mod migrate_tui_local_tests {
     /// T_migrate_no_tuilocal_sites_remain: no non-test code in
-    /// `tui/src/app.rs` or `tui/src/workflow/controller.rs`
-    /// references `SpawnTarget::TuiLocal`. Test fixtures may
-    /// still use the variant; the enum value stays in place
-    /// for future cloud-worker use.
+    /// `tui/src/app.rs` references `SpawnTarget::TuiLocal`. Test
+    /// fixtures may still use the variant; the enum value stays in
+    /// place for future cloud-worker use. (The former
+    /// `tui/src/workflow/controller.rs` half of this pin was dropped
+    /// when that file was deleted — the TUI owns no workflow logic.)
     #[test]
     fn t_migrate_no_tuilocal_sites_remain() {
         let app_src = include_str!("app.rs");
-        let ctrl_src = include_str!("workflow/controller.rs");
 
         // Strip `#[cfg(test)]` test modules + the inline
         // `mod tests` blocks so the scan is production-only.
@@ -21971,7 +21991,6 @@ mod migrate_tui_local_tests {
         };
 
         let app_prod = prod_only(app_src);
-        let ctrl_prod = prod_only(ctrl_src);
 
         // The doc-comment + decision-doc references to
         // `SpawnTarget::TuiLocal` ARE allowed (we keep them
@@ -21984,13 +22003,6 @@ mod migrate_tui_local_tests {
              `crate::mcp_config::SpawnTarget::TuiLocal,` to \
              any build_args call site — migrate-tui-local \
              routes every spawn through SpawnTarget::Daemon.",
-        );
-        assert!(
-            !ctrl_prod.contains(bad_pattern),
-            "tui/src/workflow/controller.rs production code \
-             MUST NOT pass \
-             `crate::mcp_config::SpawnTarget::TuiLocal,` to \
-             any build_args call site.",
         );
     }
 
@@ -23132,7 +23144,7 @@ mod migrate_tui_local_tests {
         // Both variants should be followed by a `cursor_task_id`
         // field declaration. Search both variant bodies.
         let picker_idx = src
-            .find("WorkflowPicker {\n        ws_index: usize,")
+            .find("    /// Picking which workflow to launch when more than one is defined.\n    WorkflowPicker {")
             .expect("WorkflowPicker variant must exist");
         let picker_end = src[picker_idx..]
             .find("    },\n")
@@ -23148,7 +23160,7 @@ mod migrate_tui_local_tests {
         );
 
         let confirm_idx = src
-            .find("WorkflowLaunchConfirm {\n        ws_index: usize,")
+            .find("    /// Confirming launch of a workflow on a workspace.\n    WorkflowLaunchConfirm {")
             .expect("WorkflowLaunchConfirm variant must exist");
         let confirm_end = src[confirm_idx..]
             .find("    },\n")
@@ -23203,7 +23215,7 @@ mod migrate_tui_local_tests {
         // Find the App-level handler block for
         // SubmitAction::LaunchWorkflow.
         let handler_idx = src
-            .find("SubmitAction::LaunchWorkflow {\n                ws_index,")
+            .find("SubmitAction::LaunchWorkflow {\n                ws_id,")
             .expect("LaunchWorkflow handler must exist");
         let handler_rest = &src[handler_idx..];
         let handler_end = handler_rest
@@ -23223,7 +23235,7 @@ mod migrate_tui_local_tests {
         // `cursor_task_id` (NOT a hardcoded None).
         assert!(
             handler_body.contains(
-                "self.launch_workflow_via_daemon(\n                    ws_index,\n                    &workflow_name,\n                    goal,\n                    cursor_task_id,",
+                "self.launch_workflow_via_daemon(\n                    &ws_id,\n                    &workflow_name,\n                    goal,\n                    cursor_task_id,",
             ),
             "the SubmitAction::LaunchWorkflow handler MUST \
              forward `cursor_task_id` (NOT a hardcoded `None`) \
@@ -23246,12 +23258,12 @@ mod migrate_tui_local_tests {
         // SubmitAction::EnterWorkflowLaunchConfirm + LaunchWorkflow
         // variants carry the cursor_task_id field on the wire.
         assert!(
-            src.contains("EnterWorkflowLaunchConfirm {\n        ws_index: usize,\n        focused_si: Option<usize>,\n        workflow_name: String,\n        /// migrate-tui-local Issue I"),
+            src.contains("EnterWorkflowLaunchConfirm {\n        ws_id: String,\n        focused_si: Option<usize>,\n        workflow_name: String,\n        /// migrate-tui-local Issue I"),
             "SubmitAction::EnterWorkflowLaunchConfirm MUST \
              carry a `cursor_task_id` field (Issue I)",
         );
         assert!(
-            src.contains("LaunchWorkflow {\n        ws_index: usize,\n        workflow_name: String,\n        slots: Vec<WorkflowSlotChoice>,\n        goal: Option<String>,\n        /// migrate-tui-local Issue I"),
+            src.contains("LaunchWorkflow {\n        ws_id: String,\n        workflow_name: String,\n        slots: Vec<WorkflowSlotChoice>,\n        goal: Option<String>,\n        /// migrate-tui-local Issue I"),
             "SubmitAction::LaunchWorkflow MUST carry a \
              `cursor_task_id` field (Issue I)",
         );

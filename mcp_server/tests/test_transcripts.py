@@ -9,7 +9,9 @@ to catch.
 
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
 
 from mcp_server.transcripts import claude_code, codex
 from mcp_server.transcripts.types import Role, parse_cursor, format_cursor, resolve_offset
@@ -242,6 +244,44 @@ class CodexParserTest(unittest.TestCase):
         msgs, cur = codex.parse_lines(line, 0, 0, 0)
         self.assertEqual(msgs, [])
         self.assertEqual(parse_cursor(cur), (0, 0))
+
+
+class SharedFixtureCorpusTest(unittest.TestCase):
+    """Parse the SHARED fixtures in `tests/fixtures/transcripts/` and assert the
+    same user/assistant text extraction the Rust parser asserts on them
+    (`daemon/src/workflow/transcript.rs::shared_fixture_corpus_*`). The two
+    parsers encode the JSONL formats independently; pinning both against one
+    `expected.json` means a drift in either one's user/assistant text extraction
+    (e.g. the codex `agent_message` mirror stops being deduped) fails CI in BOTH
+    languages. Tool-call rendering is deliberately NOT pinned — the parsers
+    diverge there by design (see the fixtures README), so the corpus has no
+    `tool_use` lines.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        d = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "transcripts"
+        cls.expected = json.loads((d / "expected.json").read_text())
+        cls.claude_text = (d / "claude_text.jsonl").read_text()
+        cls.codex_text = (d / "codex_text.jsonl").read_text()
+
+    @staticmethod
+    def _by_role(msgs):
+        users = [m.content for m in msgs if m.role == Role.USER]
+        assistants = [m.content for m in msgs if m.role == Role.ASSISTANT]
+        return users, assistants
+
+    def test_claude_corpus_matches_expected(self):
+        msgs, _ = claude_code.parse_lines(self.claude_text, 0, 1000, 0)
+        users, assistants = self._by_role(msgs)
+        self.assertEqual(users, self.expected["claude"]["user"])
+        self.assertEqual(assistants, self.expected["claude"]["assistant"])
+
+    def test_codex_corpus_matches_expected(self):
+        msgs, _ = codex.parse_lines(self.codex_text, 0, 1000, 0)
+        users, assistants = self._by_role(msgs)
+        self.assertEqual(users, self.expected["codex"]["user"])
+        self.assertEqual(assistants, self.expected["codex"]["assistant"])
 
 
 if __name__ == "__main__":

@@ -634,10 +634,32 @@ fn dispatch_propose_task(
 /// Operator-callable; the file-writer it replaces trusted any
 /// caller. Participant validation against `workflow_runs` lands
 /// with 10d-2c.
+/// Reject a FORGED Operator frame on a workflow event-writer. Inside
+/// `workflow_transition` / `workflow_done` / `workflow_reject_finding` an
+/// Operator caller BYPASSES the Session-caller participant check, so an
+/// unvalidated Operator frame would let a same-UID agent forge
+/// `{"token_id":"x"}` and mutate ANY run's control plane (escaping its
+/// descendant-task scope). Validating the token here, at the socket boundary,
+/// closes that bypass — mirroring `dispatch_start_workflow`. Session callers
+/// pass through to the body's participant check. The in-process workflow poller
+/// calls these methods DIRECTLY (not via this dispatcher), so it is unaffected
+/// by this gate. Returns `Some(error)` to short-circuit, `None` to proceed.
+fn reject_forged_operator(req: &Request) -> Option<Response> {
+    if matches!(req.caller, Caller::Operator(_)) {
+        if let Err(msg) = operator::validate_operator(&req.caller) {
+            return Some(Response::err(req.id.clone(), ErrorCode::Unauthorized, msg));
+        }
+    }
+    None
+}
+
 fn dispatch_workflow_transition(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
     match methods::workflow_transition(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
@@ -650,6 +672,9 @@ fn dispatch_workflow_done(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
     match methods::workflow_done(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
@@ -663,6 +688,9 @@ fn dispatch_workflow_reject_finding(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
     match methods::workflow_reject_finding(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
@@ -6574,8 +6602,8 @@ mod tests {
     }
 
     /// Sub-2b-1 review-r#4 #2: simulate the TUI's
-    /// workflow-launch transcript binding. The TUI's
-    /// `WorkflowControllerCtx::launch_workflow` sets/rebinds
+    /// workflow-launch transcript binding. The former TUI
+    /// controller's launch set/rebound
     /// `transcript_id` for each Existing slot (initial-bind
     /// + codex-resume-rebind branches) and then post-loop
     /// calls `push_transcript_path_to_daemon_if_attached`
@@ -6598,8 +6626,8 @@ mod tests {
         assert_eq!(pre_r["state"], "pending");
         assert_eq!(pre_r["generation"], 0);
         // Workflow launch: TUI detects transcript and pushes
-        // the path. This is the wire equivalent of what
-        // workflow/controller.rs:341+ now does post-loop.
+        // the path. This is the wire equivalent of what the former
+        // TUI controller did post-loop.
         let _ = dispatch_request(
             &state,
             &operator_request(

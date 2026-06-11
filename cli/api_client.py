@@ -10,9 +10,14 @@ class CMClient:
         )
 
     def add_task(self, repo_url: str, branch: str, prompt: str, priority: int = 0) -> dict:
+        # is_cloud=True is REQUIRED for the dispatch daemon to claim this task:
+        # claim_next_task filters `is_cloud = true AND project IS NULL`
+        # (dispatch/db.py). Without it `cm add` / `cm push` land an is_cloud=false
+        # row that never dispatches, while the CLI prints "Dispatch daemon will
+        # pick it up". The TUI cloud push already sends is_cloud=true.
         r = self.client.post("/tasks", json={
             "repo_url": repo_url, "repo_branch": branch,
-            "prompt": prompt, "priority": priority,
+            "prompt": prompt, "priority": priority, "is_cloud": True,
         })
         r.raise_for_status()
         return r.json()

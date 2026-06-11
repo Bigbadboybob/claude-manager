@@ -31,7 +31,7 @@ pub fn read_first_line(path: &Path) -> Option<String> {
 }
 
 /// Path to the Claude JSONL for a session id in a given worktree.
-fn claude_transcript_path(worktree_path: &Path, session_id: &str) -> Option<PathBuf> {
+pub(crate) fn claude_transcript_path(worktree_path: &Path, session_id: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let path_str = worktree_path.to_str()?;
     let encoded = path_str.replace('/', "-").replace('.', "-");
@@ -767,6 +767,82 @@ mod tests {
             content.push_str(line);
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// Expected user/assistant text extraction for a fixture engine, from the
+    /// shared `tests/fixtures/transcripts/expected.json` corpus (see that dir's
+    /// README). The Python MCP parser asserts the SAME expected on the SAME
+    /// fixtures (`mcp_server/tests/test_transcripts.py::SharedFixtureCorpusTest`)
+    /// so a drift in either parser's user/assistant text extraction fails CI in
+    /// both languages.
+    fn corpus_expected(engine: &str) -> (Vec<String>, Vec<String>) {
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/transcripts/expected.json"
+        ))
+        .expect("expected.json parses");
+        let pull = |key: &str| -> Vec<String> {
+            expected[engine][key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        (pull("user"), pull("assistant"))
+    }
+
+    /// Shared corpus — CLAUDE. `list_messages` user/assistant text extraction
+    /// must match the canonical `expected.json` (isMeta + pure-tool_result
+    /// users dropped; text-only).
+    #[test]
+    fn shared_fixture_corpus_claude_user_assistant_text() {
+        let _h = HomeOverride::new();
+        let wt = _h.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let encoded = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        write_transcript(
+            _h.path(),
+            &encoded,
+            "sid-claude",
+            include_str!("../../../tests/fixtures/transcripts/claude_text.jsonl"),
+        );
+        let (exp_user, exp_assistant) = corpus_expected("claude");
+        assert_eq!(
+            list_messages(&Engine::ClaudeCode, &wt, "sid-claude", MessageKind::User),
+            exp_user,
+            "claude USER text extraction drifted from the shared corpus",
+        );
+        assert_eq!(
+            list_messages(&Engine::ClaudeCode, &wt, "sid-claude", MessageKind::Assistant),
+            exp_assistant,
+            "claude ASSISTANT text extraction drifted from the shared corpus",
+        );
+    }
+
+    /// Shared corpus — CODEX. `list_messages` user/assistant extraction must
+    /// match `expected.json`, including the `event_msg`/`agent_message` mirror
+    /// dedup (the assistant turn counts once) and dropped lifecycle records.
+    #[test]
+    fn shared_fixture_corpus_codex_user_assistant_text() {
+        let _h = HomeOverride::new();
+        let body =
+            include_str!("../../../tests/fixtures/transcripts/codex_text.jsonl");
+        let lines: Vec<&str> =
+            body.lines().filter(|l| !l.trim().is_empty()).collect();
+        write_codex_transcript(_h.path(), "sid-codex", &lines);
+        let (exp_user, exp_assistant) = corpus_expected("codex");
+        // Codex resolves the path by session id, so the worktree arg is ignored.
+        let ignored = std::path::Path::new("/ignored-by-codex");
+        assert_eq!(
+            list_messages(&Engine::Codex, ignored, "sid-codex", MessageKind::User),
+            exp_user,
+            "codex USER text extraction drifted from the shared corpus",
+        );
+        assert_eq!(
+            list_messages(&Engine::Codex, ignored, "sid-codex", MessageKind::Assistant),
+            exp_assistant,
+            "codex ASSISTANT extraction drifted (mirror-dedup?) from the shared corpus",
+        );
     }
 
     /// `codex_last_message` returns the canonical `response_item`

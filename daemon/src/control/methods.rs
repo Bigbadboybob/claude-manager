@@ -329,8 +329,8 @@ struct StartSessionParams {
     ///
     /// Note: this covers spawn-time tagging only. When the TUI
     /// launches a workflow on an already-spawned daemon session
-    /// (the Existing-slot path in
-    /// `controller::launch_workflow`), it uses
+    /// (the Existing-slot path in the former TUI
+    /// controller's launch), it uses
     /// `session.set_workflow_context` to update the field
     /// after-the-fact — same DaemonSession field, different
     /// write path.
@@ -1087,6 +1087,33 @@ pub(crate) fn start_session_with_spawn_fn(
 /// populated kernel slot.
 pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     let exited_at = now_unix_f64();
+    // Capture a read-after-exit tombstone BEFORE the session is removed from
+    // the registry, so `resolve_authorized_session` / `list_sessions` can still
+    // serve its transcript + final state for a window (the MCP read-after-exit
+    // contract). Resolve the worktree from the workspace (the session itself
+    // doesn't carry it). Built here, recorded after the existing last_exit /
+    // broadcast steps so it lands under the same lock as the remove.
+    let tombstone = state.sessions.get(uid).map(|sess| {
+        let worktree_path = state
+            .workspaces
+            .get(&sess.workspace_id)
+            .and_then(|w| w.worktree_path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned());
+        crate::state::ExitedTombstone {
+            session_uid: uid.to_string(),
+            transcript_path: sess.transcript_path.clone(),
+            generation: sess.generation,
+            session_type: sess.session_type.clone(),
+            workspace_id: sess.workspace_id.clone(),
+            task_id: sess.task_id.clone(),
+            managed_by_uid: sess.managed_by_uid.clone(),
+            label: sess.title.clone(),
+            workflow_run_id: sess.workflow_run_id.clone(),
+            workflow_role: sess.workflow_role.clone(),
+            worktree_path,
+            exited_at,
+        }
+    });
     let (workspace_id_opt, last_exit_opt) = match state.sessions.get(uid) {
         Some(sess) => {
             let le = sess.last_exit.build_last_exit(exited_at);
@@ -1109,6 +1136,9 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             uid: uid.to_string(),
             last_exit,
         });
+    }
+    if let Some(tomb) = tombstone {
+        state.record_exited(tomb);
     }
     state.sessions.remove(uid);
 }
@@ -1555,10 +1585,13 @@ pub fn read_session_output(
 //      Python MCP tool parity.)
 //   - `type`: `DaemonSession.session_type` (`"claude-code"` /
 //      `"codex"` / `"bash"` etc.).
-//   - `state`: always `"running"` at sub-1. Phase 1 daemon
-//      doesn't track tombstones (those still live on the TUI
-//      side until slice 10e flips manifest ownership). The
-//      `include_exited` param is accepted but a no-op.
+//   - `state`: `"running"`/`"ready"`/`"pending"` for live
+//      sessions (via `compute_session_state_and_idle`), or
+//      `"exited"` for recently-exited tombstones when the caller
+//      passes `include_exited=true` (read-after-exit). The daemon
+//      now retains a bounded `recently_exited` tombstone ring
+//      (`DaemonState::recently_exited`); `include_exited` surfaces
+//      those rows instead of being a no-op.
 //   - `idle`: always `false` at sub-1. Daemon doesn't track PTY
 //      idleness yet; future slice can plumb the idle-detection
 //      output through the fanout.
@@ -1787,6 +1820,59 @@ pub fn list_sessions(
             "managed_by_uid": Value::Null,
         }));
     }
+    // Recently-exited sessions, included only when the caller opts in
+    // (`include_exited=true`) — the read-after-exit surface: a caller that lost
+    // or killed a session can still find it here as state="exited", and
+    // resolve_authorized_session serves its transcript. Skip a uid that was
+    // re-spawned (live entry wins) or is already a TUI snapshot row. Scope-
+    // filtered like live rows, but via the exited-target auth (the tombstone is
+    // gone from state.sessions, so the live check_session_caller would deny it).
+    if p.include_exited {
+        for tomb in state.recently_exited.iter() {
+            let uid = tomb.session_uid.as_str();
+            if state.sessions.contains_key(uid) || state.tui_sessions.contains_key(uid) {
+                continue;
+            }
+            let include = match (scope_task.as_deref(), caller_uid) {
+                (Some(scope), _) => tomb
+                    .task_id
+                    .as_deref()
+                    .map(|t| {
+                        crate::control::auth::task_is_self_or_descendant_of(
+                            &state.task_tree,
+                            t,
+                            scope,
+                        )
+                    })
+                    .unwrap_or(false),
+                (None, Some(cuid)) => crate::control::auth::check_session_caller_for_exited(
+                    &state,
+                    cuid,
+                    uid,
+                    tomb.task_id.as_deref(),
+                    &tomb.workspace_id,
+                )
+                .is_allow(),
+                (None, None) => true,
+            };
+            if !include {
+                continue;
+            }
+            sessions.push(json!({
+                "session_uid": uid,
+                "label": tomb.label,
+                "type": tomb.session_type,
+                "state": "exited",
+                "idle": true,
+                "managed_by_uid": tomb.managed_by_uid,
+                "workspace_id": tomb.workspace_id,
+                "task_id": tomb.task_id,
+                "workflow_run_id": tomb.workflow_run_id,
+                "workflow_role": tomb.workflow_role,
+                "worktree_path": tomb.worktree_path,
+            }));
+        }
+    }
     // Stable order for deterministic test assertions and for
     // human-debuggable output.
     sessions.sort_by(|a, b| {
@@ -1875,35 +1961,58 @@ pub fn resolve_authorized_session(
     // on the existence check.
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cuid) = caller_uid {
-        let decision = crate::control::auth::check_session_caller(
-            &state,
-            cuid,
-            &p.session_uid,
-        );
+        // Auth against the LIVE session if present, else its read-after-exit
+        // TOMBSTONE (same descendant-task/workspace scope rule applies to a dead
+        // target), else the live path which yields TargetNotInRegistry for a
+        // genuinely-unknown uid.
+        let decision = if state.sessions.contains_key(&p.session_uid) {
+            crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
+        } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
+            crate::control::auth::check_session_caller_for_exited(
+                &state,
+                cuid,
+                &p.session_uid,
+                tomb.task_id.as_deref(),
+                &tomb.workspace_id,
+            )
+        } else {
+            crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
+        };
         return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
     }
-    let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
-        (
+    // Auth passed (or Operator caller). Resolve the target: live session first,
+    // then a recently-exited tombstone (read-after-exit), else NotFound.
+    if let Some(session) = state.sessions.get(&p.session_uid) {
+        let (state_str, idle) = compute_session_state_and_idle(session);
+        // Sub-2b-1 review-r#2 #2: surface the generation counter
+        // so the Python `read_session_output` tool's cursor
+        // (`v1:<generation>:<offset>`) resets when the underlying
+        // transcript file rotates (e.g. `/clear`, codex resume).
+        Ok(json!({
+            "state": state_str,
+            "engine": engine_str(&session.session_type),
+            "transcript_path": session.transcript_path.clone(),
+            "generation": session.generation,
+            "idle": idle,
+        }))
+    } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
+        // Read-after-exit: the session left the registry but its transcript
+        // file is still on disk. Report state="exited" + the final transcript
+        // path/generation so `read_session_output` serves the last output. An
+        // exited session has no live PTY, so it is trivially idle.
+        Ok(json!({
+            "state": "exited",
+            "engine": engine_str(&tomb.session_type),
+            "transcript_path": tomb.transcript_path.clone(),
+            "generation": tomb.generation,
+            "idle": true,
+        }))
+    } else {
+        Err((
             ErrorCode::NotFound,
             format!("session '{}' not in daemon registry", p.session_uid),
-        )
-    })?;
-
-    let (state_str, idle) = compute_session_state_and_idle(session);
-    let transcript_path = session.transcript_path.clone();
-    let engine = engine_str(&session.session_type);
-    // Sub-2b-1 review-r#2 #2: surface the generation counter
-    // so the Python `read_session_output` tool's cursor
-    // (`v1:<generation>:<offset>`) resets when the underlying
-    // transcript file rotates (e.g. `/clear`, codex resume).
-    let generation = session.generation;
-    Ok(json!({
-        "state": state_str,
-        "engine": engine,
-        "transcript_path": transcript_path,
-        "generation": generation,
-        "idle": idle,
-    }))
+        ))
+    }
 }
 
 /// Sub-2b-1 (review #2): PTY-quiet threshold for daemon-side
@@ -1930,13 +2039,13 @@ const IDLE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
 ///     short-circuits to empty messages + poll-again on
 ///     this).
 ///
-/// `exited` is NOT returned today — daemon removes sessions
-/// from `state.sessions` on exit (sub-2a's kill_session +
-/// reaper-cleanup callback). Tombstone retention lands in
-/// slice 10e (daemon-side manifest ownership); when it does
-/// this helper grows an `Exited` arm reading from
-/// `state.workspaces[..].tombstones`. Both call sites pick
-/// the new arm up for free.
+/// This helper handles only LIVE sessions (transcript-bound →
+/// `ready`, else `pending`); it never returns `exited`, because the
+/// daemon removes a session from `state.sessions` on exit (sub-2a's
+/// kill_session + reaper-cleanup callback). The `exited` state for
+/// read-after-exit is served separately by `resolve_authorized_session`
+/// / `list_sessions` from the `DaemonState::recently_exited` tombstone
+/// ring, which `handle_session_exit` records right before the remove.
 ///
 /// Idle derivation: `last_activity_at.elapsed() >=
 /// IDLE_THRESHOLD`. Production sessions stamp spawn-time at
@@ -2072,7 +2181,7 @@ pub fn set_transcript_path(
 //
 // After-the-fact tagging: when the TUI launches a workflow on an
 // already-spawned daemon-attached session (the Existing-slot path
-// in `controller::launch_workflow`), it pushes the
+// in the former TUI controller's launch), it pushes the
 // (workflow_run_id, workflow_role) pair to the daemon so the
 // `DaemonSession` mirrors what the TUI's `TerminalSession` now
 // carries. Without this RPC, `lookup_session_any` would return
@@ -2789,10 +2898,26 @@ pub fn start_workflow(
         // waiting BEFORE the snapshot, role B's snapshot isn't taken until role
         // A's detector has bound (so A's transcript is excluded from B's diff).
         let wt_path = std::path::Path::new(&worktree).to_path_buf();
+        // Cross-bind fix: spawn-time detectors are CODEX-ONLY. A Codex agent
+        // writes its rollout file at boot, so detection-at-spawn is causal and
+        // the spawn-queue serialization above actually serializes. A Claude
+        // participant writes NO transcript until its first prompt — its
+        // detector window always outlives the slot wait, every role's detector
+        // ends up armed concurrently against an empty snapshot, and whichever
+        // polls first claims the worker's first transcript (observed on
+        // cm-manager: the worker's transcript bound to the idle manager,
+        // wedging the run headlessly). Claude roles instead bind causally at
+        // activation time via the finalize drainer's deliver-then-discover
+        // snapshot diff (`ActivationPhase::RebindPending`).
         let detector_engine = if workflow_detector_disabled() {
             None
         } else {
-            crate::transcript_detect::DetectorEngine::from_session_type(session_type)
+            match crate::transcript_detect::DetectorEngine::from_session_type(session_type) {
+                Some(crate::transcript_detect::DetectorEngine::Codex) => {
+                    Some(crate::transcript_detect::DetectorEngine::Codex)
+                }
+                _ => None,
+            }
         };
         let ticket = match detector_engine {
             Some(_) => {
@@ -3674,8 +3799,8 @@ fn new_event_id() -> String {
 
 /// 10d-2c-2-2-b round-4 F2: daemon-internal capture of the
 /// outgoing role's last assistant message for the closing
-/// history entry. Mirrors TUI's `fire_transition` capture
-/// (`tui/src/workflow/controller.rs:1719-1735`) but reads
+/// history entry. Mirrors the former TUI controller's
+/// `fire_transition` capture but reads
 /// state via the daemon's session registry instead of
 /// `App.workspaces`.
 ///
@@ -4443,6 +4568,11 @@ pub fn workflow_done(
             run.active_role = None;
             run.status = crate::workflow::run::RunStatus::Done;
             run.done_reason = Some(reason);
+            // A terminal run carries no in-flight hand-off: drop any
+            // pending_activation so the drainer has nothing to resume and the
+            // on-disk record isn't left pointing at a hand-off that can never
+            // complete (parity with WorkflowRun::mark_done).
+            run.pending_activation = None;
             // Round-15: capture iteration (workflow_done doesn't
             // bump it, but parity with workflow_transition).
             *captured_iteration_for_closure
@@ -8147,6 +8277,67 @@ mod tests {
         }
     }
 
+    /// Read-after-exit: `handle_session_exit` records a tombstone before the
+    /// registry remove, so `resolve_authorized_session` still serves the exited
+    /// session's transcript path + `state="exited"`, and `list_sessions` shows
+    /// it only under `include_exited=true`. The bug this guards: the daemon
+    /// evicted exited sessions with no tombstone, so the MCP read-after-exit
+    /// contract returned not_found.
+    #[test]
+    fn read_after_exit_serves_transcript_via_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-rae", &dir);
+        let uid = fresh_test_uid();
+        {
+            let mut sp =
+                crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "ws-rae".to_string();
+            sp.session_type = "claude-code".to_string();
+            let mut ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            ds.transcript_path = Some("/tmp/rae-sid.jsonl".to_string());
+            let mut s = state.lock().unwrap();
+            s.sessions.insert(uid.clone(), ds);
+        }
+        // Exit it: tombstone recorded, removed from the live registry (the
+        // returned DaemonSession drops here, SIGKILLing the /bin/sleep child).
+        {
+            let mut s = state.lock().unwrap();
+            handle_session_exit(&mut s, &uid);
+            assert!(!s.sessions.contains_key(&uid), "removed from live registry");
+            assert!(s.exited_tombstone(&uid).is_some(), "tombstone recorded");
+        }
+        // Operator read-after-exit: exited + the final transcript path.
+        let resolved = resolve_authorized_session(
+            &state,
+            &json!({ "session_uid": uid }),
+            None,
+        )
+        .expect("resolve ok");
+        assert_eq!(resolved["state"], "exited");
+        assert_eq!(resolved["transcript_path"], "/tmp/rae-sid.jsonl");
+        assert_eq!(resolved["idle"], true);
+        // list_sessions surfaces the exited row only with include_exited=true.
+        let with = list_sessions(&state, &json!({ "include_exited": true }), None)
+            .expect("list ok");
+        assert!(
+            with.as_array().unwrap().iter().any(|r| {
+                r["session_uid"] == uid.as_str() && r["state"] == "exited"
+            }),
+            "include_exited=true must surface the tombstone: {with:?}",
+        );
+        let without = list_sessions(&state, &json!({ "include_exited": false }), None)
+            .expect("list ok");
+        assert!(
+            !without
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["session_uid"] == uid.as_str()),
+            "include_exited=false (default) must omit the tombstone",
+        );
+    }
+
     // --- initial PTY size plumbing (slice-10c-e-2 review-3 fix) ----------
 
     #[test]
@@ -10861,7 +11052,15 @@ mod tests {
                 1,
                 "initial delivery patches, never appends a 2nd worker entry"
             );
-            assert!(run.pending_activation.is_none(), "initial activation finalized to Done");
+            // Cross-bind fix: the unbound Claude worker's initial activation
+            // delivers, then parks in RebindPending awaiting causal sid
+            // discovery (it used to clear to Done and rely on the spawn-time
+            // detector — the race that wedged headless runs on cm-manager).
+            assert_eq!(
+                run.pending_activation.as_ref().map(|p| p.phase.clone()),
+                Some(crate::workflow::run::ActivationPhase::RebindPending),
+                "initial delivery done; sid awaits deliver-then-discover"
+            );
         });
     }
 
@@ -11037,14 +11236,18 @@ mod tests {
         });
     }
 
-    /// Phase 4 (P-A): two claude roles share one worktree's transcript dir, so
-    /// their detectors must be SERIALIZED or they cross-bind. With the
-    /// wait_for_turn fix, role B's pre-snapshot is taken only AFTER role A's
-    /// detector bound — so it INCLUDES A's transcript and B can't bind it.
-    /// Deterministic via the test detector (writes its transcript after a delay,
-    /// so an un-serialized B snapshots empty). Fails pre-fix, passes post-fix.
+    /// Cross-bind fix: Claude participants must arm NO spawn-time transcript
+    /// detector. A Claude agent writes no transcript until its first prompt,
+    /// so a spawn-time detector window is pure timing roulette — every idle
+    /// role's detector races for the active role's first transcript (observed
+    /// on cm-manager: the worker's transcript bound to the idle manager,
+    /// wedging the run). Their sids bind causally at activation delivery via
+    /// the finalize drainer instead. Deterministic pin: with the FAILING
+    /// detector hook installed, any arming attempt would fail the launch
+    /// closed — so a successful two-Claude-role launch proves no detector was
+    /// armed for either role.
     #[test]
-    fn start_workflow_serializes_same_worktree_detectors() {
+    fn start_workflow_claude_roles_arm_no_spawn_detectors() {
         use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
         use std::collections::BTreeMap;
         let _tmp = with_temp_home(|| {
@@ -11067,30 +11270,28 @@ mod tests {
                 });
             }
             set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
-            enable_test_detector(Some(wt.clone()));
-            let _ = take_spawn_snapshots_for_test();
+            // Any detector-arming attempt fails the launch closed under this
+            // hook — success below therefore proves Claude roles arm nothing.
+            set_failing_detector_for_test(true);
 
-            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+            let result = start_workflow(&state, &Caller::operator("op"), &json!({
                 "workflow_name": "two", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
-            })).expect("ok");
+            }));
 
-            enable_test_detector(None);
+            set_failing_detector_for_test(false);
             set_spawn_program_override_for_test(None);
 
-            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
-            let worker_uid = run.role_sessions["worker"].daemon_session_uid.clone().unwrap();
-            let manager_uid = run.role_sessions["manager"].daemon_session_uid.clone().unwrap();
-
-            let snaps = take_spawn_snapshots_for_test();
-            let worker_snap = snaps.iter().find(|(u, _)| *u == worker_uid).map(|(_, s)| s.clone()).expect("worker recorded");
-            let manager_snap = snaps.iter().find(|(u, _)| *u == manager_uid).map(|(_, s)| s.clone()).expect("manager recorded");
-            assert!(worker_snap.is_empty(), "worker is first; empty pre-snapshot");
-            assert!(
-                manager_snap.contains(&worker_uid),
-                "P-A: manager's pre-snapshot must include the worker's transcript \
-                 (serialized via the spawn queue); got {:?}",
-                manager_snap,
+            let resp = result.expect(
+                "two-Claude-role launch must succeed with the failing-detector \
+                 hook installed: Claude participants arm no spawn-time detector",
             );
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            // Both roles spawned, neither sid bound yet — discovery happens at
+            // activation delivery, not at spawn.
+            for role in ["worker", "manager"] {
+                assert!(run.role_sessions[role].daemon_session_uid.is_some());
+                assert!(run.role_sessions[role].current_session_id.is_none());
+            }
         });
     }
 
@@ -11099,10 +11300,13 @@ mod tests {
     /// skipped. The old `if let (Some(engine), Some(ticket))` guard skipped the
     /// detector entirely on a None ticket, leaving the participant with no
     /// `transcript_path` so `sync_role_session_ids` could never bind its sid and
-    /// the run wedged after returning a run_id. Here we pre-occupy the worktree
-    /// queue (never released) so the worker's wait times out, then assert the
-    /// detector STILL ran and bound the transcript. Mutation: restoring the
-    /// `Some(ticket)` guard makes `transcript_path` stay None and this fails.
+    /// the run wedged after returning a run_id. Codex role (the only engine
+    /// that still arms a spawn-time detector post-cross-bind-fix). Here we
+    /// pre-occupy the worktree queue (never released) so the worker's wait
+    /// times out, then prove arming was still ATTEMPTED via the failing
+    /// detector hook: fail-closed Err means `spawn_queued_detector` was
+    /// reached on the timeout path. Mutation: restoring the `Some(ticket)`
+    /// guard skips arming → the launch would succeed → this fails.
     #[test]
     fn start_workflow_timeout_still_arms_detector_unserialized() {
         use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
@@ -11119,7 +11323,7 @@ mod tests {
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -11133,37 +11337,26 @@ mod tests {
 
             let _wait_guard = set_slot_wait_timeout_for_test(std::time::Duration::from_millis(60));
             set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
-            enable_test_detector(Some(wt.clone()));
+            set_failing_detector_for_test(true);
 
-            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+            let result = start_workflow(&state, &Caller::operator("op"), &json!({
                 "workflow_name": "solo", "goal": "g", "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
-            })).expect("start_workflow returns despite the queue timeout");
+            }));
 
-            enable_test_detector(None);
+            set_failing_detector_for_test(false);
             set_spawn_program_override_for_test(None);
 
-            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
-            let worker_uid = run.role_sessions["worker"].daemon_session_uid.clone().unwrap();
-
-            // The detector (armed despite the timeout) writes + binds the
-            // transcript within ~1s. Poll for transcript_path becoming Some.
-            let mut bound = false;
-            for _ in 0..60 {
-                {
-                    let s = state.lock().unwrap();
-                    if let Some(sess) = s.sessions.get(&worker_uid) {
-                        if sess.transcript_path.is_some() {
-                            bound = true;
-                            break;
-                        }
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            // Fail-closed Err == spawn_queued_detector was REACHED on the
+            // timeout path (arming attempted, unserialized). A skip (the old
+            // Some(ticket) guard) would have returned Ok with no detector.
+            let (_code, msg) = result.expect_err(
+                "P-B: detector arming must still be attempted after a \
+                 spawn-queue timeout (old guard skipped it → would wedge)",
+            );
             assert!(
-                bound,
-                "P-B: detector must be armed UNSERIALIZED on queue timeout and \
-                 bind transcript_path (old guard skipped it → would wedge)",
+                msg.contains("transcript detector spawn failed"),
+                "error must name the detector spawn failure: {}",
+                msg,
             );
         });
     }
@@ -11189,7 +11382,10 @@ mod tests {
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                // Codex: the only engine that still arms a spawn-time detector
+                // (its rollout exists from boot). Claude roles bind at
+                // activation via the drainer and never reach this path.
+                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],

@@ -28,13 +28,44 @@
 //! handle, workflow controller state) joins this struct as later
 //! sub-slices land.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::attach::TicketAllocator;
 use crate::manifest::{Manifest, ManifestWorkspace};
 use crate::session::DaemonSession;
+
+/// Max number of recently-exited sessions retained for read-after-exit (see
+/// [`DaemonState::recently_exited`]). A small bound: this backs the MCP
+/// `read_session_output` / `list_sessions(include_exited)` "read a session's
+/// final output after it exits" contract, which callers use within seconds of
+/// an exit — old tombstones have no readers. The transcript FILE is untouched
+/// by eviction (it lives on disk); evicting a tombstone only drops the daemon's
+/// in-memory `uid → (transcript_path, final state)` lookup.
+pub const RECENTLY_EXITED_CAP: usize = 256;
+
+/// A session that has exited and been removed from [`DaemonState::sessions`],
+/// retained briefly so `resolve_authorized_session` / `list_sessions` can still
+/// answer "where's its transcript + what was its final state" for read-after-
+/// exit. Holds only the fields those two methods need — including `task_id` /
+/// `workspace_id` so the descendant-scope auth check still applies to a dead
+/// target (see `auth::check_session_caller_for_exited`).
+#[derive(Clone, Debug)]
+pub struct ExitedTombstone {
+    pub session_uid: String,
+    pub transcript_path: Option<String>,
+    pub generation: u64,
+    pub session_type: String,
+    pub workspace_id: String,
+    pub task_id: Option<String>,
+    pub managed_by_uid: Option<String>,
+    pub label: String,
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
+    pub worktree_path: Option<String>,
+    pub exited_at: f64,
+}
 
 /// Sub-2b-3 review-5 #1: per-worktree FIFO sequence queue.
 ///
@@ -283,6 +314,13 @@ pub struct DaemonState {
     /// spawning sessions. Indexed by the stable session uid that
     /// already lives on `ManifestEntry` / `TerminalSession`.
     pub sessions: HashMap<String, DaemonSession>,
+    /// Recently-exited sessions, retained for read-after-exit (the MCP
+    /// `read_session_output` / `list_sessions(include_exited)` contract). A
+    /// session is moved here from `sessions` on exit (see
+    /// `handle_session_exit`) and evicted oldest-first past
+    /// [`RECENTLY_EXITED_CAP`]. Front = oldest. Recorded via
+    /// [`DaemonState::record_exited`].
+    pub recently_exited: VecDeque<ExitedTombstone>,
     /// Snapshot of the persisted manifest's workspaces, keyed by
     /// stable workspace id. Loaded at daemon startup via
     /// [`load_manifest_from_disk`](Self::load_manifest_from_disk).
@@ -520,6 +558,7 @@ impl Default for DaemonState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            recently_exited: VecDeque::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
             tickets: TicketAllocator::new(),
@@ -545,6 +584,26 @@ impl Default for DaemonState {
 impl DaemonState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a just-exited session as a tombstone for read-after-exit, evicting
+    /// the oldest past [`RECENTLY_EXITED_CAP`]. A repeat uid (a slot reused by a
+    /// fresh-context respawn that later exits again) drops any prior tombstone
+    /// for that uid first, so the newest exit wins and lookups stay unambiguous.
+    pub fn record_exited(&mut self, tomb: ExitedTombstone) {
+        self.recently_exited.retain(|t| t.session_uid != tomb.session_uid);
+        self.recently_exited.push_back(tomb);
+        while self.recently_exited.len() > RECENTLY_EXITED_CAP {
+            self.recently_exited.pop_front();
+        }
+    }
+
+    /// Look up a recently-exited session's tombstone by uid.
+    pub fn exited_tombstone(&self, uid: &str) -> Option<&ExitedTombstone> {
+        self.recently_exited
+            .iter()
+            .rev()
+            .find(|t| t.session_uid == uid)
     }
 
     /// Phase 4 §B2: resolve a workflow definition by name through the two-layer
@@ -669,6 +728,47 @@ mod tests {
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::env_lock()
+    }
+
+    fn tomb(uid: &str) -> ExitedTombstone {
+        ExitedTombstone {
+            session_uid: uid.to_string(),
+            transcript_path: Some(format!("/tmp/{uid}.jsonl")),
+            generation: 0,
+            session_type: "claude-code".to_string(),
+            workspace_id: "ws".to_string(),
+            task_id: None,
+            managed_by_uid: None,
+            label: uid.to_string(),
+            workflow_run_id: None,
+            workflow_role: None,
+            worktree_path: None,
+            exited_at: 0.0,
+        }
+    }
+
+    #[test]
+    fn record_exited_evicts_oldest_past_cap_and_dedups_uid() {
+        let mut s = DaemonState::default();
+        // Fill past the cap: the oldest must be evicted, length capped.
+        for i in 0..(RECENTLY_EXITED_CAP + 5) {
+            s.record_exited(tomb(&format!("ts-{i:04}")));
+        }
+        assert_eq!(s.recently_exited.len(), RECENTLY_EXITED_CAP);
+        assert!(s.exited_tombstone("ts-0000").is_none(), "oldest evicted");
+        assert!(
+            s.exited_tombstone(&format!("ts-{:04}", RECENTLY_EXITED_CAP + 4)).is_some(),
+            "newest retained",
+        );
+
+        // Re-recording a uid drops the prior tombstone (newest exit wins) and
+        // doesn't grow the deque with a duplicate.
+        let before = s.recently_exited.len();
+        let mut t = tomb("ts-0100");
+        t.generation = 7;
+        s.record_exited(t);
+        assert_eq!(s.recently_exited.len(), before, "no duplicate row for same uid");
+        assert_eq!(s.exited_tombstone("ts-0100").unwrap().generation, 7, "newest wins");
     }
 
     fn write_manifest(dir: &TempDir, contents: &str) -> PathBuf {

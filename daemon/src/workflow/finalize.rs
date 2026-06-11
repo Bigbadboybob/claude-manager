@@ -104,6 +104,18 @@ where
         Some(r) => r,
         None => return Ok(FinalizeStep::NoPending),
     };
+    // Re-check terminal/paused status on the freshly-reloaded run. The drainer's
+    // collection-time filter (`Running && !paused`) is evaluated ONCE under the
+    // lock, but the control-socket dispatcher runs on another thread: an agent's
+    // `workflow_done`, an operator `stop_workflow`, or a pause can land between
+    // collection and this call (or between drain-loop iterations). None of those
+    // clear `pending_activation`, so without this guard the drainer would keep
+    // writing /clear + body + Enter into the participant's PTY for a run that is
+    // no longer active — fighting the very "don't deliver into a paused/stopped
+    // session" invariant the collection filter exists for.
+    if !matches!(run.status, run::RunStatus::Running) || run.paused {
+        return Ok(FinalizeStep::Blocked);
+    }
     let pa = match run.pending_activation.clone() {
         Some(pa) => pa,
         None => return Ok(FinalizeStep::NoPending),
@@ -206,6 +218,33 @@ where
             if !tracker.quiet_for(ctx.quiet_window, ctx.now_instant) {
                 return Ok(FinalizeStep::Blocked);
             }
+            // Cross-bind fix: an UNBOUND persistent Claude role (initial worker,
+            // or a persistent role's first-ever activation) gets its sid bound
+            // CAUSALLY — snapshot the transcript dir before delivery, then
+            // discover the one new file this activation produces (the same
+            // deliver-then-discover flow fresh reset uses). Spawn-time
+            // detectors can't do this: a Claude participant writes no
+            // transcript until its first prompt, so an idle role's detector
+            // window just grabs whichever transcript appears next (observed
+            // cross-binding the worker's transcript to the manager on
+            // cm-manager, wedging the run). Codex is excluded: its rollout
+            // file exists from boot (spawn-time detection is correct for it)
+            // and it APPENDS to that file on first prompt, so a pre-delivery
+            // diff would find nothing and block forever.
+            //
+            // Crash-retry safety: the transcript can't exist before the Enter
+            // fires (BodySent), so re-running this arm re-snapshots safely.
+            let needs_sid_discovery = engine == Engine::ClaudeCode
+                && pa.pre_clear_snapshot.is_none()
+                && run
+                    .role_sessions
+                    .get(&role)
+                    .map_or(false, |b| b.current_session_id.is_none());
+            let discovery_snapshot = if needs_sid_discovery {
+                Some(fresh_reset::snapshot_pre_clear(engine, ctx.worktree))
+            } else {
+                None
+            };
             let body = pa.rendered_prompt.clone().unwrap_or_default();
             // Trim trailing line endings BEFORE framing — mirrors the TUI's
             // `deliver_pending_write` (`tui/src/app.rs`:
@@ -222,6 +261,9 @@ where
             let enter_at = ctx.now_ms + ctx.gap_ms;
             run::modify(ctx.run_id, |r| {
                 if let Some(pa) = r.pending_activation.as_mut() {
+                    if let Some(snap) = discovery_snapshot.clone() {
+                        pa.pre_clear_snapshot = Some(snap);
+                    }
                     pa.enter_fire_at_ms = Some(enter_at);
                     pa.phase = ActivationPhase::BodySent;
                 }
@@ -236,9 +278,16 @@ where
             }
             write(pty_tracker::enter_bytes_for_mode(tracker.term_mode()))
                 .map_err(PersistError::Io)?;
-            if pa.needs_fresh_reset {
-                // Fresh: delivery done, but the record stays until the sid
-                // rebinds (step 6). The idle gate is inert (NoTranscriptId).
+            // Reload the just-persisted record: `pa` was cloned before the
+            // Appended arm may have stored a discovery snapshot, so its
+            // `pre_clear_snapshot` can be stale-None here.
+            let has_snapshot = run::load_one(ctx.run_id)
+                .and_then(|r| r.pending_activation)
+                .map_or(false, |p| p.pre_clear_snapshot.is_some());
+            if pa.needs_fresh_reset || has_snapshot {
+                // Fresh reset, or an unbound persistent role's sid discovery:
+                // delivery done, but the record stays until the sid (re)binds
+                // (step 6). The idle gate is inert (NoTranscriptId) meanwhile.
                 run::modify(ctx.run_id, |r| {
                     if let Some(pa) = r.pending_activation.as_mut() {
                         pa.enter_fire_at_ms = None;
@@ -247,7 +296,7 @@ where
                 })?;
                 Ok(FinalizeStep::Advanced(ActivationPhase::RebindPending))
             } else {
-                // Persistent: finalization complete — clear the record.
+                // Bound persistent: finalization complete — clear the record.
                 run::modify(ctx.run_id, |r| {
                     r.pending_activation = None;
                 })?;

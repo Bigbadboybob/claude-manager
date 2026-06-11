@@ -361,15 +361,25 @@ def call(
         raise TransportError(f"connect {path}: {e}") from e
 
     try:
-        sock.sendall(struct.pack(">I", len(body)) + body)
+        try:
+            sock.sendall(struct.pack(">I", len(body)) + body)
 
-        # Read length prefix.
-        len_bytes = _read_exact(sock, 4)
-        (resp_len,) = struct.unpack(">I", len_bytes)
-        if resp_len > 4 * 1024 * 1024:
-            raise TransportError(f"response too large: {resp_len}")
+            # Read length prefix.
+            len_bytes = _read_exact(sock, 4)
+            (resp_len,) = struct.unpack(">I", len_bytes)
+            if resp_len > 4 * 1024 * 1024:
+                raise TransportError(f"response too large: {resp_len}")
 
-        resp_bytes = _read_exact(sock, resp_len)
+            resp_bytes = _read_exact(sock, resp_len)
+        except OSError as e:
+            # send/recv failures — a per-recv timeout (socket.timeout /
+            # TimeoutError), peer reset (ConnectionResetError), broken pipe on
+            # sendall (BrokenPipeError) — are all OSError subclasses. The
+            # connect() block above already maps OSError -> TransportError;
+            # without this they'd escape call() RAW, violating the documented
+            # `Raises: TransportError` contract and slipping past callers that
+            # only catch TransportError (e.g. the workflow event-writers).
+            raise TransportError(f"io {path}: {e}") from e
     finally:
         sock.close()
 

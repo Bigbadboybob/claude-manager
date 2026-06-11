@@ -1,0 +1,4 @@
+{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"add a smoke test"}]}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"added the smoke test"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"added the smoke test"}]}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
