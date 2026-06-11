@@ -21,9 +21,11 @@ use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::workflow::{self, toml_schema::Engine, Workflow, WorkflowRun};
-// `log_tick` lives in `workflow::observer` now; re-import so the call sites in
-// the tick loop read unchanged.
-use crate::workflow::observer::log_tick;
+// These live in `workflow::observer` now (workflow-observation glue split out
+// of this file); re-import so the call sites here read unchanged.
+use crate::workflow::observer::{
+    drop_inactive_runs_from_in_mem, drop_run_from_in_mem, log_tick,
+};
 use cm_daemon::worktree;
 
 mod dirs {
@@ -7661,63 +7663,34 @@ impl App {
     /// existing tail-observer entry point so 11e's file-tail
     /// removal swaps the source without touching the apply
     /// pipeline.
+    /// Drain queued `events.subscribe` frames and fold them into the observer
+    /// mirror. Thin wrapper — the logic lives in `workflow::observer` (split
+    /// out of this file). Channel drain and mirror update are separated so the
+    /// `workflow_watch_rx` borrow doesn't conflict with the `workflow_runs` /
+    /// `needs_redraw` borrows the mirror needs.
     pub fn drain_workflow_watch_events(&mut self) {
-        let mut events: Vec<crate::workflow_watch::WorkflowWatchEvent> = Vec::new();
-        if let Some(rx) = self.workflow_watch_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(ev) => events.push(ev),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
+        let events =
+            crate::workflow::observer::drain_watch_channel(self.workflow_watch_rx.as_ref());
+        crate::workflow::observer::RunMirror {
+            runs: &mut self.workflow_runs,
+            needs_redraw: &mut self.needs_redraw,
         }
-        for ev in events {
-            match ev {
-                crate::workflow_watch::WorkflowWatchEvent::Snapshot(run) => {
-                    self.apply_workflow_watch_snapshot(run);
-                }
-                crate::workflow_watch::WorkflowWatchEvent::Event(_event) => {
-                    // P-A: the local controller that used to DRAIN
-                    // `pending_workflow_events` (its tick) was deleted for
-                    // criterion #5, so accumulating events here would grow an
-                    // unbounded buffer nothing reads. Run STATE now arrives
-                    // authoritatively via `Snapshot` frames
-                    // (`broadcast_changed_snapshots` on the daemon), which
-                    // already reflect every transition/done the events
-                    // describe. So an event is now purely a redraw nudge — we
-                    // do NOT buffer it. (The buffer helpers remain as tested
-                    // utilities but have no production producer.)
-                    self.needs_redraw = true;
-                }
-            }
-        }
+        .apply_events(events);
     }
 
-    /// Apply a snapshot frame from `events.subscribe`. The daemon's
-    /// `WorkflowRun` is the AUTHORITATIVE source of run state — the TUI is a
-    /// pure observer (Phase 4 §E; the local state-machine controller was
-    /// deleted for criterion #5).
-    ///
-    /// **P-A (criterion #4):** this UPDATES an existing run, it does not just
-    /// insert-when-absent. The old conservative-merge ("never overwrite; the
-    /// local entry already absorbed live diffs the controller holds") was
-    /// correct only while the TUI drove runs locally. With the controller gone
-    /// the TUI holds NO live diffs the daemon doesn't, so refusing to overwrite
-    /// froze every run at its creation snapshot — active_role, history, and
-    /// terminal status never advanced without a reconnect. The daemon poller
-    /// broadcasts a fresh snapshot on every state change
-    /// (`broadcast_changed_snapshots`), so adopting it wholesale is how
-    /// progress renders "from broadcasts alone."
+    /// Apply one snapshot frame to the observer mirror (see
+    /// [`crate::workflow::observer::RunMirror::apply_snapshot`]). Kept as an
+    /// `App` method for the direct callers/tests; the logic lives in the
+    /// observer module.
     pub(crate) fn apply_workflow_watch_snapshot(
         &mut self,
         run: cm_daemon::workflow::run::WorkflowRun,
     ) {
-        match self.workflow_runs.iter_mut().find(|r| r.run_id == run.run_id) {
-            Some(slot) => *slot = run,
-            None => self.workflow_runs.push(run),
+        crate::workflow::observer::RunMirror {
+            runs: &mut self.workflow_runs,
+            needs_redraw: &mut self.needs_redraw,
         }
-        self.needs_redraw = true;
+        .apply_snapshot(run);
     }
 
     /// 10e-c r1 F1: apply a post-(re)connect snapshot.
@@ -13226,61 +13199,9 @@ impl App {
 //                         Workflow modal rendering
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 10d-3 r2 F1: untag every session pointing at `run_id` (clear
-/// `workflow_run_id` + `workflow_role`, unhide), then drop the
-/// run from `workflow_runs`. Pure: takes `&mut` to the two
-/// collections, no `App` required. Used by
-/// [`App::apply_local_workflow_stop_cleanup`] and (in tests) by
-/// the tick-ordering pin.
-pub(crate) fn drop_run_from_in_mem(
-    workflow_runs: &mut Vec<WorkflowRun>,
-    workspaces: &mut Vec<Workspace>,
-    run_id: &str,
-) {
-    for ws in workspaces.iter_mut() {
-        for ts in &mut ws.sessions {
-            if ts.workflow_run_id.as_deref() == Some(run_id) {
-                ts.workflow_run_id = None;
-                ts.workflow_role = None;
-                ts.hidden = false;
-            }
-        }
-    }
-    workflow_runs.retain(|r| r.run_id != run_id);
-}
-
-/// 10d-3 r2: for each tracked run, peek `state.json` on disk; if
-/// the on-disk status is no longer active (Detached / Done) or
-/// the run file is gone, drop the run from `workflow_runs` and
-/// untag sessions. Returns the number of runs dropped so callers
-/// can decide whether to persist the manifest.
-///
-/// Pure helper — exists outside `App` so the round-2 tick-ordering
-/// test can exercise the exact post-controller-tick predicate
-/// without constructing an `App`. The ordering invariant lives in
-/// [`App::tick_workflows`]: controller tick runs FIRST so
-/// daemon-written `workflow_done` events get drained (events_offset
-/// advance + history append) before this function removes the run.
-pub(crate) fn drop_inactive_runs_from_in_mem(
-    workflow_runs: &mut Vec<WorkflowRun>,
-    workspaces: &mut Vec<Workspace>,
-) -> usize {
-    let tracked: Vec<String> = workflow_runs.iter().map(|r| r.run_id.clone()).collect();
-    let mut dropped = 0usize;
-    for run_id in &tracked {
-        // `load_one` returns `None` if the run file is missing or
-        // unreadable. Treat missing as "not active" — a tracked
-        // run whose file is gone is also stale.
-        let still_active = workflow::run::load_one(run_id)
-            .map(|r| r.is_active())
-            .unwrap_or(false);
-        if !still_active {
-            drop_run_from_in_mem(workflow_runs, workspaces, run_id);
-            dropped += 1;
-        }
-    }
-    dropped
-}
+// `drop_run_from_in_mem` + `drop_inactive_runs_from_in_mem` (the run-mirror
+// lifecycle GC) moved to `crate::workflow::observer` (re-imported at the top of
+// this file).
 
 /// 10d-3 r1 F2: untag predicate used by `restore_sessions` before
 /// the spawn loop. Returns `Some(cleaned_entry)` if the entry's
