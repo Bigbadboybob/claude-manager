@@ -163,6 +163,62 @@ fn resolve_python_interpreter(server: &std::path::Path) -> String {
     "python".to_string()
 }
 
+/// Daemon-startup preflight: resolve the MCP server path + interpreter EXACTLY
+/// as a spawned participant would, then actually run `<python> server.py
+/// --selftest` to confirm it imports and registers its tools on THIS host.
+///
+/// This closes the "works locally, breaks headless" class that bit this project
+/// repeatedly (bare `python` absent on the VM; `server.py` crashing on
+/// `from cli.planning_client` when the `cli` package isn't deployed): each was a
+/// per-spawn silent failure discovered only when a workflow's manager couldn't
+/// call `workflow_done`. Running the same resolution + a real import once at
+/// startup surfaces the gap with a single actionable error instead.
+///
+/// `Ok(summary)` on success (the selftest's stderr line); `Err(message)` with
+/// the exact reproduction command + failure otherwise. The caller logs loudly;
+/// it is intentionally NON-fatal (the daemon still serves non-workflow
+/// sessions), but the error names precisely what an operator must fix.
+pub fn run_mcp_preflight(server_path_override: Option<&str>) -> Result<String, String> {
+    let server = resolve_server_path(server_path_override).ok_or_else(|| {
+        "could not locate mcp_server/server.py (set `mcp_server_path` in \
+         daemon.toml on a headless/remote host)"
+            .to_string()
+    })?;
+    let python = resolve_python_interpreter(&server);
+    let output = std::process::Command::new(&python)
+        .arg(server.as_os_str())
+        .arg("--selftest")
+        .output()
+        .map_err(|e| {
+            format!(
+                "could not run `{} {} --selftest`: {} — is the interpreter \
+                 present on PATH (or is the adjacent .venv missing)?",
+                python,
+                server.display(),
+                e,
+            )
+        })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        Ok(format!(
+            "{} {} --selftest → {}",
+            python,
+            server.display(),
+            stderr.trim(),
+        ))
+    } else {
+        Err(format!(
+            "MCP server self-test FAILED — workflow participants cannot call \
+             workflow tools on this host until fixed.\n  command: {} {} --selftest\
+             \n  exit:    {}\n  stderr:  {}",
+            python,
+            server.display(),
+            output.status,
+            stderr.trim(),
+        ))
+    }
+}
+
 /// Write the per-session Claude MCP config JSON. Returns the path the caller
 /// threads through `--mcp-config <path>`. `server_path_override` (the daemon's
 /// configured `mcp_server_path`) wins over env/repo resolution — see
@@ -480,6 +536,58 @@ mod tests {
             cmd.ends_with("/.venv/bin/python"),
             "command must be the adjacent venv python, got {cmd}",
         );
+    }
+
+    /// Preflight runs `<resolved python> <server.py> --selftest` and maps its
+    /// exit status to Ok/Err. Hermetic: a fake `.venv/bin/python` shell script
+    /// (picked up by `resolve_python_interpreter`) stands in for the real
+    /// interpreter, so the test needs no system python. Covers the success
+    /// path, the selftest-failure path (the cli-import / interpreter-dep class),
+    /// and an unresolvable server path.
+    #[test]
+    fn mcp_preflight_maps_selftest_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+        // Returns (guard, server.py path); hold the guard so the dir survives.
+        let make = |exit: i32| -> (TempDir, std::path::PathBuf) {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join("server.py"), "").unwrap();
+            let venv_bin = dir.path().join(".venv/bin");
+            std::fs::create_dir_all(&venv_bin).unwrap();
+            let py = venv_bin.join("python");
+            std::fs::write(
+                &py,
+                format!(
+                    "#!/bin/sh\necho \"selftest {} (fake)\" >&2\nexit {}\n",
+                    if exit == 0 { "OK" } else { "FAILED" },
+                    exit,
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let server = dir.path().join("server.py");
+            (dir, server)
+        };
+
+        let (_ok_guard, ok_server) = make(0);
+        let ok = run_mcp_preflight(Some(ok_server.to_str().unwrap()))
+            .expect("exit 0 must map to Ok");
+        assert!(ok.contains("selftest OK"), "summary carries the selftest line: {ok}");
+
+        let (_bad_guard, bad_server) = make(1);
+        let err = run_mcp_preflight(Some(bad_server.to_str().unwrap()))
+            .expect_err("exit 1 must map to Err");
+        assert!(err.contains("self-test FAILED"), "names the failure: {err}");
+        assert!(err.contains("--selftest"), "includes the reproduction command: {err}");
+
+        // Unresolvable server path (empty override + no repo fallback in a bare
+        // temp HOME) → a clear locate error, not a panic.
+        let _g = home_lock();
+        let home = TempDir::new().unwrap();
+        let _h = HomeGuard::set(home.path());
+        let missing = run_mcp_preflight(Some("/nonexistent/does/not/exist/server.py"));
+        // A nonexistent interpreter path still tries to spawn → Io error mapped
+        // to Err (not a panic); either the locate or the spawn arm is fine.
+        assert!(missing.is_err(), "a bogus server path must yield Err, got {missing:?}");
     }
 
     #[test]

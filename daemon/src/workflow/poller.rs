@@ -11,28 +11,14 @@
 //! agent goes idle without calling a transition tool) still required
 //! TUI residency.
 //!
-//! 2c-2-2 moves the static-path driver into the daemon. The TUI's
-//! poller stays in place — both pollers consult a per-run ownership
-//! gate (`daemon_owns_run`) to ensure exactly one fires per tick.
-//!
-//! ## Sub-split status
-//!
-//! **2c-2-2-a (this file's initial state)**: skeleton only.
-//! - Poller thread spawns and ticks at the configured interval.
-//! - `poll_once` walks active runs and produces a `Vec<Decision>`,
-//!   but **every decision is currently `Skip`** because the
-//!   ownership gate (`daemon_owns_run`) returns `false`
-//!   unconditionally. Behavior is unchanged from pre-2c-2-2.
-//! - Shutdown wiring + panic safety + lock-contention pattern are
-//!   all in place and tested.
-//!
-//! **2c-2-2-b (next slice)**: flip the gate. `daemon_owns_run` returns
-//! true when the active role's session is in `DaemonState.sessions`.
-//! Decisions fire. The TUI controller gets the same gate (2c-2-3
-//! bundle).
-//!
-//! **2c-2-2-c (final slice)**: cross-path interaction tests
-//! (`workflow_transition` racing the static poller, etc.).
+//! 2c-2-2 moved the static-path driver into the daemon, which is now the SOLE
+//! poller — the TUI is a pure observer with no poller of its own. Originally
+//! the daemon and TUI pollers each consulted a per-run ownership gate
+//! (`daemon_owns_run`) so exactly one fired per tick; with the TUI poller gone
+//! that coordination is moot. `daemon_owns_run` survives only as the fire
+//! PRECONDITION — "is the active role bound to a live daemon session the poller
+//! can deliver to" — and a run that fails it is surfaced as `SessionNotFound`
+//! rather than deferred to a poller that no longer exists.
 //!
 //! ## Ownership boundaries
 //!
@@ -134,9 +120,6 @@ pub enum Decision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Active role's session isn't daemon-owned. The TUI's
-    /// controller fires for this run. See [`daemon_owns_run`].
-    TuiOwns,
     /// Run is paused. Pollers skip paused runs until resumed.
     Paused,
     /// Run has no active role (transient state during start/stop).
@@ -167,10 +150,12 @@ pub enum SkipReason {
     /// `MAX_CONSECUTIVE_IDLE_NUDGES` times. Give up and leave the run idle
     /// for an operator to notice.
     NudgeExhausted,
-    /// Active role's session wasn't found in either
-    /// `state.sessions` or `state.tui_sessions` (the gate
-    /// couldn't determine ownership). Self-resolves once
-    /// `tui_sessions` push catches up (R11).
+    /// Active role isn't bound to a LIVE daemon session
+    /// (`daemon_session_uid` set + present in `state.sessions`), so
+    /// the daemon — the sole poller — can't drive this run yet.
+    /// Transient during the spawn/rebind window; persistent only if
+    /// the session exited or the run is a stale binding (e.g. a
+    /// legacy TUI-only session). Surfaced, not silently skipped.
     SessionNotFound,
     /// 10d-2c-2-2-b F1: no history entry for the currently-active
     /// role yet. Happens in the 10d-2c-1 round-1 gap window —
@@ -225,15 +210,15 @@ struct TickSnapshot {
     /// `state.tui_sessions` looking for entries whose
     /// `workflow_run_id` + `workflow_role` match this run.
     role_session_types: BTreeMap<String, String>,
-    /// True iff the active role's session lives in `state.sessions`
-    /// (daemon-spawned). Otherwise the TUI's poller owns this run.
-    /// 2c-2-2-b's gate. Captured here so the apply phase doesn't
-    /// need to re-walk session maps under the lock.
-    daemon_owns: bool,
-    /// True iff we found ANY session (daemon or TUI) for the active
-    /// role. Distinguishes "TUI owns" from "no session bound yet"
-    /// (R11 — TUI snapshot push lag).
-    active_session_found: bool,
+    /// True iff the active role is bound to a LIVE daemon session
+    /// (`daemon_session_uid` set AND present in `state.sessions`) —
+    /// i.e. the daemon can deliver to it. The daemon is the sole
+    /// poller, so this is the single precondition for driving a run;
+    /// a run that fails it can't be driven by anyone and is surfaced
+    /// as `SessionNotFound` (not silently deferred to a phantom TUI
+    /// poller). Captured here so the apply phase doesn't re-walk the
+    /// session maps under the lock.
+    active_session_daemon_owned: bool,
     /// Snapshot of the workflow definition, if loaded. Cloned
     /// because the apply phase may run under a fresh state lock
     /// in [`fire_static_transition`] and we don't want to re-lookup
@@ -563,7 +548,8 @@ impl WorkflowPoller {
                 }
             }
             // Phase 3: complete in-flight hand-offs. Keyed off run state
-            // (`pending_activation`), gated on `daemon_owns_run`, idempotent —
+            // (`pending_activation`), gated on the target role having a live
+            // daemon session (the drain's filter_map), idempotent —
             // re-runs a half-finalized activation after a crash and never
             // double-applies. Runs AFTER the fire loop so a just-fired
             // transition's Queued record gets finalized starting this tick.
@@ -774,7 +760,9 @@ impl WorkflowPoller {
                         && !run.paused
                         && run.pending_activation.is_some()
                 })
-                .filter(|run| daemon_owns_run(&state, run))
+                // No separate ownership filter here: the filter_map below
+                // already drops any run whose target role lacks a live daemon
+                // session (the same precondition `daemon_owns_run` checks).
                 .filter_map(|run| {
                     let pa = run.pending_activation.as_ref()?;
                     let uid = run
@@ -886,8 +874,8 @@ impl WorkflowPoller {
     /// 2c-2-2-b real evaluate. The hot path:
     /// 1. `active_role` must be set.
     /// 2. Not paused.
-    /// 3. Daemon owns the active role's session (per
-    ///    `TickSnapshot.daemon_owns`).
+    /// 3. Active role bound to a live daemon session (per
+    ///    `TickSnapshot.active_session_daemon_owned`).
     /// 4. Workflow definition loaded + has on_idle from active.
     /// 5. Worktree path known.
     /// 6. `assistant_turn_completed_since(engine, wt, sid,
@@ -906,16 +894,10 @@ impl WorkflowPoller {
                 reason: SkipReason::NoActiveRole,
             };
         };
-        if !snap.active_session_found {
+        if !snap.active_session_daemon_owned {
             return Decision::Skip {
                 run_id: snap.run_id.clone(),
                 reason: SkipReason::SessionNotFound,
-            };
-        }
-        if !snap.daemon_owns {
-            return Decision::Skip {
-                run_id: snap.run_id.clone(),
-                reason: SkipReason::TuiOwns,
             };
         }
         let Some(wf) = snap.workflow.as_ref() else {
@@ -1329,28 +1311,14 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
                 }
             }
 
-            let active = run.active_role.as_deref();
-            // Round-5 F1: `active_session_found` covers BOTH the
-            // tag-based path (role_session_types is built from
-            // workflow_run_id/workflow_role match — for the
-            // engine-derivation read path) AND the durable
-            // uid-binding path (the new ownership signal).
-            // Pre-r5 this only checked tags, so a daemon
-            // session without tags but with a proper
-            // `daemon_session_uid` binding would skip with
-            // SessionNotFound and never fire.
-            let active_session_found = active
-                .map(|r| {
-                    role_session_types.contains_key(r)
-                        || run
-                            .role_sessions
-                            .get(r)
-                            .and_then(|b| b.daemon_session_uid.as_deref())
-                            .map(|uid| state.sessions.contains_key(uid))
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            let daemon_owns = daemon_owns_run(state, run);
+            // The daemon drives a run iff its active role is bound to a LIVE
+            // daemon session (the single gate precondition — the daemon is the
+            // sole poller, so a tag-only/TUI-only or exited binding can't be
+            // driven by anyone and is surfaced as SessionNotFound, not deferred
+            // to a phantom TUI poller). `role_session_types` /
+            // `resolve_role_session_context` (tag fallbacks) still serve engine
+            // + worktree derivation below; only the FIRE gate is uid-based.
+            let active_session_daemon_owned = daemon_owns_run(state, run);
 
             // Worktree resolution via session tags, NOT
             // `run.task_key`. The session bound to this run +
@@ -1393,42 +1361,30 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
                 run: run.clone(),
                 worktree_path,
                 role_session_types,
-                daemon_owns,
-                active_session_found,
+                active_session_daemon_owned,
                 workflow,
             }
         })
         .collect()
 }
 
-/// 2c-2-2-b ownership gate (round-5 F1: uid-based, durable signal).
+/// Can the daemon drive this run right now? True iff the active role is bound
+/// to a LIVE daemon session: `run.role_sessions[active].daemon_session_uid` is
+/// set AND `state.sessions` contains that uid.
 ///
-/// Daemon owns a run iff `run.role_sessions[active].daemon_session_uid`
-/// is set AND `state.sessions` contains that uid.
+/// This is the sole FIRE precondition. Historically it was an OWNERSHIP gate
+/// coordinating two pollers (the daemon's and the TUI's) so exactly one fired
+/// per tick; after the daemon-side orchestration relocation the TUI poller is
+/// gone, so there is no coordination to do — this is now just "is the active
+/// session a live daemon session the poller can deliver to". A run that fails
+/// it can't be driven by anyone, so the gate surfaces `SessionNotFound`
+/// (visible in decisions/logs) rather than silently deferring to a poller that
+/// no longer exists.
 ///
-/// **Why uid-based over tag-based**: pre-r5 the gate walked
-/// `state.sessions` for a session tagged with `workflow_run_id` +
-/// `workflow_role`. Those tags are populated by the best-effort
-/// `session.set_workflow_context` RPC — if that push fails or
-/// hasn't landed yet, the daemon session lacks tags and the
-/// gate would say "TUI owns" while the TUI's own gate (checking
-/// `TerminalSession.daemon_session_uid`) said "daemon owns".
-/// Result: workflow stalled, neither poller fires.
-///
-/// Post-r5: the gate uses
-/// `run.role_sessions[active].daemon_session_uid`, which the TUI
-/// populates at every `current_session_id` write site, then
-/// state.json membership check. Both signals are durable
-/// (workflow record on disk, daemon registry in memory). The
-/// `set_workflow_context` tags become defense-in-depth for
-/// `lookup_session_any` (auth path), not load-bearing for
-/// ownership.
-///
-/// The former TUI controller's equivalent gate (skip when
-/// `session.daemon_session_uid.is_some()`) checked the SAME
-/// session-uid signal, just from a different angle. The
-/// two-poller agreement invariant rests on this signal
-/// alignment.
+/// Uid-based (durable: the on-disk workflow record + the in-memory registry),
+/// NOT the best-effort `set_workflow_context` tags — those remain
+/// defense-in-depth for `lookup_session_any` (auth path) and for
+/// engine/worktree derivation, but are not load-bearing for the fire gate.
 pub fn daemon_owns_run(state: &DaemonState, run: &WorkflowRun) -> bool {
     let Some(active) = run.active_role.as_deref() else {
         return false;
@@ -1873,13 +1829,15 @@ mod tests {
         ), "expected Skip{{SessionNotFound}}, got {:?}", decisions[0]);
     }
 
-    /// T2 daemon-side companion: a run whose active role is bound
-    /// to a TUI-only session (visible only via
-    /// `state.tui_sessions`, not in `state.sessions`) gets
-    /// `Skip{TuiOwns}`. The TUI controller fires for this run; the
-    /// daemon poller stays out.
+    /// Post-relocation: a run whose active role is bound ONLY to a TUI-only
+    /// session (visible via `state.tui_sessions`, NOT a live `state.sessions`
+    /// entry — no `daemon_session_uid`) gets `Skip{SessionNotFound}`. There is
+    /// no TUI poller anymore, so the daemon can't defer to one; it can't deliver
+    /// to a non-daemon session either, so it surfaces SessionNotFound rather
+    /// than the old (now-removed) `TuiOwns`. (Pre-relocation this was the
+    /// two-poller hand-off case.)
     #[test]
-    fn poll_once_returns_tui_owns_when_active_role_session_is_tui_only() {
+    fn poll_once_skips_session_not_found_for_tui_only_active_session() {
         let _guard = crate::test_support::env_lock();
         let _tmp_home = tempfile::tempdir().expect("tempdir");
         let _orig_home = std::env::var_os("HOME");
@@ -1906,9 +1864,9 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert!(matches!(
             &decisions[0],
-            Decision::Skip { run_id, reason: SkipReason::TuiOwns }
+            Decision::Skip { run_id, reason: SkipReason::SessionNotFound }
                 if run_id == "r1"
-        ), "expected Skip{{TuiOwns}}, got {:?}", decisions[0]);
+        ), "expected Skip{{SessionNotFound}} for a TUI-only session, got {:?}", decisions[0]);
     }
 
     #[test]

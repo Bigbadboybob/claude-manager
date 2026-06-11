@@ -21,6 +21,9 @@ use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::workflow::{self, toml_schema::Engine, Workflow, WorkflowRun};
+// `log_tick` lives in `workflow::observer` now; re-import so the call sites in
+// the tick loop read unchanged.
+use crate::workflow::observer::log_tick;
 use cm_daemon::worktree;
 
 mod dirs {
@@ -364,12 +367,6 @@ const TERMINAL_DRAIN_BUDGET: Duration = Duration::from_millis(50);
 /// every MCP/agent call routing to the stale binary instead.
 const CONTROL_REBIND_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Per-file cap on `~/.cm/workflow-runs/<run-id>/tick.log`. When `log_tick`
-/// is about to write and the file is at or over this size, it truncates and
-/// starts fresh (with a marker line). Generous because these logs are useful
-/// debugging artifacts; this exists only to bound runaway growth from
-/// pathologically chatty runs.
-const TICK_LOG_MAX_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Gap between writing a workflow prompt body and the trailing Enter. Implemented
 /// as a deferred write (not `thread::sleep`) so the UI thread keeps draining
@@ -14201,58 +14198,9 @@ fn format_body_for_delivery(body: &str, term_mode: TermMode) -> Vec<u8> {
 /// Lives in `~/.cm/workflow-runs/<run_id>/tick.log`. Rate-limited to at most
 /// one distinct message per run per second to avoid spamming the file on every
 /// tick of the main loop. Best-effort — ignores all I/O errors.
-pub(crate) fn log_tick(run_id: &str, msg: &str) {
-    use std::io::Write as _;
-    use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Rate-limit: remember the last (run_id, msg) logged and when. Skip if we
-    // logged the same thing within the last second.
-    static LAST: std::sync::OnceLock<Mutex<Option<(String, String, u64)>>> =
-        std::sync::OnceLock::new();
-    let lock = LAST.get_or_init(|| Mutex::new(None));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    {
-        let mut guard = match lock.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if let Some((last_run, last_msg, last_ts)) = guard.as_ref() {
-            if last_run == run_id && last_msg == msg && now.saturating_sub(*last_ts) < 1 {
-                return;
-            }
-        }
-        *guard = Some((run_id.to_string(), msg.to_string(), now));
-    }
-
-    let path = workflow::run::run_dir(run_id).join("tick.log");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let truncate = std::fs::metadata(&path)
-        .map(|m| m.len() >= TICK_LOG_MAX_BYTES)
-        .unwrap_or(false);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true);
-    if truncate {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
-    }
-    if let Ok(mut f) = opts.open(&path) {
-        if truncate {
-            let _ = writeln!(
-                f,
-                "{} (log truncated: cap {} bytes hit)",
-                now, TICK_LOG_MAX_BYTES
-            );
-        }
-        let _ = writeln!(f, "{} {}", now, msg);
-    }
-}
+// `log_tick` + its `TICK_LOG_MAX_BYTES` cap moved to
+// `crate::workflow::observer` (re-exported below) as the first extraction of
+// workflow-observation glue out of this file.
 
 /// Uid of the session the cursor currently selects, if it's on a session row
 /// that resolves to a live session. This is the clear-on-focus target for

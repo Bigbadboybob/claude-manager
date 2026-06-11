@@ -380,6 +380,23 @@ pub fn run() -> anyhow::Result<()> {
         );
         initial_state.base_workflow_definitions = defs;
     }
+    // Headless preflight: if this daemon can run workflows, verify the MCP
+    // server actually starts on THIS host (resolve interpreter + path, run a
+    // real --selftest import) so the "works locally, breaks headless" gaps
+    // surface here, loudly, instead of as a silent per-participant failure when
+    // a manager can't call workflow_done. Non-fatal (the daemon still serves
+    // non-workflow sessions); the error names exactly what to fix.
+    if !initial_state.base_workflow_definitions.is_empty() {
+        let server_override = if initial_state.config.mcp_server_path.trim().is_empty() {
+            None
+        } else {
+            Some(initial_state.config.mcp_server_path.as_str())
+        };
+        match mcp_config::run_mcp_preflight(server_override) {
+            Ok(summary) => eprintln!("cm-daemon: MCP preflight OK: {}", summary),
+            Err(msg) => eprintln!("cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED\n{}", msg),
+        }
+    }
     // The path the TUI dials for a dedicated attach connection.
     // For Phase 1 (Unix socket only), the attach connection lands
     // on the same listener as the control connection — the

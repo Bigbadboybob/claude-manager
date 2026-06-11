@@ -19,6 +19,10 @@
 //! its render coverage moved to `cm_daemon::workflow::poller`'s
 //! `daemon_resolver_renders_all_template_shapes`.
 
+/// Workflow OBSERVATION glue (tick logging, and — incrementally — the
+/// run-state-mirror plumbing being extracted out of `app.rs`).
+pub(crate) mod observer;
+
 // Re-exports of the relocated submodules — keep the
 // `crate::workflow::run::*` etc. paths working for the existing
 // callsites in `app.rs`, `agent/`, `agent_memory.rs`,

@@ -1116,4 +1116,18 @@ def workflow_reject_finding(text: str) -> str:
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        # Startup preflight (invoked by the daemon's run_mcp_preflight). Reaching
+        # here means this module already imported on THIS interpreter/host — so
+        # the missing-`cli`-package crash and a missing interpreter are already
+        # caught. Confirm tool registration too, then exit. The daemon logs a
+        # loud, actionable error at startup when this fails, instead of a
+        # workflow participant silently failing to start its MCP server later.
+        try:
+            _tools = asyncio.run(mcp.list_tools())
+        except Exception as e:  # noqa: BLE001 — surface any failure verbatim
+            print(f"selftest FAILED: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"selftest OK: {len(_tools)} tools registered", file=sys.stderr)
+        sys.exit(0)
     mcp.run()

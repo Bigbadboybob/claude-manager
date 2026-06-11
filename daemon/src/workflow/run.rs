@@ -95,11 +95,11 @@ pub struct HistoryEntry {
 ///   `DaemonSession.uid` keys in `DaemonState.sessions`). `Some(_)` iff the
 ///   role was bound to a daemon-spawned session at launch / rebind time.
 ///   `None` for TUI-only sessions and pre-r5 on-disk records.
-///   Populated by `tui/src/workflow/controller.rs` at every site that writes
-///   `current_session_id` — co-write the matching uid from
-///   `TerminalSession.session.daemon_session_uid`. Used by the daemon's
-///   workflow poller (`cm_daemon::workflow::poller::daemon_owns_run`) as the
-///   durable ownership signal — no longer relies on the best-effort
+///   Set at spawn/rebind by the daemon's `start_workflow` + fresh-reset
+///   rebind. Used by the daemon's workflow poller
+///   (`cm_daemon::workflow::poller::daemon_owns_run`) as the durable
+///   fire-precondition signal — "can the (sole) daemon poller deliver to this
+///   role's session" — no longer relies on the best-effort
 ///   `session.set_workflow_context` RPC tags.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoleBinding {
