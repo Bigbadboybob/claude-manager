@@ -1791,6 +1791,30 @@ pub enum WorkflowSlotSource {
     New(Engine),
 }
 
+/// Phase 3 (doc/existing-session-binding.md): map a launch modal's slots to the
+/// `role -> daemon_session_uid` bindings forwarded to `start_workflow`. A slot
+/// whose selected source is `Existing(si)` contributes `role -> uid` when
+/// `session_uids[si]` is `Some` (a daemon-owned session); `New` slots — and any
+/// `Existing(si)` pointing at a session that has no daemon uid or no longer
+/// exists (out-of-range after a mid-modal reconcile) — contribute nothing, so
+/// the daemon fresh-spawns those roles. `session_uids[i]` is
+/// `ws.sessions[i].session.daemon_session_uid`: the DAEMON session uid, never
+/// the local `TerminalSession` UI handle.
+pub(crate) fn slots_to_role_sessions(
+    slots: &[WorkflowSlotChoice],
+    session_uids: &[Option<String>],
+) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for slot in slots {
+        if let WorkflowSlotSource::Existing(si) = slot.source() {
+            if let Some(uid) = session_uids.get(*si).and_then(|u| u.clone()) {
+                map.insert(slot.role.clone(), uid);
+            }
+        }
+    }
+    map
+}
+
 // ── Input handler extraction ────────────────────────────────────────
 //
 // The per-mode arms of `handle_input_event` are implemented as free
@@ -9219,7 +9243,7 @@ impl App {
             SubmitAction::LaunchWorkflow {
                 ws_id,
                 workflow_name,
-                slots: _slots,
+                slots,
                 goal,
                 cursor_task_id,
             } => {
@@ -9243,6 +9267,7 @@ impl App {
                 self.launch_workflow_via_daemon(
                     &ws_id,
                     &workflow_name,
+                    &slots,
                     goal,
                     cursor_task_id,
                 );
@@ -12944,19 +12969,45 @@ impl App {
             return;
         };
 
-        // Phase 4 §D (P-C): the daemon spawns every participant FRESH with its
-        // TOML-declared engine and does NOT honor existing-session or alternate-
-        // engine selection. So we no longer present a chooser — each role gets a
-        // single fixed fresh slot (its TOML engine). The modal shows the roles
-        // informationally; `focused_si` (the old focused-session-as-worker
-        // binding) is intentionally ignored.
+        // Phase 3 (doc/existing-session-binding.md): re-light the dormant
+        // Existing-slot chooser. For each role ELIGIBLE for binding —
+        // `Context::Persistent` AND `needs_mcp == false`, mirroring the daemon's
+        // Phase 1 eligibility intent (in feedback.toml only the worker qualifies;
+        // the reviewer is Fresh and the manager needs the workflow MCP) — offer
+        // the focused workspace's DAEMON-OWNED sessions
+        // (`daemon_session_uid.is_some()`) as `Existing(si)` options alongside
+        // `New(engine)`. Ineligible roles, and any session without a daemon uid,
+        // are offered/appear only as `New`. `New(engine)` stays index 0 (the
+        // default), so a plain Enter fresh-spawns every role exactly as before —
+        // binding is an explicit cycle-to-`Existing` choice. The old single
+        // focused-session-as-worker binding (`focused_si`) is superseded: the
+        // chooser now offers every eligible existing session in the workspace.
         let _ = focused_si;
+        let ws_index = resolve_workspace_by_id(&self.workspaces, &ws_id);
         let mut slots = Vec::new();
         for role_name in wf.role_order.iter() {
             let role = &wf.roles[role_name];
+            let mut options = vec![WorkflowSlotSource::New(role.engine.clone())];
+            let eligible = role.context
+                == workflow::toml_schema::Context::Persistent
+                && !role.needs_mcp;
+            if eligible {
+                if let Some(ws) = ws_index.and_then(|i| self.workspaces.get(i)) {
+                    for (si, sess) in ws.sessions.iter().enumerate() {
+                        // Only DAEMON-OWNED sessions are bindable: the daemon's
+                        // eligibility check requires `state.sessions` membership
+                        // and we must forward the daemon uid, not the local UI
+                        // handle. A purely TUI-local session is unbindable and
+                        // must not be offered.
+                        if sess.session.daemon_session_uid.is_some() {
+                            options.push(WorkflowSlotSource::Existing(si));
+                        }
+                    }
+                }
+            }
             slots.push(WorkflowSlotChoice {
                 role: role_name.clone(),
-                options: vec![WorkflowSlotSource::New(role.engine.clone())],
+                options,
                 option_index: 0,
             });
         }
@@ -12979,6 +13030,7 @@ impl App {
         &mut self,
         ws_id: &str,
         workflow_name: &str,
+        slots: &[WorkflowSlotChoice],
         goal: Option<String>,
         task_id: Option<String>,
     ) {
@@ -12998,6 +13050,20 @@ impl App {
             self.set_status_msg("launch: workspace has no worktree");
             return;
         };
+        // Phase 3 (doc/existing-session-binding.md): map each `Existing(si)`
+        // slot to `role -> daemon_session_uid`. We forward the DAEMON session
+        // uid (`ws.sessions[si].session.daemon_session_uid`), NOT the local
+        // `TerminalSession` UI handle — only daemon-owned sessions are bindable.
+        // `New` slots (and any selected session that lost its daemon uid via a
+        // mid-modal reconcile) contribute no entry, so the daemon fresh-spawns
+        // those roles. Built while `ws` is still borrowed; the resulting map is
+        // owned (cloned uids) so no borrow lingers.
+        let session_uids: Vec<Option<String>> = ws
+            .sessions
+            .iter()
+            .map(|s| s.session.daemon_session_uid.clone())
+            .collect();
+        let role_sessions = slots_to_role_sessions(slots, &session_uids);
         let host_id = self.active_host.clone();
         let daemon_socket = match self.host_pool.for_host(&host_id) {
             Ok(h) => match h.socket_path() {
@@ -13020,6 +13086,7 @@ impl App {
             &workspace_id,
             goal.as_deref(),
             task_id.as_deref(),
+            &role_sessions,
             self.last_term_size,
         ) {
             Ok(run_id) => {
@@ -19193,6 +19260,111 @@ mod input_handler_tests {
         assert_cancel(&outcome);
     }
 
+    // Phase 3 (doc/existing-session-binding.md): an `Existing` selection in the
+    // launch modal threads `role -> daemon_session_uid` into the launch; a
+    // `New` selection sends no entry for that role. The handler emits the slots
+    // on submit; `slots_to_role_sessions` (called inside
+    // `launch_workflow_via_daemon`) maps them against the workspace's per-index
+    // daemon uids. Asserted on the daemon uid, NOT the local UI handle.
+    #[test]
+    fn workflow_launch_existing_slot_maps_to_role_sessions() {
+        // worker: eligible role offering [New(claude), Existing(0)] with the
+        // existing session selected. reviewer: a New-only slot (e.g. an
+        // ineligible role) — must contribute no binding.
+        let worker = WorkflowSlotChoice {
+            role: "worker".to_string(),
+            options: vec![
+                WorkflowSlotSource::New(Engine::ClaudeCode),
+                WorkflowSlotSource::Existing(0),
+            ],
+            option_index: 1, // Existing(0) selected
+        };
+        let reviewer = WorkflowSlotChoice {
+            role: "reviewer".to_string(),
+            options: vec![WorkflowSlotSource::New(Engine::ClaudeCode)],
+            option_index: 0, // New selected
+        };
+        let mut slots = vec![worker, reviewer];
+        let mut active = slots.len(); // goal-focused, so Enter submits
+        let mut goal = String::new();
+        let outcome = handle_workflow_launch_confirm(
+            WorkflowLaunchConfirmMut {
+                ws_id: "ws-7",
+                workflow_name: "feedback",
+                slots: &mut slots,
+                active_slot: &mut active,
+                goal: &mut goal,
+                cursor_task_id: None,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        let launched = match outcome {
+            InputOutcome::Submit(SubmitAction::LaunchWorkflow { slots, .. }) => slots,
+            other => panic!("expected LaunchWorkflow, got {:?}", other),
+        };
+        // Two daemon-owned sessions in the workspace; index 0 (selected by the
+        // worker slot) carries this uid. The map is keyed on the DAEMON uid.
+        let session_uids = vec![
+            Some("daemon-uid-worker".to_string()),
+            Some("daemon-uid-other".to_string()),
+        ];
+        let map = slots_to_role_sessions(&launched, &session_uids);
+        // Exactly the worker is bound, to the daemon uid at the selected index;
+        // the New reviewer slot produces no entry.
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("worker").map(String::as_str), Some("daemon-uid-worker"));
+        assert!(!map.contains_key("reviewer"));
+
+        // And with NO Existing slots selected (all New), the map is empty —
+        // byte-identical to the pre-Phase-3 fresh-spawn launch.
+        let all_new = vec![
+            WorkflowSlotChoice {
+                role: "worker".to_string(),
+                options: vec![
+                    WorkflowSlotSource::New(Engine::ClaudeCode),
+                    WorkflowSlotSource::Existing(0),
+                ],
+                option_index: 0, // New selected
+            },
+            WorkflowSlotChoice {
+                role: "reviewer".to_string(),
+                options: vec![WorkflowSlotSource::New(Engine::ClaudeCode)],
+                option_index: 0,
+            },
+        ];
+        assert!(slots_to_role_sessions(&all_new, &session_uids).is_empty());
+    }
+
+    // Phase 3: an `Existing(si)` selection pointing at a session WITHOUT a
+    // daemon uid (a purely TUI-local session, or an index that no longer
+    // resolves) contributes no binding — the daemon then fresh-spawns the role
+    // rather than receiving an unbindable uid.
+    #[test]
+    fn workflow_launch_existing_slot_without_daemon_uid_is_dropped() {
+        let slots = vec![WorkflowSlotChoice {
+            role: "worker".to_string(),
+            options: vec![
+                WorkflowSlotSource::New(Engine::ClaudeCode),
+                WorkflowSlotSource::Existing(0),
+            ],
+            option_index: 1, // Existing(0) selected
+        }];
+        // Session 0 has no daemon uid (local-only); index 1 doesn't exist.
+        let session_uids = vec![None];
+        assert!(slots_to_role_sessions(&slots, &session_uids).is_empty());
+
+        let slots_oob = vec![WorkflowSlotChoice {
+            role: "worker".to_string(),
+            options: vec![
+                WorkflowSlotSource::New(Engine::ClaudeCode),
+                WorkflowSlotSource::Existing(5),
+            ],
+            option_index: 1,
+        }];
+        assert!(slots_to_role_sessions(&slots_oob, &session_uids).is_empty());
+    }
+
     // ── WorkflowPicker ────────────────────────────────────────────
 
     #[test]
@@ -23105,10 +23277,11 @@ mod migrate_tui_local_tests {
         // `cursor_task_id` (NOT a hardcoded None).
         assert!(
             handler_body.contains(
-                "self.launch_workflow_via_daemon(\n                    &ws_id,\n                    &workflow_name,\n                    goal,\n                    cursor_task_id,",
+                "self.launch_workflow_via_daemon(\n                    &ws_id,\n                    &workflow_name,\n                    &slots,\n                    goal,\n                    cursor_task_id,",
             ),
             "the SubmitAction::LaunchWorkflow handler MUST \
-             forward `cursor_task_id` (NOT a hardcoded `None`) \
+             forward the launch `slots` (Phase 3) AND \
+             `cursor_task_id` (NOT a hardcoded `None`) \
              to self.launch_workflow_via_daemon (Phase 4); handler \
              body:\n{}",
             handler_body,

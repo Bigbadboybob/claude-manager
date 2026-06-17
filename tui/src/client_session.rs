@@ -1086,6 +1086,7 @@ pub fn rpc_start_workflow(
     workspace_id: &str,
     goal: Option<&str>,
     task_id: Option<&str>,
+    role_sessions: &std::collections::BTreeMap<String, String>,
     size: (u16, u16),
 ) -> anyhow::Result<String> {
     // (cols, rows): participants spawn at the operator's terminal size instead
@@ -1102,6 +1103,19 @@ pub fn rpc_start_workflow(
     }
     if let Some(t) = task_id {
         params["task_id"] = serde_json::Value::String(t.to_string());
+    }
+    // Phase 3 (doc/existing-session-binding.md): forward the existing-session
+    // bindings (`role -> daemon_session_uid`) ONLY when non-empty, so a launch
+    // with no `Existing` slots is byte-identical on the wire to the pre-Phase-3
+    // fresh-spawn call (the daemon's `role_sessions` param is
+    // `#[serde(default)]`). Values are DAEMON session uids, never local UI
+    // handles — the daemon's eligibility check keys on `state.sessions`.
+    if !role_sessions.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = role_sessions
+            .iter()
+            .map(|(role, uid)| (role.clone(), serde_json::Value::String(uid.clone())))
+            .collect();
+        params["role_sessions"] = serde_json::Value::Object(map);
     }
     let req = Request {
         id: next_request_id(),
