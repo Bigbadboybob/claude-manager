@@ -616,6 +616,7 @@ def start_workflow(
     task_id: str,
     workflow_name: str,
     goal: str = "",
+    role_sessions: dict[str, str] | None = None,
 ) -> dict:
     """Launch a workflow on a task you have authority over.
 
@@ -634,6 +635,24 @@ def start_workflow(
         goal: Optional initial goal string passed to the worker's
             activation prompt template ({{ goal }}), or delivered verbatim
             when the worker role has no activation_prompt.
+        role_sessions: Optional map of `role -> existing daemon session
+            uid`. For each entry the daemon ADOPTS the already-running live
+            session as that role instead of fresh-spawning it — so a worker
+            you've already explored a codebase with (or accepted a plan in)
+            starts WARM, keeping its context, and the goal is delivered to
+            that live agent. Get the uid from `list_sessions`.
+
+            Eligibility (enforced daemon-side): a role is bindable ONLY when
+            it is `context = "persistent"` AND `needs_mcp = false` in the
+            workflow TOML (e.g. the feedback `worker`). `Context::Fresh`
+            roles (reset every activation) and `needs_mcp = true` roles (a
+            manager that calls `workflow_done`) are always fresh-spawned. The
+            session must also be a live daemon session in the run's
+            workspace, with an engine matching the role and not already a
+            participant of another active run. An ineligible or unresolvable
+            entry FAILS the whole launch (it is NOT silently fresh-spawned),
+            so a worker you expected to keep its context never starts cold
+            without a signal. Omit (or pass None) to fresh-spawn every role.
 
     Returns: {"run_id": "<id>"}.
 
@@ -642,6 +661,11 @@ def start_workflow(
     params: dict = {"task_id": task_id, "workflow_name": workflow_name}
     if goal:
         params["goal"] = goal
+    # Existing-session binding (Phase 2): forward `role_sessions` verbatim only
+    # when provided, so existing callers' wire shape is unchanged (the daemon's
+    # StartWorkflowParams.role_sessions is #[serde(default)] — absent == None).
+    if role_sessions is not None:
+        params["role_sessions"] = role_sessions
     # P-3c: the daemon serializes each participant's transcript-detector binding
     # (the cross-bind fix), waiting up to ~20s/role before spawning the next, so
     # a normal 3-role feedback launch can exceed the default 30s control_client
