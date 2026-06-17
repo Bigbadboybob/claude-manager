@@ -1837,6 +1837,7 @@ mod tests {
                     session_label: "claude".into(),
                     current_session_id: Some("sid-1".into()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
             role_sessions.insert(
@@ -1845,6 +1846,7 @@ mod tests {
                     session_label: "reviewer".into(),
                     current_session_id: None,
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
             let mut role_baselines = std::collections::BTreeMap::new();

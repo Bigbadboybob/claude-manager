@@ -218,6 +218,88 @@ where
             if !tracker.quiet_for(ctx.quiet_window, ctx.now_instant) {
                 return Ok(FinalizeStep::Blocked);
             }
+            // Bound-session readiness + baseline (existing-session binding): the
+            // INITIAL worker of a BOUND launch is a LIVE agent that may be
+            // mid-(long)-tool-call when we go to deliver the goal. PTY-quiet alone
+            // is too weak for it — a paused mid-turn is also quiet, unlike a just-
+            // spawned fresh session that genuinely has nothing in flight. So for a
+            // bound initial delivery ALSO require the turn to have actually
+            // finished before delivering.
+            //
+            // The "is this an adopted session" test keys off the EXPLICIT
+            // `RoleBinding::bound` flag recorded on the bind path — NOT runtime
+            // sid presence. A fresh-spawned Codex initial worker's rollout exists
+            // from boot, so the poller syncs its `current_session_id` BEFORE this
+            // delivery; a sid-presence heuristic would then wrongly hold its goal
+            // behind `role_turn_complete` on a pre-prompt rollout (no
+            // `task_complete` yet → blocks forever), regressing fresh-Codex
+            // launches. `bound` is false for every fresh spawn, so the gate
+            // evaluates only for genuinely adopted sessions.
+            if pa.is_initial {
+                if let Some(binding) = run.role_sessions.get(&role) {
+                    if binding.bound {
+                        if let Some(sid) = binding.current_session_id.as_deref() {
+                            // Ready to deliver iff the agent is not actively
+                            // WORKING. Two ways to be ready:
+                            //   (a) its last turn completed (`end_turn`), or
+                            //   (b) it is parked at an `ExitPlanMode` tool_use —
+                            //       it accepted a plan and is BLOCKED awaiting user
+                            //       input, and the goal we're about to deliver IS
+                            //       that input.
+                            // (b) is the CENTRAL plan-then-bind flow: an accepted
+                            // `ExitPlanMode` tail has `stop_reason == "tool_use"`,
+                            // so `role_turn_complete` is permanently false — without
+                            // this exception the run deadlocks at Appended forever.
+                            // Scope the exception STRICTLY to `ExitPlanMode` (via
+                            // `latest_plan`, which matches only that tool on the
+                            // transcript tail): a session mid long-running Bash/
+                            // other tool must still wait — that's the case this gate
+                            // exists for. Codex has no `ExitPlanMode`; `latest_plan`
+                            // returns None for it, so only (a) applies there.
+                            let ready = transcript::role_turn_complete(&engine, ctx.worktree, sid)
+                                || transcript::latest_plan(&engine, ctx.worktree, sid).is_some();
+                            if !ready {
+                                return Ok(FinalizeStep::Blocked);
+                            }
+                            // (Re)capture the idle-eval baseline NOW, at delivery,
+                            // so the initial history entry reflects the transcript
+                            // right before the goal lands. The LAUNCH-time baseline
+                            // (seeded into that entry by `WorkflowRun::new`) is
+                            // STALE whenever the readiness gate above deferred
+                            // delivery past an in-flight pre-goal turn: the
+                            // transcript grew (N -> N+1), and the idle gate
+                            // (`active_assistant_start_count`) would then fire
+                            // worker->reviewer on that PRE-goal turn instead of the
+                            // worker's response to the goal. Re-reading here pins
+                            // the baseline to N+1, so the gate fires only on the
+                            // genuine post-goal turn (N+2). Mirrors
+                            // `persistent_baselines` for the fresh→persistent
+                            // append. (Bound NON-initial roles need no analog:
+                            // their history entry is created at THEIR activation
+                            // via `persistent_baselines`, already delivery-time-
+                            // correct — only the initial role's entry is seeded at
+                            // launch.) Idempotent: no input reaches the worker
+                            // before the body write below, so a crash-retry re-read
+                            // yields the same counts.
+                            let assistant = transcript::count_messages(
+                                &engine, ctx.worktree, sid, MessageKind::Assistant,
+                            );
+                            let text = transcript::list_messages(
+                                &engine, ctx.worktree, sid, MessageKind::Assistant,
+                            )
+                            .len();
+                            run::modify(ctx.run_id, |r| {
+                                if let Some(h) =
+                                    r.history.iter_mut().rev().find(|h| h.role == role)
+                                {
+                                    h.assistant_count_at_start = assistant;
+                                    h.text_messages_at_start = text;
+                                }
+                            })?;
+                        }
+                    }
+                }
+            }
             // Cross-bind fix: an UNBOUND persistent Claude role (initial worker,
             // or a persistent role's first-ever activation) gets its sid bound
             // CAUSALLY — snapshot the transcript dir before delivery, then
@@ -556,6 +638,7 @@ to = "manager"
                     session_label: role.to_string(),
                     current_session_id: sid.map(|s| s.to_string()),
                     daemon_session_uid: Some(format!("uid-{role}")),
+                    bound: false,
                 },
             );
         }
@@ -731,6 +814,7 @@ to = "manager"
             session_label: "worker".into(),
             current_session_id: None,
             daemon_session_uid: Some("uid-worker".into()),
+            bound: false,
         });
         let mut run = WorkflowRun::new(
             "wf-verbatim".into(), "test-wf".into(), wt.to_str().unwrap().into(),
@@ -941,6 +1025,144 @@ to = "manager"
         // /clear body delivered exactly once; prompt body exactly once.
         let clears = writes.iter().filter(|w| w.as_slice() == b"/clear").count();
         assert_eq!(clears, 1, "exactly one /clear body");
+        std::env::remove_var("HOME");
+    }
+
+    // ---- Existing-session binding: bound initial delivery readiness ------
+
+    /// A BOUND initial worker (`RoleBinding::bound` + an already-resolved sid) is
+    /// delivered the goal only once its turn is actually COMPLETE — not merely
+    /// PTY-quiet (a live agent can be quiet mid-tool-call). A mid-turn transcript
+    /// BLOCKS at the body-delivery gate; once the turn ends (`end_turn`), delivery
+    /// proceeds. The gate keys off the explicit `bound` flag, so fresh spawns
+    /// (`bound == false`) are unaffected — see the fresh-Codex regression below.
+    #[test]
+    fn bound_initial_delivery_waits_for_turn_complete() {
+        let _g = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let wt = home.path().join("wt");
+        let dir = claude_dir(home.path(), &wt);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Mid-turn: the last assistant record is a tool_use (stop_reason tool_use).
+        std::fs::write(
+            dir.join("wkr.jsonl"),
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}],\"stop_reason\":\"tool_use\"}}\n",
+        )
+        .unwrap();
+
+        let wf = workflow();
+        let mut roles = BTreeMap::new();
+        roles.insert("worker".to_string(), RoleBinding {
+            session_label: "worker".into(),
+            current_session_id: Some("wkr".into()), // bound: sid resolved at launch
+            daemon_session_uid: Some("uid-worker".into()),
+            bound: true,
+        });
+        let mut run = WorkflowRun::new(
+            "wf-bound-init".into(), "test-wf".into(), wt.to_str().unwrap().into(),
+            roles, "worker".into(), BTreeMap::new(), Some("g".into()), BTreeMap::new(), 0,
+        );
+        run.pending_activation = Some(PendingActivation {
+            activation_id: 1, target_role: "worker".into(), iteration: 1,
+            trigger: TriggerKind::Initial, raw_prompt: "the goal".into(),
+            verbatim: true, needs_fresh_reset: false, is_initial: true,
+            phase: ActivationPhase::Queued, rendered_prompt: None,
+            pre_clear_snapshot: None, enter_fire_at_ms: None,
+        });
+        run::save(&run).unwrap();
+
+        let tracker = PtyModeTracker::new();
+        let mut writes = Vec::new();
+        // Mid-turn: render + patch the initial entry, then BLOCK at the body gate.
+        let step = drive(&ctx("wf-bound-init", &wf, &wt, 1, 0), &tracker, &mut writes);
+        assert_eq!(step, FinalizeStep::Blocked, "delivery blocked while the turn is mid-flight");
+        assert!(writes.is_empty(), "no goal delivered before the turn completes");
+        assert_eq!(
+            run::load_one("wf-bound-init").unwrap().pending_activation.unwrap().phase,
+            ActivationPhase::Appended,
+            "parked at Appended awaiting turn-complete",
+        );
+
+        // The worker's turn finishes (append a tool_result + a final end_turn).
+        let mut f = std::fs::OpenOptions::new().append(true).open(dir.join("wkr.jsonl")).unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"content\":\"ok\"}]}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"stop_reason\":\"end_turn\"}}\n",
+        )
+        .unwrap();
+        let step = drive(&ctx("wf-bound-init", &wf, &wt, 1, 0), &tracker, &mut writes);
+        assert_eq!(step, FinalizeStep::Done, "delivery proceeds once the turn is complete");
+        assert!(writes.iter().any(|w| w.as_slice() == b"the goal"), "goal delivered after turn-complete");
+        // The idle-eval baseline was (re)captured at delivery: the transcript now
+        // has 2 assistant turns (the completed pre-goal turn), so the gate will
+        // fire only on a 3rd (post-goal) turn — NOT on the pre-goal completion.
+        let entry = run::load_one("wf-bound-init").unwrap()
+            .history.into_iter().rev().find(|h| h.role == "worker").unwrap();
+        assert_eq!(entry.assistant_count_at_start, 2, "baseline recomputed to the pre-delivery count");
+        assert_eq!(entry.text_messages_at_start, 1, "text baseline recomputed at delivery");
+        std::env::remove_var("HOME");
+    }
+
+    /// Regression (reviewer): a FRESH-spawned Codex initial worker whose sid was
+    /// synced at spawn (its rollout exists from boot) must NOT be held by the
+    /// bound-readiness gate, even though its pre-prompt rollout is NOT
+    /// turn-complete (no `task_complete`). `RoleBinding::bound` is false for a
+    /// fresh spawn, so the gate is skipped and the goal delivers as it does
+    /// today. With the prior sid-presence heuristic this BLOCKED forever.
+    #[test]
+    fn fresh_codex_initial_with_synced_sid_is_not_gated() {
+        let _g = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        let wt = home.path().join("wt");
+        // Codex rollout (resolved globally by sid): session_meta + one assistant
+        // message, but NO `task_complete` → `role_turn_complete` is false.
+        let cdir = home.path().join(".codex/sessions/2026/01/15");
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(
+            cdir.join("rollout.jsonl"),
+            "{\"payload\":{\"id\":\"codex-sid\",\"type\":\"session_meta\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"warm context\"}]}}\n",
+        )
+        .unwrap();
+        // Sanity: the rollout is genuinely not turn-complete.
+        assert!(
+            !transcript::role_turn_complete(&Engine::Codex, &wt, "codex-sid"),
+            "precondition: pre-prompt codex rollout is not turn-complete",
+        );
+
+        let wf = workflow();
+        let mut roles = BTreeMap::new();
+        // Fresh-spawned (bound: false) but sid already synced by the poller.
+        roles.insert("worker".to_string(), RoleBinding {
+            session_label: "worker".into(),
+            current_session_id: Some("codex-sid".into()),
+            daemon_session_uid: Some("uid-worker".into()),
+            bound: false,
+        });
+        let mut run = WorkflowRun::new(
+            "wf-fresh-codex".into(), "test-wf".into(), wt.to_str().unwrap().into(),
+            roles, "worker".into(), BTreeMap::new(), Some("g".into()), BTreeMap::new(), 0,
+        );
+        run.pending_activation = Some(PendingActivation {
+            activation_id: 1, target_role: "worker".into(), iteration: 1,
+            trigger: TriggerKind::Initial, raw_prompt: "the goal".into(),
+            verbatim: true, needs_fresh_reset: false, is_initial: true,
+            phase: ActivationPhase::Queued, rendered_prompt: None,
+            pre_clear_snapshot: None, enter_fire_at_ms: None,
+        });
+        run::save(&run).unwrap();
+
+        // worker engine = Codex for this run.
+        let mut role_engines = BTreeMap::new();
+        role_engines.insert("worker".to_string(), Engine::Codex);
+        let codex_ctx = FinalizeCtx { role_engines, ..ctx("wf-fresh-codex", &wf, &wt, 1, 0) };
+
+        let tracker = PtyModeTracker::new();
+        let mut writes = Vec::new();
+        let step = drive(&codex_ctx, &tracker, &mut writes);
+        assert_eq!(step, FinalizeStep::Done, "fresh codex delivery must NOT be gated on turn-complete");
+        assert!(writes.iter().any(|w| w.as_slice() == b"the goal"), "goal delivered for the fresh codex worker");
         std::env::remove_var("HOME");
     }
 

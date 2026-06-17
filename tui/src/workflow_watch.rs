@@ -356,6 +356,7 @@ mod tests {
                 session_label: "claude".into(),
                 current_session_id: None,
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         WorkflowRun::new(

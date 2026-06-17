@@ -101,13 +101,29 @@ pub struct HistoryEntry {
 ///   fire-precondition signal — "can the (sole) daemon poller deliver to this
 ///   role's session" — no longer relies on the best-effort
 ///   `session.set_workflow_context` RPC tags.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoleBinding {
     pub session_label: String,
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
     pub daemon_session_uid: Option<String>,
+    /// True iff this role ADOPTED an already-running session at launch (the
+    /// existing-session bind path of `start_workflow`), rather than being
+    /// fresh-spawned. Set ONLY on the bind path; fresh spawns leave it `false`.
+    ///
+    /// This is the durable, bind-time signal the finalize drainer keys its
+    /// bound-delivery readiness gate off — it must NOT be inferred from runtime
+    /// sid presence or `daemon_session_uid.is_some()`: a fresh-spawned Codex
+    /// role's rollout exists from boot, so the poller syncs its
+    /// `current_session_id` BEFORE the initial activation is delivered, and a
+    /// sid-presence heuristic would then wrongly hold its goal behind a
+    /// `role_turn_complete` check on a pre-prompt rollout (no `task_complete`
+    /// yet → blocks forever). Recorded here, the gate fires only for genuinely
+    /// adopted sessions. Additive (`#[serde(default)]`); older state.json
+    /// records deserialize to `false`.
+    #[serde(default)]
+    pub bound: bool,
 }
 
 /// Message counts at the moment the workflow run was launched. Later reads of
@@ -905,6 +921,7 @@ mod tests {
                 session_label: "claude".to_string(),
                 current_session_id: Some("sid-1".into()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         roles.insert(
@@ -913,6 +930,7 @@ mod tests {
                 session_label: "reviewer".to_string(),
                 current_session_id: None,
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         WorkflowRun::new(
@@ -1091,6 +1109,7 @@ mod tests {
                 session_label: "claude".into(),
                 current_session_id: Some("sid-w".into()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let mut run = WorkflowRun::new(

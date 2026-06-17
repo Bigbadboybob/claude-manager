@@ -15689,6 +15689,7 @@ mod transcript_rebind_tests {
                 session_label: "worker".into(),
                 current_session_id: Some("old-sid".into()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let mut role_baselines = BTreeMap::new();

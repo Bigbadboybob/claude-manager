@@ -178,6 +178,16 @@ pub enum SkipReason {
     /// This divergence is intentional + commented at the call
     /// site in `evaluate_snapshot`.
     NoHistoryEntry,
+    /// The run's `pending_activation` targets the currently-active role: a
+    /// hand-off is mid-flight and the finalize drainer owns delivering the
+    /// activation prompt to the role's PTY. Idle-evaluating it now would race
+    /// the delivery. Matters for an existing-session bind: a BOUND role has a
+    /// real sid from tick one (a fresh/unbound role's `None` sid already skips
+    /// with [`SkipReason::NoTranscriptId`] before this check), so without this
+    /// guard the gate could fire the NEXT transition against the role's
+    /// PRE-launch turns before the goal was ever delivered. Removes the
+    /// dependence on baseline arithmetic for that correctness.
+    PendingActivationInFlight,
 }
 
 /// What `collect_snapshots` returns under the lock. Pure data — no
@@ -303,6 +313,29 @@ fn codex_session_id_from_path(path: &Path) -> Option<String> {
     v.pointer("/payload/id")
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+/// Resolve the canonical transcript sid for a live session from its engine +
+/// `transcript_path`. Claude: the transcript file's stem (`<sid>.jsonl`). Codex:
+/// the first-line `payload.id` (the rollout *filename* is NOT the id — see
+/// [`codex_session_id_from_path`]). `None` if the path is absent/unparseable.
+///
+/// Shared by the poller's [`WorkflowPoller::sync_role_session_ids`] (which
+/// bridges a daemon-launched participant's detected transcript into its run
+/// binding) and `start_workflow`'s existing-session bind path (which must
+/// resolve a bound session's sid EAGERLY at launch — a bound agent appends to
+/// its EXISTING transcript, so the listing-diff discovery the fresh path uses
+/// never fires for it). Both need the SAME engine-correct logic, so it lives
+/// here as one helper rather than duplicated.
+pub fn resolve_existing_sid(session_type: &str, transcript_path: &str) -> Option<String> {
+    if session_type == "codex" {
+        codex_session_id_from_path(Path::new(transcript_path))
+    } else {
+        Path::new(transcript_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+    }
 }
 
 impl WorkflowPoller {
@@ -654,21 +687,10 @@ impl WorkflowPoller {
                     let Some(tp) = session.transcript_path.as_deref() else {
                         continue;
                     };
-                    // P-2: the canonical session id is engine-specific. For
-                    // Claude it's the transcript file's stem (`<sid>.jsonl`).
-                    // For Codex the rollout filename is NOT the id — the id is
-                    // the first-line `payload.id`, which `transcript.rs` keys
-                    // its lookups off (`find_codex_file`). Binding the filename
-                    // stem for a Codex role would make every later transcript
-                    // read miss and idle/message polling stall.
-                    let sid = if session.session_type == "codex" {
-                        codex_session_id_from_path(std::path::Path::new(tp))
-                    } else {
-                        std::path::Path::new(tp)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(str::to_string)
-                    };
+                    // P-2: the canonical session id is engine-specific (Claude
+                    // file-stem / Codex first-line `payload.id`). Shared with
+                    // `start_workflow`'s bind path via [`resolve_existing_sid`].
+                    let sid = resolve_existing_sid(&session.session_type, tp);
                     if let Some(sid) = sid {
                         out.push((run.run_id.clone(), role.clone(), sid));
                     }
@@ -931,6 +953,25 @@ impl WorkflowPoller {
                 reason: SkipReason::NoTranscriptId,
             };
         };
+        // Bound-session hand-off guard (existing-session binding): a run whose
+        // `pending_activation` targets the active role is mid-delivery — the
+        // finalize drainer owns it and will push the activation prompt to the
+        // role's PTY this/next tick. A BOUND role has a resolved sid from tick
+        // one, so unlike a fresh/unbound role (which already skipped above via
+        // `NoTranscriptId`) it WOULD reach the idle predicate here; evaluating
+        // it now could fire the next transition against the role's pre-launch
+        // turns BEFORE the goal is delivered. Skip and let the drainer finish.
+        // Placed AFTER the sid check so fresh-run behavior is unchanged (the
+        // fresh reviewer in `RebindPending` has a `None` sid and still skips
+        // with `NoTranscriptId`). Also covers the nudge path below.
+        if let Some(pa) = snap.run.pending_activation.as_ref() {
+            if pa.target_role.as_str() == active {
+                return Decision::Skip {
+                    run_id: snap.run_id.clone(),
+                    reason: SkipReason::PendingActivationInFlight,
+                };
+            }
+        }
         let session_type = snap
             .role_session_types
             .get(active)
@@ -1776,6 +1817,7 @@ mod tests {
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-worker".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let mut baselines = BTreeMap::new();
@@ -2455,6 +2497,7 @@ mod tests {
                 session_label: "reviewer".to_string(),
                 current_session_id: Some("sid-reviewer-old".to_string()),
                 daemon_session_uid: Some("ts-reviewer".to_string()),
+                bound: false,
             });
         })
         .unwrap();
@@ -2583,6 +2626,7 @@ mod tests {
                 session_label: "reviewer".to_string(),
                 current_session_id: Some("sid-rev".to_string()),
                 daemon_session_uid: Some("ts-rev".to_string()),
+                bound: false,
             });
             r.pending_activation = Some(PendingActivation {
                 activation_id: 2, target_role: "reviewer".to_string(), iteration: 2,
@@ -2660,6 +2704,7 @@ mod tests {
                 session_label: "manager".to_string(),
                 current_session_id: Some("sid-mgr".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let mut baselines = BTreeMap::new();
@@ -2874,6 +2919,7 @@ mod tests {
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-disk".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let run = WorkflowRun::new(
@@ -2953,6 +2999,7 @@ mod tests {
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-w".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         role_sessions.insert(
@@ -2961,6 +3008,7 @@ mod tests {
                 session_label: "reviewer".to_string(),
                 current_session_id: Some("sid-r".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let mut run = WorkflowRun::new(
@@ -3190,6 +3238,7 @@ mod tests {
                     session_label: "reviewer".to_string(),
                     current_session_id: Some("sid-reviewer".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
             run.active_role = Some("reviewer".to_string());
@@ -3336,6 +3385,7 @@ mod tests {
                 session_label: "worker".to_string(),
                 current_session_id: None,
                 daemon_session_uid: Some("ts-codex-w".to_string()),
+                bound: false,
             });
         })
         .unwrap();
@@ -3541,6 +3591,7 @@ to = "reviewer"
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-w".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let mut baselines = BTreeMap::new();
@@ -3626,6 +3677,7 @@ to = "reviewer"
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-w".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         // Baseline skips the first user/assistant pair so prior_* vs current_*
@@ -3802,6 +3854,7 @@ to = "reviewer"
                         session_label: "reviewer".to_string(),
                         current_session_id: Some("sid-reviewer".to_string()),
                         daemon_session_uid: None,
+                        bound: false,
                     },
                 );
 
@@ -3893,6 +3946,7 @@ to = "reviewer"
                     session_label: "reviewer".to_string(),
                     current_session_id: Some("sid-r".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         })
@@ -4015,6 +4069,7 @@ to = "reviewer"
                     session_label: "reviewer".to_string(),
                     current_session_id: Some("sid-r".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
             r.role_sessions.insert(
@@ -4023,6 +4078,7 @@ to = "reviewer"
                     session_label: "manager".to_string(),
                     current_session_id: Some("sid-m".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         })
@@ -4162,6 +4218,7 @@ to = "reviewer"
                     session_label: "reviewer".to_string(),
                     current_session_id: Some("sid-reviewer".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
             r.role_sessions.insert(
@@ -4170,6 +4227,7 @@ to = "reviewer"
                     session_label: "manager".to_string(),
                     current_session_id: Some("sid-manager".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         })
@@ -4320,6 +4378,7 @@ to = "reviewer"
                     session_label: "reviewer".to_string(),
                     current_session_id: Some("sid-r".to_string()),
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         })
@@ -4553,6 +4612,7 @@ to = "reviewer"
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-x".to_string()),
                 daemon_session_uid: Some("ts-codex-untagged".to_string()),
+                bound: false,
             },
         );
         let run = WorkflowRun::new(
@@ -4720,6 +4780,395 @@ to = "reviewer"
         );
     }
 
+    /// Existing-session binding (Phase 1) — a BOUND worker is NOT idle-evaluated
+    /// while its initial `pending_activation` is in flight, and only drives
+    /// `worker -> reviewer` AFTER a post-goal turn.
+    ///
+    /// A bound worker has a real sid from tick one (unlike a fresh worker whose
+    /// `None` sid skips with `NoTranscriptId`). With the goal not yet delivered
+    /// the drainer owns the run via `pending_activation`; the gate must SKIP
+    /// (`PendingActivationInFlight`) even when the baseline arithmetic alone
+    /// would fire — proving the guard, not luck. Once delivered (pending
+    /// cleared) the gate fires only when a NEW completed turn appears past the
+    /// (correct) baseline.
+    #[test]
+    fn poll_once_bound_worker_skips_while_pending_then_fires_after_post_goal_turn() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        let _orig_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-bind");
+        std::fs::create_dir_all(&wt).unwrap();
+        let encoded = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join("sid-worker.jsonl");
+        // One pre-existing COMPLETE turn (the worker's warm context).
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"explored\"}]}}\n",
+        )
+        .unwrap();
+
+        // `make_state_with_one_active_run` seeds a worker binding with
+        // current_session_id="sid-worker" + baseline 0/0, active_role worker,
+        // and a worker iter-1 history entry (assistant_count_at_start=0).
+        let state = make_state_with_one_active_run("r-bind");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-bind".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-bind".to_string(), ws);
+            use crate::workflow::toml_schema::{Context, Role, Transition, TriggerOn, Workflow};
+            let mut roles = BTreeMap::new();
+            for r in ["worker", "reviewer"] {
+                roles.insert(r.to_string(), Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some(r.to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                });
+            }
+            s.workflow_definitions.insert("feedback".to_string(), Workflow {
+                name: "feedback".to_string(), description: String::new(), roles,
+                role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                transitions: vec![Transition { from: "worker".to_string(), on: TriggerOn::Idle, to: "reviewer".to_string() }],
+            });
+            let mut sp = crate::session::SpawnParams::new("ts-worker", "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "ws-bind".to_string();
+            sp.session_type = "claude-code".to_string();
+            let ds: DaemonSession = DaemonSession::spawn(sp).expect("spawn");
+            s.sessions.insert("ts-worker".to_string(), ds);
+        }
+        bind_daemon_uid_to_role("r-bind", "worker", "ts-worker");
+        // The initial goal delivery is in flight (drainer owns it).
+        crate::workflow::run::modify("r-bind", |r| {
+            r.pending_activation = Some(crate::workflow::run::PendingActivation {
+                activation_id: 1,
+                target_role: "worker".to_string(),
+                iteration: 1,
+                trigger: crate::workflow::run::TriggerKind::Initial,
+                raw_prompt: "the goal".to_string(),
+                verbatim: true,
+                needs_fresh_reset: false,
+                is_initial: true,
+                phase: crate::workflow::run::ActivationPhase::Queued,
+                rendered_prompt: None,
+                pre_clear_snapshot: None,
+                enter_fire_at_ms: None,
+            });
+        })
+        .unwrap();
+
+        let poller = WorkflowPoller::new(std::sync::Arc::clone(&state));
+        poller.set_disable_apply_for_test(true);
+
+        // Part A: baseline 0 + one complete turn WOULD fire, but the pending
+        // initial activation guards it — Skip(PendingActivationInFlight).
+        let find = |ds: &[Decision]| -> Decision {
+            ds.iter().find(|d| match d {
+                Decision::Skip { run_id, .. }
+                | Decision::Nudge { run_id, .. }
+                | Decision::ActivateStatic { run_id, .. } => run_id == "r-bind",
+            }).cloned().expect("our run produced a decision")
+        };
+        assert!(
+            matches!(find(&poller.poll_once()), Decision::Skip { reason: SkipReason::PendingActivationInFlight, .. }),
+            "bound worker must NOT be idle-evaluated while its initial pending_activation is in flight",
+        );
+
+        // Part B: goal delivered (pending cleared); seed the CORRECT baseline
+        // (the 1 pre-existing turn). No new turn yet → NotIdle (not before a
+        // post-goal turn).
+        crate::workflow::run::modify("r-bind", |r| {
+            r.pending_activation = None;
+            if let Some(h) = r.history.iter_mut().find(|h| h.role == "worker") {
+                h.assistant_count_at_start = 1;
+            }
+        })
+        .unwrap();
+        assert!(
+            matches!(find(&poller.poll_once()), Decision::Skip { reason: SkipReason::NotIdle, .. }),
+            "no post-goal turn yet → must not hand off",
+        );
+
+        // The worker addresses the goal: a NEW completed turn lands.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+            f.write_all(b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"did it\"}]}}\n").unwrap();
+        }
+        assert!(
+            matches!(
+                find(&poller.poll_once()),
+                Decision::ActivateStatic { from_role, to_role, .. } if from_role == "worker" && to_role == "reviewer"
+            ),
+            "after a post-goal turn the bound worker drives worker -> reviewer",
+        );
+    }
+
+    /// Existing-session binding (Phase 1) — MID-TURN bind, end-to-end: binding a
+    /// worker that is mid-turn at launch must NOT fire worker->reviewer on the
+    /// PRE-goal turn that completes between launch and goal delivery. The
+    /// readiness gate defers delivery until that turn finishes, and the
+    /// delivery-time baseline recapture pins the idle baseline to the grown count
+    /// — so the gate fires only on the genuine POST-goal turn.
+    ///
+    /// Drives the full poller (finalize enabled) so the delivery + recompute +
+    /// idle-eval all run together. Without the recompute, tick 3 would fire on
+    /// the pre-goal turn (mutation-verified).
+    #[test]
+    fn poll_once_bound_mid_turn_worker_no_premature_fire_on_pre_goal_turn() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-mt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let encoded = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join("sid-worker.jsonl");
+        // MID-TURN at launch: one assistant tool_use record, NOT turn-complete.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{}}],\"stop_reason\":\"tool_use\"}}\n",
+        )
+        .unwrap();
+
+        let state = make_state_with_one_active_run("r-mt");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-mt".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-mt".to_string(), ws);
+            use crate::workflow::toml_schema::{Context, Role, Transition, TriggerOn, Workflow};
+            let mut roles = BTreeMap::new();
+            for r in ["worker", "reviewer"] {
+                roles.insert(r.to_string(), Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some(r.to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                });
+            }
+            s.workflow_definitions.insert("feedback".to_string(), Workflow {
+                name: "feedback".to_string(), description: String::new(), roles,
+                role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                transitions: vec![Transition { from: "worker".to_string(), on: TriggerOn::Idle, to: "reviewer".to_string() }],
+            });
+            for (uid, role) in [("ts-worker", "worker"), ("ts-reviewer", "reviewer")] {
+                let mut sp = crate::session::SpawnParams::new(uid, role, "/bin/sleep");
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws-mt".to_string();
+                sp.session_type = "claude-code".to_string();
+                s.sessions.insert(uid.to_string(), DaemonSession::spawn(sp).expect("spawn"));
+            }
+        }
+        // Bind the worker (bound: true) with the LAUNCH-time baseline = 1 (the
+        // mid-turn count). Add the reviewer binding as the transition target.
+        crate::workflow::run::modify("r-mt", |r| {
+            if let Some(b) = r.role_sessions.get_mut("worker") {
+                b.current_session_id = Some("sid-worker".to_string());
+                b.daemon_session_uid = Some("ts-worker".to_string());
+                b.bound = true;
+            }
+            r.role_sessions.insert("reviewer".to_string(), RoleBinding {
+                session_label: "reviewer".to_string(),
+                current_session_id: Some("sid-reviewer".to_string()),
+                daemon_session_uid: Some("ts-reviewer".to_string()),
+                bound: false,
+            });
+            if let Some(h) = r.history.iter_mut().find(|h| h.role == "worker") {
+                h.assistant_count_at_start = 1; // launch-time (mid-turn) count
+            }
+            r.pending_activation = Some(crate::workflow::run::PendingActivation {
+                activation_id: 1, target_role: "worker".to_string(), iteration: 1,
+                trigger: crate::workflow::run::TriggerKind::Initial,
+                raw_prompt: "the goal".to_string(), verbatim: true,
+                needs_fresh_reset: false, is_initial: true,
+                phase: crate::workflow::run::ActivationPhase::Queued,
+                rendered_prompt: None, pre_clear_snapshot: None, enter_fire_at_ms: None,
+            });
+        })
+        .unwrap();
+
+        let poller = WorkflowPoller::new(std::sync::Arc::clone(&state));
+        poller.set_finalize_timing_for_test(0, 0); // instant, gate-free delivery
+
+        // Tick 1: worker is mid-turn → delivery BLOCKS; no transition.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("r-mt").unwrap();
+        assert_eq!(run.active_role.as_deref(), Some("worker"));
+        assert!(run.pending_activation.is_some(), "delivery deferred while the worker is mid-turn");
+
+        // The PRE-goal turn completes (tool_result + end_turn): count 1 -> 2.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+            f.write_all(b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"content\":\"ok\"}]}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"finished pre-goal work\"}],\"stop_reason\":\"end_turn\"}}\n").unwrap();
+        }
+
+        // Tick 2: turn-complete → recompute baseline to 2, deliver the goal, clear pending.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("r-mt").unwrap();
+        assert!(run.pending_activation.is_none(), "goal delivered once the pre-goal turn finished");
+        assert_eq!(run.active_role.as_deref(), Some("worker"), "no premature transition at delivery");
+        let entry = run.history.iter().find(|h| h.role == "worker").unwrap();
+        assert_eq!(entry.assistant_count_at_start, 2, "idle baseline recomputed at delivery (pre-goal turn excluded)");
+
+        // Tick 3: the PRE-goal turn (count 2 == baseline 2) must NOT fire.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("r-mt").unwrap();
+        assert_eq!(run.active_role.as_deref(), Some("worker"), "pre-goal turn must NOT drive worker -> reviewer");
+
+        // The worker responds to the goal: a genuine POST-goal turn. count 2 -> 3.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+            f.write_all(b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"addressed the goal\"}],\"stop_reason\":\"end_turn\"}}\n").unwrap();
+        }
+
+        // Tick 4: NOW worker -> reviewer fires.
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("r-mt").unwrap();
+        assert_eq!(run.active_role.as_deref(), Some("reviewer"), "post-goal turn drives worker -> reviewer");
+    }
+
+    /// Existing-session binding (Phase 1) — the CENTRAL plan-then-bind flow, end
+    /// to end: binding a worker parked at an accepted `ExitPlanMode` must NOT
+    /// deadlock. The tool_use tail has `stop_reason == "tool_use"`, so
+    /// `role_turn_complete` is permanently false — the readiness gate must treat
+    /// an `ExitPlanMode` tail as ready-to-deliver (the agent is blocked awaiting
+    /// input, which is exactly the goal we deliver). Asserts the goal is
+    /// delivered (run advances past Appended / pending clears), then a genuine
+    /// post-goal turn drives worker -> reviewer.
+    #[test]
+    fn poll_once_bound_worker_parked_at_plan_delivers_goal_no_deadlock() {
+        use crate::session::DaemonSession;
+        let _guard = crate::test_support::env_lock();
+        let _tmp_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("HOME", _tmp_home.path());
+
+        let wt = _tmp_home.path().join("wt-plan");
+        std::fs::create_dir_all(&wt).unwrap();
+        let encoded = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        let proj = _tmp_home.path().join(format!(".claude/projects/{}", encoded));
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join("sid-worker.jsonl");
+        // Accepted-plan tail: 2 text turns then an ExitPlanMode tool_use (count
+        // 3). NOT `end_turn` → `role_turn_complete` is false; the run would park
+        // at Appended forever without the ExitPlanMode readiness exception.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"explored\"}]}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"found the bug\"}]}}\n{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"ExitPlanMode\",\"input\":{\"plan\":\"# Plan\\n1. fix it\"}}]}}\n",
+        )
+        .unwrap();
+        // Precondition: the tail is genuinely not turn-complete.
+        assert!(
+            !crate::workflow::transcript::role_turn_complete(&Engine::ClaudeCode, &wt, "sid-worker"),
+            "precondition: accepted-plan tail is not end_turn",
+        );
+
+        let state = make_state_with_one_active_run("r-plan");
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-plan".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-plan".to_string(), ws);
+            use crate::workflow::toml_schema::{Context, Role, Transition, TriggerOn, Workflow};
+            let mut roles = BTreeMap::new();
+            for r in ["worker", "reviewer"] {
+                roles.insert(r.to_string(), Role {
+                    engine: Engine::ClaudeCode,
+                    context: Context::Persistent,
+                    activation_prompt: Some(r.to_string()),
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                });
+            }
+            s.workflow_definitions.insert("feedback".to_string(), Workflow {
+                name: "feedback".to_string(), description: String::new(), roles,
+                role_order: vec!["worker".to_string(), "reviewer".to_string()],
+                transitions: vec![Transition { from: "worker".to_string(), on: TriggerOn::Idle, to: "reviewer".to_string() }],
+            });
+            for (uid, role) in [("ts-worker", "worker"), ("ts-reviewer", "reviewer")] {
+                let mut sp = crate::session::SpawnParams::new(uid, role, "/bin/sleep");
+                sp.args = vec!["60".to_string()];
+                sp.workspace_id = "ws-plan".to_string();
+                sp.session_type = "claude-code".to_string();
+                s.sessions.insert(uid.to_string(), DaemonSession::spawn(sp).expect("spawn"));
+            }
+        }
+        crate::workflow::run::modify("r-plan", |r| {
+            if let Some(b) = r.role_sessions.get_mut("worker") {
+                b.current_session_id = Some("sid-worker".to_string());
+                b.daemon_session_uid = Some("ts-worker".to_string());
+                b.bound = true;
+            }
+            r.role_sessions.insert("reviewer".to_string(), RoleBinding {
+                session_label: "reviewer".to_string(),
+                current_session_id: Some("sid-reviewer".to_string()),
+                daemon_session_uid: Some("ts-reviewer".to_string()),
+                bound: false,
+            });
+            if let Some(h) = r.history.iter_mut().find(|h| h.role == "worker") {
+                h.assistant_count_at_start = 3; // launch-time count incl. the plan tool_use
+            }
+            r.pending_activation = Some(crate::workflow::run::PendingActivation {
+                activation_id: 1, target_role: "worker".to_string(), iteration: 1,
+                trigger: crate::workflow::run::TriggerKind::Initial,
+                raw_prompt: "the goal".to_string(), verbatim: true,
+                needs_fresh_reset: false, is_initial: true,
+                phase: crate::workflow::run::ActivationPhase::Queued,
+                rendered_prompt: None, pre_clear_snapshot: None, enter_fire_at_ms: None,
+            });
+        })
+        .unwrap();
+
+        let poller = WorkflowPoller::new(std::sync::Arc::clone(&state));
+        poller.set_finalize_timing_for_test(0, 0);
+
+        // Tick 1: the ExitPlanMode tail is ready-to-deliver → goal lands, pending
+        // clears. (Without the exception this would park at Appended forever.)
+        poller.poll_once();
+        let run = crate::workflow::run::load_one("r-plan").unwrap();
+        assert!(run.pending_activation.is_none(), "goal delivered — no deadlock at the accepted plan");
+        assert_eq!(run.active_role.as_deref(), Some("worker"), "no premature transition on the plan tail");
+        let entry = run.history.iter().find(|h| h.role == "worker").unwrap();
+        assert_eq!(entry.assistant_count_at_start, 3, "baseline incl. the plan tool_use; gate fires only past it");
+
+        // The plan tool_use (count 3 == baseline 3) must NOT fire.
+        poller.poll_once();
+        assert_eq!(
+            crate::workflow::run::load_one("r-plan").unwrap().active_role.as_deref(),
+            Some("worker"),
+            "the accepted-plan tail must NOT drive worker -> reviewer",
+        );
+
+        // The worker executes the plan in response to the goal: a post-goal turn.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+            f.write_all(b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"executed the plan\"}],\"stop_reason\":\"end_turn\"}}\n").unwrap();
+        }
+        poller.poll_once();
+        assert_eq!(
+            crate::workflow::run::load_one("r-plan").unwrap().active_role.as_deref(),
+            Some("reviewer"),
+            "a post-goal turn drives worker -> reviewer",
+        );
+    }
+
     /// Round-4 F3 — worktree resolution via session tags, NOT
     /// `run.task_key`. When `run.task_key` drifts (e.g. workspace
     /// renamed at TUI level, or run was launched with a different
@@ -4761,6 +5210,7 @@ to = "reviewer"
                 session_label: "worker".to_string(),
                 current_session_id: Some("sid-worker".to_string()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let run = WorkflowRun::new(

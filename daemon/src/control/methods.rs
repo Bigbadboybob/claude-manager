@@ -2594,6 +2594,16 @@ struct StartWorkflowParams {
     cols: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+    /// Existing-session binding (Phase 1 of `doc/existing-session-binding.md`):
+    /// optional `role -> existing daemon_session_uid` map. For each entry the
+    /// daemon ADOPTS the already-running live session as that role instead of
+    /// fresh-spawning it — preserving its explored context and (for the initial
+    /// worker) delivering the goal to the warm agent. Eligibility is enforced
+    /// (persistent + `needs_mcp=false` roles only, same-workspace, engine-match,
+    /// exclusive); an ineligible/unresolvable entry FAILS the launch rather than
+    /// silently fresh-spawning. ABSENT → byte-identical fresh-spawn behavior.
+    #[serde(default)]
+    role_sessions: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Phase 4 §D: daemon-side `start_workflow`. Spawns each role's participant
@@ -2782,6 +2792,273 @@ pub fn start_workflow(
     // Spawn each role fresh, in role_order, via the in-process start_session.
     let mut role_sessions: std::collections::BTreeMap<String, RoleBinding> = std::collections::BTreeMap::new();
     let mut role_baselines: std::collections::BTreeMap<String, MessageBaseline> = std::collections::BTreeMap::new();
+
+    // ───────────── Existing-session binding (Phase 1) ─────────────
+    // Resolve every `role_sessions` entry UP FRONT — validate eligibility,
+    // eagerly resolve the bound session's sid, capture its turn/text baselines
+    // + any accepted pre-launch plan — BEFORE the spawn loop. Doing it before
+    // any spawn means a bind REJECTION leaves zero spawned sessions to clean
+    // up; the loop below simply skips a bound role. Bound sessions are tagged
+    // with (run_id, role) only AFTER state.json is saved (tag-after-save), so a
+    // pre-save failure never orphans a tag on a pre-existing session.
+    let role_sessions_param: std::collections::BTreeMap<String, String> =
+        p.role_sessions.clone().unwrap_or_default();
+    let mut bound_bindings: std::collections::BTreeMap<String, RoleBinding> =
+        std::collections::BTreeMap::new();
+    let mut bound_baselines: std::collections::BTreeMap<String, MessageBaseline> =
+        std::collections::BTreeMap::new();
+    let mut bound_text_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut bound_plans: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    // (uid, role) pairs tagged AFTER save (tag-after-save).
+    let mut bound_uid_roles: Vec<(String, String)> = Vec::new();
+    if !role_sessions_param.is_empty() {
+        use crate::workflow::toml_schema::Context;
+        // Engine spelling differs across surfaces (the TUI's
+        // `Engine::as_session_type()` returns `"claude"`; the daemon spawn path
+        // uses `"claude-code"`); compare on a normalized form.
+        fn normalize_engine(s: &str) -> &str {
+            match s {
+                "claude" | "claude-code" => "claude",
+                other => other,
+            }
+        }
+        struct BindWork {
+            role: String,
+            uid: String,
+            engine: Engine,
+            sid: String,
+        }
+        // Validate eligibility + eagerly resolve each bound sid under the lock
+        // (pure reads). Any failure returns BEFORE the spawn loop runs.
+        let binds: Vec<BindWork> = {
+            let state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
+            // Loaded once for the exclusivity check below.
+            let all_runs = crate::workflow::run::load_all();
+            let mut seen_uids: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::new();
+            let mut out: Vec<BindWork> = Vec::new();
+            for (role_name, uid) in &role_sessions_param {
+                // (1) role exists in the workflow definition.
+                let Some(role) = wf.roles.get(role_name) else {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: role_sessions names role '{}' which is not \
+                             in workflow '{}'",
+                            role_name, p.workflow_name
+                        ),
+                    ));
+                };
+                // (2) persistent (not fresh) — fresh resets context on every
+                // activation; adopting context to KEEP it contradicts that.
+                if role.context != Context::Persistent {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: role '{}' is Context::Fresh and cannot bind \
+                             an existing session (fresh roles reset on every activation; \
+                             the adopted context would be wiped)",
+                            role_name
+                        ),
+                    ));
+                }
+                // (3) does not need the workflow MCP — a needs_mcp role would
+                // require a --resume respawn to gain the MCP, defeating the bind.
+                if role.needs_mcp {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: role '{}' has needs_mcp=true and cannot bind \
+                             an existing session (it would need a --resume respawn to gain \
+                             the workflow MCP)",
+                            role_name
+                        ),
+                    ));
+                }
+                // (4) no duplicate uid across two roles in this map.
+                if let Some(prev_role) = seen_uids.insert(uid.as_str(), role_name.as_str()) {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: uid '{}' bound to two roles ('{}' and '{}') \
+                             in role_sessions",
+                            uid, prev_role, role_name
+                        ),
+                    ));
+                }
+                // (5) uid is a live daemon session on THIS host (no cross-host).
+                let Some(session) = state.sessions.get(uid) else {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: role_sessions uid '{}' is not a live daemon \
+                             session in this host's registry",
+                            uid
+                        ),
+                    ));
+                };
+                // (6) the bound session's engine matches the role's TOML engine.
+                if normalize_engine(&session.session_type)
+                    != normalize_engine(role.engine.as_session_type())
+                {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: bound session '{}' is a '{}' session but role \
+                             '{}' is engine '{}'",
+                            uid,
+                            session.session_type,
+                            role_name,
+                            role.engine.as_session_type()
+                        ),
+                    ));
+                }
+                // (7) the bound session is in the run's RESOLVED workspace, so
+                // baseline counting reads ITS OWN transcript dir, not a
+                // different worktree's. `check_session_caller` alone is
+                // insufficient — it admits any descendant/same-workspace target.
+                if session.workspace_id != workspace_id {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: bound session '{}' is in workspace '{}', not \
+                             the run's workspace '{}'",
+                            uid, session.workspace_id, workspace_id
+                        ),
+                    ));
+                }
+                // (8) caller is authorized for uid. Session caller passes the
+                // descendant/same-workspace scope check; Operator was already
+                // token-validated at the dispatch boundary.
+                if let Some(cuid) = caller_uid.as_deref() {
+                    if !crate::control::auth::check_session_caller(&state, cuid, uid).is_allow() {
+                        return Err((
+                            ErrorCode::Unauthorized,
+                            format!(
+                                "start_workflow: caller '{}' is not authorized to bind \
+                                 session '{}' (out of descendant/workspace scope)",
+                                cuid, uid
+                            ),
+                        ));
+                    }
+                }
+                // (9) exclusivity: uid not already a participant of another
+                // ACTIVE run, and no stale workflow tag pointing at an active
+                // run — either would let the OTHER run's poller keep driving
+                // this PTY after we overwrote its tags (two pollers, one agent).
+                //
+                // TOCTOU (deferred — out of Phase 1 scope): this check reads
+                // `all_runs` under the lock, but the bound session is tagged only
+                // AFTER `save` (the tag-after-save acceptance criterion releases
+                // the lock in between). Two concurrent `start_workflow` RPCs both
+                // binding the SAME uid could each pass this check before either
+                // tags, yielding two active runs whose `daemon_session_uid` point
+                // at one PTY. A reservation that closed the window would conflict
+                // with tag-after-save, and the realistic trigger (two
+                // simultaneous deliberate binds of one live session on a
+                // mostly-single-operator daemon) is narrow. The doc's Phase-1 bar
+                // is the rejection check itself (implemented + tested); closing
+                // the race is left to a follow-up.
+                for run in all_runs.iter().filter(|r| r.is_active()) {
+                    if run
+                        .role_sessions
+                        .values()
+                        .any(|b| b.daemon_session_uid.as_deref() == Some(uid.as_str()))
+                    {
+                        return Err((
+                            ErrorCode::InvalidParams,
+                            format!(
+                                "start_workflow: uid '{}' is already a participant of \
+                                 active run '{}'",
+                                uid, run.run_id
+                            ),
+                        ));
+                    }
+                }
+                if let Some(tag_run) = session.workflow_run_id.as_deref() {
+                    if all_runs.iter().any(|r| r.is_active() && r.run_id == tag_run) {
+                        return Err((
+                            ErrorCode::InvalidParams,
+                            format!(
+                                "start_workflow: bound session '{}' still carries a \
+                                 workflow tag for active run '{}'",
+                                uid, tag_run
+                            ),
+                        ));
+                    }
+                }
+                // Eagerly resolve the sid (claude file-stem / codex payload.id).
+                // A bound agent APPENDS to its EXISTING transcript, so the
+                // fresh-spawn listing-diff discovery never fires for it: resolve
+                // NOW or reject (do NOT fall through to new-file discovery).
+                let Some(tp) = session.transcript_path.as_deref() else {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: bound session '{}' has no resolvable transcript \
+                             yet; retry once it has run a turn",
+                            uid
+                        ),
+                    ));
+                };
+                let Some(sid) =
+                    crate::workflow::poller::resolve_existing_sid(&session.session_type, tp)
+                else {
+                    return Err((
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "start_workflow: could not resolve a transcript sid for bound \
+                             session '{}' (path '{}')",
+                            uid, tp
+                        ),
+                    ));
+                };
+                out.push(BindWork {
+                    role: role_name.clone(),
+                    uid: uid.clone(),
+                    engine: role.engine.clone(),
+                    sid,
+                });
+            }
+            out
+        };
+        // Baselines + plan read lock-free against the run's worktree (== the
+        // bound session's worktree, enforced by the workspace-match check), so
+        // the idle gate counts only turns produced AFTER the goal is delivered.
+        let wt_path = std::path::Path::new(&worktree);
+        for bw in binds {
+            use crate::workflow::transcript::{
+                count_messages, latest_plan, list_messages, MessageKind,
+            };
+            let assistant = count_messages(&bw.engine, wt_path, &bw.sid, MessageKind::Assistant);
+            let user = count_messages(&bw.engine, wt_path, &bw.sid, MessageKind::User);
+            let text =
+                list_messages(&bw.engine, wt_path, &bw.sid, MessageKind::Assistant).len();
+            let plan = latest_plan(&bw.engine, wt_path, &bw.sid);
+            bound_bindings.insert(
+                bw.role.clone(),
+                RoleBinding {
+                    session_label: bw.role.clone(),
+                    current_session_id: Some(bw.sid.clone()),
+                    daemon_session_uid: Some(bw.uid.clone()),
+                    // The durable bind-time signal the finalize readiness gate
+                    // keys off (NOT runtime sid presence — see RoleBinding::bound).
+                    bound: true,
+                },
+            );
+            bound_baselines.insert(
+                bw.role.clone(),
+                MessageBaseline { user_count: user, assistant_count: assistant },
+            );
+            bound_text_counts.insert(bw.role.clone(), text);
+            if let Some(p) = plan {
+                bound_plans.insert(bw.role.clone(), p);
+            }
+            bound_uid_roles.push((bw.uid, bw.role));
+        }
+    }
     // P-2: the configured `mcp_server_path` (daemon.toml) is the AUTHORITATIVE
     // location for the MCP server on a headless/remote deployment (cm-manager,
     // /opt/cm-daemon) where the repo-relative fallback doesn't resolve. Thread
@@ -2794,6 +3071,18 @@ pub fn start_workflow(
     };
     for role_name in &wf.role_order {
         let Some(role) = wf.roles.get(role_name) else { continue };
+        // Existing-session binding: a bound role adopts its pre-resolved binding
+        // + baseline (computed up front) instead of fresh-spawning. No spawn, no
+        // detector, no spawn-queue ticket — the session is already live and its
+        // sid is already resolved.
+        if let Some(binding) = bound_bindings.get(role_name) {
+            role_sessions.insert(role_name.clone(), binding.clone());
+            role_baselines.insert(
+                role_name.clone(),
+                bound_baselines.get(role_name).cloned().unwrap_or_default(),
+            );
+            continue;
+        }
         let session_type = match role.engine {
             Engine::ClaudeCode => "claude-code",
             Engine::Codex => "codex",
@@ -3000,6 +3289,7 @@ pub fn start_workflow(
             session_label: role_name.clone(),
             current_session_id: None,
             daemon_session_uid: Some(uid),
+            bound: false,
         });
         role_baselines.insert(role_name.clone(), MessageBaseline::default());
     }
@@ -3009,6 +3299,12 @@ pub fn start_workflow(
         "start_workflow: workflow has no roles".into(),
     ))?;
 
+    // Existing-session binding: when the INITIAL role is bound, seed its
+    // iteration-1 history entry's `text_messages_at_start` from the live
+    // transcript's text-bearing assistant count so `{{ roles.worker.this_turn }}`
+    // covers only the post-goal turn (not the worker's pre-launch text). Any
+    // bound role's accepted pre-launch plan rides in via `role_plans`.
+    let initial_text_count = bound_text_counts.get(&initial_role).copied().unwrap_or(0);
     let mut run = crate::workflow::run::WorkflowRun::new(
         run_id.clone(),
         p.workflow_name.clone(),
@@ -3017,8 +3313,8 @@ pub fn start_workflow(
         initial_role.clone(),
         role_baselines,
         if goal.is_empty() { None } else { Some(goal.clone()) },
-        std::collections::BTreeMap::new(),
-        0,
+        bound_plans,
+        initial_text_count,
     );
     if let Some(tid) = task_id.clone() {
         run.task_id = Some(tid);
@@ -3074,6 +3370,18 @@ pub fn start_workflow(
     let watcher = {
         let mut state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
         state.workflow_runs.insert(run_id.clone(), run.clone());
+        // Tag-after-save (existing-session binding): the bound (pre-existing)
+        // sessions get their (run_id, role) workflow tags ONLY now that
+        // state.json is durably saved. A failure before this point left them
+        // untouched (no orphan tag pointing at a nonexistent run); fresh-spawned
+        // participants were tagged at spawn and cleaned up on failure, bound
+        // sessions simply kept their prior (untagged) state.
+        for (uid, role) in &bound_uid_roles {
+            if let Some(s) = state.sessions.get_mut(uid) {
+                s.workflow_run_id = Some(run_id.clone());
+                s.workflow_role = Some(role.clone());
+            }
+        }
         state.workflow_event_watcher.clone()
     };
     // P-3: broadcast the newly-created run as a state snapshot so clients that
@@ -9114,6 +9422,7 @@ mod tests {
                     session_label: role.to_string(),
                     current_session_id: None,
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         }
@@ -11426,6 +11735,410 @@ mod tests {
         });
     }
 
+    // ───────────────── Existing-session binding (Phase 1) ─────────────────
+
+    /// Write a Claude JSONL transcript where `claude_transcript_path` derives it
+    /// for `(wt, sid)`, returning the absolute path string for use as a live
+    /// session's `transcript_path`.
+    fn bind_write_claude_transcript(wt: &std::path::Path, sid: &str, body: &str) -> String {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+        let enc = wt.to_str().unwrap().replace('/', "-").replace('.', "-");
+        let dir = home.join(format!(".claude/projects/{}", enc));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", sid));
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Spawn a live `/bin/sleep` daemon session for binding tests with the given
+    /// engine/workspace and `transcript_path` (None = not-yet-resolvable).
+    fn bind_spawn_session(
+        s: &mut DaemonState,
+        uid: &str,
+        session_type: &str,
+        workspace_id: &str,
+        transcript_path: Option<String>,
+    ) {
+        use crate::session::{DaemonSession, SpawnParams};
+        let mut sp = SpawnParams::new(uid, uid, "/bin/sleep");
+        sp.args = vec!["120".to_string()];
+        sp.session_type = session_type.to_string();
+        sp.workspace_id = workspace_id.to_string();
+        sp.transcript_path = transcript_path;
+        s.sessions
+            .insert(uid.to_string(), DaemonSession::spawn(sp).expect("spawn"));
+    }
+
+    /// Acceptance #1 (regression): with NO `role_sessions`, every role is
+    /// fresh-spawned exactly as before — bound to a freshly-minted daemon uid,
+    /// `current_session_id` discovered later (None at launch), no plans seeded,
+    /// the initial entry's `text_messages_at_start` 0. Pins "absent →
+    /// byte-identical behavior to today".
+    #[test]
+    fn start_workflow_absent_role_sessions_fresh_spawns_unchanged() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g",
+                "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+            })).expect("ok");
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            // Fresh-spawn binding: a NEW minted uid, sid discovered later (None).
+            let b = &run.role_sessions["worker"];
+            assert!(b.daemon_session_uid.is_some(), "fresh worker bound to a minted uid");
+            assert!(b.current_session_id.is_none(), "fresh worker sid discovered later");
+            assert!(!b.bound, "fresh spawn leaves the bound flag false");
+            // No bind-only state seeded.
+            assert!(run.role_plans.is_empty(), "no plans without role_sessions");
+            assert_eq!(run.history[0].text_messages_at_start, 0, "no bound text baseline");
+            assert_eq!(run.role_baselines["worker"].assistant_count, 0, "fresh baseline 0/0");
+        });
+    }
+
+    /// Acceptance #2: binding an eligible persistent/non-mcp role to a live
+    /// session with an N-assistant-turn / M-text transcript that ends in an
+    /// accepted `ExitPlanMode` records the binding (uid + eagerly-resolved sid),
+    /// `MessageBaseline.assistant_count == N`, the initial entry's
+    /// `text_messages_at_start == M`, and `role_plans[role]` — with NO fresh
+    /// spawn for that role.
+    #[test]
+    fn start_workflow_binds_eligible_worker_with_baseline_text_and_plan() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            // N=3 assistant turns (2 text + 1 ExitPlanMode tool_use tail),
+            // M=2 text-bearing. The plan is the LAST assistant line, so
+            // `latest_plan` surfaces it.
+            let body = [
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"explored the code"}]}}"##,
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"found the bug"}]}}"##,
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"# Plan\n1. fix it"}}]}}"##,
+            ].join("\n");
+            let tp = bind_write_claude_transcript(&wt, "sid-worker-live", &body);
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                bind_spawn_session(&mut s, "sess-worker", "claude-code", "ws-1", Some(tp));
+            }
+            let _ = take_spawn_snapshots_for_test(); // clear prior captures
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "do the thing",
+                "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+                "role_sessions": { "worker": "sess-worker" },
+            })).expect("eligible bind ok");
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            let run = crate::workflow::run::load_one(resp["run_id"].as_str().unwrap()).unwrap();
+            let b = &run.role_sessions["worker"];
+            assert_eq!(b.daemon_session_uid.as_deref(), Some("sess-worker"), "bound to the existing uid");
+            assert_eq!(b.current_session_id.as_deref(), Some("sid-worker-live"), "sid resolved eagerly");
+            assert!(b.bound, "bind path records the durable bound flag");
+            assert_eq!(run.role_baselines["worker"].assistant_count, 3, "assistant baseline == N (turns)");
+            assert_eq!(run.history[0].text_messages_at_start, 2, "initial entry text baseline == M");
+            assert_eq!(run.role_plans.get("worker").map(String::as_str), Some("# Plan\n1. fix it"), "accepted plan snapshotted");
+            // No fresh spawn for the bound role: the only session is the bound
+            // one, and the spawn loop recorded no pre-snapshot for the worker.
+            assert_eq!(state.lock().unwrap().sessions.len(), 1, "no extra session minted for the bound role");
+            assert!(take_spawn_snapshots_for_test().is_empty(), "bound role never enters the spawn/detector path");
+            // The bound worker is the initial role: delivery-only initial activation.
+            let pa = run.pending_activation.as_ref().expect("initial pending activation");
+            assert!(pa.is_initial && pa.target_role == "worker");
+        });
+    }
+
+    /// Acceptance #3: a bound session whose sid is NOT resolvable (no transcript
+    /// yet) is REJECTED with `InvalidParams` — it must NOT enter the run with
+    /// `current_session_id = None`. No run is persisted.
+    #[test]
+    fn start_workflow_bind_rejects_unresolvable_sid() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                // Live session but NO transcript_path → sid unresolvable.
+                bind_spawn_session(&mut s, "sess-worker", "claude-code", "ws-1", None);
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let result = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g",
+                "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+                "role_sessions": { "worker": "sess-worker" },
+            }));
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            let (code, msg) = result.expect_err("unresolvable sid must be rejected");
+            assert_eq!(code, ErrorCode::InvalidParams);
+            assert!(msg.contains("no resolvable transcript"), "reason named: {msg}");
+            assert!(crate::workflow::run::load_all().is_empty(), "no run persisted on rejection");
+        });
+    }
+
+    /// Acceptance #4: each eligibility rejection returns `InvalidParams` /
+    /// `Unauthorized` naming the reason — fresh role, needs_mcp role, unknown
+    /// role, non-existent uid, other-workspace uid, engine mismatch, a uid in
+    /// another active run, and a duplicate uid across two roles.
+    #[test]
+    fn start_workflow_bind_eligibility_rejections() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            let wt_other = home.join("wt-other");
+            std::fs::create_dir_all(&wt).unwrap();
+            std::fs::create_dir_all(&wt_other).unwrap();
+            let tp = bind_write_claude_transcript(
+                &wt, "sid-worker-live",
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"##,
+            );
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                for (id, w) in [("ws-1", &wt), ("ws-other", &wt_other)] {
+                    let mut ws = crate::manifest::ManifestWorkspace::default();
+                    ws.id = id.to_string();
+                    ws.worktree_path = Some(w.clone());
+                    s.workspaces.insert(id.to_string(), ws);
+                }
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker2".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("w2".into()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: true });
+                s.base_workflow_definitions.insert("multi".to_string(), Workflow {
+                    name: "multi".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "worker2".into(), "reviewer".into(), "manager".into()],
+                    transitions: vec![],
+                });
+                bind_spawn_session(&mut s, "sess-worker", "claude-code", "ws-1", Some(tp));
+                bind_spawn_session(&mut s, "sess-codex", "codex", "ws-1", None);
+                bind_spawn_session(&mut s, "sess-other-ws", "claude-code", "ws-other", None);
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+
+            let call = |rs: serde_json::Value| {
+                start_workflow(&state, &Caller::operator("op"), &json!({
+                    "workflow_name": "multi", "goal": "g",
+                    "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+                    "role_sessions": rs,
+                }))
+            };
+            let reject = |rs: serde_json::Value, want_code: ErrorCode, needle: &str| {
+                let (code, msg) = call(rs).expect_err(&format!("must reject ({needle})"));
+                assert_eq!(code, want_code, "code for {needle}: got msg {msg}");
+                assert!(msg.to_lowercase().contains(needle), "reason for {needle} not named: {msg}");
+            };
+
+            reject(json!({ "ghostrole": "sess-worker" }), ErrorCode::InvalidParams, "not in workflow");
+            reject(json!({ "reviewer": "sess-worker" }), ErrorCode::InvalidParams, "fresh");
+            reject(json!({ "manager": "sess-worker" }), ErrorCode::InvalidParams, "needs_mcp");
+            reject(json!({ "worker": "ghost-uid" }), ErrorCode::InvalidParams, "not a live daemon session");
+            reject(json!({ "worker": "sess-other-ws" }), ErrorCode::InvalidParams, "workspace");
+            reject(json!({ "worker": "sess-codex" }), ErrorCode::InvalidParams, "engine");
+            // Duplicate uid across two roles (worker + worker2 both → sess-worker).
+            reject(json!({ "worker": "sess-worker", "worker2": "sess-worker" }), ErrorCode::InvalidParams, "two roles");
+
+            // uid already a participant of another ACTIVE run.
+            {
+                use crate::workflow::run::{MessageBaseline, RoleBinding, WorkflowRun};
+                let mut rs = BTreeMap::new();
+                rs.insert("worker".to_string(), RoleBinding {
+                    session_label: "worker".to_string(),
+                    current_session_id: Some("sid-worker-live".to_string()),
+                    daemon_session_uid: Some("sess-worker".to_string()),
+                    bound: false,
+                });
+                let other = WorkflowRun::new(
+                    "wf-other-active".to_string(), "multi".to_string(), "ws-1".to_string(),
+                    rs, "worker".to_string(), BTreeMap::new(), None, BTreeMap::new(), 0,
+                );
+                crate::workflow::run::save(&other).unwrap();
+            }
+            reject(json!({ "worker": "sess-worker" }), ErrorCode::InvalidParams, "active run");
+
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+            // Only the seeded conflicting run exists; no rejection persisted a run.
+            assert_eq!(crate::workflow::run::load_all().len(), 1, "rejections persist no new run");
+        });
+    }
+
+    /// Acceptance #4 (Unauthorized branch): a Session caller binding a uid that
+    /// is in the run's workspace but OUT OF its descendant/task scope is rejected
+    /// with `Unauthorized` (the `check_session_caller` gate), distinct from the
+    /// InvalidParams workspace-mismatch branch.
+    #[test]
+    fn start_workflow_bind_rejects_out_of_scope_caller() {
+        use crate::session::{DaemonSession, SpawnParams};
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let tp = bind_write_claude_transcript(
+                &wt, "sid-target",
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"##,
+            );
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                // Sibling tasks: task-B is NOT a descendant of the caller's task-A.
+                s.task_tree.insert("task-A".to_string(), None);
+                s.task_tree.insert("task-B".to_string(), None);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                // Caller bound to task-A; target session in the SAME workspace
+                // but under the unrelated task-B (out of the caller's scope).
+                let mut sp = SpawnParams::new("ts-caller", "caller", "/bin/sleep");
+                sp.args = vec!["120".to_string()];
+                sp.workspace_id = "ws-1".to_string();
+                sp.task_id = Some("task-A".to_string());
+                s.sessions.insert("ts-caller".to_string(), DaemonSession::spawn(sp).expect("spawn"));
+                let mut spt = SpawnParams::new("sess-target", "target", "/bin/sleep");
+                spt.args = vec!["120".to_string()];
+                spt.session_type = "claude-code".to_string();
+                spt.workspace_id = "ws-1".to_string();
+                spt.task_id = Some("task-B".to_string());
+                spt.transcript_path = Some(tp);
+                s.sessions.insert("sess-target".to_string(), DaemonSession::spawn(spt).expect("spawn"));
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let result = start_workflow(&state, &Caller::session("ts-caller"), &json!({
+                "workflow_name": "solo", "goal": "g",
+                "role_sessions": { "worker": "sess-target" },
+            }));
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            let (code, msg) = result.expect_err("out-of-scope bind must be rejected");
+            assert_eq!(code, ErrorCode::Unauthorized);
+            assert!(msg.to_lowercase().contains("not authorized"), "reason named: {msg}");
+            assert!(crate::workflow::run::load_all().is_empty(), "no run persisted");
+        });
+    }
+
+    /// Acceptance #6: a launch that fails AFTER bind eligibility but BEFORE save
+    /// leaves the bound session's `workflow_run_id`/`workflow_role` tags
+    /// unchanged (tag-after-save). The bound worker passes eligibility; the
+    /// fresh Codex reviewer's detector arm then fails the launch closed.
+    #[test]
+    fn start_workflow_bind_tags_only_after_save() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let tp = bind_write_claude_transcript(
+                &wt, "sid-worker-live",
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"##,
+            );
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
+                    name: "feedback".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "reviewer".into()],
+                    transitions: vec![Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() }],
+                });
+                bind_spawn_session(&mut s, "sess-worker", "claude-code", "ws-1", Some(tp));
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            // The fresh Codex reviewer arms a detector; make it fail so the
+            // launch fails AFTER the worker bind passed eligibility.
+            set_failing_detector_for_test(true);
+            let result = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "feedback", "goal": "g",
+                "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+                "role_sessions": { "worker": "sess-worker" },
+            }));
+            set_failing_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+
+            assert!(result.is_err(), "launch must fail closed on detector failure");
+            // tag-after-save: the bound session keeps its prior (untagged) state.
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get("sess-worker").expect("bound session still live");
+            assert!(sess.workflow_run_id.is_none(), "no orphan run tag on the bound session");
+            assert!(sess.workflow_role.is_none(), "no orphan role tag on the bound session");
+            assert!(crate::workflow::run::load_all().is_empty(), "no run persisted");
+        });
+    }
+
     /// P-3a: the directly-tested resolver — a "claude-code" wire type with
     /// `CM_SESSION_MEM_SOFT_CLAUDE=6G` (+ matching hard) must resolve a non-None
     /// cap with the correct suffix-parsed byte value. This is the assertion that
@@ -11850,7 +12563,7 @@ mod tests {
             }
             // Pre-seed a victim run that must NOT be clobbered.
             let mut victim_roles = BTreeMap::new();
-            victim_roles.insert("worker".to_string(), RoleBinding { session_label: "worker".into(), current_session_id: Some("victim-sid".into()), daemon_session_uid: None });
+            victim_roles.insert("worker".to_string(), RoleBinding { session_label: "worker".into(), current_session_id: Some("victim-sid".into()), daemon_session_uid: None, bound: false });
             let victim = WorkflowRun::new("wf_victim".into(), "solo".into(), "ws-1".into(), victim_roles, "worker".into(), BTreeMap::new(), Some("victim goal".into()), BTreeMap::new(), 0);
             crate::workflow::run::save(&victim).unwrap();
 

@@ -3132,6 +3132,7 @@ mod tests {
                 session_label: "claude".into(),
                 current_session_id: Some("sid-w".into()),
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let run = WorkflowRun::new(
@@ -3247,6 +3248,7 @@ mod tests {
                     session_label: r.into(),
                     current_session_id: None,
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         }
@@ -3394,6 +3396,7 @@ mod tests {
                 session_label: "claude".into(),
                 current_session_id: None,
                 daemon_session_uid: None,
+                bound: false,
             },
         );
         let run = WorkflowRun::new(

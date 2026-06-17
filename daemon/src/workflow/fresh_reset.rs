@@ -276,6 +276,7 @@ mod tests {
                 session_label: role.to_string(),
                 current_session_id: Some(old_sid.to_string()),
                 daemon_session_uid: Some(uid.to_string()),
+                bound: false,
             },
         );
         // Non-zero baseline so the reset's "-> 0" is observable.
@@ -310,6 +311,7 @@ mod tests {
                 session_label: "reviewer".to_string(),
                 current_session_id: None,
                 daemon_session_uid: Some("uid".to_string()),
+                bound: false,
             },
         );
         let run = WorkflowRun::new(

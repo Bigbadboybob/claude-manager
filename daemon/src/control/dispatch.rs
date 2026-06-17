@@ -6888,6 +6888,7 @@ mod tests {
                     session_label: role.to_string(),
                     current_session_id: None,
                     daemon_session_uid: None,
+                    bound: false,
                 },
             );
         }
