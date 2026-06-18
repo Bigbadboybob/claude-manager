@@ -12420,11 +12420,11 @@ impl App {
                     };
 
                     let max_name = (inner.width as usize).saturating_sub(2);
-                    let name = if ws.name.len() > max_name {
-                        format!("{}...", &ws.name[..max_name.saturating_sub(3)])
-                    } else {
-                        ws.name.clone()
-                    };
+                    // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
+                    // slice panics when the cut lands inside a multibyte char
+                    // (e.g. '≤' in a workspace name). Matches the session/task
+                    // name truncation sites below.
+                    let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
                     let header_line = Line::from(vec![
                         Span::raw(" "),
