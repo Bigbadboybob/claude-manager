@@ -7910,9 +7910,24 @@ impl App {
             Some(i) => i,
             None => return,
         };
-        // Idempotent: already present → no-op (duplicate Added / an Updated for
-        // a row we already adopted).
-        if self.workspaces[ws_idx].sessions.iter().any(|s| s.uid == uid) {
+        // Already present: a duplicate `Added` / a re-broadcast is a no-op, but
+        // an existing row that just BECAME a participant — an existing-session
+        // bind, where the bound worker keeps its pre-existing TUI row — must get
+        // its workflow tags stamped in place so it re-groups under the workflow
+        // header and workflow ops recognize it. Don't rebuild the row (its PTY,
+        // label, and transcript are already correct).
+        if let Some(existing) = self.workspaces[ws_idx]
+            .sessions
+            .iter_mut()
+            .find(|s| s.uid == uid)
+        {
+            if existing.workflow_run_id.as_deref() != Some(run_id.as_str())
+                || existing.workflow_role != role
+            {
+                existing.workflow_run_id = Some(run_id);
+                existing.workflow_role = role;
+                self.needs_redraw = true;
+            }
             return;
         }
 
@@ -16307,6 +16322,48 @@ mod pending_workflow_events_tests {
             app.workspaces[0].sessions.is_empty(),
             "attach failure (no daemon) must be graceful — no row",
         );
+    }
+
+    /// Regression (existing-session bind): when a session that is ALREADY a TUI
+    /// row becomes a workflow participant (the bound worker keeps its
+    /// pre-existing row), an `Updated` broadcast must STAMP the workflow tags
+    /// onto that row in place — not no-op — so it re-groups under the workflow
+    /// header. Before the fix the idempotent early-return dropped the tags and
+    /// the bound worker rendered OUTSIDE its own workflow group.
+    #[test]
+    fn adopt_stamps_tags_on_existing_bound_row_in_place() {
+        let mut app = build_app_for_buffer_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        app.workspaces.push(test_workspace("ws-b", tmp.path().to_path_buf()));
+
+        // A pre-existing, UNTAGGED row — a session the user was working in, about
+        // to be bound as the worker.
+        let session = crate::session::Session::new(
+            "/bin/true", &[], 80, 24, None, HashMap::new(), None,
+        )
+        .expect("session for test");
+        let row = make_simple_session_with_uid(
+            "ts-bound".to_string(), "worker: live", "claude", session, None,
+        );
+        assert!(row.workflow_run_id.is_none(), "precondition: row starts untagged");
+        app.workspaces.last_mut().unwrap().sessions.push(row);
+
+        // The daemon's bind broadcast: an Updated entry tagging the existing row.
+        app.adopt_daemon_workflow_participant(
+            "ts-bound",
+            &serde_json::json!({
+                "uid": "ts-bound",
+                "workspace_id": "ws-b",
+                "session_type": "claude-code",
+                "workflow_run_id": "wf_bind",
+                "workflow_role": "worker",
+            }),
+        );
+
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-b").unwrap();
+        assert_eq!(ws.sessions.len(), 1, "no duplicate row — tags applied in place");
+        assert_eq!(ws.sessions[0].workflow_run_id.as_deref(), Some("wf_bind"), "run tag stamped in place");
+        assert_eq!(ws.sessions[0].workflow_role.as_deref(), Some("worker"), "role tag stamped in place");
     }
 
     /// Option B (criterion #4) — the end-to-end proof the reviewer asked for: a

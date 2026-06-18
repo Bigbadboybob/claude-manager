@@ -3367,7 +3367,7 @@ pub fn start_workflow(
         cleanup_spawned(&spawned_uids);
         return Err((ErrorCode::Internal, format!("start_workflow save run: {}", e)));
     }
-    let watcher = {
+    let (watcher, manifest_watcher, bound_manifest_diffs) = {
         let mut state = state_arc.lock().unwrap_or_else(|pp| pp.into_inner());
         state.workflow_runs.insert(run_id.clone(), run.clone());
         // Tag-after-save (existing-session binding): the bound (pre-existing)
@@ -3376,14 +3376,43 @@ pub fn start_workflow(
         // untouched (no orphan tag pointing at a nonexistent run); fresh-spawned
         // participants were tagged at spawn and cleaned up on failure, bound
         // sessions simply kept their prior (untagged) state.
+        //
+        // Collect a manifest `Updated` diff per freshly-tagged bound session so
+        // the TUI learns the (pre-existing) row is now a workflow participant —
+        // it re-groups under the workflow header and workflow ops recognize it.
+        // Fresh-spawned participants get this via `start_session`'s `Added`
+        // broadcast; bound sessions already live in `state.sessions` (and in the
+        // TUI's manifest), so they need an in-place `Updated` instead.
+        let mut diffs: Vec<crate::manifest::ManifestDiff> = Vec::new();
         for (uid, role) in &bound_uid_roles {
             if let Some(s) = state.sessions.get_mut(uid) {
                 s.workflow_run_id = Some(run_id.clone());
                 s.workflow_role = Some(role.clone());
+                diffs.push(crate::manifest::ManifestDiff::Updated {
+                    uid: uid.clone(),
+                    entry: json!({
+                        "uid": uid,
+                        "workspace_id": s.workspace_id,
+                        "session_type": s.session_type,
+                        "workflow_run_id": s.workflow_run_id,
+                        "workflow_role": s.workflow_role,
+                        "task_id": s.task_id,
+                    }),
+                });
             }
         }
-        state.workflow_event_watcher.clone()
+        (
+            state.workflow_event_watcher.clone(),
+            std::sync::Arc::clone(&state.manifest_watcher),
+            diffs,
+        )
     };
+    // Announce the bound sessions' new workflow tags to live `manifest.watch`
+    // subscribers, lock-free after the state lock drops (mirrors the `Added` /
+    // `Exited` broadcast shape in `start_session` / `handle_session_exit`).
+    for diff in bound_manifest_diffs {
+        manifest_watcher.broadcast(diff);
+    }
     // P-3: broadcast the newly-created run as a state snapshot so clients that
     // subscribed BEFORE this launch (the launching TUI itself, plus any other
     // observer) fold it into their view immediately — `events.subscribe`
@@ -11882,6 +11911,69 @@ mod tests {
             // The bound worker is the initial role: delivery-only initial activation.
             let pa = run.pending_activation.as_ref().expect("initial pending activation");
             assert!(pa.is_initial && pa.target_role == "worker");
+        });
+    }
+
+    /// Regression (existing-session bind → TUI manifest sync): a successful bind
+    /// announces the bound session's new workflow tags to live `manifest.watch`
+    /// subscribers via a `ManifestDiff::Updated`, so the TUI re-groups the
+    /// pre-existing row under the workflow header. Fresh-spawned participants get
+    /// this from `start_session`'s `Added`; a bound row already exists, so it
+    /// needs an in-place `Updated`. Before the fix the tag was set in
+    /// `state.sessions` only and never broadcast — the bound worker rendered
+    /// OUTSIDE its own workflow group.
+    #[test]
+    fn start_workflow_bind_broadcasts_manifest_update_for_bound_session() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let tp = bind_write_claude_transcript(
+                &wt, "sid-worker-live",
+                r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"##,
+            );
+            let state = make_state_arc();
+            // Subscribe BEFORE the launch so the bind broadcast is captured.
+            let (rx, _guard) = {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("solo".to_string(), Workflow {
+                    name: "solo".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into()], transitions: vec![],
+                });
+                bind_spawn_session(&mut s, "sess-worker", "claude-code", "ws-1", Some(tp));
+                s.manifest_watcher.subscribe()
+            };
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "solo", "goal": "g",
+                "worktree": wt.to_str().unwrap(), "workspace_id": "ws-1",
+                "role_sessions": { "worker": "sess-worker" },
+            })).expect("eligible bind ok");
+            set_disable_workflow_detector_for_test(false);
+            set_spawn_program_override_for_test(None);
+            let run_id = resp["run_id"].as_str().unwrap().to_string();
+
+            // The bound session's new tags must reach manifest.watch as Updated.
+            let mut saw = false;
+            while let Ok(diff) = rx.try_recv() {
+                if let crate::manifest::ManifestDiff::Updated { uid, entry } = diff {
+                    if uid == "sess-worker" {
+                        assert_eq!(entry["workflow_run_id"].as_str(), Some(run_id.as_str()), "diff carries the run id");
+                        assert_eq!(entry["workflow_role"].as_str(), Some("worker"), "diff carries the role");
+                        saw = true;
+                    }
+                }
+            }
+            assert!(saw, "bound session tag change must broadcast a manifest Updated diff");
         });
     }
 
