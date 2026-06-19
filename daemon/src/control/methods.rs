@@ -2604,6 +2604,16 @@ struct StartWorkflowParams {
     /// silently fresh-spawning. ABSENT → byte-identical fresh-spawn behavior.
     #[serde(default)]
     role_sessions: Option<std::collections::BTreeMap<String, String>>,
+    /// Per-role engine override for FRESH-spawned roles: optional
+    /// `role -> "claude-code" | "codex"` map. When present for a role, the
+    /// daemon spawns that engine instead of the role's TOML-declared `engine`,
+    /// letting the operator pick "new claude" vs "new codex" at launch time.
+    /// Only applies to fresh spawns — a role bound via `role_sessions` keeps the
+    /// bound session's own engine and ignores any override here. An unknown
+    /// value or absent entry falls back to the TOML `engine`. ABSENT → behavior
+    /// identical to the TOML default.
+    #[serde(default)]
+    role_engines: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Phase 4 §D: daemon-side `start_workflow`. Spawns each role's participant
@@ -3083,9 +3093,21 @@ pub fn start_workflow(
             );
             continue;
         }
-        let session_type = match role.engine {
-            Engine::ClaudeCode => "claude-code",
-            Engine::Codex => "codex",
+        // Engine for this fresh spawn: an explicit `role_engines` override (the
+        // operator's "new claude" vs "new codex" launch choice) wins; an unknown
+        // or absent override falls back to the role's TOML-declared engine.
+        let session_type: &'static str = match p
+            .role_engines
+            .as_ref()
+            .and_then(|m| m.get(role_name))
+            .map(|s| s.as_str())
+        {
+            Some("codex") => "codex",
+            Some("claude-code") => "claude-code",
+            _ => match role.engine {
+                Engine::ClaudeCode => "claude-code",
+                Engine::Codex => "codex",
+            },
         };
         let uid = new_daemon_minted_session_uid();
         // P-3: the cap for THIS participant. Prefer the caller session's
@@ -11470,6 +11492,74 @@ mod tests {
                 by_role.keys().cloned().collect::<Vec<_>>(),
                 vec!["manager".to_string(), "reviewer".to_string(), "worker".to_string()],
                 "all three roles threaded their identity into the MCP config writer",
+            );
+        });
+    }
+
+    /// Engine choice ("new claude" vs "new codex"): a `role_engines` override
+    /// redirects a FRESH-spawned role's engine away from its TOML default; a role
+    /// with no override entry keeps its TOML `engine`. Asserted on each spawned
+    /// participant's recorded `session_type`.
+    #[test]
+    fn start_workflow_role_engines_overrides_spawned_engine() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt-engines");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let mut roles = BTreeMap::new();
+                // Both roles declare claude-code in the TOML.
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                s.base_workflow_definitions.insert("review".to_string(), Workflow {
+                    name: "review".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "reviewer".into()],
+                    transitions: vec![
+                        Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() },
+                        Transition { from: "reviewer".into(), on: TriggerOn::Idle, to: "worker".into() },
+                    ],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            // worker → codex override; reviewer → no entry (keeps TOML claude-code).
+            let resp = start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "review",
+                "goal": "do it",
+                "worktree": wt.to_str().unwrap(),
+                "workspace_id": "ws-1",
+                "role_engines": { "worker": "codex" },
+            })).expect("start_workflow ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+            let _run_id = resp["run_id"].as_str().unwrap().to_string();
+
+            // Each fresh-spawned participant is recorded in `s.sessions` carrying
+            // its `workflow_role` and the `session_type` it was spawned with.
+            let s = state.lock().unwrap();
+            let mut by_role: BTreeMap<String, String> = Default::default();
+            for sess in s.sessions.values() {
+                if let Some(role) = &sess.workflow_role {
+                    by_role.insert(role.clone(), sess.session_type.clone());
+                }
+            }
+            assert_eq!(
+                by_role.get("worker").map(String::as_str),
+                Some("codex"),
+                "role_engines override must redirect the worker's spawned engine to codex",
+            );
+            assert_eq!(
+                by_role.get("reviewer").map(String::as_str),
+                Some("claude-code"),
+                "a role with no override entry keeps its TOML-declared engine",
             );
         });
     }

@@ -16,6 +16,14 @@ If you're satisfied, call the `workflow_done` tool with a short `reason`. Otherw
 [roles.worker]
 engine = "claude-code"
 context = "persistent"
+# Worker drives the loop via the static `on_idle` hand-off to reviewer and only
+# OPTIONALLY calls workflow_transition (to ask a question before touching code).
+# needs_mcp=false makes the worker bindable to an existing session — launch
+# review on the session you were already working in, without a --resume respawn
+# (preserving plan-mode UI / live process state). A fresh-spawned worker still
+# gets the workflow MCP wired in; only a BOUND worker forgoes the optional
+# workflow_transition. Mirrors feedback.toml's worker.
+needs_mcp = false
 activation_prompt = """Reviewer's feedback:
 {{ roles.reviewer.last_message }}
 

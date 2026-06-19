@@ -1815,6 +1815,36 @@ pub(crate) fn slots_to_role_sessions(
     map
 }
 
+/// Map a launch modal's slots to the `role -> engine` overrides forwarded to
+/// `start_workflow`. A slot whose selected source is `New(engine)` contributes
+/// `role -> "claude-code"|"codex"` ONLY when the chosen engine differs from the
+/// role's TOML default (always `options[0]`, the Enter default) — so a launch
+/// where every fresh slot keeps its default is byte-identical on the wire to the
+/// pre-engine-choice call (the daemon's `role_engines` param is
+/// `#[serde(default)]`). `Existing` slots contribute nothing: a bound session
+/// keeps its own engine, which the daemon never overrides.
+pub(crate) fn slots_to_role_engines(
+    slots: &[WorkflowSlotChoice],
+) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for slot in slots {
+        if let WorkflowSlotSource::New(engine) = slot.source() {
+            let default_engine = match slot.options.first() {
+                Some(WorkflowSlotSource::New(e)) => Some(e),
+                _ => None,
+            };
+            if default_engine != Some(engine) {
+                let wire = match engine {
+                    Engine::ClaudeCode => "claude-code",
+                    Engine::Codex => "codex",
+                };
+                map.insert(slot.role.clone(), wire.to_string());
+            }
+        }
+    }
+    map
+}
+
 // ── Input handler extraction ────────────────────────────────────────
 //
 // The per-mode arms of `handle_input_event` are implemented as free
@@ -13003,6 +13033,16 @@ impl App {
         for role_name in wf.role_order.iter() {
             let role = &wf.roles[role_name];
             let mut options = vec![WorkflowSlotSource::New(role.engine.clone())];
+            // Offer the OTHER engine too, so any role can be launched as "new
+            // claude" or "new codex" regardless of its TOML default. The declared
+            // engine stays at index 0 (the Enter default); the alternate is one
+            // cycle away. The daemon honors a non-default pick via the
+            // `role_engines` override (see `slots_to_role_engines`).
+            let alt_engine = match role.engine {
+                Engine::ClaudeCode => Engine::Codex,
+                Engine::Codex => Engine::ClaudeCode,
+            };
+            options.push(WorkflowSlotSource::New(alt_engine));
             let eligible = role.context
                 == workflow::toml_schema::Context::Persistent
                 && !role.needs_mcp;
@@ -13079,6 +13119,9 @@ impl App {
             .map(|s| s.session.daemon_session_uid.clone())
             .collect();
         let role_sessions = slots_to_role_sessions(slots, &session_uids);
+        // Per-role "new claude" vs "new codex" overrides for fresh-spawned roles
+        // (only the ones the operator cycled off their TOML default).
+        let role_engines = slots_to_role_engines(slots);
         let host_id = self.active_host.clone();
         let daemon_socket = match self.host_pool.for_host(&host_id) {
             Ok(h) => match h.socket_path() {
@@ -13102,6 +13145,7 @@ impl App {
             goal.as_deref(),
             task_id.as_deref(),
             &role_sessions,
+            &role_engines,
             self.last_term_size,
         ) {
             Ok(run_id) => {
@@ -19420,6 +19464,60 @@ mod input_handler_tests {
             option_index: 1,
         }];
         assert!(slots_to_role_sessions(&slots_oob, &session_uids).is_empty());
+    }
+
+    // Engine choice ("new claude" vs "new codex"): a `New(engine)` selection that
+    // DIFFERS from the role's TOML default (always options[0]) threads a
+    // `role -> engine` override; an unchanged default — or an `Existing` binding,
+    // which keeps the bound session's own engine — contributes nothing, so a
+    // default launch stays byte-identical on the wire.
+    #[test]
+    fn workflow_launch_engine_override_maps_only_non_default_new_slots() {
+        let slots = vec![
+            // claude-default role cycled to the codex alternate → override.
+            WorkflowSlotChoice {
+                role: "worker".to_string(),
+                options: vec![
+                    WorkflowSlotSource::New(Engine::ClaudeCode),
+                    WorkflowSlotSource::New(Engine::Codex),
+                ],
+                option_index: 1,
+            },
+            // codex-default role cycled to the claude alternate → override.
+            WorkflowSlotChoice {
+                role: "reviewer".to_string(),
+                options: vec![
+                    WorkflowSlotSource::New(Engine::Codex),
+                    WorkflowSlotSource::New(Engine::ClaudeCode),
+                ],
+                option_index: 1,
+            },
+            // claude-default role left at its default → NO override.
+            WorkflowSlotChoice {
+                role: "manager".to_string(),
+                options: vec![
+                    WorkflowSlotSource::New(Engine::ClaudeCode),
+                    WorkflowSlotSource::New(Engine::Codex),
+                ],
+                option_index: 0,
+            },
+            // Existing binding selected → engine comes from the bound session,
+            // never overridden here.
+            WorkflowSlotChoice {
+                role: "auditor".to_string(),
+                options: vec![
+                    WorkflowSlotSource::New(Engine::ClaudeCode),
+                    WorkflowSlotSource::Existing(0),
+                ],
+                option_index: 1,
+            },
+        ];
+        let map = slots_to_role_engines(&slots);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("worker").map(String::as_str), Some("codex"));
+        assert_eq!(map.get("reviewer").map(String::as_str), Some("claude-code"));
+        assert!(!map.contains_key("manager"));
+        assert!(!map.contains_key("auditor"));
     }
 
     // ── WorkflowPicker ────────────────────────────────────────────

@@ -1087,6 +1087,7 @@ pub fn rpc_start_workflow(
     goal: Option<&str>,
     task_id: Option<&str>,
     role_sessions: &std::collections::BTreeMap<String, String>,
+    role_engines: &std::collections::BTreeMap<String, String>,
     size: (u16, u16),
 ) -> anyhow::Result<String> {
     // (cols, rows): participants spawn at the operator's terminal size instead
@@ -1116,6 +1117,18 @@ pub fn rpc_start_workflow(
             .map(|(role, uid)| (role.clone(), serde_json::Value::String(uid.clone())))
             .collect();
         params["role_sessions"] = serde_json::Value::Object(map);
+    }
+    // Per-role engine overrides ("new claude" vs "new codex"). Forwarded ONLY
+    // when non-empty (i.e. at least one fresh slot diverges from its TOML
+    // default), so an all-default launch stays byte-identical on the wire to the
+    // pre-engine-choice call (the daemon's `role_engines` param is
+    // `#[serde(default)]`).
+    if !role_engines.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = role_engines
+            .iter()
+            .map(|(role, engine)| (role.clone(), serde_json::Value::String(engine.clone())))
+            .collect();
+        params["role_engines"] = serde_json::Value::Object(map);
     }
     let req = Request {
         id: next_request_id(),
