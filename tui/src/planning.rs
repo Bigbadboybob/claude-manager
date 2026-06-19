@@ -708,6 +708,27 @@ fn resolve_parent_patch(
     }
 }
 
+/// Promote an `Absent` parent edit to `Cleared` when the task currently
+/// has a parent.
+///
+/// `write_temp_task` only emits a `parent: <slug>` line when the task has
+/// a parent, so the only way an edit of a parented task reaches `Absent`
+/// is for the user to delete that line — which we read as an explicit
+/// "detach from parent". (Re-saving without touching it keeps the line, so
+/// that path is `Set`, not `Absent`, and never trips this.) A task with no
+/// parent stays `Absent` → no-op, so this never accidentally rewrites a
+/// field the user didn't touch. Emptying the value still clears via the
+/// normal `Cleared` path; this just makes deleting the line behave the same.
+fn effective_parent_update(
+    field: &FieldUpdate<String>,
+    current_has_parent: bool,
+) -> FieldUpdate<String> {
+    match field {
+        FieldUpdate::Absent if current_has_parent => FieldUpdate::Cleared,
+        other => other.clone(),
+    }
+}
+
 // ── Layout Persistence ──────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1172,6 +1193,7 @@ impl PlanningView {
                 task.prompt = api_task.prompt.clone().unwrap_or_default();
                 task.source = api_task.source.clone();
                 task.is_cloud = api_task.is_cloud;
+                task.parent_task_id = api_task.parent_task_id.clone();
                 self.recompute_conflicts();
                 self.needs_redraw = true;
                 return;
@@ -3016,9 +3038,22 @@ impl PlanningView {
                     .and_then(|pd| pd.tasks.iter().find(|t| t.slug == slug))
                     .map(|t| t.id.clone());
 
+                // Deleting the `parent:` line on a task that has a parent
+                // is an explicit detach — promote it to a clear. (Without
+                // this, line-deletion parses as `Absent`/"no change", so the
+                // parent stuck and re-rendered on the next refresh.)
+                let current_has_parent = current_id.as_deref().map_or(false, |id| {
+                    self.project_data
+                        .get(pi)
+                        .and_then(|pd| pd.tasks.iter().find(|t| t.id == id))
+                        .map_or(false, |t| t.parent_task_id.is_some())
+                });
+                let parent_update =
+                    effective_parent_update(&parsed.parent, current_has_parent);
+
                 let parent_patch = current_id.as_deref().and_then(|id| {
                     self.project_data.get(pi).map(|pd| {
-                        resolve_parent_patch(&pd.tasks, id, &parsed.parent)
+                        resolve_parent_patch(&pd.tasks, id, &parent_update)
                     })
                 });
 
@@ -3033,7 +3068,7 @@ impl PlanningView {
                 // the actual `Option<String>` to write back onto the
                 // PlanTask — Cleared → None, Set → Some(id), Absent →
                 // leave untouched.
-                let local_parent_update: Option<Option<String>> = match (&parsed.parent, &parent_field) {
+                let local_parent_update: Option<Option<String>> = match (&parent_update, &parent_field) {
                     (FieldUpdate::Absent, _) => None,
                     (_, None) => None, // validation error: don't touch local state
                     (FieldUpdate::Cleared, Some(_)) => Some(None),
@@ -5127,6 +5162,45 @@ mod tests {
         let out = resolve_parent_patch(&tasks, "id-me", &FieldUpdate::Absent)
             .expect("absent is ok");
         assert_eq!(out, None);
+    }
+
+    #[test]
+    fn deleting_parent_line_on_parented_task_clears_it() {
+        // The user opens a subtask, deletes the `parent:` line entirely,
+        // and saves. Parse surfaces Absent; because the task currently has
+        // a parent, that's an explicit detach → Cleared → PATCH null.
+        let field = effective_parent_update(&FieldUpdate::Absent, true);
+        assert_eq!(field, FieldUpdate::Cleared);
+
+        let tasks = vec![task_with_parent("me", "id-me", Some("id-old"))];
+        let out = resolve_parent_patch(&tasks, "id-me", &field)
+            .expect("clear must succeed");
+        assert_eq!(out, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn absent_parent_on_orphan_stays_no_op() {
+        // A task with no parent must keep Absent → no PATCH entry, so a
+        // plain edit of an orphan never spuriously writes parent_task_id.
+        let field = effective_parent_update(&FieldUpdate::Absent, false);
+        assert_eq!(field, FieldUpdate::Absent);
+
+        let tasks = vec![task_with_parent("me", "id-me", None)];
+        let out = resolve_parent_patch(&tasks, "id-me", &field).expect("ok");
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn effective_parent_update_passes_through_set_and_cleared() {
+        // Promotion only touches Absent; Set/Cleared are returned verbatim
+        // regardless of whether the task currently has a parent.
+        let set = FieldUpdate::Set("other".to_string());
+        assert_eq!(effective_parent_update(&set, true), set);
+        assert_eq!(effective_parent_update(&set, false), set);
+        assert_eq!(
+            effective_parent_update(&FieldUpdate::Cleared, true),
+            FieldUpdate::Cleared
+        );
     }
 
     // -- compose_launch_prompt --
