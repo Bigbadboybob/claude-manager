@@ -12395,8 +12395,8 @@ impl App {
             ("A-f    workflow", "A-u  resume"),
             ("A-o    stop wf", "A-,  activity"),
             ("A-b    snapshot", "A-z  catalog"),
-            ("A-O    reopen ws", ""),
-            ("PgUp   scroll up", ""),
+            ("A-O    reopen ws", "A-H  switch host"),
+            ("PgUp   scroll up", "A-t  planning"),
             ("PgDn   scroll dn", ""),
             ("A-Ent  newline", ""),
         ];
