@@ -10195,9 +10195,11 @@ impl App {
             None => return,
         };
         let (cols, rows) = self.last_term_size;
-        // migrate-tui-local: capture active_host snapshot up front
-        // and route the local-claude branch through the daemon.
-        let active_host = self.active_host.clone();
+        // attach_active runs only on an EMPTY workspace (checked below), so
+        // there's no existing session to inherit a host from; the worktree is
+        // a local path, so the first session spawns locally — independent of
+        // the global active_host (which only seeds NEW workspaces).
+        let spawn_host = crate::hosts::HostId::local();
         let ws = &self.workspaces[wi];
 
         if !ws.sessions.is_empty() {
@@ -10241,7 +10243,7 @@ impl App {
             // cloud-VM branch above and the bash-fallback below
             // don't talk to the daemon, so the guard scopes to
             // this arm only.
-            if let Err(e) = guard_local_host_only(&active_host, "A-a attach-active") {
+            if let Err(e) = guard_local_host_only(&spawn_host, "A-a attach-active") {
                 self.set_status_msg(&format!("{}", e));
                 None
             } else {
@@ -10259,7 +10261,7 @@ impl App {
                     None,
                     None,
                     None,
-                    &active_host,
+                    &spawn_host,
                     // attach_active is a fresh spawn — post-spawn
                     // detector will discover the transcript path.
                     None,
@@ -10318,21 +10320,9 @@ impl App {
         task_id: Option<String>,
         seed_from: Option<&str>,
     ) {
-        // 12e-r2 F1: snapshot active_host ONCE — same
-        // rationale as `create_local_session`.
-        let active_host = self.active_host.clone();
-        // 12e-r6 F1: fail fast BEFORE any session-creation
-        // work on a non-local active_host. A-s reuses an
-        // existing workspace + worktree, so there's no
-        // orphan-disk concern like A-n — the guard is
-        // primarily about not silently mistagging.
-        if let Err(e) = guard_local_host_only(
-            &active_host,
-            "A-s session-on-workspace",
-        ) {
-            self.set_status_msg(&format!("{}", e));
-            return;
-        }
+        // Host is a property of the WORKSPACE, not the global active_host
+        // (which only seeds NEW workspaces). The spawn host is resolved and
+        // guarded from the target workspace below, once ws_index is known.
         // Resolve workspace_id → current index. If the workspace
         // disappeared while the form was open (delete, reconcile drop,
         // etc.), bail cleanly rather than spawning into an unrelated
@@ -10391,6 +10381,20 @@ impl App {
             }
         }
 
+        // The new session runs on the workspace's host (its worktree lives
+        // there) — inherit from an existing session, else local. NOT the
+        // global active_host (which only seeds NEW workspaces). Remote spawns
+        // from the TUI aren't supported yet (doc/remote-session-execution.md);
+        // guard with a clear message rather than mistag/misroute.
+        let spawn_host = self.workspaces[ws_index]
+            .sessions
+            .first()
+            .map(|s| s.host_id.clone())
+            .unwrap_or_else(|| crate::hosts::HostId::local());
+        if let Err(e) = guard_local_host_only(&spawn_host, "A-s session-on-workspace") {
+            self.set_status_msg(&format!("{}", e));
+            return;
+        }
         let wt = self.workspaces[ws_index].worktree_path.clone();
 
         // Clone the seed snapshot BEFORE computing the baseline (Codex)
@@ -10487,7 +10491,7 @@ impl App {
             // at spawn time.
             None,
             None,
-            &active_host,
+            &spawn_host,
             pre_spawn_transcript.as_deref(),
         ) {
             Some(Ok(s)) => Ok(s),
@@ -10527,10 +10531,10 @@ impl App {
                 );
                 ts.task_id = task_id;
                 ts.seeded_from_snapshot = seed_from.map(str::to_string);
-                // 12e-r2 F1: use the active_host SNAPSHOT
-                // taken at the top of this function — same
-                // value the spawn dialed against.
-                ts.host_id = active_host.clone();
+                // The new session inherits the WORKSPACE's host (the worktree
+                // lives there) — the same value the spawn dialed against —
+                // NOT the global active_host (which only seeds new workspaces).
+                ts.host_id = spawn_host.clone();
                 // Engine-asymmetric transcript_id wiring — see
                 // `ClonedSession` rustdoc. For Claude the cloned id IS
                 // the live transcript id; for Codex it's a seed-file id
@@ -13118,11 +13122,30 @@ impl App {
             .iter()
             .map(|s| s.session.daemon_session_uid.clone())
             .collect();
+        // Host is a property of the WORKSPACE — its worktree lives on one host
+        // and every session in it is pinned there. Resolve the launch target
+        // from the workspace, NOT the global `active_host` (which only seeds the
+        // NEXT new workspace). Using active_host here was the bug: A-f on a local
+        // workspace while active_host=manager fired a doomed cross-host launch
+        // (local worktree path + local uids sent to the remote daemon) and froze
+        // the UI on the 150s start_workflow RPC over the flaky tunnel.
+        let host_id = ws
+            .sessions
+            .first()
+            .map(|s| s.host_id.clone())
+            .unwrap_or_else(|| crate::hosts::HostId::local());
         let role_sessions = slots_to_role_sessions(slots, &session_uids);
         // Per-role "new claude" vs "new codex" overrides for fresh-spawned roles
         // (only the ones the operator cycled off their TOML default).
         let role_engines = slots_to_role_engines(slots);
-        let host_id = self.active_host.clone();
+        // Remote workflow launch from the TUI isn't supported yet (Phase 5 of
+        // doc/remote-session-execution.md): the remote daemon can't use a local
+        // worktree path or bind local session uids. Guard with a clear message
+        // instead of firing a launch that hangs/fails.
+        if let Err(e) = guard_local_host_only(&host_id, "A-f workflow launch") {
+            self.set_status_msg(&format!("{e}"));
+            return;
+        }
         let daemon_socket = match self.host_pool.for_host(&host_id) {
             Ok(h) => match h.socket_path() {
                 Some(p) => p,
@@ -20614,16 +20637,22 @@ mod slice_12e_tests {
         // AND the TerminalSession.host_id assignment. Pin
         // structurally — the markers are the 12e-r2 comments
         // and the snapshot variable name.
-        for marker in &[
-            "12e-r2 F1: snapshot active_host ONCE — same\n        // rationale as `create_local_session`",
-            "12e-r2 F1: snapshot active_host ONCE at the top",
-        ] {
-            assert!(
-                src.contains(marker),
-                "expected 12e-r2 snapshot comment not found: {:?}",
-                marker,
-            );
-        }
+        // create_local_session (A-n) snapshots self.active_host — a NEW
+        // workspace is seeded by the global active host.
+        assert!(
+            src.contains("12e-r2 F1: snapshot active_host ONCE at the top"),
+            "create_local_session must snapshot active_host for a new workspace",
+        );
+        // spawn_session_on_workspace (A-s) resolves the spawn host from the
+        // WORKSPACE (its worktree's host), NOT the global active_host — host is
+        // a workspace property; active_host only seeds new workspaces.
+        assert!(
+            src.contains(
+                "Host is a property of the WORKSPACE, not the global active_host",
+            ),
+            "spawn_session_on_workspace must resolve the spawn host from the \
+             workspace, not the global active_host",
+        );
         // And the call sites pass &active_host (the snapshot).
         // migrate-tui-local Issue 3: a `transcript_path` arg
         // follows `&active_host,` now, so the needle is the
@@ -21254,13 +21283,11 @@ mod slice_12e_tests {
 
         assert!(
             body.contains(
-                "guard_local_host_only(\n            &active_host,\n            \"A-s session-on-workspace\",\n        )",
-            ) || body.contains(
-                "guard_local_host_only(&active_host, \"A-s session-on-workspace\")",
+                "guard_local_host_only(&spawn_host, \"A-s session-on-workspace\")",
             ),
-            "spawn_session_on_workspace must call \
-             guard_local_host_only at the top (12e-r6 F1); \
-             body:\n{}",
+            "spawn_session_on_workspace must guard the WORKSPACE's resolved \
+             spawn host (host is a workspace property, not the global \
+             active_host) before any spawn work; body:\n{}",
             body,
         );
 
