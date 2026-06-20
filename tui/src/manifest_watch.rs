@@ -54,6 +54,7 @@ use std::time::Duration;
 
 use cm_daemon::control::protocol::{Caller, CallerOperator, Request, StreamKind};
 use cm_daemon::control::wire;
+use cm_daemon::host_id::HostId;
 use cm_daemon::manifest::{LastExit, ManifestDiff};
 
 /// 10e-c r1 F1: post-disconnect snapshot reconciliation payload.
@@ -94,7 +95,14 @@ pub enum ManifestEvent {
     Snapshot(ManifestSnapshotPayload),
     /// One live broadcast — `ManifestDiff::Exited` carries the
     /// memory_cap_kill flag the named criterion needs.
-    Diff(ManifestDiff),
+    ///
+    /// Phase 3 (remote-session-execution): `host` is the host whose
+    /// `manifest.watch` stream produced this diff (set by the per-host
+    /// consumer in [`spawn_per_host`]). The adoption path uses it to tag an
+    /// adopted sidebar row with the right `ts.host_id` and to dial the
+    /// correct daemon when attaching. Pre-Phase-3 this was a tuple variant
+    /// with no host; everything routed to `HostId::local()`.
+    Diff { host: HostId, diff: ManifestDiff },
 }
 
 // Operator-caller token is loaded at TUI startup and shared with the
@@ -185,7 +193,9 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("cm-tui-manifest-watch".to_string())
-        .spawn(move || run_consumer_with_provider(&path_provider, event_tx))
+        .spawn(move || {
+            run_consumer_with_provider(&path_provider, HostId::local(), event_tx)
+        })
         .expect("spawn manifest.watch consumer thread");
     ManifestWatchConsumer {
         event_rx,
@@ -229,10 +239,11 @@ pub fn spawn_per_host(
             host.id.clone(),
         );
         let tx = event_tx.clone();
+        let host_id = host.id.clone();
         let host_name = host.id.as_str().to_string();
         let thread = std::thread::Builder::new()
             .name(format!("cm-tui-manifest-watch-{}", host_name))
-            .spawn(move || run_consumer_with_provider(&provider, tx))
+            .spawn(move || run_consumer_with_provider(&provider, host_id, tx))
             .expect("spawn manifest.watch consumer thread");
         threads.push(thread);
     }
@@ -260,6 +271,7 @@ pub fn spawn_per_host(
 /// a tunnel respawn.
 pub(crate) fn run_consumer_with_provider(
     path_provider: &crate::host_pool::SocketPathProvider,
+    host: HostId,
     event_tx: mpsc::Sender<ManifestEvent>,
 ) {
     let mut backoff = RECONNECT_BACKOFF_BASE;
@@ -283,7 +295,7 @@ pub(crate) fn run_consumer_with_provider(
                 // A flaky daemon that goes down/up shouldn't
                 // accumulate exponential delay across sessions.
                 backoff = RECONNECT_BACKOFF_BASE;
-                match drive_stream(stream, &event_tx) {
+                match drive_stream(stream, &host, &event_tx) {
                     DriveOutcome::ChannelDisconnected => {
                         // App dropped its receiver. Done forever.
                         return;
@@ -323,7 +335,7 @@ pub(crate) fn run_consumer(
         let p = socket_path.to_path_buf();
         std::sync::Arc::new(move || Some(p.clone()))
     };
-    run_consumer_with_provider(&provider, event_tx);
+    run_consumer_with_provider(&provider, HostId::local(), event_tx);
 }
 
 /// Why the inner stream loop ended. Drives the outer loop's
@@ -381,6 +393,7 @@ fn connect_and_subscribe(socket_path: &Path) -> std::io::Result<UnixStream> {
 /// reconnect.
 fn drive_stream(
     mut stream: UnixStream,
+    host: &HostId,
     event_tx: &mpsc::Sender<ManifestEvent>,
 ) -> DriveOutcome {
     loop {
@@ -417,7 +430,10 @@ fn drive_stream(
                     match serde_json::from_value::<ManifestDiff>(frame.payload.clone()) {
                         Ok(diff) => {
                             if event_tx
-                                .send(ManifestEvent::Diff(diff))
+                                .send(ManifestEvent::Diff {
+                                    host: host.clone(),
+                                    diff,
+                                })
                                 .is_err()
                             {
                                 // R8: main loop's Receiver dropped.
@@ -659,15 +675,18 @@ mod tests {
         let first =
             event_rx.recv_timeout(Duration::from_secs(2)).expect("first diff");
         match first {
-            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+            ManifestEvent::Diff { diff: ManifestDiff::Tombstoned { uid, .. }, host } => {
                 assert_eq!(uid, "ts-t14-a");
+                // run_consumer (the local seam) attributes diffs to the
+                // local host; spawn_per_host passes the real host id.
+                assert_eq!(host, HostId::local(), "diff host defaults to local via run_consumer");
             }
             other => panic!("expected Diff(Tombstoned ts-t14-a), got {:?}", other),
         }
         let second =
             event_rx.recv_timeout(Duration::from_secs(2)).expect("second diff");
         match second {
-            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+            ManifestEvent::Diff { diff: ManifestDiff::Tombstoned { uid, .. }, .. } => {
                 assert_eq!(uid, "ts-t14-b");
             }
             other => panic!("expected Diff(Tombstoned ts-t14-b), got {:?}", other),
@@ -886,7 +905,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("post-reconnect diff MUST arrive");
         match post {
-            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+            ManifestEvent::Diff { diff: ManifestDiff::Tombstoned { uid, .. }, .. } => {
                 assert_eq!(uid, "ts-post-reconnect");
             }
             other => panic!(
@@ -935,7 +954,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("valid diff after malformed");
         match event {
-            ManifestEvent::Diff(ManifestDiff::Tombstoned { uid, .. }) => {
+            ManifestEvent::Diff { diff: ManifestDiff::Tombstoned { uid, .. }, .. } => {
                 assert_eq!(uid, "ts-valid-after-malformed");
             }
             other => panic!("unexpected event: {:?}", other),

@@ -7695,8 +7695,8 @@ impl App {
         }
         for ev in events {
             match ev {
-                crate::manifest_watch::ManifestEvent::Diff(diff) => {
-                    self.apply_manifest_diff(diff);
+                crate::manifest_watch::ManifestEvent::Diff { host, diff } => {
+                    self.apply_manifest_diff_from_host(host, diff);
                 }
                 crate::manifest_watch::ManifestEvent::Snapshot(payload) => {
                     self.apply_manifest_snapshot(payload);
@@ -7828,8 +7828,28 @@ impl App {
     /// (`drain_terminal_events`) shares the same `cap_kill_toasted`
     /// set, so a session that was attached at kill time only
     /// toasts once regardless of arrival order.
+    /// Host-agnostic entry point (defaults the source host to local).
+    /// Retained for the many existing tests + any caller that doesn't
+    /// track a source host; the production drain loop calls
+    /// [`apply_manifest_diff_from_host`] with the diff's real host.
     pub(crate) fn apply_manifest_diff(
         &mut self,
+        diff: cm_daemon::manifest::ManifestDiff,
+    ) {
+        self.apply_manifest_diff_from_host(
+            cm_daemon::host_id::HostId::local(),
+            diff,
+        );
+    }
+
+    /// Phase 3 (remote-session-execution): apply a manifest diff that
+    /// arrived from `host`'s `manifest.watch` stream. Identical to the
+    /// pre-Phase-3 behavior for `host == local`; for a remote host, an
+    /// adopted row is tagged with that host (see
+    /// [`adopt_daemon_workflow_participant_on_host`]).
+    pub(crate) fn apply_manifest_diff_from_host(
+        &mut self,
+        host: cm_daemon::host_id::HostId,
         diff: cm_daemon::manifest::ManifestDiff,
     ) {
         use cm_daemon::manifest::ManifestDiff;
@@ -7881,8 +7901,9 @@ impl App {
                 // TerminalSession, so adopting them can't duplicate or race the
                 // TUI-local row creation that A-n/A-s/mcp_start_session use.
                 // Non-workflow daemon sessions keep their existing behavior
-                // (the broader manifest-sync consumer stays deferred — 10e-d/10f).
-                self.adopt_daemon_workflow_participant(&uid, &entry);
+                // (the broader manifest-sync consumer stays deferred — 10e-d/10f)
+                // EXCEPT remote ones — see `adopt_daemon_workflow_participant_on_host`.
+                self.adopt_daemon_workflow_participant_on_host(&host, &uid, &entry);
             }
             ManifestDiff::Tombstoned { .. } => {
                 // Session removal reaches the TUI via `Exited` (and the
@@ -7908,10 +7929,55 @@ impl App {
         uid: &str,
         entry: &serde_json::Value,
     ) {
-        let run_id = match entry.get("workflow_run_id").and_then(|v| v.as_str()) {
-            Some(r) if !r.is_empty() => r.to_string(),
-            _ => return, // not a workflow participant — leave to existing paths
-        };
+        // Host-agnostic wrapper: defaults the source host to local (existing
+        // callers + tests). The production drain loop calls the host-aware
+        // form with the diff's real host.
+        self.adopt_daemon_workflow_participant_on_host(
+            &cm_daemon::host_id::HostId::local(),
+            uid,
+            entry,
+        );
+    }
+
+    /// Phase 3 (remote-session-execution): host-aware adoption of a
+    /// daemon-created session into the sidebar from a `manifest.watch`
+    /// Added/Updated broadcast, tagged with the producing `host`.
+    ///
+    /// Adoption set:
+    ///   - Workflow PARTICIPANTS (entry carries `workflow_run_id`) on ANY
+    ///     host — the daemon-launched-participant case; the row is tagged
+    ///     with `host` (Phase 5 wires the remote-workflow producer).
+    ///   - REMOTE non-workflow daemon sessions — Phase 3's remote A-n/A-s
+    ///     created by ANOTHER client land here. For THIS TUI's own remote
+    ///     create the row is built directly (create+attach), so the
+    ///     uid-present check below makes the echoed broadcast an idempotent
+    ///     no-op.
+    ///   - LOCAL non-workflow sessions are NOT adopted here (unchanged):
+    ///     the direct A-n/A-s build + the `adopt_untracked_daemon_sessions`
+    ///     poller own them. Keeping local non-workflow out preserves
+    ///     byte-for-byte local behavior.
+    ///
+    /// Other invariants are unchanged: untracked workspace → silent no-op;
+    /// uid already present → idempotent (workflow tags stamped in place for
+    /// an existing-session bind); a failed attach logs + skips rather than
+    /// panicking.
+    pub(crate) fn adopt_daemon_workflow_participant_on_host(
+        &mut self,
+        host: &cm_daemon::host_id::HostId,
+        uid: &str,
+        entry: &serde_json::Value,
+    ) {
+        let run_id = entry
+            .get("workflow_run_id")
+            .and_then(|v| v.as_str())
+            .filter(|r| !r.is_empty())
+            .map(String::from);
+        let is_local = host == &cm_daemon::host_id::HostId::local();
+        // Gate: workflow participant (any host) OR a remote non-workflow
+        // session. A local non-workflow session stays the prior no-op.
+        if run_id.is_none() && is_local {
+            return;
+        }
         let ws_id = match entry.get("workspace_id").and_then(|v| v.as_str()) {
             Some(w) if !w.is_empty() => w.to_string(),
             _ => return,
@@ -7945,35 +8011,29 @@ impl App {
         // bind, where the bound worker keeps its pre-existing TUI row — must get
         // its workflow tags stamped in place so it re-groups under the workflow
         // header and workflow ops recognize it. Don't rebuild the row (its PTY,
-        // label, and transcript are already correct).
+        // label, and transcript are already correct). A non-workflow
+        // re-broadcast (run_id None) is a plain no-op.
         if let Some(existing) = self.workspaces[ws_idx]
             .sessions
             .iter_mut()
             .find(|s| s.uid == uid)
         {
-            if existing.workflow_run_id.as_deref() != Some(run_id.as_str())
-                || existing.workflow_role != role
-            {
-                existing.workflow_run_id = Some(run_id);
-                existing.workflow_role = role;
-                self.needs_redraw = true;
+            if let Some(rid) = run_id.as_deref() {
+                if existing.workflow_run_id.as_deref() != Some(rid)
+                    || existing.workflow_role != role
+                {
+                    existing.workflow_run_id = Some(rid.to_string());
+                    existing.workflow_role = role;
+                    self.needs_redraw = true;
+                }
             }
             return;
         }
 
-        // TODO(Phase 5 — remote enablement on cm-manager): adoption is
-        // hard-coded to the LOCAL host. The per-host manifest-watch consumer
-        // thread knows which host produced this diff (`spawn_per_host`'s
-        // `host.id`), but `ManifestEvent::Diff` doesn't yet carry it, so a
-        // workflow launched on a REMOTE active host would try to attach the
-        // remote uid on the local daemon, fail, and skip the row (the run still
-        // completes headlessly — the observer just lacks panes). Threading the
-        // producing host id through the manifest event (and using it for both
-        // `host_pool.for_host` and `ts.host_id`) is the clean fix; it's deferred
-        // to Phase 5 (the doc scopes remote enablement there) rather than
-        // half-wiring the host plane now. The local path — default mode, and
-        // what criterion #4 + the tests exercise — is correct.
-        let host_id = cm_daemon::host_id::HostId::local();
+        // Attach to the PRODUCING host's daemon (local or remote, via the
+        // host_pool) and tag the row with that host — this is what makes a
+        // remote-host diff render a row with `ts.host_id = remote`.
+        let host_id = host.clone();
         let socket = match self
             .host_pool
             .for_host(&host_id)
@@ -8007,14 +8067,16 @@ impl App {
             worktree_path: worktree.as_deref(),
             task_id: task_id.as_deref(),
             transcript_path: None,
-            workflow_run_id: Some(run_id.as_str()),
+            // None for non-workflow remote sessions; the daemon ignores
+            // these on the attach path either way.
+            workflow_run_id: run_id.as_deref(),
             workflow_role: role.as_deref(),
         };
         let session = match crate::session::Session::new_attached_existing(config) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
-                    "cm-tui: failed to adopt workflow participant {} ({}): {} \
+                    "cm-tui: failed to adopt daemon session {} ({}): {} \
                      — skipping row (will appear on next reconnect)",
                     uid, label, e
                 );
@@ -8036,7 +8098,7 @@ impl App {
             session,
             None,
         );
-        ts.workflow_run_id = Some(run_id);
+        ts.workflow_run_id = run_id;
         ts.workflow_role = role;
         ts.task_id = task_id;
         ts.host_id = host_id;
@@ -9989,15 +10051,22 @@ impl App {
         // and reuse the same value for the TerminalSession.host_id
         // assignment below.
         let active_host = self.active_host.clone();
-        // 12e-r6 F1: fail fast BEFORE worktree creation on
-        // non-local active_host. The spawn would build local
-        // mcp_config paths and send them to a remote daemon
-        // that can't read them; worse, A-n already created a
-        // worktree by the point we'd discover the failure
-        // (orphan dir on disk). The guard up here means no
-        // git work happens for the non-supported case.
-        if let Err(e) = guard_local_host_only(&active_host, "A-n local session") {
-            self.set_status_msg(&format!("{}", e));
+        // Phase 3 (remote-session-execution): a non-local active host routes
+        // A-n to the daemon-resolved `create_session` path — the daemon makes
+        // the worktree and builds argv/env on its OWN filesystem, then the TUI
+        // attaches over the host's socket. Local A-n runs the existing path
+        // below, unchanged (it always passed the old `guard_local_host_only`,
+        // so removing that guard is a no-op for the local branch).
+        if active_host != crate::hosts::HostId::local() {
+            self.create_remote_session(
+                &active_host,
+                repo_url,
+                label,
+                start_branch,
+                idle_timeout_secs,
+                seed_from,
+                in_place,
+            );
             return;
         }
         let main_repo = match worktree::find_local_repo(repo_url) {
@@ -10221,6 +10290,190 @@ impl App {
         self.set_status_msg("Workspace created");
     }
 
+    /// Phase 3 (remote-session-execution): A-n on a REMOTE daemon host.
+    /// The daemon resolves the repo, creates the worktree, and builds
+    /// argv/env on its OWN filesystem (`create_session` RPC); the TUI sends
+    /// only the high-level request — NO local argv/env/working_dir/MCP-path/
+    /// cgroup_prefix — then attaches over the host's socket via
+    /// `try_attach_via_daemon_with_deps` and builds a `TerminalSession`
+    /// pinned to that host.
+    ///
+    /// `in_place` and `seed_from` are rejected up front (Non-goals): both
+    /// need cross-host machinery (spawning in the repo root / materializing
+    /// + resuming a snapshot on the remote) out of scope here. Rejected with
+    /// a status message and NO RPC — never silently downgraded.
+    fn create_remote_session(
+        &mut self,
+        host: &cm_daemon::host_id::HostId,
+        repo_url: &str,
+        label: &str,
+        start_branch: Option<&str>,
+        idle_timeout_secs: u16,
+        seed_from: Option<&str>,
+        in_place: bool,
+    ) {
+        // Non-goals: reject (no RPC) before any work.
+        if in_place {
+            self.set_status_msg(
+                "Remote A-n: in-place (repo-root) sessions aren't supported on a remote host",
+            );
+            return;
+        }
+        if seed_from.is_some() {
+            self.set_status_msg(
+                "Remote A-n: seeding from a snapshot isn't supported on a remote host",
+            );
+            return;
+        }
+
+        let slug = worktree::slugify(label);
+        if slug.is_empty() {
+            self.set_status_msg("Invalid name");
+            return;
+        }
+
+        let socket = match self
+            .host_pool
+            .for_host(host)
+            .ok()
+            .and_then(|h| h.socket_path())
+        {
+            Some(s) => s,
+            None => {
+                self.set_status_msg(&format!(
+                    "Remote host `{}` not reachable (no live socket)",
+                    host.as_str()
+                ));
+                return;
+            }
+        };
+
+        let (cols, rows) = self.last_term_size;
+        // The TUI is the source of truth for uid + workspace identity (same
+        // as the local path); the daemon auto-registers the workspace from
+        // the worktree it creates.
+        let session_uid = new_session_uid();
+        let workspace_id_pre = new_workspace_id();
+        let op_token = crate::daemon_launch::operator_token();
+
+        // create_session: daemon resolves repo → worktree → argv/env. Engine
+        // travels in the daemon's WIRE vocabulary ("claude-code"). A-n is
+        // taskless.
+        let res = match crate::client_session::rpc_create_session(
+            &socket,
+            op_token,
+            &session_uid,
+            &workspace_id_pre,
+            "claude",
+            "claude-code",
+            repo_url,
+            start_branch,
+            &slug,
+            None,
+            cols,
+            rows,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status_msg(&format!("Remote create_session failed: {}", e));
+                return;
+            }
+        };
+
+        // Attach to the just-created remote session over the host's socket.
+        let worktree_path = PathBuf::from(&res.worktree_path);
+        let session = match try_attach_via_daemon_with_deps(
+            &self.host_pool,
+            &res.session_uid,
+            &res.workspace_id,
+            &worktree_path,
+            "claude",
+            "claude",
+            cols,
+            rows,
+            None,
+            None,
+            None,
+            host,
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // The daemon already started the session (and created its
+                // worktree). Mirror `ClientSession::new`'s cleanup contract:
+                // best-effort kill before bubbling so we don't leak a live,
+                // headless, unattached session on the remote host. Log the
+                // cleanup error separately; the original attach error wins.
+                if let Err(cleanup_err) = crate::client_session::rpc_kill_session(
+                    &socket,
+                    op_token,
+                    &res.session_uid,
+                ) {
+                    eprintln!(
+                        "create_remote_session cleanup: kill_session({}) failed \
+                         after attach error: {}",
+                        res.session_uid, cleanup_err,
+                    );
+                }
+                self.set_status_msg(&format!("Remote attach failed: {}", e));
+                return;
+            }
+        };
+
+        let ts = TerminalSession {
+            uid: res.session_uid,
+            label: "claude".to_string(),
+            session_type: "claude".to_string(),
+            session,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            transcript_id: None,
+            generation: 0,
+            // Remote: the worktree lives on the daemon's filesystem, so the
+            // TUI can't run local JSONL detection. Transcript-path resolution
+            // for remote sessions is a follow-on (out of Phase 3 scope); the
+            // interactive PTY attach above works regardless.
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            last_delivery: None,
+            task_id: None,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+            seeded_from_snapshot: None,
+            preserved_last_exit: None,
+            host_id: host.clone(),
+        };
+        let ws = Workspace {
+            id: res.workspace_id,
+            name: label.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: Some(repo_url.to_string()),
+            worktree_path: Some(worktree_path),
+            // The main checkout lives on the remote host; there is no local
+            // main repo path for a remote workspace.
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![ts],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        };
+        let new_wi = self.workspaces.len();
+        self.workspaces.push(ws);
+        self.cursor = Cursor::Session(new_wi, 0);
+        self.save_session_manifest();
+        self.set_status_msg(&format!("Workspace created on `{}`", host.as_str()));
+    }
+
     /// Attach to the active workspace (SSH for cloud, claude for local, bash fallback).
     fn attach_active(&mut self) {
         let wi = match self.active_workspace_index() {
@@ -10424,8 +10677,18 @@ impl App {
             .first()
             .map(|s| s.host_id.clone())
             .unwrap_or_else(|| crate::hosts::HostId::local());
-        if let Err(e) = guard_local_host_only(&spawn_host, "A-s session-on-workspace") {
-            self.set_status_msg(&format!("{}", e));
+        // Phase 3 (remote-session-execution): a remote-hosted workspace routes
+        // A-s to the daemon-resolved `add_session` path (reuses the remote
+        // worktree). Local A-s runs the existing path below, unchanged (it
+        // always passed the old `guard_local_host_only`).
+        if spawn_host != crate::hosts::HostId::local() {
+            self.add_remote_session(
+                &spawn_host,
+                ws_index,
+                session_type,
+                task_id,
+                seed_from,
+            );
             return;
         }
         let wt = self.workspaces[ws_index].worktree_path.clone();
@@ -10603,6 +10866,129 @@ impl App {
                 self.set_status_msg(&format!("Spawn: {}", e));
             }
         }
+    }
+
+    /// Phase 3 (remote-session-execution): A-s on a REMOTE-hosted workspace.
+    /// Adds another session to the workspace's EXISTING remote worktree via
+    /// the daemon's `add_session` RPC (no `repo_url`/`slug`/`start_branch` —
+    /// the daemon looks up the workspace's worktree), then attaches over the
+    /// host's socket and builds a `TerminalSession` pinned to that host.
+    ///
+    /// `seed_from` is rejected up front (Non-goals): resuming an agent-memory
+    /// snapshot on a remote host needs cross-host materialization out of
+    /// scope here. Rejected with a status message and NO RPC.
+    fn add_remote_session(
+        &mut self,
+        host: &cm_daemon::host_id::HostId,
+        ws_index: usize,
+        session_type: &str,
+        task_id: Option<String>,
+        seed_from: Option<&str>,
+    ) {
+        if seed_from.is_some() {
+            self.set_status_msg(
+                "Remote A-s: seeding from a snapshot isn't supported on a remote host",
+            );
+            return;
+        }
+
+        let socket = match self
+            .host_pool
+            .for_host(host)
+            .ok()
+            .and_then(|h| h.socket_path())
+        {
+            Some(s) => s,
+            None => {
+                self.set_status_msg(&format!(
+                    "Remote host `{}` not reachable (no live socket)",
+                    host.as_str()
+                ));
+                return;
+            }
+        };
+
+        let (cols, rows) = self.last_term_size;
+        let workspace_id = self.workspaces[ws_index].id.clone();
+        let session_uid = new_session_uid();
+        let op_token = crate::daemon_launch::operator_token();
+        // Daemon WIRE engine ("claude" → "claude-code").
+        let wire_engine = match session_type {
+            "claude" => "claude-code",
+            other => other,
+        };
+
+        let res = match crate::client_session::rpc_add_session(
+            &socket,
+            op_token,
+            &session_uid,
+            &workspace_id,
+            session_type,
+            wire_engine,
+            task_id.as_deref(),
+            cols,
+            rows,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status_msg(&format!("Remote add_session failed: {}", e));
+                return;
+            }
+        };
+
+        let worktree_path = PathBuf::from(&res.worktree_path);
+        let session = match try_attach_via_daemon_with_deps(
+            &self.host_pool,
+            &res.session_uid,
+            &workspace_id,
+            &worktree_path,
+            session_type,
+            session_type,
+            cols,
+            rows,
+            task_id.as_deref(),
+            None,
+            None,
+            host,
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // The daemon already started the session into the existing
+                // worktree. Mirror `ClientSession::new`'s cleanup contract:
+                // best-effort kill before bubbling so we don't leak a live,
+                // headless, unattached session on the remote host. Log the
+                // cleanup error separately; the original attach error wins.
+                if let Err(cleanup_err) = crate::client_session::rpc_kill_session(
+                    &socket,
+                    op_token,
+                    &res.session_uid,
+                ) {
+                    eprintln!(
+                        "add_remote_session cleanup: kill_session({}) failed \
+                         after attach error: {}",
+                        res.session_uid, cleanup_err,
+                    );
+                }
+                self.set_status_msg(&format!("Remote attach failed: {}", e));
+                return;
+            }
+        };
+
+        let mut ts = make_simple_session_with_uid(
+            res.session_uid,
+            session_type,
+            session_type,
+            session,
+            None,
+        );
+        ts.task_id = task_id;
+        ts.host_id = host.clone();
+        let si = self.workspaces[ws_index].sessions.len();
+        self.workspaces[ws_index].sessions.push(ts);
+        self.cursor = Cursor::Session(ws_index, si);
+        self.save_session_manifest();
+        self.set_status_msg(&format!("Started {} session on `{}`", session_type, host.as_str()));
     }
 
     /// Spawn a local claude --resume session after a pull completes.
@@ -16776,6 +17162,294 @@ mod pending_workflow_events_tests {
             None => unsafe { std::env::remove_var("CM_DAEMON_SOCKET") },
         }
     }
+
+    // === Phase 3 (remote-session-execution): remote A-n / A-s ===
+
+    fn status_text(app: &App) -> String {
+        app.status_msg
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default()
+    }
+
+    /// Criterion: a remote A-n with `in_place` is rejected with a status
+    /// message and issues NO RPC (the rejection precedes any host_pool /
+    /// daemon access), and creates no workspace.
+    #[test]
+    fn remote_a_n_rejects_in_place_no_rpc() {
+        let mut app = build_app_for_buffer_tests();
+        app.active_host = cm_daemon::host_id::HostId::new("manager");
+        let before = app.workspaces.len();
+        app.create_local_session("somerepo", "label", None, 0, None, true);
+        assert!(
+            status_text(&app).contains("in-place"),
+            "remote in_place must be rejected with a clear message; got {:?}",
+            status_text(&app),
+        );
+        assert_eq!(app.workspaces.len(), before, "no workspace created on rejection");
+    }
+
+    /// Criterion: a remote A-n with `seed_from` is rejected, no RPC, no
+    /// workspace.
+    #[test]
+    fn remote_a_n_rejects_seed_from_no_rpc() {
+        let mut app = build_app_for_buffer_tests();
+        app.active_host = cm_daemon::host_id::HostId::new("manager");
+        let before = app.workspaces.len();
+        app.create_local_session("somerepo", "label", None, 0, Some("snap-1"), false);
+        assert!(
+            status_text(&app).contains("snapshot"),
+            "remote seed_from must be rejected with a clear message; got {:?}",
+            status_text(&app),
+        );
+        assert_eq!(app.workspaces.len(), before, "no workspace created on rejection");
+    }
+
+    /// Criterion: the SAME options on a LOCAL host are NOT rejected — local
+    /// A-n with `in_place` runs the existing local path (here it stops at
+    /// "Repo not found locally" because the test has no repo, proving it got
+    /// past the remote-rejection branch into the local path).
+    #[test]
+    fn local_a_n_in_place_not_rejected() {
+        let mut app = build_app_for_buffer_tests();
+        // active_host defaults to local in build_app_for_buffer_tests.
+        assert_eq!(app.active_host, cm_daemon::host_id::HostId::local());
+        app.create_local_session("no-such-repo-xyz", "label", None, 0, None, true);
+        let st = status_text(&app);
+        assert!(
+            !st.contains("in-place") && !st.contains("remote host"),
+            "local in_place must NOT hit the remote rejection; got {:?}",
+            st,
+        );
+        assert_eq!(
+            st, "Repo not found locally",
+            "local A-n runs the existing local path (stops at repo lookup)",
+        );
+    }
+
+    /// Criterion: a remote A-s with `seed_from` is rejected, no RPC, no new
+    /// session. Tested directly on `add_remote_session` (the rejection
+    /// precedes any host_pool / daemon access).
+    #[test]
+    fn remote_a_s_rejects_seed_from_no_rpc() {
+        let mut app = build_app_for_buffer_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        app.workspaces.push(test_workspace("ws-rs", tmp.path().to_path_buf()));
+        let before = app.workspaces[0].sessions.len();
+        app.add_remote_session(
+            &cm_daemon::host_id::HostId::new("manager"),
+            0,
+            "claude",
+            None,
+            Some("snap-2"),
+        );
+        assert!(
+            status_text(&app).contains("snapshot"),
+            "remote A-s seed_from must be rejected; got {:?}",
+            status_text(&app),
+        );
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            before,
+            "no session added on rejection",
+        );
+    }
+
+    /// Criterion: a diff carrying a REMOTE source host adopts a sidebar row
+    /// with `ts.host_id = remote`. End-to-end via an in-process daemon at a
+    /// "manager" unix socket + a 2-host pool; the non-workflow Added diff
+    /// (the remote A-s/other-client case) is adopted and tagged with the
+    /// producing host.
+    #[test]
+    fn remote_diff_adopts_row_with_remote_host_id() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let local_sock = home.join(".cm/daemon.sock");
+        let mgr_sock = home.join(".cm/manager.sock");
+
+        // In-process daemon at the MANAGER socket with a known workspace.
+        let mut state_inner = cm_daemon::state::DaemonState::new();
+        state_inner.attach_addr = mgr_sock.to_string_lossy().into_owned();
+        state_inner.workspaces.insert(
+            "ws-mgr".into(),
+            cm_daemon::manifest::ManifestWorkspace {
+                id: "ws-mgr".into(),
+                name: "mgr".into(),
+                is_closed: false,
+                is_cloud: false,
+                worktree_path: Some(wt.clone()),
+                main_repo_path: None,
+                repo_url: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let state = Arc::new(std::sync::Mutex::new(state_inner));
+        let listener = UnixListener::bind(&mgr_sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dstate = state.clone();
+        let dstop = stop.clone();
+        let dhandle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let st = dstate.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            let req = match cm_daemon::control::wire::read_request(&mut stream) {
+                                Ok(Some(r)) => r,
+                                _ => return,
+                            };
+                            use cm_daemon::control::dispatch::DispatchOutcome::*;
+                            match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Done(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                                }
+                                AttachStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_attach_stream(&mut stream, st, handle);
+                                    }
+                                }
+                                ManifestWatchStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_manifest_watch_stream(&mut stream, handle);
+                                    }
+                                }
+                                EventsSubscribeStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_events_subscribe_stream(&mut stream, handle);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Replace the default (local-only) pool with one that resolves the
+        // "manager" host to the in-process daemon's unix socket.
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.workspaces.push(test_workspace("ws-mgr", wt.clone()));
+
+        // Spawn a NON-workflow session on the manager daemon (the uid the
+        // adopt path attaches to).
+        let uid = new_session_uid();
+        let argv = vec!["/bin/bash".to_string()];
+        let cfg = crate::client_session::ClientSessionConfig {
+            daemon_socket: &mgr_sock,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid: &uid,
+            workspace_id: "ws-mgr",
+            label: "claude-code",
+            session_type: "claude-code",
+            argv: &argv,
+            working_dir: &wt,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: Some(&wt),
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
+        };
+        crate::client_session::rpc_start_session_full(&cfg)
+            .expect("manager daemon spawns session");
+
+        // A NON-workflow Added diff from the MANAGER host → adopt with
+        // host_id = manager.
+        let entry = serde_json::json!({
+            "uid": uid,
+            "workspace_id": "ws-mgr",
+            "label": "claude-code",
+            "session_type": "claude-code",
+            "workflow_run_id": serde_json::Value::Null,
+            "workflow_role": serde_json::Value::Null,
+            "task_id": serde_json::Value::Null,
+        });
+        app.apply_manifest_diff_from_host(
+            cm_daemon::host_id::HostId::new("manager"),
+            cm_daemon::manifest::ManifestDiff::Added {
+                uid: uid.clone(),
+                entry,
+            },
+        );
+
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-mgr").unwrap();
+        let row = ws
+            .sessions
+            .iter()
+            .find(|s| s.uid == uid)
+            .expect("a remote-host diff must adopt a sidebar row");
+        assert_eq!(
+            row.host_id,
+            cm_daemon::host_id::HostId::new("manager"),
+            "adopted row must be tagged with the PRODUCING remote host",
+        );
+        // Wire type normalized to internal for the rest of the TUI.
+        assert_eq!(row.session_type, "claude");
+
+        // Cleanup.
+        let _ = crate::client_session::rpc_kill_session(
+            &mgr_sock,
+            crate::daemon_launch::operator_token(),
+            &uid,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
 }
 
 /// 12a reviewer round: `App::new` falls back to
@@ -20690,6 +21364,7 @@ mod slice_12e_tests {
                 .spawn(move || {
                     crate::manifest_watch::run_consumer_with_provider(
                         &provider_for_thread,
+                        cm_daemon::host_id::HostId::local(),
                         event_tx,
                     );
                 });
@@ -21391,42 +22066,37 @@ mod slice_12e_tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        // Structural pin: shared-helper call.
+        // Phase 3 (remote-session-execution): the local-only guard was
+        // replaced by a remote-host DISPATCH. A non-local active host MUST
+        // route to `create_remote_session` BEFORE any local worktree / spawn
+        // work — otherwise a remote A-n would build a local worktree (orphan
+        // dir) and a local spawn it can't use.
         assert!(
-            body.contains(
-                "guard_local_host_only(&active_host, \"A-n local session\")",
-            ),
-            "create_local_session must call \
-             guard_local_host_only at the top (12e-r6 F1); \
-             body:\n{}",
+            body.contains("self.create_remote_session("),
+            "create_local_session must dispatch a non-local active host to \
+             create_remote_session; body:\n{}",
             body,
         );
-
-        // Ordering: guard MUST precede worktree creation.
-        // Operator catching the error shouldn't see an
-        // orphan worktree dir left behind.
-        let guard_idx = body
-            .find("guard_local_host_only(&active_host, \"A-n local session\")")
-            .expect("guard call not found");
+        let dispatch_idx = body
+            .find("if active_host != crate::hosts::HostId::local()")
+            .expect("remote-host dispatch not found");
         let worktree_idx = body
             .find("worktree::create_worktree(")
             .expect("worktree::create_worktree call not found");
         assert!(
-            guard_idx < worktree_idx,
-            "guard (at byte {}) MUST precede \
-             worktree::create_worktree (at byte {}) — \
-             otherwise a remote-host A-n leaves an orphan dir",
-            guard_idx,
+            dispatch_idx < worktree_idx,
+            "remote dispatch (at byte {}) MUST precede \
+             worktree::create_worktree (at byte {}) — otherwise a remote-host \
+             A-n leaves an orphan local worktree dir",
+            dispatch_idx,
             worktree_idx,
         );
-
-        // Ordering: guard MUST also precede try_spawn_via_daemon.
         let spawn_idx = body
             .find("self.try_spawn_via_daemon(")
             .expect("try_spawn_via_daemon call not found");
         assert!(
-            guard_idx < spawn_idx,
-            "guard must precede try_spawn_via_daemon",
+            dispatch_idx < spawn_idx,
+            "remote dispatch must precede try_spawn_via_daemon (the local path)",
         );
     }
 
@@ -21446,25 +22116,26 @@ mod slice_12e_tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
+        // Phase 3 (remote-session-execution): the local-only guard was
+        // replaced by a remote-host DISPATCH on the WORKSPACE's resolved spawn
+        // host (host is a workspace property, not the global active_host). A
+        // remote-hosted workspace MUST route to `add_remote_session` BEFORE the
+        // local spawn path.
         assert!(
-            body.contains(
-                "guard_local_host_only(&spawn_host, \"A-s session-on-workspace\")",
-            ),
-            "spawn_session_on_workspace must guard the WORKSPACE's resolved \
-             spawn host (host is a workspace property, not the global \
-             active_host) before any spawn work; body:\n{}",
+            body.contains("self.add_remote_session("),
+            "spawn_session_on_workspace must dispatch a remote-hosted workspace \
+             to add_remote_session; body:\n{}",
             body,
         );
-
-        let guard_idx = body
-            .find("guard_local_host_only(")
-            .expect("guard call not found");
+        let dispatch_idx = body
+            .find("if spawn_host != crate::hosts::HostId::local()")
+            .expect("remote-host dispatch not found");
         let spawn_idx = body
             .find("self.try_spawn_via_daemon(")
             .expect("try_spawn_via_daemon call not found");
         assert!(
-            guard_idx < spawn_idx,
-            "guard must precede try_spawn_via_daemon",
+            dispatch_idx < spawn_idx,
+            "remote dispatch must precede try_spawn_via_daemon (the local path)",
         );
     }
 

@@ -702,6 +702,130 @@ pub(crate) fn rpc_start_session_full(
     })
 }
 
+/// `create_session` response (remote-session-execution Phase 1/3). The
+/// daemon resolves the repo + creates the worktree on its OWN filesystem
+/// and returns identity-only.
+pub(crate) struct CreateSessionResult {
+    pub session_uid: String,
+    pub worktree_path: String,
+    pub workspace_id: String,
+}
+
+/// `create_session` RPC — A-n on a (possibly remote) daemon host. Unlike
+/// `start_session`, the TUI sends only the high-level request (no local
+/// argv / env / working_dir / MCP-config path / cgroup_prefix); the daemon
+/// resolves the repo, creates `~/.cm/worktrees/<repo>-<slug>` on `cm/<slug>`,
+/// and builds argv/env itself. Operator-only on the daemon side.
+#[allow(clippy::too_many_arguments)]
+pub fn rpc_create_session(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    repo_url: &str,
+    start_branch: Option<&str>,
+    slug: &str,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<CreateSessionResult> {
+    let mut params = serde_json::json!({
+        "uid": uid,
+        "workspace_id": workspace_id,
+        "label": label,
+        "engine": engine,
+        "repo_url": repo_url,
+        "slug": slug,
+        "cols": cols,
+        "rows": rows,
+    });
+    if let Some(sb) = start_branch {
+        params["start_branch"] = serde_json::Value::String(sb.to_string());
+    }
+    if let Some(tid) = task_id {
+        params["task_id"] = serde_json::Value::String(tid.to_string());
+    }
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "create_session".into(),
+        params,
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp.result.context("create_session response missing result")?;
+    Ok(CreateSessionResult {
+        session_uid: result["session_uid"]
+            .as_str()
+            .context("create_session result missing session_uid")?
+            .to_string(),
+        worktree_path: result["worktree_path"]
+            .as_str()
+            .context("create_session result missing worktree_path")?
+            .to_string(),
+        // The daemon echoes the workspace_id it registered; fall back to
+        // the one we sent if an older daemon omits it.
+        workspace_id: result["workspace_id"]
+            .as_str()
+            .unwrap_or(workspace_id)
+            .to_string(),
+    })
+}
+
+/// `add_session` response (remote-session-execution Phase 1/3).
+pub(crate) struct AddSessionResult {
+    pub session_uid: String,
+    pub worktree_path: String,
+}
+
+/// `add_session` RPC — A-s on a remote-hosted workspace. Reuses the
+/// workspace's existing worktree (no `repo_url`/`slug`/`start_branch`);
+/// the daemon looks up `workspace_id` and spawns into its worktree.
+/// Operator-only on the daemon side.
+#[allow(clippy::too_many_arguments)]
+pub fn rpc_add_session(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<AddSessionResult> {
+    let mut params = serde_json::json!({
+        "uid": uid,
+        "workspace_id": workspace_id,
+        "label": label,
+        "engine": engine,
+        "cols": cols,
+        "rows": rows,
+    });
+    if let Some(tid) = task_id {
+        params["task_id"] = serde_json::Value::String(tid.to_string());
+    }
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "add_session".into(),
+        params,
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp.result.context("add_session response missing result")?;
+    Ok(AddSessionResult {
+        session_uid: result["session_uid"]
+            .as_str()
+            .context("add_session result missing session_uid")?
+            .to_string(),
+        worktree_path: result["worktree_path"]
+            .as_str()
+            .context("add_session result missing worktree_path")?
+            .to_string(),
+    })
+}
+
 /// `session.attach` response shape — local to the client; we
 /// don't share types with the daemon-side `attach::SessionAttachResponse`
 /// because the wire format is a plain JSON object and the daemon's
