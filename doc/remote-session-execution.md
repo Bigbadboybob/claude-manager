@@ -109,7 +109,7 @@ Both the create/add flow and standalone reattach go through `try_attach_via_daem
 
 ## Risks and open questions
 
-- Clone-on-demand fetches caller-named URLs on the VM. Mitigation: allowlist by default; open cloning behind `allow_clone`; never auto-run repo setup scripts on clone.
+- Clone-on-demand fetches caller-named URLs on the VM. Mitigation: allowlist by default; open cloning behind `allow_clone`. Operator decision (2026-06-20): `setup_worktree.sh` DOES run on cloned repos too — same as the local A-n path, no provenance gate — accepted because cloning is allowlist-gated to the operator's own private/trusted repos, so the setup hook is trusted code with no untrusted-source RCE risk in this single-operator setup. Revisit (gate setup off for daemon-cloned repos) only if open cloning of untrusted URLs is ever enabled via `allow_clone`.
 - Memory caps are host-local (`cgroup_prefix`, app.rs:888), so the local cap triple can't cross hosts. Mitigation: the RPCs omit it; remote sessions spawn uncapped until daemon-side cap resolution (methods.rs:6046) is added.
 - The attach stream can stall if the tunnel respawns mid-stream. Mitigation: `host_pool` respawns dead tunnels; validate that attach survives a bounce or surfaces a clean reattach.
 - A partial `create_session` (repo resolved, `git worktree add` fails) could orphan a branch/dir. Mitigation: clean up on failure and return a typed error.
