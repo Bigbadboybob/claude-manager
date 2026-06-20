@@ -13722,14 +13722,16 @@ impl App {
         // Per-role "new claude" vs "new codex" overrides for fresh-spawned roles
         // (only the ones the operator cycled off their TOML default).
         let role_engines = slots_to_role_engines(slots);
-        // Remote workflow launch from the TUI isn't supported yet (Phase 5 of
-        // doc/remote-session-execution.md): the remote daemon can't use a local
-        // worktree path or bind local session uids. Guard with a clear message
-        // instead of firing a launch that hangs/fails.
-        if let Err(e) = guard_local_host_only(&host_id, "A-f workflow launch") {
-            self.set_status_msg(&format!("{e}"));
-            return;
-        }
+        // Phase 5 (doc/remote-session-execution.md): A-f routes to the
+        // WORKSPACE's host, ungated. `start_workflow` is already daemon-driven
+        // — for a remote-hosted workspace the worktree path and the bound
+        // session uids are the REMOTE daemon's own (Phase 3 created the
+        // worktree + sessions there), so the launch is correct against that
+        // host's socket. `for_host(&host_id)` below resolves that socket and
+        // surfaces a clear "daemon unavailable" message if the host is
+        // unreachable; the TUI then observes the run via the existing
+        // workflow event / manifest streams. Local A-f is unchanged
+        // (host_id == local → the local socket, exactly as before).
         let daemon_socket = match self.host_pool.for_host(&host_id) {
             Ok(h) => match h.socket_path() {
                 Some(p) => p,
@@ -17398,6 +17400,62 @@ mod pending_workflow_events_tests {
         (stop, handle)
     }
 
+    /// Spin a minimal RECORDING control-socket listener on `sock`: it captures
+    /// each request's `{method, params}` and replies OK `{run_id:"wf_test"}`,
+    /// WITHOUT running the real dispatcher (so a `start_workflow` routing test
+    /// never spawns participants). Returns `(captured, stop, handle)`.
+    #[allow(clippy::type_complexity)]
+    fn spawn_recording_listener(
+        sock: std::path::PathBuf,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dstop = stop.clone();
+        let cap = captured.clone();
+        let handle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let cap = cap.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            if let Ok(Some(req)) =
+                                cm_daemon::control::wire::read_request(&mut stream)
+                            {
+                                cap.lock().unwrap_or_else(|p| p.into_inner()).push(
+                                    serde_json::json!({
+                                        "method": req.method,
+                                        "params": req.params,
+                                    }),
+                                );
+                                let resp = cm_daemon::control::protocol::Response::ok(
+                                    req.id.clone(),
+                                    serde_json::json!({ "run_id": "wf_test" }),
+                                );
+                                let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (captured, stop, handle)
+    }
+
     /// Criterion: a remote A-n with `in_place` is rejected with a status
     /// message and issues NO RPC (the rejection precedes any host_pool /
     /// daemon access), and creates no workspace.
@@ -18372,6 +18430,165 @@ mod pending_workflow_events_tests {
             "no session adopted from an unreachable host",
         );
 
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Phase 5 (remote-session-execution): `A-f` (launch_workflow_via_daemon)
+    /// routes `start_workflow` to the WORKSPACE's host socket — a remote-hosted
+    /// workspace → the remote daemon (with the remote worktree), a local
+    /// workspace → the local daemon, unchanged. Recording listeners on both
+    /// sockets capture where the RPC landed (no real participant spawn).
+    ///
+    /// The cm-manager live e2e (A-f a feedback workflow on a remote worktree,
+    /// watch worker→reviewer→manager drive to done from the TUI) is a deferred
+    /// MANUAL operator pass — no live TUI + VM in this loop.
+    #[test]
+    fn a_f_routes_start_workflow_to_workspace_host() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let mgr_sock = cm_dir.join("manager.sock");
+
+        let (local_cap, local_stop, local_h) =
+            spawn_recording_listener(local_sock.clone());
+        let (mgr_cap, mgr_stop, mgr_h) = spawn_recording_listener(mgr_sock.clone());
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+
+        // Local-hosted workspace (its session's host_id defaults to local).
+        let local_sess = make_simple_session(
+            "claude",
+            "claude",
+            Session::new("/bin/bash", &[], 80, 24, None, Default::default(), None)
+                .expect("local sess"),
+            None,
+        );
+        app.workspaces.push(Workspace {
+            id: "ws-local".into(),
+            name: "l".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(PathBuf::from("/tmp/wt-local")),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![local_sess],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        });
+
+        // Remote-hosted workspace (its session pinned to host "manager").
+        let mut remote_sess = make_simple_session(
+            "claude",
+            "claude",
+            Session::new("/bin/bash", &[], 80, 24, None, Default::default(), None)
+                .expect("remote sess"),
+            None,
+        );
+        remote_sess.host_id = cm_daemon::host_id::HostId::new("manager");
+        app.workspaces.push(Workspace {
+            id: "ws-remote".into(),
+            name: "r".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(PathBuf::from("/remote/wt")),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![remote_sess],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        });
+
+        // A-f on each workspace (empty slots → fresh-spawn launch; the
+        // recording listener doesn't run the real spawn).
+        app.launch_workflow_via_daemon("ws-local", "feedback", &[], Some("goal-l".into()), None);
+        app.launch_workflow_via_daemon("ws-remote", "feedback", &[], Some("goal-r".into()), None);
+
+        let find_sw = |caps: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>|
+         -> Option<serde_json::Value> {
+            caps.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .find(|c| c["method"] == "start_workflow")
+                .cloned()
+        };
+
+        // Remote A-f → the MANAGER socket, with the REMOTE worktree.
+        let mgr_sw = find_sw(&mgr_cap)
+            .expect("remote A-f must send start_workflow to the manager socket");
+        assert_eq!(mgr_sw["params"]["worktree"], "/remote/wt");
+        assert_eq!(mgr_sw["params"]["workspace_id"], "ws-remote");
+
+        // Local A-f → the LOCAL socket, with the local worktree (unchanged).
+        let local_sw = find_sw(&local_cap)
+            .expect("local A-f must send start_workflow to the local socket");
+        assert_eq!(local_sw["params"]["worktree"], "/tmp/wt-local");
+        assert_eq!(local_sw["params"]["workspace_id"], "ws-local");
+
+        // Cross-check: neither socket got the OTHER workspace's launch.
+        assert!(
+            mgr_cap
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .all(|c| c["method"] != "start_workflow"
+                    || c["params"]["workspace_id"] == "ws-remote"),
+            "the manager socket must only receive the remote workspace's launch",
+        );
+        assert!(
+            local_cap
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .all(|c| c["method"] != "start_workflow"
+                    || c["params"]["workspace_id"] == "ws-local"),
+            "the local socket must only receive the local workspace's launch",
+        );
+
+        // Cleanup.
+        local_stop.store(true, Ordering::SeqCst);
+        mgr_stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&local_sock);
+        let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
+        let _ = local_h.join();
+        let _ = mgr_h.join();
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
