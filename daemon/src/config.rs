@@ -99,6 +99,19 @@ pub struct TlsConfig {
     pub listen_addr: String,
 }
 
+/// `[[repo]]` allowlist entry — a repo the daemon is permitted to clone
+/// on demand (Phase 2, remote-session-execution). `name` is matched
+/// against the requested repo's shortname and `url` against the requested
+/// URL; `url` is also the actual `git clone` source. The allowlist is the
+/// default-deny complement to `allow_clone`: cloning arbitrary URLs runs
+/// code-fetch on the host, so it's opt-in per-repo (or globally via
+/// `allow_clone`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RepoAllowEntry {
+    pub name: String,
+    pub url: String,
+}
+
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
@@ -142,6 +155,39 @@ pub struct DaemonConfig {
     /// is the local-workstation default.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Directory where the daemon clones repos not already on disk
+    /// (Phase 2 clone-on-demand). Empty → the `~/.cm/repos` default
+    /// (see [`DaemonConfig::repos_dir_or_default`]). Only consulted when
+    /// a clone is actually permitted (an allowlist match or
+    /// `allow_clone`); with neither, no clone ever happens and this is
+    /// unused.
+    #[serde(default)]
+    pub repos_dir: String,
+    /// Open-cloning flag. `false` (default) → only allowlisted URLs may
+    /// be cloned. Cloning an arbitrary URL runs code-fetch on the host,
+    /// so open cloning is opt-in. `true` → any requested URL may be
+    /// cloned on demand.
+    #[serde(default)]
+    pub allow_clone: bool,
+    /// Clone allowlist. Each `[[repo]]` entry permits cloning one repo by
+    /// `name` / `url` even when `allow_clone` is false.
+    #[serde(default, rename = "repo")]
+    pub repos: Vec<RepoAllowEntry>,
+}
+
+impl DaemonConfig {
+    /// Effective clone directory: the configured `repos_dir`, or the
+    /// `~/.cm/repos` default when unset. Daemon-cloned repos live here —
+    /// separate from the operator's hand-managed `~/code/projects` (which
+    /// `find_local_repo` checks first), alongside the daemon's other
+    /// `~/.cm/` state (worktrees, mcp configs, workflow-runs).
+    pub fn repos_dir_or_default(&self) -> PathBuf {
+        if self.repos_dir.trim().is_empty() {
+            crate::path::dot_cm_dir().join("repos")
+        } else {
+            PathBuf::from(&self.repos_dir)
+        }
+    }
 }
 
 impl Default for DaemonConfig {
@@ -154,6 +200,9 @@ impl Default for DaemonConfig {
             workflows_dir: String::new(),
             auth: AuthConfig::default(),
             tls: None,
+            repos_dir: String::new(),
+            allow_clone: false,
+            repos: Vec::new(),
         }
     }
 }
@@ -437,6 +486,12 @@ mode = "ssh-trust"
                 mode: AuthMode::Token,
             },
             tls: None,
+            repos_dir: "/home/lucas/.cm/repos".into(),
+            allow_clone: true,
+            repos: vec![RepoAllowEntry {
+                name: "claude-manager".into(),
+                url: "https://github.com/u/claude-manager.git".into(),
+            }],
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =
@@ -448,6 +503,82 @@ mode = "ssh-trust"
         assert_eq!(reparsed.workflows_dir, original.workflows_dir);
         assert_eq!(reparsed.auth.mode, original.auth.mode);
         assert!(reparsed.tls.is_none());
+        assert_eq!(reparsed.repos_dir, original.repos_dir);
+        assert_eq!(reparsed.allow_clone, original.allow_clone);
+        assert_eq!(reparsed.repos.len(), 1);
+        assert_eq!(reparsed.repos[0].name, "claude-manager");
+        assert_eq!(reparsed.repos[0].url, "https://github.com/u/claude-manager.git");
+    }
+
+    /// Phase 2: the repos section (`repos_dir`, `allow_clone`, and
+    /// `[[repo]]` allowlist entries) parses from daemon.toml.
+    #[test]
+    fn repos_section_parses() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            r#"
+mcp_server_path = ""
+repos_dir = "/home/lucas/.cm/repos"
+allow_clone = false
+
+[[repo]]
+name = "claude-manager"
+url = "https://github.com/u/claude-manager.git"
+
+[[repo]]
+name = "other"
+url = "git@github.com:u/other.git"
+"#,
+        )
+        .expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        assert_eq!(cfg.repos_dir, "/home/lucas/.cm/repos");
+        assert!(!cfg.allow_clone);
+        assert_eq!(cfg.repos.len(), 2);
+        assert_eq!(cfg.repos[0].name, "claude-manager");
+        assert_eq!(cfg.repos[1].url, "git@github.com:u/other.git");
+    }
+
+    /// Phase 2: no repos section → empty defaults (allow_clone=false,
+    /// empty allowlist) so no clone ever happens — today's behavior.
+    /// `repos_dir_or_default` falls back to `~/.cm/repos`.
+    #[test]
+    fn repos_section_absent_defaults_to_no_clone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(&path, "mcp_server_path = \"\"\n").expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        assert!(!cfg.allow_clone, "default-deny: no open cloning");
+        assert!(cfg.repos.is_empty(), "no allowlist entries");
+        assert_eq!(cfg.repos_dir, "", "repos_dir unset");
+        assert!(
+            cfg.repos_dir_or_default().ends_with(".cm/repos"),
+            "default clone dir is ~/.cm/repos, got {:?}",
+            cfg.repos_dir_or_default(),
+        );
+    }
+
+    /// Phase 2: a non-empty `repos_dir` is honored verbatim by
+    /// `repos_dir_or_default`.
+    #[test]
+    fn repos_dir_or_default_honors_configured_value() {
+        let cfg = DaemonConfig {
+            repos_dir: "/srv/clones".into(),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(cfg.repos_dir_or_default(), PathBuf::from("/srv/clones"));
     }
 
     /// 12h: `[tls]` section parses when present. All three fields

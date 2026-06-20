@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 /// Base directory for all worktrees.
 fn worktree_base() -> PathBuf {
@@ -410,6 +411,174 @@ pub fn find_local_repo(repo_url: &str) -> Option<PathBuf> {
     None
 }
 
+/// An allowlist entry the daemon may clone (borrowed view of
+/// `config::RepoAllowEntry`, so this module stays free of a config
+/// dependency).
+pub struct RepoAllow<'a> {
+    pub name: &'a str,
+    pub url: &'a str,
+}
+
+/// Why `resolve_repo` couldn't produce a local checkout.
+#[derive(Debug)]
+pub enum RepoResolveError {
+    /// Not present on disk and cloning isn't permitted — the URL is not
+    /// in the allowlist and `allow_clone` is false. Carries the repo
+    /// name. (Phase 2 default-deny: cloning runs code-fetch on the host.)
+    NotPermitted(String),
+    /// Cloning was permitted and attempted, but `git clone` failed.
+    /// Carries the repo name + git's stderr.
+    CloneFailed { repo: String, detail: String },
+}
+
+/// Serializes first-resolve clones in [`resolve_repo`] so two concurrent
+/// `create_session` calls for the same not-yet-cloned URL can't both
+/// `git clone` into the same target (which would let the loser's cleanup
+/// delete the winner's checkout). Coarse on purpose — see the lock-acquire
+/// site for the invariant. The reuse fast path stays outside the lock, so
+/// only genuine first-resolves ever contend.
+static CLONE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Resolve a repo shortname/URL to a local checkout, cloning on demand
+/// when permitted (Phase 2, remote-session-execution).
+///
+/// Resolution order:
+///   1. `find_local_repo` fast path — `~/code/projects/<name>` + cwd
+///      (today's behavior). A repo already on disk is used as-is.
+///   2. Reuse a prior clone at `repos_dir/<name>`. Checked independently
+///      of `find_local_repo`'s hardcoded paths, so the no-re-clone
+///      guarantee holds even when `repos_dir` isn't one of them.
+///   3. On a miss, cloning is permitted iff the request matches an
+///      allowlist entry (by `name` or `url`) OR `allow_clone` is true.
+///      If permitted, `git clone <url> <repos_dir>/<name>` then return
+///      that path. Otherwise `NotPermitted` — no clone is attempted.
+///
+/// With an empty allowlist and `allow_clone == false` (no repos config),
+/// this is exactly `find_local_repo` + a NotPermitted on miss — i.e.
+/// today's behavior, never cloning.
+pub fn resolve_repo(
+    repo_url: &str,
+    repos_dir: &Path,
+    allow_clone: bool,
+    allowlist: &[RepoAllow],
+) -> Result<PathBuf, RepoResolveError> {
+    let name = repo_name(repo_url);
+
+    // Safety gate FIRST, before any filesystem access. `repo_name` can
+    // derive an unsafe component (empty, ".", "..", or one containing a
+    // path separator) from a malformed URL — e.g. one ending in `/..`.
+    // Then `repos_dir.join(name)` escapes repos_dir (".." → its parent,
+    // `~/.cm` by default), and the failure-cleanup `remove_dir_all` below
+    // could delete it. It would also let `find_local_repo` match an
+    // unintended dir. A `name` MUST be a single safe path component.
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(RepoResolveError::CloneFailed {
+            repo: name.clone(),
+            detail: format!(
+                "refusing to resolve unsafe repo name '{}' derived from URL '{}' \
+                 — must be a single safe path component",
+                name, repo_url
+            ),
+        });
+    }
+
+    // 1. Local fast path.
+    if let Some(p) = find_local_repo(repo_url) {
+        return Ok(p);
+    }
+
+    // 2. Reuse a prior clone (fast path, NO lock). A `.git` under
+    // repos_dir/<name> means a previous resolve already cloned it — never
+    // re-clone (criterion #1). Already-cloned repos thus never contend on
+    // the clone lock below.
+    let target = repos_dir.join(&name);
+    if target.join(".git").exists() {
+        return Ok(target);
+    }
+
+    // Serialize first-resolve clones. Two concurrent create_session calls
+    // for the same not-yet-cloned URL run on separate daemon handler
+    // threads (the state lock is released before resolve_repo); without
+    // this, both would pass the reuse check above, both `git clone` into
+    // `target`, and the loser's clone would fail on the now-non-empty dir
+    // and its cleanup could delete the winner's fresh checkout. A single
+    // coarse lock is fine: clones happen only on first-resolve (rare,
+    // I/O-bound) and the common reuse path above stays outside it.
+    // Poison is recovered so one panicking clone can't wedge all future
+    // clones.
+    let _clone_guard = CLONE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Double-checked reuse: a concurrent winner may have finished cloning
+    // into `target` while we waited for the lock. If so, reuse it — no
+    // second clone. (Holding the lock, the only states are: `.git` present
+    // → winner finished, reuse; or `target` absent / a non-clone leftover
+    // → proceed. A concurrent clone can't be mid-flight here.)
+    if target.join(".git").exists() {
+        return Ok(target);
+    }
+
+    // 3. Permission gate. An allowlist entry matches by name or URL (or
+    // by the URL's derived shortname, so a shortname request resolves an
+    // entry keyed by full URL). When matched, clone the entry's URL;
+    // under open `allow_clone`, clone the requested URL verbatim.
+    let allow_match = allowlist.iter().find(|e| {
+        e.name == name || e.url == repo_url || repo_name(e.url) == name
+    });
+    let clone_url: String = match allow_match {
+        Some(e) => e.url.to_string(),
+        None if allow_clone => repo_url.to_string(),
+        None => return Err(RepoResolveError::NotPermitted(name)),
+    };
+
+    // 4. Clone into repos_dir/<name>.
+    if let Err(e) = std::fs::create_dir_all(repos_dir) {
+        return Err(RepoResolveError::CloneFailed {
+            repo: name,
+            detail: format!("create repos_dir {}: {}", repos_dir.display(), e),
+        });
+    }
+    // Capture whether `target` already existed BEFORE our clone, so the
+    // failure-cleanup only ever removes a directory THIS call created.
+    // Same-URL race: two threads can both pass the step-2 reuse check and
+    // both `git clone` into `target`; the loser's clone fails on the
+    // now-non-empty dir and must NOT delete the winner's fresh checkout
+    // out from under its in-flight worktree build.
+    let pre_existed = target.exists();
+    let out = Command::new("git")
+        .args(["clone", &clone_url])
+        .arg(&target)
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            // git failed to spawn — no clone dir was created by us.
+            return Err(RepoResolveError::CloneFailed {
+                repo: name,
+                detail: format!("spawn git clone: {}", e),
+            });
+        }
+    };
+    if !out.status.success() || !target.join(".git").exists() {
+        // Clean up a partial clone so a retry isn't blocked and the reuse
+        // check (step 2) can't latch onto a broken checkout — but ONLY if
+        // this call created `target` (`!pre_existed`). Never delete a
+        // pre-existing dir (a concurrent winner's clone, or a leftover).
+        if !pre_existed && target.exists() {
+            let _ = std::fs::remove_dir_all(&target);
+        }
+        return Err(RepoResolveError::CloneFailed {
+            repo: name,
+            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(target)
+}
+
 mod dirs {
     use std::path::PathBuf;
 
@@ -506,6 +675,236 @@ mod tests {
 
             assert_eq!(recover_worktree_path("r", "main"), None);
             assert_eq!(recover_worktree_path("r", "feature/x"), None);
+        });
+    }
+
+    // === Phase 2: resolve_repo (registry + clone-on-demand) ===
+
+    /// Build a real git repo (one commit) at `path` so `git clone` has a
+    /// source. Test helper.
+    fn make_git_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(path.join("README.md"), "x").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    /// Criterion: an allowlisted URL absent from disk clones into
+    /// `repos_dir/<name>` then resolves; a second resolve reuses it (no
+    /// re-clone). The sentinel proves reuse — a re-clone would `git clone`
+    /// into a non-empty dir and fail (or wipe the sentinel).
+    #[test]
+    fn resolve_repo_clones_allowlisted_url_then_reuses() {
+        with_home(|_home| {
+            let src = tempfile::tempdir().unwrap();
+            let src_repo = src.path().join("myrepo");
+            make_git_repo(&src_repo);
+            let src_url = src_repo.to_string_lossy().into_owned();
+
+            let repos = tempfile::tempdir().unwrap();
+            let repos_dir = repos.path();
+            let allow = [RepoAllow { name: "myrepo", url: &src_url }];
+
+            // First resolve: not on disk → allowlisted → clone.
+            let got = resolve_repo("myrepo", repos_dir, false, &allow)
+                .expect("allowlisted repo clones");
+            assert_eq!(got, repos_dir.join("myrepo"));
+            assert!(got.join(".git").exists(), "clone produced a real checkout");
+
+            // Sentinel survives the second resolve iff it reuses.
+            let sentinel = got.join("SENTINEL");
+            std::fs::write(&sentinel, "keep").unwrap();
+
+            let got2 = resolve_repo("myrepo", repos_dir, false, &allow)
+                .expect("second resolve reuses");
+            assert_eq!(got2, repos_dir.join("myrepo"));
+            assert!(
+                sentinel.exists(),
+                "second resolve must reuse the clone, not re-clone"
+            );
+        });
+    }
+
+    /// Criterion: a non-allowlisted URL with `allow_clone=false` returns
+    /// NotPermitted WITHOUT cloning.
+    #[test]
+    fn resolve_repo_not_permitted_does_not_clone() {
+        with_home(|_home| {
+            let repos = tempfile::tempdir().unwrap();
+            let repos_dir = repos.path();
+            let err = resolve_repo(
+                "https://github.com/u/ghostrepo.git",
+                repos_dir,
+                false,
+                &[],
+            )
+            .expect_err("not permitted");
+            match err {
+                RepoResolveError::NotPermitted(name) => assert_eq!(name, "ghostrepo"),
+                other => panic!("expected NotPermitted, got {:?}", other),
+            }
+            assert!(
+                !repos_dir.join("ghostrepo").exists(),
+                "must not attempt a clone when not permitted"
+            );
+        });
+    }
+
+    /// Criterion: no repos config (empty allowlist, `allow_clone=false`)
+    /// → find_local_repo only. A repo present in ~/code/projects resolves
+    /// via the fast path and nothing is cloned.
+    #[test]
+    fn resolve_repo_uses_find_local_repo_fast_path() {
+        with_home(|home| {
+            let local = home.join("code/projects/foundrepo");
+            make_git_repo(&local);
+            let repos = tempfile::tempdir().unwrap();
+            let got = resolve_repo("foundrepo", repos.path(), false, &[])
+                .expect("resolved via find_local_repo");
+            assert_eq!(got, local);
+            assert!(
+                !repos.path().join("foundrepo").exists(),
+                "fast path must not clone"
+            );
+        });
+    }
+
+    /// `allow_clone=true` clones a non-allowlisted URL (the open-cloning
+    /// flag).
+    #[test]
+    fn resolve_repo_allow_clone_open_clones_unlisted_url() {
+        with_home(|_home| {
+            let src = tempfile::tempdir().unwrap();
+            let src_repo = src.path().join("openrepo");
+            make_git_repo(&src_repo);
+            let src_url = src_repo.to_string_lossy().into_owned();
+            let repos = tempfile::tempdir().unwrap();
+            let got = resolve_repo(&src_url, repos.path(), true, &[])
+                .expect("open clone");
+            assert_eq!(got, repos.path().join("openrepo"));
+            assert!(got.join(".git").exists());
+        });
+    }
+
+    /// A permitted-but-failing clone returns CloneFailed and cleans up the
+    /// partial target (so a retry isn't blocked and the reuse check can't
+    /// latch a broken checkout).
+    #[test]
+    fn resolve_repo_clone_failure_returns_error_and_cleans_up() {
+        with_home(|_home| {
+            let repos = tempfile::tempdir().unwrap();
+            let err = resolve_repo(
+                "/nonexistent/path/to/brokenrepo",
+                repos.path(),
+                true,
+                &[],
+            )
+            .expect_err("clone of a missing source fails");
+            match err {
+                RepoResolveError::CloneFailed { repo, .. } => {
+                    assert_eq!(repo, "brokenrepo")
+                }
+                other => panic!("expected CloneFailed, got {:?}", other),
+            }
+            assert!(
+                !repos.path().join("brokenrepo").exists(),
+                "partial clone must be cleaned up"
+            );
+        });
+    }
+
+    /// Safety: a URL whose derived name is unsafe (here `..`, from a URL
+    /// ending in `/..`) is rejected BEFORE any filesystem op — so the
+    /// failure-cleanup can never `remove_dir_all` an escaped path
+    /// (`repos_dir/..` = its parent). A canary file in repos_dir's parent
+    /// must survive, and repos_dir itself must remain.
+    #[test]
+    fn resolve_repo_unsafe_name_is_rejected_without_touching_parent() {
+        with_home(|_home| {
+            let root = tempfile::tempdir().unwrap();
+            let repos_dir = root.path().join("repos");
+            std::fs::create_dir_all(&repos_dir).unwrap();
+            // Sibling of repos_dir == repos_dir/.. (the dir the unsafe
+            // name would resolve to and the cleanup would delete).
+            let canary = root.path().join("CANARY");
+            std::fs::write(&canary, "do not delete").unwrap();
+
+            // URL ending in `/..` → repo_name() == "..".
+            let err = resolve_repo(
+                "https://github.com/u/..",
+                &repos_dir,
+                true, // even with cloning enabled, the name check blocks first
+                &[],
+            )
+            .expect_err("unsafe derived name must error");
+            match err {
+                RepoResolveError::CloneFailed { repo, detail } => {
+                    assert_eq!(repo, "..");
+                    assert!(
+                        detail.contains("unsafe repo name"),
+                        "detail must name the cause: {}",
+                        detail
+                    );
+                }
+                other => panic!("expected CloneFailed(unsafe name), got {:?}", other),
+            }
+            assert!(
+                canary.exists(),
+                "an unsafe name must NEVER let cleanup escape repos_dir"
+            );
+            assert!(repos_dir.exists(), "repos_dir itself must survive");
+        });
+    }
+
+    /// Safety: when the clone fails but `target` PRE-EXISTED (e.g. a
+    /// concurrent winner's checkout), the failure-cleanup must NOT delete
+    /// it. A sentinel inside the pre-existing target must survive.
+    #[test]
+    fn resolve_repo_clone_failure_leaves_preexisting_target_untouched() {
+        with_home(|_home| {
+            let src = tempfile::tempdir().unwrap();
+            let src_repo = src.path().join("racerepo");
+            make_git_repo(&src_repo);
+            let src_url = src_repo.to_string_lossy().into_owned();
+
+            let repos = tempfile::tempdir().unwrap();
+            // Pre-create target as a NON-empty, non-git dir (stands in for
+            // a concurrent winner's in-progress / different checkout). git
+            // clone into it fails ("destination exists / not empty").
+            let target = repos.path().join("racerepo");
+            std::fs::create_dir_all(&target).unwrap();
+            let sentinel = target.join("WINNER");
+            std::fs::write(&sentinel, "winner's work").unwrap();
+
+            let err = resolve_repo(&src_url, repos.path(), true, &[])
+                .expect_err("clone into a non-empty pre-existing target fails");
+            assert!(
+                matches!(err, RepoResolveError::CloneFailed { .. }),
+                "expected CloneFailed, got {:?}",
+                err
+            );
+            assert!(
+                sentinel.exists(),
+                "failure-cleanup must NOT delete a pre-existing target \
+                 (a concurrent winner's checkout)"
+            );
         });
     }
 }

@@ -6240,17 +6240,50 @@ pub fn create_session(
         ));
     }
 
-    // Resolve the repo on the DAEMON's filesystem. Phase 1: local
-    // fast-path only — clone-on-demand lands in Phase 2. An
-    // unresolvable repo is a typed NotFound naming the repo.
-    let repo = crate::worktree::find_local_repo(&p.repo_url).ok_or((
-        ErrorCode::NotFound,
-        format!(
-            "repo '{}' not found on the daemon host (no ~/code/projects/<name> \
-             match; clone-on-demand lands in Phase 2)",
-            p.repo_url
+    // Resolve the repo on the DAEMON's filesystem: local fast-path
+    // (find_local_repo), else clone a permitted URL into `repos_dir`
+    // (Phase 2). Snapshot the repos config under the lock, then resolve
+    // without holding it (clone can be slow).
+    let (repos_dir, allow_clone, allow_entries): (PathBuf, bool, Vec<(String, String)>) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            st.config.repos_dir_or_default(),
+            st.config.allow_clone,
+            st.config
+                .repos
+                .iter()
+                .map(|e| (e.name.clone(), e.url.clone()))
+                .collect(),
+        )
+    };
+    let allowlist: Vec<crate::worktree::RepoAllow> = allow_entries
+        .iter()
+        .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
+        .collect();
+    let repo = crate::worktree::resolve_repo(
+        &p.repo_url,
+        &repos_dir,
+        allow_clone,
+        &allowlist,
+    )
+    .map_err(|e| match e {
+        // Not on disk and cloning isn't permitted → NotFound naming the
+        // repo (per the doc; an allowlist entry or allow_clone lifts it).
+        crate::worktree::RepoResolveError::NotPermitted(name) => (
+            ErrorCode::NotFound,
+            format!(
+                "repo '{}' not found on the daemon host and cloning is not \
+                 permitted — add a [[repo]] allowlist entry or set \
+                 allow_clone in daemon.toml",
+                name
+            ),
         ),
-    ))?;
+        // Cloning was permitted but git failed (bad URL, network, auth).
+        crate::worktree::RepoResolveError::CloneFailed { repo, detail } => (
+            ErrorCode::Internal,
+            format!("clone of repo '{}' failed: {}", repo, detail),
+        ),
+    })?;
 
     // Create the worktree: ~/.cm/worktrees/<repo>-<slug> on cm/<slug>.
     // On `git worktree add` failure `create_worktree` cleans up its
@@ -7195,6 +7228,66 @@ mod tests {
             }
             kill_all_sessions(&state);
         });
+    }
+
+    /// Phase 2 wiring: `create_session` resolves a repo that is NOT on
+    /// disk by cloning an allowlisted URL into `~/.cm/repos/<name>`, then
+    /// builds the worktree from the clone and spawns. Source repo lives
+    /// outside `~/code/projects` so `find_local_repo` misses and the
+    /// clone path is exercised.
+    #[test]
+    fn create_session_clones_allowlisted_repo_then_builds_worktree() {
+        let _g = crate::test_support::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()); }
+
+        // Source repo OUTSIDE ~/code/projects (one commit so it's clonable).
+        let src = tempfile::tempdir().unwrap();
+        let src_repo = src.path().join("clonerepo");
+        std::fs::create_dir_all(&src_repo).unwrap();
+        run_git(&src_repo, &["init", "-q"]);
+        run_git(&src_repo, &["config", "user.email", "t@example.com"]);
+        run_git(&src_repo, &["config", "user.name", "t"]);
+        std::fs::write(src_repo.join("README.md"), "x").unwrap();
+        run_git(&src_repo, &["add", "-A"]);
+        run_git(&src_repo, &["commit", "-q", "-m", "init"]);
+        let src_url = src_repo.to_string_lossy().into_owned();
+
+        // State with an allowlist entry mapping clonerepo → src_url.
+        let state = {
+            let mut s = DaemonState::new();
+            s.config.repos.push(crate::config::RepoAllowEntry {
+                name: "clonerepo".into(),
+                url: src_url.clone(),
+            });
+            Arc::new(Mutex::new(s))
+        };
+        let uid = fresh_test_uid();
+        let params = json!({
+            "uid": uid,
+            "workspace_id": "ws-clone",
+            "label": "cloned",
+            "engine": "bash",
+            "repo_url": "clonerepo",
+            "slug": "work",
+        });
+        let result = create_session(&state, &params).expect("create_session via clone ok");
+        assert_eq!(result["session_uid"], uid);
+        // Cloned into ~/.cm/repos/clonerepo; worktree built from it.
+        assert!(
+            home.path().join(".cm/repos/clonerepo/.git").exists(),
+            "repo cloned into ~/.cm/repos"
+        );
+        let wt = home.path().join(".cm/worktrees/clonerepo-work");
+        assert!(wt.join(".git").exists(), "worktree built from the clone");
+        assert_eq!(result["worktree_path"].as_str().unwrap(), wt.to_string_lossy().as_ref());
+        kill_all_sessions(&state);
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("HOME", p) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 
     /// Criterion: an unresolvable `repo_url` returns a typed error naming
@@ -8194,6 +8287,9 @@ mod tests {
                 workflows_dir: String::new(),
                 auth: Default::default(),
                 tls: None,
+                repos_dir: String::new(),
+                allow_clone: false,
+                repos: Vec::new(),
             };
             Arc::new(Mutex::new(s))
         };

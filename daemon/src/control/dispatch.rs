@@ -6698,6 +6698,9 @@ mod tests {
                 workflows_dir: String::new(),
                 auth: Default::default(),
                 tls: None,
+                repos_dir: String::new(),
+                allow_clone: false,
+                repos: Vec::new(),
             };
         }
         let resp = dispatch_request(
