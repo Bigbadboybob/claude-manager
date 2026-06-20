@@ -117,7 +117,7 @@ Both the create/add flow and standalone reattach go through `try_attach_via_daem
 
 ## Implementation plan
 
-### Phase 1: Daemon `create_session` + `add_session` RPCs
+### Phase 1: Daemon `create_session` + `add_session` RPCs [feedback]
 
 - **Goal:** two Operator-only daemon RPCs spawn a session with daemon-resolved argv/env/MCP-config and return its identity — `create_session` creating a worktree, `add_session` reusing an existing workspace's worktree. Testable against the local daemon.
 - **Scope:** daemon/src/control/methods.rs (the two methods + params structs; a shared spawn core factored out of `start_session`), daemon/src/control/dispatch.rs (both arms `require_operator`), daemon/src/worktree.rs `create_worktree` (create only), daemon/src/mcp_config.rs `build_args`/`build_env` (both). Remote sessions spawn uncapped.
@@ -131,7 +131,7 @@ Both the create/add flow and standalone reattach go through `try_attach_via_daem
   - `start_session` / `mcp_start_session` behavior is unchanged (existing tests green).
 - **Dependencies:** none.
 
-### Phase 2: Daemon repo availability
+### Phase 2: Daemon repo availability [feedback]
 
 - **Goal:** the daemon resolves any repo — local fast-path, else clone a permitted URL — so `create_session` works for repos not pre-present.
 - **Scope:** daemon/src/config.rs (`repos_dir` + allowlist / `allow_clone`), daemon/src/worktree.rs (a resolver wrapping `find_local_repo` with a clone fallback), wired into `create_session`.
@@ -142,7 +142,7 @@ Both the create/add flow and standalone reattach go through `try_attach_via_daem
   - No repos section in `daemon.toml` → today's behavior (`find_local_repo` only).
 - **Dependencies:** Phase 1.
 
-### Phase 3: TUI remote create/add + attach + sidebar adoption
+### Phase 3: TUI remote create/add + attach + sidebar adoption [feedback]
 
 - **Goal:** `A-n` on a remote host, and `A-s` on a remote-hosted workspace, create/add a session on that host; the TUI attaches and the session renders in the host-grouped sidebar.
 - **Scope:** tui/src/app.rs (`create_local_session` → `rpc_create_session`, `spawn_session_on_workspace` → `rpc_add_session` on a remote host, each followed by `try_attach_via_daemon_with_deps`; reject `in_place`/`seed_from`; remove the create-site `guard_local_host_only`), tui/src/client_session.rs (`rpc_create_session` + `rpc_add_session`), `ManifestEvent` source-host attribution + the adoption path (app.rs:7964, manifest_watch.rs).
@@ -156,7 +156,7 @@ Both the create/add flow and standalone reattach go through `try_attach_via_daem
   - Existing local A-n/A-s tests pass.
 - **Dependencies:** Phase 1 (full "any repo" also needs Phase 2).
 
-### Phase 4: Reattach to a remote session
+### Phase 4: Reattach to a remote session [feedback]
 
 - **Goal:** reattaching to an existing remote session (a sidebar row, or after a TUI restart) streams its PTY live over the tunnel — output, input, resize, kitty-mode.
 - **Scope:** tui/src/app.rs — the reattach entry point passes the session's `ts.host_id` into `try_attach_via_daemon_with_deps` and is not gated to local.
@@ -167,7 +167,7 @@ Both the create/add flow and standalone reattach go through `try_attach_via_daem
   - Local reattach unchanged.
 - **Dependencies:** Phase 3.
 
-### Phase 5: Remote workflows (`A-f`)
+### Phase 5: Remote workflows (`A-f`) [feedback]
 
 - **Goal:** `A-f` on a remote-hosted workspace launches a feedback workflow on that host.
 - **Scope:** tui/src/app.rs (the `A-f` launch path; lift `guard_local_host_only` for a remote workspace host so `start_workflow` routes to that host's socket).
