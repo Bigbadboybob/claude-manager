@@ -10037,7 +10037,8 @@ impl App {
             main_repo.clone()
         } else {
             match worktree::create_worktree(&main_repo, &slug, start_branch) {
-                Ok(p) => p,
+                // `_created` flag (created-vs-reused) is unused on this path.
+                Ok((p, _created)) => p,
                 Err(e) => {
                     self.set_status_msg(&format!("Worktree: {}", e));
                     return;
@@ -11145,7 +11146,8 @@ impl App {
             main_repo.clone()
         } else {
             match worktree::create_worktree(&main_repo, slug, start_branch) {
-                Ok(p) => p,
+                // `_created` flag (created-vs-reused) is unused on this path.
+                Ok((p, _created)) => p,
                 Err(e) => {
                     self.set_status_msg(&format!("Worktree: {}", e));
                     return;

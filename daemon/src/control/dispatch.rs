@@ -476,6 +476,20 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_mcp_start_session(state, req))
         }
 
+        // remote-session-execution Phase 1: Operator-only daemon RPCs
+        // that resolve every path on the daemon's own filesystem, so the
+        // TUI can run interactive `A-n` / `A-s` against a REMOTE host.
+        // `create_session` creates a worktree; `add_session` reuses an
+        // existing workspace's worktree. Both delegate to the shared
+        // `start_session` spawn core. Session callers get Unauthorized —
+        // agents use the Session-callable `mcp_start_session`.
+        "create_session" => {
+            DispatchOutcome::Done(dispatch_create_session(state, req))
+        }
+        "add_session" => {
+            DispatchOutcome::Done(dispatch_add_session(state, req))
+        }
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -607,6 +621,43 @@ fn dispatch_mcp_start_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mcp_start_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `create_session` — remote-session-execution Phase 1. Operator-only:
+/// the TUI is an Operator caller and supplies an explicit `workspace_id`
+/// + `repo_url`/`slug`, which the Session-callable `mcp_start_session`
+/// refuses (it derives workspace/task from the caller). The daemon
+/// resolves the repo, creates the worktree, and builds argv/env on its
+/// OWN filesystem, then delegates to the shared `start_session` core.
+fn dispatch_create_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "create_session is Operator-callable only (the TUI is an Operator caller; \
+         agents use mcp_start_session, which resolves workspace/task from the caller)",
+    ) {
+        return resp;
+    }
+    match methods::create_session(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `add_session` — remote-session-execution Phase 1. Operator-only (same
+/// rationale as `create_session`); reuses an existing workspace's
+/// worktree rather than creating one.
+fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "add_session is Operator-callable only (the TUI is an Operator caller; \
+         agents use mcp_start_session)",
+    ) {
+        return resp;
+    }
+    match methods::add_session(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1722,6 +1773,92 @@ mod tests {
                 "label": "x",
                 "argv": ["/bin/bash"],
                 "working_dir": "/tmp",
+            }),
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.message.contains("ws-ghost"));
+    }
+
+    // --- create_session / add_session (remote-session-execution Phase 1) ---
+    //
+    // Operator-only at the dispatch boundary. Method-body behavior
+    // (worktree create/reuse, argv/env resolution, no-orphan) lives in
+    // `crate::control::methods::tests`. Tests here pin the auth gate +
+    // routing.
+
+    #[test]
+    fn create_session_session_caller_is_unauthorized() {
+        let state = make_state();
+        let req = session_request(
+            "create_session",
+            serde_json::json!({
+                "uid": "ts-deadbeef-1",
+                "workspace_id": "ws-1",
+                "label": "x",
+                "engine": "bash",
+                "repo_url": "r",
+                "slug": "s",
+            }),
+            "ts-agent",
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok, "Session callers must not reach create_session");
+        assert_eq!(resp.error.expect("error body").code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn create_session_operator_caller_routes_to_methods_layer() {
+        // Operator + malformed params must reach methods::create_session
+        // (→ InvalidParams), not the require_operator gate (Unauthorized)
+        // or the unknown-method fallback (UnknownMethod).
+        let state = make_state();
+        let req = operator_request(
+            "create_session",
+            serde_json::json!({ "label": "missing-required-fields" }),
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::InvalidParams,
+            "operator caller with malformed params should reach the methods layer",
+        );
+    }
+
+    #[test]
+    fn add_session_session_caller_is_unauthorized() {
+        let state = make_state();
+        let req = session_request(
+            "add_session",
+            serde_json::json!({
+                "uid": "ts-deadbeef-2",
+                "workspace_id": "ws-1",
+                "label": "x",
+                "engine": "bash",
+            }),
+            "ts-agent",
+        );
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok, "Session callers must not reach add_session");
+        assert_eq!(resp.error.expect("error body").code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn add_session_operator_caller_routes_to_methods_layer() {
+        // Operator + unknown workspace must reach methods::add_session
+        // (→ NotFound naming the workspace), proving routing + Operator
+        // allowance.
+        let state = make_state();
+        let req = operator_request(
+            "add_session",
+            serde_json::json!({
+                "uid": "ts-deadbeef-3",
+                "workspace_id": "ws-ghost",
+                "label": "x",
+                "engine": "bash",
             }),
         );
         let resp = dispatch_request(&state, &req).into_response();

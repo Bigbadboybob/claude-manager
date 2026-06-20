@@ -165,6 +165,13 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # view); the Session-callable `get_workflow_state` covers
     # agent-side reads. Not Python-routable.
     "workflow.get_state",
+    # remote-session-execution Phase 1: create_session / add_session —
+    # Operator-only daemon RPCs the TUI uses to run interactive A-n / A-s
+    # against a remote host (daemon resolves repo/worktree/argv/env on its
+    # own filesystem). Included here for dispatch-surface alignment; not
+    # Python-routable (agents create sessions via `mcp_start_session`).
+    "create_session",
+    "add_session",
 })
 
 

@@ -650,7 +650,8 @@ fn do_pull(
         .output();
 
     let worktree_path = match cm_daemon::worktree::create_worktree(main_repo, &slug, Some(branch)) {
-        Ok(p) => p,
+        // `_created` flag (created-vs-reused) is unused on this path.
+        Ok((p, _created)) => p,
         Err(e) => {
             progress(&format!("Pull failed: worktree: {}", e));
             return;

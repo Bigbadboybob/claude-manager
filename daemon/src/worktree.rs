@@ -80,12 +80,17 @@ fn try_worktree_add_attempts(
 /// If `start_branch` is provided, the worktree starts from that branch
 /// (fetched from origin first). Otherwise creates a new `cm/<slug>` branch from HEAD.
 ///
-/// Returns the path to the new worktree directory.
+/// Returns `(worktree_path, created)`. `created` is `true` when this call
+/// freshly created the worktree, and `false` when it reused a pre-existing
+/// valid worktree already on the matching `cm/<slug>` branch (a slug/dir
+/// collision). Callers that clean up on a later failure MUST NOT remove a
+/// reused (`created == false`) worktree — it may contain work this call
+/// didn't create.
 pub fn create_worktree(
     main_repo: &Path,
     task_slug: &str,
     start_branch: Option<&str>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, bool)> {
     let base = worktree_base();
     std::fs::create_dir_all(&base)?;
 
@@ -120,7 +125,7 @@ pub fn create_worktree(
             );
         }
         return match worktree_current_branch(&worktree_path) {
-            Some(b) if b == branch_name => Ok(worktree_path),
+            Some(b) if b == branch_name => Ok((worktree_path, false)),
             Some(b) => anyhow::bail!(
                 "worktree path {} exists but is on branch {} (expected {})",
                 worktree_path.display(),
@@ -134,7 +139,7 @@ pub fn create_worktree(
         };
     }
 
-    if let Some(start) = start_branch {
+    let add_result = if let Some(start) = start_branch {
         // Fetch the branch first; OK if it fails (offline / no remote).
         let _ = Command::new("git")
             .arg("-C")
@@ -151,7 +156,7 @@ pub fn create_worktree(
             // Last resort: just check out <start> directly.
             &[start],
         ];
-        try_worktree_add_attempts(main_repo, &worktree_path, &attempts)?;
+        try_worktree_add_attempts(main_repo, &worktree_path, &attempts)
     } else {
         let attempts: [&[&str]; 2] = [
             // Create new branch from HEAD.
@@ -159,10 +164,27 @@ pub fn create_worktree(
             // Branch already exists, just attach a worktree to it.
             &[&branch_name],
         ];
-        try_worktree_add_attempts(main_repo, &worktree_path, &attempts)?;
+        try_worktree_add_attempts(main_repo, &worktree_path, &attempts)
+    };
+
+    // On failure, clean up any partial worktree git may have left behind
+    // (a half-created dir / stale admin record) so a retry with the same
+    // slug isn't blocked, and a caller like the daemon's `create_session`
+    // is never handed an orphaned worktree to clean up itself. Best-effort:
+    // the original add error is what we surface.
+    if let Err(e) = add_result {
+        if worktree_path.exists() {
+            let _ = std::fs::remove_dir_all(&worktree_path);
+        }
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(main_repo)
+            .args(["worktree", "prune"])
+            .output();
+        return Err(e);
     }
 
-    Ok(worktree_path)
+    Ok((worktree_path, true))
 }
 
 /// Create a worktree for a subtask. Differs from `create_worktree` in:
