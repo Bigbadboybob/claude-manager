@@ -4506,6 +4506,18 @@ impl App {
             .map(|r| r.run_id.clone())
             .collect();
 
+        // Phase 4 (remote-session-execution): bound an OFFLINE remote host to
+        // ONE reachability dial per restore pass. `for_host` runs
+        // `ensure_alive` (a ~3s ssh-tunnel spawn for a down ssh-unix host) and
+        // does NOT consult the reachability backoff cache, so without this an
+        // N-session offline host would stall startup ~3s×N. We cache a host
+        // ONLY on a host-unreachable failure (`for_host` Err) — NEVER on a
+        // session-gone failure (a reachable host where one specific session
+        // exited), so sibling LIVE sessions on a reachable host still reattach.
+        let mut unreachable_hosts: std::collections::HashSet<
+            cm_daemon::host_id::HostId,
+        > = std::collections::HashSet::new();
+
         // Rebuild self.workspaces from the manifest. Closed workspaces are
         // loaded with empty sessions (their PTY state is gone anyway).
         for (_, mw) in manifest.workspaces.iter() {
@@ -4564,29 +4576,89 @@ impl App {
             };
             if !ws.is_closed {
                 for entry in &mw.sessions {
-                    // 12e-r7 F1: guard at the CALLER (was in
-                    // `spawn_restored_session` pre-r7). The
-                    // round-6 fix mistakenly dropped the
-                    // skipped entry from live state, and the
-                    // next save then dropped it from disk
-                    // forever. Now: if the guard fires,
-                    // preserve the raw ManifestEntry in
+                    // Phase 4 (remote-session-execution): a REMOTE entry
+                    // reattaches to its session on ITS host, ungated, via
+                    // `try_reattach_remote_session` →
+                    // `try_attach_via_daemon_with_deps(&entry.host_id, ...)`
+                    // (which routes the attach RPCs through that host's
+                    // socket). On ANY failure (host unreachable, session
+                    // gone) PRESERVE the raw `ManifestEntry` in
                     // `skipped_manifest_entries` so the next
-                    // `save_session_manifest` round-trips it
-                    // back to disk untouched.
-                    if let Err(e) = guard_local_host_only(
-                        &entry.host_id,
-                        "session restore",
-                    ) {
-                        eprintln!(
-                            "cm-tui: skip restore of session {} ({}): {} \
-                             (entry preserved in manifest for next save)",
-                            entry.uid, entry.label, e,
-                        );
-                        self.skipped_manifest_entries
-                            .entry(ws.id.clone())
-                            .or_default()
-                            .push(entry.clone());
+                    // `save_session_manifest` round-trips it back to disk
+                    // untouched — remote re-spawn from restore is out of
+                    // scope (it needs the Phase-3 create/add path), and
+                    // dropping the entry would be the 12e-r7 F1 data-loss
+                    // regression. Local entries fall through to the
+                    // unchanged spawn/attach path below.
+                    if entry.host_id != cm_daemon::host_id::HostId::local() {
+                        // Already-known-offline host this pass → preserve the
+                        // RAW entry WITHOUT re-dialing (bounds an offline host
+                        // to one ~3s reachability dial, not one per session).
+                        if unreachable_hosts.contains(&entry.host_id) {
+                            self.skipped_manifest_entries
+                                .entry(ws.id.clone())
+                                .or_default()
+                                .push(entry.clone());
+                            continue;
+                        }
+                        // Reachability probe FIRST. A host-unreachable failure
+                        // (`for_host` Err — unknown host / down ssh tunnel)
+                        // marks the host offline for the rest of the pass and
+                        // preserves the raw entry. CRITICAL: this does NOT run
+                        // for a session-gone failure below, so sibling LIVE
+                        // sessions on a REACHABLE host still reattach.
+                        if self.host_pool.for_host(&entry.host_id).is_err() {
+                            eprintln!(
+                                "cm-tui: host {} unreachable; preserving remote \
+                                 session {} ({}) + skipping further dials this pass",
+                                entry.host_id.as_str(),
+                                entry.uid,
+                                entry.label,
+                            );
+                            unreachable_hosts.insert(entry.host_id.clone());
+                            self.skipped_manifest_entries
+                                .entry(ws.id.clone())
+                                .or_default()
+                                .push(entry.clone());
+                            continue;
+                        }
+                        // 10d-3 R3 parity with the local path below: if this
+                        // entry's workflow_run_id points to a non-active
+                        // (Detached/Done) run, reattach with the tags CLEARED
+                        // — otherwise dead workflow context is pushed to the
+                        // remote daemon (the attach RPC + the row tags). The
+                        // SUCCESSFUL reattach uses the cleaned entry; a FAILED
+                        // reattach preserves the RAW entry (F1 data-loss
+                        // protection — the on-disk tags stay authoritative for
+                        // the next restart).
+                        let cleaned =
+                            untag_stale_workflow(entry, &active_run_ids);
+                        let entry_for_attach = cleaned.as_ref().unwrap_or(entry);
+                        match self.try_reattach_remote_session(
+                            entry_for_attach,
+                            &ws,
+                            (cols, rows),
+                        ) {
+                            Some(ts) => ws.sessions.push(ts),
+                            None => {
+                                // Session-gone on a REACHABLE host (for_host
+                                // succeeded above). Preserve THIS entry only;
+                                // do NOT mark the host unreachable — sibling
+                                // live sessions on it must still reattach.
+                                eprintln!(
+                                    "cm-tui: skip restore of remote session {} \
+                                     ({}) on host {} (session gone; entry \
+                                     preserved for next save)",
+                                    entry.uid,
+                                    entry.label,
+                                    entry.host_id.as_str(),
+                                );
+                                self.skipped_manifest_entries
+                                    .entry(ws.id.clone())
+                                    .or_default()
+                                    .push(entry.clone());
+                            }
+                        }
                         continue;
                     }
                     // 10d-3 R3 in-place untag: if this session's
@@ -5208,6 +5280,98 @@ impl App {
             host_id: entry.host_id.clone(),
         };
         Some((ts, outcome))
+    }
+
+    /// Phase 4 (remote-session-execution): reattach a single REMOTE manifest
+    /// entry to its live session on `entry.host_id`, ungated. Routes the
+    /// attach RPCs through that host's socket via
+    /// `try_attach_via_daemon_with_deps` (which dials
+    /// `host_pool.for_host(&entry.host_id)`). Returns `Some(ts)` on a
+    /// successful reattach; `None` on any failure (host unreachable, session
+    /// gone) — the caller PRESERVES the raw entry rather than dropping it.
+    /// NEVER spawns: remote re-spawn from restore is out of scope (it needs
+    /// the Phase-3 create/add path), so a session that's gone is preserved
+    /// for a later restart, not re-created locally with the wrong paths.
+    ///
+    /// The local restore path (`spawn_restored_session`) is deliberately
+    /// untouched — only non-local entries reach this helper.
+    fn try_reattach_remote_session(
+        &self,
+        entry: &ManifestEntry,
+        ws: &Workspace,
+        (cols, rows): (u16, u16),
+    ) -> Option<TerminalSession> {
+        // A reattach binds to an EXISTING daemon session by uid; an empty
+        // uid (legacy entry) has nothing to attach to.
+        if entry.uid.is_empty() {
+            return None;
+        }
+        // The remote worktree path (the Phase-3 create/add stored it on the
+        // workspace). Needed as the attach's working_dir.
+        let wt = ws.worktree_path.clone()?;
+
+        let session = match try_attach_via_daemon_with_deps(
+            &self.host_pool,
+            &entry.uid,
+            &ws.id,
+            &wt,
+            &entry.session_type,
+            &entry.label,
+            cols,
+            rows,
+            entry.task_id.as_deref(),
+            entry.workflow_run_id.as_deref(),
+            entry.workflow_role.as_deref(),
+            &entry.host_id,
+            // Transcript binding survived on the remote daemon; don't push a
+            // (locally-computed, wrong-for-remote) path over it. The daemon's
+            // existing binding is authoritative — same as the attached-restore
+            // / adoption paths.
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "cm-tui: remote reattach of session {} ({}) on host {} \
+                     failed: {} (entry preserved for next save)",
+                    entry.uid,
+                    entry.label,
+                    entry.host_id.as_str(),
+                    e,
+                );
+                return None;
+            }
+        };
+
+        Some(TerminalSession {
+            uid: entry.uid.clone(),
+            label: entry.label.clone(),
+            session_type: entry.session_type.clone(),
+            session,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            transcript_id: entry.transcript_id.clone(),
+            generation: entry.generation,
+            // Attached → no local spawn detection (mirrors the
+            // `RestoreOutcome::Attached` case in spawn_restored_session).
+            pending_jsonl_files: None,
+            hidden: entry.hidden,
+            idle_timeout_secs: entry.idle_timeout_secs,
+            burst_threshold: entry.burst_threshold,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: entry.workflow_run_id.clone(),
+            workflow_role: entry.workflow_role.clone(),
+            last_delivery: None,
+            task_id: entry.task_id.clone(),
+            notify_on_idle: entry.notify_on_idle,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: entry.managed_by_uid.clone(),
+            seeded_from_snapshot: entry.seeded_from_snapshot.clone(),
+            preserved_last_exit: entry.last_exit.clone(),
+            host_id: entry.host_id.clone(),
+        })
     }
 
     /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
@@ -17172,6 +17336,68 @@ mod pending_workflow_events_tests {
             .unwrap_or_default()
     }
 
+    /// Spin a best-effort in-process cm-daemon on `sock` for the remote-host
+    /// TUI tests (real `dispatch_request`). Returns `(stop, handle)`; set the
+    /// flag + poke the socket to stop it.
+    fn spawn_inproc_daemon(
+        sock: std::path::PathBuf,
+        state: std::sync::Arc<std::sync::Mutex<cm_daemon::state::DaemonState>>,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dstop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let st = state.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            let req = match cm_daemon::control::wire::read_request(&mut stream) {
+                                Ok(Some(r)) => r,
+                                _ => return,
+                            };
+                            use cm_daemon::control::dispatch::DispatchOutcome::*;
+                            match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Done(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                                }
+                                AttachStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_attach_stream(&mut stream, st, handle);
+                                    }
+                                }
+                                ManifestWatchStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_manifest_watch_stream(&mut stream, handle);
+                                    }
+                                }
+                                EventsSubscribeStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_events_subscribe_stream(&mut stream, handle);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (stop, handle)
+    }
+
     /// Criterion: a remote A-n with `in_place` is rejected with a status
     /// message and issues NO RPC (the rejection precedes any host_pool /
     /// daemon access), and creates no workspace.
@@ -17445,6 +17671,707 @@ mod pending_workflow_events_tests {
         stop.store(true, Ordering::SeqCst);
         let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
         let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Phase 4 (remote-session-execution): `restore_sessions` reattaches a
+    /// session with a REMOTE `host_id`, routing the attach RPCs through that
+    /// host's socket, ungated. End-to-end via an in-process daemon at a
+    /// "manager" unix socket + a 2-host pool: a live session is spawned on
+    /// the manager daemon, a manifest pins it to host "manager", and restore
+    /// reattaches it (no skip/preserve) tagged with host_id = manager.
+    ///
+    /// Local reattach is unchanged — the local path
+    /// (`spawn_restored_session`) is untouched and covered by the existing
+    /// restore suite + the `restore_sessions_reattaches_remote_else_preserves`
+    /// pin. The cm-manager live e2e (run a command, resize, Enter, tunnel
+    /// respawn) is a deferred MANUAL operator pass (no live TUI + VM here).
+    #[test]
+    fn remote_reattach_routes_through_host_socket() {
+        use cm_daemon::manifest::{Manifest, ManifestEntry, ManifestWorkspace};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let mgr_sock = cm_dir.join("manager.sock");
+
+        // In-process daemon at the MANAGER socket with workspace ws-r.
+        let mut state_inner = cm_daemon::state::DaemonState::new();
+        state_inner.attach_addr = mgr_sock.to_string_lossy().into_owned();
+        state_inner.workspaces.insert(
+            "ws-r".into(),
+            cm_daemon::manifest::ManifestWorkspace {
+                id: "ws-r".into(),
+                name: "r".into(),
+                is_closed: false,
+                is_cloud: false,
+                worktree_path: Some(wt.clone()),
+                main_repo_path: None,
+                repo_url: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let state = Arc::new(std::sync::Mutex::new(state_inner));
+        let listener = UnixListener::bind(&mgr_sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dstate = state.clone();
+        let dstop = stop.clone();
+        let dhandle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let st = dstate.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+                            let req = match cm_daemon::control::wire::read_request(&mut stream) {
+                                Ok(Some(r)) => r,
+                                _ => return,
+                            };
+                            use cm_daemon::control::dispatch::DispatchOutcome::*;
+                            match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Done(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                                }
+                                AttachStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_attach_stream(&mut stream, st, handle);
+                                    }
+                                }
+                                ManifestWatchStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_manifest_watch_stream(&mut stream, handle);
+                                    }
+                                }
+                                EventsSubscribeStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_events_subscribe_stream(&mut stream, handle);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Spawn the live session on the manager daemon (the uid restore
+        // will reattach to).
+        let uid = new_session_uid();
+        let argv = vec!["/bin/bash".to_string()];
+        let cfg = crate::client_session::ClientSessionConfig {
+            daemon_socket: &mgr_sock,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid: &uid,
+            workspace_id: "ws-r",
+            label: "claude-code",
+            session_type: "claude-code",
+            argv: &argv,
+            working_dir: &wt,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: Some(&wt),
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
+        };
+        crate::client_session::rpc_start_session_full(&cfg)
+            .expect("manager daemon spawns session");
+
+        // Manifest on disk: workspace ws-r with one session pinned to host
+        // "manager".
+        let entry = ManifestEntry {
+            uid: uid.clone(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "claude".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: cm_daemon::host_id::HostId::new("manager"),
+        };
+        let mw = ManifestWorkspace {
+            id: "ws-r".into(),
+            name: "r".into(),
+            is_closed: false,
+            is_cloud: false,
+            worktree_path: Some(wt.clone()),
+            main_repo_path: None,
+            repo_url: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![entry],
+            tombstones: Vec::new(),
+        };
+        let mut workspaces = HashMap::new();
+        workspaces.insert(mw.id.clone(), mw);
+        let manifest = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: None,
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&manifest).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Inject a 2-host pool so "manager" resolves to the in-process daemon.
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.sessions_restored = true;
+        app.restore_sessions();
+
+        // The remote session reattached — ungated — tagged with host manager.
+        let ws = app
+            .workspaces
+            .iter()
+            .find(|w| w.id == "ws-r")
+            .expect("workspace restored");
+        let row = ws
+            .sessions
+            .iter()
+            .find(|s| s.uid == uid)
+            .expect("remote session must reattach over its host's socket");
+        assert_eq!(
+            row.host_id,
+            cm_daemon::host_id::HostId::new("manager"),
+            "reattached row stays pinned to its remote host",
+        );
+        // It reattached (not skipped/preserved).
+        assert!(
+            app.skipped_manifest_entries
+                .get("ws-r")
+                .map_or(true, |v| v.is_empty()),
+            "a reattachable remote session must NOT be skipped",
+        );
+
+        // Cleanup.
+        let _ = crate::client_session::rpc_kill_session(
+            &mgr_sock,
+            crate::daemon_launch::operator_token(),
+            &uid,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Phase 4 (remote-session-execution): a remote entry whose
+    /// `workflow_run_id` points to a non-active (Detached/Done) run
+    /// reattaches with its workflow tags CLEARED — stale workflow context is
+    /// NOT propagated to the remote daemon. Parity with the local restore
+    /// path's `untag_stale_workflow`.
+    #[test]
+    fn remote_reattach_clears_stale_workflow_tags() {
+        use cm_daemon::manifest::{Manifest, ManifestEntry, ManifestWorkspace};
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let mgr_sock = cm_dir.join("manager.sock");
+
+        let mut state_inner = cm_daemon::state::DaemonState::new();
+        state_inner.attach_addr = mgr_sock.to_string_lossy().into_owned();
+        state_inner.workspaces.insert(
+            "ws-r".into(),
+            ManifestWorkspace {
+                id: "ws-r".into(),
+                name: "r".into(),
+                is_closed: false,
+                is_cloud: false,
+                worktree_path: Some(wt.clone()),
+                main_repo_path: None,
+                repo_url: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let state = std::sync::Arc::new(std::sync::Mutex::new(state_inner));
+        let (stop, dhandle) = spawn_inproc_daemon(mgr_sock.clone(), state.clone());
+
+        // Live session on the manager daemon (spawned WITHOUT workflow ctx).
+        let uid = new_session_uid();
+        let argv = vec!["/bin/bash".to_string()];
+        let cfg = crate::client_session::ClientSessionConfig {
+            daemon_socket: &mgr_sock,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid: &uid,
+            workspace_id: "ws-r",
+            label: "claude-code",
+            session_type: "claude-code",
+            argv: &argv,
+            working_dir: &wt,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: Some(&wt),
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
+        };
+        crate::client_session::rpc_start_session_full(&cfg).expect("spawn");
+
+        // Manifest entry pinned to "manager" with a STALE workflow_run_id
+        // (no active runs exist → it's Detached/Done from the TUI's POV).
+        let entry = ManifestEntry {
+            uid: uid.clone(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "claude".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: Some("wf_dead".into()),
+            workflow_role: Some("worker".into()),
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: cm_daemon::host_id::HostId::new("manager"),
+        };
+        let mw = ManifestWorkspace {
+            id: "ws-r".into(),
+            name: "r".into(),
+            is_closed: false,
+            is_cloud: false,
+            worktree_path: Some(wt.clone()),
+            main_repo_path: None,
+            repo_url: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![entry],
+            tombstones: Vec::new(),
+        };
+        let mut workspaces = HashMap::new();
+        workspaces.insert("ws-r".to_string(), mw);
+        let manifest = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: None,
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&manifest).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.sessions_restored = true;
+        // No active workflow runs → "wf_dead" is stale and must be cleaned.
+        assert!(app.workflow_runs.is_empty(), "precondition: no active runs");
+        app.restore_sessions();
+
+        let ws = app
+            .workspaces
+            .iter()
+            .find(|w| w.id == "ws-r")
+            .expect("workspace restored");
+        let row = ws
+            .sessions
+            .iter()
+            .find(|s| s.uid == uid)
+            .expect("remote session must reattach");
+        assert_eq!(row.host_id, cm_daemon::host_id::HostId::new("manager"));
+        assert!(
+            row.workflow_run_id.is_none(),
+            "stale workflow_run_id must be CLEARED on remote reattach, not propagated",
+        );
+        assert!(
+            row.workflow_role.is_none(),
+            "stale workflow_role must be CLEARED on remote reattach",
+        );
+
+        // Cleanup.
+        let _ = crate::client_session::rpc_kill_session(
+            &mgr_sock,
+            crate::daemon_launch::operator_token(),
+            &uid,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Phase 4 anti-poisoning (the property that matters most): two remote
+    /// entries on the SAME REACHABLE host where the FIRST session is gone
+    /// (reattach `None`) but the SECOND is live → the second STILL reattaches.
+    /// A session-gone failure must NOT mark the host unreachable, or it would
+    /// poison sibling live sessions.
+    #[test]
+    fn remote_reattach_session_gone_does_not_poison_live_sibling() {
+        use cm_daemon::manifest::{Manifest, ManifestEntry, ManifestWorkspace};
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let mgr_sock = cm_dir.join("manager.sock");
+
+        let mut state_inner = cm_daemon::state::DaemonState::new();
+        state_inner.attach_addr = mgr_sock.to_string_lossy().into_owned();
+        state_inner.workspaces.insert(
+            "ws-r".into(),
+            ManifestWorkspace {
+                id: "ws-r".into(),
+                name: "r".into(),
+                is_closed: false,
+                is_cloud: false,
+                worktree_path: Some(wt.clone()),
+                main_repo_path: None,
+                repo_url: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let state = std::sync::Arc::new(std::sync::Mutex::new(state_inner));
+        let (stop, dhandle) = spawn_inproc_daemon(mgr_sock.clone(), state.clone());
+
+        // Spawn ONLY the live session on the manager daemon.
+        let uid_live = new_session_uid();
+        let uid_gone = new_session_uid(); // never spawned → attach will fail
+        let argv = vec!["/bin/bash".to_string()];
+        let cfg = crate::client_session::ClientSessionConfig {
+            daemon_socket: &mgr_sock,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid: &uid_live,
+            workspace_id: "ws-r",
+            label: "claude-code",
+            session_type: "claude-code",
+            argv: &argv,
+            working_dir: &wt,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: Some(&wt),
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
+        };
+        crate::client_session::rpc_start_session_full(&cfg).expect("spawn live");
+
+        // Manifest: [gone, live] — gone FIRST so its failure precedes live.
+        let mk = |uid: &str| ManifestEntry {
+            uid: uid.into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "claude".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: cm_daemon::host_id::HostId::new("manager"),
+        };
+        let mw = ManifestWorkspace {
+            id: "ws-r".into(),
+            name: "r".into(),
+            is_closed: false,
+            is_cloud: false,
+            worktree_path: Some(wt.clone()),
+            main_repo_path: None,
+            repo_url: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![mk(&uid_gone), mk(&uid_live)],
+            tombstones: Vec::new(),
+        };
+        let mut workspaces = HashMap::new();
+        workspaces.insert("ws-r".to_string(), mw);
+        let manifest = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: None,
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&manifest).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: local_sock.clone() },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::Unix { socket: mgr_sock.clone() },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.sessions_restored = true;
+        app.restore_sessions();
+
+        let ws = app
+            .workspaces
+            .iter()
+            .find(|w| w.id == "ws-r")
+            .expect("workspace restored");
+        // The LIVE sibling reattached despite the gone sibling failing first.
+        assert!(
+            ws.sessions.iter().any(|s| s.uid == uid_live),
+            "live sibling MUST reattach even though a prior sibling on the \
+             same reachable host was gone (no host poisoning)",
+        );
+        // The gone session is preserved; the live one is NOT skipped.
+        let skipped = app
+            .skipped_manifest_entries
+            .get("ws-r")
+            .expect("ws-r has a skipped entry");
+        assert!(skipped.iter().any(|e| e.uid == uid_gone));
+        assert!(
+            !skipped.iter().any(|e| e.uid == uid_live),
+            "the live session must NOT be skipped",
+        );
+
+        // Cleanup.
+        let _ = crate::client_session::rpc_kill_session(
+            &mgr_sock,
+            crate::daemon_launch::operator_token(),
+            &uid_live,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Phase 4 latency hardening: two remote entries on an UNREACHABLE host
+    /// (here an unknown host → `for_host` errors) are BOTH preserved, and the
+    /// host is dialed at most once (the `unreachable_hosts` cache skips the
+    /// second dial). No daemon needed — `for_host` on an unknown host errors
+    /// instantly.
+    #[test]
+    fn restore_preserves_all_entries_on_unreachable_host() {
+        use cm_daemon::manifest::{Manifest, ManifestEntry, ManifestWorkspace};
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+
+        let mk = |uid: &str| ManifestEntry {
+            uid: uid.into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "claude".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            // Unknown host → host_pool.for_host returns Err.
+            host_id: cm_daemon::host_id::HostId::new("ghost"),
+        };
+        let mw = ManifestWorkspace {
+            id: "ws-g".into(),
+            name: "g".into(),
+            is_closed: false,
+            is_cloud: false,
+            worktree_path: None,
+            main_repo_path: None,
+            repo_url: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![mk("uid-g1"), mk("uid-g2")],
+            tombstones: Vec::new(),
+        };
+        let mut workspaces = HashMap::new();
+        workspaces.insert("ws-g".to_string(), mw);
+        let manifest = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: None,
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&manifest).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        // App::new synthesizes a local-only pool → "ghost" is unknown.
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.sessions_restored = true;
+        app.restore_sessions();
+
+        // Both entries preserved; none adopted.
+        let skipped = app
+            .skipped_manifest_entries
+            .get("ws-g")
+            .expect("ws-g has skipped entries");
+        assert_eq!(
+            skipped.len(),
+            2,
+            "both entries on an unreachable host must be preserved",
+        );
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-g").expect("ws-g");
+        assert!(
+            ws.sessions.is_empty(),
+            "no session adopted from an unreachable host",
+        );
+
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
@@ -22139,19 +23066,18 @@ mod slice_12e_tests {
         );
     }
 
-    /// 12e-r7 F1: the round-6 in-function host-guard moved
-    /// to `restore_sessions` (the caller) so the caller can
-    /// preserve the raw ManifestEntry in
-    /// `App.skipped_manifest_entries` for the next save's
-    /// round-trip. The guard now lives in the per-entry loop
-    /// inside `restore_sessions`; `spawn_restored_session`
-    /// itself returns `None` ONLY on actual spawn failures.
+    /// Phase 4 (remote-session-execution): the 12e-r7 local-only
+    /// `guard_local_host_only(&entry.host_id, ...)` SKIP in
+    /// `restore_sessions` is replaced by a remote REATTACH branch:
+    /// a non-local entry routes to `try_reattach_remote_session`
+    /// (which attaches over its host's socket, ungated) and, on
+    /// failure, PRESERVES the raw entry in `skipped_manifest_entries`
+    /// (the 12e-r7 F1 data-loss protection is retained). The local
+    /// path (`spawn_restored_session`) is untouched.
     #[test]
-    fn spawn_restored_session_fails_fast_for_non_local_entry_host() {
+    fn restore_sessions_reattaches_remote_else_preserves() {
         let src = include_str!("app.rs");
 
-        // The guard moved from `spawn_restored_session` to
-        // its CALLER `restore_sessions`. Pin the new location.
         let sig = "fn restore_sessions(";
         let start = src.find(sig).expect("must find sig");
         let rest = &src[start..];
@@ -22163,46 +23089,46 @@ mod slice_12e_tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        // Structural pin: guard call on `entry.host_id` —
-        // the MANIFEST ENTRY's persisted host, not active_host.
+        // The local-only SKIP guard is GONE — a non-local entry is no
+        // longer fail-fast-skipped; it reattaches.
         assert!(
-            body.contains(
-                "guard_local_host_only(\n                        &entry.host_id,",
-            ) || body.contains("guard_local_host_only(&entry.host_id,"),
-            "restore_sessions must call \
-             guard_local_host_only(&entry.host_id, ...) — \
-             checks the MANIFEST ENTRY's host_id, not \
-             active_host (12e-r7 F1); body:\n{}",
+            !body.contains("guard_local_host_only(&entry.host_id")
+                && !body.contains(
+                    "guard_local_host_only(\n                        &entry.host_id,",
+                ),
+            "Phase 4 removes the local-only restore skip guard on \
+             entry.host_id (replaced by a remote reattach branch); body:\n{}",
             body,
         );
 
-        // Ordering: guard MUST precede the call to
-        // `spawn_restored_session` (the spawn would build
-        // local paths that wouldn't apply to a remote host).
-        let guard_idx = body
-            .find("guard_local_host_only(")
-            .expect("guard call not found");
-        // migrate-tui-local: spawn_restored_session became a
-        // `&self` method so it can route claude/codex through the
-        // daemon RPC. Call shape moved from `Self::…(` to `self.…(`.
+        // Structural pin: a non-local entry routes to the remote reattach
+        // helper.
+        assert!(
+            body.contains("self.try_reattach_remote_session("),
+            "restore_sessions must reattach a non-local entry via \
+             try_reattach_remote_session; body:\n{}",
+            body,
+        );
+        let remote_branch_idx = body
+            .find("if entry.host_id != cm_daemon::host_id::HostId::local()")
+            .expect("remote-entry branch not found");
         let spawn_idx = body
             .find("self.spawn_restored_session(")
-            .expect("spawn_restored_session call not found");
+            .expect("spawn_restored_session (local path) call not found");
         assert!(
-            guard_idx < spawn_idx,
-            "guard must precede the spawn_restored_session call",
+            remote_branch_idx < spawn_idx,
+            "the remote reattach branch must precede the local \
+             spawn_restored_session path",
         );
 
-        // The skipped entry MUST be preserved in
-        // `App.skipped_manifest_entries` — the round-7 F1
-        // data-loss fix.
+        // The reattach-failure path MUST preserve the raw entry in
+        // `skipped_manifest_entries` — the 12e-r7 F1 data-loss protection,
+        // retained (a remote session that can't be reattached is preserved,
+        // never dropped, since remote re-spawn from restore is out of scope).
         assert!(
             body.contains("self.skipped_manifest_entries"),
-            "restore_sessions must preserve the skipped \
-             ManifestEntry in `skipped_manifest_entries` so \
-             `save_session_manifest` round-trips it back to \
-             disk (12e-r7 F1 — round-6's drop-and-overwrite \
-             was a data-loss regression); body:\n{}",
+            "restore_sessions must preserve a non-reattachable remote entry \
+             in skipped_manifest_entries (no data-loss regression); body:\n{}",
             body,
         );
     }
