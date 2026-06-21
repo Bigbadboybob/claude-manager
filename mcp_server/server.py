@@ -861,6 +861,7 @@ async def wait_for_session_idle(
     session_uid: str,
     timeout_s: float = 600.0,
     poll_interval_s: float = 2.0,
+    pending_idle_grace_s: float = 8.0,
 ) -> dict:
     """Block until a session becomes idle (agent at the prompt), then
     return.
@@ -875,22 +876,45 @@ async def wait_for_session_idle(
     Use this after `send_input` or `start_session` instead of looping
     on `read_session_output` yourself.
 
+    Pending-but-quiet sessions: a session is `state="pending"` until the
+    daemon binds a transcript path for it. A `ready` session that goes
+    quiet returns immediately. A `pending` session that goes quiet is
+    given a grace window (`pending_idle_grace_s`) for its transcript to
+    bind into `ready` — if it stays continuously pending+quiet past the
+    grace, we return idle anyway with state="pending" rather than
+    blocking to `timeout_s`. This bounds the wait for sessions that will
+    NEVER bind a transcript (bash sessions, or claude/codex on a daemon
+    with no transcript detector watching it) while still letting a
+    freshly-spawned agent's transcript self-heal first. Any busy poll
+    resets the grace clock.
+
     Args:
         session_uid: Target session's stable UID.
         timeout_s: Max seconds to wait. Default 600 (10 min).
         poll_interval_s: Seconds between polls. Default 2.
+        pending_idle_grace_s: Max seconds to keep waiting on a
+            continuously pending+quiet session for its transcript to
+            bind before returning idle anyway. Default 8. Clamped to
+            [1.0, 60.0].
 
     Returns: {"idle": bool, "timed_out": bool, "state":
         "ready"|"pending"|"exited"}.
         - idle=True, state="ready": agent finished its turn.
         - idle=True, state="exited": session terminated.
+        - idle=True, state="pending": PTY quiet but no transcript bound;
+          best-effort idle after the grace window (transcript never
+          bound — e.g. a bash session or a detector-less daemon).
         - idle=False, timed_out=True: deadline reached while still busy.
 
     Raises ControlError on auth failure or unknown session_uid.
     """
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
+    grace = max(1.0, min(pending_idle_grace_s, 60.0))
     resolved_once = False
+    # Monotonic time the session FIRST went (pending && idle) in an
+    # unbroken streak; reset to None on any non-(pending && idle) poll.
+    pending_idle_since = None
     while True:
         try:
             resolved = await asyncio.to_thread(
@@ -912,20 +936,34 @@ async def wait_for_session_idle(
             raise
         resolved_once = True
         state = resolved.get("state", "pending")
+        idle = bool(resolved.get("idle", False))
+        now = time.monotonic()
         if state == "exited":
             return {"idle": True, "timed_out": False, "state": state}
-        # Only a READY session (transcript bound) can be "done with its
-        # turn". A `pending` session reports idle=True as soon as its PTY
-        # is quiet — but quiet-and-pending means the agent hasn't started
-        # a turn yet (e.g. transcript not bound, or it never ran one), NOT
-        # that it finished. Returning here would make the caller read
-        # empty output and conclude the agent is done when it never began.
-        # Require state=="ready" so a still-pending session keeps polling
-        # until it binds (the detector self-heals late transcripts) or the
-        # deadline is hit (surfacing the stuck session as timed_out).
-        if state == "ready" and bool(resolved.get("idle", False)):
+        # A READY session (transcript bound) that's quiet is unambiguously
+        # done with its turn — return immediately.
+        if state == "ready" and idle:
             return {"idle": True, "timed_out": False, "state": state}
-        if time.monotonic() >= deadline:
+        # A `pending` session reports idle=True as soon as its PTY is
+        # quiet, but quiet-and-pending is ambiguous: the transcript may
+        # just not be bound YET (a freshly-spawned agent the detector
+        # hasn't caught up to), OR it may NEVER bind (a bash session, or
+        # claude/codex on a daemon with no transcript detector). Returning
+        # on the first quiet poll would risk a false "done" in the former
+        # case; blocking forever (the pre-fix behavior) hangs the latter
+        # until `timeout_s`. Compromise: start a grace clock on the first
+        # pending+quiet poll and keep waiting for the transcript to bind;
+        # if the streak survives `grace`, treat PTY-quiet as the idle
+        # signal and return with state="pending". Any busy poll (or a
+        # bind into "ready") resets the streak.
+        if state == "pending" and idle:
+            if pending_idle_since is None:
+                pending_idle_since = now
+            elif now - pending_idle_since >= grace:
+                return {"idle": True, "timed_out": False, "state": state}
+        else:
+            pending_idle_since = None
+        if now >= deadline:
             return {"idle": False, "timed_out": True, "state": state}
         await asyncio.sleep(interval)
 
