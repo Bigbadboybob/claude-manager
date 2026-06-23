@@ -25,34 +25,49 @@
 //! never writes a transcript and hangs (observed: 227s on cm-manager in a repo
 //! whose `.mcp.json` declared `postgres-remote` + `claude-manager`).
 //!
-//! `claude` records that approval in the SAME project entry under
-//! `enabledMcpjsonServers` (an array of approved `.mcp.json` server names). An
-//! empty array with a `.mcp.json` present => prompt => hang. So alongside
-//! folder-trust we read `<working_dir>/.mcp.json` and union its declared server
-//! names into `enabledMcpjsonServers`.
+//! Modern `claude` reads that per-project approval from
+//! `<working_dir>/.claude/settings.local.json`'s `enabledMcpjsonServers` array
+//! — NOT from `~/.claude.json`. (A live headless test confirmed that writing
+//! `enabledMcpjsonServers` into `~/.claude.json` does NOT skip the prompt;
+//! `claude` still hung. The operator's working local config carries the
+//! approval in `<repo>/.claude/settings.local.json`.) `settings.local.json` is
+//! gitignored, so a freshly cloned worktree lacks it and headless `claude`
+//! prompts and hangs. So alongside folder-trust we read `<working_dir>/.mcp.json`
+//! and union its declared server names into the `enabledMcpjsonServers` array of
+//! `<working_dir>/.claude/settings.local.json`, creating that file (and the
+//! `.claude/` dir) when absent.
 //!
 //! ## Safety contract (every point is load-bearing)
 //!
-//! - **Merge, never clobber.** Preserve every other top-level key and every
-//!   other project entry; only add/update the one project's entry. The result
-//!   stays valid JSON.
-//! - **Atomic.** Write to a temp file in the SAME directory, then `rename` over
-//!   `~/.claude.json` — a crash or a concurrent reader never sees a partial
-//!   file.
-//! - **Best-effort.** On ANY error (read / parse / write) we log and continue.
-//!   We NEVER fail or block the spawn. The public entry points return `()`.
-//!   Reading `.mcp.json` is itself best-effort: absent / unreadable / malformed
-//!   / no `mcpServers` => the MCP part is a no-op and only folder-trust is
-//!   written.
+//! - **Two independent, decoupled writes.** Folder-trust touches `~/.claude.json`
+//!   ONLY; project-MCP approval touches `<working_dir>/.claude/settings.local.json`
+//!   ONLY. `~/.claude.json` never receives `enabledMcpjsonServers` from this
+//!   code. Either write can no-op or fail without affecting the other.
+//! - **Merge, never clobber.** For `~/.claude.json`, preserve every other
+//!   top-level key and every other project entry; only add/update the one
+//!   project's entry. For `settings.local.json`, preserve every other top-level
+//!   key (`permissions`, `hooks`, …); only union `enabledMcpjsonServers`. Both
+//!   results stay valid JSON.
+//! - **Atomic.** Write to a temp file in the SAME directory as the target, then
+//!   `rename` over it — a crash or a concurrent reader never sees a partial
+//!   file. `~/.claude.json` is written 0600 (it can hold oauth credentials);
+//!   `settings.local.json` is NOT a credentials file, so it matches an existing
+//!   file's mode or defaults to 0644.
+//! - **Best-effort.** On ANY error (read / parse / write / mkdir) we log and
+//!   continue. We NEVER fail or block the spawn. The public entry points return
+//!   `()`. Reading `.mcp.json` is itself best-effort: absent / unreadable /
+//!   malformed / no `mcpServers` => the MCP part is a no-op (no
+//!   `settings.local.json` created/changed) and only folder-trust is written.
 //! - **Refuse to clobber a malformed file.** If the existing `~/.claude.json`
-//!   does not parse as a JSON object, log and SKIP the write (leave it
-//!   untouched) rather than overwriting it.
+//!   or `settings.local.json` does not parse as a JSON object, log and SKIP that
+//!   write (leave it untouched) rather than overwriting it.
 //! - **MCP: union, never remove; never touch `disabledMcpjsonServers`.** We
 //!   only ADD `.mcp.json` server names to `enabledMcpjsonServers`, preserving
 //!   any already there, and never modify the user's explicit disables.
-//! - **Idempotent.** Skip the write entirely when the project entry already has
-//!   BOTH `hasTrustDialogAccepted == true` AND every `.mcp.json` server name
-//!   already present in `enabledMcpjsonServers`.
+//! - **Idempotent.** Folder-trust skips its write when the project entry already
+//!   has `hasTrustDialogAccepted == true`. The MCP write skips when
+//!   `settings.local.json`'s `enabledMcpjsonServers` already contains every
+//!   `.mcp.json` server name.
 
 use std::path::{Path, PathBuf};
 
@@ -76,6 +91,10 @@ fn claude_json_path() -> Option<PathBuf> {
 /// `--` separator so a capped `claude` is STILL pre-trusted — otherwise the
 /// "always-on, never wedge" guarantee would have a hole on exactly the
 /// headless/capped host this feature targets.
+///
+/// Two independent best-effort writes: folder-trust into `~/.claude.json`, and
+/// project-MCP approval into `<working_dir>/.claude/settings.local.json`. Either
+/// may no-op or fail without affecting the other.
 pub fn maybe_pretrust_for_spawn(shell: &str, args: &[String], working_dir: Option<&Path>) {
     if !program_is_claude(shell, args) {
         return;
@@ -84,6 +103,7 @@ pub fn maybe_pretrust_for_spawn(shell: &str, args: &[String], working_dir: Optio
         return;
     };
     ensure_folder_trusted(wd);
+    ensure_project_mcp_approved(wd);
 }
 
 /// True when the program that will actually `exec` is `claude` — either
@@ -138,12 +158,6 @@ fn ensure_folder_trusted_at(claude_json: &Path, working_dir: &Path) -> Result<()
     // absolute worktree path.
     let key = working_dir.to_string_lossy().into_owned();
 
-    // The worktree's project-scoped MCP server names, read best-effort from
-    // `<working_dir>/.mcp.json`. EMPTY on absence / unreadable / malformed / no
-    // `mcpServers` — in which case the MCP part is a no-op and only folder-trust
-    // is written. Reading this MUST NEVER fail or block the spawn.
-    let mcp_servers = read_mcp_server_names(working_dir);
-
     // 1) Read the existing file. Missing -> start from an empty object. Refuse
     //    to clobber a file that doesn't parse as a JSON object.
     let mut root = match std::fs::read_to_string(claude_json) {
@@ -196,13 +210,13 @@ fn ensure_folder_trusted_at(claude_json: &Path, working_dir: &Path) -> Result<()
         )
     })?;
 
-    // 3) Idempotent: skip the write entirely only when BOTH guarantees already
-    //    hold — folder-trust accepted AND every `.mcp.json` server name already
-    //    present in `enabledMcpjsonServers`. (The MCP half makes this gate aware
-    //    of a `.mcp.json` that appeared after a folder-trust-only first run.)
+    // 3) Idempotent: skip the write entirely when folder-trust is already
+    //    accepted. (Project-MCP approval is a SEPARATE write to
+    //    `<working_dir>/.claude/settings.local.json` — see
+    //    `ensure_project_mcp_approved` — and never appears in `~/.claude.json`.)
     let already_trusted =
         entry.get("hasTrustDialogAccepted") == Some(&serde_json::Value::Bool(true));
-    if already_trusted && enabled_contains_all(entry, &mcp_servers) {
+    if already_trusted {
         return Ok(());
     }
     entry.insert(
@@ -214,13 +228,96 @@ fn ensure_folder_trusted_at(claude_json: &Path, working_dir: &Path) -> Result<()
         serde_json::Value::Bool(true),
     );
 
-    // 4) Pre-approve the project's MCP servers: union the `.mcp.json` names into
-    //    `enabledMcpjsonServers` (never removes existing names; never touches
-    //    `disabledMcpjsonServers`). No-op when there are no names to add.
-    merge_enabled_mcp_servers(entry, &mcp_servers);
+    // 4) Atomic write: temp file in the same dir, then rename over the target.
+    //    0600 — `~/.claude.json` can hold oauth credentials.
+    write_atomic_json(claude_json, &root, 0o600)
+}
+
+/// Best-effort: pre-approve the worktree's project-scoped MCP servers so a
+/// headless `claude` doesn't wedge on the "Enable this project's MCP servers?"
+/// prompt. Reads `<working_dir>/.mcp.json` for its declared server names and, if
+/// any, unions them into `<working_dir>/.claude/settings.local.json`'s
+/// `enabledMcpjsonServers` (creating the `.claude/` dir and the file when
+/// absent). A NO-OP when there is no `.mcp.json` / it's unreadable / malformed /
+/// declares no `mcpServers`. Logs and returns on ANY error; never panics, never
+/// blocks the spawn — and never touches `~/.claude.json`.
+pub fn ensure_project_mcp_approved(working_dir: &Path) {
+    let names = read_mcp_server_names(working_dir);
+    if names.is_empty() {
+        // No `.mcp.json` (or absent / malformed / no `mcpServers`): do NOT
+        // create or modify `settings.local.json`. Folder-trust still happened.
+        return;
+    }
+    let settings = working_dir.join(".claude").join("settings.local.json");
+    if let Err(reason) = ensure_project_mcp_approved_at(&settings, &names) {
+        eprintln!(
+            "cm-daemon: claude project-MCP pre-approval for {} skipped: {}",
+            working_dir.display(),
+            reason,
+        );
+    }
+}
+
+/// Core merge + atomic write of `settings.local.json` against an explicit path.
+/// Split out from [`ensure_project_mcp_approved`] so tests can point at a
+/// tempdir. Unions `names` into the top-level `enabledMcpjsonServers` array,
+/// preserving every other key (`permissions`, `hooks`, …) and never touching
+/// `disabledMcpjsonServers`. Creates the parent `.claude/` dir and the file when
+/// absent. Refuses to clobber a file that doesn't parse as a JSON object.
+/// Idempotent: skips the write when `enabledMcpjsonServers` already contains
+/// every name. Returns `Err(reason)` for the caller to log (best-effort).
+fn ensure_project_mcp_approved_at(settings_path: &Path, names: &[String]) -> Result<(), String> {
+    // 1) Read the existing file. Missing -> start from an empty object. Refuse
+    //    to clobber a file that doesn't parse as a JSON object.
+    let mut root = match std::fs::read_to_string(settings_path) {
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                return Err(format!(
+                    "existing {} is valid JSON but not an object — left untouched",
+                    settings_path.display(),
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "existing {} does not parse as JSON ({}) — left untouched",
+                    settings_path.display(),
+                    e,
+                ));
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(e) => {
+            return Err(format!("could not read {}: {}", settings_path.display(), e));
+        }
+    };
+
+    let obj = root
+        .as_object_mut()
+        .expect("root is an object: checked is_object above / freshly created Map");
+
+    // 2) Idempotent: skip the write entirely when every `.mcp.json` name is
+    //    already present in `enabledMcpjsonServers`.
+    if enabled_contains_all(obj, names) {
+        return Ok(());
+    }
+
+    // 3) Union the names into `enabledMcpjsonServers` (never removes existing
+    //    names; never touches `disabledMcpjsonServers`; preserves all other
+    //    keys). `names` is non-empty here (the wrapper short-circuits on empty).
+    merge_enabled_mcp_servers(obj, names);
+
+    // 4) Ensure the parent `.claude/` dir exists before the atomic temp+rename.
+    if let Some(dir) = settings_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("create dir {}: {}", dir.display(), e))?;
+    }
 
     // 5) Atomic write: temp file in the same dir, then rename over the target.
-    write_atomic_json(claude_json, &root)
+    //    NOT a credentials file — match an existing file's mode or default 0644.
+    write_atomic_json(settings_path, &root, 0o644)
 }
 
 /// Best-effort: read `<working_dir>/.mcp.json` and return its declared MCP
@@ -244,10 +341,11 @@ fn read_mcp_server_names(working_dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// True when every name in `names` is already a string element of the project
-/// entry's `enabledMcpjsonServers` array. An empty `names` is trivially
-/// satisfied; an absent / non-array `enabledMcpjsonServers` satisfies only an
-/// empty `names`. Used by the idempotent short-circuit.
+/// True when every name in `names` is already a string element of `obj`'s
+/// `enabledMcpjsonServers` array (`obj` is the top-level `settings.local.json`
+/// object). An empty `names` is trivially satisfied; an absent / non-array
+/// `enabledMcpjsonServers` satisfies only an empty `names`. Used by the
+/// idempotent short-circuit.
 fn enabled_contains_all(
     entry: &serde_json::Map<String, serde_json::Value>,
     names: &[String],
@@ -263,11 +361,12 @@ fn enabled_contains_all(
     names.iter().all(|n| existing.contains(&n.as_str()))
 }
 
-/// Union `names` into the project entry's `enabledMcpjsonServers` array,
-/// preserving every name already present (never removes) and never touching
-/// `disabledMcpjsonServers`. Creates the key as an array when absent. If it is
-/// present but NOT an array (a hand-corrupted value), leave it untouched rather
-/// than clobber it. A no-op when `names` is empty.
+/// Union `names` into `obj`'s `enabledMcpjsonServers` array (`obj` is the
+/// top-level `settings.local.json` object), preserving every name already
+/// present (never removes) and never touching `disabledMcpjsonServers`. Creates
+/// the key as an array when absent. If it is present but NOT an array (a
+/// hand-corrupted value), leave it untouched rather than clobber it. A no-op
+/// when `names` is empty.
 fn merge_enabled_mcp_servers(
     entry: &mut serde_json::Map<String, serde_json::Value>,
     names: &[String],
@@ -292,8 +391,15 @@ fn merge_enabled_mcp_servers(
 /// Serialize `value` and replace `target` atomically: write a temp sibling in
 /// the same directory, then `rename` it over `target`. Same-directory rename is
 /// atomic on a POSIX filesystem, so a reader sees either the old file or the
-/// fully-written new one — never a partial.
-fn write_atomic_json(target: &Path, value: &serde_json::Value) -> Result<(), String> {
+/// fully-written new one — never a partial. `default_mode` is the file mode used
+/// for a freshly created target (0600 for the credential-bearing
+/// `~/.claude.json`, 0644 for the non-secret `settings.local.json`); an existing
+/// target's mode is preserved via [`preserve_mode`].
+fn write_atomic_json(
+    target: &Path,
+    value: &serde_json::Value,
+    default_mode: u32,
+) -> Result<(), String> {
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -306,26 +412,27 @@ fn write_atomic_json(target: &Path, value: &serde_json::Value) -> Result<(), Str
     serialized.push('\n');
 
     let tmp = unique_temp_sibling(dir, target);
-    // Create the temp with 0600 UP FRONT (not the umask default, typically
-    // 0644) so the credential-bearing config is never even momentarily
-    // world-readable in the window between creation and `preserve_mode` below.
+    // Create the temp with `default_mode` UP FRONT (not the umask default) so a
+    // credential-bearing config (0600) is never even momentarily world-readable
+    // in the window between creation and `preserve_mode` below.
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(default_mode)
             .open(&tmp)
             .map_err(|e| format!("create temp {}: {}", tmp.display(), e))?;
         f.write_all(serialized.as_bytes())
             .map_err(|e| format!("write temp {}: {}", tmp.display(), e))?;
     }
 
-    // Match the existing file's mode (it can hold oauth credentials — don't
-    // loosen a 0600 file); a freshly created target keeps the 0600 above.
-    // Best-effort: a perms failure must not abort the write.
-    preserve_mode(&tmp, target);
+    // Match the existing file's mode (don't loosen a 0600 `~/.claude.json`, and
+    // respect whatever the operator set on an existing `settings.local.json`); a
+    // freshly created target keeps `default_mode` from above. Best-effort: a
+    // perms failure must not abort the write.
+    preserve_mode(&tmp, target, default_mode);
 
     if let Err(e) = std::fs::rename(&tmp, target) {
         // Clean up the orphaned temp; ignore any cleanup error.
@@ -356,13 +463,15 @@ fn unique_temp_sibling(dir: &Path, target: &Path) -> PathBuf {
 }
 
 /// Best-effort: set `tmp`'s mode to match `target`'s (when it exists), else
-/// `0600`. Keeps the credential-bearing config from being world-readable after
-/// the rename. Ignores any failure — perms are a safety nicety, not a gate.
-fn preserve_mode(tmp: &Path, target: &Path) {
+/// `default_mode`. For `~/.claude.json` (0600) this keeps the credential-bearing
+/// config from being world-readable after the rename; for `settings.local.json`
+/// (0644) it respects whatever mode the operator already set. Ignores any
+/// failure — perms are a safety nicety, not a gate.
+fn preserve_mode(tmp: &Path, target: &Path, default_mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(target)
         .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o600);
+        .unwrap_or(default_mode);
     let _ = std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(mode));
 }
 
@@ -531,11 +640,13 @@ mod tests {
         assert_eq!(mode, 0o600, "got mode {:o}", mode);
     }
 
-    // ---- Project MCP-server pre-approval (.mcp.json -> enabledMcpjsonServers) -
+    // ---- Project MCP-server pre-approval (.mcp.json -> <wd>/.claude/settings.local.json) -
 
-    /// Collect `projects[key].enabledMcpjsonServers` as owned strings.
-    fn enabled_names(v: &serde_json::Value, key: &str) -> Vec<String> {
-        v["projects"][key]["enabledMcpjsonServers"]
+    /// Collect a settings.local.json's TOP-LEVEL `enabledMcpjsonServers` as
+    /// owned strings. (Modern `claude` reads project-MCP approval from here, NOT
+    /// from `~/.claude.json`.)
+    fn settings_enabled(path: &Path) -> Vec<String> {
+        read_json(path)["enabledMcpjsonServers"]
             .as_array()
             .unwrap()
             .iter()
@@ -544,186 +655,242 @@ mod tests {
     }
 
     #[test]
-    fn mcp_json_servers_are_added_to_enabled() {
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
-        // A real worktree dir holding a .mcp.json with two declared servers.
-        let wt = TempDir::new().unwrap();
+    fn spawn_writes_folder_trust_to_claude_json_and_mcp_to_settings_local() {
+        // The headline acceptance: folder-trust lands in ~/.claude.json, the MCP
+        // approval lands in <wd>/.claude/settings.local.json, and ~/.claude.json
+        // NEVER receives enabledMcpjsonServers from this code.
+        let _g = home_lock();
+        let home = TempDir::new().unwrap();
+        let _h = HomeGuard::set(home.path());
+        let claude_json = home.path().join(".claude.json");
+
+        let wt = home.path().join("work/repo");
+        std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(
-            wt.path().join(".mcp.json"),
+            wt.join(".mcp.json"),
             r#"{"mcpServers": {"postgres-remote": {"url": "x"}, "claude-manager": {}}}"#,
         )
         .unwrap();
 
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("write ok");
+        maybe_pretrust_for_spawn("claude", &[], Some(&wt));
 
-        let v = read_json(&cfg);
-        let key = wt.path().to_string_lossy().into_owned();
-        // Folder-trust still written...
+        // Folder-trust in ~/.claude.json (unchanged behavior)...
+        let cj = read_json(&claude_json);
+        let key = wt.to_string_lossy().into_owned();
         assert_eq!(
-            v["projects"][&key]["hasTrustDialogAccepted"],
+            cj["projects"][&key]["hasTrustDialogAccepted"],
             serde_json::json!(true),
         );
-        // ...and both .mcp.json servers approved.
-        let enabled = enabled_names(&v, &key);
+        // ...but ~/.claude.json must NOT carry enabledMcpjsonServers, anywhere.
+        assert!(
+            cj["projects"][&key].get("enabledMcpjsonServers").is_none(),
+            "~/.claude.json project entry must NOT carry enabledMcpjsonServers",
+        );
+        assert!(
+            !cj.as_object().unwrap().contains_key("enabledMcpjsonServers"),
+            "~/.claude.json must have no top-level enabledMcpjsonServers either",
+        );
+
+        // The MCP approval lands in <wd>/.claude/settings.local.json.
+        let settings = wt.join(".claude").join("settings.local.json");
+        let enabled = settings_enabled(&settings);
         assert!(enabled.contains(&"postgres-remote".to_string()), "{enabled:?}");
         assert!(enabled.contains(&"claude-manager".to_string()), "{enabled:?}");
     }
 
     #[test]
-    fn no_mcp_json_does_not_invent_enabled() {
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
-        let wt = TempDir::new().unwrap(); // empty: no .mcp.json
+    fn settings_local_created_with_enabled_servers() {
+        // Neither the .claude/ dir nor the file exists: both are created.
+        let wt = TempDir::new().unwrap();
+        let settings = wt.path().join(".claude").join("settings.local.json");
+        assert!(!settings.exists());
 
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("write ok");
+        ensure_project_mcp_approved_at(&settings, &["a".into(), "b".into()]).expect("write ok");
 
-        let v = read_json(&cfg);
-        let key = wt.path().to_string_lossy().into_owned();
-        assert_eq!(
-            v["projects"][&key]["hasTrustDialogAccepted"],
-            serde_json::json!(true),
-        );
-        assert!(
-            v["projects"][&key].get("enabledMcpjsonServers").is_none(),
-            "must not invent enabledMcpjsonServers when there is no .mcp.json",
-        );
+        let enabled = settings_enabled(&settings);
+        assert!(enabled.contains(&"a".to_string()), "{enabled:?}");
+        assert!(enabled.contains(&"b".to_string()), "{enabled:?}");
     }
 
     #[test]
-    fn malformed_mcp_json_is_skipped_but_folder_trust_written() {
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
+    fn settings_local_union_merge_preserves_permissions_and_hooks() {
         let wt = TempDir::new().unwrap();
-        std::fs::write(wt.path().join(".mcp.json"), "{ not valid json ]").unwrap();
-
-        // Best-effort: the malformed .mcp.json must not fail the call.
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("write ok");
-
-        let v = read_json(&cfg);
-        let key = wt.path().to_string_lossy().into_owned();
-        assert_eq!(
-            v["projects"][&key]["hasTrustDialogAccepted"],
-            serde_json::json!(true),
-        );
-        assert!(
-            v["projects"][&key].get("enabledMcpjsonServers").is_none(),
-            "malformed .mcp.json => no MCP names added",
-        );
-    }
-
-    #[test]
-    fn mcp_json_without_mcpservers_object_is_skipped() {
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
-        let wt = TempDir::new().unwrap();
-        // Valid JSON object, but no `mcpServers` key.
-        std::fs::write(wt.path().join(".mcp.json"), r#"{"other": 1}"#).unwrap();
-
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("write ok");
-
-        let v = read_json(&cfg);
-        let key = wt.path().to_string_lossy().into_owned();
-        assert_eq!(
-            v["projects"][&key]["hasTrustDialogAccepted"],
-            serde_json::json!(true),
-        );
-        assert!(v["projects"][&key].get("enabledMcpjsonServers").is_none());
-    }
-
-    #[test]
-    fn unions_existing_enabled_and_never_touches_disabled() {
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
-        let wt = TempDir::new().unwrap();
-        let key = wt.path().to_string_lossy().into_owned();
-        std::fs::write(
-            wt.path().join(".mcp.json"),
-            r#"{"mcpServers": {"new-one": {}, "keep-me": {}}}"#,
-        )
-        .unwrap();
-
-        // Pre-existing entry: one of the .mcp.json names is already enabled, plus
-        // an unrelated enabled name and an explicit disable.
+        let claude_dir = wt.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.local.json");
+        // Existing file carrying unrelated keys, a pre-existing enabled name and
+        // an explicit disable.
         let existing = serde_json::json!({
-            "projects": {
-                &key: {
-                    "enabledMcpjsonServers": ["keep-me", "already-here"],
-                    "disabledMcpjsonServers": ["nope"]
-                }
-            }
+            "permissions": { "allow": ["Bash(ls:*)"] },
+            "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "echo hi" }] }] },
+            "enabledMcpjsonServers": ["keep-me", "already-here"],
+            "disabledMcpjsonServers": ["nope"]
         });
-        std::fs::write(&cfg, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        std::fs::write(&settings, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("write ok");
+        ensure_project_mcp_approved_at(&settings, &["new-one".into(), "keep-me".into()])
+            .expect("write ok");
 
-        let v = read_json(&cfg);
-        let enabled = enabled_names(&v, &key);
-        // Union: pre-existing names kept, new one added.
+        let v = read_json(&settings);
+        // Every other key preserved verbatim.
+        assert_eq!(v["permissions"]["allow"], serde_json::json!(["Bash(ls:*)"]));
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            serde_json::json!("echo hi"),
+        );
+        // enabledMcpjsonServers unioned, no duplicate.
+        let enabled = settings_enabled(&settings);
         assert!(enabled.contains(&"keep-me".to_string()), "{enabled:?}");
         assert!(enabled.contains(&"already-here".to_string()), "{enabled:?}");
         assert!(enabled.contains(&"new-one".to_string()), "{enabled:?}");
-        // No duplicate for the name present in both.
         assert_eq!(
             enabled.iter().filter(|s| *s == "keep-me").count(),
             1,
             "no duplicate: {enabled:?}",
         );
-        // The explicit disable is untouched.
-        assert_eq!(
-            v["projects"][&key]["disabledMcpjsonServers"],
-            serde_json::json!(["nope"]),
-        );
-        assert_eq!(
-            v["projects"][&key]["hasTrustDialogAccepted"],
-            serde_json::json!(true),
-        );
+        // disabledMcpjsonServers never touched.
+        assert_eq!(v["disabledMcpjsonServers"], serde_json::json!(["nope"]));
     }
 
     #[test]
-    fn idempotent_when_trust_and_mcp_already_satisfied() {
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
+    fn malformed_settings_local_is_left_untouched() {
         let wt = TempDir::new().unwrap();
-        std::fs::write(
-            wt.path().join(".mcp.json"),
-            r#"{"mcpServers": {"a": {}, "b": {}}}"#,
-        )
-        .unwrap();
+        let claude_dir = wt.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.local.json");
+        let garbage = "{ not valid json ]";
+        std::fs::write(&settings, garbage).unwrap();
 
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("first write ok");
-        let after_first = std::fs::read_to_string(&cfg).unwrap();
+        let err =
+            ensure_project_mcp_approved_at(&settings, &["a".into()]).expect_err("must skip");
+        assert!(err.contains("does not parse as JSON"), "err: {err}");
+        // Bytes unchanged — never clobbered.
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), garbage);
+    }
 
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("second call ok");
-        let after_second = std::fs::read_to_string(&cfg).unwrap();
+    #[test]
+    fn non_object_settings_local_is_left_untouched() {
+        let wt = TempDir::new().unwrap();
+        let claude_dir = wt.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.local.json");
+        std::fs::write(&settings, "[1, 2, 3]").unwrap();
 
-        // Both halves already satisfied => no rewrite at all (byte-identical).
+        let err =
+            ensure_project_mcp_approved_at(&settings, &["a".into()]).expect_err("must skip");
+        assert!(err.contains("not an object"), "err: {err}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn settings_local_idempotent_when_already_superset() {
+        let wt = TempDir::new().unwrap();
+        let settings = wt.path().join(".claude").join("settings.local.json");
+
+        ensure_project_mcp_approved_at(&settings, &["a".into(), "b".into()]).expect("first ok");
+        let after_first = std::fs::read_to_string(&settings).unwrap();
+
+        ensure_project_mcp_approved_at(&settings, &["a".into(), "b".into()])
+            .expect("second ok");
+        let after_second = std::fs::read_to_string(&settings).unwrap();
+
+        // Already a superset => no rewrite at all (byte-identical).
         assert_eq!(after_first, after_second);
     }
 
     #[test]
-    fn already_trusted_still_adds_a_late_appearing_mcp_server() {
-        // First run has NO .mcp.json (folder-trust only). A .mcp.json then
-        // appears and a re-run must NOT short-circuit on hasTrustDialogAccepted
-        // alone — the MCP-aware idempotent gate must still add the new server.
-        let dir = TempDir::new().unwrap();
-        let cfg = dir.path().join(".claude.json");
+    fn fresh_settings_local_is_0644_not_credentials_mode() {
+        use std::os::unix::fs::PermissionsExt;
         let wt = TempDir::new().unwrap();
-        let key = wt.path().to_string_lossy().into_owned();
+        let settings = wt.path().join(".claude").join("settings.local.json");
 
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("first ok");
-        let v = read_json(&cfg);
-        assert!(v["projects"][&key].get("enabledMcpjsonServers").is_none());
+        ensure_project_mcp_approved_at(&settings, &["a".into()]).expect("write ok");
+
+        // Not a credentials file — defaults to 0644, deterministic regardless of umask.
+        let mode = std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "got mode {:o}", mode);
+    }
+
+    #[test]
+    fn settings_local_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = TempDir::new().unwrap();
+        let claude_dir = wt.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.local.json");
+        std::fs::write(&settings, r#"{"permissions": {}}"#).unwrap();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        ensure_project_mcp_approved_at(&settings, &["a".into()]).expect("write ok");
+
+        // An operator-set mode on the existing file is preserved across the merge.
+        let mode = std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing mode must be preserved, got {:o}", mode);
+    }
+
+    #[test]
+    fn wrapper_reads_mcp_json_and_writes_settings_local() {
+        let wt = TempDir::new().unwrap();
+        std::fs::write(
+            wt.path().join(".mcp.json"),
+            r#"{"mcpServers": {"x": {}, "y": {}}}"#,
+        )
+        .unwrap();
+
+        ensure_project_mcp_approved(wt.path());
+
+        let settings = wt.path().join(".claude").join("settings.local.json");
+        let enabled = settings_enabled(&settings);
+        assert!(enabled.contains(&"x".to_string()), "{enabled:?}");
+        assert!(enabled.contains(&"y".to_string()), "{enabled:?}");
+    }
+
+    #[test]
+    fn no_mcp_json_creates_no_settings_local() {
+        let wt = TempDir::new().unwrap(); // empty: no .mcp.json
+        ensure_project_mcp_approved(wt.path());
+        assert!(
+            !wt.path().join(".claude").exists(),
+            "no .mcp.json => no .claude/ dir or settings.local.json created",
+        );
+    }
+
+    #[test]
+    fn malformed_mcp_json_creates_no_settings_local() {
+        let wt = TempDir::new().unwrap();
+        std::fs::write(wt.path().join(".mcp.json"), "{ not valid json ]").unwrap();
+        // Best-effort: the malformed .mcp.json must not panic or create a file.
+        ensure_project_mcp_approved(wt.path());
+        assert!(!wt.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn mcp_json_without_mcpservers_creates_no_settings_local() {
+        let wt = TempDir::new().unwrap();
+        // Valid JSON object, but no `mcpServers` key.
+        std::fs::write(wt.path().join(".mcp.json"), r#"{"other": 1}"#).unwrap();
+        ensure_project_mcp_approved(wt.path());
+        assert!(!wt.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn late_appearing_mcp_json_is_approved_on_rerun() {
+        // First run has NO .mcp.json: nothing is created. A .mcp.json then
+        // appears and a re-run approves it into settings.local.json.
+        let wt = TempDir::new().unwrap();
+
+        ensure_project_mcp_approved(wt.path());
+        assert!(!wt.path().join(".claude").exists());
 
         std::fs::write(
             wt.path().join(".mcp.json"),
             r#"{"mcpServers": {"late": {}}}"#,
         )
         .unwrap();
-        ensure_folder_trusted_at(&cfg, wt.path()).expect("second ok");
+        ensure_project_mcp_approved(wt.path());
 
-        let v = read_json(&cfg);
-        let enabled = enabled_names(&v, &key);
+        let settings = wt.path().join(".claude").join("settings.local.json");
+        let enabled = settings_enabled(&settings);
         assert!(enabled.contains(&"late".to_string()), "{enabled:?}");
     }
 
