@@ -1253,6 +1253,22 @@ impl PendingSession {
             cmd.cwd(wd);
         }
 
+        // ALWAYS-ON claude folder pre-trust. A daemon-spawned interactive
+        // `claude` launched in an untrusted directory wedges forever at the
+        // "Do you trust the files in this folder?" dialog — state stays
+        // `pending`, no transcript is written, and any headless workflow
+        // stalls at iteration 1 with no human to answer. `claude` records
+        // trust per-path in `~/.claude.json`; pre-seeding it before exec
+        // closes the wedge. This is the SINGLE PTY-spawn choke point, so it
+        // covers both `mcp_start_session` spawns and workflow-participant
+        // fresh-spawns. Best-effort + gated to `claude` only (codex/bash write
+        // nothing); see `crate::claude_trust`.
+        crate::claude_trust::maybe_pretrust_for_spawn(
+            &params.shell,
+            &params.args,
+            params.working_dir.as_deref(),
+        );
+
         // Capture the memory-kill-log baseline BEFORE the child
         // starts. Order matters (slice-10c-e-2 review-4 fix): if
         // we baseline *after* spawn_command, a child that OOMs

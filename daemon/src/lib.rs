@@ -54,6 +54,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod attach;
+pub mod claude_trust;
 pub mod config;
 pub mod control;
 pub mod host_id;
