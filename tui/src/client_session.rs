@@ -356,12 +356,34 @@ impl ClientSession {
         let attach_resp = rpc_session_attach(config, session_uid)
             .context("RPC session.attach")?;
 
-        // Step 3: dial a fresh socket to attach_addr. That socket
-        // morphs into the PTY stream after attach.open's response;
-        // no re-dial after.
-        let mut attach_socket = UnixStream::connect(Path::new(&attach_resp.attach_addr))
+        // Step 3: dial a fresh socket and send `attach.open` on it.
+        // That socket morphs into the PTY stream after attach.open's
+        // response; no re-dial after.
+        //
+        // Dial `config.daemon_socket` — the SAME per-host socket the
+        // `session.attach` RPC above used (the SSH-tunnel's local
+        // forwarded socket for a remote host; `~/.cm/daemon.sock` for
+        // local). We deliberately do NOT dial `attach_resp.attach_addr`:
+        // the daemon sets that to its OWN listen-socket path
+        // (daemon/src/lib.rs sets `attach_addr = <listen socket path>`),
+        // which is only meaningful on the daemon's own filesystem. For a
+        // remote host that exact path usually ALSO exists locally
+        // (`~/.cm/daemon.sock`), so dialing it would connect to the LOCAL
+        // daemon and `attach.open` would fail ("RPC attach.open") because
+        // the local daemon never allocated the remote ticket. Since
+        // `attach_addr` is always the daemon's control socket — the same
+        // socket that handles `attach.open` as a stream-morph first frame
+        // — dialing `config.daemon_socket` reaches the daemon that issued
+        // the ticket for BOTH local (same path, no behavior change) and
+        // remote (through the tunnel). `attach_resp.attach_addr` is left
+        // unused on purpose; a remote client must never dial it.
+        let _ = &attach_resp.attach_addr; // daemon-local path; not dialable by a remote client
+        let mut attach_socket = UnixStream::connect(config.daemon_socket)
             .with_context(|| {
-                format!("dial attach socket at {}", attach_resp.attach_addr)
+                format!(
+                    "dial attach socket at {}",
+                    config.daemon_socket.display()
+                )
             })?;
 
         // Step 4: attach.open on the same socket. The response
@@ -2751,6 +2773,124 @@ mod tests {
         // Cleanup: kill the session before tearing down the daemon.
         let _ = rpc_kill_session(&socket, "op-full", &session.session_uid);
         // Drop the ClientSession so its EventLoop thread tears down.
+        drop(session);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Remote-interactive-attach regression: the attach STREAM must
+    /// be dialed at `config.daemon_socket` (the per-host socket — the
+    /// SSH tunnel's local forwarded socket for a remote host), NOT at
+    /// the `attach_addr` that the `session.attach` RPC returns.
+    ///
+    /// The daemon sets `attach_addr` to its OWN listen-socket path
+    /// (`daemon/src/lib.rs`: `attach_addr = <listen socket path>`),
+    /// which is only meaningful on the daemon's own filesystem. For a
+    /// REMOTE ssh-unix host that path is not the socket the local
+    /// client can reach — and worse, the same path
+    /// (`~/.cm/daemon.sock`) usually ALSO exists locally pointing at a
+    /// *different* daemon. Pre-fix the client dialed `attach_addr`
+    /// verbatim, so a remote attach connected to the LOCAL daemon and
+    /// `attach.open` failed ("RPC attach.open") because that daemon
+    /// never allocated the remote ticket.
+    ///
+    /// Reproduce the remote situation exactly: the daemon listens on
+    /// path A (`config.daemon_socket == socket`) but advertises a
+    /// DIFFERENT, bogus `attach_addr` (path B) via `session.attach`.
+    /// Dialing B would fail to connect, so completing the dance proves
+    /// the client dialed A and ignored the daemon-returned B. Covers
+    /// the reattach (`attach_existing`) flow.
+    #[test]
+    fn attach_existing_dials_config_socket_not_returned_attach_addr() {
+        let (socket, working_dir, state, stop, handle) =
+            start_test_daemon("ws-remote-sim");
+
+        // Bring a session live on the daemon at path A.
+        let argv = vec!["/bin/bash".to_string()];
+        let uid = test_uid();
+        let config = bash_config(
+            &socket, &working_dir, "op-remote", &uid, "ws-remote-sim",
+            "remote-attach", &argv, 80, 24,
+        );
+        let live_uid = rpc_start_session(&config).expect("start_session");
+
+        // Simulate the remote case: the daemon now advertises an
+        // attach_addr (path B) that the client cannot dial — a
+        // nonexistent path stands in for "the daemon-local socket
+        // path, which is the wrong/non-dialable socket for a remote
+        // client". Path A (the real listen socket) is unchanged.
+        let bogus_attach_addr =
+            "/nonexistent/cm-remote-attach-path-B.sock".to_string();
+        state.lock().unwrap().attach_addr = bogus_attach_addr.clone();
+
+        // session.attach really does hand back the bogus path B now —
+        // the exact condition the fix must tolerate.
+        let attach = rpc_session_attach(&config, &live_uid)
+            .expect("session.attach");
+        assert_eq!(
+            attach.attach_addr, bogus_attach_addr,
+            "test invariant: the daemon advertises the bogus path B",
+        );
+
+        // attach_existing (reattach) funnels through build_after_start
+        // like new(). It must dial config.daemon_socket (A) for the
+        // stream and so complete despite attach_addr being the
+        // un-dialable B.
+        let session = ClientSession::attach_existing(config).expect(
+            "remote attach must succeed by dialing config.daemon_socket (A), \
+             ignoring the daemon-returned attach_addr (B)",
+        );
+        assert_eq!(session.session_uid, live_uid);
+        assert!(
+            state.lock().unwrap().sessions.contains_key(&session.session_uid),
+            "daemon at A must still hold the session — confirming we \
+             attached to A, not the bogus B",
+        );
+
+        let _ = rpc_kill_session(&socket, "op-remote", &session.session_uid);
+        drop(session);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// Companion to the reattach test above, exercising the
+    /// create+attach (`A-n`) flow through `ClientSession::new`: with
+    /// the daemon advertising a bogus `attach_addr` (path B) from the
+    /// start, the full dance must still complete by dialing
+    /// `config.daemon_socket` (path A). This is the headline flow that
+    /// broke for remote ssh-unix hosts.
+    #[test]
+    fn client_session_new_dials_config_socket_not_returned_attach_addr() {
+        let (socket, working_dir, state, stop, handle) =
+            start_test_daemon("ws-remote-new");
+        // Daemon advertises the un-dialable path B for the whole run.
+        // start_session ignores attach_addr; session.attach (inside
+        // new()) returns B; the attach-stream dial must use A.
+        let bogus_attach_addr =
+            "/nonexistent/cm-remote-new-path-B.sock".to_string();
+        state.lock().unwrap().attach_addr = bogus_attach_addr.clone();
+
+        let argv = vec!["/bin/bash".to_string()];
+        let uid = test_uid();
+        let config = bash_config(
+            &socket, &working_dir, "op-remote-new", &uid, "ws-remote-new",
+            "remote-new", &argv, 80, 24,
+        );
+        let session = ClientSession::new(config).expect(
+            "remote create+attach must succeed by dialing \
+             config.daemon_socket (A), ignoring attach_addr (B)",
+        );
+        assert!(session.session_uid.starts_with("ts-"));
+        // The advertised attach_addr stayed bogus throughout — the
+        // client never relied on it.
+        assert_eq!(
+            state.lock().unwrap().attach_addr, bogus_attach_addr,
+            "attach_addr remained the bogus path B for the whole dance",
+        );
+        assert!(
+            state.lock().unwrap().sessions.contains_key(&session.session_uid),
+            "daemon at A must hold the session created by new()",
+        );
+
+        let _ = rpc_kill_session(&socket, "op-remote-new", &session.session_uid);
         drop(session);
         stop_test_daemon(&socket, stop, handle);
     }
