@@ -1579,8 +1579,15 @@ enum InputMode {
         /// that agent-memory snapshot. Filled in via the picker invoked
         /// from field 4. See chunk 5 in DESIGN_AGENT_MEMORIES.md.
         seed_from: Option<String>,
+        /// Host the new workspace is created on. Seeded from `active_host`
+        /// at form-open so an operator who doesn't touch the field gets
+        /// today's behavior; cycled with ←/→ on field 5. Host is fixed at
+        /// creation — this picker makes the per-A-n choice explicit instead
+        /// of forcing an `A-H` to pre-aim the global `active_host`.
+        host_id: cm_daemon::host_id::HostId,
         /// 0 = repo (←/→ to cycle), 1 = name, 2 = branch, 3 = idle timeout,
-        /// 4 = seed-from (Enter opens snapshot picker, Esc clears)
+        /// 4 = seed-from (Enter opens snapshot picker, Esc clears),
+        /// 5 = host (←/→ to cycle the configured hosts)
         active_field: u8,
     },
     /// Picking a session type to add to a workspace.
@@ -1865,6 +1872,11 @@ pub(crate) struct InputCtx<'a> {
     /// Repo URLs in the user's config, sorted by repo name. Used by
     /// `handle_new_session` to cycle the repo picker (←/→).
     pub repo_urls: &'a [String],
+    /// Configured host ids (local + any `~/.cm/hosts.toml` entries), in
+    /// config order. Used by `handle_new_session` to cycle the host picker
+    /// (←/→) on field 5. Empty in contexts where host selection doesn't
+    /// apply — cycling is then a no-op.
+    pub host_ids: &'a [cm_daemon::host_id::HostId],
 }
 
 /// Post-condition signal from a per-mode handler back to the dispatcher.
@@ -1902,6 +1914,10 @@ pub(crate) enum SubmitAction {
         /// in-place in the main repo (no worktree, no branch). `branch`
         /// is `None` in that case.
         in_place: bool,
+        /// Host chosen on the A-n form (defaults to `active_host`). The
+        /// create path pins the new workspace to THIS host — local →
+        /// existing local create path, remote → `create_remote_session`.
+        host_id: cm_daemon::host_id::HostId,
     },
     SpawnSessionOnWorkspace {
         workspace_id: String,
@@ -1918,6 +1934,10 @@ pub(crate) enum SubmitAction {
         idle_timeout_text: String,
         repo_url: String,
         existing_seed_from: Option<String>,
+        /// Carried through the picker round-trip so the chosen host
+        /// survives a snapshot pick/cancel (same rationale as the typed
+        /// text fields above).
+        host_id: cm_daemon::host_id::HostId,
     },
     /// Open the snapshot catalog in picker mode from the A-s form.
     OpenSnapshotPickerForNewTerminalSession {
@@ -2001,6 +2021,7 @@ pub(crate) struct NewSessionMut<'a> {
     pub idle_timeout_text: &'a mut String,
     pub repo_url: &'a mut String,
     pub seed_from: &'a mut Option<String>,
+    pub host_id: &'a mut cm_daemon::host_id::HostId,
     pub active_field: &'a mut u8,
 }
 
@@ -2056,6 +2077,10 @@ pub enum PickerTarget {
         idle_timeout_text: String,
         repo_url: String,
         existing_seed_from: Option<String>,
+        /// The host chosen on the form when the picker was opened —
+        /// preserved verbatim so a pick/cancel round-trip doesn't reset
+        /// the operator's host choice back to the default.
+        host_id: cm_daemon::host_id::HostId,
     },
     NewTerminalSession {
         workspace_id: String,
@@ -2135,12 +2160,14 @@ fn rebuild_form_from_picker(target: PickerTarget, name: Option<String>) -> Input
             idle_timeout_text,
             repo_url,
             existing_seed_from,
+            host_id,
         } => InputMode::NewSession {
             label_text,
             branch_text,
             idle_timeout_text,
             repo_url,
             seed_from: name.or(existing_seed_from),
+            host_id,
             // Keep the picker field selected so the user sees the
             // result of their pick (or non-pick) land in context.
             active_field: 4,
@@ -2275,7 +2302,7 @@ pub(crate) fn handle_new_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    const FIELD_COUNT: u8 = 5; // repo, label, branch, idle, seed-from
+    const FIELD_COUNT: u8 = 6; // repo, label, branch, idle, seed-from, host
     match key.code {
         KeyCode::Esc => {
             // Esc on the seed-from field with a value clears the
@@ -2312,6 +2339,27 @@ pub(crate) fn handle_new_session(
             }
             InputOutcome::Consumed
         }
+        KeyCode::Left | KeyCode::Right if *state.active_field == 5 => {
+            // Host picker: cycle through the configured hosts (local +
+            // any hosts.toml entries). Mirrors the repo picker at field 0.
+            // Empty list (no ctx) or an unknown current host falls back to
+            // index 0 so a cycle still lands somewhere sensible.
+            if !ctx.host_ids.is_empty() {
+                let cur = ctx
+                    .host_ids
+                    .iter()
+                    .position(|h| h == state.host_id)
+                    .unwrap_or(0);
+                let n = ctx.host_ids.len();
+                let next = if matches!(key.code, KeyCode::Right) {
+                    (cur + 1) % n
+                } else {
+                    (cur + n - 1) % n
+                };
+                *state.host_id = ctx.host_ids[next].clone();
+            }
+            InputOutcome::Consumed
+        }
         KeyCode::Enter if *state.active_field == 4 => {
             // Open the snapshot catalog in picker mode. The dispatcher
             // stashes the form state on the submit action so it can
@@ -2324,6 +2372,7 @@ pub(crate) fn handle_new_session(
                 idle_timeout_text: state.idle_timeout_text.clone(),
                 repo_url: state.repo_url.clone(),
                 existing_seed_from: state.seed_from.clone(),
+                host_id: state.host_id.clone(),
             })
         }
         KeyCode::Enter => {
@@ -2350,6 +2399,7 @@ pub(crate) fn handle_new_session(
                     idle_timeout_secs: timeout,
                     seed_from: state.seed_from.clone(),
                     in_place,
+                    host_id: state.host_id.clone(),
                 })
             } else {
                 InputOutcome::Consumed
@@ -9347,6 +9397,11 @@ impl App {
             return true;
         }
         let urls = sorted_repo_urls(&self.config.repos);
+        // Configured hosts (local + any hosts.toml entries) in config order,
+        // for the A-n host picker. Cloned per keystroke; the list is tiny
+        // (1-3 entries) so the cost is negligible.
+        let host_ids: Vec<cm_daemon::host_id::HostId> =
+            self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
         let outcome = match &mut self.input_mode {
             InputMode::Normal => InputOutcome::Ignored,
             InputMode::NewSession {
@@ -9355,6 +9410,7 @@ impl App {
                 idle_timeout_text,
                 repo_url,
                 seed_from,
+                host_id,
                 active_field,
             } => handle_new_session(
                 NewSessionMut {
@@ -9363,9 +9419,10 @@ impl App {
                     idle_timeout_text,
                     repo_url,
                     seed_from,
+                    host_id,
                     active_field,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::NewTerminalSession {
@@ -9382,7 +9439,7 @@ impl App {
                     seed_from,
                     active_field,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::SessionSettings {
@@ -9406,7 +9463,7 @@ impl App {
                     notify_on_idle,
                     active_field,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::WorkspaceSettings { ws_index, name } => handle_workspace_settings(
@@ -9414,7 +9471,7 @@ impl App {
                     ws_index: *ws_index,
                     name,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::SaveSnapshot {
@@ -9433,7 +9490,7 @@ impl App {
                     active_field,
                     error,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::SnapshotCatalog {
@@ -9450,7 +9507,7 @@ impl App {
                     picker_target: picker_target.as_ref(),
                     status_msg,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::TaskSettings { task_id, name } => handle_task_settings(
@@ -9458,7 +9515,7 @@ impl App {
                     task_id: task_id.as_str(),
                     name,
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::WorkflowLaunchConfirm {
@@ -9477,7 +9534,7 @@ impl App {
                     goal,
                     cursor_task_id: cursor_task_id.as_deref(),
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::WorkflowPicker {
@@ -9494,22 +9551,22 @@ impl App {
                     selected,
                     cursor_task_id: cursor_task_id.as_deref(),
                 },
-                InputCtx { repo_urls: &urls },
+                InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
             InputMode::WorkflowHistory { run_id: _ } => {
-                handle_workflow_history(InputCtx { repo_urls: &urls }, event)
+                handle_workflow_history(InputCtx { repo_urls: &urls, host_ids: &host_ids }, event)
             }
             InputMode::PastWorkspacePicker { candidates, selected } => {
                 handle_past_workspace_picker(
                     candidates,
                     selected,
-                    InputCtx { repo_urls: &urls },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
                     event,
                 )
             }
             InputMode::Confirm { action, .. } => {
-                handle_confirm(action, InputCtx { repo_urls: &urls }, event)
+                handle_confirm(action, InputCtx { repo_urls: &urls, host_ids: &host_ids }, event)
             }
         };
         self.apply_input_outcome(outcome)
@@ -9584,8 +9641,10 @@ impl App {
                 idle_timeout_secs,
                 seed_from,
                 in_place,
+                host_id,
             } => {
                 self.create_local_session(
+                    &host_id,
                     &repo_url,
                     &label,
                     branch.as_deref(),
@@ -9613,6 +9672,7 @@ impl App {
                 idle_timeout_text,
                 repo_url,
                 existing_seed_from,
+                host_id,
             } => {
                 self.open_snapshot_catalog(Some(PickerTarget::NewSession {
                     label_text,
@@ -9620,6 +9680,7 @@ impl App {
                     idle_timeout_text,
                     repo_url,
                     existing_seed_from,
+                    host_id,
                 }));
             }
             SubmitAction::OpenSnapshotPickerForNewTerminalSession {
@@ -9782,6 +9843,10 @@ impl App {
             idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
             repo_url,
             seed_from: None,
+            // Default the host choice to the global active_host: an operator
+            // who never touches the host field gets exactly today's behavior.
+            // ←/→ on field 5 picks a different configured host.
+            host_id: self.active_host.clone(),
             active_field: 0,
         };
     }
@@ -10378,6 +10443,7 @@ impl App {
 
     fn create_local_session(
         &mut self,
+        chosen_host: &cm_daemon::host_id::HostId,
         repo_url: &str,
         label: &str,
         start_branch: Option<&str>,
@@ -10385,12 +10451,15 @@ impl App {
         seed_from: Option<&str>,
         in_place: bool,
     ) {
-        // 12e-r2 F1: snapshot active_host ONCE at the top of
-        // the user action. Pass it through to `try_spawn_via_daemon`
-        // and reuse the same value for the TerminalSession.host_id
-        // assignment below.
-        let active_host = self.active_host.clone();
-        // Phase 3 (remote-session-execution): a non-local active host routes
+        // Host-picker (A-n): the host is now an explicit per-A-n choice on the
+        // form (defaulting to `active_host`), passed in as `chosen_host` —
+        // NOT read from the global `self.active_host`. Snapshot it ONCE here
+        // and thread the same value through `try_spawn_via_daemon` AND the
+        // TerminalSession.host_id assignment below, so a concurrent A-H cycle
+        // can't tag the session with a different host mid-create. (Was the
+        // 12e-r2 F1 active_host snapshot before the picker landed.)
+        let active_host = chosen_host.clone();
+        // Phase 3 (remote-session-execution): a non-local chosen host routes
         // A-n to the daemon-resolved `create_session` path — the daemon makes
         // the worktree and builds argv/env on its OWN filesystem, then the TUI
         // attaches over the host's socket. Local A-n runs the existing path
@@ -12506,6 +12575,7 @@ impl App {
                     idle_timeout_text,
                     repo_url,
                     seed_from,
+                    host_id,
                     active_field,
                 } => {
                     self.draw_input_dialog(
@@ -12516,6 +12586,7 @@ impl App {
                         idle_timeout_text,
                         repo_url,
                         seed_from.as_deref(),
+                        host_id,
                         *active_field,
                     );
                 }
@@ -12672,11 +12743,12 @@ impl App {
         idle_timeout_text: &str,
         repo_url: &str,
         seed_from: Option<&str>,
+        host_id: &cm_daemon::host_id::HostId,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        // +2 rows for the seed-from line (one separator + the field).
-        let height = 13u16;
+        // +1 row over the pre-host-picker layout for the host line.
+        let height = 14u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -12736,6 +12808,15 @@ impl App {
             _ => "",
         };
 
+        let host_label = sanitize_for_display(host_id.as_str());
+        let host_style = if active_field == 5 { highlight } else { white };
+        // ←/→ only does something with more than one configured host.
+        let host_hint = if active_field == 5 && self.hosts.hosts.len() > 1 {
+            "  \u{2190}/\u{2192} change"
+        } else {
+            ""
+        };
+
         let lines = vec![
             Line::from(vec![
                 Span::styled("    Repo: ", dim),
@@ -12763,6 +12844,11 @@ impl App {
                 Span::styled("    Seed: ", dim),
                 Span::styled(seed_label, seed_style),
                 Span::styled(seed_hint, dim),
+            ]),
+            Line::from(vec![
+                Span::styled("    Host: ", dim),
+                Span::styled(host_label, host_style),
+                Span::styled(host_hint, dim),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -17637,9 +17723,11 @@ mod pending_workflow_events_tests {
     #[test]
     fn remote_a_n_rejects_in_place_no_rpc() {
         let mut app = build_app_for_buffer_tests();
-        app.active_host = cm_daemon::host_id::HostId::new("manager");
+        // Routing keys off the CHOSEN host param, not the global active_host
+        // (which stays local here) — proving the host-picker choice drives it.
+        let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
-        app.create_local_session("somerepo", "label", None, 0, None, true);
+        app.create_local_session(&chosen, "somerepo", "label", None, 0, None, true);
         assert!(
             status_text(&app).contains("in-place"),
             "remote in_place must be rejected with a clear message; got {:?}",
@@ -17653,9 +17741,9 @@ mod pending_workflow_events_tests {
     #[test]
     fn remote_a_n_rejects_seed_from_no_rpc() {
         let mut app = build_app_for_buffer_tests();
-        app.active_host = cm_daemon::host_id::HostId::new("manager");
+        let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
-        app.create_local_session("somerepo", "label", None, 0, Some("snap-1"), false);
+        app.create_local_session(&chosen, "somerepo", "label", None, 0, Some("snap-1"), false);
         assert!(
             status_text(&app).contains("snapshot"),
             "remote seed_from must be rejected with a clear message; got {:?}",
@@ -17673,7 +17761,8 @@ mod pending_workflow_events_tests {
         let mut app = build_app_for_buffer_tests();
         // active_host defaults to local in build_app_for_buffer_tests.
         assert_eq!(app.active_host, cm_daemon::host_id::HostId::local());
-        app.create_local_session("no-such-repo-xyz", "label", None, 0, None, true);
+        let chosen = cm_daemon::host_id::HostId::local();
+        app.create_local_session(&chosen, "no-such-repo-xyz", "label", None, 0, None, true);
         let st = status_text(&app);
         assert!(
             !st.contains("in-place") && !st.contains("remote host"),
@@ -17683,6 +17772,53 @@ mod pending_workflow_events_tests {
         assert_eq!(
             st, "Repo not found locally",
             "local A-n runs the existing local path (stops at repo lookup)",
+        );
+    }
+
+    /// Host-picker A-n: the chosen host on the form (carried via
+    /// `SubmitAction::CreateLocalSession.host_id`) drives the create path,
+    /// NOT the global active_host. A chosen REMOTE host routes to the remote
+    /// path (proven by the in-place rejection that path issues); a chosen
+    /// LOCAL host routes to the existing local path. active_host stays local
+    /// throughout, so this also pins that A-H is NOT consulted at create time.
+    #[test]
+    fn a_n_submit_routes_by_chosen_host_not_active_host() {
+        // Remote choice → remote create path (rejects in-place, no workspace).
+        let mut app = build_app_for_buffer_tests();
+        assert_eq!(app.active_host, cm_daemon::host_id::HostId::local());
+        let before = app.workspaces.len();
+        app.apply_submit_action(SubmitAction::CreateLocalSession {
+            repo_url: "somerepo".into(),
+            label: "label".into(),
+            branch: None,
+            idle_timeout_secs: 0,
+            seed_from: None,
+            in_place: true,
+            host_id: cm_daemon::host_id::HostId::new("manager"),
+        });
+        assert!(
+            status_text(&app).contains("in-place"),
+            "remote chosen host must route to the remote path (in-place \
+             rejection); got {:?}",
+            status_text(&app),
+        );
+        assert_eq!(app.workspaces.len(), before, "no workspace on remote rejection");
+
+        // Local choice → existing local path (stops at the repo lookup).
+        let mut app = build_app_for_buffer_tests();
+        app.apply_submit_action(SubmitAction::CreateLocalSession {
+            repo_url: "no-such-repo-xyz".into(),
+            label: "label".into(),
+            branch: None,
+            idle_timeout_secs: 0,
+            seed_from: None,
+            in_place: true,
+            host_id: cm_daemon::host_id::HostId::local(),
+        });
+        assert_eq!(
+            status_text(&app),
+            "Repo not found locally",
+            "local chosen host runs the local create path",
         );
     }
 
@@ -19700,7 +19836,7 @@ mod input_handler_tests {
     }
 
     fn ctx_no_repos<'a>() -> InputCtx<'a> {
-        InputCtx { repo_urls: &[] }
+        InputCtx { repo_urls: &[], host_ids: &[] }
     }
 
     fn assert_consumed(o: &InputOutcome) {
@@ -19727,19 +19863,20 @@ mod input_handler_tests {
         timeout: &str,
         repo: &str,
         active: u8,
-    ) -> (String, String, String, String, u8) {
+    ) -> (String, String, String, String, cm_daemon::host_id::HostId, u8) {
         (
             label.to_string(),
             branch.to_string(),
             timeout.to_string(),
             repo.to_string(),
+            cm_daemon::host_id::HostId::local(),
             active,
         )
     }
 
     #[test]
     fn new_session_esc_cancels() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("hello", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19748,6 +19885,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19760,7 +19898,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_backspace_pops_label_buffer() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("foo", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19769,6 +19907,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19780,7 +19919,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_enter_with_label_submits_create_local_session() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("my-task", "feat/x", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19789,6 +19928,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19802,6 +19942,7 @@ mod input_handler_tests {
                 idle_timeout_secs,
                 seed_from,
                 in_place,
+                host_id,
             }) => {
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
@@ -19809,6 +19950,8 @@ mod input_handler_tests {
                 assert_eq!(idle_timeout_secs, 10);
                 assert!(seed_from.is_none());
                 assert!(!in_place, "a real branch must not be in-place");
+                // No host field touched → defaults to local (active_host).
+                assert_eq!(host_id, cm_daemon::host_id::HostId::local());
             }
             other => panic!("expected Submit(CreateLocalSession), got {:?}", other),
         }
@@ -19820,7 +19963,7 @@ mod input_handler_tests {
     #[test]
     fn new_session_dot_branch_sets_in_place() {
         for raw in ["."] {
-            let (mut label, mut branch, mut timeout, mut repo, mut active) =
+            let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
                 new_session_state("my-task", raw, "10", "https://github.com/a/b", 1);
             let outcome = handle_new_session(
                 NewSessionMut {
@@ -19829,6 +19972,7 @@ mod input_handler_tests {
                     idle_timeout_text: &mut timeout,
                     repo_url: &mut repo,
                     seed_from: &mut None,
+                    host_id: &mut host,
                     active_field: &mut active,
                 },
                 ctx_no_repos(),
@@ -19846,7 +19990,7 @@ mod input_handler_tests {
         }
 
         // Negative: `./foo` is a real branch name, never in-place.
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("my-task", "./foo", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19855,6 +19999,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19876,7 +20021,7 @@ mod input_handler_tests {
         // When the label is empty, Enter is consumed but the modal does
         // NOT close — pre-extraction behavior was `return true` without
         // touching `input_mode`.
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("   ", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19885,6 +20030,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19895,7 +20041,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_char_appends_only_to_active_field() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "2", "", 2);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19904,6 +20050,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19917,7 +20064,7 @@ mod input_handler_tests {
     #[test]
     fn new_session_right_cycles_repo_when_field_zero() {
         let urls = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "2", "b", 0);
         let outcome = handle_new_session(
             NewSessionMut {
@@ -19926,9 +20073,10 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut None,
+                host_id: &mut host,
                 active_field: &mut active,
             },
-            InputCtx { repo_urls: &urls },
+            InputCtx { repo_urls: &urls, host_ids: &[] },
             &key(KeyCode::Right),
         );
         assert_consumed(&outcome);
@@ -19938,12 +20086,12 @@ mod input_handler_tests {
     // ── NewSession seed-from (chunk 5) ────────────────────────────
 
     #[test]
-    fn new_session_tab_cycles_through_five_fields() {
-        // 0 → 1 → 2 → 3 → 4 → 0
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+    fn new_session_tab_cycles_through_six_fields() {
+        // 0 → 1 → 2 → 3 → 4 → 5 → 0 (host picker added as field 5)
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "", "", 0);
         let mut seed: Option<String> = None;
-        for expected in [1, 2, 3, 4, 0] {
+        for expected in [1, 2, 3, 4, 5, 0] {
             handle_new_session(
                 NewSessionMut {
                     label_text: &mut label,
@@ -19951,6 +20099,7 @@ mod input_handler_tests {
                     idle_timeout_text: &mut timeout,
                     repo_url: &mut repo,
                     seed_from: &mut seed,
+                    host_id: &mut host,
                     active_field: &mut active,
                 },
                 ctx_no_repos(),
@@ -19962,7 +20111,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_enter_on_seed_field_opens_picker_with_form_state() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("my-task", "feat/x", "12", "https://github.com/o/r", 4);
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
@@ -19972,6 +20121,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut seed,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -19985,6 +20135,7 @@ mod input_handler_tests {
                     idle_timeout_text,
                     repo_url,
                     existing_seed_from,
+                    host_id,
                 },
             ) => {
                 assert_eq!(label_text, "my-task");
@@ -19992,6 +20143,8 @@ mod input_handler_tests {
                 assert_eq!(idle_timeout_text, "12");
                 assert_eq!(repo_url, "https://github.com/o/r");
                 assert!(existing_seed_from.is_none());
+                // Defaulted to local in `new_session_state`; carried through.
+                assert_eq!(host_id, cm_daemon::host_id::HostId::local());
             }
             other => panic!(
                 "expected OpenSnapshotPickerForNewSession, got {other:?}"
@@ -20001,7 +20154,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_esc_on_seed_field_with_value_clears_seed_only() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("x", "", "2", "", 4);
         let mut seed: Option<String> = Some("reviewer".into());
         let outcome = handle_new_session(
@@ -20011,6 +20164,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut seed,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -20023,7 +20177,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_esc_on_other_fields_still_cancels() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("x", "", "2", "", 1);
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
@@ -20033,6 +20187,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut seed,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -20043,7 +20198,7 @@ mod input_handler_tests {
 
     #[test]
     fn new_session_submit_carries_seed_from_when_set() {
-        let (mut label, mut branch, mut timeout, mut repo, mut active) =
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("task", "", "2", "https://github.com/a/b", 1);
         let mut seed: Option<String> = Some("reviewer-strict".into());
         let outcome = handle_new_session(
@@ -20053,6 +20208,7 @@ mod input_handler_tests {
                 idle_timeout_text: &mut timeout,
                 repo_url: &mut repo,
                 seed_from: &mut seed,
+                host_id: &mut host,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -20064,6 +20220,117 @@ mod input_handler_tests {
             }) => assert_eq!(seed_from.as_deref(), Some("reviewer-strict")),
             other => panic!("expected CreateLocalSession, got {other:?}"),
         }
+    }
+
+    // ── NewSession host picker ────────────────────────────────────
+
+    /// The host field (5) cycles through the OFFERED host list — sourced
+    /// from `ctx.host_ids` (the configured hosts) — with ←/→, wrapping at
+    /// both ends, exactly like the repo picker at field 0.
+    #[test]
+    fn new_session_host_field_cycles_offered_hosts() {
+        let hosts = vec![
+            cm_daemon::host_id::HostId::local(),
+            cm_daemon::host_id::HostId::new("manager"),
+            cm_daemon::host_id::HostId::new("worker"),
+        ];
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("task", "", "2", "https://github.com/a/b", 5);
+        // Defaults to local (seeded by `new_session_state`).
+        assert_eq!(host, cm_daemon::host_id::HostId::local());
+        let mut press = |code: KeyCode, host: &mut cm_daemon::host_id::HostId| {
+            handle_new_session(
+                NewSessionMut {
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: &mut None,
+                    host_id: host,
+                    active_field: &mut active,
+                },
+                InputCtx { repo_urls: &[], host_ids: &hosts },
+                &key(code),
+            );
+        };
+        press(KeyCode::Right, &mut host);
+        assert_eq!(host, cm_daemon::host_id::HostId::new("manager"));
+        press(KeyCode::Right, &mut host);
+        assert_eq!(host, cm_daemon::host_id::HostId::new("worker"));
+        // Wraps forward to the first.
+        press(KeyCode::Right, &mut host);
+        assert_eq!(host, cm_daemon::host_id::HostId::local());
+        // Wraps backward to the last.
+        press(KeyCode::Left, &mut host);
+        assert_eq!(host, cm_daemon::host_id::HostId::new("worker"));
+    }
+
+    /// Enter on the form submits `CreateLocalSession` carrying the CHOSEN
+    /// host — so the create path pins the new workspace to it instead of
+    /// the global active_host.
+    #[test]
+    fn new_session_submit_carries_chosen_host() {
+        let hosts = vec![
+            cm_daemon::host_id::HostId::local(),
+            cm_daemon::host_id::HostId::new("manager"),
+        ];
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("task", "", "2", "https://github.com/a/b", 5);
+        // Cycle to the remote host, then submit from the host field.
+        handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut None,
+                host_id: &mut host,
+                active_field: &mut active,
+            },
+            InputCtx { repo_urls: &[], host_ids: &hosts },
+            &key(KeyCode::Right),
+        );
+        let outcome = handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut None,
+                host_id: &mut host,
+                active_field: &mut active,
+            },
+            InputCtx { repo_urls: &[], host_ids: &hosts },
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::CreateLocalSession {
+                host_id, ..
+            }) => assert_eq!(host_id, cm_daemon::host_id::HostId::new("manager")),
+            other => panic!("expected CreateLocalSession, got {other:?}"),
+        }
+    }
+
+    /// An empty offered list (no hosts in ctx) makes host cycling a no-op
+    /// rather than panicking — the chosen host stays at its default.
+    #[test]
+    fn new_session_host_cycle_no_op_when_list_empty() {
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("task", "", "2", "https://github.com/a/b", 5);
+        handle_new_session(
+            NewSessionMut {
+                label_text: &mut label,
+                branch_text: &mut branch,
+                idle_timeout_text: &mut timeout,
+                repo_url: &mut repo,
+                seed_from: &mut None,
+                host_id: &mut host,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Right),
+        );
+        assert_eq!(host, cm_daemon::host_id::HostId::local());
     }
 
     // ── NewTerminalSession ────────────────────────────────────────
@@ -20305,6 +20572,7 @@ mod input_handler_tests {
             idle_timeout_text: "30".into(),
             repo_url: "u".into(),
             existing_seed_from: Some("snap-A".into()),
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let mode = super::rebuild_form_from_picker(target, None);
         match mode {
@@ -20351,6 +20619,7 @@ mod input_handler_tests {
             idle_timeout_text: String::new(),
             repo_url: String::new(),
             existing_seed_from: None,
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let mode = super::rebuild_form_from_picker(target, None);
         match mode {
@@ -20565,6 +20834,7 @@ mod input_handler_tests {
             idle_timeout_text: "30".into(),
             repo_url: "https://github.com/o/r".into(),
             existing_seed_from: Some("prior-snap".into()),
+            host_id: cm_daemon::host_id::HostId::local(),
         };
         let err = agent_memory::SnapshotError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -20794,6 +21064,7 @@ mod input_handler_tests {
                 idle_timeout_text: String::new(),
                 repo_url: String::new(),
                 existing_seed_from: None,
+                host_id: cm_daemon::host_id::HostId::local(),
             }),
             Some(Engine::ClaudeCode)
         );
@@ -21341,6 +21612,7 @@ mod input_handler_tests {
                     idle_timeout_text: String::new(),
                     repo_url: String::new(),
                     existing_seed_from: None,
+                    host_id: cm_daemon::host_id::HostId::local(),
                 }),
                 status_msg: &mut None,
             },
@@ -21417,6 +21689,7 @@ mod input_handler_tests {
                         idle_timeout_text: String::new(),
                         repo_url: String::new(),
                         existing_seed_from: None,
+                        host_id: cm_daemon::host_id::HostId::local(),
                     }),
                     status_msg: &mut None,
                 },
@@ -22707,6 +22980,74 @@ mod slice_12e_tests {
         );
     }
 
+    /// Host picker: `start_new_session` seeds the form's `host_id` from the
+    /// current `active_host` — an operator who never touches the host field
+    /// creates on active_host, exactly as before the picker existed. Here
+    /// `A-H` first moves active_host to `manager`, then A-n inherits it.
+    #[test]
+    fn a_n_form_defaults_host_to_active_host() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        // start_new_session bails without a repo; give it one.
+        app.config
+            .repos
+            .insert("r".into(), "https://github.com/a/b".into());
+        app.cycle_active_host();
+        assert_eq!(app.active_host, HostId::new("manager"));
+        app.start_new_session();
+        match &app.input_mode {
+            InputMode::NewSession { host_id, .. } => {
+                assert_eq!(
+                    *host_id,
+                    HostId::new("manager"),
+                    "A-n form must default the host to active_host",
+                );
+            }
+            _ => panic!("expected NewSession form open"),
+        }
+    }
+
+    /// Host picker: the offered host list the dispatcher feeds the form is
+    /// sourced from the CONFIGURED hosts (`self.hosts.hosts`). Driving the
+    /// real `handle_input_event` path, ←/→ on the host field cycles to the
+    /// configured `manager` entry.
+    #[test]
+    fn a_n_form_host_picker_sourced_from_configured_hosts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: KeyCode| {
+            CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::empty()))
+        };
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) = build_app_with_hosts(
+            &[("local", true), ("manager", false)],
+            &guard,
+        );
+        app.config
+            .repos
+            .insert("r".into(), "https://github.com/a/b".into());
+        app.start_new_session();
+        // Tab from field 0 (repo) to field 5 (host).
+        for _ in 0..5 {
+            app.handle_input_event(&key(KeyCode::Tab));
+        }
+        // ←/→ cycles through the configured hosts: local → manager.
+        app.handle_input_event(&key(KeyCode::Right));
+        match &app.input_mode {
+            InputMode::NewSession { host_id, active_field, .. } => {
+                assert_eq!(*active_field, 5, "host field should be active");
+                assert_eq!(
+                    *host_id,
+                    HostId::new("manager"),
+                    "host picker must cycle through the configured hosts",
+                );
+            }
+            _ => panic!("expected NewSession form open"),
+        }
+    }
+
     /// T_g3e_new_session_inherits (named acceptance test).
     ///
     /// Session creation paths (`A-n` / `A-s` / `A-f`) set the
@@ -23193,17 +23534,19 @@ mod slice_12e_tests {
         );
 
         // The two production callers (create_local_session,
-        // spawn_session_on_workspace) must SNAPSHOT
-        // `self.active_host` at the top of the function and
-        // pass that snapshot through to BOTH the spawn call
-        // AND the TerminalSession.host_id assignment. Pin
-        // structurally — the markers are the 12e-r2 comments
-        // and the snapshot variable name.
-        // create_local_session (A-n) snapshots self.active_host — a NEW
-        // workspace is seeded by the global active host.
+        // spawn_session_on_workspace) must SNAPSHOT the host ONCE
+        // at the top of the function and pass that snapshot through
+        // to BOTH the spawn call AND the TerminalSession.host_id
+        // assignment. Pin structurally — the markers are the
+        // comments and the snapshot variable name.
+        // create_local_session (A-n) snapshots the CHOSEN host param
+        // (the host-picker choice, defaulting to active_host) — NOT
+        // self.active_host directly.
         assert!(
-            src.contains("12e-r2 F1: snapshot active_host ONCE at the top"),
-            "create_local_session must snapshot active_host for a new workspace",
+            src.contains("passed in as `chosen_host`")
+                && src.contains("Snapshot it ONCE here"),
+            "create_local_session must snapshot the chosen host param once \
+             for a new workspace",
         );
         // spawn_session_on_workspace (A-s) resolves the spawn host from the
         // WORKSPACE (its worktree's host), NOT the global active_host — host is
