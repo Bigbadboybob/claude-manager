@@ -8731,23 +8731,36 @@ impl App {
                     _ => {}
                 }
             }
-            // Plain PageUp/PageDown also scroll (Shift not required).
-            match key.code {
-                KeyCode::PageUp if key.modifiers.is_empty() => {
-                    if let Some((_, ts)) = self.active_session() {
-                        use alacritty_terminal::grid::Scroll;
-                        ts.session.term.lock().scroll_display(Scroll::PageUp);
+            // Plain PageUp/PageDown also scroll our scrollback (Shift not
+            // required) — but only in the primary screen. In the alternate
+            // screen there's no scrollback to move, and fullscreen apps (Claude
+            // Code's renderer, vim, less) expect these keys themselves, so we let
+            // them fall through to the PTY instead of swallowing them into a
+            // no-op. Shift+PageUp/PageDown above stay the dedicated scrollback
+            // binding regardless, matching the usual terminal convention.
+            let in_alt_screen = self
+                .active_session()
+                .is_some_and(|(_, ts)| {
+                    ts.session.term.lock().mode().contains(TermMode::ALT_SCREEN)
+                });
+            if !in_alt_screen {
+                match key.code {
+                    KeyCode::PageUp if key.modifiers.is_empty() => {
+                        if let Some((_, ts)) = self.active_session() {
+                            use alacritty_terminal::grid::Scroll;
+                            ts.session.term.lock().scroll_display(Scroll::PageUp);
+                        }
+                        return true;
                     }
-                    return true;
-                }
-                KeyCode::PageDown if key.modifiers.is_empty() => {
-                    if let Some((_, ts)) = self.active_session() {
-                        use alacritty_terminal::grid::Scroll;
-                        ts.session.term.lock().scroll_display(Scroll::PageDown);
+                    KeyCode::PageDown if key.modifiers.is_empty() => {
+                        if let Some((_, ts)) = self.active_session() {
+                            use alacritty_terminal::grid::Scroll;
+                            ts.session.term.lock().scroll_display(Scroll::PageDown);
+                        }
+                        return true;
                     }
-                    return true;
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -8849,6 +8862,25 @@ impl App {
         let viewport_row = (me.row - 1) as usize;
 
         let Some(ts) = self.active_session_mut() else { return false; };
+
+        // If the inner app has enabled mouse tracking (e.g. Claude Code's
+        // fullscreen renderer, or vim/less in the alternate screen), the mouse
+        // belongs to the app: consume the event and forward it to the PTY instead
+        // of driving our own scrollback/selection. The app manages its own scroll
+        // region; in the alternate screen there is no scrollback for
+        // `scroll_display` to move anyway, so handling the wheel locally just
+        // makes it appear dead. Exited sessions always fall through to local
+        // scrollback so leftover transcripts stay scrollable.
+        let term_mode = *ts.session.term.lock().mode();
+        if !ts.session.exited && term_mode.intersects(TermMode::MOUSE_MODE) {
+            if let Some(bytes) =
+                encode_mouse_for_pty(me, term_mode, grid_col, viewport_row)
+            {
+                let _ = ts.session.write(&bytes);
+                ts.last_write_at = Some(Instant::now());
+            }
+            return true;
+        }
 
         use alacritty_terminal::grid::Scroll;
         use alacritty_terminal::index::{Column, Point as GridPoint, Side};
@@ -14236,6 +14268,39 @@ fn enter_bytes_for_mode(mode: TermMode) -> &'static [u8] {
     }
 }
 
+/// Encode a terminal-pane mouse event into the SGR mouse report bytes the inner
+/// app expects, translating screen coordinates into 0-based PTY cell coordinates
+/// (`grid_col`/`viewport_row`); the SGR encoder re-adds the 1-based offset.
+///
+/// Callers gate on `TermMode::MOUSE_MODE` before invoking — once an app is
+/// tracking the mouse, the event is consumed regardless. This only decides
+/// *whether bytes are produced*: motion the app didn't ask for (a `Moved`
+/// without any-motion tracking, a `Drag` without button/any-motion tracking)
+/// returns `None` so we swallow it silently instead of flooding the PTY.
+fn encode_mouse_for_pty(
+    me: &crossterm::event::MouseEvent,
+    term_mode: TermMode,
+    grid_col: usize,
+    viewport_row: usize,
+) -> Option<Vec<u8>> {
+    let wanted = match me.kind {
+        MouseEventKind::Moved => term_mode.contains(TermMode::MOUSE_MOTION),
+        MouseEventKind::Drag(_) => {
+            term_mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
+        }
+        _ => true,
+    };
+    if !wanted {
+        return None;
+    }
+    let translated = crossterm::event::MouseEvent {
+        column: grid_col as u16,
+        row: viewport_row as u16,
+        ..*me
+    };
+    input::event_to_bytes(&CrosstermEvent::Mouse(translated), &term_mode)
+}
+
 /// Decide the actual byte sequence to write for a workflow delivery body,
 /// given the inner program's current terminal mode.
 ///
@@ -15575,6 +15640,104 @@ mod body_delivery_tests {
         let out = format_body_for_delivery(body, mode);
         let expected = format!("\x1b[200~{}\x1b[201~", body);
         assert_eq!(out, expected.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod mouse_forwarding_tests {
+    //! When the inner app enables mouse tracking (e.g. Claude Code's fullscreen
+    //! renderer enters the alternate screen and turns on `?1000`/`?1002` +
+    //! `?1006`), the TUI must forward mouse reports to the PTY rather than
+    //! consuming the wheel for its own — empty, in the alt screen — scrollback.
+    //! These pin the encoding + the per-kind forwarding decision in
+    //! `encode_mouse_for_pty`.
+    use super::*;
+    use crossterm::event::{
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn ev(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent { kind, column: 7, row: 3, modifiers: KeyModifiers::empty() }
+    }
+
+    #[test]
+    fn scroll_up_forwards_sgr_with_translated_coords() {
+        // grid_col/viewport_row are 0-based PTY cells; the SGR encoder re-adds
+        // the 1-based offset, so cell (5, 9) reports as column 6, row 10.
+        // Wheel-up is SGR button 64.
+        let bytes =
+            encode_mouse_for_pty(&ev(MouseEventKind::ScrollUp), TermMode::MOUSE_MODE, 5, 9)
+                .expect("wheel-up should forward in mouse mode");
+        assert_eq!(bytes, b"\x1b[<64;6;10M");
+    }
+
+    #[test]
+    fn scroll_down_forwards_sgr() {
+        // Wheel-down is SGR button 65.
+        let bytes =
+            encode_mouse_for_pty(&ev(MouseEventKind::ScrollDown), TermMode::MOUSE_MODE, 0, 0)
+                .expect("wheel-down should forward in mouse mode");
+        assert_eq!(bytes, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn left_click_press_and_release_forward() {
+        let down = encode_mouse_for_pty(
+            &ev(MouseEventKind::Down(MouseButton::Left)),
+            TermMode::MOUSE_REPORT_CLICK,
+            5,
+            9,
+        )
+        .expect("press should forward");
+        assert_eq!(down, b"\x1b[<0;6;10M");
+        // Release uses the SGR `m` terminator.
+        let up = encode_mouse_for_pty(
+            &ev(MouseEventKind::Up(MouseButton::Left)),
+            TermMode::MOUSE_REPORT_CLICK,
+            5,
+            9,
+        )
+        .expect("release should forward");
+        assert_eq!(up, b"\x1b[<0;6;10m");
+    }
+
+    #[test]
+    fn drag_suppressed_when_only_click_tracking() {
+        // ?1000 reports button press/release but not motion. A drag must not be
+        // forwarded — returning None lets the caller swallow it.
+        let out = encode_mouse_for_pty(
+            &ev(MouseEventKind::Drag(MouseButton::Left)),
+            TermMode::MOUSE_REPORT_CLICK,
+            5,
+            9,
+        );
+        assert!(out.is_none(), "drag should be suppressed without motion tracking");
+    }
+
+    #[test]
+    fn drag_forwarded_when_button_motion_tracking() {
+        // ?1002 (MOUSE_DRAG) reports motion while a button is held.
+        let out = encode_mouse_for_pty(
+            &ev(MouseEventKind::Drag(MouseButton::Left)),
+            TermMode::MOUSE_DRAG,
+            5,
+            9,
+        );
+        assert!(out.is_some(), "drag should forward under button-motion tracking");
+    }
+
+    #[test]
+    fn bare_motion_only_when_any_motion_tracking() {
+        assert!(
+            encode_mouse_for_pty(&ev(MouseEventKind::Moved), TermMode::MOUSE_DRAG, 5, 9)
+                .is_none(),
+            "bare motion needs ?1003, not just ?1002"
+        );
+        assert!(
+            encode_mouse_for_pty(&ev(MouseEventKind::Moved), TermMode::MOUSE_MOTION, 5, 9)
+                .is_some(),
+            "bare motion forwards under any-motion tracking"
+        );
     }
 }
 
