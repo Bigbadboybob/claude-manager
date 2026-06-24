@@ -3230,6 +3230,20 @@ pub(crate) fn handle_confirm(
     }
 }
 
+/// Phase 4 startup-freeze fix: a remote manifest entry whose host uses a
+/// transport whose dial can BLOCK (`ssh-unix` tunnel spawn ~3s / `tcp-tls`
+/// connect), deferred out of `restore_sessions`' synchronous loop so the
+/// first frame paints immediately. The raw entry is held here as the retry
+/// worklist; an identical copy is preserved in `skipped_manifest_entries`
+/// so a save during the deferral window round-trips it (no data loss). The
+/// per-host `manifest.watch` consumer (its own thread) warms the tunnel and
+/// `drain_deferred_remote_reattach` reattaches once it's connectable.
+#[derive(Clone)]
+struct PendingRemoteReattach {
+    ws_id: String,
+    entry: cm_daemon::manifest::ManifestEntry,
+}
+
 pub struct App {
     pub tasks: Vec<TaskEntry>,
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
@@ -3433,6 +3447,15 @@ pub struct App {
     /// again. Until then, they ride along on disk untouched.
     pub skipped_manifest_entries:
         HashMap<String, Vec<cm_daemon::manifest::ManifestEntry>>,
+    /// Phase 4 startup-freeze fix: remote manifest entries whose host uses a
+    /// blocking transport (`ssh-unix`/`tcp-tls`), deferred out of
+    /// `restore_sessions`' synchronous loop so a configured-but-slow remote
+    /// no longer freezes the first frame for ~1-3s per host. The per-host
+    /// `manifest.watch` consumer warms the tunnel off the main thread;
+    /// `drain_deferred_remote_reattach` (per tick) reattaches each entry once
+    /// its tunnel is connectable. Until then the raw entry also rides in
+    /// `skipped_manifest_entries` so a save during the window round-trips it.
+    pending_remote_reattach: Vec<PendingRemoteReattach>,
     /// Background fanout worker for daemon RPC pushes. Main
     /// thread builds owned snapshots and fires them at this
     /// worker; the worker coalesces bursts and does the per-host
@@ -3731,6 +3754,7 @@ impl App {
             host_pool,
             active_host,
             skipped_manifest_entries: HashMap::new(),
+            pending_remote_reattach: Vec::new(),
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
@@ -4591,6 +4615,35 @@ impl App {
                     // regression. Local entries fall through to the
                     // unchanged spawn/attach path below.
                     if entry.host_id != cm_daemon::host_id::HostId::local() {
+                        // Phase 4 startup-freeze fix: a host whose dial can
+                        // BLOCK (an `ssh-unix` tunnel spawn waits up to ~3s for
+                        // the local socket to bind; `tcp-tls` opens a fresh
+                        // connect) must NOT be dialed on the MAIN thread here —
+                        // `restore_sessions` runs before the first frame paints,
+                        // so a `for_host(remote)` here froze the UI for ~1-3s
+                        // per configured remote. DEFER instead: preserve the RAW
+                        // entry in `skipped_manifest_entries` (round-trips on
+                        // save — the 12e-r7 F1 data-loss protection is retained)
+                        // AND queue it in `pending_remote_reattach`. The per-host
+                        // `manifest.watch` consumer (already on its own thread
+                        // with reconnect) warms the tunnel; the main loop's
+                        // `drain_deferred_remote_reattach` reattaches the session
+                        // once the tunnel is connectable. Unix-transport remote
+                        // hosts (whose `ensure_alive` is a no-op) and unknown
+                        // hosts (`for_host` errors instantly) fall through to the
+                        // synchronous reattach/preserve path below — their dial
+                        // can't block, so local behavior there is unchanged.
+                        if self.host_pool.dial_may_block(&entry.host_id) {
+                            self.skipped_manifest_entries
+                                .entry(ws.id.clone())
+                                .or_default()
+                                .push(entry.clone());
+                            self.pending_remote_reattach.push(PendingRemoteReattach {
+                                ws_id: ws.id.clone(),
+                                entry: entry.clone(),
+                            });
+                            continue;
+                        }
                         // Already-known-offline host this pass → preserve the
                         // RAW entry WITHOUT re-dialing (bounds an offline host
                         // to one ~3s reachability dial, not one per session).
@@ -5372,6 +5425,128 @@ impl App {
             preserved_last_exit: entry.last_exit.clone(),
             host_id: entry.host_id.clone(),
         })
+    }
+
+    /// Phase 4 startup-freeze fix: reattach remote sessions that
+    /// `restore_sessions` deferred (their host's dial can block, so it was
+    /// kept off the main thread). Called per tick from the main loop; a cheap
+    /// no-op once the queue drains.
+    ///
+    /// For each queued entry we probe the host's tunnel WITHOUT spawning it
+    /// (`HostPool::live_socket_path` — no `ensure_alive`); only once it's
+    /// already connectable — the per-host `manifest.watch` consumer warmed it
+    /// on its own thread — do we reattach, so the main thread never pays the
+    /// ~3s tunnel-spawn wait. On a successful reattach the session moves from
+    /// `skipped_manifest_entries` into its workspace and we persist the move.
+    /// A session-gone failure drops the entry from the retry queue but LEAVES
+    /// it preserved in `skipped_manifest_entries` (parity with the synchronous
+    /// path's session-gone posture: no retry, no data loss). An entry whose
+    /// tunnel never comes up simply stays queued (and preserved) — cheap to
+    /// re-probe and never lost.
+    pub fn drain_deferred_remote_reattach(&mut self) {
+        if self.pending_remote_reattach.is_empty() {
+            return;
+        }
+        let (cols, rows) = self.last_term_size;
+        // Parity with the synchronous restore path: clear stale workflow tags
+        // before reattach so a Detached/Done run isn't pushed to the remote
+        // daemon. Recomputed here (vs. threaded from restore) so it reflects
+        // the run set at reattach time.
+        let active_run_ids: std::collections::HashSet<String> = self
+            .workflow_runs
+            .iter()
+            .map(|r| r.run_id.clone())
+            .collect();
+        let pending = std::mem::take(&mut self.pending_remote_reattach);
+        let mut still_pending: Vec<PendingRemoteReattach> = Vec::new();
+        let mut reattached_any = false;
+        for p in pending {
+            // Non-blocking liveness probe. `live_socket_path` never calls
+            // `ensure_alive`, so the MAIN thread can't trigger a tunnel spawn;
+            // it returns `Some` only after the consumer thread brought the
+            // tunnel up. Keep the entry queued until then.
+            if self.host_pool.live_socket_path(&p.entry.host_id).is_none() {
+                still_pending.push(p);
+                continue;
+            }
+            let Some(ws_idx) =
+                self.workspaces.iter().position(|w| w.id == p.ws_id)
+            else {
+                // Workspace not present (yet); keep retrying.
+                still_pending.push(p);
+                continue;
+            };
+            // The pending window can outlive a user CLOSING this workspace
+            // (and is effectively unbounded while the remote host is down), so
+            // the workspace may now be closed even though restore only queued
+            // OPEN workspaces. Never resurrect a live session into a workspace
+            // the user explicitly closed: drop the retry but LEAVE the raw
+            // entry in `skipped_manifest_entries` — closed workspaces ride
+            // their entries on disk (the save path serializes the closed
+            // workspace's skipped entries), so this is no data loss.
+            if self.workspaces[ws_idx].is_closed {
+                continue;
+            }
+            // Idempotent: another path (e.g. the manifest.watch adoption) may
+            // have already surfaced this uid. Don't double-add; just retire the
+            // preserved copy.
+            if self.workspaces[ws_idx]
+                .sessions
+                .iter()
+                .any(|s| s.uid == p.entry.uid)
+            {
+                self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
+                continue;
+            }
+            let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
+            let entry_for_attach = cleaned.as_ref().unwrap_or(&p.entry);
+            // The tunnel is warm (gated above), so `for_host` inside the helper
+            // resolves the socket without a spawn wait. Two simultaneous
+            // immutable borrows of `self` (the helper + the `&Workspace` arg)
+            // are fine; the owned `Option<TerminalSession>` outlives them.
+            let outcome = {
+                let ws_ref = &self.workspaces[ws_idx];
+                self.try_reattach_remote_session(entry_for_attach, ws_ref, (cols, rows))
+            };
+            match outcome {
+                Some(ts) => {
+                    self.workspaces[ws_idx].sessions.push(ts);
+                    self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
+                    reattached_any = true;
+                }
+                None => {
+                    eprintln!(
+                        "cm-tui: deferred remote reattach of session {} ({}) \
+                         on host {} failed (session gone; entry preserved for \
+                         next save)",
+                        p.entry.uid,
+                        p.entry.label,
+                        p.entry.host_id.as_str(),
+                    );
+                }
+            }
+        }
+        self.pending_remote_reattach = still_pending;
+        if reattached_any {
+            self.needs_redraw = true;
+            // Persist the skipped → live move so a restart before the next
+            // natural save doesn't re-defer a session that's now attached.
+            self.save_session_manifest();
+        }
+    }
+
+    /// Drop the preserved copy of a manifest entry (matched by uid) from
+    /// `skipped_manifest_entries[ws_id]`, removing the workspace bucket if it
+    /// empties. Used by `drain_deferred_remote_reattach` once an entry is
+    /// reattached into live state, so the save path doesn't double-write it
+    /// (once from `ws.sessions`, once from the skipped list).
+    fn remove_skipped_entry(&mut self, ws_id: &str, uid: &str) {
+        if let Some(v) = self.skipped_manifest_entries.get_mut(ws_id) {
+            v.retain(|e| e.uid != uid);
+            if v.is_empty() {
+                self.skipped_manifest_entries.remove(ws_id);
+            }
+        }
     }
 
     /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
@@ -18436,6 +18611,409 @@ mod pending_workflow_events_tests {
         }
     }
 
+    /// Phase 4 startup-freeze fix (named acceptance): `restore_sessions` must
+    /// NOT perform a blocking remote dial on the main thread for a remote
+    /// entry whose host uses a tunnel transport (`ssh-unix`). Such a dial
+    /// spawns `ssh -N -L ...` and BLOCKS up to ~3s for the local socket to
+    /// bind — running it before the first frame paints was the startup
+    /// freeze. Instead the entry is DEFERRED: queued in
+    /// `pending_remote_reattach` for the main loop to reattach once the
+    /// tunnel is warm, and preserved verbatim in `skipped_manifest_entries`
+    /// so a save during the window round-trips it.
+    ///
+    /// Determinism / no real ssh: the `ssh-unix` "manager" pool is INJECTED
+    /// after `App::new` (which spawned its `manifest.watch` consumers for the
+    /// synthesized local-only config only), so nothing warms the manager
+    /// tunnel during the test. The proof that no synchronous main-thread dial
+    /// happened is `has_live_tunnel_for_test() == false` right after
+    /// `restore_sessions` — `restore_sessions` never called `for_host` on the
+    /// manager handle, so no `SshTunnel` was spawned.
+    #[test]
+    fn restore_defers_blocking_remote_host_no_synchronous_dial() {
+        use cm_daemon::manifest::{Manifest, ManifestEntry, ManifestWorkspace};
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+
+        let entry = ManifestEntry {
+            uid: "uid-ssh".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "claude".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: cm_daemon::host_id::HostId::new("manager"),
+        };
+        let mw = ManifestWorkspace {
+            id: "ws-ssh".into(),
+            name: "ssh".into(),
+            is_closed: false,
+            is_cloud: false,
+            worktree_path: Some(home.join("wt")),
+            main_repo_path: None,
+            repo_url: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![entry.clone()],
+            tombstones: Vec::new(),
+        };
+        let mut workspaces = HashMap::new();
+        workspaces.insert("ws-ssh".to_string(), mw);
+        let manifest = Manifest {
+            workspaces,
+            bindings: HashMap::new(),
+            view: None,
+        };
+        std::fs::write(
+            cm_dir.join("tui-sessions.json"),
+            serde_json::to_string(&manifest).expect("ser"),
+        )
+        .expect("write manifest");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Inject a 2-host pool where "manager" is a tunnel transport
+        // (`ssh-unix`) — exactly the case whose `for_host` blocks ~3s. The
+        // bogus ssh_host is never dialed because restore defers it; building
+        // the handle does NOT spawn ssh.
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: local_sock.clone(),
+                    },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::SshUnix {
+                        ssh_host: "cm-test-nonexistent-host".into(),
+                        ssh_user: None,
+                        remote_socket: PathBuf::from("/remote/daemon.sock"),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.sessions_restored = true;
+        app.restore_sessions();
+
+        // DEFERRED, not synchronously reattached: the entry sits in the retry
+        // queue tagged with its remote host.
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "the ssh-unix remote entry must be queued for deferred reattach",
+        );
+        assert_eq!(app.pending_remote_reattach[0].entry.uid, "uid-ssh");
+        assert_eq!(
+            app.pending_remote_reattach[0].entry.host_id,
+            cm_daemon::host_id::HostId::new("manager"),
+        );
+
+        // PRESERVED on disk (no data loss during the deferral window).
+        let skipped = app
+            .skipped_manifest_entries
+            .get("ws-ssh")
+            .expect("ws-ssh has a preserved skipped entry");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].uid, "uid-ssh");
+
+        // NOT reattached into the live workspace yet (tunnel never warmed).
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-ssh").expect("ws-ssh");
+        assert!(
+            ws.sessions.is_empty(),
+            "a deferred remote entry must not be synchronously reattached",
+        );
+
+        // THE no-synchronous-dial proof: restore_sessions never called
+        // `for_host` on the manager handle, so no SSH tunnel was spawned on
+        // the main thread (a real dial would have blocked ~3s and left a live
+        // tunnel here).
+        let manager = app
+            .host_pool
+            .get_handle_for_test(&cm_daemon::host_id::HostId::new("manager"))
+            .expect("manager handle");
+        assert!(
+            !manager.has_live_tunnel_for_test(),
+            "restore_sessions must NOT spawn the ssh tunnel on the main \
+             thread — the dial is deferred to the manifest.watch consumer / \
+             main-loop reattach",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Phase 4 startup-freeze fix (#2 guard): the deferred-reattach window can
+    /// outlive a user CLOSING the workspace (it's effectively unbounded while
+    /// the remote host is down), so `drain_deferred_remote_reattach` must NOT
+    /// resurrect a live session into a workspace the user closed. With a LIVE
+    /// in-process daemon at the manager socket the reattach WOULD succeed
+    /// absent the guard — so an empty `ws.sessions` after the drain proves the
+    /// `is_closed` guard fired. The raw entry stays preserved in
+    /// `skipped_manifest_entries` (closed workspaces ride their entries on
+    /// disk), and the retry is dropped from the queue.
+    #[test]
+    fn drain_deferred_remote_reattach_skips_closed_workspace() {
+        use cm_daemon::manifest::ManifestEntry;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let mgr_sock = cm_dir.join("manager.sock");
+
+        // In-process daemon at the MANAGER socket holding workspace ws-c.
+        let mut state_inner = cm_daemon::state::DaemonState::new();
+        state_inner.attach_addr = mgr_sock.to_string_lossy().into_owned();
+        state_inner.workspaces.insert(
+            "ws-c".into(),
+            cm_daemon::manifest::ManifestWorkspace {
+                id: "ws-c".into(),
+                name: "c".into(),
+                is_closed: false,
+                is_cloud: false,
+                worktree_path: Some(wt.clone()),
+                main_repo_path: None,
+                repo_url: None,
+                worker_vm: None,
+                worker_zone: None,
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        );
+        let state = Arc::new(std::sync::Mutex::new(state_inner));
+        let listener = UnixListener::bind(&mgr_sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dstate = state.clone();
+        let dstop = stop.clone();
+        let dhandle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let st = dstate.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(
+                                std::time::Duration::from_secs(2),
+                            ));
+                            let _ = stream.set_write_timeout(Some(
+                                std::time::Duration::from_secs(2),
+                            ));
+                            let req = match cm_daemon::control::wire::read_request(&mut stream) {
+                                Ok(Some(r)) => r,
+                                _ => return,
+                            };
+                            use cm_daemon::control::dispatch::DispatchOutcome::*;
+                            match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Done(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
+                                }
+                                AttachStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_attach_stream(&mut stream, st, handle);
+                                    }
+                                }
+                                ManifestWatchStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_manifest_watch_stream(&mut stream, handle);
+                                    }
+                                }
+                                EventsSubscribeStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(&mut stream, &response).is_ok() {
+                                        cm_daemon::control::stream::handle_events_subscribe_stream(&mut stream, handle);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // A genuinely live session on the manager daemon — the reattach target.
+        let uid = new_session_uid();
+        let argv = vec!["/bin/bash".to_string()];
+        let cfg = crate::client_session::ClientSessionConfig {
+            daemon_socket: &mgr_sock,
+            operator_token_id: crate::daemon_launch::operator_token(),
+            uid: &uid,
+            workspace_id: "ws-c",
+            label: "claude-code",
+            session_type: "claude-code",
+            argv: &argv,
+            working_dir: &wt,
+            env: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            memory_cap_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            cgroup_path: None,
+            worktree_path: Some(&wt),
+            task_id: None,
+            transcript_path: None,
+            workflow_run_id: None,
+            workflow_role: None,
+        };
+        crate::client_session::rpc_start_session_full(&cfg)
+            .expect("manager daemon spawns the live session");
+
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Manager is a Unix-direct host → `live_socket_path` reports it live
+        // immediately, so the drain proceeds to the workspace/`is_closed`
+        // check (the bit under test) rather than parking on the probe.
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: local_sock.clone(),
+                    },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::new("manager"),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: mgr_sock.clone(),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool =
+            std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).expect("pool"));
+        app.sessions_restored = true;
+
+        // Simulate the close-during-pending-window: a now-CLOSED workspace
+        // plus a queued reattach (with its preserved-on-disk copy) for the
+        // live session.
+        app.workspaces.push(Workspace {
+            id: "ws-c".into(),
+            name: "c".into(),
+            is_closed: true,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(wt.clone()),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: Vec::new(),
+            tombstones: Vec::new(),
+            is_pushing: false,
+        });
+        let entry = ManifestEntry {
+            uid: uid.clone(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "claude".into(),
+            session_type: "claude".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: cm_daemon::host_id::HostId::new("manager"),
+        };
+        app.skipped_manifest_entries
+            .insert("ws-c".into(), vec![entry.clone()]);
+        app.pending_remote_reattach.push(PendingRemoteReattach {
+            ws_id: "ws-c".into(),
+            entry: entry.clone(),
+        });
+
+        app.drain_deferred_remote_reattach();
+
+        // The session is NOT resurrected into the closed workspace — even
+        // though the live daemon would have attached successfully.
+        let ws = app.workspaces.iter().find(|w| w.id == "ws-c").expect("ws-c");
+        assert!(
+            ws.sessions.is_empty(),
+            "drain must not reattach a session into a CLOSED workspace",
+        );
+        // Retry dropped from the queue...
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "closed-workspace entry must be dropped from the retry queue",
+        );
+        // ...but the raw entry stays preserved on disk (no data loss).
+        assert_eq!(
+            app.skipped_manifest_entries
+                .get("ws-c")
+                .map(|v| v.len()),
+            Some(1),
+            "the entry must remain preserved in skipped_manifest_entries",
+        );
+
+        // Cleanup.
+        let _ = crate::client_session::rpc_kill_session(
+            &mgr_sock,
+            crate::daemon_launch::operator_token(),
+            &uid,
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
     /// Phase 5 (remote-session-execution): `A-f` (launch_workflow_via_daemon)
     /// routes `start_workflow` to the WORKSPACE's host socket — a remote-hosted
     /// workspace → the remote daemon (with the remote worktree), a local
@@ -23347,6 +23925,30 @@ mod slice_12e_tests {
             "restore_sessions must preserve a non-reattachable remote entry \
              in skipped_manifest_entries (no data-loss regression); body:\n{}",
             body,
+        );
+
+        // Phase 4 startup-freeze fix — local-path-unchanged structural pin:
+        // the deferral that moves blocking remote dials off the main thread is
+        // gated on `self.host_pool.dial_may_block(...)` and lives INSIDE the
+        // non-local remote branch (after `remote_branch_idx`, before the local
+        // `spawn_restored_session`). So a LOCAL entry — which never enters the
+        // remote branch — can never be deferred or queued: the local restore
+        // path is byte-for-byte unchanged.
+        let defer_idx = body
+            .find("self.host_pool.dial_may_block(&entry.host_id)")
+            .expect(
+                "restore_sessions must gate the off-main-thread deferral on \
+                 host_pool.dial_may_block",
+            );
+        assert!(
+            remote_branch_idx < defer_idx && defer_idx < spawn_idx,
+            "the dial_may_block deferral must sit inside the non-local remote \
+             branch (so local entries never reach it)",
+        );
+        assert!(
+            body.contains("self.pending_remote_reattach.push("),
+            "the deferral must queue the entry in pending_remote_reattach for \
+             the background-warmed reattach",
         );
     }
 

@@ -431,6 +431,59 @@ impl ConnectionHandle {
         }
     }
 
+    /// Phase 4 startup-freeze fix: like [`socket_path`] but NON-BLOCKING.
+    /// Uses `try_lock` instead of `lock`, so a caller on the MAIN/UI thread
+    /// never blocks behind whoever currently holds `state`.
+    ///
+    /// This matters because [`ensure_alive`] holds `state` across the entire
+    /// `SshTunnel::spawn` socket-bind wait (~1-3s), and the per-host
+    /// `manifest.watch` consumer thread calls `ensure_alive` (via `for_host`)
+    /// immediately at startup. A plain `socket_path().lock()` from the
+    /// main-thread deferred-reattach probe would queue behind that spawn and
+    /// reintroduce the exact startup freeze — just relocated. With `try_lock`,
+    /// contention (someone is mid-spawn) returns `None`; the caller leaves the
+    /// entry queued and re-probes on the next tick, by which point the spawn
+    /// has finished and the lock is free.
+    ///
+    /// `socket_path` itself keeps its blocking semantics — the consumer
+    /// thread (via `path_provider_for_host`) is fine to block there.
+    pub fn socket_path_nonblocking(&self) -> Option<PathBuf> {
+        use std::sync::TryLockError;
+        let mut state = match self.state.try_lock() {
+            Ok(g) => g,
+            // Poisoned-but-uncontended: recover the guard (same posture as
+            // `socket_path`'s `unwrap_or_else(into_inner)`).
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            // Held by another thread (mid-spawn) → don't block; report
+            // "not ready yet" and let the caller retry next tick.
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        match &mut *state {
+            HandleState::UnixDirect { socket_path } => Some(socket_path.clone()),
+            HandleState::SshUnix { tunnel, .. } => {
+                let t = tunnel.as_mut()?;
+                // A stored tunnel whose child has ALREADY exited is NOT ready.
+                // Returning its (now stale) path would make the deferred-
+                // reattach drain treat the tunnel as live and call `for_host`
+                // → `ensure_alive`, whose own `try_wait` would detect the dead
+                // child and respawn `SshTunnel::spawn` SYNCHRONOUSLY on the
+                // main thread (~1-3s) — the very block this probe exists to
+                // avoid. Report not-ready instead (mirrors the not-yet-spawned
+                // case); the per-host `manifest.watch` consumer re-warms the
+                // tunnel OFF-thread on its own reconnect loop. We don't clear
+                // the slot here — that's `ensure_alive`'s job under the
+                // blocking lock; we just decline. `matches!(.., Ok(Some(_)))`
+                // mirrors `ensure_alive`'s exact dead-child predicate (an
+                // `Err`/can't-tell leaves the path returned, same as today).
+                if matches!(t.child.try_wait(), Ok(Some(_))) {
+                    return None;
+                }
+                Some(t.local_socket.clone())
+            }
+            HandleState::TcpTls { .. } => None,
+        }
+    }
+
     /// Probe the tunnel's liveness; spawn fresh if it's missing
     /// or exited. Called from `for_host` / `default_handle`.
     /// Returns the most recent spawn outcome — `Ok` once a
@@ -1018,6 +1071,47 @@ impl HostPool {
             Some(ReachabilityState::Dead { next_retry, .. })
                 if now < *next_retry,
         )
+    }
+
+    /// Phase 4 startup-freeze fix: true if dialing `host_id` via
+    /// [`HostPool::for_host`] could BLOCK the caller for a noticeable
+    /// time. An `ssh-unix` entry's [`SshTunnel::spawn`] waits up to
+    /// [`SPAWN_SOCKET_WAIT`] (~3s) for the local socket to bind, and a
+    /// `tcp-tls` dial opens a fresh TCP connect + handshake.
+    /// `App::restore_sessions` consults this to DEFER such reattaches off
+    /// the main thread so the first frame paints immediately — the per-host
+    /// `manifest.watch` consumer (its own thread) warms the tunnel and the
+    /// main loop reattaches once it's connectable.
+    ///
+    /// False for local-Unix (and any other Unix-direct) hosts — their
+    /// `ensure_alive` is a no-op, so a restore reattach over them is cheap
+    /// and stays synchronous — and false for unknown hosts (not in the pool;
+    /// `for_host` errors instantly without a dial). Reuses the
+    /// `tracked_hosts` membership, which is exactly the set of non-Unix
+    /// transports, computed once at construction.
+    pub fn dial_may_block(&self, host_id: &HostId) -> bool {
+        self.tracked_hosts.contains(host_id)
+    }
+
+    /// Phase 4 startup-freeze fix: the live socket path for `host_id`
+    /// WITHOUT triggering a tunnel spawn (no `ensure_alive`) AND without
+    /// blocking on the handle's `state` lock. Returns `Some` only when the
+    /// tunnel is ALREADY up — an `ssh-unix` handle whose [`SshTunnel`] some
+    /// other caller (typically the per-host `manifest.watch` consumer thread)
+    /// already spawned, or a Unix-direct handle (always bound). `TcpTls`
+    /// handles have no socket file and return `None`.
+    ///
+    /// Critically this uses [`ConnectionHandle::socket_path_nonblocking`]
+    /// (`try_lock`), so the main-thread deferred-reattach drain returns
+    /// instantly even while the consumer thread holds `state` across a ~1-3s
+    /// `SshTunnel::spawn` — a blocking `lock()` here would re-create the very
+    /// startup freeze this code removes. Lock contention surfaces as `None`
+    /// (not-ready-yet); the drain re-probes next tick once the spawn frees
+    /// the lock.
+    pub fn live_socket_path(&self, host_id: &HostId) -> Option<PathBuf> {
+        self.entries
+            .get(host_id)
+            .and_then(|h| h.socket_path_nonblocking())
     }
 
     /// 12e-perf: record a successful push. Clears any Dead state
@@ -2805,5 +2899,197 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
             "post-recovery failure must NOT carry over the prior \
              doubled backoff",
         );
+    }
+
+    /// Phase 4 startup-freeze fix (REQUIRED): the main-thread liveness probe
+    /// `HostPool::live_socket_path` must NOT block when the handle's `state`
+    /// lock is held by another thread — which is exactly what happens at
+    /// startup, because the per-host `manifest.watch` consumer thread holds
+    /// `state` across the ~1-3s `SshTunnel::spawn` inside `ensure_alive`. A
+    /// blocking `lock()` here would relocate (not remove) the startup freeze.
+    ///
+    /// We simulate the contending consumer by holding the manager handle's
+    /// `state` lock on a separate thread, then assert the probe returns
+    /// essentially instantly (well under the hold duration). The test module
+    /// is a child of `host_pool`, so it can take `handle.state.lock()`
+    /// directly — the same lock `ensure_alive` would hold mid-spawn.
+    #[test]
+    fn live_socket_path_does_not_block_under_state_lock_contention() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let cfg = HostsConfig {
+            hosts: vec![
+                HostConfig {
+                    id: HostId::local(),
+                    transport: HostTransport::Unix {
+                        socket: PathBuf::from("/tmp/local-probe.sock"),
+                    },
+                    default: true,
+                },
+                HostConfig {
+                    id: HostId::new("manager"),
+                    transport: HostTransport::SshUnix {
+                        ssh_host: "cm-test-nonexistent".into(),
+                        ssh_user: None,
+                        remote_socket: PathBuf::from("/remote/daemon.sock"),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        let pool = Arc::new(HostPool::from_config(&cfg).expect("pool"));
+        // HOME no longer needed (pool/handles built); restore early.
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let manager = HostId::new("manager");
+        // Hold the manager handle's `state` lock on another thread for a
+        // window long enough that a blocking probe would clearly exceed our
+        // assertion threshold. This stands in for the consumer thread parked
+        // inside `SshTunnel::spawn` with the lock held.
+        const HOLD: Duration = Duration::from_millis(500);
+        let pool2 = Arc::clone(&pool);
+        let manager2 = manager.clone();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let handle = pool2
+                .get_handle_for_test(&manager2)
+                .expect("manager handle");
+            let _g = handle.state.lock().unwrap_or_else(|p| p.into_inner());
+            acquired_tx.send(()).expect("signal lock acquired");
+            thread::sleep(HOLD);
+        });
+        // Wait until the holder definitely owns the lock.
+        acquired_rx.recv().expect("holder acquired the lock");
+
+        let start = Instant::now();
+        let result = pool.live_socket_path(&manager);
+        let elapsed = start.elapsed();
+
+        // Contention → `None` (not-ready-yet), and crucially it returns
+        // WITHOUT waiting out the lock hold. A regression to a blocking
+        // `lock()` would make this ~`HOLD` (500ms).
+        assert!(
+            result.is_none(),
+            "a contended probe must report not-ready (None), got {:?}",
+            result,
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "live_socket_path must not block on the held state lock; took \
+             {:?} (a blocking lock() would be ~{:?})",
+            elapsed,
+            HOLD,
+        );
+
+        holder.join().expect("holder thread");
+
+        // Sanity: once the lock is free, the probe still works (no panic /
+        // poison fallout) and reports the ssh-unix handle as not-yet-spawned.
+        assert_eq!(
+            pool.live_socket_path(&manager),
+            None,
+            "uncontended ssh-unix probe is None until a tunnel is spawned",
+        );
+        // And a Unix-direct host is always reported live (no spawn needed).
+        assert_eq!(
+            pool.live_socket_path(&HostId::local()),
+            Some(PathBuf::from("/tmp/local-probe.sock")),
+        );
+    }
+
+    /// Phase 4 startup-freeze fix (dead-child guard): a stored `SshUnix`
+    /// tunnel whose child has already EXITED must probe as not-ready via
+    /// `socket_path_nonblocking` / `live_socket_path`. Otherwise the
+    /// deferred-reattach drain would take the stale `Some(path)` as "live",
+    /// call `for_host` → `ensure_alive`, and `ensure_alive`'s `try_wait`
+    /// would respawn `SshTunnel::spawn` SYNCHRONOUSLY on the main thread —
+    /// reintroducing the startup block on a flaky host (tunnel warmed, then
+    /// child dies before the first ready-probe).
+    ///
+    /// The BLOCKING `socket_path` (used by `path_provider_for_host` on the
+    /// consumer thread) is intentionally left returning the stored path —
+    /// the consumer's subsequent `for_host`/`ensure_alive` handles the
+    /// respawn off the main thread.
+    #[test]
+    fn live_socket_path_reports_dead_child_tunnel_as_not_ready() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let cfg = HostsConfig {
+            hosts: vec![
+                HostConfig {
+                    id: HostId::local(),
+                    transport: HostTransport::Unix {
+                        socket: PathBuf::from("/tmp/local-deadchild.sock"),
+                    },
+                    default: true,
+                },
+                HostConfig {
+                    id: HostId::new("manager"),
+                    transport: HostTransport::SshUnix {
+                        ssh_host: "cm-test-nonexistent".into(),
+                        ssh_user: None,
+                        remote_socket: PathBuf::from("/remote/daemon.sock"),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        let pool = HostPool::from_config(&cfg).expect("pool");
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let manager = HostId::new("manager");
+        let handle = pool.get_handle_for_test(&manager).expect("manager handle");
+
+        // Pre-install: no tunnel yet → not-ready.
+        assert_eq!(pool.live_socket_path(&manager), None);
+
+        // Install a tunnel whose child has ALREADY exited. `wait()` reaps it
+        // and caches the exit status, so the subsequent `try_wait()` inside
+        // the probe returns `Ok(Some(_))` (the dead-child signal).
+        let sock_path = tmp.path().join("dead-tunnel.sock");
+        let mut child =
+            std::process::Command::new("true").spawn().expect("spawn `true`");
+        child.wait().expect("reap `true`");
+        let tunnel = SshTunnel::from_child_for_test(child, sock_path.clone());
+        handle.install_tunnel_for_test(tunnel);
+
+        // The slot IS `Some` (this is the stale-tunnel scenario)...
+        assert!(
+            handle.has_live_tunnel_for_test(),
+            "a tunnel struct is installed (slot is Some)",
+        );
+        // ...but the non-blocking probe must report not-ready, so the drain
+        // never triggers a synchronous main-thread respawn.
+        assert_eq!(
+            handle.socket_path_nonblocking(),
+            None,
+            "a stored tunnel whose child exited must probe as not-ready \
+             (no stale Some that would drive a main-thread respawn)",
+        );
+        assert_eq!(
+            pool.live_socket_path(&manager),
+            None,
+            "live_socket_path must not hand the drain a dead-child path",
+        );
+        // The BLOCKING variant is unchanged: it still returns the stored path
+        // (the consumer thread is fine to drive the respawn via ensure_alive).
+        assert_eq!(handle.socket_path(), Some(sock_path));
     }
 }

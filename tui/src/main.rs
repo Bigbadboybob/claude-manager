@@ -332,6 +332,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.maybe_restore_sessions();
         log_slow_phase("maybe_restore_sessions", t.elapsed());
 
+        // Phase 4 startup-freeze fix: reattach any remote sessions that
+        // `restore_sessions` deferred off the main thread (their host's dial
+        // can block). Fires once each deferred host's tunnel is warmed by its
+        // `manifest.watch` consumer thread; a cheap no-op once the queue
+        // drains. This is what keeps remote sessions coming online without a
+        // blocking `for_host` on the startup critical path.
+        let t = Instant::now();
+        app.drain_deferred_remote_reattach();
+        log_slow_phase("drain_deferred_remote_reattach", t.elapsed());
+
         // Part 1: periodically surface agent-spawned ("phantom") daemon
         // sessions in the sidebar. Self-throttled to ~5s (the daemon never
         // broadcasts these, so a poll is required). No-op in legacy
