@@ -164,6 +164,21 @@ pub enum ChildEvent {
     Exited {
         code: Option<i32>,
         memory_cap_kill: bool,
+        /// True when this exit was SYNTHESIZED from a bare stream EOF
+        /// — the attach socket closed at a clean frame boundary
+        /// WITHOUT a structured `End` frame — rather than parsed from
+        /// an explicit daemon `End` frame. For a daemon-attached
+        /// REMOTE session this is the ground-truth "the transport
+        /// died, but the daemon-side PTY is probably still alive"
+        /// signal: a genuine child exit always arrives as an `End`
+        /// frame (`transport_eof = false`), whereas an SSH-tunnel
+        /// death just closes the forwarded socket
+        /// (`transport_eof = true`). The TUI's exit handler
+        /// (`app.rs::drain_pty_events`) uses it to decide
+        /// reconnect-vs-teardown for remote sessions, plumbed up
+        /// through the same `Arc<AtomicBool>` side channel as
+        /// `memory_cap_kill`.
+        transport_eof: bool,
     },
 }
 
@@ -184,6 +199,28 @@ impl<R: Read> StreamReader<R> {
     /// or if it's already been taken.
     pub fn take_child_event(&mut self) -> Option<ChildEvent> {
         self.child_event.take()
+    }
+
+    /// Latch a synthesized transport-death exit (`transport_eof: true`,
+    /// unknown code) and mark EOF. Shared by the clean-inter-frame-EOF path
+    /// AND the torn-frame / raw-socket-error path: both mean the attach
+    /// socket died WITHOUT a structured `End` frame, so a REMOTE session
+    /// should reconnect rather than tear down. The caller surfaces this as
+    /// `Ok(0)` (EOF) — crucially NOT an `Err`, because alacritty's EventLoop
+    /// `break`s on a read error without emitting an exit event or polling the
+    /// child-event pipe (`alacritty_terminal` `event_loop.rs` ~280), which
+    /// would freeze the session. `Ok(0)` routes through the proven clean-EOF
+    /// delivery path (self-pipe → `next_child_event` → `terminal.exit()` →
+    /// `Event::Exit`).
+    fn synthesize_transport_death_eof(&mut self) {
+        self.eof = true;
+        if self.child_event.is_none() {
+            self.child_event = Some(ChildEvent::Exited {
+                code: None,
+                memory_cap_kill: false,
+                transport_eof: true,
+            });
+        }
     }
 
     /// Drive the FSM forward by reading as much as the inner source
@@ -324,32 +361,50 @@ impl<R: Read> Read for StreamReader<R> {
         // return, hit a terminator, or run out of immediately-
         // available bytes (WouldBlock).
         loop {
-            let frame = match self.next_frame()? {
-                Some(f) => f,
-                None => {
-                    // Clean EOF before an End frame arrived. The
-                    // daemon vanished / restarted / closed the
-                    // attach socket without writing a structured
-                    // exit. Synthesize a ChildEvent so the TUI's
-                    // EventLoop observes the exit — without this
-                    // the session pane stays alive indefinitely
-                    // (slice-10c-e-2 review-5 fix #2a).
-                    //
-                    // We don't know exit_code or memory_cap_kill
-                    // in this case; the "daemon-vanished" exit
-                    // looks identical to a SIGKILL from outside
-                    // (which the TUI's signal-9 toast already
-                    // handles). exit_code: None matches a
-                    // signal-kill; memory_cap_kill: false is the
-                    // safe default — only attribution via the
-                    // explicit End frame can flip it true.
-                    self.eof = true;
-                    if self.child_event.is_none() {
-                        self.child_event = Some(ChildEvent::Exited {
-                            code: None,
-                            memory_cap_kill: false,
-                        });
-                    }
+            let frame = match self.next_frame() {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    // Clean inter-frame EOF — the daemon vanished /
+                    // restarted / closed the attach socket at a frame
+                    // boundary without writing a structured exit. We
+                    // don't know exit_code or memory_cap_kill; the
+                    // "daemon-vanished" exit looks identical to a
+                    // SIGKILL from outside. Synthesize the transport-
+                    // death exit (slice-10c-e-2 review-5 fix #2a +
+                    // remote-reconnect).
+                    self.synthesize_transport_death_eof();
+                    return Ok(0);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // Transient: no data available right now. `next_frame`
+                    // preserved the partial-frame FSM state, so surface
+                    // WouldBlock and let alacritty's EventLoop reschedule.
+                    // NOT a transport death.
+                    return Err(e);
+                }
+                Err(e) if e.kind() == ErrorKind::InvalidData => {
+                    // Protocol error (oversized frame length / malformed
+                    // JSON body) — a genuine error, not a transport death.
+                    // Surface it unchanged.
+                    return Err(e);
+                }
+                Err(_e) => {
+                    // Mid-frame EOF (a TORN frame — the socket closed
+                    // partway through a length prefix or body) or a raw
+                    // socket error (ECONNRESET / EPIPE / …). Semantically
+                    // identical to the clean-EOF case above: the transport
+                    // died WITHOUT a structured `End` frame; only the close
+                    // landed mid-frame instead of at a boundary. This is the
+                    // ACTIVELY-STREAMING disconnect — a session producing
+                    // output when connectivity drops is almost always
+                    // mid-frame, not idle-at-boundary — so it's the COMMON
+                    // case, not an edge case. Synthesize the SAME
+                    // transport-death exit and return `Ok(0)` (NOT the
+                    // `Err`) so the reconnect flag latches here too. (A
+                    // genuine daemon-side child exit always arrives as a
+                    // structured `End` frame, so it's still never
+                    // misclassified as transport death.)
+                    self.synthesize_transport_death_eof();
                     return Ok(0);
                 }
             };
@@ -396,6 +451,11 @@ impl<R: Read> Read for StreamReader<R> {
                     self.child_event = Some(ChildEvent::Exited {
                         code,
                         memory_cap_kill,
+                        // Structured `End` frame → a genuine
+                        // daemon-side child exit, NOT a transport
+                        // death. The exit handler tears the session
+                        // down normally (no reconnect).
+                        transport_eof: false,
                     });
                     self.eof = true;
                     return Ok(0);
@@ -869,9 +929,14 @@ mod tests {
         let mut buf = [0u8; 16];
         assert_eq!(r.read(&mut buf).unwrap(), 0);
         match r.take_child_event() {
-            Some(ChildEvent::Exited { code, memory_cap_kill }) => {
+            Some(ChildEvent::Exited { code, memory_cap_kill, transport_eof }) => {
                 assert_eq!(code, None, "EOF-without-End surfaces unknown exit_code");
                 assert!(!memory_cap_kill, "EOF-without-End cannot attribute memory_cap_kill");
+                assert!(
+                    transport_eof,
+                    "a bare EOF with no End frame is a transport death — \
+                     this is the signal the remote-reconnect path keys off",
+                );
             }
             None => panic!("clean EOF must synthesize a ChildEvent so the TUI observes exit"),
         }
@@ -941,7 +1006,10 @@ mod tests {
             ev,
             ChildEvent::Exited {
                 code: Some(0),
-                memory_cap_kill: false
+                memory_cap_kill: false,
+                // A structured End frame is a genuine exit, never a
+                // transport death.
+                transport_eof: false,
             }
         );
         assert!(r.take_child_event().is_none());
@@ -961,6 +1029,7 @@ mod tests {
             ChildEvent::Exited {
                 code: Some(137),
                 memory_cap_kill: true,
+                transport_eof: false,
             }
         );
     }
@@ -976,6 +1045,9 @@ mod tests {
             ChildEvent::Exited {
                 code: None,
                 memory_cap_kill: false,
+                // Explicit End frame (with an absent exit_code) is
+                // still a genuine exit, not a transport death.
+                transport_eof: false,
             }
         );
     }
@@ -1018,14 +1090,35 @@ mod tests {
 
     #[test]
     fn reader_partial_frame_truncated_at_body() {
+        // A TORN frame (socket closed mid-body) is a TRANSPORT DEATH, not a
+        // surfaced error. Returning Err would freeze the session — alacritty
+        // `break`s its EventLoop on a read error without emitting an exit or
+        // polling the child-event pipe. So the reader yields Ok(0) and
+        // latches a transport-death child event → the TUI reconnects.
         let prefix = (50u32).to_be_bytes();
         let truncated_body = b"short";
         let mut wire = prefix.to_vec();
         wire.extend(truncated_body);
         let mut r = StreamReader::new(Cursor::new(wire));
         let mut buf = [0u8; 8];
-        let err = r.read(&mut buf).expect_err("truncated body must error");
-        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(
+            r.read(&mut buf).unwrap(),
+            0,
+            "a torn body surfaces as EOF, not an error",
+        );
+        match r.take_child_event() {
+            Some(ChildEvent::Exited { transport_eof, code, .. }) => {
+                assert!(
+                    transport_eof,
+                    "a torn frame is a transport death → must flag reconnect",
+                );
+                assert_eq!(code, None, "torn frame has no structured exit code");
+            }
+            other => panic!(
+                "torn frame must synthesize a transport-death exit, got {:?}",
+                other
+            ),
+        }
     }
 
     #[test]
@@ -1039,21 +1132,26 @@ mod tests {
     }
 
     #[test]
-    fn reader_partial_length_prefix_is_torn_frame_error() {
+    fn reader_partial_length_prefix_is_transport_death() {
+        // Socket closed partway through the 4-byte length prefix → torn
+        // frame → transport death (Ok(0) + transport_eof), NOT a surfaced
+        // error (which would freeze an actively-streaming session).
         let mut wire = (42u32).to_be_bytes().to_vec();
         wire.truncate(2);
         let mut r = StreamReader::new(Cursor::new(wire));
         let mut buf = [0u8; 8];
-        let err = r
-            .read(&mut buf)
-            .expect_err("partial-prefix EOF must surface as error");
-        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
-        let msg = err.to_string();
-        assert!(
-            msg.contains("torn frame") && msg.contains("2 of 4"),
-            "error message should identify the torn frame: {}",
-            msg
+        assert_eq!(
+            r.read(&mut buf).unwrap(),
+            0,
+            "a partial length prefix surfaces as EOF, not an error",
         );
+        match r.take_child_event() {
+            Some(ChildEvent::Exited { transport_eof, .. }) => assert!(
+                transport_eof,
+                "a torn length prefix is a transport death → must flag reconnect",
+            ),
+            other => panic!("expected transport-death exit, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1071,12 +1169,28 @@ mod tests {
 
     #[test]
     fn reader_frame_length_at_cap_is_accepted() {
+        // A length exactly AT the cap is ACCEPTED (not rejected like an
+        // oversized one): the reader proceeds to read the body, which is
+        // absent here, so it surfaces as a torn-frame transport death
+        // (Ok(0) + transport_eof) rather than an "exceeds cap" InvalidData
+        // error — distinguishing it from
+        // `reader_oversized_frame_length_errors_before_allocating`.
         let len = MAX_FRAME_LEN as u32;
         let wire = len.to_be_bytes().to_vec();
         let mut r = StreamReader::new(Cursor::new(wire));
         let mut buf = [0u8; 8];
-        let err = r.read(&mut buf).expect_err("body absent → truncated");
-        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(
+            r.read(&mut buf).unwrap(),
+            0,
+            "at-cap length is accepted → reads body → absent → torn → EOF",
+        );
+        match r.take_child_event() {
+            Some(ChildEvent::Exited { transport_eof, .. }) => assert!(
+                transport_eof,
+                "the at-cap length was accepted and the missing body torn",
+            ),
+            other => panic!("expected transport-death exit, got {:?}", other),
+        }
     }
 
     #[test]

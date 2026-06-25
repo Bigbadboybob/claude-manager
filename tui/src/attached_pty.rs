@@ -114,6 +114,17 @@ pub struct AttachedPty {
     /// `Arc<AtomicBool>` so reader half and `next_child_event`
     /// share access without coupling on a non-atomic field.
     memory_cap_kill: Arc<AtomicBool>,
+    /// Side channel mirroring [`Self::memory_cap_kill`] for the
+    /// remote-reconnect path. The reader half stores `true` here when
+    /// it synthesizes an exit from a bare stream EOF (no daemon `End`
+    /// frame) — i.e. the attach transport died while the daemon-side
+    /// PTY is (almost certainly) still alive. The TUI's exit handler
+    /// reads it (via the cloned [`Self::transport_eof_handle`]) when
+    /// it observes the child-exit event and, for a REMOTE session,
+    /// requeues the session for reattach instead of tearing it down.
+    /// Set BEFORE the child-event pipe is signalled (same ordering
+    /// contract as `memory_cap_kill`).
+    transport_eof: Arc<AtomicBool>,
 }
 
 /// Wrapper around [`StreamReader<UnixStream>`] that signals
@@ -146,6 +157,11 @@ pub struct ReaderHalf {
     /// the flag on `ChildEvent::Exited` always sees a populated
     /// value (no read-vs-write ordering hazard).
     memory_cap_kill: Arc<AtomicBool>,
+    /// Shared with [`AttachedPty::transport_eof`]. Set BEFORE
+    /// signalling the self-pipe (same ordering as
+    /// `memory_cap_kill`) when the observed `ChildEvent` was
+    /// synthesized from a bare stream EOF with no `End` frame.
+    transport_eof: Arc<AtomicBool>,
 }
 
 impl ReaderHalf {
@@ -177,9 +193,23 @@ impl Read for ReaderHalf {
                 // and using SeqCst means by the time the reader
                 // observes the token, the flag is already
                 // populated.
-                let ShimChildEvent::Exited { memory_cap_kill, .. } = &event;
+                let ShimChildEvent::Exited {
+                    memory_cap_kill,
+                    transport_eof,
+                    ..
+                } = &event;
                 if *memory_cap_kill {
                     self.memory_cap_kill.store(true, Ordering::SeqCst);
+                }
+                // Same BEFORE-the-pipe-signal ordering as
+                // `memory_cap_kill`: by the time the EventLoop
+                // delivers the exit event and the TUI's exit handler
+                // reads this flag, it's already populated. `true`
+                // means the attach socket EOF'd with no daemon `End`
+                // frame — the transport died, so a REMOTE session
+                // should reconnect rather than tear down.
+                if *transport_eof {
+                    self.transport_eof.store(true, Ordering::SeqCst);
                 }
                 // SAFETY: pipe_write is a valid pipe fd owned by
                 // ReaderHalf. write(2) on a non-full pipe with a
@@ -238,12 +268,14 @@ impl AttachedPty {
         let (child_pipe_read, child_pipe_write) = open_child_event_pipe()?;
 
         let memory_cap_kill = Arc::new(AtomicBool::new(false));
+        let transport_eof = Arc::new(AtomicBool::new(false));
         let reader = ReaderHalf {
             inner: StreamReader::new(reader_socket),
             pipe_write: child_pipe_write,
             signalled: false,
             pending_exit_stash: None,
             memory_cap_kill: memory_cap_kill.clone(),
+            transport_eof: transport_eof.clone(),
         };
         let writer = StreamWriter::new(writer_socket, stream_id);
 
@@ -254,6 +286,7 @@ impl AttachedPty {
             child_pipe_read,
             pending_exit: None,
             memory_cap_kill,
+            transport_eof,
         })
     }
 
@@ -287,6 +320,21 @@ impl AttachedPty {
     /// (owned by the EventLoop thread).
     pub fn memory_cap_kill_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.memory_cap_kill)
+    }
+
+    /// Hand out a clone of the latched `transport_eof` Arc so the
+    /// TUI's exit handler can observe — AFTER alacritty's EventLoop
+    /// has taken ownership of the `AttachedPty` — whether the exit
+    /// came from a bare transport EOF (no daemon `End` frame). The
+    /// remote-reconnect path (`app.rs::drain_pty_events`) reads this
+    /// via `swap(false, SeqCst)`: `true` means the attach stream died
+    /// out from under a still-alive daemon session, so the session is
+    /// requeued for reattach rather than marked exited.
+    ///
+    /// Mirrors [`Self::memory_cap_kill_handle`]; same shared-`Arc`
+    /// read-and-clear semantics.
+    pub fn transport_eof_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.transport_eof)
     }
 
     /// Opportunistically drain pending writer bytes. Slice-10c-e-2
@@ -901,6 +949,156 @@ mod tests {
             !pty.took_memory_cap_kill(),
             "EOF without End must not attribute memory_cap_kill"
         );
+    }
+
+    // --- remote-reconnect: transport_eof side channel --------------------
+
+    #[test]
+    fn bare_eof_latches_transport_eof_handle_but_end_frame_does_not() {
+        // The remote auto-reconnect path keys off `transport_eof`:
+        // a bare socket EOF (the SSH-tunnel-death signature) must
+        // latch the handle true, while a structured End frame (a
+        // genuine daemon-side exit) must leave it false. Pin BOTH so
+        // a reconnect only fires when the transport — not the
+        // daemon's child — died.
+
+        // Case 1: bare EOF (server vanishes without an End frame).
+        {
+            let (client, server) = socket_pair();
+            let mut pty = AttachedPty::from_socket(client, "attach-teof-eof")
+                .expect("from_socket");
+            let transport_eof = pty.transport_eof_handle();
+            assert!(
+                !transport_eof.load(Ordering::SeqCst),
+                "handle starts false (no EOF observed yet)",
+            );
+            drop(server); // clean EOF, no End frame
+
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut buf = [0u8; 64];
+            loop {
+                match pty.reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!("reader didn't reach EOF within 3s");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("reader error: {}", e),
+                }
+            }
+            assert!(
+                transport_eof.load(Ordering::SeqCst),
+                "a bare EOF with no End frame must latch transport_eof — \
+                 this is the ground-truth tunnel-death signal the App's \
+                 remote-reconnect path requeues on",
+            );
+        }
+
+        // Case 2: genuine End frame → transport_eof stays false.
+        {
+            let (client, mut server) = socket_pair();
+            let mut pty = AttachedPty::from_socket(client, "attach-teof-end")
+                .expect("from_socket");
+            let transport_eof = pty.transport_eof_handle();
+            let frame = StreamFrame {
+                id: "attach-teof-end".into(),
+                kind: StreamKind::End,
+                payload: serde_json::json!({ "exit_code": 0, "memory_cap_kill": false }),
+            };
+            server.write_all(&encode_frame(&frame)).expect("write end");
+
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut buf = [0u8; 64];
+            loop {
+                match pty.reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!("reader stuck on WouldBlock");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("reader error: {}", e),
+                }
+            }
+            assert!(
+                !transport_eof.load(Ordering::SeqCst),
+                "a structured End frame is a genuine exit — transport_eof \
+                 must stay false so the session tears down normally",
+            );
+        }
+    }
+
+    #[test]
+    fn mid_frame_socket_close_latches_transport_eof() {
+        // The ACTIVELY-STREAMING disconnect: the daemon is partway through a
+        // frame when the SSH tunnel dies, so the framing layer sees a TORN
+        // frame (mid-body EOF), NOT a clean boundary EOF. This drives the
+        // REAL reader path (not a directly-injected child event), so it would
+        // catch the gap where only clean-EOF latched the reconnect flag. The
+        // flag must latch here too — otherwise an actively-streaming session
+        // freezes when connectivity drops.
+        let (client, mut server) = socket_pair();
+        let mut pty = AttachedPty::from_socket(client, "attach-torn")
+            .expect("from_socket");
+        let transport_eof = pty.transport_eof_handle();
+        assert!(
+            !transport_eof.load(Ordering::SeqCst),
+            "handle starts false (no torn frame observed yet)",
+        );
+
+        // Length prefix claims a 50-byte body, but we send only a few body
+        // bytes and then close the socket MID-FRAME.
+        let prefix = (50u32).to_be_bytes();
+        server.write_all(&prefix).expect("write prefix");
+        server.write_all(b"streaming output...").expect("write partial body");
+        drop(server); // mid-frame close — the tunnel just died
+
+        // Drive the reader until it's done. With the fix a torn frame surfaces
+        // as Ok(0) (transport-death EOF); a non-WouldBlock Err is the
+        // pre-fix path — either way we stop and then assert on the flag, so
+        // the test is a clean RED (pre-fix: Err, flag NOT latched) / GREEN
+        // (post-fix: Ok(0), flag latched).
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut buf = [0u8; 64];
+        loop {
+            match pty.reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("reader didn't finish within 3s");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                // Pre-fix path: the torn frame surfaced as an error. Stop and
+                // let the assertion below report the un-latched flag.
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            transport_eof.load(Ordering::SeqCst),
+            "a mid-frame (torn) socket close must latch transport_eof — \
+             actively-streaming sessions die mid-frame, not at a boundary; \
+             without this they freeze on a connectivity drop",
+        );
+        // And the exit surfaces through the normal child-event path so the
+        // App's EventLoop observes it (Exited(None), no structured code).
+        match pty.next_child_event() {
+            Some(ChildEvent::Exited(code)) => assert_eq!(code, None),
+            other => panic!(
+                "torn-frame transport death must surface Exited(None), got {:?}",
+                other
+            ),
+        }
     }
 
     // --- slice-10c-e-2 review-7 (Shape B) -------------------------------

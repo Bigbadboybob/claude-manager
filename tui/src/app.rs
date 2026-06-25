@@ -205,6 +205,40 @@ impl TerminalSession {
         self.transcript_id = new_sid;
         self.generation = self.generation.saturating_add(1);
     }
+
+    /// Serialize this live session back to its on-disk `ManifestEntry`
+    /// shape. Used both by `save_session_manifest` (the periodic save)
+    /// and by the remote-reconnect requeue in `drain_pty_events`,
+    /// which needs an entry to hand to the deferred-reattach drain
+    /// when a remote session's attach stream dies. Keeping the two in
+    /// one place means a new manifest field can't silently diverge
+    /// between the save path and the reconnect path.
+    pub(crate) fn to_manifest_entry(&self) -> cm_daemon::manifest::ManifestEntry {
+        cm_daemon::manifest::ManifestEntry {
+            uid: self.uid.clone(),
+            managed_by_uid: self.managed_by_uid.clone(),
+            generation: self.generation,
+            label: self.label.clone(),
+            session_type: self.session_type.clone(),
+            transcript_id: self.transcript_id.clone(),
+            hidden: self.hidden,
+            idle_timeout_secs: self.idle_timeout_secs,
+            burst_threshold: self.burst_threshold,
+            workflow_run_id: self.workflow_run_id.clone(),
+            workflow_role: self.workflow_role.clone(),
+            task_id: self.task_id.clone(),
+            notify_on_idle: self.notify_on_idle,
+            seeded_from_snapshot: self.seeded_from_snapshot.clone(),
+            // Read-modify-write the daemon-owned `last_exit`. The TUI
+            // never inspects or mutates it — just hands it back
+            // unchanged so the daemon's `memory_cap_kill: true` flag
+            // survives every TUI save.
+            last_exit: self.preserved_last_exit.clone(),
+            // Round-trip the host_id from the in-memory session so a
+            // remote-pinned entry stays pinned to its host.
+            host_id: self.host_id.clone(),
+        }
+    }
 }
 
 fn note_workflow_transcript_binding(
@@ -3292,7 +3326,46 @@ pub(crate) fn handle_confirm(
 struct PendingRemoteReattach {
     ws_id: String,
     entry: cm_daemon::manifest::ManifestEntry,
+    /// Remote auto-reconnect bound: consecutive failed reattach attempts made
+    /// while the tunnel was UP. A transient post-respawn race (the forwarded
+    /// socket exists but `session.attach`/`attach.open` lost the race) fails
+    /// here even though the daemon session is alive, so — like the
+    /// `manifest.watch` consumer — we keep retrying instead of giving up on
+    /// the first failure. Only after [`REMOTE_REATTACH_MAX_ATTEMPTS`]
+    /// sustained failures do we treat the session as genuinely gone. The
+    /// restore-deferred (non-reconnecting) path leaves this at 0.
+    attempts: u32,
+    /// Wall-clock of the last reattach attempt, for throttling. The main loop
+    /// can spin at ~1ms, so without this the bound would be exhausted in
+    /// milliseconds; we retry at most once per
+    /// [`REMOTE_REATTACH_RETRY_INTERVAL`] (mirrors manifest.watch's backoff
+    /// cadence). `None` until the first attempt.
+    last_attempt_at: Option<Instant>,
 }
+
+impl PendingRemoteReattach {
+    /// Fresh worklist item — no reattach attempts yet.
+    fn new(ws_id: String, entry: cm_daemon::manifest::ManifestEntry) -> Self {
+        Self {
+            ws_id,
+            entry,
+            attempts: 0,
+            last_attempt_at: None,
+        }
+    }
+}
+
+/// Remote auto-reconnect: retry a dead attach at most this often. The main
+/// loop ticks far faster (~1ms when idle), so this throttle is what spreads
+/// the give-up bound below over a meaningful window — mirroring
+/// manifest.watch's bounded-backoff cadence rather than hammering the RPC.
+const REMOTE_REATTACH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Give up reconnecting (mark the slot exited) only after this many
+/// CONSECUTIVE failed reattach attempts WITH THE TUNNEL UP — ~30s of
+/// sustained failure at [`REMOTE_REATTACH_RETRY_INTERVAL`]. A transient
+/// post-respawn race resolves well within this; a genuinely-gone daemon
+/// session settles instead of spinning "⟳ reconnecting" forever.
+const REMOTE_REATTACH_MAX_ATTEMPTS: u32 = 15;
 
 pub struct App {
     pub tasks: Vec<TaskEntry>,
@@ -3533,6 +3606,18 @@ pub struct App {
     /// ride the normal event-driven repaint; `tick_alerts` flips `needs_redraw`
     /// whenever this frame index advances so the icon keeps animating.
     last_alert_frame: u64,
+    /// Remote sessions whose attach I/O stream died (the SSH tunnel
+    /// dropped) but whose daemon-side PTY + workflow keep running.
+    /// Keyed by session uid. Transient + in-memory only (never
+    /// persisted): set in `drain_pty_events` when a REMOTE session's
+    /// `daemon_transport_eof` flag fires on exit, and cleared in
+    /// `drain_deferred_remote_reattach` once the PTY rebinds (or the
+    /// session is found genuinely gone). Drives the `⟳ reconnecting`
+    /// sidebar indicator and keeps the session slot alive so no work
+    /// is lost while connectivity is restored. Mirrors the transient
+    /// per-uid shape of [`Self::alerts`]; the matching reattach
+    /// worklist entry rides in [`Self::pending_remote_reattach`].
+    reconnecting_sessions: std::collections::HashSet<String>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -3810,6 +3895,7 @@ impl App {
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
             last_alert_frame: 0,
+            reconnecting_sessions: std::collections::HashSet::new(),
         }
     }
 
@@ -4334,39 +4420,7 @@ impl App {
             let mut entries: Vec<ManifestEntry> = ws
                 .sessions
                 .iter()
-                .map(|ts| ManifestEntry {
-                    uid: ts.uid.clone(),
-                    managed_by_uid: ts.managed_by_uid.clone(),
-                    generation: ts.generation,
-                    label: ts.label.clone(),
-                    session_type: ts.session_type.clone(),
-                    transcript_id: ts.transcript_id.clone(),
-                    hidden: ts.hidden,
-                    idle_timeout_secs: ts.idle_timeout_secs,
-                    burst_threshold: ts.burst_threshold,
-                    workflow_run_id: ts.workflow_run_id.clone(),
-                    workflow_role: ts.workflow_role.clone(),
-                    task_id: ts.task_id.clone(),
-                    notify_on_idle: ts.notify_on_idle,
-                    seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
-                    // Read-modify-write the daemon-owned `last_exit`.
-                    // The TUI never inspects or mutates it — just
-                    // hands it back unchanged so the daemon's
-                    // `memory_cap_kill: true` flag survives every
-                    // TUI save. Without this, the named acceptance
-                    // criterion (detached cap-kill toast on
-                    // reattach) breaks the moment the TUI saves
-                    // after the daemon writes.
-                    last_exit: ts.preserved_last_exit.clone(),
-                    // 12b: round-trip the host_id from the
-                    // in-memory session. Pre-12 manifests load
-                    // with `host_id = HostId::local()` via the
-                    // `#[serde(default)]` constructor; the next
-                    // save writes the upgraded shape back so the
-                    // load-after-save is a no-op-default-free
-                    // round-trip.
-                    host_id: ts.host_id.clone(),
-                })
+                .map(TerminalSession::to_manifest_entry)
                 .collect();
             // 12e-r7 F1: append any manifest entries that
             // were skipped at restore time because their
@@ -4688,10 +4742,12 @@ impl App {
                                 .entry(ws.id.clone())
                                 .or_default()
                                 .push(entry.clone());
-                            self.pending_remote_reattach.push(PendingRemoteReattach {
-                                ws_id: ws.id.clone(),
-                                entry: entry.clone(),
-                            });
+                            self.pending_remote_reattach.push(
+                                PendingRemoteReattach::new(
+                                    ws.id.clone(),
+                                    entry.clone(),
+                                ),
+                            );
                             continue;
                         }
                         // Already-known-offline host this pass → preserve the
@@ -5497,6 +5553,7 @@ impl App {
         if self.pending_remote_reattach.is_empty() {
             return;
         }
+        let now = Instant::now();
         let (cols, rows) = self.last_term_size;
         // Parity with the synchronous restore path: clear stale workflow tags
         // before reattach so a Detached/Done run isn't pushed to the remote
@@ -5537,14 +5594,119 @@ impl App {
             if self.workspaces[ws_idx].is_closed {
                 continue;
             }
-            // Idempotent: another path (e.g. the manifest.watch adoption) may
-            // have already surfaced this uid. Don't double-add; just retire the
-            // preserved copy.
-            if self.workspaces[ws_idx]
+            // A live slot with this uid already exists. Two cases:
+            if let Some(existing_idx) = self.workspaces[ws_idx]
                 .sessions
                 .iter()
-                .any(|s| s.uid == p.entry.uid)
+                .position(|s| s.uid == p.entry.uid)
             {
+                // Case A — RECONNECTING slot: its attach stream died
+                // and `drain_pty_events` kept the slot + requeued it.
+                // Rebind the PTY IN PLACE: swap the freshly-attached
+                // live `Session` into the existing slot, preserving
+                // all the user's slot metadata (label, transcript
+                // binding, workflow tags, pending prompts). Dropping
+                // the old dead-EventLoop `Session` just best-effort
+                // sends `Msg::Shutdown` (see `impl Drop for Session`)
+                // — it does NOT issue a daemon `kill_session`, so the
+                // daemon-side PTY the fresh attach binds to is the
+                // SAME still-running session. This is the seamless,
+                // no-work-lost recovery.
+                if self.reconnecting_sessions.contains(&p.entry.uid) {
+                    // Throttle: the main loop ticks far faster (~1ms idle)
+                    // than we should retry a network reattach. Skip — but KEEP
+                    // queued + reconnecting — until the retry interval elapses
+                    // since the last attempt.
+                    if let Some(last) = p.last_attempt_at {
+                        if now.duration_since(last)
+                            < REMOTE_REATTACH_RETRY_INTERVAL
+                        {
+                            still_pending.push(p);
+                            continue;
+                        }
+                    }
+                    let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
+                    let entry_for_attach = cleaned.as_ref().unwrap_or(&p.entry);
+                    let outcome = {
+                        let ws_ref = &self.workspaces[ws_idx];
+                        self.try_reattach_remote_session(
+                            entry_for_attach,
+                            ws_ref,
+                            (cols, rows),
+                        )
+                    };
+                    match outcome {
+                        Some(fresh) => {
+                            {
+                                let slot = &mut self.workspaces[ws_idx]
+                                    .sessions[existing_idx];
+                                slot.session = fresh.session;
+                                slot.status = SessionStatus::Running;
+                            }
+                            self.reconnecting_sessions.remove(&p.entry.uid);
+                            reattached_any = true;
+                            eprintln!(
+                                "cm-tui: remote session {} ({}) on host {} \
+                                 reattached after transport recovery (attempt {})",
+                                p.entry.uid,
+                                p.entry.label,
+                                p.entry.host_id.as_str(),
+                                p.attempts + 1,
+                            );
+                        }
+                        None => {
+                            // `live_socket_path` only proves the LOCAL
+                            // forwarded socket exists and the ssh child is
+                            // alive — the `session.attach`/`attach.open` RPCs
+                            // can still fail TRANSIENTLY in the race right
+                            // after a tunnel respawn while the daemon session
+                            // is very much alive. Giving up here on one
+                            // failure would reintroduce the freeze. Mirror the
+                            // manifest.watch consumer: keep retrying with a
+                            // bound, and only treat the session as genuinely
+                            // gone after a sustained run of failures with the
+                            // tunnel up.
+                            let attempts = p.attempts + 1;
+                            if attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
+                                {
+                                    let slot = &mut self.workspaces[ws_idx]
+                                        .sessions[existing_idx];
+                                    slot.session.exited = true;
+                                }
+                                self.reconnecting_sessions.remove(&p.entry.uid);
+                                reattached_any = true;
+                                eprintln!(
+                                    "cm-tui: reconnecting remote session {} ({}) \
+                                     on host {} still unreachable after {} \
+                                     attempts — marking exited",
+                                    p.entry.uid,
+                                    p.entry.label,
+                                    p.entry.host_id.as_str(),
+                                    attempts,
+                                );
+                            } else {
+                                eprintln!(
+                                    "cm-tui: reattach attempt {} for remote \
+                                     session {} ({}) on host {} failed (tunnel \
+                                     up) — keeping reconnecting, will retry",
+                                    attempts,
+                                    p.entry.uid,
+                                    p.entry.label,
+                                    p.entry.host_id.as_str(),
+                                );
+                                still_pending.push(PendingRemoteReattach {
+                                    attempts,
+                                    last_attempt_at: Some(now),
+                                    ..p
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Case B — already surfaced by another path (e.g. the
+                // manifest.watch adoption). Don't double-add; just
+                // retire the preserved copy.
                 self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
                 continue;
             }
@@ -5596,6 +5758,26 @@ impl App {
             if v.is_empty() {
                 self.skipped_manifest_entries.remove(ws_id);
             }
+        }
+    }
+
+    /// Remote auto-reconnect: drop any reconnect bookkeeping for `uid` when its
+    /// session is closed/removed. Without this, closing a session during the
+    /// offline window (when `kill_session` can't even reach the daemon because
+    /// the tunnel is down) would leave the queued reattach work item behind,
+    /// and `drain_deferred_remote_reattach` would RESURRECT the session — re-
+    /// creating something the user explicitly removed — once the tunnel
+    /// returns. We only touch `pending_remote_reattach` when the uid was
+    /// actually reconnecting: a restore-deferred entry (queued but never
+    /// surfaced as a live slot) never reaches a close path, so its work item is
+    /// left intact. No-op for the common (non-reconnecting) close.
+    ///
+    /// `pub(crate)` so the control-socket `kill_session` handler
+    /// (`control::methods`) routes its removal through here too — same
+    /// resurrection guard as the operator close paths.
+    pub(crate) fn forget_reconnect_state(&mut self, uid: &str) {
+        if self.reconnecting_sessions.remove(uid) {
+            self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
         }
     }
 
@@ -6980,6 +7162,14 @@ impl App {
         // broadcast (which arrives via a separate channel) is
         // suppressed.
         let mut cap_kill_notes: Vec<String> = Vec::new();
+        // Remote auto-reconnect: (wi, si) of REMOTE sessions whose
+        // attach I/O stream died (transport EOF, not a daemon `End`
+        // frame) this pass. Collected here for the same borrow-shape
+        // reason as `cap_kill_notes` — after the workspaces loop we
+        // mark each uid reconnecting and requeue its manifest entry
+        // into `pending_remote_reattach`, which can't happen inside
+        // the `&mut self.workspaces` iteration.
+        let mut remote_reconnect_requeue: Vec<(usize, usize)> = Vec::new();
         // Bound how long this pass spends draining PTY events so a flooding
         // session can't starve the rest of the main loop (control queue, UI).
         // See `TERMINAL_DRAIN_BUDGET`. Once the deadline passes, sessions not
@@ -6988,9 +7178,25 @@ impl App {
         // unread events wait for the next tick.
         let drain_deadline = now + TERMINAL_DRAIN_BUDGET;
         let mut drain_over_budget = false;
+        // Remote auto-reconnect: snapshot the set of sessions whose attach
+        // stream is currently dead so the per-session pending-write gate below
+        // can read it without re-borrowing `self` while `self.workspaces` is
+        // mutably borrowed. Cheap (the set is empty in the common case); the
+        // post-loop requeue is the only writer and it runs after this loop, so
+        // a clone here is a consistent read.
+        let reconnecting_snapshot = self.reconnecting_sessions.clone();
         for (wi, ws) in self.workspaces.iter_mut().enumerate() {
             for (si, ts) in ws.sessions.iter_mut().enumerate() {
                 let is_focused = focused_idx == Some((wi, si));
+                // True while this remote session's PTY I/O stream is dead and
+                // awaiting reattach. Seeded from the snapshot (sessions already
+                // reconnecting from a prior tick) and flipped on below if THIS
+                // tick's drain observes the transport death. Gates pending-write
+                // delivery so a queued workflow prompt isn't consumed (and
+                // silently lost) against the dead EventLoop — it stays queued
+                // and flushes naturally once the PTY rebinds.
+                let mut session_reconnecting =
+                    reconnecting_snapshot.contains(&ts.uid);
                 // `drain_over_budget` short-circuits the event drain for this
                 // and every later session once the per-tick budget is spent.
                 let mut drained_this_session: usize = 0;
@@ -7001,7 +7207,6 @@ impl App {
                     };
                     match event {
                         TermEvent::Exit | TermEvent::ChildExit(_) => {
-                            ts.session.exited = true;
                             visible_dirty = true;
                             // Slice 10c-e-3b-fix4b (+ 10e-d
                             // unification): daemon-attached
@@ -7021,7 +7226,10 @@ impl App {
                             // cap_kill_toasted set-marking that
                             // suppresses a duplicate toast when
                             // the same uid's manifest.watch
-                            // broadcast arrives.
+                            // broadcast arrives. A cap-kill is
+                            // always an explicit `End` frame, so
+                            // it's mutually exclusive with the
+                            // transport-EOF case handled below.
                             if let Some(flag) =
                                 ts.session.daemon_memory_cap_kill.as_ref()
                             {
@@ -7029,6 +7237,60 @@ impl App {
                                 if flag.swap(false, Ordering::SeqCst) {
                                     cap_kill_notes.push(ts.uid.clone());
                                 }
+                            }
+                            // Remote auto-reconnect: distinguish a
+                            // TRANSPORT death (the attach socket
+                            // EOF'd with no daemon `End` frame —
+                            // typically the SSH tunnel dropped when
+                            // the laptop lost connectivity) from a
+                            // genuine daemon-side child exit. Only
+                            // the former is recoverable: the daemon-
+                            // side PTY + workflow keep running
+                            // (daemon-side execution), so instead of
+                            // tearing the session slot down we keep
+                            // it alive, mark it reconnecting, and
+                            // requeue it for reattach once the per-
+                            // host manifest.watch consumer warms the
+                            // tunnel back up. The `daemon_transport_eof`
+                            // flag is the GROUND-TRUTH signal latched
+                            // by the attach reader on EOF — we do NOT
+                            // infer transport death from a transient
+                            // `live_socket_path()==None`, which can
+                            // momentarily be None during a HEALTHY
+                            // tunnel respawn. LOCAL sessions have no
+                            // `daemon_transport_eof` Arc (None) and
+                            // always take the normal exit path —
+                            // completely unaffected.
+                            let transport_died = ts
+                                .session
+                                .daemon_transport_eof
+                                .as_ref()
+                                .map(|f| {
+                                    f.swap(
+                                        false,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    )
+                                })
+                                .unwrap_or(false);
+                            let is_remote = ts.host_id
+                                != cm_daemon::host_id::HostId::local();
+                            if is_remote && transport_died {
+                                // Keep the slot (do NOT set
+                                // `exited`); the post-loop requeue
+                                // marks it reconnecting and enqueues
+                                // the rebind. Drop it out of the
+                                // Running sort so the green spinner
+                                // doesn't imply live output while the
+                                // stream is dead.
+                                ts.status = SessionStatus::Idle;
+                                // Gate this tick's pending-write
+                                // delivery too: the stream just died,
+                                // so don't consume a queued prompt
+                                // against the now-dead EventLoop.
+                                session_reconnecting = true;
+                                remote_reconnect_requeue.push((wi, si));
+                            } else {
+                                ts.session.exited = true;
                             }
                         }
                         TermEvent::Title(title) => {
@@ -7142,7 +7404,13 @@ impl App {
                 // so we don't retry the same payload — preventing an infinite
                 // loop against a wedged PTY. We surface the timeout to the
                 // status bar so the user knows to investigate.
-                if let Some(clear) = &ts.pending_clear {
+                // `.filter(|_| !session_reconnecting)` short-circuits delivery
+                // while the attach stream is dead: the `Option` becomes `None`,
+                // so `pending_clear` is NEITHER read-as-ready NOR `take()`n — it
+                // survives untouched until the PTY rebinds.
+                if let Some(clear) =
+                    ts.pending_clear.as_ref().filter(|_| !session_reconnecting)
+                {
                     if Self::ready_for_write(&ts.session, clear, now) {
                         let pw = ts.pending_clear.take().unwrap();
                         if let Err(e) = Self::deliver_pending_write(ts, &pw, "pending_clear") {
@@ -7167,7 +7435,13 @@ impl App {
                 // ts.pending_enter before the clear's Enter ever fires —
                 // codex then sees `/clearCan you review unstaged changes...\r`
                 // as a single slash command and rejects it.
-                if ts.pending_clear.is_none() && ts.pending_enter.is_none() {
+                // Same reconnect gate as `pending_clear`: don't consume a
+                // queued prompt against a dead EventLoop — leave it for the
+                // post-rebind flush.
+                if ts.pending_clear.is_none()
+                    && ts.pending_enter.is_none()
+                    && !session_reconnecting
+                {
                     if let Some(prompt) = &ts.pending_prompt {
                         if Self::ready_for_write(&ts.session, prompt, now) {
                             let pw = ts.pending_prompt.take().unwrap();
@@ -7192,7 +7466,15 @@ impl App {
                 // time) because the agent often flips to Kitty keyboard mode
                 // during the gap; the Enter keystroke must match the mode in
                 // effect right now or the agent treats it as a literal `\r`.
-                if let Some(pe) = &ts.pending_enter {
+                // Reconnect gate again: a leftover deferred Enter (its body
+                // already reached the daemon PTY before the stream died) must
+                // NOT fire against the dead EventLoop — that would lose the
+                // submit and leave the body un-submitted on the daemon side.
+                // Hold it; once the PTY rebinds it fires (its `fire_at` is past)
+                // and submits the body cleanly.
+                if let Some(pe) =
+                    ts.pending_enter.as_ref().filter(|_| !session_reconnecting)
+                {
                     if now >= pe.fire_at {
                         ts.pending_enter = None;
                         let enter = enter_bytes_for(&ts.session);
@@ -7438,6 +7720,45 @@ impl App {
         // order.
         for uid in cap_kill_notes {
             self.try_emit_cap_kill_toast(&uid);
+        }
+
+        // Remote auto-reconnect: for each REMOTE session whose attach
+        // stream died this pass, mark it reconnecting (drives the
+        // `⟳` sidebar indicator + keeps the slot) and requeue its
+        // manifest entry into the existing deferred-reattach flow.
+        // The per-host manifest.watch consumer (its own thread, with
+        // exponential-backoff reconnect) re-warms the tunnel on its
+        // own; `drain_deferred_remote_reattach` then rebinds the PTY
+        // to the still-alive daemon session — no work lost. We do NOT
+        // add to `skipped_manifest_entries` here: the slot stays live
+        // in `ws.sessions`, so `save_session_manifest` already
+        // round-trips it; a skipped copy would double-write.
+        if !remote_reconnect_requeue.is_empty() {
+            for (wi, si) in remote_reconnect_requeue {
+                let ws_id = self.workspaces[wi].id.clone();
+                let entry = self.workspaces[wi].sessions[si].to_manifest_entry();
+                self.reconnecting_sessions.insert(entry.uid.clone());
+                // Idempotent: don't double-queue the same uid if a
+                // prior tick already enqueued it (the dead EventLoop
+                // emits one exit, but guard anyway).
+                if !self
+                    .pending_remote_reattach
+                    .iter()
+                    .any(|p| p.entry.uid == entry.uid)
+                {
+                    eprintln!(
+                        "cm-tui: remote session {} ({}) on host {} lost its \
+                         attach stream (transport EOF) — marking reconnecting \
+                         and requeuing for reattach",
+                        entry.uid,
+                        entry.label,
+                        entry.host_id.as_str(),
+                    );
+                    self.pending_remote_reattach
+                        .push(PendingRemoteReattach::new(ws_id, entry));
+                }
+            }
+            self.needs_redraw = true;
         }
 
         // Poll `~/.claude/history.jsonl` for `/clear` and `/compact` events
@@ -9223,13 +9544,23 @@ impl App {
             return true;
         }
 
+        // Remote auto-reconnect: while the active remote session's attach
+        // stream is dead (awaiting reattach), don't forward input to its dead
+        // EventLoop — the write would just fail and spam an error toast per
+        // keystroke. The session rebinds on its own; queued workflow prompts
+        // are preserved by the pending-write gate in `drain_terminal_events`.
+        let active_reconnecting = match self.active_session() {
+            Some((_, ts)) => self.reconnecting_sessions.contains(&ts.uid),
+            None => false,
+        };
+
         // Handle bracketed paste — send entire text at once, wrapped in
         // bracket escapes if the inner program has enabled bracketed paste mode.
         if let CrosstermEvent::Paste(text) = event {
             let mut paste_err: Option<(String, std::io::Error)> = None;
             let mut handled = false;
             if let Some(ts) = self.active_session_mut() {
-                if !ts.session.exited {
+                if !ts.session.exited && !active_reconnecting {
                     use alacritty_terminal::grid::Scroll;
                     ts.session.term.lock().scroll_display(Scroll::Bottom);
 
@@ -9269,7 +9600,7 @@ impl App {
         let mut input_err: Option<(String, std::io::Error)> = None;
         let mut handled = false;
         if let Some(ts) = self.active_session_mut() {
-            if !ts.session.exited {
+            if !ts.session.exited && !active_reconnecting {
                 // Auto-scroll to bottom on any input so the cursor stays visible.
                 {
                     use alacritty_terminal::grid::Scroll;
@@ -10265,26 +10596,37 @@ impl App {
         // `kill_daemon_session_if_attached` while `ws` holds a
         // mutable borrow of `self.workspaces`.
         let pool = std::sync::Arc::clone(&self.host_pool);
-        let Some(ws) = self.workspaces.get_mut(ws_index) else {
-            return 0;
-        };
-        let mut removed = 0;
-        let mut i = 0;
-        while i < ws.sessions.len() {
-            if should_drop(&ws.sessions[i]) {
-                // Slice 10c-e-3b-fix2: operator-driven kill
-                // before drop. See `kill_daemon_session_if_attached`
-                // for rationale. Bulk-cleanup paths (task close,
-                // workspace teardown) flow through here too.
-                Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
-                Self::tombstone_session(ws, i);
-                ws.sessions[i].session.exited = true;
-                ws.sessions.remove(i);
-                removed += 1;
-            } else {
-                i += 1;
+        // Collected here so reconnect bookkeeping can be cleared AFTER the
+        // `&mut self.workspaces` borrow ends (forget_reconnect_state needs
+        // `&mut self`).
+        let mut removed_uids: Vec<String> = Vec::new();
+        {
+            let Some(ws) = self.workspaces.get_mut(ws_index) else {
+                return 0;
+            };
+            let mut i = 0;
+            while i < ws.sessions.len() {
+                if should_drop(&ws.sessions[i]) {
+                    // Slice 10c-e-3b-fix2: operator-driven kill
+                    // before drop. See `kill_daemon_session_if_attached`
+                    // for rationale. Bulk-cleanup paths (task close,
+                    // workspace teardown) flow through here too.
+                    Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
+                    Self::tombstone_session(ws, i);
+                    ws.sessions[i].session.exited = true;
+                    removed_uids.push(ws.sessions[i].uid.clone());
+                    ws.sessions.remove(i);
+                } else {
+                    i += 1;
+                }
             }
         }
+        // Cancel reconnect/reattach for every removed session so a
+        // closed-while-offline remote session isn't resurrected on reconnect.
+        for uid in &removed_uids {
+            self.forget_reconnect_state(uid);
+        }
+        let removed = removed_uids.len();
         if removed > 0 {
             self.save_session_manifest();
         }
@@ -10340,6 +10682,7 @@ impl App {
                         // design.
                         Self::kill_daemon_session_if_attached(&pool, &ws.sessions[si]);
                         Self::tombstone_session(ws, si);
+                        let closed_uid = ws.sessions[si].uid.clone();
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
                             self.cursor = Cursor::Workspace(wi);
@@ -10347,6 +10690,9 @@ impl App {
                             let new_si = si.min(ws.sessions.len() - 1);
                             self.cursor = Cursor::Session(wi, new_si);
                         }
+                        // Cancel any reconnect/reattach for the closed session
+                        // so it isn't resurrected once the tunnel returns.
+                        self.forget_reconnect_state(&closed_uid);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
                     }
@@ -10359,8 +10705,11 @@ impl App {
                         // Session-cursor arm above.
                         Self::kill_daemon_session_if_attached(&pool, &ws.sessions[0]);
                         Self::tombstone_session(ws, 0);
+                        let closed_uid = ws.sessions[0].uid.clone();
                         ws.sessions.remove(0);
                         self.cursor = Cursor::Workspace(wi);
+                        // Cancel any reconnect/reattach for the closed session.
+                        self.forget_reconnect_state(&closed_uid);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
                     }
@@ -11736,10 +12085,21 @@ impl App {
         // BEFORE the Workspace (and its Sessions) drop — Drop is
         // detach-only by design.
         let pool = std::sync::Arc::clone(&self.host_pool);
+        let removed_uids: Vec<String> = self.workspaces[wi]
+            .sessions
+            .iter()
+            .map(|ts| ts.uid.clone())
+            .collect();
         for ts in &self.workspaces[wi].sessions {
             Self::kill_daemon_session_if_attached(&pool, ts);
         }
         self.workspaces.remove(wi);
+        // Cancel reconnect/reattach for every session in the deleted
+        // workspace — otherwise a reconnecting entry would stay queued in
+        // `pending_remote_reattach` forever (its workspace is gone).
+        for uid in &removed_uids {
+            self.forget_reconnect_state(uid);
+        }
         self.cursor = Cursor::Workspace(wi.min(self.workspaces.len().saturating_sub(1)));
         // Sub-2a Finding #1: workspace delete removed all bound
         // tasks from `self.tasks` — refresh tree.
@@ -13335,7 +13695,19 @@ impl App {
                         .as_deref()
                         .is_some_and(|id| self.workflow_runs.iter().any(|r| r.run_id == id));
 
-                    let (indicator, indicator_style) = if ts.hidden {
+                    let (indicator, indicator_style) = if self
+                        .reconnecting_sessions
+                        .contains(&ts.uid)
+                    {
+                        // Remote auto-reconnect: this session's attach
+                        // I/O stream died (tunnel dropped) but its
+                        // daemon-side PTY keeps running. The `⟳` marks
+                        // it reconnecting; the slot stays put and
+                        // rebinds when connectivity returns. Shown even
+                        // for hidden sessions — a stuck stream is worth
+                        // surfacing.
+                        ("\u{27f3}", Style::default().fg(Color::Yellow))
+                    } else if ts.hidden {
                         (" ", Style::default())
                     } else {
                         match ts.status {
@@ -19107,10 +19479,10 @@ mod pending_workflow_events_tests {
         };
         app.skipped_manifest_entries
             .insert("ws-c".into(), vec![entry.clone()]);
-        app.pending_remote_reattach.push(PendingRemoteReattach {
-            ws_id: "ws-c".into(),
-            entry: entry.clone(),
-        });
+        app.pending_remote_reattach.push(PendingRemoteReattach::new(
+            "ws-c".into(),
+            entry.clone(),
+        ));
 
         app.drain_deferred_remote_reattach();
 
@@ -19303,6 +19675,650 @@ mod pending_workflow_events_tests {
         let _ = std::os::unix::net::UnixStream::connect(&mgr_sock);
         let _ = local_h.join();
         let _ = mgr_h.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
+/// Regression for the remote-attach auto-reconnect fix: when an
+/// ATTACHED remote session's I/O stream dies (the SSH tunnel drops on
+/// a connectivity blip) the daemon-side PTY + workflow keep running,
+/// so the TUI must NOT tear the session slot down. Pre-fix
+/// `drain_terminal_events` marked the slot `exited` on the synthesized
+/// child-exit — the freeze the user had to restart out of. Post-fix
+/// the latched `transport_eof` flag routes the session into the
+/// reconnect path: the slot is kept, marked reconnecting, and requeued
+/// into `pending_remote_reattach` so `drain_deferred_remote_reattach`
+/// rebinds the PTY to the still-alive daemon session once the tunnel
+/// returns.
+#[cfg(test)]
+mod remote_reconnect_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn manager_host() -> cm_daemon::host_id::HostId {
+        cm_daemon::host_id::HostId::new("manager")
+    }
+
+    /// `App::new` with an injected 2-host pool: local (unix) +
+    /// "manager" (ssh-unix, tunnel transport). The manager tunnel is
+    /// never warmed (no real ssh), so `live_socket_path("manager")` is
+    /// `None` throughout — exactly the "internet still down" window.
+    fn app_with_manager_host(local_sock: &std::path::Path) -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: local_sock.to_path_buf(),
+                    },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: manager_host(),
+                    transport: crate::hosts::HostTransport::SshUnix {
+                        ssh_host: "cm-test-nonexistent-host".into(),
+                        ssh_user: None,
+                        remote_socket: PathBuf::from("/remote/daemon.sock"),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts).expect("pool"),
+        );
+        app
+    }
+
+    /// A live `TerminalSession` whose attach stream just died. A real
+    /// local `Session` gives us a valid term/sender; we then REPLACE
+    /// its event channel (so the child-exit is deterministic — no
+    /// dependence on `/bin/true`'s real exit timing) and, when
+    /// `transport_eof` is set, latch the `daemon_transport_eof` flag
+    /// the attach reader would have set on a bare socket EOF.
+    fn session_with_injected_exit(
+        uid: &str,
+        host: cm_daemon::host_id::HostId,
+        transport_eof: bool,
+    ) -> (
+        TerminalSession,
+        std::sync::mpsc::Sender<TermEvent>,
+        Option<Arc<AtomicBool>>,
+    ) {
+        let mut session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .expect("dummy session");
+        let (tx, rx) = std::sync::mpsc::channel();
+        session.event_rx = rx;
+        let teof = if transport_eof {
+            let f = Arc::new(AtomicBool::new(true));
+            session.daemon_transport_eof = Some(f.clone());
+            Some(f)
+        } else {
+            None
+        };
+        let ts = TerminalSession {
+            uid: uid.into(),
+            label: "claude".into(),
+            session_type: "claude".into(),
+            session,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            transcript_id: None,
+            generation: 0,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            task_id: None,
+            last_delivery: None,
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+            seeded_from_snapshot: None,
+            preserved_last_exit: None,
+            host_id: host,
+        };
+        (ts, tx, teof)
+    }
+
+    fn workspace_with(ts: TerminalSession) -> Workspace {
+        Workspace {
+            id: "ws-remote".into(),
+            name: "remote".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            sessions: vec![ts],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        }
+    }
+
+    /// THE freeze→recovery regression. RED without the fix (the
+    /// detection branch in `drain_terminal_events`): the slot would be
+    /// marked `exited` and never requeued. GREEN with it: the slot is
+    /// preserved, flagged reconnecting, and queued for reattach.
+    #[test]
+    fn transport_death_on_attached_remote_session_reconnects_instead_of_freezing() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&local_sock);
+        let (ts, tx, teof) =
+            session_with_injected_exit("uid-remote", manager_host(), true);
+        let teof = teof.expect("remote session has a transport_eof flag");
+        app.workspaces.push(workspace_with(ts));
+        // sessions_restored=false → any internal manifest save no-ops
+        // (no disk writes); we assert in-memory state only.
+        app.sessions_restored = false;
+
+        // The attach stream died: the reader synthesized a child exit
+        // (no End frame). Deliver it through the session's event
+        // channel exactly as alacritty's EventLoop would.
+        tx.send(TermEvent::Exit).expect("send exit");
+
+        app.drain_terminal_events();
+
+        // 1) The slot is NOT torn down — this is the freeze fix.
+        let live = &app.workspaces[0].sessions[0];
+        assert!(
+            !live.session.exited,
+            "a transport EOF on a remote attach must NOT mark the slot exited \
+             — the daemon-side PTY is still alive",
+        );
+        // 2) Flagged reconnecting (drives the ⟳ sidebar indicator).
+        assert!(
+            app.reconnecting_sessions.contains("uid-remote"),
+            "the session must be marked reconnecting",
+        );
+        // 3) Requeued into the existing deferred-reattach flow.
+        assert_eq!(app.pending_remote_reattach.len(), 1);
+        assert_eq!(app.pending_remote_reattach[0].entry.uid, "uid-remote");
+        assert_eq!(
+            app.pending_remote_reattach[0].entry.host_id,
+            manager_host(),
+        );
+        // 4) The transport-EOF flag was consumed (read-and-clear).
+        assert!(
+            !teof.load(Ordering::SeqCst),
+            "the transport_eof flag is cleared once consumed",
+        );
+
+        // --- recovery window: tunnel still down ---------------------
+        // The per-host manifest.watch consumer hasn't warmed the
+        // tunnel yet (no real ssh), so the reattach drain must PRESERVE
+        // the reconnecting slot, never drop it.
+        app.drain_deferred_remote_reattach();
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "while the tunnel is down the entry stays queued for retry",
+        );
+        assert!(
+            app.reconnecting_sessions.contains("uid-remote"),
+            "still reconnecting until the tunnel returns",
+        );
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "the session slot is preserved across the reconnect window",
+        );
+        assert!(
+            !app.workspaces[0].sessions[0].session.exited,
+            "the preserved slot is not exited",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// LOCAL sessions are completely unaffected: a child exit marks
+    /// them exited as before — no reconnect, no requeue.
+    /// `daemon_transport_eof` is `None` for local sessions, so the
+    /// transport-death branch can never fire.
+    #[test]
+    fn local_session_exit_is_unaffected_by_reconnect_path() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let (ts, tx, teof) = session_with_injected_exit(
+            "uid-local",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        assert!(teof.is_none(), "local sessions carry no transport_eof flag");
+        app.workspaces.push(workspace_with(ts));
+        app.sessions_restored = false;
+
+        tx.send(TermEvent::Exit).expect("send exit");
+        app.drain_terminal_events();
+
+        let live = &app.workspaces[0].sessions[0];
+        assert!(
+            live.session.exited,
+            "a local child exit still marks the slot exited",
+        );
+        assert!(
+            app.reconnecting_sessions.is_empty(),
+            "local sessions never enter the reconnect path",
+        );
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "local sessions are never requeued for remote reattach",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// "No lost work" guarantee: a queued workflow prompt must NOT be
+    /// consumed (delivered against the dead EventLoop) while the remote
+    /// session's attach stream is down — it stays queued for the post-rebind
+    /// flush. Covers BOTH the in-tick path (the stream dies this drain) and
+    /// the snapshot path (already reconnecting from a prior tick). RED without
+    /// the pending-write gate: `deliver_pending_write` would `take()` the
+    /// ready prompt and lose it.
+    #[test]
+    fn queued_prompt_survives_while_remote_session_reconnecting() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&local_sock);
+        // Remote session with a workflow prompt queued and unconditionally
+        // READY (hard_deadline in the past), so the ONLY thing that can stop
+        // its delivery is the reconnect gate.
+        let (mut ts, tx, _teof) =
+            session_with_injected_exit("uid-remote", manager_host(), true);
+        ts.pending_prompt = Some(PendingWrite {
+            text: "review the unstaged diff".into(),
+            submit: true,
+            earliest_deliver_at: Instant::now() - Duration::from_secs(1),
+            require_quiet: Duration::from_millis(0),
+            hard_deadline: Instant::now() - Duration::from_millis(1),
+        });
+        app.workspaces.push(workspace_with(ts));
+        app.sessions_restored = false;
+
+        // Sanity: the prompt really is ready — without the gate it WOULD be
+        // delivered/consumed this tick.
+        assert!(
+            App::ready_for_write(
+                &app.workspaces[0].sessions[0].session,
+                app.workspaces[0].sessions[0].pending_prompt.as_ref().unwrap(),
+                Instant::now(),
+            ),
+            "prompt must be ready so the test actually exercises the gate",
+        );
+
+        // --- in-tick path: the stream dies THIS drain ---------------
+        tx.send(TermEvent::Exit).expect("send exit");
+        app.drain_terminal_events();
+
+        assert!(
+            app.reconnecting_sessions.contains("uid-remote"),
+            "session entered reconnecting state",
+        );
+        assert!(
+            app.workspaces[0].sessions[0].pending_prompt.is_some(),
+            "a queued prompt must NOT be consumed in the same tick the stream \
+             dies — it would be silently lost against the dead EventLoop",
+        );
+
+        // --- snapshot path: still reconnecting next tick ------------
+        app.drain_terminal_events();
+        assert!(
+            app.workspaces[0].sessions[0].pending_prompt.is_some(),
+            "the prompt must keep surviving on subsequent reconnecting ticks \
+             (seeded from the reconnecting snapshot), not just the first",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Closing a session during the offline window must cancel its reconnect
+    /// bookkeeping so `drain_deferred_remote_reattach` can't resurrect it once
+    /// the tunnel returns. RED without the `forget_reconnect_state` call on the
+    /// close path: the queued reattach work item survives the close and would
+    /// re-create the session the user explicitly removed.
+    #[test]
+    fn closing_a_reconnecting_session_prevents_resurrection() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let local_sock = cm_dir.join("daemon.sock");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&local_sock);
+        let (ts, _tx, _teof) =
+            session_with_injected_exit("uid-remote", manager_host(), false);
+        app.workspaces.push(workspace_with(ts));
+        // Reconnecting state: marked + queued for reattach (what
+        // drain_pty_events would have set up when the stream died).
+        app.reconnecting_sessions.insert("uid-remote".to_string());
+        app.pending_remote_reattach.push(PendingRemoteReattach::new(
+            "ws-remote".to_string(),
+            app.workspaces[0].sessions[0].to_manifest_entry(),
+        ));
+        app.sessions_restored = false;
+
+        // User closes the session during the offline window.
+        app.cursor = Cursor::Session(0, 0);
+        app.close_active_session();
+
+        // Both reconnect collections are cleared by the close.
+        assert!(
+            app.reconnecting_sessions.is_empty(),
+            "the reconnecting marker must be cleared on close",
+        );
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "the queued reattach work item must be cancelled on close",
+        );
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "the session slot is removed",
+        );
+
+        // The deferred drain has nothing to act on — no resurrection.
+        app.drain_deferred_remote_reattach();
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "a session closed while offline must NOT be resurrected on reconnect",
+        );
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "still nothing queued after the drain",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// App + a REMOTE host on a Unix transport whose socket doesn't exist.
+    /// `live_socket_path` for a UnixDirect handle is ALWAYS `Some` (it's
+    /// "always bound"), so the deferred-reattach drain treats the tunnel as UP
+    /// and ATTEMPTS the reattach — but the attach RPCs then fail (no daemon
+    /// behind the socket). That's the transient-failure-with-tunnel-up shape
+    /// the bounded retry must survive, without any real ssh.
+    fn app_with_ghost_unix_host(
+        cm_dir: &std::path::Path,
+    ) -> (App, cm_daemon::host_id::HostId) {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let ghost = cm_daemon::host_id::HostId::new("ghost");
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: cm_dir.join("daemon.sock"),
+                    },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: ghost.clone(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: cm_dir.join("ghost-nonexistent.sock"),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts).expect("pool"),
+        );
+        (app, ghost)
+    }
+
+    /// A reconnecting remote session whose tunnel is UP but whose reattach
+    /// attempt fails (no daemon) must KEEP retrying — not be flipped to exited
+    /// on the first failure. `live_socket_path()` only proves the forwarded
+    /// socket exists; the attach RPCs can still lose a transient race right
+    /// after a tunnel respawn while the daemon session is alive. RED without
+    /// the bounded-retry change: a single `None` marks the slot exited.
+    #[test]
+    fn transient_reattach_failure_keeps_retrying_not_immediately_exited() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        // Sanity: the drain WILL attempt (tunnel reported up).
+        assert!(
+            app.host_pool.live_socket_path(&ghost).is_some(),
+            "a UnixDirect host always reports a live socket path",
+        );
+
+        let (ts, _tx, _teof) =
+            session_with_injected_exit("uid-remote", ghost.clone(), false);
+        let mut ws = workspace_with(ts);
+        // A worktree_path so try_reattach proceeds to the (failing) dial
+        // rather than short-circuiting on a missing path.
+        ws.worktree_path = Some(home.join("wt"));
+        app.workspaces.push(ws);
+        app.reconnecting_sessions.insert("uid-remote".to_string());
+        app.pending_remote_reattach.push(PendingRemoteReattach::new(
+            "ws-remote".to_string(),
+            app.workspaces[0].sessions[0].to_manifest_entry(),
+        ));
+        app.sessions_restored = false;
+
+        // One drain tick: the reattach fails, but it's the FIRST failure.
+        app.drain_deferred_remote_reattach();
+
+        assert!(
+            !app.workspaces[0].sessions[0].session.exited,
+            "a transient reattach failure must NOT immediately mark the slot \
+             exited — the daemon session may still be alive (post-respawn \
+             race); this is the freeze the bounded retry prevents",
+        );
+        assert!(
+            app.reconnecting_sessions.contains("uid-remote"),
+            "the session stays reconnecting and keeps retrying",
+        );
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "the reattach work item stays queued for the next attempt",
+        );
+        assert_eq!(
+            app.pending_remote_reattach[0].attempts, 1,
+            "the failed attempt was counted toward the give-up bound",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Bound check (nice-to-have): a genuinely-gone session settles to exited
+    /// after the give-up threshold instead of spinning "⟳ reconnecting"
+    /// forever.
+    #[test]
+    fn reconnect_settles_to_exited_after_sustained_failure() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        let (ts, _tx, _teof) =
+            session_with_injected_exit("uid-remote", ghost.clone(), false);
+        let mut ws = workspace_with(ts);
+        ws.worktree_path = Some(home.join("wt"));
+        app.workspaces.push(ws);
+        app.reconnecting_sessions.insert("uid-remote".to_string());
+        // Pre-load the item one short of the bound, with no throttle delay
+        // (last_attempt_at None) so this drain makes the FINAL attempt.
+        let mut item = PendingRemoteReattach::new(
+            "ws-remote".to_string(),
+            app.workspaces[0].sessions[0].to_manifest_entry(),
+        );
+        item.attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+        app.pending_remote_reattach.push(item);
+        app.sessions_restored = false;
+
+        app.drain_deferred_remote_reattach();
+
+        assert!(
+            app.workspaces[0].sessions[0].session.exited,
+            "after the sustained-failure bound the slot settles to exited",
+        );
+        assert!(
+            app.reconnecting_sessions.is_empty(),
+            "the reconnecting marker is cleared on give-up",
+        );
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "the work item is dropped from the retry queue on give-up",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// The MCP/control `kill_session` removal path must clear reconnect
+    /// bookkeeping too — same resurrection guard as the operator close paths
+    /// (round 2). RED without the `forget_reconnect_state` call in
+    /// `control::methods::kill_session`: the queued reattach survives and the
+    /// session would be resurrected when the tunnel returns.
+    #[test]
+    fn kill_session_control_path_clears_reconnect_state() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        // A live caller (no task scope, same workspace → authorized to kill)
+        // plus the reconnecting target.
+        let (caller, _c_tx, _c_t) =
+            session_with_injected_exit("caller", ghost.clone(), false);
+        let (target, _tx, _teof) =
+            session_with_injected_exit("uid-remote", ghost.clone(), false);
+        let mut ws = workspace_with(caller);
+        ws.sessions.push(target);
+        app.workspaces.push(ws);
+        app.reconnecting_sessions.insert("uid-remote".to_string());
+        app.pending_remote_reattach.push(PendingRemoteReattach::new(
+            "ws-remote".to_string(),
+            app.workspaces[0].sessions[1].to_manifest_entry(),
+        ));
+        app.sessions_restored = false;
+
+        // Kill the reconnecting session via the control/MCP handler.
+        let res = crate::control::methods::kill_session(
+            &mut app,
+            "caller",
+            &serde_json::json!({ "session_uid": "uid-remote" }),
+        );
+        assert!(res.is_ok(), "kill_session should succeed: {:?}", res.err());
+
+        assert!(
+            app.reconnecting_sessions.is_empty(),
+            "kill_session must clear the reconnecting marker",
+        );
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "kill_session must cancel the queued reattach so the killed \
+             session can't be resurrected on reconnect",
+        );
+
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },

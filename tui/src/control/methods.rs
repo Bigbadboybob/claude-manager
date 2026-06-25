@@ -763,6 +763,11 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
         }
         ws.sessions.remove(si);
     }
+    // Cancel any remote-reconnect bookkeeping for the killed session so a
+    // session killed mid-reconnect (via this MCP/control path) isn't
+    // resurrected by `drain_deferred_remote_reattach` when the tunnel
+    // returns — the same resurrection guard the operator close paths use.
+    app.forget_reconnect_state(&p.session_uid);
     // Persist immediately so a TUI crash between this kill and the next
     // unrelated save can't lose the tombstone (which would let the
     // killed session restore as live on next boot, breaking Phase 2b).

@@ -84,6 +84,21 @@ pub struct Session {
     /// signal via the watcher's `MemoryKillEvent` channel
     /// instead.
     pub daemon_memory_cap_kill: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Latched `transport_eof` flag for daemon-attached sessions
+    /// (remote auto-reconnect). The attach-stream reader half stores
+    /// `true` here when the daemon's attach socket EOF'd WITHOUT an
+    /// `End` frame — the transport (typically the SSH tunnel) died
+    /// while the daemon-side PTY + workflow keep running. The exit
+    /// handler at `app.rs::drain_pty_events` reads-and-clears it via
+    /// `swap(false, SeqCst)` after observing
+    /// `TermEvent::Exit`/`ChildExit`; for a REMOTE session a `true`
+    /// here means "this session's I/O stream died, but the daemon
+    /// session is alive — mark it reconnecting and requeue for
+    /// reattach" instead of tearing the session slot down.
+    ///
+    /// `None` for local-PTY sessions — a local PTY has no detachable
+    /// transport, so its exits are always genuine child exits.
+    pub daemon_transport_eof: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Session {
@@ -244,6 +259,9 @@ impl Session {
             // Local-spawn sessions get cap-kill signals via the
             // watcher's `MemoryKillEvent` channel, not this Arc.
             daemon_memory_cap_kill: None,
+            // A local PTY has no detachable transport, so its exits
+            // are always genuine child exits — never a reconnect.
+            daemon_transport_eof: None,
         })
     }
 
@@ -285,6 +303,10 @@ impl Session {
             cgroup_path,
             daemon_session_uid: Some(cs.session_uid),
             daemon_memory_cap_kill: Some(cs.memory_cap_kill),
+            // Route the latched transport-EOF flag up to the exit
+            // handler so a tunnel death on this re-attached remote
+            // session triggers reconnect, not teardown.
+            daemon_transport_eof: Some(cs.transport_eof),
         })
     }
 
@@ -332,6 +354,10 @@ impl Session {
             // flag from the AttachedPty's reader half up to the
             // exit handler.
             daemon_memory_cap_kill: Some(cs.memory_cap_kill),
+            // Remote auto-reconnect: route the latched transport-EOF
+            // flag up too, so a dead attach stream on a remote
+            // session reconnects instead of tearing down.
+            daemon_transport_eof: Some(cs.transport_eof),
         })
     }
 

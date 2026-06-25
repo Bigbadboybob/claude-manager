@@ -264,6 +264,19 @@ pub struct ClientSession {
     /// so by the time the EventLoop delivers the exit event the
     /// flag is already populated.
     pub memory_cap_kill: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Latched `transport_eof` flag from the attach stream (remote
+    /// auto-reconnect). The attach-stream reader half stores `true`
+    /// here when the socket EOF'd with no daemon `End` frame — the
+    /// transport died while the daemon-side PTY is (almost certainly)
+    /// still alive. The exit handler reads (and clears) this via
+    /// `swap(false, SeqCst)` after observing
+    /// `TermEvent::Exit`/`ChildExit`; for a REMOTE session `true`
+    /// means "requeue for reattach" rather than "mark exited".
+    ///
+    /// Shared with the `AttachedPty` (which lives inside alacritty's
+    /// EventLoop thread post-spawn); same latched-before-pipe-signal
+    /// ordering as [`Self::memory_cap_kill`].
+    pub transport_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -419,6 +432,12 @@ impl ClientSession {
         // out so the TUI's exit handler can observe and clear it
         // post-spawn.
         let memory_cap_kill = pty.memory_cap_kill_handle();
+        // Same as `memory_cap_kill`: grab the latched-by-reader
+        // `transport_eof` Arc BEFORE the EventLoop takes ownership of
+        // `pty`, so the TUI's exit handler can observe (post-spawn,
+        // via this shared Arc) whether the exit was a transport death
+        // and drive the remote-reconnect requeue.
+        let transport_eof = pty.transport_eof_handle();
 
         // Step 6: build alacritty Term + EventLoop over the
         // AttachedPty. Mirrors Session::new's post-PTY shape so
@@ -467,6 +486,7 @@ impl ClientSession {
             session_uid: session_uid.to_string(),
             cgroup_path: start_result.cgroup_path.clone(),
             memory_cap_kill,
+            transport_eof,
         })
     }
 
