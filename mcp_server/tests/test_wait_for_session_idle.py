@@ -64,12 +64,18 @@ class WaitForSessionIdleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ready_idle_returns_immediately(self):
         res, dt = await self._run([READY_IDLE], pending_idle_grace_s=0.5)
-        self.assertEqual(res, {"idle": True, "timed_out": False, "state": "ready"})
+        self.assertEqual(res, {
+            "idle": True, "timed_out": False, "state": "ready",
+            "status": "awaiting_input",
+        })
         self.assertLess(dt, 0.2)
 
     async def test_exited_returns_idle_exited(self):
         res, _ = await self._run([EXITED], pending_idle_grace_s=0.5)
-        self.assertEqual(res, {"idle": True, "timed_out": False, "state": "exited"})
+        self.assertEqual(res, {
+            "idle": True, "timed_out": False, "state": "exited",
+            "status": "exited",
+        })
 
     async def test_pending_idle_returns_after_grace_not_timeout(self):
         # The core regression: a quiet pending session must return within
@@ -77,7 +83,10 @@ class WaitForSessionIdleTests(unittest.IsolatedAsyncioTestCase):
         res, dt = await self._run(
             [PENDING_IDLE], pending_idle_grace_s=0.4, timeout_s=60
         )
-        self.assertEqual(res, {"idle": True, "timed_out": False, "state": "pending"})
+        self.assertEqual(res, {
+            "idle": True, "timed_out": False, "state": "pending",
+            "status": "starting",
+        })
         self.assertGreaterEqual(dt, 0.3)  # waited roughly the grace
         self.assertLess(dt, 5.0)  # nowhere near timeout_s=60
 
@@ -89,7 +98,10 @@ class WaitForSessionIdleTests(unittest.IsolatedAsyncioTestCase):
             [PENDING_BUSY, PENDING_BUSY, READY_BUSY, READY_IDLE],
             pending_idle_grace_s=0.4,
         )
-        self.assertEqual(res, {"idle": True, "timed_out": False, "state": "ready"})
+        self.assertEqual(res, {
+            "idle": True, "timed_out": False, "state": "ready",
+            "status": "awaiting_input",
+        })
 
     async def test_busy_poll_resets_pending_idle_streak(self):
         # A busy poll partway through the pending-idle streak must restart
@@ -108,7 +120,10 @@ class WaitForSessionIdleTests(unittest.IsolatedAsyncioTestCase):
         res, _ = await self._run(
             [READY_BUSY], pending_idle_grace_s=5, timeout_s=0.3
         )
-        self.assertEqual(res, {"idle": False, "timed_out": True, "state": "ready"})
+        self.assertEqual(res, {
+            "idle": False, "timed_out": True, "state": "ready",
+            "status": "working",
+        })
 
 
 if __name__ == "__main__":

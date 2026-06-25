@@ -33,6 +33,7 @@ except ModuleNotFoundError:
 from mcp_server import control_client
 from mcp_server.transcripts import claude_code as transcripts_claude
 from mcp_server.transcripts import codex as transcripts_codex
+from mcp_server.transcripts.types import Role
 
 mcp = FastMCP("claude-manager")
 
@@ -413,6 +414,63 @@ def ping() -> dict:
         return {"ok": False, "transport_error": str(e)}
 
 
+# ---- Session status + transcript-tail helpers ----------------------
+# Shared by the read / wait / monitor tools below.
+
+def _session_status(state: str, idle: bool) -> str:
+    """Collapse the daemon's (state, idle) pair into ONE unambiguous
+    word. Agents routinely misread the raw signal because "idle" means
+    three different things depending on `state`; this is the legible
+    summary they should branch on:
+
+      - "starting"        spawned but transcript not bound yet — the
+                          agent is still coming up, OR it's a
+                          transcript-less bash session. `idle` is not
+                          meaningful here, so a quiet pending session is
+                          still "starting", not "done".
+      - "working"         transcript bound, PTY active in the last ~2s
+                          (mid-turn).
+      - "awaiting_input"  transcript bound, PTY quiet — the agent
+                          finished its turn and is back at the prompt,
+                          waiting on you.
+      - "exited"          process gone.
+
+    `state` and `idle` are still returned alongside `status` everywhere,
+    so callers that want the raw signal keep it.
+    """
+    if state == "exited":
+        return "exited"
+    if state == "pending":
+        return "starting"
+    return "awaiting_input" if idle else "working"
+
+
+# Large enough to mean "read the whole transcript": parse_lines stops
+# once it has this many rendered messages, and no real session approaches
+# it, so this reads everything.
+_READ_ALL_LIMIT = 100_000_000
+
+
+def _parser_for(engine: str):
+    return transcripts_codex if engine == "codex" else transcripts_claude
+
+
+def _read_all_messages(engine: str, path: str, generation: int):
+    """Parse the entire current-generation transcript. Returns
+    (messages, end_cursor)."""
+    return _parser_for(engine).read_messages(
+        path, generation, None, _READ_ALL_LIMIT
+    )
+
+
+def _last_assistant(messages) -> dict | None:
+    """The last assistant message in `messages` as a dict, or None."""
+    for m in reversed(messages):
+        if m.role == Role.ASSISTANT:
+            return m.to_dict()
+    return None
+
+
 @mcp.tool()
 def list_sessions(
     task_id: str | None = None,
@@ -429,13 +487,25 @@ def list_sessions(
             (state=`exited`). Default false. Read-after-exit still
             works via `read_session_output` regardless of this flag.
 
-    Returns: list of {session_uid, label, type, state, idle, managed_by_uid}.
+    Returns: list of {session_uid, label, type, state, idle, status,
+        managed_by_uid}.
         state ∈ {"ready", "pending", "exited"}.
+        status ∈ {"starting", "working", "awaiting_input", "exited"} —
+            the legible summary of (state, idle); branch on this instead
+            of decoding the pair yourself. See the status legend on
+            `wait_for_session_idle`.
     """
     params: dict = {"include_exited": include_exited}
     if task_id:
         params["task_id"] = task_id
-    return control_client.call("list_sessions", params)
+    sessions = control_client.call("list_sessions", params)
+    # Enrich each entry with the legible `status` derived from the
+    # daemon's raw (state, idle) — one word agents can branch on.
+    for s in sessions:
+        s["status"] = _session_status(
+            s.get("state", "pending"), bool(s.get("idle", False))
+        )
+    return sessions
 
 
 @mcp.tool()
@@ -495,6 +565,12 @@ def start_session(
 @mcp.tool()
 def send_input(session_uid: str, text: str, submit: bool = True) -> dict:
     """Deliver a prompt to a session you can see.
+
+    If you want the agent's REPLY (the usual case), prefer
+    `send_input_and_wait` — it sends, waits for the turn to finish, and
+    returns the response in one call, without the post-send idle race.
+    Use bare `send_input` for fire-and-forget or when you'll monitor a
+    batch with `wait_for_any_session_idle`.
 
     Args:
         session_uid: Target session's stable UID (from list_sessions).
@@ -566,10 +642,16 @@ def read_session_output(
             start from the beginning of the current transcript.
         max_messages: Stop after this many messages. Default 20.
 
-    Returns: {messages, cursor, generation, state, idle}.
+    To grab only the FINAL message of a long session, don't page all the
+    way through with this — call `read_last_turn` instead (it reads the
+    tail directly).
+
+    Returns: {messages, cursor, generation, state, idle, status}.
         - messages: list of {role, content, ts}
         - cursor: opaque, pass back on next call
         - state: "ready" | "pending" | "exited"
+        - status: "starting"|"working"|"awaiting_input"|"exited" — the
+          legible summary of (state, idle)
         - When state="pending", messages is empty and you can poll again.
     """
     try:
@@ -593,9 +675,10 @@ def read_session_output(
             "generation": generation,
             "state": state,
             "idle": idle,
+            "status": _session_status(state, idle),
         }
 
-    parser = transcripts_codex if engine == "codex" else transcripts_claude
+    parser = _parser_for(engine)
     messages, cursor = parser.read_messages(
         transcript_path,
         generation,
@@ -608,6 +691,75 @@ def read_session_output(
         "generation": generation,
         "state": state,
         "idle": idle,
+        "status": _session_status(state, idle),
+    }
+
+
+@mcp.tool()
+def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
+    """Read the TAIL of a session's transcript — the fast way to see what
+    an agent just said without paging through the whole thing.
+
+    `read_session_output` pages FORWARD from the start, so fetching the
+    final message of a long session means walking the entire transcript
+    20 messages at a time (the trap where you read the first N and never
+    reach the end). When all you want is "what did it conclude / what is
+    it asking me?", call this: it returns the last assistant message
+    directly, plus a little trailing context.
+
+    Args:
+        session_uid: Target session's stable UID.
+        context_messages: How many trailing messages to include in
+            `messages` for context (default 6, clamped to [0, 100]).
+            `last_assistant` is the final assistant message regardless.
+
+    Returns: {last_assistant, messages, status, state, idle, generation,
+        cursor}.
+        - last_assistant: {role, content, ts} for the final assistant
+          message, or null if the agent hasn't produced one yet.
+        - messages: the last `context_messages` rendered messages
+          (oldest-first), for context around the final turn.
+        - status: "starting"|"working"|"awaiting_input"|"exited".
+        - cursor: end cursor — pass to `read_session_output(since_cursor=)`
+          if you later want to resume forward reads from here.
+    """
+    try:
+        resolved = control_client.call(
+            "resolve_authorized_session",
+            {"session_uid": session_uid},
+        )
+    except control_client.ControlError as e:
+        return {"error": e.code, "message": e.message}
+
+    state = resolved.get("state", "pending")
+    engine = resolved.get("engine", "claude-code")
+    transcript_path = resolved.get("transcript_path")
+    generation = int(resolved.get("generation", 0))
+    idle = bool(resolved.get("idle", False))
+    status = _session_status(state, idle)
+
+    if transcript_path is None:
+        return {
+            "last_assistant": None,
+            "messages": [],
+            "status": status,
+            "state": state,
+            "idle": idle,
+            "generation": generation,
+            "cursor": None,
+        }
+
+    n = max(0, min(context_messages, 100))
+    messages, cursor = _read_all_messages(engine, transcript_path, generation)
+    tail = messages[-n:] if n else []
+    return {
+        "last_assistant": _last_assistant(messages),
+        "messages": [m.to_dict() for m in tail],
+        "status": status,
+        "state": state,
+        "idle": idle,
+        "generation": generation,
+        "cursor": cursor,
     }
 
 
@@ -898,13 +1050,25 @@ async def wait_for_session_idle(
             [1.0, 60.0].
 
     Returns: {"idle": bool, "timed_out": bool, "state":
-        "ready"|"pending"|"exited"}.
-        - idle=True, state="ready": agent finished its turn.
-        - idle=True, state="exited": session terminated.
-        - idle=True, state="pending": PTY quiet but no transcript bound;
-          best-effort idle after the grace window (transcript never
-          bound — e.g. a bash session or a detector-less daemon).
-        - idle=False, timed_out=True: deadline reached while still busy.
+        "ready"|"pending"|"exited", "status":
+        "starting"|"working"|"awaiting_input"|"exited"}.
+        `status` is the legible summary of (state, idle) — branch on it
+        instead of decoding the pair:
+        - status="awaiting_input" (state="ready", idle): agent finished
+          its turn and is back at the prompt.
+        - status="exited" (state="exited"): session terminated.
+        - status="starting" (state="pending", idle): PTY quiet but no
+          transcript bound; best-effort idle after the grace window
+          (transcript never bound — e.g. a bash session or a
+          detector-less daemon).
+        - status="working" (idle=False, timed_out=True): deadline
+          reached while still busy.
+
+    Note: this returns on the FIRST quiet-at-prompt poll, which can race
+    a slow-to-start agent right after `send_input` (the session looks
+    quiet for ~2s before the agent's first token). To send a prompt and
+    reliably get the reply to THAT prompt, use `send_input_and_wait`,
+    which anchors on transcript progress instead.
 
     Raises ControlError on auth failure or unknown session_uid.
     """
@@ -932,18 +1096,27 @@ async def wait_for_session_idle(
             # wait" helper exactly when the watched turn finishes by exiting).
             # A uid that NEVER resolved is a genuine bad-uid error — re-raise.
             if resolved_once and getattr(e, "code", None) == "not_found":
-                return {"idle": True, "timed_out": False, "state": "exited"}
+                return {
+                    "idle": True, "timed_out": False, "state": "exited",
+                    "status": "exited",
+                }
             raise
         resolved_once = True
         state = resolved.get("state", "pending")
         idle = bool(resolved.get("idle", False))
         now = time.monotonic()
         if state == "exited":
-            return {"idle": True, "timed_out": False, "state": state}
+            return {
+                "idle": True, "timed_out": False, "state": state,
+                "status": _session_status(state, idle),
+            }
         # A READY session (transcript bound) that's quiet is unambiguously
         # done with its turn — return immediately.
         if state == "ready" and idle:
-            return {"idle": True, "timed_out": False, "state": state}
+            return {
+                "idle": True, "timed_out": False, "state": state,
+                "status": _session_status(state, idle),
+            }
         # A `pending` session reports idle=True as soon as its PTY is
         # quiet, but quiet-and-pending is ambiguous: the transcript may
         # just not be bound YET (a freshly-spawned agent the detector
@@ -960,11 +1133,384 @@ async def wait_for_session_idle(
             if pending_idle_since is None:
                 pending_idle_since = now
             elif now - pending_idle_since >= grace:
-                return {"idle": True, "timed_out": False, "state": state}
+                return {
+                "idle": True, "timed_out": False, "state": state,
+                "status": _session_status(state, idle),
+            }
         else:
             pending_idle_since = None
         if now >= deadline:
-            return {"idle": False, "timed_out": True, "state": state}
+            return {
+                "idle": False, "timed_out": True, "state": state,
+                "status": _session_status(state, idle),
+            }
+        await asyncio.sleep(interval)
+
+
+@mcp.tool()
+async def send_input_and_wait(
+    session_uid: str,
+    text: str,
+    submit: bool = True,
+    timeout_s: float = 600.0,
+    poll_interval_s: float = 2.0,
+    pending_idle_grace_s: float = 8.0,
+) -> dict:
+    """Send a prompt to a session and block until it finishes replying,
+    then return the reply. The canonical "ask an agent something and get
+    its answer" call.
+
+    This folds the three-step dance (`send_input` → `wait_for_session_idle`
+    → `read_last_turn`) into one and — crucially — closes the race in the
+    gap between them. `send_input` makes the session look busy for only
+    ~2s, so if the agent takes longer than that to emit its first token, a
+    plain idle-wait can return "done" BEFORE the agent has even started,
+    handing you the PREVIOUS turn's message. This tool anchors completion
+    to transcript progress: it records where the transcript ends BEFORE
+    sending, then reports complete only once a NEW assistant message has
+    appeared AND the session has gone quiet — so you always get the reply
+    to THIS input.
+
+    For transcript-less sessions (bash, or an agent whose transcript never
+    binds) there is nothing to anchor on, so it falls back to the same
+    bounded idle-wait as `wait_for_session_idle` and returns no message.
+
+    Args:
+        session_uid: Target session's stable UID.
+        text: The prompt/body to deliver.
+        submit: Append Enter so the agent submits it (default true). With
+            submit=False the agent won't act, and this will time out.
+        timeout_s: Max seconds to wait for the reply. Default 600 (10 min).
+        poll_interval_s: Seconds between polls. Default 2.
+        pending_idle_grace_s: Grace for a transcript-less session to
+            settle before reporting idle (see `wait_for_session_idle`).
+            Default 8.
+
+    Returns: {delivered, completed, timed_out, status, state, idle,
+        last_message}.
+        - completed=True: the agent produced a reply and went quiet;
+          `last_message` is its final assistant message {role, content,
+          ts} (null for transcript-less sessions even on success).
+        - completed=False, timed_out=True: no completed reply before the
+          deadline (agent may be stuck, or mid-tool-call on a very long
+          turn) — inspect `status`/`state`, or `read_last_turn` to see
+          partial progress.
+
+    State your intent and ask the user before calling — this delivers
+    input to another session, same as `send_input`.
+    """
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(0.5, min(poll_interval_s, 30.0))
+    grace = max(1.0, min(pending_idle_grace_s, 60.0))
+
+    # Anchor: capture the transcript end BEFORE sending so we can tell the
+    # reply to THIS input apart from the turn that was already there. The
+    # file persists across exit, so the captured path also lets us read
+    # the final reply even if the agent exits right after answering.
+    engine = "claude-code"
+    transcript_path: str | None = None
+    anchor_cursor: str | None = None
+    generation = 0
+    try:
+        pre = await asyncio.to_thread(
+            control_client.call,
+            "resolve_authorized_session",
+            {"session_uid": session_uid},
+        )
+        engine = pre.get("engine", "claude-code")
+        transcript_path = pre.get("transcript_path")
+        generation = int(pre.get("generation", 0))
+        if transcript_path is not None:
+            _pre_msgs, anchor_cursor = await asyncio.to_thread(
+                _read_all_messages, engine, transcript_path, generation
+            )
+    except control_client.ControlError as e:
+        return {"error": e.code, "message": e.message}
+
+    # Deliver the input. Routes to the TUI's encoding-aware drainer
+    # (kitty Enter etc.), same as the standalone `send_input` tool.
+    await asyncio.to_thread(
+        control_client.call,
+        "send_input",
+        {"session_uid": session_uid, "text": text, "submit": submit},
+    )
+
+    cursor = anchor_cursor
+    saw_new_assistant = False
+    last_message: dict | None = None
+    pending_idle_since: float | None = None
+    resolved_once = False
+
+    def _final_read() -> dict | None:
+        if transcript_path is None:
+            return last_message
+        try:
+            msgs, _ = _read_all_messages(engine, transcript_path, generation)
+        except OSError:
+            return last_message
+        return _last_assistant(msgs) or last_message
+
+    while True:
+        try:
+            resolved = await asyncio.to_thread(
+                control_client.call,
+                "resolve_authorized_session",
+                {"session_uid": session_uid},
+            )
+        except control_client.ControlError as e:
+            # Evicted-after-seen == exited mid-turn (see
+            # `wait_for_session_idle`). The agent answered then exited
+            # (one-shot) — read the final reply from the captured path.
+            if resolved_once and getattr(e, "code", None) == "not_found":
+                last_message = await asyncio.to_thread(_final_read)
+                return {
+                    "delivered": True, "completed": True, "timed_out": False,
+                    "status": "exited", "state": "exited", "idle": True,
+                    "last_message": last_message,
+                }
+            raise
+        resolved_once = True
+        state = resolved.get("state", "pending")
+        idle = bool(resolved.get("idle", False))
+        # A fresh agent's transcript may bind only AFTER we sent — pick it
+        # up the moment it appears.
+        if transcript_path is None and resolved.get("transcript_path"):
+            transcript_path = resolved.get("transcript_path")
+            engine = resolved.get("engine", engine)
+            generation = int(resolved.get("generation", generation))
+        now = time.monotonic()
+
+        if state == "exited":
+            last_message = await asyncio.to_thread(_final_read)
+            return {
+                "delivered": True, "completed": True, "timed_out": False,
+                "status": "exited", "state": "exited", "idle": True,
+                "last_message": last_message,
+            }
+
+        if transcript_path is not None:
+            # Transcript-anchored: pull new messages since the anchor,
+            # latch the reply, and complete only when a NEW assistant
+            # message exists AND the session is quiet at the prompt.
+            new_msgs, cursor = await asyncio.to_thread(
+                _parser_for(engine).read_messages,
+                transcript_path, generation, cursor, _READ_ALL_LIMIT,
+            )
+            for m in new_msgs:
+                if m.role == Role.ASSISTANT:
+                    saw_new_assistant = True
+                    last_message = m.to_dict()
+            if saw_new_assistant and state == "ready" and idle:
+                return {
+                    "delivered": True, "completed": True, "timed_out": False,
+                    "status": _session_status(state, idle),
+                    "state": state, "idle": idle, "last_message": last_message,
+                }
+        else:
+            # Transcript-less fallback == `wait_for_session_idle` semantics
+            # (no reply to return).
+            if state == "ready" and idle:
+                return {
+                    "delivered": True, "completed": True, "timed_out": False,
+                    "status": _session_status(state, idle),
+                    "state": state, "idle": idle, "last_message": None,
+                }
+            if state == "pending" and idle:
+                if pending_idle_since is None:
+                    pending_idle_since = now
+                elif now - pending_idle_since >= grace:
+                    return {
+                        "delivered": True, "completed": True,
+                        "timed_out": False,
+                        "status": _session_status(state, idle),
+                        "state": state, "idle": idle, "last_message": None,
+                    }
+            else:
+                pending_idle_since = None
+
+        if now >= deadline:
+            return {
+                "delivered": True, "completed": False, "timed_out": True,
+                "status": _session_status(state, idle),
+                "state": state, "idle": idle, "last_message": last_message,
+            }
+        await asyncio.sleep(interval)
+
+
+def _monitor_completed_entry(
+    uid: str,
+    status: str,
+    state: str,
+    idle: bool,
+    engine: str,
+    transcript_path: str | None,
+    generation: int,
+    include_message: bool,
+) -> dict:
+    """Build a `wait_for_any_session_idle` completed-entry, reading the
+    final assistant message off disk when asked. Sync (does file IO) —
+    callers offload it via asyncio.to_thread."""
+    last_message = None
+    if include_message and transcript_path is not None:
+        try:
+            msgs, _ = _read_all_messages(engine, transcript_path, generation)
+            last_message = _last_assistant(msgs)
+        except OSError:
+            last_message = None
+    return {
+        "session_uid": uid,
+        "status": status,
+        "state": state,
+        "idle": idle,
+        "last_message": last_message,
+    }
+
+
+@mcp.tool()
+async def wait_for_any_session_idle(
+    session_uids: list[str],
+    timeout_s: float = 1800.0,
+    poll_interval_s: float = 2.0,
+    pending_idle_grace_s: float = 8.0,
+    return_last_message: bool = True,
+) -> dict:
+    """Monitor MANY sessions at once and return as soon as ANY finishes.
+    The multi-session counterpart to `wait_for_session_idle`.
+
+    `wait_for_session_idle` blocks on a single session, so watching a
+    fan-out of workers means waiting on them one at a time and missing
+    whoever finishes first. This watches the whole set in one call and
+    returns the moment one (or more) reaches a terminal state — finished
+    its turn (`awaiting_input`) or `exited` — telling you WHICH, and
+    (by default) handing you each one's final message inline so you don't
+    need a follow-up read.
+
+    Canonical fan-out loop:
+
+        remaining = [a, b, c]
+        while remaining:
+            r = wait_for_any_session_idle(remaining)
+            for done in r["completed"]:
+                ...handle done["session_uid"], done["last_message"]...
+            remaining = r["still_running"]
+            if r["timed_out"]:
+                break
+
+    Each session uses the same idle rule as `wait_for_session_idle`
+    (ready+quiet, or exited; a transcript-less pending+quiet session
+    reports after `pending_idle_grace_s`). SAME race caveat too: a session
+    that is already quiet at call time is reported immediately, so don't
+    pass a worker you JUST sent input to here — use `send_input_and_wait`
+    for that one, then monitor the rest with this.
+
+    Args:
+        session_uids: Sessions to watch (UIDs from `list_sessions`).
+        timeout_s: Max seconds to wait. Default 1800 (30 min).
+        poll_interval_s: Seconds between polls. Default 2.
+        pending_idle_grace_s: Grace for transcript-less pending sessions.
+            Default 8.
+        return_last_message: Include each completed session's final
+            assistant message. Default true.
+
+    Returns: {completed, still_running, timed_out}.
+        - completed: list of {session_uid, status, state, idle,
+          last_message} for sessions that finished this call (>=1 unless
+          timed out). A bad/unauthorized uid is reported here once with
+          status="error" and an `error` code, so a typo can't block the
+          call forever. last_message is null for transcript-less sessions
+          / when return_last_message is false.
+        - still_running: UIDs not yet finished — pass back to keep waiting.
+        - timed_out: true if the deadline passed with nothing finished.
+    """
+    # Dedupe, preserve order.
+    uids = list(dict.fromkeys(session_uids or []))
+    if not uids:
+        return {"completed": [], "still_running": [], "timed_out": False}
+
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(0.5, min(poll_interval_s, 30.0))
+    grace = max(1.0, min(pending_idle_grace_s, 60.0))
+
+    seen: dict[str, bool] = {u: False for u in uids}
+    pending_idle_since: dict[str, float | None] = {u: None for u in uids}
+    # Last successful (engine, transcript_path, generation) per uid, so we
+    # can still read the final reply after a session is evicted on exit.
+    last_meta: dict[str, tuple[str, str | None, int]] = {}
+    remaining = list(uids)
+
+    while True:
+        completed: list[dict] = []
+        now = time.monotonic()
+        for uid in list(remaining):
+            try:
+                resolved = await asyncio.to_thread(
+                    control_client.call,
+                    "resolve_authorized_session",
+                    {"session_uid": uid},
+                )
+            except control_client.ControlError as e:
+                code = getattr(e, "code", "error")
+                if seen[uid] and code == "not_found":
+                    # Evicted after being seen == exited.
+                    eng, tpath, gen = last_meta.get(
+                        uid, ("claude-code", None, 0)
+                    )
+                    completed.append(await asyncio.to_thread(
+                        _monitor_completed_entry, uid, "exited", "exited",
+                        True, eng, tpath, gen, return_last_message,
+                    ))
+                else:
+                    # Never resolved == bad / unauthorized uid. Report once
+                    # rather than blocking the whole monitor on a typo.
+                    completed.append({
+                        "session_uid": uid, "status": "error",
+                        "state": "exited", "idle": True,
+                        "last_message": None, "error": code,
+                    })
+                remaining.remove(uid)
+                continue
+
+            seen[uid] = True
+            state = resolved.get("state", "pending")
+            idle = bool(resolved.get("idle", False))
+            engine = resolved.get("engine", "claude-code")
+            tpath = resolved.get("transcript_path")
+            gen = int(resolved.get("generation", 0))
+            last_meta[uid] = (engine, tpath, gen)
+
+            done = False
+            if state == "exited":
+                done = True
+            elif state == "ready" and idle:
+                done = True
+            elif state == "pending" and idle:
+                if pending_idle_since[uid] is None:
+                    pending_idle_since[uid] = now
+                elif now - pending_idle_since[uid] >= grace:
+                    done = True
+            else:
+                pending_idle_since[uid] = None
+
+            if done:
+                completed.append(await asyncio.to_thread(
+                    _monitor_completed_entry, uid,
+                    _session_status(state, idle), state, idle,
+                    engine, tpath, gen, return_last_message,
+                ))
+                remaining.remove(uid)
+
+        if completed:
+            return {
+                "completed": completed,
+                "still_running": remaining,
+                "timed_out": False,
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "completed": [],
+                "still_running": remaining,
+                "timed_out": True,
+            }
         await asyncio.sleep(interval)
 
 
