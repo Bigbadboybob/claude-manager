@@ -207,3 +207,12 @@ ssh cm-manager 'sudo cp -r /tmp/mcp_server/* /opt/cm-daemon/mcp_server/ && sudo 
 ```
 
 `claude` (npm `@anthropic-ai/claude-code`) and `codex` (npm `@openai/codex`) are installed system-wide so the daemon can spawn them from any session.
+
+### `cm-manager` backtest-replay DB (predictionTrading)
+
+`cm-manager` also hosts a **local PostgreSQL 17 + TimescaleDB** for predictionTrading backtest replay (the download-from-prod-once, replay-from-local paradigm).
+
+- **Tunnel to prod** — `cm-db-tunnel.service` (systemd, runs as `lucas`, `Restart=always`): `ssh -i ~/.ssh/db-east4-tunnel -N -L 5433:localhost:5432 lucas@34.181.167.141`. `db-east4` lives in a **different** GCP project (`prediction-market-scalper`), so rather than grant the cm-manager SA cross-project IAM (OS Login is off there), a dedicated `~/.ssh/db-east4-tunnel` key is in db-east4's *instance* `ssh-keys` metadata (`default-allow-ssh` already opens `:22`). Mirrors the local `gcloud compute ssh db-east4 -- -N -L 5433:localhost:5432`.
+- **Local DB** — `predictiondb` / `predictionuser`, `timescaledb-tune`'d for the VM. Schema from `prediction/common/application/data/events/setup.sql` (run with `psql -f`; it uses `\ir` includes → 22 tables / 9 hypertables / the `all_events` view). Seed a window with `cd ~/.cm/repos/predictionTrading && uv run python -m analysis.backtests.scripts.download_events --from-config <run>.yaml` over the tunnel (needs `uv sync` + a uv-managed py3.12 first).
+- **`.env`** at `~/.cm/repos/predictionTrading/.env` (the CLONE — worktrees source it via git-common-dir): `POSTGRES_CONNECTION_STRING` (`:5433` → prod via tunnel) + `LOCAL_POSTGRES_CONNECTION_STRING` (`:5432` → local replay). Minimal — just the two DSNs.
+- **MCPs** — `postgres-remote` rides the repo's committed `.mcp.json` (universal — prod is the right target anywhere); `postgres-local` is **host-global** in cm-manager's `~/.claude.json` `mcpServers` with an *absolute* path to the clone's `scripts/mcp/postgres-local.sh` (per-machine opt-in: not every host has a local replay DB — e.g. the trader instance — so it is intentionally NOT committed to `.mcp.json`). `claude mcp list` from the clone shows all three connected.
