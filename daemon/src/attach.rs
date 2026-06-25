@@ -268,6 +268,21 @@ pub struct SessionAttachResponse {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AttachOpenParams {
     pub ticket: String,
+    /// Client terminal size at attach time. `Option` (with
+    /// `#[serde(default)]`) for backward-compat: older TUIs send
+    /// only `ticket` and rely solely on a best-effort post-attach
+    /// `Resize` data frame. That frame silently drops when the
+    /// attach socket is dead/replaced at the moment it fires
+    /// (`Broken pipe`), leaving the PTY stuck at its spawn size —
+    /// the "session renders tiny" bug. When these are present the
+    /// daemon resizes the PTY server-side at stream bind
+    /// (`dispatch_attach_open`), which runs in-process over the
+    /// freshly-consumed ticket and cannot hit a dead socket, so
+    /// the size is correct regardless of the data socket's health.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
 }
 
 /// Response shape for `attach.open`. Returns the bound session uid
@@ -590,6 +605,8 @@ mod tests {
             &caller,
             &AttachOpenParams {
                 ticket: issued.attach_ticket.clone(),
+                cols: None,
+                rows: None,
             },
         )
         .expect("consume succeeds");
@@ -605,6 +622,8 @@ mod tests {
             &operator("op-default"),
             &AttachOpenParams {
                 ticket: "never-issued".into(),
+                cols: None,
+                rows: None,
             },
         )
         .expect_err("unknown ticket must be rejected");
@@ -628,6 +647,8 @@ mod tests {
             &caller,
             &AttachOpenParams {
                 ticket: ticket.id.clone(),
+                cols: None,
+                rows: None,
             },
         )
         .expect_err("expired ticket must be rejected");
@@ -656,6 +677,8 @@ mod tests {
             &operator("op-bob"),
             &AttachOpenParams {
                 ticket: issued.attach_ticket.clone(),
+                cols: None,
+                rows: None,
             },
         )
         .expect_err("wrong caller must be rejected");
@@ -673,6 +696,8 @@ mod tests {
             &operator("op-alice"),
             &AttachOpenParams {
                 ticket: issued.attach_ticket,
+                cols: None,
+                rows: None,
             },
         )
         .expect("legitimate caller still succeeds");
@@ -699,6 +724,8 @@ mod tests {
             &caller,
             &AttachOpenParams {
                 ticket: issued.attach_ticket.clone(),
+                cols: None,
+                rows: None,
             },
         )
         .expect("first consume succeeds");
@@ -709,6 +736,8 @@ mod tests {
             &caller,
             &AttachOpenParams {
                 ticket: issued.attach_ticket,
+                cols: None,
+                rows: None,
             },
         )
         .expect_err("second consume must fail");
@@ -735,9 +764,22 @@ mod tests {
         // The dispatcher deserializes `req.params` into the handler's
         // request type; this test pins the JSON shape so a future
         // schema drift fails noisily.
+        //
+        // Legacy shape (older TUI, ticket only): cols/rows default to
+        // None so the daemon falls back to the post-attach Resize frame.
         let s = r#"{ "ticket": "tk-xyz" }"#;
         let req: AttachOpenParams = serde_json::from_str(s).unwrap();
         assert_eq!(req.ticket, "tk-xyz");
+        assert_eq!(req.cols, None);
+        assert_eq!(req.rows, None);
+
+        // Size-bearing shape (current TUI): cols/rows present so the
+        // daemon resizes the PTY server-side at stream bind.
+        let s = r#"{ "ticket": "tk-xyz", "cols": 203, "rows": 51 }"#;
+        let req: AttachOpenParams = serde_json::from_str(s).unwrap();
+        assert_eq!(req.ticket, "tk-xyz");
+        assert_eq!(req.cols, Some(203));
+        assert_eq!(req.rows, Some(51));
     }
 
     #[test]

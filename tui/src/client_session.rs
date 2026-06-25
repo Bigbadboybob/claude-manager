@@ -407,6 +407,8 @@ impl ClientSession {
             &mut attach_socket,
             config.operator_token_id,
             &attach_resp.attach_ticket,
+            config.cols,
+            config.rows,
         )
         .context("RPC attach.open")?;
         if &open_resp.session_uid != session_uid {
@@ -910,16 +912,27 @@ struct AttachOpenResp {
 /// socket morphs into the PTY stream after the response; callers
 /// pass it back into [`AttachedPty::from_socket`] for the
 /// stream-mode half.
+///
+/// `cols`/`rows` carry the client's live terminal size so the
+/// daemon can resize the PTY server-side at stream bind (see
+/// `dispatch_attach_open`). This is the authoritative size delivery
+/// on (re)attach; the post-attach `session.resize` "kick" the
+/// caller fires afterward is a fallback for older daemons that
+/// ignore these fields. Pre-fix, the kick was the *only* signal,
+/// and it silently dropped (`Broken pipe`) when the attach socket
+/// was dead at that instant — leaving the session stuck tiny.
 fn rpc_attach_open(
     socket: &mut UnixStream,
     operator_token_id: &str,
     ticket: &str,
+    cols: u16,
+    rows: u16,
 ) -> anyhow::Result<AttachOpenResp> {
     let req = Request {
         id: next_request_id(),
         caller: Caller::operator(operator_token_id),
         method: "attach.open".into(),
-        params: serde_json::json!({ "ticket": ticket }),
+        params: serde_json::json!({ "ticket": ticket, "cols": cols, "rows": rows }),
     };
     wire::write_request(socket, &req).context("write attach.open frame")?;
     let _ = socket.flush();

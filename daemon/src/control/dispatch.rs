@@ -1040,8 +1040,32 @@ fn dispatch_attach_open(state: &mut DaemonState, req: &Request) -> DispatchOutco
     // session.attach already minted a ticket for a uid that has
     // since exited — surface as Conflict so the client knows the
     // attach can't proceed.
-    let (fanout_rx, last_exit) = match state.sessions.get(&session_uid) {
-        Some(session) => (session.fanout.subscribe(), session.last_exit.clone()),
+    let (fanout_rx, last_exit) = match state.sessions.get_mut(&session_uid) {
+        Some(session) => {
+            // Apply the client's terminal size server-side, in the
+            // same locked critical section that binds the stream.
+            // This is the authoritative size delivery on (re)attach:
+            // the TUI's post-attach `Resize` data frame is now only a
+            // belt-and-suspenders fallback. That frame writes over the
+            // attach data socket and silently drops (`Broken pipe`)
+            // when the socket is dead/replaced at the instant it fires,
+            // leaving the PTY at its spawn size forever (the terminal
+            // size rarely changes again, so nothing re-triggers it) —
+            // the "session renders tiny" bug. attach.open runs before
+            // any PTY byte flows and resizes in-process, so it can't
+            // hit a dead socket. `cols`/`rows` are absent only for
+            // older TUIs, which keep the legacy frame-only behavior.
+            if let (Some(c), Some(r)) = (params.cols, params.rows) {
+                if let Err(e) = session.resize(c, r) {
+                    eprintln!(
+                        "cm-daemon: attach.open resize {}x{} for {} failed: {} \
+                         (client's post-attach Resize frame is the fallback)",
+                        c, r, session_uid, e,
+                    );
+                }
+            }
+            (session.fanout.subscribe(), session.last_exit.clone())
+        }
         None => {
             return DispatchOutcome::Done(Response::err(
                 req.id.clone(),
@@ -1615,6 +1639,96 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "ts-live",
+        );
+    }
+
+    #[test]
+    fn attach_open_with_size_resizes_session_pty_server_side() {
+        // The fix for the "session renders tiny" bug: attach.open
+        // carries the client's terminal size and the daemon applies
+        // it to the PTY in-process at stream bind, instead of relying
+        // solely on the TUI's best-effort post-attach Resize frame
+        // (which drops with `Broken pipe` when the attach socket is
+        // dead at that instant, stranding the PTY at its spawn size).
+        let state = state_with_session("ts-live");
+
+        // Spawn baseline is the 80x24 SpawnParams default — the very
+        // size that made small-spawned sessions render cut off.
+        let (c0, r0) = {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get("ts-live").expect("live session");
+            (sess.last_cols, sess.last_rows)
+        };
+        assert_ne!(
+            (c0, r0),
+            (203, 51),
+            "precondition: session must not already be at the target size",
+        );
+
+        let mint = dispatch_request(
+            &state,
+            &operator_request("session.attach", serde_json::json!({ "uid": "ts-live" })),
+        ).into_response();
+        let ticket = mint.result.expect("mint result")["attach_ticket"]
+            .as_str()
+            .expect("ticket id")
+            .to_string();
+
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "attach.open",
+                serde_json::json!({ "ticket": ticket, "cols": 203, "rows": 51 }),
+            ),
+        ).into_response();
+        assert!(resp.ok, "attach.open should succeed: {:?}", resp.error);
+
+        // The PTY's last-known size now reflects the client's real
+        // terminal — set server-side, before any byte flowed.
+        let s = state.lock().unwrap();
+        let sess = s.sessions.get("ts-live").expect("live session");
+        assert_eq!(
+            (sess.last_cols, sess.last_rows),
+            (203, 51),
+            "attach.open cols/rows must resize the daemon PTY",
+        );
+    }
+
+    #[test]
+    fn attach_open_without_size_leaves_session_pty_unchanged() {
+        // Backward-compat: an older TUI sends `attach.open { ticket }`
+        // with no cols/rows. The daemon must not touch the PTY size —
+        // it keeps relying on the post-attach Resize frame. Pins the
+        // `#[serde(default)] Option` contract so a future refactor
+        // can't silently resize to 0x0.
+        let state = state_with_session("ts-live");
+        let (c0, r0) = {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get("ts-live").expect("live session");
+            (sess.last_cols, sess.last_rows)
+        };
+
+        let mint = dispatch_request(
+            &state,
+            &operator_request("session.attach", serde_json::json!({ "uid": "ts-live" })),
+        ).into_response();
+        let ticket = mint.result.expect("mint result")["attach_ticket"]
+            .as_str()
+            .expect("ticket id")
+            .to_string();
+
+        let resp = dispatch_request(
+            &state,
+            &operator_request("attach.open", serde_json::json!({ "ticket": ticket })),
+        ).into_response();
+        assert!(resp.ok, "attach.open should succeed: {:?}", resp.error);
+
+        let s = state.lock().unwrap();
+        let sess = s.sessions.get("ts-live").expect("live session");
+        assert_eq!(
+            (sess.last_cols, sess.last_rows),
+            (c0, r0),
+            "size-less attach.open must not change the PTY size",
         );
     }
 
