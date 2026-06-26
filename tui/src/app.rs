@@ -13658,17 +13658,43 @@ impl App {
                         _ => false,
                     };
 
-                    let max_name = (inner.width as usize).saturating_sub(2);
+                    // Remote-host indicator. The host is workspace-scoped (all
+                    // sessions in a workspace share one host, by invariant) but
+                    // it lives per-session as `ts.host_id`, so derive it from the
+                    // first non-local session. An all-local or session-less
+                    // workspace shows nothing. Status view surfaces remoteness via
+                    // `HostHeader` grouping instead; this tag is what makes the
+                    // Task sub-view (which has no host headers) legible.
+                    let remote_host = ws
+                        .sessions
+                        .iter()
+                        .map(|s| &s.host_id)
+                        .find(|h| **h != cm_daemon::host_id::HostId::local());
+                    let host_tag = remote_host
+                        .map(|h| format!(" @{}", h.as_str()))
+                        .unwrap_or_default();
+
+                    // Reserve room for the tag so the name truncates before it.
+                    let max_name = (inner.width as usize)
+                        .saturating_sub(2)
+                        .saturating_sub(host_tag.chars().count());
                     // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
                     // slice panics when the cut lands inside a multibyte char
                     // (e.g. '≤' in a workspace name). Matches the session/task
                     // name truncation sites below.
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
-                    let header_line = Line::from(vec![
-                        Span::raw(" "),
-                        Span::raw(name),
-                    ]);
+                    let mut header_spans = vec![Span::raw(" "), Span::raw(name)];
+                    if !host_tag.is_empty() {
+                        // Magenta keeps it distinct from the Yellow/DarkGray host
+                        // headers and Cyan task/workflow headers. The span keeps
+                        // its color through selection (the name still highlights).
+                        header_spans.push(Span::styled(
+                            host_tag,
+                            Style::default().fg(Color::Magenta),
+                        ));
+                    }
+                    let header_line = Line::from(header_spans);
 
                     let base_style = if is_selected {
                         Style::default()
