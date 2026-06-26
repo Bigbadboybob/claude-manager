@@ -527,6 +527,29 @@ pub fn run() -> anyhow::Result<()> {
         )
     })?;
 
+    // Spawn the continuous-task scheduler — the daemon's SOLE periodic-fire
+    // driver (Phase 3; the structural twin of the workflow poller). It fires
+    // due Periodic tasks, respawns dead supervised Persistent sessions, and
+    // reconciles leaked in_flight guards. Construction is unconditional: when
+    // `[scheduler] enabled = false` the tick is a no-op (and `shutdown()` is a
+    // no-op when never effectively running).
+    //
+    // Same FATAL-on-spawn posture as the poller: with no scheduler the daemon
+    // would persist Periodic continuous tasks but never fire any of them — a
+    // silently-dead scheduler. Fail closed so the operator sees it at startup.
+    let scheduler = std::sync::Arc::new(
+        continuous::scheduler::ContinuousScheduler::new(std::sync::Arc::clone(&state)),
+    );
+    scheduler.start().map_err(|e| {
+        anyhow::anyhow!(
+            "cm-daemon: continuous scheduler thread spawn failed: {}; refusing \
+             to start — the scheduler is the daemon's only periodic-fire driver, \
+             so a daemon without it would persist Periodic continuous tasks but \
+             never fire any of them",
+            e,
+        )
+    })?;
+
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
@@ -556,6 +579,9 @@ pub fn run() -> anyhow::Result<()> {
     // poller is the one long-running auxiliary that needs an
     // explicit signal.
     poller.shutdown();
+    // Signal the continuous scheduler to exit + join, beside the poller. No-op
+    // if it was never started (handle is None).
+    scheduler.shutdown();
     Ok(())
 }
 

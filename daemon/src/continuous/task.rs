@@ -229,6 +229,11 @@ pub struct ContinuousTask {
     /// Phase 3 (watchdog): per-run runtime ceiling.
     #[serde(default)]
     pub max_runtime_secs: Option<u32>,
+    /// Phase 3 (memory cap): per-task override for the spawn's memory-cap
+    /// triple, in bytes. `None` (default) falls back to the daemon's
+    /// `[scheduler] default_cap`; `Some(0)` opts out (uncapped).
+    #[serde(default)]
+    pub mem_cap_bytes: Option<u64>,
     /// Phase 3 (backoff): consecutive-failure counter.
     #[serde(default)]
     pub consecutive_failures: u32,
@@ -286,6 +291,7 @@ impl ContinuousTask {
             compact_every: None,
             supervise: false,
             max_runtime_secs: None,
+            mem_cap_bytes: None,
             consecutive_failures: 0,
             downstream: Vec::new(),
             enqueue_to: None,
@@ -771,6 +777,7 @@ mod tests {
         assert!(task.compact_every.is_none());
         assert!(!task.supervise);
         assert!(task.max_runtime_secs.is_none());
+        assert!(task.mem_cap_bytes.is_none());
         assert!(task.review_surface.is_none());
         assert_eq!(task.run_count, 0);
         assert!(task.modes.is_empty());

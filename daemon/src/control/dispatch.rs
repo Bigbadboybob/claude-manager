@@ -7077,6 +7077,7 @@ mod tests {
                 repos_dir: String::new(),
                 allow_clone: false,
                 repos: Vec::new(),
+                scheduler: Default::default(),
             };
         }
         let resp = dispatch_request(

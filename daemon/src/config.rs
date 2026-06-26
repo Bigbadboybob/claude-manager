@@ -112,6 +112,67 @@ pub struct RepoAllowEntry {
     pub url: String,
 }
 
+/// `[scheduler]` section — Continuous Tasks Phase 3. Tunables for the daemon's
+/// periodic-fire driver (`continuous::scheduler::ContinuousScheduler`, the
+/// structural twin of `workflow::poller::WorkflowPoller`). Every field is
+/// `#[serde(default)]`, and the section itself is `#[serde(default)]` on
+/// `DaemonConfig`, so an existing `daemon.toml` with no `[scheduler]` section
+/// still loads (the local-workstation + cm-manager configs predate it).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SchedulerConfig {
+    /// Master on/off for the scheduler. `false` makes the scheduler's
+    /// `tick_once` a no-op (lib.rs still constructs+starts the thread) so no
+    /// Periodic continuous task ever fires. Default `true`.
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    /// Tick cadence in MICROSECONDS — same vocab as the poller's `tick_micros`
+    /// (`workflow::poller::DEFAULT_TICK_INTERVAL_MICROS = 250_000`). The
+    /// scheduler seeds its own `tick_micros` from this value (clamped to a
+    /// 1 ms floor, falling back to the default when `0`); keeping it in micros
+    /// avoids diverging from the twin and the clamp math. Default `250_000`
+    /// (250 ms).
+    #[serde(default = "default_scheduler_tick_micros")]
+    pub tick_interval: u64,
+    /// Optional disk guard: the maximum number of live continuous worktrees the
+    /// scheduler permits. `None` (default) = unguarded. Enforcement lives in the
+    /// scheduler's due-check (Phase 3), NOT in this config struct.
+    #[serde(default)]
+    pub max_worktrees: Option<u32>,
+    /// Default per-fire memory cap in BYTES, applied to continuous spawns as the
+    /// memory-cap triple (`memory_cap_bytes` / `memory_cap_hard_bytes` /
+    /// `cgroup_prefix`) unless a task overrides it via
+    /// `ContinuousTask::mem_cap_bytes`. `0` opts out (uncapped). Default
+    /// `1_073_741_824` (1 GiB).
+    #[serde(default = "default_scheduler_default_cap")]
+    pub default_cap: u64,
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_scheduler_tick_micros() -> u64 {
+    // Poller-class cadence — mirrors `workflow::poller::DEFAULT_TICK_INTERVAL_MICROS`.
+    250_000
+}
+
+fn default_scheduler_default_cap() -> u64 {
+    // 1 GiB — the per-fire memory ceiling for continuous headless spawns
+    // (DESIGN_MEMORY_CAP.md). A per-task `mem_cap_bytes` overrides this.
+    1_073_741_824
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scheduler_enabled(),
+            tick_interval: default_scheduler_tick_micros(),
+            max_worktrees: None,
+            default_cap: default_scheduler_default_cap(),
+        }
+    }
+}
+
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
@@ -173,6 +234,11 @@ pub struct DaemonConfig {
     /// `name` / `url` even when `allow_clone` is false.
     #[serde(default, rename = "repo")]
     pub repos: Vec<RepoAllowEntry>,
+    /// `[scheduler]` section — Continuous Tasks Phase 3 tunables (the
+    /// periodic-fire driver + per-fire memory cap). Additive +
+    /// `#[serde(default)]` so a `daemon.toml` predating it still loads.
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 impl DaemonConfig {
@@ -203,6 +269,7 @@ impl Default for DaemonConfig {
             repos_dir: String::new(),
             allow_clone: false,
             repos: Vec::new(),
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -492,6 +559,7 @@ mode = "ssh-trust"
                 name: "claude-manager".into(),
                 url: "https://github.com/u/claude-manager.git".into(),
             }],
+            scheduler: SchedulerConfig::default(),
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =
@@ -579,6 +647,69 @@ url = "git@github.com:u/other.git"
             ..DaemonConfig::default()
         };
         assert_eq!(cfg.repos_dir_or_default(), PathBuf::from("/srv/clones"));
+    }
+
+    /// Phase 3: no `[scheduler]` section → every field falls back to its
+    /// serde default (enabled, 250_000 µs / poller-class tick, no worktree
+    /// guard, 1 GiB cap) so a `daemon.toml` predating Continuous Tasks Phase 3
+    /// still loads.
+    #[test]
+    fn scheduler_section_absent_defaults() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(&path, "mcp_server_path = \"\"\n").expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        assert!(cfg.scheduler.enabled, "scheduler on by default");
+        assert_eq!(cfg.scheduler.tick_interval, 250_000, "poller-class µs tick");
+        assert!(cfg.scheduler.max_worktrees.is_none(), "unguarded by default");
+        assert_eq!(cfg.scheduler.default_cap, 1_073_741_824, "1 GiB cap default");
+    }
+
+    /// Phase 3: `SchedulerConfig::default()` (used by the missing-file path and
+    /// the `DaemonConfig` default) carries the same values as an absent section.
+    #[test]
+    fn scheduler_config_default_values() {
+        let s = SchedulerConfig::default();
+        assert!(s.enabled);
+        assert_eq!(s.tick_interval, 250_000);
+        assert_eq!(s.max_worktrees, None);
+        assert_eq!(s.default_cap, 1_073_741_824);
+    }
+
+    /// Phase 3: an explicit `[scheduler]` section overrides each field, and a
+    /// partial section leaves the unspecified fields at their serde defaults.
+    #[test]
+    fn scheduler_section_parses_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            r#"
+mcp_server_path = ""
+
+[scheduler]
+enabled = false
+tick_interval = 500000
+max_worktrees = 32
+"#,
+        )
+        .expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        assert!(!cfg.scheduler.enabled);
+        assert_eq!(cfg.scheduler.tick_interval, 500_000);
+        assert_eq!(cfg.scheduler.max_worktrees, Some(32));
+        // `default_cap` was omitted → its serde default still applies.
+        assert_eq!(cfg.scheduler.default_cap, 1_073_741_824);
     }
 
     /// 12h: `[tls]` section parses when present. All three fields

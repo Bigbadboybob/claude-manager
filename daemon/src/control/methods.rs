@@ -5500,6 +5500,85 @@ fn spawn_agent_prompt_delivery(
         });
 }
 
+/// Deliver a PERSISTENT continuous-task fire's prompt to an EXISTING live
+/// session (no respawn — prior context preserved), optionally preceded by a
+/// `/clear` auto-compaction. Detached thread, same kitty-TUI mechanics as
+/// [`spawn_agent_prompt_delivery`]: settle, then (when `compact`) `/clear` body →
+/// gap → kitty-Enter → settle, then the bracketed prompt body → gap → kitty-Enter.
+///
+/// The `/clear` reuses the SAME hardcoded kitty-Enter + raw single-line body as
+/// the prompt delivery, NOT `fresh_reset::send_clear_body` + a `PtyModeTracker`:
+/// a tracker attached at fire time has NOT observed the agent's startup
+/// kitty/bracketed-paste escapes (those fire once at process start, not per
+/// fire), so `term_mode()` would report the default raw-`\r` mode and `/clear`
+/// would not submit on a kitty TUI — the exact failure `spawn_agent_prompt_delivery`
+/// was written to avoid. The compaction keeps the SAME session/PTY/uid (only the
+/// agent's internal transcript sid rotates); `current_session_uid` is unchanged.
+/// Write failures are logged, not fatal (the fire already counted).
+fn spawn_persistent_prompt_delivery(
+    handle: crate::session::InputHandle,
+    session_uid: String,
+    prompt: String,
+    compact: bool,
+) {
+    let _ = std::thread::Builder::new()
+        .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
+        .spawn(move || {
+            std::thread::sleep(AGENT_PROMPT_SETTLE);
+            if compact {
+                // `/clear` is a single-line slash command — raw body, no bracket.
+                if let Err(e) = handle.write_and_stamp(b"/clear") {
+                    eprintln!(
+                        "cm-daemon: persistent /clear body write failed for {}: {}",
+                        session_uid, e
+                    );
+                    return;
+                }
+                std::thread::sleep(AGENT_ENTER_GAP);
+                if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
+                    eprintln!(
+                        "cm-daemon: persistent /clear Enter write failed for {}: {}",
+                        session_uid, e
+                    );
+                    return;
+                }
+                // Let the agent process /clear (transcript rotation) before the
+                // next prompt lands.
+                std::thread::sleep(AGENT_PROMPT_SETTLE);
+                eprintln!(
+                    "cm-daemon: persistent auto-compact /clear delivered for {}",
+                    session_uid
+                );
+            }
+            let body = prompt.trim_end_matches(['\r', '\n']);
+            let payload = agent_paste_payload(body);
+            let bracketed = payload.len() != body.len();
+            if let Err(e) = handle.write_and_stamp(&payload) {
+                eprintln!(
+                    "cm-daemon: persistent prompt body write failed for {}: {}",
+                    session_uid, e
+                );
+                return;
+            }
+            std::thread::sleep(AGENT_ENTER_GAP);
+            if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
+                eprintln!(
+                    "cm-daemon: persistent prompt Enter write failed for {}: {}",
+                    session_uid, e
+                );
+                return;
+            }
+            eprintln!(
+                "cm-daemon: persistent prompt delivered for {}: compact={} \
+                 body={}B bracketed={} + kitty-Enter(CSI 13 u)",
+                session_uid,
+                compact,
+                body.len(),
+                bracketed,
+            );
+        });
+}
+
 pub fn mcp_start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -6296,6 +6375,13 @@ fn compose_daemon_spawn_params(
 /// task's durable workspace self-heals after a daemon restart cleared the
 /// in-memory `state.workspaces` snapshot (idempotent — a no-op when already
 /// registered; Phase 2 has no restart reconciliation).
+///
+/// Phase 3 also threads the memory-cap triple: the per-task `mem_cap_bytes`
+/// override (else the daemon's `[scheduler] default_cap`) is resolved via
+/// [`resolve_continuous_cap`] and, when backed by a real cgroup prefix, wraps
+/// argv in `systemd-run` and sets `memory_cap_bytes`/`memory_cap_hard_bytes`/
+/// `cgroup_prefix` (all-or-nothing — `start_session` rejects a partial triple).
+/// Absent a user systemd manager the fire runs UNCAPPED rather than failing.
 fn compose_continuous_spawn_params(
     state_arc: &Arc<Mutex<DaemonState>>,
     uid: &str,
@@ -6305,6 +6391,7 @@ fn compose_continuous_spawn_params(
     working_dir: &std::path::Path,
     task_id: Option<&str>,
     continuous_task_id: &str,
+    mem_cap_bytes: Option<u64>,
     cols: u16,
     rows: u16,
 ) -> MethodResult {
@@ -6320,13 +6407,116 @@ fn compose_continuous_spawn_params(
         rows,
         Some(working_dir),
     )?;
+    // A continuous fire has no launching caller to inherit a cap from (the
+    // scheduler tick / Operator run_now is headless), so derive it from config:
+    // the per-task `mem_cap_bytes` override, else `[scheduler] default_cap`.
+    let default_cap = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.config.scheduler.default_cap
+    };
     if let Value::Object(m) = &mut full {
         m.insert(
             "continuous_task_id".into(),
             Value::String(continuous_task_id.to_string()),
         );
+        // Memory-cap triple — ALL-OR-NOTHING: wrap argv via systemd-run AND set
+        // the three wire keys together (start_session rejects a partial triple
+        // and SIGKILLs a child whose scope didn't materialize). The argv built by
+        // compose_daemon_spawn_params is the plain program (idx 0) + tail, never a
+        // pre-existing wrapper, so re-splitting it is safe. resolve_continuous_cap
+        // graceful-degrades to None (uncapped) when the predicted cgroup prefix is
+        // absent, so a host with no user systemd manager still fires.
+        if let Some((soft, hard, prefix)) =
+            resolve_continuous_cap(engine, mem_cap_bytes, default_cap)
+        {
+            let argv: Vec<String> = m
+                .get("argv")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some((program, tail)) = argv.split_first() {
+                let cap_spec = crate::mcp_config::CapSpec {
+                    soft_bytes: soft,
+                    hard_bytes: hard,
+                    session_uid: uid,
+                    cgroup_prefix: std::path::Path::new(&prefix),
+                };
+                let (wrapped_program, wrapped_args, _cgroup_path) =
+                    crate::mcp_config::wrap_with_systemd_run(program, tail, Some(&cap_spec));
+                let mut wrapped_argv = Vec::with_capacity(wrapped_args.len() + 1);
+                wrapped_argv.push(Value::String(wrapped_program));
+                wrapped_argv.extend(wrapped_args.into_iter().map(Value::String));
+                m.insert("argv".into(), Value::Array(wrapped_argv));
+                m.insert("memory_cap_bytes".into(), Value::Number(soft.into()));
+                m.insert("memory_cap_hard_bytes".into(), Value::Number(hard.into()));
+                m.insert("cgroup_prefix".into(), Value::String(prefix));
+            }
+        }
     }
     Ok(full)
+}
+
+/// Resolve the memory-cap triple for a continuous-task spawn (Phase 3,
+/// DESIGN_CONTINUOUS_TASKS.md §10 + DESIGN_MEMORY_CAP.md). A continuous fire has
+/// no launching caller cap to inherit, so the cap is config-driven: the per-task
+/// `mem_cap_bytes` override, else the daemon's `[scheduler] default_cap`.
+///
+/// A single configured ceiling maps to BOTH `MemoryHigh` and `MemoryMax`
+/// (`soft == hard == effective`). `effective == 0` opts out (uncapped). Only
+/// `claude-code`/`codex` are capped (bash + unknown → `None`, parity with
+/// [`resolve_configured_participant_cap`] and DESIGN_MEMORY_CAP's bash default-off).
+///
+/// The daemon has NO memory-cap preflight (that lives TUI-side), so the sole gate
+/// is the predicted `app.slice` cgroup prefix existing. When it is absent (e.g. a
+/// system service with no user systemd manager — no `enable-linger`), return
+/// `None` and run the fire UNCAPPED rather than emitting a partial/unbacked triple
+/// that `start_session` would reject + SIGKILL. Mirrors
+/// [`resolve_configured_participant_cap`]'s `is_dir` graceful-degrade gate and
+/// reuses its `CONFIGURED_CAP_PREFIX_OVERRIDE` test seam.
+fn resolve_continuous_cap(
+    session_type: &str,
+    mem_cap_bytes: Option<u64>,
+    default_cap: u64,
+) -> Option<(u64, u64, String)> {
+    // bash/unknown never capped (parity with resolve_configured_participant_cap).
+    match session_type {
+        "claude-code" | "claude" | "codex" => {}
+        _ => return None,
+    }
+    let effective = mem_cap_bytes.unwrap_or(default_cap);
+    if effective == 0 {
+        return None;
+    }
+    let uid = unsafe { libc::getuid() };
+    #[allow(unused_mut)]
+    let mut prefix = std::path::PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service/app.slice",
+        uid, uid
+    ));
+    // In unit tests the cap is OFF unless a test explicitly arms the cgroup prefix
+    // override (reuses resolve_configured_participant_cap's seam) — so the
+    // spawn-param tests stay deterministic regardless of whether the host has a
+    // user systemd slice (where the real `app.slice` would otherwise exist).
+    #[cfg(test)]
+    match CONFIGURED_CAP_PREFIX_OVERRIDE.with(|c| c.borrow().clone()) {
+        Some(ov) => prefix = std::path::PathBuf::from(ov),
+        None => return None,
+    }
+    if !prefix.is_dir() {
+        eprintln!(
+            "cm-daemon: continuous cap requested ({} bytes) but predicted cgroup \
+             prefix {} is absent (no user manager?) — running the fire UNCAPPED \
+             rather than failing the spawn",
+            effective,
+            prefix.display()
+        );
+        return None;
+    }
+    Some((effective, effective, prefix.to_string_lossy().into_owned()))
 }
 
 /// Mint a fire_token idempotency key (`ft_<hex>-<hex>`) for a `trigger` call
@@ -6378,6 +6568,28 @@ pub(crate) fn take_continuous_spawn_spy_for_test() -> Vec<Value> {
     CONTINUOUS_SPAWN_SPY.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam for the PERSISTENT executor's live-delivery boundary. When
+    /// armed (`Some(vec)`), the persistent executor (1) treats a present
+    /// `current_session_uid` as a LIVE session WITHOUT probing `state.sessions`
+    /// (so a test needn't stand up a real PTY), and (2) RECORDS each delivery as
+    /// `(run_mode, session_uid, compact)` instead of handing off to the detached
+    /// delivery thread. Mirrors [`CONTINUOUS_SPAWN_SPY`] for the spawn boundary.
+    static CONTINUOUS_DELIVERY_SPY: std::cell::RefCell<Option<Vec<(String, String, bool)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_continuous_delivery_spy_for_test() {
+    CONTINUOUS_DELIVERY_SPY.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_continuous_delivery_spy_for_test() -> Vec<(String, String, bool)> {
+    CONTINUOUS_DELIVERY_SPY.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
 /// The FRESH executor's spawn boundary: hand the composed params to the
 /// production [`start_session`] choke point — the two-phase race-safe spawn
 /// (`PendingSession::spawn` → arm_reaper → lock-held uid-collision recheck →
@@ -6422,6 +6634,7 @@ fn continuous_clear_in_flight_after_failure(
     seq: u64,
     fire_token: &str,
     session_uid: &str,
+    run_mode: &str,
     trigger_source: &str,
     detail: &str,
 ) {
@@ -6441,7 +6654,7 @@ fn continuous_clear_in_flight_after_failure(
             event: "fired".to_string(),
             fire_token: Some(fire_token.to_string()),
             session_uid: Some(session_uid.to_string()),
-            run_mode: Some("fresh".to_string()),
+            run_mode: Some(run_mode.to_string()),
             trigger_source: Some(trigger_source.to_string()),
             status: Some("failed".to_string()),
             detail: Some(json!({ "error": detail })),
@@ -6478,25 +6691,35 @@ enum FireAbort {
     DuplicateFireToken,
 }
 
-/// `trigger` — fire a continuous task once, on demand (Phase 2, MANUAL-ONLY).
+/// `trigger` — fire a continuous task once (Phase 2 manual fire + Phase 3
+/// scheduler/supervision fire; the scheduler calls this in-process).
 ///
-/// Bimodal caller: Operator (TUI / cloud control plane — token validated at
-/// dispatch) OR Session (an agent fanning out). A Session caller is CONFINED to
-/// its own task or a descendant (the downstream-allowlist edge is Phase 6).
+/// Bimodal caller: Operator (TUI / cloud control plane / the daemon's own
+/// scheduler — token validated at dispatch / internal) OR Session (an agent
+/// fanning out). A Session caller is CONFINED to its own task or a descendant
+/// (the downstream-allowlist edge is Phase 6).
 ///
 /// Flow: validate task_id → (Session) self-or-descendant gate → `load_one` →
-/// paused/persistent guards → resolve the prompt → mint uid + fire_token →
+/// paused guard → resolve the prompt → resolve the per-`run_mode` session uid →
 /// inside-flock atomic check-and-set of the `in_flight` spawn-window guard
 /// (rejects a concurrent fire as `busy` and a repeat idempotency key as
-/// `duplicate_fire_token`) → FRESH executor (compose params tagged with
-/// `continuous_task_id`, pinned to the task's durable worktree, spawned via the
-/// `start_session` choke point, then `spawn_agent_prompt_delivery`) → record
-/// `last_run` / `current_session_uid` / `run_count` + CLEAR `in_flight` →
-/// append a `"fired"` runs.jsonl line.
+/// `duplicate_fire_token`) → executor → record `last_run` /
+/// `current_session_uid` / `run_count` + CLEAR `in_flight` → append a `"fired"`
+/// runs.jsonl line.
 ///
-/// Returns `{fired:true, fire_token, session_uid, run_mode:"fresh"}` on a fire,
-/// else `{fired:false, reason:"busy"|"duplicate_fire_token"|"paused"|
-/// "persistent_not_yet_implemented"}`.
+/// Two executors, branched on `run_mode`:
+///   - FRESH — spawn a NEW session per fire (compose params tagged with
+///     `continuous_task_id`, pinned to the durable worktree, spawned via the
+///     `start_session` choke point), leave prior sessions idle, then
+///     `spawn_agent_prompt_delivery`.
+///   - PERSISTENT — deliver the prompt to the task's existing live session (no
+///     respawn, prior context preserved) via `spawn_persistent_prompt_delivery`,
+///     auto-`/clear`-compacting every `compact_every` runs. A dead/absent pinned
+///     session promotes to a FRESH respawn (mint a new uid, spawn, rebind
+///     `current_session_uid`) rather than writing to a dead PTY.
+///
+/// Returns `{fired:true, fire_token, session_uid, run_mode:"fresh"|"persistent"}`
+/// on a fire, else `{fired:false, reason:"busy"|"duplicate_fire_token"|"paused"}`.
 pub fn trigger(
     state_arc: &Arc<Mutex<DaemonState>>,
     caller: &Caller,
@@ -6554,16 +6777,6 @@ pub fn trigger(
         return Ok(json!({ "fired": false, "reason": "paused" }));
     }
 
-    // run_mode branch. PERSISTENT (supervised long-lived session + watchdog) is
-    // Phase 3; until then it's an advertised clean no-op so callers can detect
-    // it rather than getting a half-implemented fire.
-    if task.run_mode == crate::continuous::task::RunMode::Persistent {
-        return Ok(json!({
-            "fired": false,
-            "reason": "persistent_not_yet_implemented"
-        }));
-    }
-
     // Resolve the prompt: explicit `prompt` > `modes[mode].prompt` >
     // `default_prompt`. Continuity across fires is the per-task NOTES.md (the
     // default prompt instructs read-NOTES-first) — Phase 2 spawns a fresh
@@ -6595,9 +6808,50 @@ pub fn trigger(
         Caller::Session(s) => format!("session:{}", s.session_uid),
     };
 
-    // Mint the per-trigger SESSION uid up front so it lands in the in_flight
-    // guard, the spawn params, AND last_run.session_uid (one identity).
-    let session_uid = new_daemon_minted_session_uid();
+    let is_persistent = task.run_mode == crate::continuous::task::RunMode::Persistent;
+
+    // PERSISTENT liveness + delivery-handle resolution (the ONLY DaemonState lock
+    // the executor takes before a spawn/PTY write; dropped immediately). For a
+    // pinned session that is still LIVE we deliver to its existing PTY and REUSE
+    // its uid — so the in_flight guard + last_run identity stay the live uid
+    // (Phase-3 restart reconciliation probes in_flight.session_uid for liveness;
+    // pointing it at a never-spawned minted uid would make reconciliation orphan
+    // a healthy fire). A dead/absent pinned session resolves to None → a FRESH
+    // respawn with a freshly-minted uid below.
+    //
+    //   `Some((uid, Some(handle)))` = live, deliver to handle (production);
+    //   `Some((uid, None))`         = live per the delivery test spy (no real PTY);
+    //   `None`                      = not persistent, or dead/unset → FRESH spawn.
+    let persistent_target: Option<(String, Option<crate::session::InputHandle>)> =
+        if is_persistent {
+            task.current_session_uid.as_deref().and_then(|uid| {
+                #[cfg(test)]
+                if CONTINUOUS_DELIVERY_SPY.with(|c| c.borrow().is_some()) {
+                    return Some((uid.to_string(), None));
+                }
+                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                match state.sessions.get(uid) {
+                    // Dead-session predicate: registry-absent OR the reaper has
+                    // populated kernel exit (kernel_set flips before on_exit
+                    // removes the registry entry — no liveness gap).
+                    Some(s) if !s.last_exit.kernel_set() => {
+                        Some((uid.to_string(), Some(s.input_handle())))
+                    }
+                    _ => None,
+                }
+            })
+        } else {
+            None
+        };
+
+    // Resolve the per-trigger SESSION uid: a PERSISTENT live fire reuses the
+    // pinned session's uid (no new spawn); FRESH and the PERSISTENT dead->respawn
+    // fallback mint a fresh uid for the new session. It lands in the in_flight
+    // guard, the spawn params (respawn), AND last_run.session_uid (one identity).
+    let session_uid = match &persistent_target {
+        Some((uid, _)) => uid.clone(),
+        None => new_daemon_minted_session_uid(),
+    };
     // Accept the caller's idempotency key, else mint a fresh one.
     let fire_token = p.fire_token.clone().unwrap_or_else(new_fire_token);
 
@@ -6645,68 +6899,110 @@ pub fn trigger(
     // in_flight guard blocks any concurrent fire from advancing run_count.
     let seq = task.run_count as u64 + 1;
 
-    // ---- FRESH executor (Phase 2): spawn a NEW session, LEAVE prior idle ----
+    // run_mode label for the run record, audit line, and response.
+    let run_mode_label = if is_persistent { "persistent" } else { "fresh" };
+
+    // ---- Executor (branched on run_mode) -----------------------------------
     // Lock discipline: NO DaemonState mutex and NO continuous-task flock is held
-    // across the spawn or the prompt-delivery PTY write — `start_session`
-    // re-acquires the state lock internally and the reaper's on_exit callback
-    // re-acquires it too; the try_modify above already released the flock.
-    // Prior idle sessions are LEFT ALONE — the retention.keep_sessions prune is
-    // a later, default-off addition.
-    let engine = task.engine.as_session_type();
-    let (cols, rows) = caller_size.unwrap_or((80, 24));
-    let working_dir = PathBuf::from(&task.worktree_path);
-
-    let full = match compose_continuous_spawn_params(
-        state_arc,
-        &session_uid,
-        &task.workspace_id,
-        &task.label,
-        engine,
-        &working_dir,
-        Some(&task.task_id),
-        &task.task_id,
-        cols,
-        rows,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            continuous_clear_in_flight_after_failure(
-                &p.task_id,
-                seq,
-                &fire_token,
-                &session_uid,
-                &trigger_source,
-                &e.1,
-            );
-            return Err(e);
+    // across a spawn or a prompt-delivery PTY write — `start_session` re-acquires
+    // the state lock internally and the reaper's on_exit callback re-acquires it
+    // too; the try_modify above already released the flock.
+    match persistent_target {
+        // PERSISTENT, pinned session ALIVE: deliver the prompt to the EXISTING
+        // PTY (no respawn — prior context preserved). Auto-`/clear`-compact every
+        // `compact_every` runs. The handle was already cloned out under the brief
+        // liveness-probe lock above, so no lock is held here.
+        Some((live_uid, handle_opt)) => {
+            // The run just armed is `seq` (== run_count+1). compact-after-N gates
+            // on it so the Nth, 2Nth, … fire `/clear`s before delivering.
+            let compact =
+                matches!(task.compact_every, Some(n) if n > 0 && seq % n as u64 == 0);
+            // Under the delivery test spy `handle_opt` is None — record the
+            // delivery in lieu of a PTY write (production always carries a handle
+            // in the live arm).
+            #[cfg(test)]
+            if handle_opt.is_none() {
+                CONTINUOUS_DELIVERY_SPY.with(|c| {
+                    if let Some(v) = c.borrow_mut().as_mut() {
+                        v.push(("persistent".to_string(), live_uid.clone(), compact));
+                    }
+                });
+            }
+            if let Some(handle) = handle_opt {
+                spawn_persistent_prompt_delivery(
+                    handle,
+                    live_uid.clone(),
+                    resolved_prompt.clone(),
+                    compact,
+                );
+            }
         }
-    };
+        // FRESH, or PERSISTENT dead->respawn: spawn a NEW session (compose params
+        // tagged with `continuous_task_id`, worktree-pinned, memory-capped, via
+        // the `start_session` choke point), then deliver. FRESH leaves prior idle
+        // sessions ALONE; the persistent respawn rebinds `current_session_uid` to
+        // the new uid in the record step below.
+        None => {
+            let engine = task.engine.as_session_type();
+            let (cols, rows) = caller_size.unwrap_or((80, 24));
+            let working_dir = PathBuf::from(&task.worktree_path);
 
-    if let Err(e) = continuous_fresh_spawn(state_arc, &full) {
-        continuous_clear_in_flight_after_failure(
-            &p.task_id,
-            seq,
-            &fire_token,
-            &session_uid,
-            &trigger_source,
-            &e.1,
-        );
-        return Err(e);
-    }
+            let full = match compose_continuous_spawn_params(
+                state_arc,
+                &session_uid,
+                &task.workspace_id,
+                &task.label,
+                engine,
+                &working_dir,
+                Some(&task.task_id),
+                &task.task_id,
+                task.mem_cap_bytes,
+                cols,
+                rows,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    continuous_clear_in_flight_after_failure(
+                        &p.task_id,
+                        seq,
+                        &fire_token,
+                        &session_uid,
+                        run_mode_label,
+                        &trigger_source,
+                        &e.1,
+                    );
+                    return Err(e);
+                }
+            };
 
-    // Deliver the resolved prompt to the freshly-spawned session. Clone the
-    // input handle under a BRIEF state lock, drop it, THEN hand off to the
-    // detached delivery thread (settle → bracketed-paste body → gap → kitty
-    // Enter). A bare `\n` does NOT submit a claude-code/codex kitty TUI.
-    // Best-effort: a vanished session (fast-exit reaper removed the registry
-    // entry) skips delivery — the fire already counted and the caller has its
-    // uid (matches spawn_agent_prompt_delivery's fire-and-forget contract).
-    let handle_opt = {
-        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        state.sessions.get(&session_uid).map(|s| s.input_handle())
-    };
-    if let Some(handle) = handle_opt {
-        spawn_agent_prompt_delivery(handle, session_uid.clone(), resolved_prompt);
+            if let Err(e) = continuous_fresh_spawn(state_arc, &full) {
+                continuous_clear_in_flight_after_failure(
+                    &p.task_id,
+                    seq,
+                    &fire_token,
+                    &session_uid,
+                    run_mode_label,
+                    &trigger_source,
+                    &e.1,
+                );
+                return Err(e);
+            }
+
+            // Deliver the resolved prompt to the freshly-spawned session. Clone
+            // the input handle under a BRIEF state lock, drop it, THEN hand off to
+            // the detached delivery thread (settle → bracketed-paste body → gap →
+            // kitty Enter). A bare `\n` does NOT submit a claude-code/codex kitty
+            // TUI. Best-effort: a vanished session (fast-exit reaper removed the
+            // registry entry) skips delivery — the fire already counted and the
+            // caller has its uid.
+            let handle_opt = {
+                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                state.sessions.get(&session_uid).map(|s| s.input_handle())
+            };
+            if let Some(handle) = handle_opt {
+                spawn_agent_prompt_delivery(handle, session_uid.clone(), resolved_prompt.clone());
+            }
+        }
     }
 
     // Record the fire + CLEAR the spawn-window guard in one atomic modify.
@@ -6745,7 +7041,7 @@ pub fn trigger(
             event: "fired".to_string(),
             fire_token: Some(fire_token.clone()),
             session_uid: Some(session_uid.clone()),
-            run_mode: Some("fresh".to_string()),
+            run_mode: Some(run_mode_label.to_string()),
             trigger_source: Some(trigger_source.clone()),
             status: Some("running".to_string()),
             // Carry the caller's free-form `args` blob into the audit line
@@ -6764,7 +7060,7 @@ pub fn trigger(
         "fired": true,
         "fire_token": fire_token,
         "session_uid": session_uid,
-        "run_mode": "fresh",
+        "run_mode": run_mode_label,
     }))
 }
 
@@ -6843,6 +7139,10 @@ struct ContinuousCreateParams {
     supervise: bool,
     #[serde(default)]
     max_runtime_secs: Option<u32>,
+    /// Phase 3 memory-cap per-task override (bytes). `None` → the daemon's
+    /// `[scheduler] default_cap`; `Some(0)` → uncapped.
+    #[serde(default)]
+    mem_cap_bytes: Option<u64>,
 }
 
 /// `continuous.create` — register a continuous task: resolve the repo, create
@@ -6995,6 +7295,7 @@ pub fn continuous_create(
     task.compact_every = p.compact_every;
     task.supervise = p.supervise;
     task.max_runtime_secs = p.max_runtime_secs;
+    task.mem_cap_bytes = p.mem_cap_bytes;
 
     let record_created = match crate::continuous::task::create(&task) {
         Ok(c) => c,
@@ -9297,6 +9598,7 @@ mod tests {
                 repos_dir: String::new(),
                 allow_clone: false,
                 repos: Vec::new(),
+                scheduler: Default::default(),
             };
             Arc::new(Mutex::new(s))
         };
@@ -16615,10 +16917,12 @@ mod tests {
         )
     }
 
-    /// `run_mode = persistent` is an advertised clean no-op until Phase 3
-    /// (supervised long-lived session + watchdog) — NOT a spawn, NOT an error.
+    /// A PERSISTENT task's FIRST fire has no pinned session yet
+    /// (`current_session_uid` = None), so it BOOTSTRAPS one via a fresh respawn:
+    /// mint a uid, spawn (tagged + pinned), and bind `current_session_uid`. The
+    /// spawn boundary is spied (no real claude).
     #[test]
-    fn trigger_persistent_run_mode_is_clean_no_op() {
+    fn trigger_persistent_no_session_bootstraps_fresh_spawn() {
         with_continuous_home(|home| {
             let wt = home.join("wt");
             std::fs::create_dir_all(&wt).unwrap();
@@ -16630,6 +16934,7 @@ mod tests {
             );
             crate::continuous::task::save(&task).expect("save");
 
+            arm_continuous_spawn_spy_for_test();
             let state = Arc::new(Mutex::new(DaemonState::new()));
             let resp = trigger(
                 &state,
@@ -16637,14 +16942,21 @@ mod tests {
                 &json!({ "task_id": "ct-persistent" }),
             )
             .expect("trigger ok");
-            assert_eq!(resp["fired"], json!(false));
-            assert_eq!(resp["reason"], json!("persistent_not_yet_implemented"));
+            assert_eq!(resp["fired"], json!(true));
+            assert_eq!(resp["run_mode"], json!("persistent"));
+            let new_uid = resp["session_uid"].as_str().expect("session_uid str");
+            assert!(is_valid_session_uid(new_uid), "bootstrap minted a fresh uid");
 
-            // Nothing recorded: no run, no in_flight leak.
+            // One bootstrap spawn, tagged + bound to the new uid.
+            let captured = take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "one bootstrap spawn");
+            assert_eq!(captured[0]["continuous_task_id"], json!("ct-persistent"));
+            assert_eq!(captured[0]["uid"].as_str().unwrap(), new_uid);
+
             let reloaded = crate::continuous::task::load_one("ct-persistent").unwrap();
-            assert_eq!(reloaded.run_count, 0);
+            assert_eq!(reloaded.run_count, 1);
             assert!(reloaded.in_flight.is_none());
-            assert!(reloaded.last_run.is_none());
+            assert_eq!(reloaded.current_session_uid.as_deref(), Some(new_uid));
         });
     }
 
@@ -16821,6 +17133,7 @@ mod tests {
                 &wt,
                 Some("ct-compose"),
                 "ct-compose",
+                None,
                 120,
                 30,
             )
@@ -16842,6 +17155,261 @@ mod tests {
                 .collect();
             assert_eq!(argv[0], "claude");
             assert!(argv.iter().any(|a| a == "--mcp-config"), "argv: {:?}", argv);
+        });
+    }
+
+    // --- Continuous Tasks Phase 3: PERSISTENT executor + memory cap ---------
+
+    /// A PERSISTENT fire to a LIVE pinned session delivers the prompt to the
+    /// EXISTING session (REUSING its uid — no new spawn) and records the run. The
+    /// live-delivery boundary is spied (no real PTY).
+    #[test]
+    fn trigger_persistent_delivers_to_live_session() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-pers-live",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.current_session_uid = Some("ts-live-aaaa-0".to_string());
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_delivery_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-pers-live" }),
+            )
+            .expect("trigger ok");
+
+            assert_eq!(resp["fired"], json!(true));
+            assert_eq!(resp["run_mode"], json!("persistent"));
+            // The live pinned session's uid is REUSED (not a freshly-minted one).
+            assert_eq!(resp["session_uid"], json!("ts-live-aaaa-0"));
+
+            // Delivery went to the existing session via the persistent path with
+            // compact=false (no compact_every).
+            let deliveries = take_continuous_delivery_spy_for_test();
+            assert_eq!(deliveries.len(), 1, "exactly one delivery");
+            assert_eq!(
+                deliveries[0],
+                (
+                    "persistent".to_string(),
+                    "ts-live-aaaa-0".to_string(),
+                    false
+                )
+            );
+
+            let reloaded = crate::continuous::task::load_one("ct-pers-live").unwrap();
+            assert!(reloaded.in_flight.is_none(), "in_flight cleared on return");
+            assert_eq!(reloaded.run_count, 1);
+            // current_session_uid UNCHANGED (same live session, no respawn).
+            assert_eq!(
+                reloaded.current_session_uid.as_deref(),
+                Some("ts-live-aaaa-0")
+            );
+            let last = reloaded.last_run.expect("last_run recorded");
+            assert_eq!(last.session_uid.as_deref(), Some("ts-live-aaaa-0"));
+
+            // The audit line carries run_mode "persistent".
+            let runs =
+                std::fs::read_to_string(crate::continuous::task::runs_log_path("ct-pers-live"))
+                    .expect("runs.jsonl exists");
+            let line: crate::continuous::runlog::RunLogLine =
+                serde_json::from_str(runs.lines().next().expect("one line")).unwrap();
+            assert_eq!(line.event, "fired");
+            assert_eq!(line.run_mode.as_deref(), Some("persistent"));
+        });
+    }
+
+    /// A PERSISTENT fire whose pinned session is DEAD (absent from the registry)
+    /// promotes to a FRESH respawn: mint a NEW uid, spawn a new session (tagged +
+    /// pinned), and REBIND `current_session_uid`. The spawn boundary is spied
+    /// (no real claude); no delivery spy, so the real liveness probe runs.
+    #[test]
+    fn trigger_persistent_dead_session_promotes_to_fresh_respawn() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-pers-dead",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            // A pinned uid that is NOT in state.sessions => dead => respawn.
+            task.current_session_uid = Some("ts-dead-bbbb-0".to_string());
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_spawn_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-pers-dead" }),
+            )
+            .expect("trigger ok");
+
+            assert_eq!(resp["fired"], json!(true));
+            assert_eq!(resp["run_mode"], json!("persistent"));
+            let new_uid = resp["session_uid"].as_str().expect("session_uid str");
+            assert!(is_valid_session_uid(new_uid), "respawn minted a fresh uid");
+            assert_ne!(new_uid, "ts-dead-bbbb-0", "did NOT reuse the dead uid");
+
+            // Exactly one respawn spawn, tagged + bound to the new uid.
+            let captured = take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "one respawn spawn");
+            let full = &captured[0];
+            assert_eq!(full["continuous_task_id"], json!("ct-pers-dead"));
+            assert_eq!(full["uid"].as_str().unwrap(), new_uid);
+
+            // current_session_uid REBOUND to the new uid; run recorded.
+            let reloaded = crate::continuous::task::load_one("ct-pers-dead").unwrap();
+            assert!(reloaded.in_flight.is_none());
+            assert_eq!(reloaded.run_count, 1);
+            assert_eq!(reloaded.current_session_uid.as_deref(), Some(new_uid));
+        });
+    }
+
+    /// PERSISTENT auto-compact: with `compact_every = Some(2)`, the 2nd run
+    /// (seq 2, 2%2==0) `/clear`s before delivering; the 3rd (seq 3, 3%2==1) does
+    /// not. Two consecutive fires exercise the modulo gate.
+    #[test]
+    fn trigger_persistent_compact_after_n_clears_at_nth() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-pers-compact",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.current_session_uid = Some("ts-live-cccc-0".to_string());
+            task.compact_every = Some(2);
+            // Prior run_count=1 => this fire is seq=2 (the Nth).
+            task.run_count = 1;
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_delivery_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+
+            // Fire #1: seq=2 => compact.
+            trigger(
+                &state,
+                &Caller::operator("op"),
+                &json!({ "task_id": "ct-pers-compact" }),
+            )
+            .expect("fire 1");
+            // Fire #2: seq=3 => no compact.
+            trigger(
+                &state,
+                &Caller::operator("op"),
+                &json!({ "task_id": "ct-pers-compact" }),
+            )
+            .expect("fire 2");
+
+            let deliveries = take_continuous_delivery_spy_for_test();
+            assert_eq!(deliveries.len(), 2);
+            assert!(deliveries[0].2, "Nth fire (seq 2) compacts");
+            assert!(!deliveries[1].2, "non-Nth fire (seq 3) does not compact");
+
+            let reloaded = crate::continuous::task::load_one("ct-pers-compact").unwrap();
+            assert_eq!(reloaded.run_count, 3);
+        });
+    }
+
+    /// `compose_continuous_spawn_params` wraps argv in `systemd-run` and sets the
+    /// all-or-nothing memory-cap triple when the cgroup prefix is backed (test
+    /// seam), and runs UNCAPPED (plain argv, no triple) when the prefix is absent
+    /// (graceful degrade — the daemon has no preflight, so a missing user manager
+    /// must not fail the spawn).
+    #[test]
+    fn compose_continuous_spawn_params_threads_memory_cap_triple() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+
+            // (a) Backed prefix (a real temp dir) => wrapped + triple set.
+            let cgroup = home.join("fake-app.slice");
+            std::fs::create_dir_all(&cgroup).unwrap();
+            set_configured_cap_prefix_override_for_test(Some(
+                cgroup.to_string_lossy().into_owned(),
+            ));
+            let uid = fresh_test_uid();
+            let full = compose_continuous_spawn_params(
+                &state,
+                &uid,
+                "ws-cont",
+                "Continuous label",
+                crate::continuous::task::Engine::Claude.as_session_type(),
+                &wt,
+                Some("ct-cap"),
+                "ct-cap",
+                Some(536_870_912), // 512 MiB per-task override
+                80,
+                24,
+            )
+            .expect("compose ok");
+            let argv: Vec<String> = full["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(argv[0], "systemd-run", "argv wrapped: {:?}", argv);
+            assert!(
+                argv.iter().any(|a| a == "MemoryMax=536870912"),
+                "argv: {:?}",
+                argv
+            );
+            assert_eq!(full["memory_cap_bytes"].as_u64(), Some(536_870_912));
+            assert_eq!(full["memory_cap_hard_bytes"].as_u64(), Some(536_870_912));
+            assert_eq!(
+                full["cgroup_prefix"].as_str(),
+                Some(cgroup.to_string_lossy().as_ref())
+            );
+            // The tagged continuous_task_id survives the wrap.
+            assert_eq!(full["continuous_task_id"], json!("ct-cap"));
+
+            // (b) Absent prefix => graceful degrade => plain argv, no triple.
+            let absent = home.join("does-not-exist");
+            set_configured_cap_prefix_override_for_test(Some(
+                absent.to_string_lossy().into_owned(),
+            ));
+            let uid2 = fresh_test_uid();
+            let full2 = compose_continuous_spawn_params(
+                &state,
+                &uid2,
+                "ws-cont",
+                "Continuous label",
+                crate::continuous::task::Engine::Claude.as_session_type(),
+                &wt,
+                Some("ct-cap2"),
+                "ct-cap2",
+                Some(536_870_912),
+                80,
+                24,
+            )
+            .expect("compose ok");
+            let argv2: Vec<String> = full2["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(argv2[0], "claude", "uncapped plain argv: {:?}", argv2);
+            assert!(
+                full2.get("memory_cap_bytes").is_none(),
+                "no cap triple when degraded"
+            );
+
+            set_configured_cap_prefix_override_for_test(None);
         });
     }
 

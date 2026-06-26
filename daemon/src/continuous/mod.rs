@@ -22,8 +22,10 @@
 //! fields are defined here but inert.
 
 pub mod runlog;
+pub mod scheduler;
 pub mod task;
 
+pub use scheduler::ContinuousScheduler;
 pub use task::{
     ContinuousTask, Engine, InFlight, ModePreset, Retention, RunMode, RunRecord, RunStatus,
     Schedule,
