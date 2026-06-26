@@ -128,6 +128,12 @@ pub struct TerminalSession {
     pub workflow_run_id: Option<String>,
     /// Role name within that workflow (e.g. "worker", "reviewer", "manager").
     pub workflow_role: Option<String>,
+    /// If this session is a tick of a continuous task, that task's id.
+    /// Read through from `ManifestEntry.continuous_task_id`; `None` for
+    /// every ordinary session. The trigger funnel that sets it lands in
+    /// Phase 2 — this is the Phase-1 wire field only, mirroring
+    /// `workflow_run_id`. See DESIGN_CONTINUOUS_TASKS.md §6/§12.
+    pub continuous_task_id: Option<String>,
     /// Task this session belongs to. None = workspace-level (ad-hoc) session
     /// not tied to any task. Sessions launched from the planning view (A-f / A-l)
     /// inherit the launched task's id; manually added sessions (A-s) inherit
@@ -226,6 +232,7 @@ impl TerminalSession {
             burst_threshold: self.burst_threshold,
             workflow_run_id: self.workflow_run_id.clone(),
             workflow_role: self.workflow_role.clone(),
+            continuous_task_id: self.continuous_task_id.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: self.notify_on_idle,
             seeded_from_snapshot: self.seeded_from_snapshot.clone(),
@@ -1057,6 +1064,7 @@ fn make_simple_session_with_uid(
         pending_clear: None,
         workflow_run_id: None,
         workflow_role: None,
+        continuous_task_id: None,
         last_delivery: None,
         task_id: None,
         notify_on_idle: false,
@@ -1597,6 +1605,13 @@ enum VisualItem {
     /// host's `host_id` follow until the next `HostHeader` or
     /// the end of the list.
     HostHeader(cm_daemon::host_id::HostId),
+    /// Continuous Tasks: header row for the continuous-session
+    /// group, sorted to the bottom of the sidebar. Emitted only
+    /// when at least one session carries a `continuous_task_id`.
+    /// Sessions tagged continuous follow until the end of the
+    /// group. Non-selectable, like `HostHeader`. See
+    /// DESIGN_CONTINUOUS_TASKS.md §12.
+    ContinuousHeader,
 }
 
 /// Modal input state.
@@ -3457,6 +3472,11 @@ pub struct App {
     /// Toggle for the bottom-of-screen activity strip. Off by default;
     /// `Alt-,` flips it.
     pub activity_visible: bool,
+    /// Continuous-Tasks Phase 1: when set, all three `visual_items_*`
+    /// builders skip the continuous group (its `ContinuousHeader` + the
+    /// sessions under it). Off by default; `A-c` flips it. Persisted in
+    /// the session manifest like `view`.
+    pub hide_continuous: bool,
     /// Result of the startup memory-cap preflight probe. Cached for
     /// the lifetime of the run; consulted in `spawn_agent_session`
     /// to decide whether to wrap a spawn. See DESIGN_MEMORY_CAP.md
@@ -3663,6 +3683,7 @@ impl App {
             Some("task") => SidebarView::Task,
             _ => SidebarView::Status,
         };
+        let hide_continuous = manifest.hide_continuous;
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
@@ -3877,6 +3898,7 @@ impl App {
             control_rebind_at: Instant::now() + CONTROL_REBIND_INTERVAL,
             activity_log,
             activity_visible: false,
+            hide_continuous,
             memory_cap_status,
             memory_kill_tx,
             memory_kill_rx,
@@ -4465,6 +4487,7 @@ impl App {
             workspaces,
             bindings,
             view: Some(view.to_string()),
+            hide_continuous: self.hide_continuous,
         };
 
         let path = Self::manifest_path();
@@ -5119,6 +5142,9 @@ impl App {
                 pending_clear: None,
                 workflow_run_id: s.workflow_run_id.clone(),
                 workflow_role: s.workflow_role.clone(),
+                // DaemonSessionSummary carries no continuous tag; the
+                // adoption path leaves it None (Phase-1 plumbing).
+                continuous_task_id: None,
                 last_delivery: None,
                 task_id: s.task_id.clone(),
                 notify_on_idle: false,
@@ -5486,6 +5512,7 @@ impl App {
             pending_clear: None,
             workflow_run_id: entry.workflow_run_id.clone(),
             workflow_role: entry.workflow_role.clone(),
+            continuous_task_id: entry.continuous_task_id.clone(),
             last_delivery: None,
             task_id: entry.task_id.clone(),
             notify_on_idle: entry.notify_on_idle,
@@ -5586,6 +5613,7 @@ impl App {
             pending_clear: None,
             workflow_run_id: entry.workflow_run_id.clone(),
             workflow_role: entry.workflow_role.clone(),
+            continuous_task_id: entry.continuous_task_id.clone(),
             last_delivery: None,
             task_id: entry.task_id.clone(),
             notify_on_idle: entry.notify_on_idle,
@@ -6876,6 +6904,10 @@ impl App {
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
+        // Continuous Tasks: sessions carrying a `continuous_task_id`
+        // are pulled out of the status buckets and sorted into their
+        // own section at the bottom (the divided-panel requirement).
+        let mut continuous: Vec<VisualItem> = Vec::new();
 
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed || self.is_past_workspace(wi) {
@@ -6886,6 +6918,10 @@ impl App {
             } else {
                 for (si, ts) in ws.sessions.iter().enumerate() {
                     let item = VisualItem::Session(wi, si);
+                    if ts.continuous_task_id.is_some() {
+                        continuous.push(item);
+                        continue;
+                    }
                     match ts.status {
                         SessionStatus::Running => running.push(item),
                         SessionStatus::Idle => idle.push(item),
@@ -6906,6 +6942,17 @@ impl App {
             }
         }
         items.extend(no_session);
+        // Continuous group at the bottom, behind a conditional
+        // separator (guard the double-separator / leading-separator
+        // cases so an all-continuous list doesn't open with a rule).
+        // `A-c` (hide_continuous) skips the whole group — header + sessions.
+        if !continuous.is_empty() && !self.hide_continuous {
+            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
+                items.push(VisualItem::Separator);
+            }
+            items.push(VisualItem::ContinuousHeader);
+            items.extend(continuous);
+        }
         items
     }
 
@@ -6915,9 +6962,13 @@ impl App {
     /// can't be host-tagged (workspace itself has no host) —
     /// they go in a single tail section after all host groups.
     fn visual_items_status_multihost(&self) -> Vec<VisualItem> {
+        // Per host: (running, idle, continuous). Continuous sessions
+        // nest within their host group, sorted to the bottom of that
+        // group behind a `ContinuousHeader` (lockstep with the
+        // single-host builder; the divided-panel requirement).
         let mut by_host: std::collections::HashMap<
             cm_daemon::host_id::HostId,
-            (Vec<VisualItem>, Vec<VisualItem>),
+            (Vec<VisualItem>, Vec<VisualItem>, Vec<VisualItem>),
         > = std::collections::HashMap::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -6931,26 +6982,60 @@ impl App {
             for (si, ts) in ws.sessions.iter().enumerate() {
                 let entry = by_host
                     .entry(ts.host_id.clone())
-                    .or_insert_with(|| (Vec::new(), Vec::new()));
+                    .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new()));
                 let item = VisualItem::Session(wi, si);
+                if ts.continuous_task_id.is_some() {
+                    entry.2.push(item);
+                    continue;
+                }
                 match ts.status {
                     SessionStatus::Running => entry.0.push(item),
                     SessionStatus::Idle => entry.1.push(item),
                 }
             }
         }
-        let mut items: Vec<VisualItem> = Vec::new();
-        for host in &self.hosts.hosts {
-            let group = by_host.remove(&host.id).unwrap_or_default();
-            if group.0.is_empty() && group.1.is_empty() {
-                continue;
-            }
+        // `A-c` (hide_continuous) skips the per-host continuous
+        // subsection — and a host group with ONLY continuous sessions
+        // is dropped entirely (see the skip guards below) so no bare
+        // header is left behind.
+        let hide_continuous = self.hide_continuous;
+        // Emit a host group (header + running + idle, then the
+        // continuous subsection behind a separator). Shared by the
+        // configured-host and orphan-host passes.
+        let push_host_group = |items: &mut Vec<VisualItem>,
+                               id: cm_daemon::host_id::HostId,
+                               group: (
+            Vec<VisualItem>,
+            Vec<VisualItem>,
+            Vec<VisualItem>,
+        )| {
             if !items.is_empty() {
                 items.push(VisualItem::Separator);
             }
-            items.push(VisualItem::HostHeader(host.id.clone()));
+            items.push(VisualItem::HostHeader(id));
+            let has_temp = !group.0.is_empty() || !group.1.is_empty();
             items.extend(group.0); // running
             items.extend(group.1); // idle
+            if !group.2.is_empty() && !hide_continuous {
+                if has_temp {
+                    items.push(VisualItem::Separator);
+                }
+                items.push(VisualItem::ContinuousHeader);
+                items.extend(group.2); // continuous
+            }
+        };
+        let mut items: Vec<VisualItem> = Vec::new();
+        for host in &self.hosts.hosts {
+            let group = by_host.remove(&host.id).unwrap_or_default();
+            // A continuous-only group is empty for display purposes when
+            // hide_continuous is set — skip it so no bare header survives.
+            if group.0.is_empty()
+                && group.1.is_empty()
+                && (group.2.is_empty() || hide_continuous)
+            {
+                continue;
+            }
+            push_host_group(&mut items, host.id.clone(), group);
         }
         // Sessions on hosts NO LONGER in hosts.toml (rare —
         // operator removed an entry; existing sessions remain
@@ -6959,13 +7044,15 @@ impl App {
         let mut orphan_ids: Vec<_> = by_host.keys().cloned().collect();
         orphan_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for id in orphan_ids {
-            let (run, idle) = by_host.remove(&id).unwrap();
-            if !items.is_empty() {
-                items.push(VisualItem::Separator);
+            let group = by_host.remove(&id).unwrap();
+            // Same continuous-only skip as the configured-host pass.
+            if group.0.is_empty()
+                && group.1.is_empty()
+                && (group.2.is_empty() || hide_continuous)
+            {
+                continue;
             }
-            items.push(VisualItem::HostHeader(id));
-            items.extend(run);
-            items.extend(idle);
+            push_host_group(&mut items, id, group);
         }
         if !items.is_empty() && !no_session.is_empty() {
             items.push(VisualItem::Separator);
@@ -6993,9 +7080,17 @@ impl App {
 
             // Partition sessions by task_id bucket. Unbound sessions live in
             // the `None` bucket and render at workspace level (no subheader).
+            // Continuous sessions are pulled out entirely and sorted into
+            // their own section at the bottom of the workspace (the
+            // divided-panel requirement; lockstep with the status builders).
             let mut by_task: std::collections::BTreeMap<Option<String>, Vec<usize>> =
                 std::collections::BTreeMap::new();
+            let mut continuous: Vec<usize> = Vec::new();
             for (si, ts) in ws.sessions.iter().enumerate() {
+                if ts.continuous_task_id.is_some() {
+                    continuous.push(si);
+                    continue;
+                }
                 by_task.entry(ts.task_id.clone()).or_default().push(si);
             }
 
@@ -7090,6 +7185,20 @@ impl App {
                     }
                 }
             }
+
+            // Continuous group at the bottom of the workspace, behind a
+            // conditional separator (the WorkspaceHeader above guarantees
+            // a non-empty list, so guard only the double-separator case).
+            // `A-c` (hide_continuous) skips the whole group — header + sessions.
+            if !continuous.is_empty() && !self.hide_continuous {
+                if !matches!(items.last(), Some(VisualItem::Separator)) {
+                    items.push(VisualItem::Separator);
+                }
+                items.push(VisualItem::ContinuousHeader);
+                for si in continuous {
+                    items.push(VisualItem::Session(wi, si));
+                }
+            }
         }
         items
     }
@@ -7118,6 +7227,9 @@ impl App {
             // 12e: host headers are presentation-only; skip
             // them in cursor navigation.
             VisualItem::HostHeader(_) => false,
+            // Continuous header is presentation-only, like
+            // `HostHeader`; skip it in cursor navigation.
+            VisualItem::ContinuousHeader => false,
         };
 
         if !items.iter().any(is_selectable) {
@@ -8373,6 +8485,7 @@ impl App {
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             last_delivery: None,
             task_id,
             notify_on_idle: false,
@@ -8775,6 +8888,11 @@ impl App {
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let continuous_task_id = entry
+            .get("continuous_task_id")
+            .and_then(|v| v.as_str())
+            .filter(|c| !c.is_empty())
+            .map(String::from);
 
         // R5: untracked workspace → silent no-op.
         let ws_idx = match self.workspaces.iter().position(|w| w.id == ws_id) {
@@ -8876,6 +8994,7 @@ impl App {
         ts.workflow_run_id = run_id;
         ts.workflow_role = role;
         ts.task_id = task_id;
+        ts.continuous_task_id = continuous_task_id;
         ts.host_id = host_id;
         // Kick a resize so a participant spawned at a smaller PTY size (e.g.
         // a headless launch before any TUI attached) immediately matches this
@@ -9249,6 +9368,14 @@ impl App {
             // Phase 6: Alt+, toggles the activity feed strip.
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char(',') {
                 self.activity_visible = !self.activity_visible;
+                self.needs_redraw = true;
+                return true;
+            }
+            // Continuous-Tasks Phase 1: Alt+c hides/shows the continuous
+            // section in all three sidebar builders. Persisted in the
+            // session manifest like `view`.
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c') {
+                self.hide_continuous = !self.hide_continuous;
                 self.needs_redraw = true;
                 return true;
             }
@@ -11056,6 +11183,7 @@ impl App {
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             last_delivery: None,
             task_id: None,
             notify_on_idle: false,
@@ -11263,6 +11391,7 @@ impl App {
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             last_delivery: None,
             task_id: None,
             notify_on_idle: false,
@@ -13701,7 +13830,7 @@ impl App {
             ("A-b    snapshot", "A-z  catalog"),
             ("A-O    reopen ws", "A-H  switch host"),
             ("PgUp   scroll up", "A-t  planning"),
-            ("PgDn   scroll dn", ""),
+            ("PgDn   scroll dn", "A-c  continuous"),
             ("A-Ent  newline", ""),
         ];
         let help_rows = help_entries.len() as u16;
@@ -14002,6 +14131,26 @@ impl App {
                     let line = Line::from(vec![Span::styled(
                         format!("{}{}", prefix, host_id.as_str()),
                         style,
+                    )]);
+                    items.push(ListItem::new(line));
+                }
+                // Continuous-tasks section header, styled like the
+                // (inactive) `HostHeader` arm. The count badge reflects
+                // the continuous sessions across all visible workspaces.
+                VisualItem::ContinuousHeader => {
+                    let count = self
+                        .workspaces
+                        .iter()
+                        .enumerate()
+                        .filter(|(wi, ws)| !ws.is_closed && !self.is_past_workspace(*wi))
+                        .flat_map(|(_, ws)| ws.sessions.iter())
+                        .filter(|ts| ts.continuous_task_id.is_some())
+                        .count();
+                    let line = Line::from(vec![Span::styled(
+                        format!("  continuous ({})", count),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
                     )]);
                     items.push(ListItem::new(line));
                 }
@@ -15835,6 +15984,7 @@ mod stop_workflow_local_cleanup_tests {
             burst_threshold: 0,
             workflow_run_id: run_id.map(str::to_string),
             workflow_role: run_id.map(|_| "worker".to_string()),
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -15988,6 +16138,7 @@ mod manifest_entry_seeded_from_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: Some("reviewer-strict".into()),
@@ -16031,6 +16182,7 @@ mod manifest_entry_seeded_from_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -16089,6 +16241,7 @@ mod manifest_entry_seeded_from_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -16149,6 +16302,7 @@ mod manifest_entry_seeded_from_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -16191,6 +16345,7 @@ mod manifest_entry_seeded_from_tests {
             burst_threshold: loaded.burst_threshold,
             workflow_run_id: loaded.workflow_run_id.clone(),
             workflow_role: loaded.workflow_role.clone(),
+            continuous_task_id: None,
             task_id: loaded.task_id.clone(),
             notify_on_idle: loaded.notify_on_idle,
             seeded_from_snapshot: loaded.seeded_from_snapshot.clone(),
@@ -17230,6 +17385,7 @@ mod transcript_rebind_tests {
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             last_delivery: None,
             notify_on_idle: false,
@@ -17248,6 +17404,25 @@ mod transcript_rebind_tests {
         ts.rebind_transcript(Some("new-sid".into()));
         assert_eq!(ts.transcript_id.as_deref(), Some("new-sid"));
         assert_eq!(ts.generation, 6);
+    }
+
+    /// Continuous-Tasks Phase 1: a session tagged with a
+    /// `continuous_task_id` carries that tag through
+    /// `to_manifest_entry` (the live→disk projection), and a fresh
+    /// untagged session leaves it `None`. This is the TUI half of
+    /// the daemon→manifest→TUI wire thread; the daemon serde test
+    /// (`manifest::tests::t_continuous_task_id_serde_default_and_roundtrip`)
+    /// covers the on-disk shape.
+    #[test]
+    fn continuous_task_id_threads_into_manifest_entry() {
+        let mut ts = make_test_session(None, 0);
+        assert!(ts.to_manifest_entry().continuous_task_id.is_none());
+
+        ts.continuous_task_id = Some("bug-triage".into());
+        assert_eq!(
+            ts.to_manifest_entry().continuous_task_id.as_deref(),
+            Some("bug-triage"),
+        );
     }
 
     #[test]
@@ -17363,6 +17538,7 @@ mod rotation_binding_tests {
             pending_clear: None,
             workflow_run_id: workflow.map(|(r, _)| r.to_string()),
             workflow_role: workflow.map(|(_, role)| role.to_string()),
+            continuous_task_id: None,
             task_id: None,
             last_delivery: None,
             notify_on_idle: false,
@@ -18649,6 +18825,7 @@ mod pending_workflow_events_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -18674,6 +18851,7 @@ mod pending_workflow_events_tests {
             workspaces,
             bindings: HashMap::new(),
             view: None,
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -18833,6 +19011,7 @@ mod pending_workflow_events_tests {
             burst_threshold: 0,
             workflow_run_id: Some("wf_dead".into()),
             workflow_role: Some("worker".into()),
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -18858,6 +19037,7 @@ mod pending_workflow_events_tests {
             workspaces,
             bindings: HashMap::new(),
             view: None,
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -19014,6 +19194,7 @@ mod pending_workflow_events_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -19039,6 +19220,7 @@ mod pending_workflow_events_tests {
             workspaces,
             bindings: HashMap::new(),
             view: None,
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -19140,6 +19322,7 @@ mod pending_workflow_events_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -19166,6 +19349,7 @@ mod pending_workflow_events_tests {
             workspaces,
             bindings: HashMap::new(),
             view: None,
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -19250,6 +19434,7 @@ mod pending_workflow_events_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -19275,6 +19460,7 @@ mod pending_workflow_events_tests {
             workspaces,
             bindings: HashMap::new(),
             view: None,
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -19562,6 +19748,7 @@ mod pending_workflow_events_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -19883,6 +20070,7 @@ mod remote_reconnect_tests {
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             last_delivery: None,
             notify_on_idle: false,
@@ -22631,6 +22819,7 @@ mod input_handler_tests {
                 pending_clear: None,
                 workflow_run_id: None,
                 workflow_role: None,
+                continuous_task_id: None,
                 task_id: None,
                 last_delivery: None,
                 notify_on_idle: false,
@@ -24411,6 +24600,216 @@ mod slice_12e_tests {
         );
     }
 
+    /// Continuous Tasks: `visual_items_status` pulls sessions
+    /// carrying a `continuous_task_id` into their own section,
+    /// emits a `ContinuousHeader`, sorts the group to the BOTTOM
+    /// (below the temporary sessions), and the header is
+    /// non-selectable (navigation skips it). See
+    /// DESIGN_CONTINUOUS_TASKS.md §12.
+    #[test]
+    fn continuous_sessions_sort_below_under_a_header() {
+        let guard = crate::test_support::home_lock();
+        let (mut app, _tmp) =
+            build_app_with_hosts(&[("local", true)], &guard);
+        // One workspace: a normal (temporary) session followed by
+        // a continuous-tagged session. Both idle so status order
+        // can't be what sorts the continuous one down.
+        let mk = |uid: &str, label: &str, continuous: Option<&str>| {
+            let mut ts = make_simple_session_with_uid(
+                uid.into(),
+                label,
+                "bash",
+                crate::session::Session::new(
+                    "/bin/true",
+                    &[],
+                    80,
+                    24,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .expect("spawn"),
+                None,
+            );
+            ts.status = SessionStatus::Idle;
+            ts.continuous_task_id = continuous.map(|s| s.to_string());
+            ts
+        };
+        app.workspaces.push(Workspace {
+            id: "ws-0".into(),
+            name: "ws-0".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            is_pushing: false,
+            sessions: vec![
+                mk("uid-normal", "normal", None),
+                mk("uid-cont", "continuous", Some("ct-1")),
+            ],
+            tombstones: Vec::new(),
+        });
+
+        let items = app.visual_items_status();
+
+        // ContinuousHeader is emitted exactly once.
+        let header_pos = items
+            .iter()
+            .position(|i| matches!(i, VisualItem::ContinuousHeader));
+        assert!(
+            header_pos.is_some(),
+            "a continuous-tagged session MUST emit a \
+             ContinuousHeader; got: {:?}",
+            items,
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, VisualItem::ContinuousHeader))
+                .count(),
+            1,
+            "exactly one ContinuousHeader expected; got: {:?}",
+            items,
+        );
+
+        // The continuous session sorts BELOW the normal one, and
+        // below the header (the divided-panel requirement).
+        let normal_pos = items
+            .iter()
+            .position(|i| matches!(i, VisualItem::Session(0, 0)))
+            .expect("normal session must be present");
+        let cont_pos = items
+            .iter()
+            .position(|i| matches!(i, VisualItem::Session(0, 1)))
+            .expect("continuous session must be present");
+        assert!(
+            normal_pos < header_pos.unwrap()
+                && header_pos.unwrap() < cont_pos,
+            "continuous session MUST sort below the normal \
+             session, under the ContinuousHeader; got: {:?}",
+            items,
+        );
+
+        // The header is non-selectable: navigating down from the
+        // normal session skips the Separator + ContinuousHeader and
+        // lands on the continuous session.
+        app.cursor = Cursor::Session(0, 0);
+        app.navigate(1);
+        assert_eq!(
+            app.cursor,
+            Cursor::Session(0, 1),
+            "navigation MUST skip the non-selectable \
+             ContinuousHeader and land on the continuous session",
+        );
+    }
+
+    /// Continuous Tasks `A-c`: when `hide_continuous` is set, all three
+    /// sidebar builders drop the continuous group entirely — the
+    /// `ContinuousHeader` AND the sessions under it. The normal
+    /// (temporary) session stays put. See DESIGN_CONTINUOUS_TASKS.md §12.
+    #[test]
+    fn hide_continuous_removes_group_from_all_builders() {
+        let guard = crate::test_support::home_lock();
+        // Build a workspace with one normal + one continuous session.
+        let mk_ws = || {
+            let mk = |uid: &str, label: &str, continuous: Option<&str>| {
+                let mut ts = make_simple_session_with_uid(
+                    uid.into(),
+                    label,
+                    "bash",
+                    crate::session::Session::new(
+                        "/bin/true",
+                        &[],
+                        80,
+                        24,
+                        None,
+                        HashMap::new(),
+                        None,
+                    )
+                    .expect("spawn"),
+                    None,
+                );
+                ts.status = SessionStatus::Idle;
+                ts.continuous_task_id = continuous.map(|s| s.to_string());
+                ts
+            };
+            Workspace {
+                id: "ws-0".into(),
+                name: "ws-0".into(),
+                is_closed: false,
+                is_cloud: false,
+                repo_url: None,
+                worktree_path: None,
+                main_repo_path: None,
+                worker_vm: None,
+                worker_zone: None,
+                is_pushing: false,
+                sessions: vec![
+                    mk("uid-normal", "normal", None),
+                    mk("uid-cont", "continuous", Some("ct-1")),
+                ],
+                tombstones: Vec::new(),
+            }
+        };
+
+        // No ContinuousHeader and no Session(0, 1) (the continuous one)
+        // may appear; the normal Session(0, 0) must survive.
+        let assert_hidden = |items: &[VisualItem], builder: &str| {
+            assert!(
+                !items.iter().any(|i| matches!(i, VisualItem::ContinuousHeader)),
+                "{builder}: hide_continuous MUST drop the \
+                 ContinuousHeader; got: {items:?}",
+            );
+            assert!(
+                !items.iter().any(|i| matches!(i, VisualItem::Session(0, 1))),
+                "{builder}: hide_continuous MUST drop the continuous \
+                 session; got: {items:?}",
+            );
+            assert!(
+                items.iter().any(|i| matches!(i, VisualItem::Session(0, 0))),
+                "{builder}: the normal session MUST survive; got: {items:?}",
+            );
+        };
+
+        // Single-host status builder + task builder.
+        {
+            let (mut app, _tmp) =
+                build_app_with_hosts(&[("local", true)], &guard);
+            app.workspaces.push(mk_ws());
+            // Sanity: shown by default.
+            assert!(app
+                .visual_items_status()
+                .iter()
+                .any(|i| matches!(i, VisualItem::ContinuousHeader)));
+            app.hide_continuous = true;
+            assert_hidden(&app.visual_items_status(), "visual_items_status");
+            assert_hidden(&app.visual_items_task(), "visual_items_task");
+        }
+
+        // Multi-host status builder (>1 host routes through the
+        // multihost path; the local-default sessions nest under the
+        // local host group).
+        {
+            let (mut app, _tmp) = build_app_with_hosts(
+                &[("local", true), ("manager", false)],
+                &guard,
+            );
+            app.workspaces.push(mk_ws());
+            assert!(app
+                .visual_items_status_multihost()
+                .iter()
+                .any(|i| matches!(i, VisualItem::ContinuousHeader)));
+            app.hide_continuous = true;
+            assert_hidden(
+                &app.visual_items_status_multihost(),
+                "visual_items_status_multihost",
+            );
+        }
+    }
+
     // ---------------------------------------------------------
     // Orchestrator-added tests: route the 3 helpers through the
     // session's pinned host.
@@ -25484,6 +25883,7 @@ mod slice_12e_tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -25502,6 +25902,7 @@ mod slice_12e_tests {
             burst_threshold: 3,
             workflow_run_id: Some("wf_abc".into()),
             workflow_role: Some("worker".into()),
+            continuous_task_id: None,
             task_id: Some("task_xyz".into()),
             notify_on_idle: true,
             seeded_from_snapshot: Some("snap1".into()),
@@ -25526,6 +25927,7 @@ mod slice_12e_tests {
             workspaces,
             bindings: HashMap::new(),
             view: Some("status".to_string()),
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -25709,6 +26111,7 @@ remote_socket = "/remote/manager.sock"
             workspaces,
             bindings: HashMap::new(),
             view: Some("task".to_string()),
+            hide_continuous: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),

@@ -339,6 +339,13 @@ struct StartSessionParams {
     /// Role name within the workflow run. See [`workflow_run_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_role: Option<String>,
+    /// Phase-1 continuous wire field: the continuous-task this
+    /// spawn is a tick of. `None` for ordinary spawns; the trigger
+    /// funnel that sets it lands in Phase 2. Plumbed onto the
+    /// `DaemonSession` (and broadcast in the `Added` diff) beside
+    /// the workflow tags. See DESIGN_CONTINUOUS_TASKS.md §6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuous_task_id: Option<String>,
 }
 
 fn default_session_type() -> String {
@@ -598,6 +605,9 @@ pub(crate) fn start_session_with_spawn_fn(
     // uses `session.set_workflow_context`.
     spawn_params.workflow_run_id = p.workflow_run_id.clone();
     spawn_params.workflow_role = p.workflow_role.clone();
+    // Phase-1 continuous wire field: carry the continuous-task tag
+    // onto the DaemonSession. `None` for ordinary spawns.
+    spawn_params.continuous_task_id = p.continuous_task_id.clone();
     spawn_params.args = p.argv[1..].to_vec();
     spawn_params.working_dir = Some(working_dir);
     spawn_params.cols = p.cols;
@@ -1037,6 +1047,7 @@ pub(crate) fn start_session_with_spawn_fn(
         "session_type": p.session_type,
         "workflow_run_id": p.workflow_run_id,
         "workflow_role": p.workflow_role,
+        "continuous_task_id": p.continuous_task_id,
         "task_id": p.task_id,
     });
     drop(state);
@@ -9082,6 +9093,7 @@ mod tests {
                     burst_threshold: 0,
                     workflow_run_id: None,
                     workflow_role: None,
+                    continuous_task_id: None,
                     task_id: None,
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
@@ -9324,6 +9336,7 @@ mod tests {
                     burst_threshold: 0,
                     workflow_run_id: None,
                     workflow_role: None,
+                    continuous_task_id: None,
                     task_id: None,
                     notify_on_idle: false,
                     seeded_from_snapshot: None,
@@ -9517,6 +9530,7 @@ mod tests {
                     burst_threshold: 0,
                     workflow_run_id: None,
                     workflow_role: None,
+                    continuous_task_id: None,
                     task_id: None,
                     notify_on_idle: false,
                     seeded_from_snapshot: None,

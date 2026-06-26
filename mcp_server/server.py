@@ -67,7 +67,7 @@ mcp = FastMCP("claude-manager")
 
 _BRIEF_FIELDS = (
     "id", "slug", "project", "name", "status", "source",
-    "priority", "difficulty", "is_cloud",
+    "priority", "difficulty", "is_cloud", "kind",
 )
 _FULL_EXTRA_FIELDS = (
     "description", "prompt", "depends", "repo_url", "repo_branch",

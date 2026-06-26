@@ -17,6 +17,9 @@ class TaskCreate(BaseModel):
     depends: list[str] | None = None
     source: str = "user"
     is_cloud: bool = False
+    # Task kind — "oneshot" (default) or "continuous". Continuous rows are
+    # excluded from the legacy GCP one-shot dispatcher.
+    kind: str = "oneshot"
     # Subtask fields (Phase 5 of agent orchestration)
     parent_task_id: str | None = None
     worktree_mode: str = "inherit"
@@ -49,6 +52,7 @@ class TaskUpdate(BaseModel):
     depends: list[str] | None = None
     source: str | None = None
     is_cloud: bool | None = None
+    kind: str | None = None
     # Subtask fields
     parent_task_id: str | None = None
     worktree_mode: str | None = None
@@ -82,6 +86,7 @@ class TaskResponse(BaseModel):
     depends: list[str] | None = None
     source: str = "user"
     is_cloud: bool = False
+    kind: str = "oneshot"
     # Subtask fields (Phase 5)
     parent_task_id: str | None = None
     worktree_mode: str = "inherit"

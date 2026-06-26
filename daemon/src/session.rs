@@ -463,6 +463,12 @@ pub struct SpawnParams {
     /// Role name this session is bound to within the workflow run.
     /// See [`workflow_run_id`](Self::workflow_run_id).
     pub workflow_role: Option<String>,
+    /// Continuous-task this session is a tick of, carried from
+    /// `StartSessionParams.continuous_task_id` onto the final
+    /// `DaemonSession`. `None` for ordinary spawns; the trigger
+    /// funnel that sets it lands in Phase 2. See
+    /// DESIGN_CONTINUOUS_TASKS.md §6.
+    pub continuous_task_id: Option<String>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -553,6 +559,8 @@ impl SpawnParams {
             // 10d-2c-1 review round-5 (F1): non-workflow default.
             workflow_run_id: None,
             workflow_role: None,
+            // Phase-1 continuous wire field: non-continuous default.
+            continuous_task_id: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -923,6 +931,10 @@ pub struct DaemonSession {
     /// `state::lookup_session_any`.
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
+    /// Phase-1 continuous wire field: the continuous-task this
+    /// session is a tick of, carried through from `SpawnParams`.
+    /// `None` for ordinary sessions. See DESIGN_CONTINUOUS_TASKS.md §6.
+    pub continuous_task_id: Option<String>,
     /// Sub-2b-1 review-r#2 #2: transcript generation counter.
     /// Initialized to 0; incremented by `session.set_transcript_path`
     /// when the incoming path differs from `transcript_path`
@@ -1119,6 +1131,9 @@ struct PendingSessionInner {
     /// SpawnParams onto the final DaemonSession.
     workflow_run_id: Option<String>,
     workflow_role: Option<String>,
+    /// Phase-1 continuous wire field, carried SpawnParams →
+    /// DaemonSession alongside the workflow tags.
+    continuous_task_id: Option<String>,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
     /// from `PendingSession::spawn` → `arm_reaper` →
     /// `DaemonSession`. The fanout already holds an Arc clone
@@ -1437,6 +1452,7 @@ impl PendingSession {
                 // carried through to the final DaemonSession.
                 workflow_run_id: params.workflow_run_id,
                 workflow_role: params.workflow_role,
+                continuous_task_id: params.continuous_task_id,
                 last_activity_at,
                 title: params.title,
                 fanout,
@@ -1493,6 +1509,7 @@ impl PendingSession {
             rows,
             workflow_run_id,
             workflow_role,
+            continuous_task_id,
             last_activity_at,
             title,
             fanout,
@@ -1575,6 +1592,7 @@ impl PendingSession {
             // `lookup_session_any` reads it from here.
             workflow_run_id,
             workflow_role,
+            continuous_task_id,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
             // path-change. Subscribed-from-spawn callers

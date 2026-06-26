@@ -270,7 +270,8 @@ async def count_dispatchable(pool: asyncpg.Pool) -> int:
             """SELECT count(*) AS n FROM tasks
                WHERE status IN ('running', 'blocked')
                  AND is_cloud = true
-                 AND project IS NULL""",
+                 AND project IS NULL
+                 AND kind <> 'continuous'""",
         )
         return row["n"]
 
@@ -305,6 +306,7 @@ async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
                    SELECT id FROM tasks
                    WHERE status = 'backlog' AND is_cloud = true
                          AND project IS NULL
+                         AND kind <> 'continuous'
                    ORDER BY priority, created_at
                    LIMIT 1
                    FOR UPDATE SKIP LOCKED

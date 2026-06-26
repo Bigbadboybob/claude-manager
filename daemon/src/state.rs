@@ -790,6 +790,7 @@ mod tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,

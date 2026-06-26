@@ -1935,6 +1935,7 @@ mod tests {
             pending_clear: None,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: task_id.map(str::to_string),
             last_delivery: None,
             notify_on_idle: false,

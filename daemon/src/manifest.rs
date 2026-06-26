@@ -347,6 +347,13 @@ pub struct ManifestEntry {
     pub workflow_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_role: Option<String>,
+    /// Continuous-task this session is a tick of, when spawned by
+    /// the trigger funnel (DESIGN_CONTINUOUS_TASKS.md §6). `None`
+    /// for every ordinary session — the funnel that sets it lands
+    /// in Phase 2; this is the Phase-1 wire field only. Mirrors
+    /// `workflow_run_id`'s daemon→manifest→TUI threading exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -480,6 +487,12 @@ pub struct Manifest {
     pub bindings: HashMap<String, String>,
     #[serde(default)]
     pub view: Option<String>,
+    /// Continuous-Tasks Phase 1: persisted `A-c` toggle that hides the
+    /// continuous section (header + its sessions) from all three sidebar
+    /// builders. Serde-default so old manifests without the key load as
+    /// `false` (section shown).
+    #[serde(default)]
+    pub hide_continuous: bool,
 }
 
 #[cfg(test)]
@@ -791,6 +804,7 @@ mod tests {
             burst_threshold: 0,
             workflow_run_id: None,
             workflow_role: None,
+            continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,
@@ -854,5 +868,58 @@ mod tests {
              save baked host_id into the encoding, so the second \
              read+write is a no-op-default-free round-trip",
         );
+    }
+
+    /// Continuous-Tasks Phase 1: the `continuous_task_id` wire field
+    /// threads through the manifest with the pinned serde shape.
+    /// A manifest written before the field existed must load with
+    /// `None` (serde default), and a None value must NOT serialize
+    /// (skip_serializing_if) so old/new encodings stay compatible.
+    /// A continuous-tagged entry round-trips the id intact.
+    #[test]
+    fn t_continuous_task_id_serde_default_and_roundtrip() {
+        // Pre-continuous JSON (no continuous_task_id key) → None.
+        let pre_json = r#"{"uid":"ts","managed_by_uid":null,"generation":0,"label":"x","session_type":"claude","transcript_id":null,"hidden":false,"idle_timeout_secs":0,"burst_threshold":0,"task_id":null,"notify_on_idle":false}"#;
+        let loaded: ManifestEntry =
+            serde_json::from_str(pre_json).expect("load");
+        assert_eq!(loaded.continuous_task_id, None);
+
+        // None must not appear in the encoding (skip_serializing_if).
+        let none_encoded = serde_json::to_string(&loaded).expect("save");
+        assert!(
+            !none_encoded.contains("continuous_task_id"),
+            "a None continuous_task_id must be omitted: {}",
+            none_encoded,
+        );
+
+        // A continuous-tagged entry round-trips the id.
+        let tagged = ManifestEntry {
+            uid: "ts-cont".into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "triage-tick".into(),
+            session_type: "claude-code".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: Some("bug-triage".into()),
+            task_id: None,
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: crate::host_id::HostId::local(),
+        };
+        let s = serde_json::to_string(&tagged).expect("serialize");
+        assert!(
+            s.contains(r#""continuous_task_id":"bug-triage""#),
+            "tagged entry must serialize the id: {}",
+            s,
+        );
+        let back: ManifestEntry =
+            serde_json::from_str(&s).expect("round-trip");
+        assert_eq!(back.continuous_task_id.as_deref(), Some("bug-triage"));
     }
 }
