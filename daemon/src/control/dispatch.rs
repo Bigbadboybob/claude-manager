@@ -495,6 +495,24 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_add_session(state, req))
         }
 
+        // Continuous Tasks Phase 2 (DESIGN_CONTINUOUS_TASKS.md §8) — the
+        // trigger funnel + continuous-task CRUD. `trigger` is bimodal
+        // (Operator OR Session): like `start_workflow` it only validates the
+        // operator token for Operator frames; Session callers pass through to
+        // `methods::trigger`'s self-or-descendant scope gate (the
+        // downstream-allowlist fan-out edge is Phase 6). The five
+        // `continuous.*` CRUD arms are Operator-only via `require_operator` —
+        // the TUI / cloud control plane manages continuous-task lifecycle;
+        // agents fan out via `trigger`. `continuous.run_now` is the lone CRUD
+        // arm that forwards the caller, because it re-dispatches to
+        // `methods::trigger` with the (already operator-validated) caller.
+        "trigger" => DispatchOutcome::Done(dispatch_trigger(state, req)),
+        "continuous.create" => DispatchOutcome::Done(dispatch_continuous_create(state, req)),
+        "continuous.list" => DispatchOutcome::Done(dispatch_continuous_list(state, req)),
+        "continuous.pause" => DispatchOutcome::Done(dispatch_continuous_pause(state, req)),
+        "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
+        "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -663,6 +681,109 @@ fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::add_session(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `trigger` — Continuous Tasks Phase 2 (DESIGN_CONTINUOUS_TASKS.md §8). Fire
+/// a continuous task now: spawn a fresh session pinned to the task's durable
+/// worktree (`run_mode = "fresh"`), or skip with a `{fired:false,reason}`
+/// response. Operator + Session callable like `dispatch_start_workflow`: the
+/// operator token is validated only for Operator frames (forged-frame defense
+/// via `reject_forged_operator`); Session callers pass through to
+/// `methods::trigger`'s self-or-descendant scope gate
+/// (`task_is_self_or_descendant_of`). The downstream-allowlist fan-out edge —
+/// where a Session caller may trigger a task it does NOT own — is Phase 6.
+fn dispatch_trigger(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
+    match methods::trigger(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.create` — Phase 2 CRUD. Operator-only (mirrors
+/// `dispatch_create_session`): the TUI / cloud control plane owns
+/// continuous-task lifecycle. Creates the durable worktree once, registers the
+/// workspace, and writes the on-disk `ContinuousTask` record.
+fn dispatch_continuous_create(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.create is Operator-callable only (the TUI / cloud control plane \
+         manages continuous-task lifecycle; agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_create(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.list` — Phase 2 CRUD. Operator-only health read of every
+/// on-disk `ContinuousTask` (`load_all`).
+fn dispatch_continuous_list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.list is Operator-callable only (the TUI / cloud control plane \
+         manages continuous-task lifecycle; agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_list(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.pause` — Phase 2 CRUD. Operator-only; sets `paused` on the
+/// record so subsequent triggers return `{fired:false,reason:"paused"}`.
+fn dispatch_continuous_pause(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.pause is Operator-callable only (the TUI / cloud control plane \
+         manages continuous-task lifecycle; agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_pause(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.run_now` — Phase 2 CRUD. Operator-only at the gate, but the ONLY
+/// CRUD wrapper that forwards `&req.caller`: it re-dispatches to
+/// `methods::continuous_run_now`, which forwards to `methods::trigger` with the
+/// already-validated Operator caller (bypassing the trigger Session-gate). A
+/// manual fire = trigger with the trusted Operator caller.
+fn dispatch_continuous_run_now(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.run_now is Operator-callable only (agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_run_now(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.delete` — Phase 2 CRUD. Operator-only; removes the on-disk
+/// `ContinuousTask` record directory.
+fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.delete is Operator-callable only (the TUI / cloud control plane \
+         manages continuous-task lifecycle; agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_delete(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

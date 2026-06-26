@@ -172,6 +172,22 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Python-routable (agents create sessions via `mcp_start_session`).
     "create_session",
     "add_session",
+    # Continuous Tasks Phase 2 (DESIGN_CONTINUOUS_TASKS.md §5/§8/§10): the
+    # trigger funnel + continuous-task CRUD. `trigger` is Operator + Session
+    # callable — it is the ONLY Session-facing tool of this set (an agent fires
+    # a continuous task it owns; Session callers are confined daemon-side to
+    # self-or-descendant, and the downstream-allowlist fan-out is Phase 6).
+    # The `continuous.*` CRUD methods are Operator-only (require_operator on the
+    # daemon): the TUI / cloud control plane manages continuous-task lifecycle,
+    # so a Session-frame MCP call would always be Unauthorized. They are
+    # included here for dispatch-surface alignment only (matching dispatch arms
+    # pinned by DaemonMethodsAlignmentTests); not Python-routable.
+    "trigger",
+    "continuous.create",
+    "continuous.list",
+    "continuous.pause",
+    "continuous.run_now",
+    "continuous.delete",
 })
 
 

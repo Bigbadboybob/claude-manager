@@ -1458,6 +1458,62 @@ def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
     )
 
 
+@mcp.tool()
+def trigger(
+    task_id: str,
+    prompt: str = "",
+    args: dict | None = None,
+    mode: str = "",
+    fire_token: str = "",
+) -> dict:
+    """Fire a continuous task NOW (Continuous Tasks Phase 2 — manual fan-out).
+
+    A continuous task is a durable, repeatable unit of work pinned to its own
+    worktree (created when the task was registered). Triggering it runs one
+    iteration. In `fresh` run_mode the daemon spawns a NEW session per trigger
+    and leaves prior sessions idle (it does NOT kill them); continuity flows
+    through the per-task NOTES.md (the default prompt instructs read-NOTES-
+    first). `persistent` run_mode is not yet implemented in Phase 2 and returns
+    {"fired": false, "reason": "persistent_not_yet_implemented"} cleanly.
+
+    Args:
+        task_id: The continuous task to fire. Must be YOUR OWN task or a
+            self-or-descendant in the parent_task_id tree — cross-task
+            triggering is rejected (the downstream-allowlist fan-out is a
+            later phase).
+        prompt: Optional one-off prompt for this run, overriding the task's
+            default prompt / mode preset.
+        args: Optional free-form JSON blob passed through to the run; the
+            daemon does not parse it.
+        mode: Optional named mode preset (selects a registered prompt/args
+            preset on the task).
+        fire_token: Optional idempotency token. If it equals the last run's
+            fire_token, the call is a no-op and returns
+            {"fired": false, "reason": "duplicate_fire_token"}. Absent => the
+            daemon mints one (`ft_<hex>`).
+
+    Returns:
+        fired => {"fired": true, "fire_token": str, "session_uid": str,
+            "run_mode": str}.
+        not fired => {"fired": false, "reason": "duplicate_fire_token" |
+            "busy" | "paused" | "persistent_not_yet_implemented"}. "busy"
+            means a concurrent trigger is still inside the spawn window.
+
+    State your intent and ask the user to confirm before calling — this spawns
+    a session.
+    """
+    params: dict = {"task_id": task_id}
+    if prompt:
+        params["prompt"] = prompt
+    if args:
+        params["args"] = args
+    if mode:
+        params["mode"] = mode
+    if fire_token:
+        params["fire_token"] = fire_token
+    return control_client.call("trigger", params)
+
+
 def _require_workflow_env() -> tuple[str, str]:
     """Return (run_id, role) from env, or raise if not in a workflow session.
 

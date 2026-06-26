@@ -6266,6 +6266,938 @@ fn compose_daemon_spawn_params(
     Ok(Value::Object(full))
 }
 
+// ===================================================================
+// Continuous Tasks — Phase 2 trigger funnel (DESIGN_CONTINUOUS_TASKS.md
+// §5/§8/§10). MANUAL-ONLY: `trigger` fires a continuous task once, on
+// demand, running the FRESH executor (spawn a NEW session per fire, leave
+// prior sessions idle). The scheduler / periodic auto-fire (Phase 3), the
+// PERSISTENT executor + supervision + watchdog (Phase 3), the queue /
+// Consumer layer (Phase 4) and the downstream-allowlist fan-out (Phase 6)
+// are later phases and are NOT built here. The continuous record +
+// persistence (`crate::continuous::task`) and the runs.jsonl audit
+// (`crate::continuous::runlog`) are twins of workflow/run.rs + events.rs and
+// ship in the module slice; this slice consumes their public API.
+// ===================================================================
+
+/// Thin wrapper over [`compose_daemon_spawn_params`] for a continuous-task
+/// fire. Same param shape (argv via `build_args`, env via `build_env`,
+/// session_type, cols/rows, task_id, auto-registered worktree) with two
+/// continuous-specific bindings:
+///   - `engine` is the `session_type` vocab (`"claude-code"`/`"codex"`/
+///     `"bash"`) — the caller maps `ContinuousTask::engine` via
+///     `Engine::as_session_type` (the wire vocab `"claude"` ≠ the session_type
+///     vocab `"claude-code"`).
+///   - the resulting params carry the Phase-1 `continuous_task_id` wire field
+///     so the spawned session is tagged on `ManifestEntry`/`DaemonSession` and
+///     surfaces in the sidebar's Continuous section (the live update rides
+///     `manifest.watch`, not a runs.jsonl subscriber).
+///
+/// `working_dir` is also passed as the `auto_register_worktree` hint, so the
+/// task's durable workspace self-heals after a daemon restart cleared the
+/// in-memory `state.workspaces` snapshot (idempotent — a no-op when already
+/// registered; Phase 2 has no restart reconciliation).
+fn compose_continuous_spawn_params(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    working_dir: &std::path::Path,
+    task_id: Option<&str>,
+    continuous_task_id: &str,
+    cols: u16,
+    rows: u16,
+) -> MethodResult {
+    let mut full = compose_daemon_spawn_params(
+        state_arc,
+        uid,
+        workspace_id,
+        label,
+        engine,
+        working_dir,
+        task_id,
+        cols,
+        rows,
+        Some(working_dir),
+    )?;
+    if let Value::Object(m) = &mut full {
+        m.insert(
+            "continuous_task_id".into(),
+            Value::String(continuous_task_id.to_string()),
+        );
+    }
+    Ok(full)
+}
+
+/// Mint a fire_token idempotency key (`ft_<hex>-<hex>`) for a `trigger` call
+/// that didn't supply one. Same `nanos`+counter recipe as
+/// [`new_daemon_minted_session_uid`], distinct prefix. A minted token is fresh
+/// by construction, so it never collides with `last_run.fire_token` — the
+/// duplicate-fire guard only ever fires for a CALLER-supplied token.
+fn new_fire_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ft_{:x}-{:x}", nanos, n)
+}
+
+/// Epoch-seconds as f64 for a `runs.jsonl` line's `ts` (mirrors
+/// `workflow::events::Event.ts`).
+fn runlog_now_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for the FRESH executor's spawn boundary. When armed
+    /// (`Some(vec)`), [`continuous_fresh_spawn`] RECORDS the composed
+    /// `start_session` params and returns a synthetic `{session_uid}` WITHOUT
+    /// spawning — so a unit test can assert the params carry
+    /// `continuous_task_id` + the pinned worktree without launching a real
+    /// claude. Mirrors `SPAWN_PROGRAM_OVERRIDE` / `CAPTURED_WORKFLOW_META` in
+    /// `start_workflow`'s spawn loop.
+    static CONTINUOUS_SPAWN_SPY: std::cell::RefCell<Option<Vec<Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_continuous_spawn_spy_for_test() {
+    CONTINUOUS_SPAWN_SPY.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_continuous_spawn_spy_for_test() -> Vec<Value> {
+    CONTINUOUS_SPAWN_SPY.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// The FRESH executor's spawn boundary: hand the composed params to the
+/// production [`start_session`] choke point — the two-phase race-safe spawn
+/// (`PendingSession::spawn` → arm_reaper → lock-held uid-collision recheck →
+/// registry insert → `ManifestDiff::Added`) plus claude_trust pretrust and the
+/// `CM_*` env injection. Calling `start_session` (NOT `PendingSession::spawn`
+/// directly) is load-bearing: it preserves every guarantee
+/// create_session/add_session/mcp_start_session/start_workflow rely on.
+///
+/// Test seam: when [`CONTINUOUS_SPAWN_SPY`] is armed the composed params are
+/// recorded and a synthetic `{session_uid}` is returned without spawning.
+fn continuous_fresh_spawn(state_arc: &Arc<Mutex<DaemonState>>, full: &Value) -> MethodResult {
+    #[cfg(test)]
+    {
+        let spied = CONTINUOUS_SPAWN_SPY.with(|c| {
+            if let Some(captured) = c.borrow_mut().as_mut() {
+                captured.push(full.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if spied {
+            let uid = full
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Ok(json!({ "session_uid": uid }));
+        }
+    }
+    start_session(state_arc, full)
+}
+
+/// Roll back the spawn-window `in_flight` guard and write a `"fired"` failure
+/// line after the FRESH executor's spawn boundary errored. Best-effort: the
+/// trigger is already returning the error to the caller, so a failed
+/// clear/append is logged rather than propagated. Leaving `in_flight` set would
+/// wedge the task into permanent `busy` (Phase 3's restart reconciliation
+/// clears a leaked guard, but Phase 2 must not leak it on a clean error path).
+fn continuous_clear_in_flight_after_failure(
+    task_id: &str,
+    seq: u64,
+    fire_token: &str,
+    session_uid: &str,
+    trigger_source: &str,
+    detail: &str,
+) {
+    if let Err(e) = crate::continuous::task::modify(task_id, |t| {
+        t.in_flight = None;
+    }) {
+        eprintln!(
+            "cm-daemon: trigger could not clear in_flight for '{}' after spawn failure: {}",
+            task_id, e
+        );
+    }
+    if let Err(e) =
+        crate::continuous::runlog::ContinuousRunLog::append(&crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: runlog_now_ts(),
+            task_id: task_id.to_string(),
+            event: "fired".to_string(),
+            fire_token: Some(fire_token.to_string()),
+            session_uid: Some(session_uid.to_string()),
+            run_mode: Some("fresh".to_string()),
+            trigger_source: Some(trigger_source.to_string()),
+            status: Some("failed".to_string()),
+            detail: Some(json!({ "error": detail })),
+        })
+    {
+        eprintln!(
+            "cm-daemon: trigger failure-runlog append failed for '{}': {}",
+            task_id, e
+        );
+    }
+}
+
+/// `trigger` request params (DESIGN_CONTINUOUS_TASKS.md §8). `args` is a
+/// free-form blob the daemon does NOT parse (later phases thread it to the
+/// agent unchanged); `fire_token` is the Phase-2 idempotency key — absent →
+/// the daemon mints `ft_<hex>`.
+#[derive(serde::Deserialize)]
+struct TriggerParams {
+    task_id: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    fire_token: Option<String>,
+}
+
+/// Reason a `trigger` fire was abandoned inside the inside-flock check-and-set.
+/// Mapped to a clean `{fired:false, reason}` response, NOT an `ErrorCode` error.
+enum FireAbort {
+    Busy,
+    DuplicateFireToken,
+}
+
+/// `trigger` — fire a continuous task once, on demand (Phase 2, MANUAL-ONLY).
+///
+/// Bimodal caller: Operator (TUI / cloud control plane — token validated at
+/// dispatch) OR Session (an agent fanning out). A Session caller is CONFINED to
+/// its own task or a descendant (the downstream-allowlist edge is Phase 6).
+///
+/// Flow: validate task_id → (Session) self-or-descendant gate → `load_one` →
+/// paused/persistent guards → resolve the prompt → mint uid + fire_token →
+/// inside-flock atomic check-and-set of the `in_flight` spawn-window guard
+/// (rejects a concurrent fire as `busy` and a repeat idempotency key as
+/// `duplicate_fire_token`) → FRESH executor (compose params tagged with
+/// `continuous_task_id`, pinned to the task's durable worktree, spawned via the
+/// `start_session` choke point, then `spawn_agent_prompt_delivery`) → record
+/// `last_run` / `current_session_uid` / `run_count` + CLEAR `in_flight` →
+/// append a `"fired"` runs.jsonl line.
+///
+/// Returns `{fired:true, fire_token, session_uid, run_mode:"fresh"}` on a fire,
+/// else `{fired:false, reason:"busy"|"duplicate_fire_token"|"paused"|
+/// "persistent_not_yet_implemented"}`.
+pub fn trigger(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: TriggerParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("trigger params: {}", e)))?;
+
+    // Containment-safe task_id allowlist BEFORE any load / path build.
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("trigger: {}", e)))?;
+
+    // Session-caller scope gate (Phase 2: self-or-descendant only — the
+    // downstream-allowlist fan-out edge is Phase 6). Operator callers bypass:
+    // their token was already validated at dispatch. Capture the caller's PTY
+    // size in the SAME brief lock so a Session-fired task inherits the caller's
+    // width; an Operator/headless fire has no terminal → 80×24 (same default as
+    // start_workflow). A taskless Session caller (own_task None) fails the gate,
+    // identical to start_workflow.
+    let caller_size: Option<(u16, u16)> = match caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let sess = state.sessions.get(&s.session_uid);
+            let own_task = sess.and_then(|x| x.task_id.clone());
+            let size = sess.map(|x| (x.last_cols, x.last_rows));
+            let ok = own_task.as_deref().map_or(false, |own| {
+                crate::control::auth::task_is_self_or_descendant_of(
+                    &state.task_tree,
+                    &p.task_id,
+                    own,
+                )
+            });
+            if !ok {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "trigger: continuous task '{}' is not the caller's task or a descendant",
+                        p.task_id
+                    ),
+                ));
+            }
+            size
+        }
+    };
+
+    // Load the durable record (None → NotFound).
+    let task = crate::continuous::task::load_one(&p.task_id).ok_or((
+        ErrorCode::NotFound,
+        format!("trigger: continuous task '{}' not found", p.task_id),
+    ))?;
+
+    // A paused task doesn't fire — a clean skip, not an error.
+    if task.paused {
+        return Ok(json!({ "fired": false, "reason": "paused" }));
+    }
+
+    // run_mode branch. PERSISTENT (supervised long-lived session + watchdog) is
+    // Phase 3; until then it's an advertised clean no-op so callers can detect
+    // it rather than getting a half-implemented fire.
+    if task.run_mode == crate::continuous::task::RunMode::Persistent {
+        return Ok(json!({
+            "fired": false,
+            "reason": "persistent_not_yet_implemented"
+        }));
+    }
+
+    // Resolve the prompt: explicit `prompt` > `modes[mode].prompt` >
+    // `default_prompt`. Continuity across fires is the per-task NOTES.md (the
+    // default prompt instructs read-NOTES-first) — Phase 2 spawns a fresh
+    // session each fire and relies on that file, not a live process. `args` is
+    // accepted but NOT parsed here (reserved for later phases that thread it to
+    // the agent).
+    let resolved_prompt = if let Some(prompt) = p.prompt.as_deref() {
+        prompt.to_string()
+    } else if let Some(mode) = p.mode.as_deref() {
+        match task.modes.get(mode) {
+            Some(preset) => preset.prompt.clone(),
+            None => {
+                return Err((
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "trigger: mode '{}' is not defined on task '{}'",
+                        mode, p.task_id
+                    ),
+                ));
+            }
+        }
+    } else {
+        task.default_prompt.clone()
+    };
+
+    // Provenance label for the run record + audit line.
+    let trigger_source = match caller {
+        Caller::Operator(_) => "operator".to_string(),
+        Caller::Session(s) => format!("session:{}", s.session_uid),
+    };
+
+    // Mint the per-trigger SESSION uid up front so it lands in the in_flight
+    // guard, the spawn params, AND last_run.session_uid (one identity).
+    let session_uid = new_daemon_minted_session_uid();
+    // Accept the caller's idempotency key, else mint a fresh one.
+    let fire_token = p.fire_token.clone().unwrap_or_else(new_fire_token);
+
+    // Atomic inside-flock check-and-set (no TOCTOU): under the exclusive
+    // per-task flock, reject a concurrent fire (`in_flight` already set) or a
+    // duplicate idempotency key (== last_run.fire_token), else arm the
+    // spawn-window guard. Busy takes precedence over duplicate, matching the
+    // pinned contract. A freshly-minted fire_token is unique by construction,
+    // so the duplicate branch only ever fires for a CALLER-supplied token.
+    let started_at = crate::continuous::task::now_unix();
+    let armed = crate::continuous::task::try_modify::<_, FireAbort>(&p.task_id, |t| {
+        if t.in_flight.is_some() {
+            return Err(FireAbort::Busy);
+        }
+        if let Some(last) = &t.last_run {
+            if last.fire_token == fire_token {
+                return Err(FireAbort::DuplicateFireToken);
+            }
+        }
+        t.in_flight = Some(crate::continuous::task::InFlight {
+            fire_token: fire_token.clone(),
+            session_uid: session_uid.clone(),
+            started_at,
+        });
+        Ok(())
+    });
+    match armed {
+        crate::continuous::task::TryModifyOutcome::Ok(_) => {}
+        crate::continuous::task::TryModifyOutcome::Aborted(FireAbort::Busy) => {
+            return Ok(json!({ "fired": false, "reason": "busy" }));
+        }
+        crate::continuous::task::TryModifyOutcome::Aborted(FireAbort::DuplicateFireToken) => {
+            return Ok(json!({ "fired": false, "reason": "duplicate_fire_token" }));
+        }
+        crate::continuous::task::TryModifyOutcome::Persist(e) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("trigger: arm in_flight for '{}': {}", p.task_id, e),
+            ));
+        }
+    }
+
+    // The new run's 1-based sequence number (mirrors run_count+1). Used for both
+    // the audit line and the persisted RunRecord. Stable from here: the
+    // in_flight guard blocks any concurrent fire from advancing run_count.
+    let seq = task.run_count as u64 + 1;
+
+    // ---- FRESH executor (Phase 2): spawn a NEW session, LEAVE prior idle ----
+    // Lock discipline: NO DaemonState mutex and NO continuous-task flock is held
+    // across the spawn or the prompt-delivery PTY write — `start_session`
+    // re-acquires the state lock internally and the reaper's on_exit callback
+    // re-acquires it too; the try_modify above already released the flock.
+    // Prior idle sessions are LEFT ALONE — the retention.keep_sessions prune is
+    // a later, default-off addition.
+    let engine = task.engine.as_session_type();
+    let (cols, rows) = caller_size.unwrap_or((80, 24));
+    let working_dir = PathBuf::from(&task.worktree_path);
+
+    let full = match compose_continuous_spawn_params(
+        state_arc,
+        &session_uid,
+        &task.workspace_id,
+        &task.label,
+        engine,
+        &working_dir,
+        Some(&task.task_id),
+        &task.task_id,
+        cols,
+        rows,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            continuous_clear_in_flight_after_failure(
+                &p.task_id,
+                seq,
+                &fire_token,
+                &session_uid,
+                &trigger_source,
+                &e.1,
+            );
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = continuous_fresh_spawn(state_arc, &full) {
+        continuous_clear_in_flight_after_failure(
+            &p.task_id,
+            seq,
+            &fire_token,
+            &session_uid,
+            &trigger_source,
+            &e.1,
+        );
+        return Err(e);
+    }
+
+    // Deliver the resolved prompt to the freshly-spawned session. Clone the
+    // input handle under a BRIEF state lock, drop it, THEN hand off to the
+    // detached delivery thread (settle → bracketed-paste body → gap → kitty
+    // Enter). A bare `\n` does NOT submit a claude-code/codex kitty TUI.
+    // Best-effort: a vanished session (fast-exit reaper removed the registry
+    // entry) skips delivery — the fire already counted and the caller has its
+    // uid (matches spawn_agent_prompt_delivery's fire-and-forget contract).
+    let handle_opt = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.sessions.get(&session_uid).map(|s| s.input_handle())
+    };
+    if let Some(handle) = handle_opt {
+        spawn_agent_prompt_delivery(handle, session_uid.clone(), resolved_prompt);
+    }
+
+    // Record the fire + CLEAR the spawn-window guard in one atomic modify.
+    // Phase 2's in_flight is a spawn-window guard ONLY — cleared as the trigger
+    // returns (the delivery thread is detached); whole-run tracking is Phase 3.
+    if let Err(e) = crate::continuous::task::modify(&p.task_id, |t| {
+        t.last_run = Some(crate::continuous::task::RunRecord {
+            seq,
+            fire_token: fire_token.clone(),
+            started_at,
+            finished_at: None,
+            session_uid: Some(session_uid.clone()),
+            status: crate::continuous::task::RunStatus::Running,
+            trigger_source: trigger_source.clone(),
+        });
+        t.current_session_uid = Some(session_uid.clone());
+        t.run_count = t.run_count.saturating_add(1);
+        t.last_fired_at = started_at;
+        t.in_flight = None;
+    }) {
+        // The session is already spawned + the prompt delivering; failing to
+        // persist last_run only leaks the in_flight guard. Log loudly — the
+        // fire DID happen, so we still report fired:true below.
+        eprintln!(
+            "cm-daemon: trigger spawned '{}' but failed to record last_run / clear in_flight: {}",
+            p.task_id, e
+        );
+    }
+
+    // Append the audit line (best-effort; the fire already happened).
+    if let Err(e) =
+        crate::continuous::runlog::ContinuousRunLog::append(&crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: runlog_now_ts(),
+            task_id: p.task_id.clone(),
+            event: "fired".to_string(),
+            fire_token: Some(fire_token.clone()),
+            session_uid: Some(session_uid.clone()),
+            run_mode: Some("fresh".to_string()),
+            trigger_source: Some(trigger_source.clone()),
+            status: Some("running".to_string()),
+            // Carry the caller's free-form `args` blob into the audit line
+            // unparsed — the daemon does NOT interpret it (later phases thread
+            // it to the agent). `None` when the caller sent no args.
+            detail: p.args.clone(),
+        })
+    {
+        eprintln!(
+            "cm-daemon: trigger runlog append failed for '{}': {}",
+            p.task_id, e
+        );
+    }
+
+    Ok(json!({
+        "fired": true,
+        "fire_token": fire_token,
+        "session_uid": session_uid,
+        "run_mode": "fresh",
+    }))
+}
+
+// ===================================================================
+// Continuous CRUD — Operator-only lifecycle management
+// (DESIGN_CONTINUOUS_TASKS.md §8). `continuous.create` / `.list` /
+// `.pause` / `.run_now` / `.delete`. The authoritative record is daemon
+// disk (`crate::continuous::task`); the planning row is a thin mirror.
+// These handlers NEVER spawn — firing a task is `trigger`'s job, and
+// `continuous.run_now` is a thin forward to it. All are gated
+// Operator-only in dispatch.rs (the TUI / cloud control plane manages
+// lifecycle; agents fan out via `trigger`).
+// ===================================================================
+
+/// `continuous.create` params. The durable worktree is created ONCE here
+/// (reused every fire — the disk-growth bound) and the workspace is registered
+/// in the daemon's manifest snapshot. Config beyond the `ContinuousTask::new`
+/// seed is assigned after construction (mirrors WorkflowRun's all-pub fields);
+/// the later-phase fields (downstream/enqueue_to/retention/…) are accepted and
+/// persisted but inert in Phase 2.
+#[derive(serde::Deserialize)]
+struct ContinuousCreateParams {
+    /// Durable task id (planning slug, e.g. `"bug-triage"`). Doubles as the
+    /// default worktree slug + workspace key. Validated by `validate_task_id`.
+    task_id: String,
+    /// Human-readable sidebar label.
+    label: String,
+    /// Wire engine: `"claude"`|`"codex"`|`"bash"` (default `claude`).
+    #[serde(default)]
+    engine: crate::continuous::task::Engine,
+    /// `"fresh"`|`"persistent"` (default `fresh`; persistent is a Phase-3 no-op).
+    #[serde(default)]
+    run_mode: crate::continuous::task::RunMode,
+    /// Internally-tagged schedule (default `on_demand`). Phase 2 only ever fires
+    /// on demand via `trigger`; periodic/consumer/cron logic is later phases.
+    #[serde(default)]
+    schedule: crate::continuous::task::Schedule,
+    /// The default prompt each fresh fire delivers (the NOTES-first instruction).
+    default_prompt: String,
+    /// Repo shortname or URL — resolved on the daemon host for the worktree.
+    repo_url: String,
+    /// Optional branch to start the worktree from. `None` → `cm/<slug>` off HEAD.
+    #[serde(default)]
+    start_branch: Option<String>,
+    /// Worktree dir/branch slug. Defaults to `task_id`.
+    #[serde(default)]
+    slug: Option<String>,
+    /// Workspace id to register. Defaults to `ws-<task_id>`.
+    #[serde(default)]
+    workspace_id: Option<String>,
+    /// Planning project this task belongs to.
+    #[serde(default)]
+    project: Option<String>,
+    /// Host id to pin the task to (e.g. `"cm-manager"`). Defaults to `"local"`
+    /// (the `ContinuousTask::new` seed).
+    #[serde(default)]
+    host: Option<String>,
+    /// Optional skill the fresh session loads.
+    #[serde(default)]
+    skill: Option<String>,
+    /// Named prompt presets (`trigger {mode}` selects one).
+    #[serde(default)]
+    modes: std::collections::BTreeMap<String, crate::continuous::task::ModePreset>,
+    // ---- later-phase config: accepted + persisted, but INERT in Phase 2 ----
+    #[serde(default)]
+    downstream: Vec<String>,
+    #[serde(default)]
+    enqueue_to: Option<String>,
+    #[serde(default)]
+    retention: Option<crate::continuous::task::Retention>,
+    #[serde(default)]
+    review_surface: Option<String>,
+    #[serde(default)]
+    compact_every: Option<u32>,
+    #[serde(default)]
+    supervise: bool,
+    #[serde(default)]
+    max_runtime_secs: Option<u32>,
+}
+
+/// `continuous.create` — register a continuous task: resolve the repo, create
+/// the durable worktree ONCE, register the workspace, and write the
+/// authoritative `state.json`. Idempotent: a second create for the same id
+/// reuses the existing record (`created=false`) without clobbering it, mirroring
+/// `create_worktree`'s reuse semantics. Does NOT spawn — firing is `trigger`'s
+/// job. Operator-only (gated in `dispatch.rs`).
+///
+/// Returns `{ created, task_id, workspace_id, worktree_path }`.
+pub fn continuous_create(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ContinuousCreateParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create params: {}", e)))?;
+
+    // Containment-safe task_id allowlist BEFORE any path build — it keys the
+    // worktree slug, the workspace, and the `~/.cm/continuous-tasks/<id>` dir.
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create: {}", e)))?;
+    if p.label.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "label must be non-empty".into()));
+    }
+    if p.default_prompt.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "default_prompt must be non-empty".into(),
+        ));
+    }
+    if p.repo_url.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "repo_url must be non-empty".into()));
+    }
+
+    // Worktree slug defaults to the (already allowlist-validated) task_id. A
+    // caller-supplied slug feeds `<repo>-<slug>` + `cm/<slug>`, so guard it
+    // against path escape exactly like create_session.
+    let slug = p.slug.clone().unwrap_or_else(|| p.task_id.clone());
+    if slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("slug '{}' must not contain path separators or '..'", slug),
+        ));
+    }
+    let workspace_id = p
+        .workspace_id
+        .clone()
+        .unwrap_or_else(|| format!("ws-{}", p.task_id));
+
+    // Resolve the repo on the DAEMON's filesystem: local fast-path, else clone a
+    // permitted URL. Snapshot the repos config under the lock, then resolve
+    // without holding it (a clone can be slow). Mirrors create_session.
+    let (repos_dir, allow_clone, allow_entries): (PathBuf, bool, Vec<(String, String)>) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            st.config.repos_dir_or_default(),
+            st.config.allow_clone,
+            st.config
+                .repos
+                .iter()
+                .map(|e| (e.name.clone(), e.url.clone()))
+                .collect(),
+        )
+    };
+    let allowlist: Vec<crate::worktree::RepoAllow> = allow_entries
+        .iter()
+        .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
+        .collect();
+    let repo = crate::worktree::resolve_repo(&p.repo_url, &repos_dir, allow_clone, &allowlist)
+        .map_err(|e| match e {
+            crate::worktree::RepoResolveError::NotPermitted(name) => (
+                ErrorCode::NotFound,
+                format!(
+                    "repo '{}' not found on the daemon host and cloning is not \
+                     permitted — add a [[repo]] allowlist entry or set \
+                     allow_clone in daemon.toml",
+                    name
+                ),
+            ),
+            crate::worktree::RepoResolveError::CloneFailed { repo, detail } => (
+                ErrorCode::Internal,
+                format!("clone of repo '{}' failed: {}", repo, detail),
+            ),
+        })?;
+
+    // Create the durable worktree ONCE (reused every fire). `created` is `false`
+    // when a pre-existing `cm/<slug>` worktree was reused on a slug collision —
+    // NEVER delete that on a later failure (it may hold prior work).
+    let (worktree_path, created) =
+        crate::worktree::create_worktree(&repo, &slug, p.start_branch.as_deref()).map_err(|e| {
+            (
+                ErrorCode::Internal,
+                format!("create_worktree for slug '{}': {}", slug, e),
+            )
+        })?;
+    if created {
+        crate::worktree::setup_worktree(&repo, &worktree_path);
+    }
+    let cleanup_if_created = |worktree_path: &std::path::Path| {
+        if created {
+            let _ = crate::worktree::remove_worktree(&repo, worktree_path);
+        }
+    };
+
+    // Register the workspace + task→workspace binding in the daemon's manifest
+    // snapshot under the lock, then DROP it. No spawn happens here (that's
+    // `trigger`'s job); the durable worktree self-heals via the auto-register
+    // hint on each fire (`compose_continuous_spawn_params`).
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.workspaces.insert(
+            workspace_id.clone(),
+            crate::manifest::ManifestWorkspace {
+                id: workspace_id.clone(),
+                worktree_path: Some(worktree_path.clone()),
+                ..Default::default()
+            },
+        );
+        state
+            .task_workspaces
+            .insert(p.task_id.clone(), workspace_id.clone());
+    }
+
+    // Build the authoritative record and write it. `create` is the idempotent
+    // first-write: `Ok(false)` on a record collision (the handler reuses the
+    // existing record, mirroring the worktree's `created=false`).
+    let mut task = crate::continuous::task::ContinuousTask::new(
+        p.task_id.clone(),
+        p.label.clone(),
+        workspace_id.clone(),
+        worktree_path.to_string_lossy().into_owned(),
+        p.engine,
+        p.run_mode,
+        p.schedule.clone(),
+        p.default_prompt.clone(),
+    );
+    task.project = p.project.clone();
+    task.repo = Some(p.repo_url.clone());
+    if let Some(host) = p.host.clone() {
+        task.host_id = host;
+    }
+    task.skill = p.skill.clone();
+    task.modes = p.modes.clone();
+    task.downstream = p.downstream.clone();
+    task.enqueue_to = p.enqueue_to.clone();
+    if let Some(retention) = p.retention.clone() {
+        task.retention = retention;
+    }
+    task.review_surface = p.review_surface.clone();
+    task.compact_every = p.compact_every;
+    task.supervise = p.supervise;
+    task.max_runtime_secs = p.max_runtime_secs;
+
+    let record_created = match crate::continuous::task::create(&task) {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup_if_created(&worktree_path);
+            return Err((
+                ErrorCode::Internal,
+                format!("continuous.create persist '{}': {}", p.task_id, e),
+            ));
+        }
+    };
+
+    // NOTE: the `metadata.continuous` mirror onto the planning task row is
+    // DEFERRED. `planning_client.rs` has no metadata-PATCH helper today (only
+    // `propose_task` POST /tasks), and a `metadata` PATCH replaces the whole
+    // object (read-modify-write needed). Daemon disk is authoritative and the
+    // planning row is a thin mirror, so the mirror is a best-effort follow-up —
+    // `continuous.create` does not depend on it.
+
+    Ok(json!({
+        "created": record_created,
+        "task_id": p.task_id,
+        "workspace_id": workspace_id,
+        "worktree_path": worktree_path.to_string_lossy().into_owned(),
+    }))
+}
+
+/// `continuous.list` — the at-a-glance health read over every persisted
+/// continuous task (`load_all` — disk is the authority). No state lock needed;
+/// the projection is a snapshot, never a replay (the live edge rides
+/// `manifest.watch`). Operator-only (gated in `dispatch.rs`).
+///
+/// Returns `{ tasks: [ { task_id, label, project, host_id, engine, run_mode,
+/// schedule, enabled, paused, run_count, current_session_uid, in_flight,
+/// next_fire_at, last_fired_at, last_outcome, last_run }, … ] }`.
+pub fn continuous_list(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    _params: &Value,
+) -> MethodResult {
+    let tasks = crate::continuous::task::load_all();
+    let items: Vec<Value> = tasks
+        .iter()
+        .map(|t| {
+            json!({
+                "task_id": t.task_id,
+                "label": t.label,
+                "project": t.project,
+                "host_id": t.host_id,
+                "engine": t.engine,
+                "run_mode": t.run_mode,
+                "schedule": t.schedule,
+                "enabled": t.enabled,
+                "paused": t.paused,
+                "run_count": t.run_count,
+                "current_session_uid": t.current_session_uid,
+                "in_flight": t.in_flight.is_some(),
+                "next_fire_at": t.next_fire_at,
+                "last_fired_at": t.last_fired_at,
+                // `last_outcome` surfaces the most-recent run's status glyph
+                // (`Running`/`Done`/`Failed`/…); `null` before the first fire.
+                "last_outcome": t.last_run.as_ref().map(|r| r.status),
+                "last_run": t.last_run,
+            })
+        })
+        .collect();
+    Ok(json!({ "tasks": items }))
+}
+
+/// `continuous.pause` params.
+#[derive(serde::Deserialize)]
+struct ContinuousPauseParams {
+    task_id: String,
+    /// Target paused state (`true` to pause, `false` to resume).
+    paused: bool,
+}
+
+/// `continuous.pause` — set/clear a task's `paused` flag (a paused task is
+/// skipped by `trigger` with `{fired:false, reason:"paused"}`). Operator-only
+/// (gated in `dispatch.rs`).
+///
+/// Returns `{ task_id, paused }`.
+pub fn continuous_pause(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ContinuousPauseParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.pause params: {}", e)))?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.pause: {}", e)))?;
+    // Clean NotFound before the modify (which would otherwise surface a missing
+    // `state.json` as an opaque io error).
+    if crate::continuous::task::load_one(&p.task_id).is_none() {
+        return Err((
+            ErrorCode::NotFound,
+            format!("continuous.pause: continuous task '{}' not found", p.task_id),
+        ));
+    }
+    let updated = crate::continuous::task::modify(&p.task_id, |t| {
+        t.paused = p.paused;
+    })
+    .map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("continuous.pause persist '{}': {}", p.task_id, e),
+        )
+    })?;
+    Ok(json!({ "task_id": p.task_id, "paused": updated.paused }))
+}
+
+/// `continuous.run_now` — manual fire. A thin forward to [`trigger`] with the
+/// caller threaded through. Operator-only at the dispatch gate, so the validated
+/// Operator caller bypasses `trigger`'s Session-caller self-or-descendant scope
+/// gate (an Operator is already trusted).
+///
+/// Returns the same shape as `trigger`
+/// (`{fired:true, fire_token, session_uid, run_mode}` or `{fired:false, reason}`).
+pub fn continuous_run_now(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    trigger(state_arc, caller, params)
+}
+
+/// `continuous.delete` params.
+#[derive(serde::Deserialize)]
+struct ContinuousDeleteParams {
+    task_id: String,
+    /// Garbage-collect the durable worktree too (best-effort, default off).
+    #[serde(default)]
+    gc: bool,
+}
+
+/// `continuous.delete` — retire a continuous task: remove its
+/// `~/.cm/continuous-tasks/<id>/` record dir (state.json + runs.jsonl + lock) and
+/// drop its in-memory manifest registration. With `gc=true`, also best-effort
+/// removes the durable worktree (resolved LOCALLY — never cloned on a delete
+/// path). Operator-only (gated in `dispatch.rs`).
+///
+/// Returns `{ deleted: true, task_id, gc }`. An unknown id is `NotFound`.
+pub fn continuous_delete(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ContinuousDeleteParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.delete params: {}", e)))?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.delete: {}", e)))?;
+    let task = crate::continuous::task::load_one(&p.task_id).ok_or((
+        ErrorCode::NotFound,
+        format!(
+            "continuous.delete: continuous task '{}' not found",
+            p.task_id
+        ),
+    ))?;
+
+    // Optional worktree GC (default off). Resolve the repo LOCALLY (a delete
+    // must never clone) and remove the worktree; any failure is logged, never
+    // fatal — the record still retires below.
+    if p.gc {
+        match task.repo.as_deref().and_then(crate::worktree::find_local_repo) {
+            Some(repo) => {
+                let wt = PathBuf::from(&task.worktree_path);
+                if let Err(e) = crate::worktree::remove_worktree(&repo, &wt) {
+                    eprintln!(
+                        "cm-daemon: continuous.delete gc could not remove worktree {} \
+                         for '{}': {}",
+                        task.worktree_path, p.task_id, e
+                    );
+                }
+            }
+            None => {
+                eprintln!(
+                    "cm-daemon: continuous.delete gc could not resolve repo for '{}' \
+                     locally — leaving worktree {} in place",
+                    p.task_id, task.worktree_path
+                );
+            }
+        }
+    }
+
+    // Retire the durable record. The validated task_id keeps this remove_dir_all
+    // confined to `~/.cm/continuous-tasks/<id>`.
+    let dir = crate::continuous::task::task_dir(&p.task_id);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        return Err((
+            ErrorCode::Internal,
+            format!("continuous.delete remove {}: {}", dir.display(), e),
+        ));
+    }
+
+    // Drop the in-memory manifest registration so the sidebar/poller stop
+    // referencing the retired task. Disk is authoritative; this just keeps the
+    // snapshot tidy (Phase 2 has no restart reconciliation).
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.task_workspaces.remove(&p.task_id);
+        state.workspaces.remove(&task.workspace_id);
+    }
+
+    Ok(json!({ "deleted": true, "task_id": p.task_id, "gc": p.gc }))
+}
+
 /// `create_session` — A-n on a (possibly remote) daemon host: resolve
 /// the repo, create the worktree daemon-side, and spawn the first
 /// session in it. Operator-only (gated in `dispatch.rs`).
@@ -15639,6 +16571,449 @@ mod tests {
                     i,
                 );
             }
+        });
+    }
+
+    // --- Continuous Tasks Phase 2: trigger funnel + FRESH executor ----------
+
+    /// Run `f` with `$HOME` pointed at a fresh tempdir so the continuous-task
+    /// persistence (`~/.cm/continuous-tasks/<id>/…`) and the per-session MCP
+    /// config (`~/.cm/mcp/<uid>/…`) land in an isolated tree. Serialized via
+    /// `env_lock` (the whole crate shares one `$HOME`). Mirrors the
+    /// continuous module's own `with_temp_home`.
+    fn with_continuous_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let _g = crate::test_support::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        f(home.path());
+        match prev {
+            Some(p) => unsafe { std::env::set_var("HOME", p) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Build a Phase-2 continuous task pinned to `worktree`. The caller mutates
+    /// the returned value (e.g. set `in_flight` / `last_run`) and `save`s it.
+    fn continuous_task(
+        task_id: &str,
+        engine: crate::continuous::task::Engine,
+        run_mode: crate::continuous::task::RunMode,
+        worktree: &std::path::Path,
+    ) -> crate::continuous::task::ContinuousTask {
+        crate::continuous::task::ContinuousTask::new(
+            task_id.to_string(),
+            "Continuous label".to_string(),
+            "ws-cont".to_string(),
+            worktree.to_string_lossy().into_owned(),
+            engine,
+            run_mode,
+            crate::continuous::task::Schedule::OnDemand,
+            "read NOTES.md first, then continue".to_string(),
+        )
+    }
+
+    /// `run_mode = persistent` is an advertised clean no-op until Phase 3
+    /// (supervised long-lived session + watchdog) — NOT a spawn, NOT an error.
+    #[test]
+    fn trigger_persistent_run_mode_is_clean_no_op() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let task = continuous_task(
+                "ct-persistent",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-persistent" }),
+            )
+            .expect("trigger ok");
+            assert_eq!(resp["fired"], json!(false));
+            assert_eq!(resp["reason"], json!("persistent_not_yet_implemented"));
+
+            // Nothing recorded: no run, no in_flight leak.
+            let reloaded = crate::continuous::task::load_one("ct-persistent").unwrap();
+            assert_eq!(reloaded.run_count, 0);
+            assert!(reloaded.in_flight.is_none());
+            assert!(reloaded.last_run.is_none());
+        });
+    }
+
+    /// A second concurrent fire while `in_flight` is set is rejected `busy`
+    /// (the spawn-window guard) — no second spawn, no mutation.
+    #[test]
+    fn trigger_in_flight_returns_busy() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-busy",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            task.in_flight = Some(crate::continuous::task::InFlight {
+                fire_token: "ft-already-firing".into(),
+                session_uid: "ts-dead-beef-0".into(),
+                started_at: 1,
+            });
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-busy" }),
+            )
+            .expect("trigger ok");
+            assert_eq!(resp["fired"], json!(false));
+            assert_eq!(resp["reason"], json!("busy"));
+
+            // The pre-existing guard is untouched (no clobber).
+            let reloaded = crate::continuous::task::load_one("ct-busy").unwrap();
+            assert_eq!(
+                reloaded.in_flight.as_ref().unwrap().fire_token,
+                "ft-already-firing"
+            );
+            assert_eq!(reloaded.run_count, 0);
+        });
+    }
+
+    /// A caller-supplied `fire_token` that equals `last_run.fire_token` is a
+    /// no-op (`duplicate_fire_token`) — idempotent re-delivery doesn't spawn
+    /// twice.
+    #[test]
+    fn trigger_duplicate_fire_token_is_no_op() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-dup",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            task.last_run = Some(crate::continuous::task::RunRecord {
+                seq: 1,
+                fire_token: "ft-seen-before".into(),
+                started_at: 1,
+                finished_at: None,
+                session_uid: Some("ts-prior-1".into()),
+                status: crate::continuous::task::RunStatus::Running,
+                trigger_source: "operator".into(),
+            });
+            task.run_count = 1;
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-dup", "fire_token": "ft-seen-before" }),
+            )
+            .expect("trigger ok");
+            assert_eq!(resp["fired"], json!(false));
+            assert_eq!(resp["reason"], json!("duplicate_fire_token"));
+
+            // No new run: run_count unchanged, in_flight never set.
+            let reloaded = crate::continuous::task::load_one("ct-dup").unwrap();
+            assert_eq!(reloaded.run_count, 1);
+            assert!(reloaded.in_flight.is_none());
+        });
+    }
+
+    /// A FRESH fire composes `start_session` params tagged with
+    /// `continuous_task_id`, pinned to the task's durable worktree, with the
+    /// engine mapped to the `session_type` vocab — and records the run + clears
+    /// the spawn-window guard. The spawn boundary is spied (no real claude).
+    #[test]
+    fn trigger_fresh_composes_params_tagged_with_continuous_task_id() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let task = continuous_task(
+                "ct-fresh",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_spawn_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-fresh" }),
+            )
+            .expect("trigger ok");
+
+            assert_eq!(resp["fired"], json!(true));
+            assert_eq!(resp["run_mode"], json!("fresh"));
+            let session_uid = resp["session_uid"].as_str().expect("session_uid str");
+            assert!(is_valid_session_uid(session_uid), "minted uid is valid");
+            let fire_token = resp["fire_token"].as_str().expect("fire_token str");
+            assert!(fire_token.starts_with("ft_"), "minted fire_token: {}", fire_token);
+
+            // The composed params reached the spawn boundary tagged + pinned.
+            let captured = take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "exactly one spawn per fire");
+            let full = &captured[0];
+            assert_eq!(full["continuous_task_id"], json!("ct-fresh"));
+            assert_eq!(full["task_id"], json!("ct-fresh"));
+            assert_eq!(full["session_type"], json!("claude-code"));
+            assert_eq!(
+                full["working_dir"].as_str().unwrap(),
+                wt.to_string_lossy().as_ref(),
+                "pinned to the task's durable worktree",
+            );
+            assert_eq!(full["uid"].as_str().unwrap(), session_uid);
+
+            // last_run recorded, current_session_uid set, run_count bumped,
+            // in_flight CLEARED (spawn-window guard only).
+            let reloaded = crate::continuous::task::load_one("ct-fresh").unwrap();
+            assert!(reloaded.in_flight.is_none(), "in_flight cleared on return");
+            assert_eq!(reloaded.run_count, 1);
+            assert_eq!(reloaded.current_session_uid.as_deref(), Some(session_uid));
+            let last = reloaded.last_run.expect("last_run recorded");
+            assert_eq!(last.fire_token, fire_token);
+            assert_eq!(last.session_uid.as_deref(), Some(session_uid));
+
+            // A `"fired"` audit line landed in runs.jsonl.
+            let runs = std::fs::read_to_string(
+                crate::continuous::task::runs_log_path("ct-fresh"),
+            )
+            .expect("runs.jsonl exists");
+            let line: crate::continuous::runlog::RunLogLine =
+                serde_json::from_str(runs.lines().next().expect("one line")).unwrap();
+            assert_eq!(line.event, "fired");
+            assert_eq!(line.run_mode.as_deref(), Some("fresh"));
+            assert_eq!(line.session_uid.as_deref(), Some(session_uid));
+        });
+    }
+
+    /// `compose_continuous_spawn_params` is a thin wrapper that injects
+    /// `continuous_task_id` and pins the worktree, delegating argv/env/cols to
+    /// `compose_daemon_spawn_params` (no real `claude` binary needed).
+    #[test]
+    fn compose_continuous_spawn_params_tags_continuous_task_id() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let uid = fresh_test_uid();
+
+            let full = compose_continuous_spawn_params(
+                &state,
+                &uid,
+                "ws-cont",
+                "Continuous label",
+                crate::continuous::task::Engine::Claude.as_session_type(),
+                &wt,
+                Some("ct-compose"),
+                "ct-compose",
+                120,
+                30,
+            )
+            .expect("compose ok");
+
+            assert_eq!(full["continuous_task_id"], json!("ct-compose"));
+            assert_eq!(full["session_type"], json!("claude-code"));
+            assert_eq!(full["task_id"], json!("ct-compose"));
+            assert_eq!(full["cols"].as_u64(), Some(120));
+            // working_dir AND the auto-register worktree hint both pin the tree.
+            assert_eq!(full["working_dir"].as_str().unwrap(), wt.to_string_lossy().as_ref());
+            assert_eq!(full["worktree_path"].as_str().unwrap(), wt.to_string_lossy().as_ref());
+            // argv came from the daemon's build_args (claude + --mcp-config).
+            let argv: Vec<String> = full["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(argv[0], "claude");
+            assert!(argv.iter().any(|a| a == "--mcp-config"), "argv: {:?}", argv);
+        });
+    }
+
+    // --- Continuous Tasks Phase 2: continuous.* CRUD handlers ---------------
+
+    /// `continuous.create` resolves the repo, creates the durable worktree
+    /// ONCE, registers the workspace + task→workspace binding, and writes the
+    /// authoritative record — and `continuous.list` then surfaces it in the
+    /// health projection. A second create for the same id reuses the record
+    /// (`created=false`). Engine `claude` does NOT spawn here, so no real
+    /// `claude` binary is needed (firing is `trigger`'s job).
+    #[test]
+    fn continuous_create_then_list_round_trip() {
+        with_home_and_repo("continuousrepo", |home, name| {
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = continuous_create(
+                &state,
+                &json!({
+                    "task_id": "bug-triage",
+                    "label": "Bug triage",
+                    "engine": "claude",
+                    "run_mode": "fresh",
+                    "default_prompt": "read NOTES.md first, then continue",
+                    "repo_url": name,
+                    "slug": "bug-triage",
+                }),
+            )
+            .expect("create ok");
+
+            assert_eq!(resp["created"], json!(true));
+            assert_eq!(resp["task_id"], json!("bug-triage"));
+            let expected_wt = home.join(".cm/worktrees/continuousrepo-bug-triage");
+            assert_eq!(
+                resp["worktree_path"].as_str().unwrap(),
+                expected_wt.to_string_lossy().as_ref(),
+            );
+            assert!(expected_wt.join(".git").exists(), "worktree dir must exist");
+
+            // Workspace + task→workspace binding registered in the snapshot.
+            let ws_id = resp["workspace_id"].as_str().unwrap().to_string();
+            {
+                let s = state.lock().unwrap();
+                assert!(s.workspaces.contains_key(&ws_id), "workspace registered");
+                assert_eq!(
+                    s.task_workspaces.get("bug-triage").map(|x| x.as_str()),
+                    Some(ws_id.as_str()),
+                    "task→workspace bound",
+                );
+            }
+
+            // Authoritative record on disk carries the config.
+            let on_disk = crate::continuous::task::load_one("bug-triage").expect("record");
+            assert_eq!(on_disk.engine, crate::continuous::task::Engine::Claude);
+            assert_eq!(on_disk.run_mode, crate::continuous::task::RunMode::Fresh);
+            assert_eq!(on_disk.repo.as_deref(), Some(name));
+            assert_eq!(on_disk.workspace_id, ws_id);
+
+            // Idempotent: a second create reuses the record (created=false).
+            let resp2 = continuous_create(
+                &state,
+                &json!({
+                    "task_id": "bug-triage",
+                    "label": "Bug triage (2)",
+                    "default_prompt": "different prompt",
+                    "repo_url": name,
+                    "slug": "bug-triage",
+                }),
+            )
+            .expect("second create ok");
+            assert_eq!(resp2["created"], json!(false), "record collision reuses");
+            // The original record was NOT clobbered.
+            let reread = crate::continuous::task::load_one("bug-triage").unwrap();
+            assert_eq!(reread.label, "Bug triage", "original label preserved");
+
+            // `continuous.list` surfaces the health projection.
+            let list = continuous_list(&state, &json!({})).expect("list ok");
+            let tasks = list["tasks"].as_array().expect("tasks array");
+            assert_eq!(tasks.len(), 1, "exactly one continuous task");
+            let t = &tasks[0];
+            assert_eq!(t["task_id"], json!("bug-triage"));
+            assert_eq!(t["engine"], json!("claude"));
+            assert_eq!(t["run_mode"], json!("fresh"));
+            assert_eq!(t["paused"], json!(false));
+            assert_eq!(t["run_count"], json!(0));
+            assert_eq!(t["in_flight"], json!(false));
+            assert_eq!(t["last_outcome"], Value::Null, "no run yet");
+            // schedule defaults to on_demand (internally-tagged on `kind`).
+            assert_eq!(t["schedule"]["kind"], json!("on_demand"));
+        });
+    }
+
+    /// `continuous.pause` flips the `paused` flag (persisted), and a pause for
+    /// an unknown id is a clean `NotFound` (not an opaque io error).
+    #[test]
+    fn continuous_pause_toggles_paused_flag() {
+        with_home_and_repo("pauserepo", |_home, name| {
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            continuous_create(
+                &state,
+                &json!({
+                    "task_id": "nightly",
+                    "label": "Nightly",
+                    "default_prompt": "go",
+                    "repo_url": name,
+                }),
+            )
+            .expect("create ok");
+
+            // Pause.
+            let resp = continuous_pause(&state, &json!({ "task_id": "nightly", "paused": true }))
+                .expect("pause ok");
+            assert_eq!(resp["paused"], json!(true));
+            assert!(
+                crate::continuous::task::load_one("nightly").unwrap().paused,
+                "paused persisted",
+            );
+
+            // Resume.
+            let resp2 =
+                continuous_pause(&state, &json!({ "task_id": "nightly", "paused": false }))
+                    .expect("resume ok");
+            assert_eq!(resp2["paused"], json!(false));
+            assert!(
+                !crate::continuous::task::load_one("nightly").unwrap().paused,
+                "resume persisted",
+            );
+
+            // Unknown id → clean NotFound.
+            let err = continuous_pause(&state, &json!({ "task_id": "ghost", "paused": true }))
+                .expect_err("missing task is an error");
+            assert_eq!(err.0, ErrorCode::NotFound);
+        });
+    }
+
+    /// `continuous.delete` retires the record (state.json gone, list empty) and
+    /// drops the in-memory manifest registration. An unknown id is `NotFound`.
+    #[test]
+    fn continuous_delete_retires_record_and_unregisters() {
+        with_home_and_repo("deleterepo", |_home, name| {
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let created = continuous_create(
+                &state,
+                &json!({
+                    "task_id": "ephemeral",
+                    "label": "Ephemeral",
+                    "default_prompt": "go",
+                    "repo_url": name,
+                }),
+            )
+            .expect("create ok");
+            let ws_id = created["workspace_id"].as_str().unwrap().to_string();
+
+            let resp = continuous_delete(&state, &json!({ "task_id": "ephemeral" }))
+                .expect("delete ok");
+            assert_eq!(resp["deleted"], json!(true));
+
+            // Record gone; list empty.
+            assert!(crate::continuous::task::load_one("ephemeral").is_none());
+            let list = continuous_list(&state, &json!({})).expect("list ok");
+            assert_eq!(list["tasks"].as_array().unwrap().len(), 0);
+
+            // In-memory registration dropped.
+            {
+                let s = state.lock().unwrap();
+                assert!(!s.workspaces.contains_key(&ws_id));
+                assert!(!s.task_workspaces.contains_key("ephemeral"));
+            }
+
+            // Deleting an unknown id is NotFound.
+            let err = continuous_delete(&state, &json!({ "task_id": "ghost" }))
+                .expect_err("missing task is an error");
+            assert_eq!(err.0, ErrorCode::NotFound);
         });
     }
 }
