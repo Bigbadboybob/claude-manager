@@ -17,12 +17,15 @@ transcript reads with real temp JSONL files so the parsers run for real.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
 import unittest
 
-from mcp_server import control_client
+from mcp_server import control_client, wait
+from mcp_server.monitor import _monitor_sessions
 from mcp_server.server import (
     _session_status,
     read_last_turn,
@@ -241,6 +244,88 @@ class WaitForAnyTests(_SocketStubMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             res, {"completed": [], "still_running": [], "timed_out": False}
         )
+
+
+def _seq_stub(per_uid):
+    """control_client.call replacement scripting resolve responses per uid;
+    each uid's last response repeats forever."""
+    counters = {u: 0 for u in per_uid}
+
+    def _call(method, params, *a, **k):
+        assert method == "resolve_authorized_session", method
+        uid = params["session_uid"]
+        seq = per_uid[uid]
+        i = min(counters[uid], len(seq) - 1)
+        counters[uid] += 1
+        return dict(seq[i])
+
+    return _call
+
+
+class MonitorAllModeTests(_SocketStubMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_all_waits_for_every_session(self):
+        # "a" is busy on the first poll then idle; "b" is idle immediately.
+        # mode="all" must NOT return after b — it waits until a finishes too,
+        # accumulating both across polls.
+        control_client.call = _seq_stub({
+            "a": [_ready(False, None), _ready(True, None)],
+            "b": [_ready(True, None)],
+        })
+        res = await _monitor_sessions(
+            ["a", "b"], mode="all", poll_interval_s=0.02,
+            return_last_message=False,
+        )
+        self.assertFalse(res["timed_out"])
+        self.assertEqual(
+            sorted(c["session_uid"] for c in res["completed"]), ["a", "b"])
+        self.assertEqual(res["still_running"], [])
+
+    async def test_all_times_out_with_partial(self):
+        # "a" finishes, "b" never does → timeout returns a in completed and
+        # b in still_running.
+        control_client.call = _seq_stub({
+            "a": [_ready(True, None)],
+            "b": [_ready(False, None)],
+        })
+        res = await _monitor_sessions(
+            ["a", "b"], mode="all", timeout_s=0.2, poll_interval_s=0.02,
+            return_last_message=False,
+        )
+        self.assertTrue(res["timed_out"])
+        self.assertEqual([c["session_uid"] for c in res["completed"]], ["a"])
+        self.assertEqual(res["still_running"], ["b"])
+
+
+class WaitCliTests(_SocketStubMixin, unittest.TestCase):
+    def _run_main(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = wait.main(argv)
+        return rc, json.loads(buf.getvalue())
+
+    def test_main_any_completed_exit_0(self):
+        control_client.call = lambda m, p, *a, **k: _ready(True, None)
+        rc, out = self._run_main(["uid-1", "--poll-interval", "0.02"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["mode"], "any")
+        self.assertEqual([c["session_uid"] for c in out["completed"]], ["uid-1"])
+        self.assertFalse(out["timed_out"])
+
+    def test_main_timeout_exit_1(self):
+        control_client.call = lambda m, p, *a, **k: _ready(False, None)
+        rc, out = self._run_main(
+            ["uid-1", "--timeout", "0.1", "--poll-interval", "0.02"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(out["timed_out"])
+        self.assertEqual(out["still_running"], ["uid-1"])
+
+    def test_main_transport_error_exit_3(self):
+        def _boom(m, p, *a, **k):
+            raise control_client.TransportError("connect refused")
+        control_client.call = _boom
+        rc, out = self._run_main(["uid-1", "--poll-interval", "0.02"])
+        self.assertEqual(rc, 3)
+        self.assertEqual(out["error"], "transport")
 
 
 if __name__ == "__main__":
