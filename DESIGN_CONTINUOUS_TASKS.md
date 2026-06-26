@@ -1,6 +1,6 @@
 # Design: Continuous Tasks
 
-**Status:** Design. Phase 1 (sidebar section + wire field + `kind` column) is **implemented and committed** (`13139f5`); the rest is design. Key decisions from review are resolved (see §18).
+**Status:** Phases 1–3 **implemented and committed** (`13139f5`, `2df9cff`, `40cec61`): sidebar + wire field + `kind` column; the `trigger` funnel + FRESH executor + `continuous.*` CRUD; the daemon scheduler + restart recovery + PERSISTENT executor. Phase 3b (stuck-story), Phase 4 (queue), Phase 5 (migration), Phase 6 (fan-out/cloud) remain. Key review decisions resolved (§18).
 **Provenance:** Synthesized from a 9-agent Ultracode design panel (4 recon → 3 competing architectures → judge → synthesis), then refined through review. Winning skeleton: the *trigger-API / extensibility-first* proposal, hardened with the *reliability-first* proposal's idempotency + restart-recovery + audit machinery and the *reuse-first* proposal's primitive-unification grafts.
 
 ---
@@ -191,7 +191,7 @@ The mode is a **task property** (`ContinuousTask.run_mode`); callers never pick 
 
 > **Optional retention/prune step (configurable, easy later add).** When `retention.keep_sessions = N` is set, after spawning the new session the executor retires the oldest idle fresh session(s) beyond N via **`kill_session` semantics** — `mark_operator_kill_requested()` + `session.kill()` while **leaving the entry in the registry** so the reaper broadcasts `ManifestDiff::Exited` + a tombstone (a bare `state.sessions.remove()` SIGKILLs via `Drop` but emits NO `Exited`, so a remote observer never sees the prune). v1 default is keep-all (the step is a no-op); the machinery being in place is what makes capping a config change, not a rework.
 
-**PERSISTENT (one live session):** resolve `state.sessions.get(current_session_uid).input_handle()`, clone it out, **drop the state lock**, then `InputHandle::write_and_stamp` through the poller's finalize drainer (PTY-quiet gate + deferred-Enter). On `run_count % compact_every == 0`, set `needs_fresh_reset` so `fresh_reset::reset_fresh_role` does the `/clear` + baseline reset + `try_rebind` **keeping the same uid** — removes a separate compaction path. Guard: a dead `input_handle()` promotes to a fresh respawn.
+**PERSISTENT (one live session):** resolve `state.sessions.get(current_session_uid).input_handle()`, clone it out, **drop the state lock**, then deliver the prompt via a dedicated `spawn_persistent_prompt_delivery` detached thread that mirrors the FRESH path's `spawn_agent_prompt_delivery` — same kitty-Enter mechanics (`AGENT_KITTY_ENTER` / `agent_paste_payload` / settle+gap). On `run_count % compact_every == 0` it prepends an **inline `/clear`** (same hardcoded kitty-Enter) to keep the **same uid/PTY** — deliberately **not** `fresh_reset::reset_fresh_role`/`PtyModeTracker`, because a tracker attached mid-session hasn't observed the agent's startup kitty/bracketed-paste escapes and would mis-detect raw `\r` mode, so `/clear` wouldn't submit. *(Implemented in Phase 3; this is the consistent-with-FRESH delivery, not the poller's finalize drainer.)* Guard: a dead/`None` `input_handle()` promotes to a fresh respawn.
 
 **Worktree discipline:** `create_worktree` once at `continuous.create`, reused every tick (`created=false`) — **never per trigger** (the disk-growth bound). `claude_trust` auto-pretrusts claude-engine tasks; codex/bash are the un-pretrusted exception.
 
@@ -298,11 +298,11 @@ All live cm-manager migrations are gated on lifting `guard_local_host_only()`.
 - `compose_continuous_spawn_params` + FRESH executor (**no auto-kill**; `start_session` funnel; `spawn_agent_prompt_delivery`).
 - `fire_token` idempotency + `in_flight` guard + `runs.jsonl` (`continuous/task.rs` twin of `run.rs`); `continuous.create/list/pause/run_now/delete`; worktree pinned once.
 
-**Phase 3 — Scheduler + restart recovery + supervision** *(L)*.
-- `ContinuousScheduler` wired FATAL into `lib.rs::run`; `tick_once` (load_all, `BinaryHeap`, `Periodic` fire, catch-up-once); restart orphan-reconciliation.
+**Phase 3 — Scheduler + restart recovery + supervision** *(L)* — **DONE, committed `40cec61`** (except the stuck-story → Phase 3b).
+- `ContinuousScheduler` wired FATAL into `lib.rs::run`; `tick_once` (load_all, `Periodic` fire, catch-up-once, per-fire panic isolation); restart orphan-reconciliation (closes the Phase-2 `in_flight` residual). *(BinaryHeap due-index deferred — linear scan is fine at current N.)*
 - PERSISTENT executor + supervision (dead-persistent respawn, `consecutive_failures` backoff); auto-compact-after-N.
-- Completion signal + `max_runtime` watchdog + snapshot-then-investigator-agent.
-- `daemon.toml [scheduler]` (`enabled`, tick, `max_worktrees`, `default_cap` ≈1 GB per-task overridable).
+- `daemon.toml [scheduler]` (`enabled`, tick, `max_worktrees`, `default_cap` ≈1 GB + per-task `mem_cap_bytes`).
+- **Phase 3b (deferred):** completion signal (`report_done`) + `max_runtime` watchdog + snapshot-then-investigator-agent (`mark_unstuck`/`restart`/`escalate`). The supervision pass it hooks into landed in Phase 3.
 
 **Phase 4 — Queue layer** *(M–L)* — `cm_trigger_queue` (api-owned by default), `enqueue` verb (RPC+MCP+API), atomic batch-claim, `Schedule::Consumer{...}` (window OR threshold), `enqueue_to` chaining.
 
