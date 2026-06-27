@@ -264,6 +264,8 @@ The task logic is a **Skill**; the daemon owns none of it. `ContinuousTask.skill
 
 Because the trigger spawns a **real** Claude PTY on cm-manager, each automation is interactively debuggable: the user `A-a` attaches and watches / re-drives the **same** skill the scheduler runs. **No skill-runner abstraction** — the skill is just the prompt the existing delivery path delivers. A new automation == config + a reusable Skill + a one-line prompt.
 
+> **MUST signal completion (verified on cm-manager 2026-06-27).** A periodic FRESH task's prompt **must** end by calling **`report_done`** (or the session must exit) — otherwise Phase 3b's due-skip-active sees `last_run.status == Running` forever and **never re-fires** (a never-completing run blocks the schedule, which is correct: no pile-up). The deploy+verify smoke proved this: a bash task whose session just idled fired *once*; the same task completed each run (exit → `Done`) fired every 3s as expected. So the `default_prompt` template should append *"…then call `report_done` to signal you're finished."*, and migrated skills (triage, etc.) must call it. **Open follow-up for `engine: bash`:** a bash step should likely run-and-exit (the prompt as `argv`) rather than interactive-bash + typed-prompt, so it exits cleanly per run.
+
 ---
 
 ## 16. Migration plan
