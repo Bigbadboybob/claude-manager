@@ -1833,6 +1833,7 @@ pub fn list_sessions(
             "task_id": session.task_id,
             "workflow_run_id": session.workflow_run_id,
             "workflow_role": session.workflow_role,
+            "continuous_task_id": session.continuous_task_id,
             "worktree_path": state
                 .workspaces
                 .get(&session.workspace_id)
