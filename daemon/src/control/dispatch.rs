@@ -335,6 +335,11 @@ pub fn dispatch_request(
         // own locking inside `methods::*`; the dispatcher just
         // does the Caller-authorization shape check.
         "send_input" => DispatchOutcome::Done(dispatch_send_input(state, req)),
+        // Reliable out-of-band PTY resize. Operator-only — the TUI's
+        // adopt scan re-asserts the pane size on any session whose
+        // daemon PTY drifted (dropped attach-stream resize frame,
+        // MCP-spawned-skinny, etc.).
+        "session.resize" => DispatchOutcome::Done(dispatch_session_resize(state, req)),
         "kill_session" => DispatchOutcome::Done(dispatch_kill_session(state, req)),
         "read_session_output" => {
             DispatchOutcome::Done(dispatch_read_session_output(state, req))
@@ -1256,6 +1261,30 @@ fn dispatch_send_input(
     }
 }
 
+/// `session.resize` — reliably resize a session's PTY. Operator-only:
+/// agents have no resize use case, and a Session caller resizing a
+/// sibling's PTY is pure griefing surface. The TUI (Operator) calls
+/// this from its adopt scan to self-heal sessions whose daemon PTY
+/// drifted from the pane size — the reliable counterpart to the
+/// best-effort attach-stream `Resize` data frame.
+fn dispatch_session_resize(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.resize is Operator-callable only — agents have no \
+         resize use case and a Session caller resizing a sibling's \
+         PTY is griefing surface",
+    ) {
+        return resp;
+    }
+    match methods::session_resize(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `kill_session` — terminate a session. Operator-only at slice
 /// 10c-d. The TUI's tombstone-and-manifest-write is deferred to
 /// slice 10e (manifest-ownership flip); this slice just removes
@@ -1730,6 +1759,84 @@ mod tests {
             (c0, r0),
             "size-less attach.open must not change the PTY size",
         );
+    }
+
+    // --- session.resize (reliable out-of-band resize) ----------------------
+
+    #[test]
+    fn session_resize_operator_resizes_pty() {
+        // The reliable counterpart to the droppable attach-stream Resize
+        // frame: an Operator `session.resize` re-asserts the PTY size in
+        // one shot. This is what the TUI's adopt-scan reconcile uses to
+        // un-stick a session left skinny by a dropped resize (the
+        // MCP-spawned-codex bug).
+        let state = state_with_session("ts-live");
+        let (c0, r0) = {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get("ts-live").expect("live session");
+            (sess.last_cols, sess.last_rows)
+        };
+        assert_ne!(
+            (c0, r0),
+            (203, 51),
+            "precondition: session must not already be at the target size",
+        );
+
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "session.resize",
+                serde_json::json!({ "session_uid": "ts-live", "cols": 203, "rows": 51 }),
+            ),
+        ).into_response();
+        assert!(resp.ok, "session.resize should succeed: {:?}", resp.error);
+
+        let s = state.lock().unwrap();
+        let sess = s.sessions.get("ts-live").expect("live session");
+        assert_eq!(
+            (sess.last_cols, sess.last_rows),
+            (203, 51),
+            "session.resize must resize the daemon PTY",
+        );
+    }
+
+    #[test]
+    fn session_resize_session_caller_is_unauthorized() {
+        // Operator-only: agents have no resize use case and a Session
+        // caller resizing a sibling's PTY is pure griefing surface.
+        let state = state_with_session("ts-live");
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "session.resize",
+                serde_json::json!({ "session_uid": "ts-live", "cols": 100, "rows": 40 }),
+                "ts-caller",
+            ),
+        ).into_response();
+        assert!(!resp.ok, "Session caller must be rejected");
+        assert_eq!(resp.error.expect("error body").code, ErrorCode::Unauthorized);
+        // The PTY size must be untouched by the rejected call.
+        let s = state.lock().unwrap();
+        let sess = s.sessions.get("ts-live").expect("live session");
+        assert_ne!(
+            (sess.last_cols, sess.last_rows),
+            (100, 40),
+            "rejected resize must not have touched the PTY",
+        );
+    }
+
+    #[test]
+    fn session_resize_unknown_session_is_not_found() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "session.resize",
+                serde_json::json!({ "session_uid": "ts-nope", "cols": 120, "rows": 40 }),
+            ),
+        ).into_response();
+        assert!(!resp.ok, "unknown session must fail");
+        assert_eq!(resp.error.expect("error body").code, ErrorCode::NotFound);
     }
 
     #[test]
@@ -2292,6 +2399,40 @@ mod tests {
             assert_eq!(s["state"], "pending");
             assert_eq!(s["idle"], false);
         }
+    }
+
+    #[test]
+    fn list_sessions_reports_live_pty_size() {
+        // The TUI's adopt-scan size reconcile compares these against its
+        // pane size to detect drift. They must ride the daemon-owned
+        // entry as numbers; freshly-spawned sessions report the 80x24
+        // SpawnParams default.
+        let state = state_with_session("ts-live");
+        let req = operator_request("list_sessions", serde_json::Value::Null);
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(resp.ok, "operator must succeed: {:?}", resp.error);
+        let sessions = resp.result.expect("result body");
+        let s = &sessions.as_array().expect("array")[0];
+        assert_eq!(s["cols"].as_u64(), Some(80), "spawn-default cols reported");
+        assert_eq!(s["rows"].as_u64(), Some(24), "spawn-default rows reported");
+
+        // After a resize the reported size tracks the new value (so the
+        // reconcile stops once it has re-asserted the right size).
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "session.resize",
+                serde_json::json!({ "session_uid": "ts-live", "cols": 200, "rows": 50 }),
+            ),
+        );
+        let resp2 = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        ).into_response();
+        let sessions2 = resp2.result.expect("result body");
+        let s2 = &sessions2.as_array().expect("array")[0];
+        assert_eq!(s2["cols"].as_u64(), Some(200));
+        assert_eq!(s2["rows"].as_u64(), Some(50));
     }
 
     /// Sub-2a: `task_id` filter is honored. A session whose

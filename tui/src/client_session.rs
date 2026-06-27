@@ -1043,6 +1043,11 @@ pub struct DaemonSessionSummary {
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
     pub worktree_path: Option<String>,
+    /// Live daemon-side PTY window size (`last_cols`/`last_rows`).
+    /// `None` from an older daemon that doesn't report it; the adopt
+    /// scan's size reconcile skips sessions it can't measure.
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
 }
 
 /// Parse one `list_sessions` array entry into a [`DaemonSessionSummary`].
@@ -1056,6 +1061,12 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     };
+    let u16_field = |k: &str| {
+        entry
+            .get(k)
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u16::try_from(n).ok())
+    };
     Some(DaemonSessionSummary {
         session_uid,
         label: str_field("label").unwrap_or_default(),
@@ -1066,6 +1077,8 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
         workflow_run_id: str_field("workflow_run_id"),
         workflow_role: str_field("workflow_role"),
         worktree_path: str_field("worktree_path"),
+        cols: u16_field("cols"),
+        rows: u16_field("rows"),
     })
 }
 
@@ -1120,6 +1133,33 @@ pub fn rpc_set_transcript_path(
         params: serde_json::json!({
             "session_uid": session_uid,
             "transcript_path": transcript_path,
+        }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// `session.resize` RPC — reliably re-assert a daemon-owned session's
+/// PTY size. Unlike `ClientSession::resize` (which queues a
+/// `{"resize": …}` data frame on the attach stream and silently drops
+/// on `Broken pipe`), this dials a fresh control socket, so it can't
+/// ride a dead attach stream. The TUI's adopt scan calls it to
+/// self-heal sessions whose daemon PTY drifted from the pane size
+/// (the "skinny codex" bug). Operator-only on the daemon side.
+pub fn rpc_session_resize(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    session_uid: &str,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.resize".into(),
+        params: serde_json::json!({
+            "session_uid": session_uid,
+            "cols": cols,
+            "rows": rows,
         }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
@@ -1489,6 +1529,7 @@ mod tests {
             "managed_by_uid": "ts-parent", "workspace_id": "ws-9",
             "task_id": "task-9", "workflow_run_id": "wf-1",
             "workflow_role": "worker", "worktree_path": "/home/u/.cm/worktrees/x",
+            "cols": 324, "rows": 97,
         });
         let s = parse_daemon_session_summary(&full).expect("entry has uid");
         assert_eq!(s.session_uid, "ts-1");
@@ -1497,6 +1538,8 @@ mod tests {
         assert_eq!(s.workspace_id.as_deref(), Some("ws-9"));
         assert_eq!(s.task_id.as_deref(), Some("task-9"));
         assert_eq!(s.worktree_path.as_deref(), Some("/home/u/.cm/worktrees/x"));
+        assert_eq!(s.cols, Some(324));
+        assert_eq!(s.rows, Some(97));
 
         // Old daemon: only the original list_sessions fields present.
         let partial = serde_json::json!({
@@ -1507,6 +1550,9 @@ mod tests {
         assert!(s2.workspace_id.is_none());
         assert!(s2.managed_by_uid.is_none());
         assert!(s2.worktree_path.is_none());
+        // No size reported by an old daemon → None, so the reconcile skips it.
+        assert!(s2.cols.is_none());
+        assert!(s2.rows.is_none());
 
         // No uid → not a session entry.
         assert!(parse_daemon_session_summary(&serde_json::json!({ "label": "x" })).is_none());
@@ -1758,6 +1804,42 @@ mod tests {
         let config = bash_config(&socket, &working_dir, "op-test", &uid, "ws-rpc", "rpc-test", &argv, 80, 24);
         let returned = rpc_start_session(&config).expect("start_session rpc ok");
         assert_eq!(returned, uid, "daemon must echo the supplied uid verbatim");
+        let _ = rpc_kill_session(&socket, "op-test", &uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    #[test]
+    fn rpc_session_resize_round_trip_resizes_daemon_pty() {
+        // Full wire path: TUI client `rpc_session_resize` → daemon
+        // `session.resize` → real PTY TIOCSWINSZ. This is the reliable
+        // delivery the adopt-scan reconcile uses to un-stick a skinny
+        // session (the MCP-spawned-codex bug). Spawn at 80×24, re-assert
+        // 200×50, and confirm the daemon's tracked size moved.
+        let (socket, working_dir, state, stop, handle) = start_test_daemon("ws-resize");
+        let argv = vec!["/bin/bash".to_string()];
+        let uid = test_uid();
+        let config = bash_config(&socket, &working_dir, "op-test", &uid, "ws-resize", "resize-test", &argv, 80, 24);
+        let returned = rpc_start_session(&config).expect("start_session rpc ok");
+        assert_eq!(returned, uid);
+        // Precondition: spawned at the config's 80×24.
+        {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get(&uid).expect("live session");
+            assert_eq!((sess.last_cols, sess.last_rows), (80, 24));
+        }
+
+        rpc_session_resize(&socket, "op-test", &uid, 200, 50)
+            .expect("session.resize rpc ok");
+
+        {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get(&uid).expect("live session");
+            assert_eq!(
+                (sess.last_cols, sess.last_rows),
+                (200, 50),
+                "round-trip session.resize must move the daemon PTY size",
+            );
+        }
         let _ = rpc_kill_session(&socket, "op-test", &uid);
         stop_test_daemon(&socket, stop, handle);
     }

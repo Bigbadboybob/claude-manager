@@ -1390,6 +1390,61 @@ pub fn send_input(
 }
 
 // ============================================================
+// session.resize — reliable, out-of-band PTY resize
+// ============================================================
+
+#[derive(Deserialize)]
+struct SessionResizeParams {
+    session_uid: String,
+    cols: u16,
+    rows: u16,
+}
+
+/// Resize a daemon-owned session's PTY to `cols`×`rows`.
+///
+/// This is the **reliable** size-delivery path. The attach data
+/// stream already carries `{"resize": {cols, rows}}` frames, but
+/// those are best-effort: when the attach socket is dead/replaced
+/// at the instant the frame fires the write drops (`Broken pipe`)
+/// and the PTY stays at its old size forever — the "session renders
+/// skinny" bug. `attach.open` closed that gap for the *initial*
+/// attach (it resizes in-process under the bind lock); this method
+/// closes it for *every other* resize. The TUI's adopt scan calls
+/// it to re-assert the pane size on any session whose daemon PTY
+/// drifted (detected via the `cols`/`rows` `list_sessions` now
+/// reports). Because every control RPC dials a fresh socket, this
+/// call can't ride a dead attach stream.
+///
+/// Operator-only (enforced at the dispatch arm) — agents have no
+/// resize use case. Resizing to the current size is a harmless
+/// idempotent ioctl, so the TUI only calls this on detected drift.
+pub fn session_resize(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: SessionResizeParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("session.resize params: {}", e)))?;
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
+        (
+            ErrorCode::NotFound,
+            format!("session '{}' not in daemon registry", p.session_uid),
+        )
+    })?;
+    // `resize` stamps `last_cols`/`last_rows` even if the underlying
+    // TIOCSWINSZ errors (rare; only when the master fd is gone after
+    // child exit). Surface that as Internal so the caller can log;
+    // the TUI treats it as best-effort and moves on.
+    session.resize(p.cols, p.rows).map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("PTY resize for '{}': {}", p.session_uid, e),
+        )
+    })?;
+    Ok(json!({ "ok": true }))
+}
+
+// ============================================================
 // kill_session (slice 10c-d)
 // ============================================================
 
@@ -1772,6 +1827,15 @@ pub fn list_sessions(
                 .get(&session.workspace_id)
                 .and_then(|w| w.worktree_path.as_ref())
                 .map(|p| p.display().to_string()),
+            // Live PTY window size (authoritative — `last_cols`/`last_rows`
+            // track every applied resize and equal the kernel winsize). The
+            // TUI's adopt scan compares these against its pane size to detect
+            // sessions whose daemon PTY drifted (e.g. an MCP-spawned codex
+            // that started skinny, or a resize data-frame that dropped on a
+            // dead attach socket) and re-asserts the size via `session.resize`.
+            // Additive — older TUIs ignore unknown fields.
+            "cols": session.last_cols,
+            "rows": session.last_rows,
         }));
     }
     // TUI-owned sessions (post-Phase-1 unified view, fixes review

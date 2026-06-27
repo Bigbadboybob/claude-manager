@@ -4968,6 +4968,46 @@ impl App {
             Err(_) => return, // best-effort; matches restore_sessions posture
         };
 
+        // Self-healing size reconcile (runs every scan, independent of
+        // whether anything is adopted below). The daemon now reports each
+        // session's live PTY size; compare it against this terminal's pane
+        // size and re-assert any LOCAL session whose daemon PTY drifted.
+        // This closes the "skinny session" gap the best-effort attach-stream
+        // resize leaves open: a resize data frame that drops on a dead/
+        // replaced attach socket (Broken pipe) leaves the PTY stuck forever,
+        // and `resize_terminals` only re-fires on a size *change*. The
+        // reliable `session.resize` control RPC (fresh socket) fixes it
+        // within one scan — most visibly an MCP-spawned codex that inherited
+        // a momentarily-skinny caller's size. Only sessions with measurable
+        // drift are touched, so the common (already-correct) case sends no
+        // RPC and triggers no spurious SIGWINCH repaint.
+        let want = self.last_term_size;
+        let drift_uids = {
+            let tracked_local: std::collections::HashSet<&str> = self
+                .workspaces
+                .iter()
+                .flat_map(|w| w.sessions.iter())
+                .filter(|s| s.host_id == cm_daemon::host_id::HostId::local())
+                .map(|s| s.uid.as_str())
+                .collect();
+            Self::select_size_drift_uids(&summaries, &tracked_local, want)
+        };
+        for uid in &drift_uids {
+            if let Err(e) = crate::client_session::rpc_session_resize(
+                &socket,
+                crate::daemon_launch::operator_token(),
+                uid,
+                want.0,
+                want.1,
+            ) {
+                eprintln!(
+                    "cm-tui: size reconcile resize {} -> {}x{} failed: {} \
+                     (will retry next adopt scan)",
+                    uid, want.0, want.1, e,
+                );
+            }
+        }
+
         // Decide adoptees under an immutable borrow, then mutate.
         //   - `managed_by_uid.is_some()`: agent-spawned only. TUI-/operator-
         //     spawned sessions are `None` and are excluded (they're already
@@ -5117,6 +5157,31 @@ impl App {
             .filter(|s| {
                 s.managed_by_uid.is_some()
                     && !tracked_uids.contains(s.session_uid.as_str())
+            })
+            .collect()
+    }
+
+    /// Pick which already-tracked sessions need a size re-assertion: those
+    /// the daemon reports at a PTY size different from `want` (the current
+    /// pane size). Skips summaries with no measurable size (older daemon)
+    /// and any uid the TUI doesn't already track locally — fresh adoptees
+    /// get the right size from `attach.open`, so reconciling them here would
+    /// be redundant. Pure (no `self`) so the drift gate is unit-testable
+    /// without a live daemon.
+    fn select_size_drift_uids(
+        summaries: &[crate::client_session::DaemonSessionSummary],
+        tracked_local_uids: &std::collections::HashSet<&str>,
+        want: (u16, u16),
+    ) -> Vec<String> {
+        summaries
+            .iter()
+            .filter_map(|s| {
+                let size = (s.cols?, s.rows?);
+                if tracked_local_uids.contains(s.session_uid.as_str()) && size != want {
+                    Some(s.session_uid.clone())
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -20585,6 +20650,8 @@ mod adopt_daemon_session_tests {
             workflow_run_id: None,
             workflow_role: None,
             worktree_path: None,
+            cols: None,
+            rows: None,
         }
     }
 
@@ -20609,6 +20676,45 @@ mod adopt_daemon_session_tests {
             picked.is_empty(),
             "TUI/operator-spawned sessions (managed_by_uid None) must not be adopted"
         );
+    }
+
+    fn sized(uid: &str, cols: Option<u16>, rows: Option<u16>) -> DaemonSessionSummary {
+        let mut s = summary(uid, Some("ts-parent"));
+        s.cols = cols;
+        s.rows = rows;
+        s
+    }
+
+    #[test]
+    fn size_drift_picks_only_tracked_mismatched_sessions() {
+        // want = the current pane size; the reconcile re-asserts it on any
+        // tracked local session whose daemon PTY drifted.
+        let want = (324u16, 97u16);
+        let tracked: HashSet<&str> = ["skinny", "right", "untracked-skinny"]
+            .into_iter()
+            .take(2) // only "skinny" and "right" are tracked
+            .collect();
+        let summaries = vec![
+            sized("skinny", Some(80), Some(24)),   // tracked + drift → resize
+            sized("right", Some(324), Some(97)),   // tracked + correct → skip
+            sized("untracked-skinny", Some(80), Some(24)), // not tracked → skip (adoption sizes it)
+        ];
+        let picked = App::select_size_drift_uids(&summaries, &tracked, want);
+        assert_eq!(picked, vec!["skinny".to_string()]);
+    }
+
+    #[test]
+    fn size_drift_skips_unmeasured_sessions() {
+        // An older daemon doesn't report cols/rows; we can't tell drift,
+        // so we must not resize (could clobber a correct size to garbage).
+        let want = (324u16, 97u16);
+        let tracked: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let summaries = vec![
+            sized("a", None, None),        // unmeasured → skip
+            sized("b", Some(100), None),   // half-measured → skip
+        ];
+        let picked = App::select_size_drift_uids(&summaries, &tracked, want);
+        assert!(picked.is_empty(), "unmeasured sessions must be skipped: {picked:?}");
     }
 }
 
