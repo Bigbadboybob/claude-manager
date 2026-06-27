@@ -6750,6 +6750,31 @@ enum FireAbort {
 ///     session promotes to a FRESH respawn (mint a new uid, spawn, rebind
 ///     `current_session_uid`) rather than writing to a dead PTY.
 ///
+/// Append the completion-signal instruction to a FRESH agent (claude/codex)
+/// prompt. A periodic fresh run stays `last_run.status == Running` until it
+/// signals done, and the scheduler's due-skip-active will not re-fire a Running
+/// task — and a fresh claude/codex session IDLES after its turn (it does not
+/// exit), so without an explicit `report_done` a periodic task fires exactly
+/// ONCE. Bash runs (run-and-exit → clean exit signals Done) and PERSISTENT
+/// sessions (reuse one live PTY, re-delivered each tick — no re-fire gate) are
+/// returned unchanged. Verified on cm-manager 2026-06-27.
+fn with_completion_instruction(
+    prompt: String,
+    engine: crate::continuous::task::Engine,
+    run_mode: crate::continuous::task::RunMode,
+) -> String {
+    use crate::continuous::task::{Engine, RunMode};
+    if engine == Engine::Bash || run_mode == RunMode::Persistent {
+        return prompt;
+    }
+    format!(
+        "{}\n\n---\nWhen you have finished this run, call the `report_done` MCP \
+         tool to signal completion — the continuous-task scheduler waits for that \
+         signal before starting the next run.",
+        prompt
+    )
+}
+
 /// Returns `{fired:true, fire_token, session_uid, run_mode:"fresh"|"persistent"}`
 /// on a fire, else `{fired:false, reason:"busy"|"duplicate_fire_token"|"paused"}`.
 pub fn trigger(
@@ -6833,6 +6858,9 @@ pub fn trigger(
     } else {
         task.default_prompt.clone()
     };
+    // Auto-signal completion for FRESH agent runs so a periodic task re-fires
+    // (no per-skill `report_done` footgun). No-op for bash / persistent.
+    let resolved_prompt = with_completion_instruction(resolved_prompt, task.engine, task.run_mode);
 
     // Provenance label for the run record + audit line.
     let trigger_source = match caller {
@@ -17820,6 +17848,32 @@ mod tests {
             );
             assert_eq!(reloaded.run_count, 0);
         });
+    }
+
+    /// FRESH agent (claude/codex) prompts get the `report_done` completion
+    /// instruction appended (so a periodic task re-fires); bash + persistent are
+    /// left unchanged.
+    #[test]
+    fn completion_instruction_appended_for_fresh_agent_only() {
+        use crate::continuous::task::{Engine, RunMode};
+        let p = "do the triage".to_string();
+        let fresh_claude = with_completion_instruction(p.clone(), Engine::Claude, RunMode::Fresh);
+        assert!(fresh_claude.starts_with("do the triage"), "original prompt preserved");
+        assert!(fresh_claude.contains("report_done"), "fresh claude gets the signal");
+        assert!(
+            with_completion_instruction(p.clone(), Engine::Codex, RunMode::Fresh).contains("report_done"),
+            "fresh codex gets the signal",
+        );
+        assert_eq!(
+            with_completion_instruction(p.clone(), Engine::Bash, RunMode::Fresh),
+            p,
+            "bash runs-and-exits — no signal appended",
+        );
+        assert_eq!(
+            with_completion_instruction(p.clone(), Engine::Claude, RunMode::Persistent),
+            p,
+            "persistent reuses its session — no re-fire gate, no signal appended",
+        );
     }
 
     /// A caller-supplied `fire_token` that equals `last_run.fire_token` is a
