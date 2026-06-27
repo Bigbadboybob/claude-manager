@@ -154,13 +154,13 @@ fn round_trip(socket: &std::path::Path, req: &Request) -> Response {
 #[test]
 fn deferred_method_returns_unknown_with_slice_10c_pointer() {
     // Methods whose bodies still live in `tui/src/control/methods.rs`
-    // (workflow lifecycle tools, subtask tools, …) return
-    // UnknownMethod from the daemon with an error message pointing
-    // at the migration slice. Slice 10d-mcp-surface-1 wired
+    // return UnknownMethod from the daemon with an error message
+    // pointing at the migration slice. Slice 10d-mcp-surface-1 wired
     // `list_sessions`; sub-2b-2 wired `propose_task`; 10d-2b wired
-    // `workflow_transition` / `workflow_done`. Phase 4 wired
-    // `start_workflow`. Pick a still-deferred method
-    // (`create_subtask` — still TUI-routed) to exercise the fallback arm.
+    // `workflow_transition` / `workflow_done`; Phase 4 wired
+    // `start_workflow`; the subtask CRUD slice wired `create_subtask` /
+    // `list_subtasks` / `mark_subtask_done`. Use a method name that is
+    // genuinely still unrouted to exercise the fallback arm.
     let _serialize = serialize_tests();
     let (socket, stop, handle) = start_test_daemon();
     assert!(wait_for_socket(&socket), "socket must appear");
@@ -168,7 +168,7 @@ fn deferred_method_returns_unknown_with_slice_10c_pointer() {
     let req = Request {
         id: "deferred-test".into(),
         caller: Caller::session("ts-x"),
-        method: "create_subtask".into(),
+        method: "definitely_unmigrated_method".into(),
         params: serde_json::Value::Null,
     };
     let resp = round_trip(&socket, &req);

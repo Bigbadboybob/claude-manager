@@ -8954,6 +8954,910 @@ fn new_daemon_minted_session_uid() -> String {
     format!("ts-{:x}-{:x}", nanos, n)
 }
 
+// ============================================================
+// Subtask CRUD — create_subtask / list_subtasks / mark_subtask_done
+// ============================================================
+//
+// Port of the TUI's `tui/src/control/methods.rs` subtask handlers,
+// re-keyed onto the daemon's headless model so a DAEMON-spawned agent
+// (e.g. a continuous-task orchestrator on cm-manager with no TUI) can
+// fork + track subtasks. Daemon-spawned sessions get `CM_TUI_SOCKET`
+// set to the daemon's own socket, so the MCP client routes
+// `create_subtask` / `list_subtasks` / `mark_subtask_done` here.
+//
+// Differences from the TUI port:
+//   - The caller is a `Caller::Session`; its OWN `task_id` is the PARENT.
+//   - Parent task metadata (repo_url, project, name, wip_branch) comes
+//     from the planning API (GET /tasks/{id}), NOT `app.tasks` /
+//     `state.task_tree` — both are empty/absent on a headless daemon.
+//   - The parent's local worktree path comes from
+//     `DaemonState.workspaces[caller.workspace_id]` (the orchestrator
+//     session runs ON this daemon). `main_repo_path` is preferred from
+//     that workspace, but production daemon workspaces register only
+//     `worktree_path` (the auto-register branch + continuous.create set
+//     `main_repo_path = None`), so branch / in-place modes fall back to
+//     resolving the repo on disk from the parent's `repo_url` — exactly
+//     the `create_session` pattern.
+//   - The planning-API HTTP is INLINED here with ureq (mirroring
+//     `propose_task`'s config-first / env-fallback credential shape)
+//     because `planning_client.rs` only exposes `propose_task` (whose
+//     body lacks `parent_task_id` / `slug` / `status` / `wip_branch`)
+//     and is outside this slice's edit set.
+//
+// Lock discipline (mirrors propose_task / create_session): the
+// `DaemonState` mutex is NEVER held across a planning-API HTTP call or
+// a git/worktree operation. Snapshot what's needed under the lock,
+// drop, do HTTP + git, then re-lock only to register the new
+// workspace + seed the headless auth edge.
+
+use crate::planning_client::PlanningClientError;
+
+/// Resolved planning-API credentials for one inline call batch.
+/// Built from the `DaemonState.config` snapshot (override-first) with
+/// `CM_API_URL` / `CM_API_TOKEN` env fallback — an inlined mirror of
+/// `planning_client::resolve_api_url` / `resolve_api_token` (those are
+/// private to that module).
+struct PlanningApiCreds {
+    base_url: String,
+    token: String,
+}
+
+impl PlanningApiCreds {
+    /// `api_url_cfg` / `api_token_cfg` are the `state.config` values
+    /// snapshotted under the lock (then dropped) by the caller. A
+    /// non-empty config value wins; empty falls through to env. The
+    /// base URL has any trailing slash trimmed (matches the TUI's
+    /// `ApiClient`).
+    fn from_config(
+        api_url_cfg: &str,
+        api_token_cfg: &str,
+    ) -> Result<Self, PlanningClientError> {
+        Ok(PlanningApiCreds {
+            base_url: resolve_planning_api_url(api_url_cfg)?,
+            token: resolve_planning_api_token(api_token_cfg)?,
+        })
+    }
+
+    /// Fresh ureq agent per call batch. 10s global timeout matches
+    /// `planning_client::build_agent`.
+    fn agent() -> ureq::Agent {
+        ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(std::time::Duration::from_secs(10)))
+                .build(),
+        )
+    }
+
+    fn auth(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+fn resolve_planning_api_url(override_val: &str) -> Result<String, PlanningClientError> {
+    let trimmed = override_val.trim();
+    if !trimmed.is_empty() {
+        return Ok(trimmed.trim_end_matches('/').to_string());
+    }
+    let url = std::env::var("CM_API_URL")
+        .map_err(|_| PlanningClientError::MissingConfig("CM_API_URL"))?;
+    let t = url.trim().to_string();
+    if t.is_empty() {
+        return Err(PlanningClientError::MissingConfig("CM_API_URL"));
+    }
+    Ok(t.trim_end_matches('/').to_string())
+}
+
+fn resolve_planning_api_token(override_val: &str) -> Result<String, PlanningClientError> {
+    let trimmed = override_val.trim();
+    if !trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    let token = std::env::var("CM_API_TOKEN")
+        .map_err(|_| PlanningClientError::MissingConfig("CM_API_TOKEN"))?;
+    let t = token.trim().to_string();
+    if t.is_empty() {
+        return Err(PlanningClientError::MissingConfig("CM_API_TOKEN"));
+    }
+    Ok(t)
+}
+
+/// ureq v3 surfaces a non-2xx response as `Error::StatusCode(u16)` (no
+/// body handle in that arm); everything else is transport. Map to the
+/// same `PlanningClientError` shape `propose_task` uses so 4xx → caller
+/// error, 5xx / transport / missing-config → Internal.
+fn map_ureq_err(e: ureq::Error) -> PlanningClientError {
+    match e {
+        ureq::Error::StatusCode(status) => {
+            PlanningClientError::ApiError { status, body: String::new() }
+        }
+        other => PlanningClientError::Transport(other.to_string()),
+    }
+}
+
+/// GET /tasks/{id} — the full task row.
+fn api_get_task(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let mut resp = agent
+        .get(&creds.url(&format!("/tasks/{}", task_id)))
+        .header("Authorization", &creds.auth())
+        .call()
+        .map_err(map_ureq_err)?;
+    resp.body_mut()
+        .read_json::<Value>()
+        .map_err(|e| PlanningClientError::Transport(format!("decode get_task: {}", e)))
+}
+
+/// GET /tasks — the full task universe. The planning API has no
+/// `parent_task_id` query filter (only status / project), so
+/// `list_subtasks` fetches everything and filters client-side.
+fn api_list_tasks(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let mut resp = agent
+        .get(&creds.url("/tasks"))
+        .header("Authorization", &creds.auth())
+        .call()
+        .map_err(map_ureq_err)?;
+    resp.body_mut()
+        .read_json::<Vec<Value>>()
+        .map_err(|e| PlanningClientError::Transport(format!("decode list_tasks: {}", e)))
+}
+
+/// POST /tasks — create a task row; returns the created row (incl. the
+/// server-assigned `id`).
+fn api_create_task(
+    creds: &PlanningApiCreds,
+    body: &Value,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let mut resp = agent
+        .post(&creds.url("/tasks"))
+        .header("Authorization", &creds.auth())
+        .send_json(body)
+        .map_err(map_ureq_err)?;
+    resp.body_mut()
+        .read_json::<Value>()
+        .map_err(|e| PlanningClientError::Transport(format!("decode create_task: {}", e)))
+}
+
+/// PATCH /tasks/{id} — partial update (e.g. `{"status":"done"}`).
+fn api_update_task(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+    fields: &Value,
+) -> Result<(), PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    agent
+        .patch(&creds.url(&format!("/tasks/{}", task_id)))
+        .header("Authorization", &creds.auth())
+        .send_json(fields)
+        .map_err(map_ureq_err)?;
+    Ok(())
+}
+
+/// DELETE /tasks/{id} — create-rollback for a worktree failure.
+fn api_delete_task(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+) -> Result<(), PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    agent
+        .delete(&creds.url(&format!("/tasks/{}", task_id)))
+        .header("Authorization", &creds.auth())
+        .call()
+        .map_err(map_ureq_err)?;
+    Ok(())
+}
+
+/// Generate a 7-hex-char id from nanos + an atomic counter. Ported
+/// verbatim from `tui/src/control/methods.rs::make_request_short_id`.
+/// Used by `create_subtask` for BOTH the slug suffix and the
+/// `cm-sub/<chain>-<short>` branch suffix so they share a consistent
+/// suffix without depending on the new task's UUID.
+fn make_request_short_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:07x}", (nanos.wrapping_add(n)) & 0x0FFF_FFFF)
+}
+
+/// Build the slug chain for a subtask branch name. The TUI walks
+/// `app.tasks`; the daemon has no task list, so it walks ancestry via
+/// the planning API following `parent_task_id`, joining each ancestor's
+/// slugified `name` with `-`, ending in the leaf slug. The immediate
+/// parent's already-fetched row is reused to save a GET (the common
+/// depth-1 orchestrator→subtask case needs zero extra round-trips).
+/// Capped at `MAX_TASK_DEPTH`; ancestor-GET failures break the walk
+/// (the chain is cosmetic — the `-<short>` suffix guarantees the slug's
+/// uniqueness).
+fn build_slug_chain_via_api(
+    creds: &PlanningApiCreds,
+    parent_id: &str,
+    parent_row: &Value,
+    leaf_slug: &str,
+) -> String {
+    let mut chain: Vec<String> = vec![leaf_slug.to_string()];
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cur_id = parent_id.to_string();
+    let mut cur_row: Option<Value> = Some(parent_row.clone());
+    for _ in 0..crate::control::auth::MAX_TASK_DEPTH {
+        if !visited.insert(cur_id.clone()) {
+            break;
+        }
+        let row = match cur_row.take() {
+            Some(r) => r,
+            None => match api_get_task(creds, &cur_id) {
+                Ok(r) => r,
+                Err(_) => break,
+            },
+        };
+        let name = row.get("name").and_then(Value::as_str).unwrap_or("");
+        chain.push(crate::worktree::slugify(name));
+        match row.get("parent_task_id").and_then(Value::as_str) {
+            Some(pid) if !pid.is_empty() => cur_id = pid.to_string(),
+            _ => break,
+        }
+    }
+    chain.reverse();
+    chain.join("-")
+}
+
+#[derive(Deserialize)]
+struct CreateSubtaskParams {
+    name: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    /// One of `"inherit"` (default), `"branch"`, or `"in-place"`.
+    #[serde(default = "default_subtask_worktree_mode")]
+    worktree_mode: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+fn default_subtask_worktree_mode() -> String {
+    "inherit".to_string()
+}
+
+/// Create a subtask off the CALLER's task (the parent). Session-callable
+/// only — the parent is the caller session's own `task_id`. Produces an
+/// IDENTICAL subtask to the TUI's `create_subtask`: `parent_task_id`
+/// set, `status="running"`, `source="claude"`, `is_cloud=false`,
+/// `slug="<chain>-<short>"`, branch mode → a `cm-sub/<chain>-<short>`
+/// worktree, with `wip_branch` baked into the API row per mode.
+///
+/// Returns `{"task_id": <new id>, "worktree_path": <string>}`.
+pub fn create_subtask(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: CreateSubtaskParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("create_subtask params: {}", e)))?;
+    // Validate mode BEFORE resolving the caller (mirror TUI ordering).
+    if !matches!(p.worktree_mode.as_str(), "inherit" | "branch" | "in-place") {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "worktree_mode must be 'inherit', 'branch', or 'in-place', got '{}'",
+                p.worktree_mode
+            ),
+        ));
+    }
+    // Reject an empty-after-normalization slug before any API/git work.
+    let leaf_slug = crate::worktree::slugify(&p.name);
+    if leaf_slug.is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("name '{}' produces an empty slug after normalization", p.name),
+        ));
+    }
+
+    // Resolve the caller + snapshot everything the unlocked HTTP/git
+    // phase needs, then DROP the lock.
+    let (
+        parent_task_id,
+        parent_workspace_id,
+        parent_worktree_path,
+        parent_main_repo_path,
+        parent_ws_repo_url,
+        repos_dir,
+        allow_clone,
+        allow_entries,
+        api_url_cfg,
+        api_token_cfg,
+    ): (
+        String,
+        String,
+        Option<PathBuf>,
+        Option<PathBuf>,
+        Option<String>,
+        PathBuf,
+        bool,
+        Vec<(String, String)>,
+        String,
+        String,
+    ) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "create_subtask is callable only by Session callers (the daemon \
+             resolves the parent task from the caller's session)"
+                .into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        // The caller's OWN task is the PARENT. Taskless callers should
+        // use propose_task for top-level tasks.
+        let parent_task_id = caller.task_id.clone().ok_or((
+            ErrorCode::Unauthorized,
+            "create_subtask requires a tasked caller; use propose_task for top-level tasks"
+                .into(),
+        ))?;
+        let parent_workspace_id = caller.workspace_id.clone();
+        let ws = state.workspaces.get(&parent_workspace_id).ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "caller's workspace '{}' not in daemon manifest snapshot",
+                parent_workspace_id
+            ),
+        ))?;
+        (
+            parent_task_id,
+            parent_workspace_id,
+            ws.worktree_path.clone(),
+            ws.main_repo_path.clone(),
+            ws.repo_url.clone(),
+            state.config.repos_dir_or_default(),
+            state.config.allow_clone,
+            state
+                .config
+                .repos
+                .iter()
+                .map(|e| (e.name.clone(), e.url.clone()))
+                .collect(),
+            state.config.api_url.clone(),
+            state.config.api_token.clone(),
+        )
+    };
+
+    // ---- API + git phase (lock dropped) ----
+
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+
+    // Parent metadata from the planning API (task_tree is empty headless).
+    let parent_row = api_get_task(&creds, &parent_task_id).map_err(|e| e.to_method_err())?;
+    let parent_repo_url: String = parent_row
+        .get("repo_url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| parent_ws_repo_url.clone())
+        .filter(|s| !s.is_empty())
+        .ok_or((ErrorCode::Conflict, "parent task has no repo_url".into()))?;
+    let parent_project = parent_row
+        .get("project")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let parent_wip_branch = parent_row
+        .get("wip_branch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // Project: explicit arg > inherit from parent.
+    let project = p.project.clone().or(parent_project);
+
+    let slug_chain = build_slug_chain_via_api(&creds, &parent_task_id, &parent_row, &leaf_slug);
+    let request_short_id = make_request_short_id();
+    let unique_slug = format!("{}-{}", slug_chain, request_short_id);
+
+    // `main_repo` for branch / in-place. Prefer the parent workspace's
+    // recorded `main_repo_path`; production daemon workspaces register
+    // only `worktree_path` (auto-register + continuous.create leave
+    // `main_repo_path = None`), so fall back to resolving the repo on
+    // the daemon's filesystem from the parent's `repo_url` — the
+    // `create_session` pattern.
+    let resolve_main_repo = || -> Result<PathBuf, (ErrorCode, String)> {
+        if let Some(mr) = parent_main_repo_path.clone() {
+            return Ok(mr);
+        }
+        let allowlist: Vec<crate::worktree::RepoAllow> = allow_entries
+            .iter()
+            .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
+            .collect();
+        crate::worktree::resolve_repo(&parent_repo_url, &repos_dir, allow_clone, &allowlist).map_err(
+            |e| match e {
+                crate::worktree::RepoResolveError::NotPermitted(name) => (
+                    ErrorCode::Conflict,
+                    format!(
+                        "parent workspace has no main_repo_path and repo '{}' is not \
+                         resolvable on the daemon host; cannot branch/launch in-place",
+                        name
+                    ),
+                ),
+                crate::worktree::RepoResolveError::CloneFailed { repo, detail } => (
+                    ErrorCode::Internal,
+                    format!("clone of repo '{}' failed: {}", repo, detail),
+                ),
+            },
+        )
+    };
+
+    // Step 1 — validate ALL per-mode preconditions BEFORE the POST so
+    // a missing path / unresolvable repo can't leak an orphan row.
+    let inherit_worktree_path: Option<PathBuf> = if p.worktree_mode == "inherit" {
+        Some(parent_worktree_path.clone().ok_or((
+            ErrorCode::Conflict,
+            "parent workspace has no worktree path (cloud workspace?)".into(),
+        ))?)
+    } else {
+        None
+    };
+    let branch_main_repo: Option<PathBuf> = if p.worktree_mode == "branch" {
+        Some(resolve_main_repo()?)
+    } else {
+        None
+    };
+    let in_place_main_repo: Option<PathBuf> = if p.worktree_mode == "in-place" {
+        Some(resolve_main_repo()?)
+    } else {
+        None
+    };
+
+    // Parent's base branch: wip_branch, else the worktree's actual HEAD.
+    // Branch mode REQUIRES this (never falls back to "main").
+    let parent_branch_resolved: Option<String> = parent_wip_branch.clone().or_else(|| {
+        parent_worktree_path
+            .as_deref()
+            .and_then(crate::worktree::worktree_current_branch)
+    });
+    if p.worktree_mode == "branch" && parent_branch_resolved.is_none() {
+        return Err((
+            ErrorCode::Conflict,
+            "cannot determine parent's base branch (no wip_branch and worktree HEAD is \
+             detached or unreadable)"
+                .into(),
+        ));
+    }
+
+    // `wip_branch` baked into the API row UPFRONT, per mode.
+    let branch_name_for_new: Option<String> = match p.worktree_mode.as_str() {
+        "inherit" => parent_branch_resolved.clone(),
+        "branch" => Some(format!("cm-sub/{}-{}", slug_chain, request_short_id)),
+        "in-place" => in_place_main_repo
+            .as_deref()
+            .and_then(crate::worktree::worktree_current_branch),
+        _ => None,
+    };
+
+    // Step 2 — create the task row. Server assigns the UUID.
+    let mut body = json!({
+        "repo_url": parent_repo_url,
+        "repo_branch": "main",
+        "name": p.name,
+        "priority": 0,
+        "status": "running",
+        "slug": unique_slug,
+        "source": "claude",
+        "is_cloud": false,
+        "parent_task_id": parent_task_id,
+        "worktree_mode": p.worktree_mode,
+    });
+    if let Some(pr) = &p.prompt {
+        body["prompt"] = json!(pr);
+    }
+    if let Some(pj) = &project {
+        body["project"] = json!(pj);
+    }
+    if let Some(b) = &branch_name_for_new {
+        body["wip_branch"] = json!(b);
+    }
+    let new_task = api_create_task(&creds, &body).map_err(|e| e.to_method_err())?;
+    let new_task_id = new_task
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or((ErrorCode::Internal, "api create_task response missing 'id'".into()))?;
+
+    // Step 3 — produce the worktree. A git failure AFTER the row exists
+    // triggers a rollback DELETE so we don't leak a `running` row.
+    let (worktree_path, new_workspace): (PathBuf, Option<crate::manifest::ManifestWorkspace>) =
+        match p.worktree_mode.as_str() {
+            "inherit" => {
+                // Reuse the parent workspace; no new workspace, no git.
+                (inherit_worktree_path.expect("validated above"), None)
+            }
+            "branch" => {
+                let main_repo = branch_main_repo.expect("validated above");
+                let parent_branch = parent_branch_resolved.clone().expect("validated above");
+                let branch_name = branch_name_for_new
+                    .clone()
+                    .expect("branch_name_for_new is Some in branch mode");
+                let wt = match crate::worktree::create_subtask_worktree(
+                    &main_repo,
+                    &branch_name,
+                    &parent_branch,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = api_delete_task(&creds, &new_task_id);
+                        return Err((
+                            ErrorCode::Internal,
+                            format!(
+                                "create worktree failed for branch '{}'; api task {} rolled back: {}",
+                                branch_name, new_task_id, e
+                            ),
+                        ));
+                    }
+                };
+                crate::worktree::setup_worktree(&main_repo, &wt);
+                let ws = crate::manifest::ManifestWorkspace {
+                    id: uuid::Uuid::new_v4().simple().to_string(),
+                    name: leaf_slug.clone(),
+                    repo_url: Some(parent_repo_url.clone()),
+                    worktree_path: Some(wt.clone()),
+                    main_repo_path: Some(main_repo.clone()),
+                    ..Default::default()
+                };
+                (wt, Some(ws))
+            }
+            "in-place" => {
+                // No worktree, no branch — the subtask runs in the MAIN
+                // repo checkout. A SEPARATE workspace whose
+                // `worktree_path == main_repo_path` is the in-place
+                // marker that gates teardown off git.
+                let main_repo = in_place_main_repo.expect("validated above");
+                let ws = crate::manifest::ManifestWorkspace {
+                    id: uuid::Uuid::new_v4().simple().to_string(),
+                    name: leaf_slug.clone(),
+                    repo_url: Some(parent_repo_url.clone()),
+                    worktree_path: Some(main_repo.clone()),
+                    main_repo_path: Some(main_repo.clone()),
+                    ..Default::default()
+                };
+                (main_repo, Some(ws))
+            }
+            _ => unreachable!(),
+        };
+
+    // Step 4 — register the workspace + seed the headless auth edge so
+    // a subsequent list_subtasks / mark_subtask_done / mcp_start_session
+    // on the subtask resolves the descendant walk (the daemon analog of
+    // the TUI's push_task_tree_to_daemon). create_subtask does NOT spawn
+    // a session, so there is no ManifestDiff::Added to broadcast — the
+    // new workspace reaches a (re)subscribing TUI via the next
+    // manifest.watch snapshot (which serializes state.workspaces +
+    // state.bindings wholesale), and an Added fires later when an agent
+    // spawns a session into the subtask via mcp_start_session.
+    let workspace_id_for_new = new_workspace
+        .as_ref()
+        .map(|w| w.id.clone())
+        .unwrap_or_else(|| parent_workspace_id.clone());
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ws) = new_workspace {
+            state.workspaces.insert(ws.id.clone(), ws);
+        }
+        state
+            .task_tree
+            .insert(new_task_id.clone(), Some(parent_task_id.clone()));
+        state
+            .task_workspaces
+            .insert(new_task_id.clone(), workspace_id_for_new.clone());
+        state
+            .bindings
+            .insert(new_task_id.clone(), workspace_id_for_new);
+    }
+
+    Ok(json!({
+        "task_id": new_task_id,
+        "worktree_path": worktree_path.to_string_lossy(),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct ListSubtasksParams {
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+/// List the children of a task. Read-only: tombstoned (recently-exited)
+/// callers may still read (mirrors the TUI's `caller_ctx_or_tombstone`).
+/// Scope = explicit `task_id` (must be self-or-descendant of the
+/// caller's task) else the caller's own task. The planning API has no
+/// `parent_task_id` filter, so this GETs /tasks and filters client-side.
+///
+/// Returns a JSON array of `{task_id, name, status, worktree_mode,
+/// wip_branch, workspace_id}` per child (`workspace_id` from the
+/// daemon-local `task_workspaces` binding — the API row has none).
+pub fn list_subtasks(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: ListSubtasksParams = if params.is_null() {
+        ListSubtasksParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("list_subtasks params: {}", e)))?
+    };
+
+    let (scope, task_workspaces, api_url_cfg, api_token_cfg): (
+        String,
+        std::collections::HashMap<String, String>,
+        String,
+        String,
+    ) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "list_subtasks is callable only by Session callers".into(),
+        ))?;
+        // Reads survive caller exit: live registry first, then tombstone.
+        let own_task_id: Option<String> = match state.sessions.get(cuid) {
+            Some(s) => s.task_id.clone(),
+            None => match state.exited_tombstone(cuid) {
+                Some(t) => t.task_id.clone(),
+                None => {
+                    return Err((ErrorCode::NotFound, "caller session not found".into()));
+                }
+            },
+        };
+        let scope = match p.task_id.as_deref() {
+            Some(req) => {
+                let own = own_task_id.as_deref().ok_or((
+                    ErrorCode::Unauthorized,
+                    format!("taskless caller cannot scope to task {}", req),
+                ))?;
+                if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, req, own) {
+                    return Err((
+                        ErrorCode::Unauthorized,
+                        format!("task {} is not the caller's task or a descendant", req),
+                    ));
+                }
+                req.to_string()
+            }
+            None => own_task_id.clone().ok_or((
+                ErrorCode::Unauthorized,
+                "taskless caller cannot list subtasks (no task scope)".into(),
+            ))?,
+        };
+        (
+            scope,
+            state.task_workspaces.clone(),
+            state.config.api_url.clone(),
+            state.config.api_token.clone(),
+        )
+    };
+
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    let all = api_list_tasks(&creds).map_err(|e| e.to_method_err())?;
+
+    let mut out: Vec<Value> = Vec::new();
+    for task in &all {
+        if task.get("parent_task_id").and_then(Value::as_str) == Some(scope.as_str()) {
+            let tid = task.get("id").and_then(Value::as_str);
+            let workspace_id = tid.and_then(|id| task_workspaces.get(id)).cloned();
+            out.push(json!({
+                "task_id": tid,
+                "name": task.get("name").cloned().unwrap_or(Value::Null),
+                "status": task.get("status").cloned().unwrap_or(Value::Null),
+                "worktree_mode": task.get("worktree_mode").cloned().unwrap_or(Value::Null),
+                "wip_branch": task.get("wip_branch").cloned().unwrap_or(Value::Null),
+                "workspace_id": workspace_id,
+            }));
+        }
+    }
+    Ok(Value::Array(out))
+}
+
+#[derive(Deserialize)]
+struct MarkSubtaskDoneParams {
+    task_id: String,
+    #[serde(default = "default_close_worktree")]
+    close_worktree: bool,
+}
+
+fn default_close_worktree() -> bool {
+    true
+}
+
+/// Best-effort bounded wait until no LIVE session is tagged with
+/// `task_id`. `mark_subtask_done` SIGKILLs the subtask's sessions
+/// before removing its worktree; the reaper removes them
+/// asynchronously, so this gives the reaper a short window so
+/// `git worktree remove` doesn't race a still-dying child.
+fn wait_for_task_sessions_gone(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let any = {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .sessions
+                .values()
+                .any(|s| s.task_id.as_deref() == Some(task_id))
+        };
+        if !any || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Mark a subtask done. Mutation: requires a LIVE caller (tombstones
+/// refused); the target must be self-or-descendant of the caller's
+/// task. Ordering matches the TUI: locate + close sessions + remove the
+/// worktree (branch mode, `close_worktree`, NOT in-place) BEFORE the API
+/// flip — a failed remove leaves the task non-done and retryable. Hard
+/// safety net: never `git worktree remove` a workspace whose
+/// `worktree_path == main_repo_path` (in-place).
+///
+/// Returns `{"ok": true, "worktree_removed": <bool>}`.
+pub fn mark_subtask_done(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: MarkSubtaskDoneParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("mark_subtask_done params: {}", e)))?;
+
+    // Auth (LIVE caller) + snapshot the subtask's local workspace paths
+    // + creds, then drop the lock.
+    let (cleanup, api_url_cfg, api_token_cfg): (
+        Option<(String, Option<PathBuf>, Option<PathBuf>)>,
+        String,
+        String,
+    ) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "mark_subtask_done is callable only by Session callers".into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        let own = caller.task_id.as_deref().ok_or((
+            ErrorCode::Unauthorized,
+            "taskless caller cannot mark subtasks done".into(),
+        ))?;
+        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &p.task_id, own) {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!("task {} is not the caller's task or a descendant", p.task_id),
+            ));
+        }
+        // Resolve the subtask's workspace from the daemon-local maps.
+        let cleanup = state
+            .task_workspaces
+            .get(&p.task_id)
+            .cloned()
+            .and_then(|ws_id| {
+                state
+                    .workspaces
+                    .get(&ws_id)
+                    .map(|ws| (ws_id, ws.worktree_path.clone(), ws.main_repo_path.clone()))
+            });
+        (
+            cleanup,
+            state.config.api_url.clone(),
+            state.config.api_token.clone(),
+        )
+    };
+
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+
+    // worktree_mode label is authoritative from the API row.
+    let task_row = api_get_task(&creds, &p.task_id).map_err(|e| e.to_method_err())?;
+    let was_branch_mode = task_row.get("worktree_mode").and_then(Value::as_str) == Some("branch");
+
+    // Close the subtask's sessions FIRST, for ALL modes — a subtask marked done
+    // has finished its work, so its sessions must not linger (git/PTY hygiene).
+    // Mirrors the TUI's mark_subtask_done, which closes sessions unconditionally
+    // regardless of worktree_mode / close_worktree (the daemon previously only
+    // closed them inside the branch-mode + close_worktree path, stranding live
+    // sessions on inherit / in-place / close_worktree=false done subtasks).
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let targets: Vec<String> = state
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.task_id.as_deref() == Some(p.task_id.as_str()))
+            .map(|(uid, _)| uid.clone())
+            .collect();
+        for uid in targets {
+            if let Some(sess) = state.sessions.get_mut(&uid) {
+                sess.last_exit.mark_operator_kill_requested();
+                let _ = sess.kill();
+            }
+        }
+    }
+    wait_for_task_sessions_gone(state_arc, &p.task_id, std::time::Duration::from_secs(2));
+
+    // Phase 1/2 — cleanup BEFORE the API flip. Only branch mode owns a
+    // dedicated worktree; inherit shares the parent's, in-place runs in
+    // the main repo (worktree_path == main_repo_path).
+    let mut worktree_removed = false;
+    if p.close_worktree && was_branch_mode {
+        let (ws_id, wt_opt, mr_opt) = cleanup.ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "task {} has no bound workspace in this daemon lifetime (a restart \
+                 drops in-memory bindings) — pass close_worktree=false to mark it \
+                 done without worktree cleanup",
+                p.task_id
+            ),
+        ))?;
+        let is_in_place = match (&wt_opt, &mr_opt) {
+            (Some(wt), Some(mr)) => wt == mr,
+            _ => false,
+        };
+        if is_in_place {
+            // Hard safety net: never git-remove the main checkout.
+        } else if wt_opt.is_none() {
+            // Already cleaned on a prior call (worktree_path cleared
+            // after a successful remove): end-state is "gone" — fall
+            // through to (re)try the API flip.
+            worktree_removed = true;
+        } else {
+            let wt = wt_opt.expect("just checked Some");
+            let mr = mr_opt.ok_or((
+                ErrorCode::Conflict,
+                format!(
+                    "workspace {} has no main_repo_path; cannot run `git worktree remove`",
+                    ws_id
+                ),
+            ))?;
+            // (sessions already closed unconditionally above)
+            match crate::worktree::remove_worktree(&mr, &wt) {
+                Ok(()) => {
+                    worktree_removed = true;
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(ws) = state.workspaces.get_mut(&ws_id) {
+                        ws.is_closed = true;
+                        ws.worktree_path = None;
+                    }
+                }
+                Err(e) => {
+                    // Cleanup failure → DO NOT mark the task done (retryable).
+                    return Err((
+                        ErrorCode::Internal,
+                        format!(
+                            "worktree remove failed for task {} (sessions closed, but task \
+                             NOT marked done — retry once the worktree issue is resolved): {}",
+                            p.task_id, e
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Phase 3 — only NOW commit the Done status.
+    api_update_task(&creds, &p.task_id, &json!({ "status": "done" }))
+        .map_err(|e| e.to_method_err())?;
+
+    Ok(json!({ "ok": true, "worktree_removed": worktree_removed }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19118,5 +20022,349 @@ mod tests {
                 .expect_err("missing task is an error");
             assert_eq!(err.0, ErrorCode::NotFound);
         });
+    }
+
+    // ============================================================
+    // Subtask CRUD — create_subtask / list_subtasks / mark_subtask_done
+    // ============================================================
+
+    #[derive(Clone, Debug)]
+    struct StubReq {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    struct StubApi {
+        port: u16,
+        requests: Arc<Mutex<Vec<StubReq>>>,
+    }
+
+    /// Multi-request loop-accept HTTP stub. Unlike
+    /// `planning_client::spawn_stub_api_for_test` (one connection only),
+    /// the subtask handlers make several sequential calls (GET parent +
+    /// POST; GET list; GET + PATCH); this routes each inbound
+    /// `(method, path, body)` through `responder` and records it for
+    /// assertions. Each `PlanningApiCreds::agent()` is fresh, so every
+    /// call opens a NEW connection — the loop handles them in order.
+    fn spawn_routed_stub<F>(responder: F) -> StubApi
+    where
+        F: Fn(&str, &str, &str) -> (u16, String) + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::<StubReq>::new()));
+        let req_sink = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 8192];
+                let mut acc: Vec<u8> = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            acc.extend_from_slice(&buf[..n]);
+                            if let Some(he) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let hs = std::str::from_utf8(&acc[..he]).unwrap_or("");
+                                let cl = hs
+                                    .lines()
+                                    .find_map(|l| {
+                                        let ll = l.to_ascii_lowercase();
+                                        ll.strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse::<usize>().ok())
+                                    })
+                                    .unwrap_or(0);
+                                if acc.len() - (he + 4) >= cl {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let raw = String::from_utf8_lossy(&acc).into_owned();
+                let first = raw.lines().next().unwrap_or("");
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let body = raw
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_string())
+                    .unwrap_or_default();
+                req_sink.lock().unwrap().push(StubReq {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                });
+                let (status, resp_body) = responder(&method, &path, &body);
+                let response = format!(
+                    "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    resp_body.as_bytes().len(),
+                    resp_body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        StubApi { port, requests }
+    }
+
+    fn set_api_env(port: u16) {
+        unsafe {
+            std::env::set_var("CM_API_URL", format!("http://127.0.0.1:{}", port));
+            std::env::set_var("CM_API_TOKEN", "test-token");
+        }
+    }
+
+    fn clear_api_env() {
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+    }
+
+    /// Seed a LIVE, tasked caller session into `state.sessions`.
+    fn seed_tasked_caller(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        ws_id: &str,
+        task_id: &str,
+    ) {
+        let mut sp = SpawnParams::new(uid, format!("caller-{}", uid), "/bin/sleep");
+        sp.args = vec!["120".to_string()];
+        sp.workspace_id = ws_id.to_string();
+        sp.task_id = Some(task_id.to_string());
+        let sess = crate::session::DaemonSession::spawn(sp).expect("spawn caller");
+        state.lock().unwrap().sessions.insert(uid.to_string(), sess);
+    }
+
+    /// Branch-mode `create_subtask`: builds the `cm-sub/<chain>-<short>`
+    /// worktree on disk, registers a FRESH workspace (worktree_path !=
+    /// main_repo_path), seeds the headless auth edge (task_tree +
+    /// task_workspaces + bindings), and POSTs the create body carrying
+    /// `parent_task_id` + `status=running` + the computed slug/branch.
+    #[test]
+    fn create_subtask_branch_mode_builds_worktree_registers_and_forwards_parent_id() {
+        with_home_and_repo("subtaskrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some(name.to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-parent" {
+                    (
+                        200,
+                        format!(
+                            r#"{{"id":"task-parent","name":"Parent Task","repo_url":"{}","project":"proj","status":"running","worktree_mode":"inherit","wip_branch":null,"parent_task_id":null}}"#,
+                            name_owned
+                        ),
+                    )
+                } else if method == "POST" && path == "/tasks" {
+                    (
+                        200,
+                        r#"{"id":"task-child-1","name":"branchy","status":"running","worktree_mode":"branch","parent_task_id":"task-parent"}"#
+                            .to_string(),
+                    )
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let result = create_subtask(
+                &state,
+                &json!({"name": "branchy", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect("create_subtask ok");
+
+            assert_eq!(result["task_id"], "task-child-1");
+            let wt = result["worktree_path"].as_str().unwrap().to_string();
+            assert!(
+                wt.contains("cm-sub-parent-task-branchy-"),
+                "worktree path should encode the cm-sub branch: {}",
+                wt
+            );
+            assert!(
+                std::path::Path::new(&wt).exists(),
+                "branch-mode worktree must exist on disk: {}",
+                wt
+            );
+
+            {
+                let s = state.lock().unwrap();
+                let new_ws = s
+                    .workspaces
+                    .values()
+                    .find(|w| w.id != "ws-parent")
+                    .expect("a fresh workspace was registered for the subtask");
+                assert_eq!(
+                    new_ws
+                        .worktree_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string()),
+                    Some(wt.clone()),
+                );
+                assert_ne!(
+                    new_ws.worktree_path, new_ws.main_repo_path,
+                    "branch-mode worktree must differ from the main repo",
+                );
+                assert_eq!(
+                    s.task_tree.get("task-child-1"),
+                    Some(&Some("task-parent".to_string())),
+                    "headless auth edge must be seeded",
+                );
+                assert!(s.task_workspaces.contains_key("task-child-1"));
+                assert!(s.bindings.contains_key("task-child-1"));
+            }
+
+            let reqs = stub.requests.lock().unwrap();
+            let post = reqs
+                .iter()
+                .find(|r| r.method == "POST" && r.path == "/tasks")
+                .expect("POST /tasks captured");
+            let body: Value = serde_json::from_str(&post.body).expect("post body json");
+            assert_eq!(body["parent_task_id"], "task-parent");
+            assert_eq!(body["status"], "running");
+            assert_eq!(body["worktree_mode"], "branch");
+            assert_eq!(body["source"], "claude");
+            assert_eq!(body["is_cloud"], false);
+            assert_eq!(body["repo_branch"], "main");
+            assert_eq!(body["repo_url"], name);
+            let slug = body["slug"].as_str().unwrap();
+            assert!(slug.starts_with("parent-task-branchy-"), "slug: {}", slug);
+            let wip = body["wip_branch"].as_str().unwrap();
+            assert!(
+                wip.starts_with("cm-sub/parent-task-branchy-"),
+                "wip_branch: {}",
+                wip
+            );
+            drop(reqs);
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// A taskless Session caller (and an Operator caller, which resolves
+    /// to `caller_uid = None`) are both rejected with Unauthorized —
+    /// create_subtask needs a parent task to fork off.
+    #[test]
+    fn create_subtask_taskless_and_operator_callers_rejected() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-taskless", "ws-x");
+        // Operator caller (caller_uid = None).
+        let err = create_subtask(&state, &json!({"name": "x"}), None)
+            .expect_err("operator caller must be rejected");
+        assert_eq!(err.0, ErrorCode::Unauthorized);
+        // Taskless Session caller.
+        let err2 = create_subtask(&state, &json!({"name": "x"}), Some("ts-taskless"))
+            .expect_err("taskless caller must be rejected");
+        assert_eq!(err2.0, ErrorCode::Unauthorized);
+        assert!(
+            err2.1.contains("propose_task"),
+            "taskless rejection should point at propose_task: {}",
+            err2.1
+        );
+        kill_all_sessions(&state);
+    }
+
+    /// list_subtasks (scoped to the caller's own task) + mark_subtask_done
+    /// round-trip against the stubbed API. The marked subtask is
+    /// inherit-mode so no git runs — mark just GETs the row then PATCHes
+    /// `status=done`.
+    #[test]
+    fn list_and_mark_subtask_round_trip_via_api() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state_arc();
+        seed_tasked_caller(&state, "ts-orch", "ws-1", "task-parent");
+        {
+            let mut s = state.lock().unwrap();
+            s.task_tree.insert("task-parent".to_string(), None);
+            s.task_tree
+                .insert("child-1".to_string(), Some("task-parent".to_string()));
+        }
+        let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+            ("GET", "/tasks") => (
+                200,
+                r#"[
+                    {"id":"child-1","name":"c1","status":"running","worktree_mode":"branch","wip_branch":"cm-sub/x","parent_task_id":"task-parent"},
+                    {"id":"other","name":"o","status":"running","worktree_mode":"inherit","wip_branch":null,"parent_task_id":"task-zzz"}
+                ]"#
+                .to_string(),
+            ),
+            ("GET", "/tasks/child-1") => (
+                200,
+                r#"{"id":"child-1","worktree_mode":"inherit","status":"running"}"#.to_string(),
+            ),
+            ("PATCH", "/tasks/child-1") => {
+                (200, r#"{"id":"child-1","status":"done"}"#.to_string())
+            }
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        set_api_env(stub.port);
+
+        let arr = list_subtasks(&state, &json!({}), Some("ts-orch")).expect("list ok");
+        let items = arr.as_array().expect("array");
+        assert_eq!(items.len(), 1, "only the child under task-parent is returned");
+        assert_eq!(items[0]["task_id"], "child-1");
+        assert_eq!(items[0]["status"], "running");
+        assert_eq!(items[0]["worktree_mode"], "branch");
+        assert_eq!(items[0]["wip_branch"], "cm-sub/x");
+
+        let res = mark_subtask_done(&state, &json!({"task_id": "child-1"}), Some("ts-orch"))
+            .expect("mark ok");
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["worktree_removed"], false);
+
+        let reqs = stub.requests.lock().unwrap();
+        let patch = reqs
+            .iter()
+            .find(|r| r.method == "PATCH" && r.path == "/tasks/child-1")
+            .expect("PATCH /tasks/child-1 captured");
+        let body: Value = serde_json::from_str(&patch.body).expect("patch body json");
+        assert_eq!(body["status"], "done");
+        drop(reqs);
+
+        kill_all_sessions(&state);
+        clear_api_env();
+    }
+
+    /// Auth: list_subtasks / mark_subtask_done targeting a task that is
+    /// NOT the caller's task or a descendant → Unauthorized (rejected
+    /// under the lock, before any API call).
+    #[test]
+    fn list_and_mark_reject_non_descendant_target() {
+        let state = make_state_arc();
+        seed_tasked_caller(&state, "ts-orch", "ws-1", "task-parent");
+        {
+            let mut s = state.lock().unwrap();
+            s.task_tree.insert("task-parent".to_string(), None);
+            s.task_tree.insert("unrelated".to_string(), None);
+        }
+        let le = list_subtasks(&state, &json!({"task_id": "unrelated"}), Some("ts-orch"))
+            .expect_err("list must reject a non-descendant target");
+        assert_eq!(le.0, ErrorCode::Unauthorized);
+        let me = mark_subtask_done(&state, &json!({"task_id": "unrelated"}), Some("ts-orch"))
+            .expect_err("mark must reject a non-descendant target");
+        assert_eq!(me.0, ErrorCode::Unauthorized);
+        kill_all_sessions(&state);
     }
 }

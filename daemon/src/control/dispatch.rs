@@ -481,6 +481,23 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_mcp_start_session(state, req))
         }
 
+        // Daemon-side subtask CRUD: a DAEMON-spawned (headless, no-TUI)
+        // agent gets `CM_TUI_SOCKET` = the daemon's own socket, so its
+        // MCP client routes these here (they are NOT in DAEMON_METHODS,
+        // so local TUI-spawned agents still hit the TUI handlers). All
+        // three are Session-callable; the method body resolves the
+        // PARENT task from the caller's session and rejects taskless /
+        // Operator callers (caller_uid None) with Unauthorized.
+        "create_subtask" => {
+            DispatchOutcome::Done(dispatch_create_subtask(state, req))
+        }
+        "list_subtasks" => {
+            DispatchOutcome::Done(dispatch_list_subtasks(state, req))
+        }
+        "mark_subtask_done" => {
+            DispatchOutcome::Done(dispatch_mark_subtask_done(state, req))
+        }
+
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the
         // TUI can run interactive `A-n` / `A-s` against a REMOTE host.
@@ -654,6 +671,48 @@ fn dispatch_mcp_start_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mcp_start_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `create_subtask` — Session-callable daemon subtask fork. Mirrors
+/// `dispatch_mcp_start_session`: caller_uid is `None` for Operator (the
+/// method body then rejects with Unauthorized — there's no Session->task
+/// scope to fork off), `Some(uid)` for a Session whose own task becomes
+/// the subtask parent. No `require_operator` — these are Session-callable.
+fn dispatch_create_subtask(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::create_subtask(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `list_subtasks` — Session-callable, read-only. Same caller-uid
+/// extraction as `dispatch_create_subtask`.
+fn dispatch_list_subtasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::list_subtasks(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `mark_subtask_done` — Session-callable mutation. Same caller-uid
+/// extraction as `dispatch_create_subtask`.
+fn dispatch_mark_subtask_done(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::mark_subtask_done(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1621,12 +1680,14 @@ mod tests {
         let state = make_state();
         // Slice 10d-mcp-surface wired list_sessions; sub-2b-2
         // wired propose_task; 10d-2b wired workflow_transition /
-        // workflow_done; Phase 4 wired start_workflow. Pick a
-        // still-deferred method (`create_subtask` — still
-        // TUI-routed) to exercise the deferred-arm fallback.
+        // workflow_done; Phase 4 wired start_workflow; the subtask
+        // CRUD slice wired create_subtask / list_subtasks /
+        // mark_subtask_done. Pick a method name that is genuinely
+        // still unrouted (falls to the `_ =>` arm) to exercise the
+        // deferred-arm fallback.
         let resp = dispatch_request(
             &state,
-            &session_request("create_subtask", serde_json::Value::Null, "ts-x"),
+            &session_request("definitely_unmigrated_method", serde_json::Value::Null, "ts-x"),
         ).into_response();
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
@@ -1636,6 +1697,71 @@ mod tests {
             "unknown-method error should point at the migration slice: {}",
             err.message
         );
+    }
+
+    // --- subtask CRUD dispatch wiring -------------------------------------
+
+    /// `create_subtask` now routes to the daemon method (not the
+    /// `_ => UnknownMethod` deferred arm). A Session caller with
+    /// malformed params (missing required `name`) surfaces
+    /// `InvalidParams` FROM THE METHOD BODY — proving the arm is wired
+    /// and the params reach `methods::create_subtask`.
+    #[test]
+    fn create_subtask_session_caller_routes_into_method_body() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &session_request("create_subtask", serde_json::json!({}), "ts-x"),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(
+            err.code,
+            ErrorCode::InvalidParams,
+            "missing `name` must surface InvalidParams from the method body, \
+             not UnknownMethod: {}",
+            err.message
+        );
+    }
+
+    /// list_subtasks / mark_subtask_done are likewise routed (not
+    /// deferred): a well-formed-params call from an unknown Session
+    /// caller reaches the method body, which rejects with Unauthorized
+    /// (the caller isn't in the registry) — distinctly NOT UnknownMethod.
+    #[test]
+    fn subtask_read_and_mark_arms_are_wired_not_deferred() {
+        let state = make_state();
+        for (method, params) in [
+            ("list_subtasks", serde_json::json!({})),
+            ("mark_subtask_done", serde_json::json!({ "task_id": "t" })),
+        ] {
+            let resp = dispatch_request(&state, &session_request(method, params, "ts-x"))
+                .into_response();
+            assert!(!resp.ok);
+            let err = resp.error.expect("error body");
+            assert_ne!(
+                err.code,
+                ErrorCode::UnknownMethod,
+                "{} must be routed to its method body, not the deferred arm",
+                method
+            );
+        }
+    }
+
+    /// Operator callers resolve to `caller_uid = None`; the Session-only
+    /// method bodies reject them with Unauthorized (no Operator-bypass).
+    #[test]
+    fn create_subtask_operator_caller_is_unauthorized() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request("create_subtask", serde_json::json!({ "name": "x" })),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
     }
 
     // --- session.attach / attach.open (slice 10c-c) -------------------------
