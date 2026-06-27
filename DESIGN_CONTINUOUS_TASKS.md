@@ -1,6 +1,6 @@
 # Design: Continuous Tasks
 
-**Status:** Phases 1–3 **implemented and committed** (`13139f5`, `2df9cff`, `40cec61`): sidebar + wire field + `kind` column; the `trigger` funnel + FRESH executor + `continuous.*` CRUD; the daemon scheduler + restart recovery + PERSISTENT executor. Phase 3b (stuck-story), Phase 4 (queue), Phase 5 (migration), Phase 6 (fan-out/cloud) remain. Key review decisions resolved (§18).
+**Status:** Phases 1–3 + 3b **implemented and committed** (`13139f5`, `2df9cff`, `40cec61`, `1288044`, `02dc80a`): sidebar + wire field + `kind` column; the `trigger` funnel + FRESH executor + `continuous.*` CRUD; the daemon scheduler + restart recovery + PERSISTENT executor; the stuck-story (completion signal + watchdog + investigator). Phases 1–3 validated end-to-end on a live daemon (smoke test). Phase 4 (queue), Phase 5 (migration), Phase 6 (fan-out/cloud) remain. Key review decisions resolved (§18).
 **Provenance:** Synthesized from a 9-agent Ultracode design panel (4 recon → 3 competing architectures → judge → synthesis), then refined through review. Winning skeleton: the *trigger-API / extensibility-first* proposal, hardened with the *reliability-first* proposal's idempotency + restart-recovery + audit machinery and the *reuse-first* proposal's primitive-unification grafts.
 
 ---
@@ -302,7 +302,7 @@ All live cm-manager migrations are gated on lifting `guard_local_host_only()`.
 - `ContinuousScheduler` wired FATAL into `lib.rs::run`; `tick_once` (load_all, `Periodic` fire, catch-up-once, per-fire panic isolation); restart orphan-reconciliation (closes the Phase-2 `in_flight` residual). *(BinaryHeap due-index deferred — linear scan is fine at current N.)*
 - PERSISTENT executor + supervision (dead-persistent respawn, `consecutive_failures` backoff); auto-compact-after-N.
 - `daemon.toml [scheduler]` (`enabled`, tick, `max_worktrees`, `default_cap` ≈1 GB + per-task `mem_cap_bytes`).
-- **Phase 3b (deferred):** completion signal (`report_done`) + `max_runtime` watchdog + snapshot-then-investigator-agent (`mark_unstuck`/`restart`/`escalate`). The supervision pass it hooks into landed in Phase 3.
+**Phase 3b — Stuck-story** *(L)* — **DONE, committed `02dc80a`.** `report_done` completion signal + clean-exit→Done; due-skip-active (no fresh-run pile-up); FRESH-only watchdog (Running past `max_runtime_secs` + live session → snapshot + investigator, capped by `max_investigations` → auto-escalate); investigator agent + `resolve_stuck` (`mark_unstuck`/`restart`/`escalate`); the investigator's own runtime is bounded (`abandon_timed_out_investigator`). Escalate surfaces via `last_run=Stuck` (red glyph) + the `Exited` broadcast + `runs.jsonl`, not an active push.
 
 **Phase 4 — Queue layer** *(M–L)* — `cm_trigger_queue` (api-owned by default), `enqueue` verb (RPC+MCP+API), atomic batch-claim, `Schedule::Consumer{...}` (window OR threshold), `enqueue_to` chaining.
 
@@ -330,7 +330,7 @@ All live cm-manager migrations are gated on lifting `guard_local_host_only()`.
 1. **Pipeline grouping + topology** — grouping sessions by pipeline is wanted; flows aren't fully linear, so topology visualization is the complex part. **Deferred to a post-core decision** (§13). Don't build now.
 2. **Queue access path** — API-owned table + endpoints the daemon calls (default) vs direct psql from the daemon (§9). Decide at the queue phase.
 3. **Scraper-gen migration specifics** — producer wiring into Queue 1, the agentic-websearch skill, Queue-1/2 schemas, decommissioning the in-process stages. Cross-project; its own sub-design (§16).
-4. **Investigator-agent details** — exact action set, attempt caps, and whether it's a skill vs a built-in (§11).
+4. ~~**Investigator-agent details**~~ — RESOLVED in Phase 3b (`02dc80a`): built-in daemon-constructed prompt (not a skill); actions `mark_unstuck`/`restart`/`escalate`; capped by `max_investigations` (default 2) → auto-escalate; the investigator is itself runtime-bounded.
 
 ---
 
