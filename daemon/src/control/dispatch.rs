@@ -513,6 +513,16 @@ pub fn dispatch_request(
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
 
+        // Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11) — the
+        // stuck-story agent tools. Both are bimodal (Operator OR Session) like
+        // `trigger`: the operator token is validated only for Operator frames
+        // (forged-frame defense via `reject_forged_operator`); the PRIMARY
+        // callers are Sessions — the continuous-task agent (`report_done`) and
+        // the daemon-spawned investigator (`resolve_stuck`) — which pass through
+        // to the method body's `continuous_task_id` auth gate.
+        "report_done" => DispatchOutcome::Done(dispatch_report_done(state, req)),
+        "resolve_stuck" => DispatchOutcome::Done(dispatch_resolve_stuck(state, req)),
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -784,6 +794,44 @@ fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
         return resp;
     }
     match methods::continuous_delete(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `report_done` — Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11).
+/// A continuous-task agent signals its own fresh run is complete (one of the two
+/// DONE signals; the other is a clean session exit). Operator + Session callable
+/// like `dispatch_trigger`: the operator token is validated only for Operator
+/// frames (forged-frame defense via `reject_forged_operator`); the Session
+/// caller — the agent itself — passes through to `methods::report_done`, which
+/// resolves the task from the caller session's `continuous_task_id` tag and only
+/// marks the run Done when `caller_uid == last_run.session_uid` (else a soft
+/// no-op). No `task_id` on the wire.
+fn dispatch_report_done(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
+    match methods::report_done(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `resolve_stuck` — Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11).
+/// The daemon-spawned investigator renders ONE verdict on a stuck fresh run:
+/// `mark_unstuck` (extend the watchdog clock, keep the session running),
+/// `restart` (kill + re-fire a fresh run), or `escalate` (kill, mark Stuck,
+/// notify). Operator + Session callable like `dispatch_trigger`: the operator
+/// token is validated only for Operator frames (forged-frame defense via
+/// `reject_forged_operator`); the Session caller — the investigator — passes
+/// through to `methods::resolve_stuck`, which authorizes on
+/// `caller.continuous_task_id == task_id AND caller_uid == task.investigator_uid`.
+fn dispatch_resolve_stuck(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
+    match methods::resolve_stuck(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

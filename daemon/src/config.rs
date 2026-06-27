@@ -145,6 +145,20 @@ pub struct SchedulerConfig {
     /// `1_073_741_824` (1 GiB).
     #[serde(default = "default_scheduler_default_cap")]
     pub default_cap: u64,
+    /// Continuous Tasks Phase 3b (stuck-story watchdog): how many investigators
+    /// the watchdog may spawn for one stuck fresh run before it gives up and
+    /// auto-escalates (last_run → Stuck). Counted in
+    /// `ContinuousTask::investigation_count` (reset on every fresh fire).
+    /// Default `2`.
+    #[serde(default = "default_scheduler_max_investigations")]
+    pub max_investigations: u32,
+    /// Continuous Tasks Phase 3b (stuck-story watchdog): the spawned
+    /// investigator's OWN runtime budget in SECONDS — so a wedged investigator
+    /// is itself bounded and eventually auto-escalates. The per-task worker
+    /// budget is `ContinuousTask::max_runtime_secs` (`None` = watchdog off);
+    /// this is the investigator-session analogue. Default `600` (10 min).
+    #[serde(default = "default_scheduler_investigator_runtime_secs")]
+    pub default_investigator_runtime_secs: u32,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -162,6 +176,18 @@ fn default_scheduler_default_cap() -> u64 {
     1_073_741_824
 }
 
+fn default_scheduler_max_investigations() -> u32 {
+    // Two investigators per stuck run before the watchdog auto-escalates
+    // (DESIGN_CONTINUOUS_TASKS.md §11).
+    2
+}
+
+fn default_scheduler_investigator_runtime_secs() -> u32 {
+    // 10 minutes — the investigator session's own runtime budget so a wedged
+    // investigator is itself bounded and auto-escalates.
+    600
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -169,6 +195,8 @@ impl Default for SchedulerConfig {
             tick_interval: default_scheduler_tick_micros(),
             max_worktrees: None,
             default_cap: default_scheduler_default_cap(),
+            max_investigations: default_scheduler_max_investigations(),
+            default_investigator_runtime_secs: default_scheduler_investigator_runtime_secs(),
         }
     }
 }
@@ -668,6 +696,12 @@ url = "git@github.com:u/other.git"
         assert_eq!(cfg.scheduler.tick_interval, 250_000, "poller-class µs tick");
         assert!(cfg.scheduler.max_worktrees.is_none(), "unguarded by default");
         assert_eq!(cfg.scheduler.default_cap, 1_073_741_824, "1 GiB cap default");
+        // Phase 3b watchdog tunables fall back to their serde defaults too.
+        assert_eq!(cfg.scheduler.max_investigations, 2, "two investigators by default");
+        assert_eq!(
+            cfg.scheduler.default_investigator_runtime_secs, 600,
+            "10-minute investigator budget default",
+        );
     }
 
     /// Phase 3: `SchedulerConfig::default()` (used by the missing-file path and
@@ -679,6 +713,8 @@ url = "git@github.com:u/other.git"
         assert_eq!(s.tick_interval, 250_000);
         assert_eq!(s.max_worktrees, None);
         assert_eq!(s.default_cap, 1_073_741_824);
+        assert_eq!(s.max_investigations, 2);
+        assert_eq!(s.default_investigator_runtime_secs, 600);
     }
 
     /// Phase 3: an explicit `[scheduler]` section overrides each field, and a
@@ -709,6 +745,39 @@ max_worktrees = 32
         assert_eq!(cfg.scheduler.tick_interval, 500_000);
         assert_eq!(cfg.scheduler.max_worktrees, Some(32));
         // `default_cap` was omitted → its serde default still applies.
+        assert_eq!(cfg.scheduler.default_cap, 1_073_741_824);
+        // The Phase 3b keys were omitted → their serde defaults still apply.
+        assert_eq!(cfg.scheduler.max_investigations, 2);
+        assert_eq!(cfg.scheduler.default_investigator_runtime_secs, 600);
+    }
+
+    /// Phase 3b: an explicit `[scheduler]` section overrides the watchdog
+    /// tunables (`max_investigations`, `default_investigator_runtime_secs`).
+    #[test]
+    fn scheduler_section_parses_watchdog_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            r#"
+mcp_server_path = ""
+
+[scheduler]
+max_investigations = 5
+default_investigator_runtime_secs = 1200
+"#,
+        )
+        .expect("write");
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let cfg = load_or_default(&path).expect("load");
+        assert_eq!(cfg.scheduler.max_investigations, 5);
+        assert_eq!(cfg.scheduler.default_investigator_runtime_secs, 1200);
+        // Untouched keys keep their serde defaults.
+        assert!(cfg.scheduler.enabled);
         assert_eq!(cfg.scheduler.default_cap, 1_073_741_824);
     }
 

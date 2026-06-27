@@ -1514,6 +1514,77 @@ def trigger(
     return control_client.call("trigger", params)
 
 
+@mcp.tool()
+def report_done(reason: str | None = None) -> dict:
+    """Signal that YOUR continuous-task run is complete (Continuous Tasks Phase 3b).
+
+    Call this from inside a continuous-task tick once you've finished the
+    iteration's work. The daemon resolves which task and run you are from your
+    own session — there is NO task_id argument. It flips the active run's status
+    from Running to Done (recording finished_at), which clears the watchdog's
+    stuck-detection clock so a slow-but-real run is never misread as wedged.
+
+    The call is scoped to YOUR session only: it marks done IFF you are the
+    session that owns the currently-active run. If you are not (a stale/older
+    run, or you've already been superseded) it is a SOFT no-op that returns a
+    clear message rather than an error.
+
+    Args:
+        reason: Optional short note about why the run is complete.
+
+    Returns:
+        {"ok": true, "done": bool, "task_id": str, "message": str}. `done` is
+        false on the soft no-op case.
+
+    This only flips your own run's status, so — like notify_user — you do NOT
+    need to ask the user first. Just call it when your run is genuinely done.
+    """
+    params: dict = {}
+    if reason:
+        params["reason"] = reason
+    return control_client.call("report_done", params)
+
+
+@mcp.tool()
+def resolve_stuck(
+    task_id: str,
+    seq: int,
+    action: str,
+    reason: str | None = None,
+) -> dict:
+    """Render a verdict on a stuck continuous-task run (Continuous Tasks Phase 3b).
+
+    INVESTIGATOR-ONLY. When the watchdog detects a fresh continuous-task run that
+    has run past its time budget but is still alive, it snapshots the evidence and
+    spawns YOU (the investigator) in the task's worktree. Read the snapshot dir
+    (metadata.json + the run transcript + NOTES.md) and inspect the worktree, then
+    call this exactly ONCE with one of three actions:
+
+      - mark_unstuck: the run is making real progress / is just slow. Keep it
+        running and reset the watchdog clock.
+      - restart: the run is wedged but the task is sound. Kill the stuck session
+        and re-fire a fresh run.
+      - escalate: the run needs a human. Kill the stuck session, mark the run
+        Stuck, and surface it to the user.
+
+    After this call your investigation is finished (you may exit / report_done).
+
+    Args:
+        task_id: The continuous task whose stuck run you are resolving (from your
+            daemon-constructed prompt).
+        seq: The stuck run's sequence number (from your prompt / metadata.json).
+        action: One of "mark_unstuck", "restart", "escalate".
+        reason: Optional explanation; surfaced to the user on "escalate".
+
+    State your intent and ask the user to confirm before calling — `restart` and
+    `escalate` kill (and `restart` re-fires) a session.
+    """
+    params: dict = {"task_id": task_id, "seq": seq, "action": action}
+    if reason:
+        params["reason"] = reason
+    return control_client.call("resolve_stuck", params)
+
+
 def _require_workflow_env() -> tuple[str, str]:
     """Return (run_id, role) from env, or raise if not in a workflow session.
 

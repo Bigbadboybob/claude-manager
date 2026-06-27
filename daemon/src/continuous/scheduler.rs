@@ -72,8 +72,15 @@ enum FireOutcome {
     Fired,
     /// `Ok({fired:false, reason:busy|paused|duplicate_fire_token})` — a benign
     /// skip (the `in_flight` guard / `paused` flag already prevents
-    /// re-selection). Do NOT bump `consecutive_failures`.
+    /// re-selection). Do NOT bump `consecutive_failures`. Leaves `next_fire_at`
+    /// UNADVANCED — the task is re-evaluated next due tick.
     Skipped,
+    /// Phase 3b DUE-SKIP-ACTIVE: a FRESH task whose prior run is still `Running`
+    /// was NOT re-fired (no overlapping fresh runs). UNLIKE [`Skipped`], this
+    /// ADVANCES `next_fire_at` catch-up-once (so the periodic schedule keeps
+    /// moving without hot-re-evaluating every tick), but — like `Skipped` — does
+    /// NOT bump `consecutive_failures` (the skip is benign, not a failure).
+    SkipActive,
     /// `Err((code,msg))` — a hard failure. Bump `consecutive_failures` and back
     /// the next fire off exponentially.
     Failed,
@@ -238,10 +245,11 @@ impl ContinuousScheduler {
         // doesn't double-fire a Persistent+Periodic task.
         let mut acted: HashSet<String> = HashSet::new();
 
-        // (c) SUPERVISION — dead-persistent respawn ONLY (NO fresh-hang / Stuck
-        // / investigator; that is Phase 3b). A supervised Persistent task whose
-        // pinned session died is respawned via the same `trigger` funnel (its
-        // persistent executor handles dead->respawn).
+        // (c) SUPERVISION — dead-persistent respawn. A supervised Persistent
+        // task whose pinned session died is respawned via the same `trigger`
+        // funnel (its persistent executor handles dead->respawn). The fresh-hang
+        // watchdog (Phase 3b) is a SEPARATE pass below — disjoint by `run_mode`
+        // (this one is Persistent-only; the watchdog is Fresh-only).
         for tk in &tasks {
             if !should_supervise(tk) {
                 continue;
@@ -259,6 +267,10 @@ impl ContinuousScheduler {
             }
         }
 
+        // (c.2) WATCHDOG (Phase 3b) — fresh-hang detection over the SAME loaded
+        // snapshot. Disjoint from the Persistent supervision above.
+        self.watchdog_pass(&tasks, now);
+
         // (d) DUE CHECK — pure read of the disk-loaded tasks. Consumer / Cron /
         // OnDemand are skipped (Periodic-only in Phase 3).
         let due = collect_due(&tasks, now);
@@ -268,9 +280,164 @@ impl ContinuousScheduler {
             if acted.contains(&task_id) {
                 continue;
             }
+            // DUE-SKIP-ACTIVE (Phase 3b): a FRESH task whose prior run is still
+            // Running passes collect_due's `in_flight.is_none()` filter (trigger
+            // clears in_flight on return) but must NOT be re-fired — that would
+            // pile up overlapping fresh sessions. Skip the fire but still ADVANCE
+            // next_fire_at catch-up-once. Persistent tasks are exempt (one live
+            // session; re-delivery to the same PTY is the intended behavior).
+            if let Some(tk) = tasks.iter().find(|t| t.task_id == task_id) {
+                if fresh_run_active(tk) {
+                    self.advance_after_fire(&task_id, FireOutcome::SkipActive, now);
+                    continue;
+                }
+            }
             let fire_token = mint_fire_token();
             let outcome = self.fire_task(&task_id, &fire_token);
             self.advance_after_fire(&task_id, outcome, now);
+        }
+    }
+
+    /// Phase (c.2) WATCHDOG — FRESH-hang detection + investigator dispatch
+    /// (Phase 3b, DESIGN_CONTINUOUS_TASKS.md §11). DISJOINT from the
+    /// dead-persistent supervision pass: that one requires
+    /// `RunMode::Persistent` + `supervise`; this one requires `RunMode::Fresh`,
+    /// so no task is matched by both.
+    ///
+    /// A fresh run is STUCK when its session is ALIVE but has overrun its
+    /// `max_runtime_secs` budget without finishing (no `report_done`, no clean
+    /// exit). A DEAD-but-`Running` session is NOT the watchdog's job — that is
+    /// `handle_session_exit` (clean exit → Done) or `reconcile_orphans` (leaked
+    /// `in_flight` → Orphaned); the `session_is_dead(stuck_uid) == false` guard
+    /// deliberately excludes it. `max_runtime_secs == None` ⇒ watchdog OFF for
+    /// that task; `last_run.session_uid == None` ⇒ not a candidate.
+    ///
+    /// On STUCK, three mutually-exclusive branches:
+    ///   1. a LIVE investigator is already on this run (`investigator_uid` set
+    ///      AND alive) → do nothing this tick.
+    ///   2. under the investigation cap (`investigation_count <
+    ///      max_investigations`) → SNAPSHOT the evidence + SPAWN a fresh
+    ///      investigator (`spawn_investigator` itself records `investigator_uid`
+    ///      / bumps `investigation_count` / appends the runs.jsonl `"stuck"`
+    ///      line).
+    ///   3. cap reached → AUTO-ESCALATE (`escalate_stuck`: kill + `last_run` →
+    ///      Stuck + clear investigator + runs.jsonl `"escalated"`).
+    ///
+    /// LOCK DISCIPLINE: the only locks taken are the brief, read-only
+    /// `session_is_dead` / `session_transcript_path` / config probes, each
+    /// dropped BEFORE the snapshot fs-copies / `spawn_investigator` /
+    /// `escalate_stuck` (all of which re-acquire the DaemonState lock
+    /// internally — holding it across them would deadlock).
+    fn watchdog_pass(&self, tasks: &[ContinuousTask], now: u64) {
+        let (max_investigations, investigator_budget) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                s.config.scheduler.max_investigations,
+                s.config.scheduler.default_investigator_runtime_secs,
+            )
+        };
+
+        for tk in tasks {
+            // FRESH-only + enabled.
+            if tk.run_mode != task::RunMode::Fresh || !tk.enabled {
+                continue;
+            }
+            // Must have an ACTIVE run.
+            let Some(run) = tk.last_run.as_ref() else {
+                continue;
+            };
+            if run.status != RunStatus::Running {
+                continue;
+            }
+            // Watchdog OFF when no runtime budget is configured.
+            let Some(max_runtime) = tk.max_runtime_secs else {
+                continue;
+            };
+            // No session to watch ⇒ not a candidate.
+            let Some(stuck_uid) = run.session_uid.as_deref() else {
+                continue;
+            };
+            // Within budget ⇒ healthy.
+            let elapsed = now.saturating_sub(run.started_at);
+            if elapsed <= max_runtime as u64 {
+                continue;
+            }
+            // A DEAD session past its budget is handle_session_exit /
+            // reconcile_orphans territory — the watchdog only acts on an
+            // ALIVE-but-overrunning run.
+            if self.session_is_dead(stuck_uid) {
+                continue;
+            }
+            let seq = run.seq;
+
+            // Branch 1: a LIVE investigator is already on this run → wait it out,
+            // UNLESS it has itself blown its own runtime budget. A wedged
+            // investigator (never calls resolve_stuck, never exits) would
+            // otherwise pin this run forever — Branch 1 would `continue` every
+            // tick. Past its budget, ABANDON it (kill + clear binding); next tick
+            // the count check re-investigates or auto-escalates. A `None`
+            // started_at (pre-3b-fix state.json) reads as elapsed 0 = within
+            // budget, never a false abandon. (A CRASHED investigator self-heals:
+            // session_is_dead == true falls through to the count check below.)
+            if let Some(inv_uid) = tk.investigator_uid.as_deref() {
+                if !self.session_is_dead(inv_uid) {
+                    let inv_started = tk.investigator_started_at.unwrap_or(now);
+                    if now.saturating_sub(inv_started) <= investigator_budget as u64 {
+                        continue;
+                    }
+                    crate::control::methods::abandon_timed_out_investigator(
+                        &self.state,
+                        tk,
+                        seq,
+                        inv_uid,
+                    );
+                    continue;
+                }
+            }
+
+            if tk.investigation_count < max_investigations {
+                // Branch 2: SNAPSHOT the evidence (transcript_path resolved under
+                // a brief lock, then DROP before the fs-copies) + SPAWN a fresh
+                // investigator. `spawn_investigator` records investigator_uid /
+                // investigation_count + the runs.jsonl "stuck" line itself.
+                let transcript = self.session_transcript_path(stuck_uid);
+                let snapshot_dir = crate::control::methods::snapshot_stuck_run(
+                    tk,
+                    seq,
+                    transcript.as_deref(),
+                    elapsed,
+                    "max_runtime_exceeded",
+                );
+                if let Err((code, msg)) = crate::control::methods::spawn_investigator(
+                    &self.state,
+                    tk,
+                    seq,
+                    &snapshot_dir,
+                ) {
+                    eprintln!(
+                        "cm-daemon: continuous watchdog failed to spawn investigator \
+                         for task={} seq={}: {:?}: {}",
+                        tk.task_id, seq, code, msg,
+                    );
+                }
+            } else {
+                // Branch 3: cap reached → AUTO-ESCALATE (kill + last_run → Stuck +
+                // runs.jsonl "escalated"). The kill rides kill_session semantics
+                // (leave-in-registry → the reaper broadcasts Exited), so no lock
+                // is held across it.
+                if let Err((code, msg)) = crate::control::methods::escalate_stuck(
+                    &self.state,
+                    tk,
+                    seq,
+                    "max_investigations",
+                ) {
+                    eprintln!(
+                        "cm-daemon: continuous watchdog auto-escalate failed for \
+                         task={} seq={}: {:?}: {}",
+                        tk.task_id, seq, code, msg,
+                    );
+                }
+            }
         }
     }
 
@@ -354,6 +521,15 @@ impl ContinuousScheduler {
                     // next_fire_at to retry next due tick, and do NOT bump
                     // failures (the task is healthy).
                 }
+                FireOutcome::SkipActive => {
+                    // DUE-SKIP-ACTIVE (Phase 3b): a fresh run is still Running,
+                    // so the due loop declined to overlap a second fresh run.
+                    // ADVANCE catch-up-once (like Fired) so the schedule keeps
+                    // moving — otherwise this still-Running task would re-qualify
+                    // as due every 250 ms tick. Do NOT bump (or reset) failures:
+                    // the skip is benign, not a fire and not a failure.
+                    t.next_fire_at = now.saturating_add(every);
+                }
                 FireOutcome::Failed => {
                     t.consecutive_failures = t.consecutive_failures.saturating_add(1);
                     t.next_fire_at =
@@ -432,6 +608,23 @@ impl ContinuousScheduler {
             .map_or(true, |s| s.last_exit.kernel_set())
     }
 
+    /// Brief, read-only lookup of a session's resolved transcript path — used by
+    /// the watchdog to thread the stuck run's transcript into
+    /// [`crate::control::methods::snapshot_stuck_run`] WITHOUT holding the lock
+    /// across the fs-copies (same collect-then-act discipline as
+    /// [`Self::session_is_dead`]; the lock drops on return). `None` when the
+    /// session is registry-absent or the transcript detector hasn't bound a path
+    /// yet (a trust-dialog hang may never produce one — the snapshot then skips
+    /// the transcript artifact, best-effort).
+    fn session_transcript_path(&self, uid: &str) -> Option<std::path::PathBuf> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .sessions
+            .get(uid)
+            .and_then(|s| s.transcript_path.clone())
+            .map(std::path::PathBuf::from)
+    }
+
     /// The loop body, run on the spawned thread. Wraps each `tick_once` in
     /// `catch_unwind` so a panic in one tick doesn't kill the daemon, then
     /// sleeps the remainder of the tick interval in shutdown-aware chunks.
@@ -494,6 +687,19 @@ fn should_supervise(tk: &ContinuousTask) -> bool {
         && tk.enabled
         && !tk.paused
         && tk.in_flight.is_none()
+}
+
+/// Phase 3b DUE-SKIP-ACTIVE predicate: a FRESH task whose most recent run is
+/// still `Running`. The periodic due loop declines to re-fire such a task (no
+/// overlapping fresh runs) but still advances `next_fire_at` catch-up-once.
+/// Persistent tasks are EXEMPT — they reuse one live session, so re-delivering
+/// the prompt to the same PTY is the intended persistent behavior, not a skip.
+fn fresh_run_active(tk: &ContinuousTask) -> bool {
+    tk.run_mode == task::RunMode::Fresh
+        && tk
+            .last_run
+            .as_ref()
+            .map_or(false, |r| r.status == RunStatus::Running)
 }
 
 /// Append a `"supervised_restart"` audit line after a supervised respawn.
@@ -921,6 +1127,337 @@ mod tests {
             sched.tick_once();
 
             assert!(sched.fire_spy_calls().is_empty(), "no session to restart");
+        });
+    }
+
+    // ----- (c.2) watchdog (Phase 3b: fresh-hang detection) -----
+
+    /// Insert a LIVE `/bin/sleep` DaemonSession under `uid` — the registry entry
+    /// the watchdog's liveness probe (`session_is_dead`) + the auto-escalate kill
+    /// path read (no real claude). `DaemonSession::spawn` arms its reaper with
+    /// `on_exit=None`, so a killed session is LEFT in the registry (the
+    /// kill_session-semantics assertion relies on that). The session's
+    /// `DaemonSession` drops with `state` at end of test, SIGKILLing the child.
+    fn insert_live_session(state: &Arc<Mutex<DaemonState>>, uid: &str) {
+        let mut sp = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+        sp.args = vec!["60".to_string()];
+        sp.session_type = "claude-code".to_string();
+        let ds = crate::session::DaemonSession::spawn(sp).expect("spawn /bin/sleep");
+        state.lock().unwrap().sessions.insert(uid.to_string(), ds);
+    }
+
+    /// A FRESH `OnDemand` task with a `Running` `last_run` pinned to `stuck_uid`
+    /// and a tiny `max_runtime_secs`. `started_at = 1` makes the elapsed against
+    /// the real `now_unix()` enormous, so the run is unconditionally past budget.
+    /// `OnDemand` keeps it out of `collect_due`, isolating the watchdog from the
+    /// due loop.
+    fn fresh_running_task(id: &str, stuck_uid: &str, max_runtime_secs: u32) -> ContinuousTask {
+        let mut t = ContinuousTask::new(
+            id.into(),
+            id.into(),
+            format!("ws-{}", id),
+            "/tmp/repo".into(),
+            Engine::Claude,
+            RunMode::Fresh,
+            Schedule::OnDemand,
+            "go".into(),
+        );
+        t.max_runtime_secs = Some(max_runtime_secs);
+        t.last_run = Some(RunRecord {
+            seq: 1,
+            fire_token: "ft-stuck-1".into(),
+            started_at: 1,
+            finished_at: None,
+            session_uid: Some(stuck_uid.into()),
+            status: RunStatus::Running,
+            trigger_source: "operator".into(),
+        });
+        t.run_count = 1;
+        t
+    }
+
+    /// A fresh run ALIVE past its `max_runtime_secs` (and under the investigation
+    /// cap) is STUCK: the watchdog snapshots the evidence and spawns a fresh
+    /// investigator, binding `investigator_uid` + bumping `investigation_count`.
+    /// The spawn boundary is spied so no real claude launches; the stuck run
+    /// stays `Running` (the investigator decides its fate).
+    #[test]
+    fn watchdog_spawns_investigator_when_alive_past_max_runtime() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let stuck_uid = "ts-stuck-aaaa-0";
+            insert_live_session(&state, stuck_uid);
+            task::save(&fresh_running_task("wd-spawn", stuck_uid, 1)).expect("save");
+
+            crate::control::methods::arm_continuous_spawn_spy_for_test();
+            sched.tick_once();
+
+            // Exactly one investigator spawn reached the (spied) boundary, tagged.
+            let captured = crate::control::methods::take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "exactly one investigator spawn");
+            assert_eq!(captured[0]["label"], serde_json::json!("investigator"));
+            assert_eq!(captured[0]["continuous_task_id"], serde_json::json!("wd-spawn"));
+            assert_eq!(captured[0]["session_type"], serde_json::json!("claude-code"));
+
+            let reloaded = task::load_one("wd-spawn").unwrap();
+            assert_eq!(reloaded.investigation_count, 1, "one investigation recorded");
+            assert!(reloaded.investigator_uid.is_some(), "investigator bound");
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "the stuck run stays Running — the investigator decides",
+            );
+
+            // The snapshot landed (metadata.json at minimum — no transcript bound
+            // on the /bin/sleep session, so that artifact is skipped best-effort).
+            let meta = task::task_dir("wd-spawn")
+                .join("stuck")
+                .join("1")
+                .join("metadata.json");
+            assert!(meta.exists(), "snapshot metadata.json written: {}", meta.display());
+
+            // spawn_investigator appended a "stuck" audit line.
+            let runs = std::fs::read_to_string(task::runs_log_path("wd-spawn")).unwrap();
+            assert!(runs.contains("\"stuck\""), "stuck audit line: {}", runs);
+        });
+    }
+
+    /// While a LIVE investigator is already on the stuck run, the watchdog does
+    /// NOTHING this tick — no second investigator, no escalation, counters
+    /// untouched.
+    #[test]
+    fn watchdog_skips_when_live_investigator_present() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let stuck_uid = "ts-stuck-bbbb-0";
+            let inv_uid = "ts-inv-bbbb-0";
+            insert_live_session(&state, stuck_uid);
+            insert_live_session(&state, inv_uid); // investigator is ALIVE
+            let mut t = fresh_running_task("wd-skip", stuck_uid, 1);
+            t.investigator_uid = Some(inv_uid.to_string());
+            t.investigation_count = 1;
+            task::save(&t).expect("save");
+
+            crate::control::methods::arm_continuous_spawn_spy_for_test();
+            sched.tick_once();
+
+            let captured = crate::control::methods::take_continuous_spawn_spy_for_test();
+            assert!(captured.is_empty(), "no new investigator while one is alive");
+
+            let reloaded = task::load_one("wd-skip").unwrap();
+            assert_eq!(reloaded.investigation_count, 1, "count unchanged");
+            assert_eq!(reloaded.investigator_uid.as_deref(), Some(inv_uid));
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "stuck run untouched while the investigator works",
+            );
+            let runs =
+                std::fs::read_to_string(task::runs_log_path("wd-skip")).unwrap_or_default();
+            assert!(!runs.contains("\"escalated\""), "must not escalate: {}", runs);
+        });
+    }
+
+    /// At the investigation cap (`investigation_count == max_investigations`,
+    /// default 2) the watchdog AUTO-ESCALATES: it kills the stuck session via
+    /// kill_session semantics (left in registry, operator-kill flag set), flips
+    /// `last_run` to Stuck, clears the investigator, and writes an "escalated"
+    /// audit line — and spawns NO further investigator.
+    #[test]
+    fn watchdog_auto_escalates_when_investigation_cap_reached() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let stuck_uid = "ts-stuck-cccc-0";
+            insert_live_session(&state, stuck_uid);
+            // default max_investigations == 2; count == 2 => cap reached.
+            let mut t = fresh_running_task("wd-cap", stuck_uid, 1);
+            t.investigation_count = 2;
+            task::save(&t).expect("save");
+
+            crate::control::methods::arm_continuous_spawn_spy_for_test();
+            sched.tick_once();
+
+            let captured = crate::control::methods::take_continuous_spawn_spy_for_test();
+            assert!(captured.is_empty(), "cap reached => no investigator spawn");
+
+            let reloaded = task::load_one("wd-cap").unwrap();
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Stuck,
+                "auto-escalate flips last_run to Stuck",
+            );
+            assert!(
+                reloaded.investigator_uid.is_none(),
+                "investigator cleared on escalate",
+            );
+
+            // kill_session semantics: the stuck session is killed but LEFT in the
+            // registry with the operator-kill flag set (so the reaper broadcasts
+            // ManifestDiff::Exited — never a bare sessions.remove()).
+            {
+                let s = state.lock().unwrap();
+                let stuck = s
+                    .sessions
+                    .get(stuck_uid)
+                    .expect("stuck session left in registry");
+                assert!(
+                    stuck.last_exit.operator_kill_requested(),
+                    "escalate killed via kill_session semantics",
+                );
+            }
+
+            let runs = std::fs::read_to_string(task::runs_log_path("wd-cap")).unwrap();
+            assert!(runs.contains("\"escalated\""), "escalated audit line: {}", runs);
+        });
+    }
+
+    /// A LIVE investigator that has blown its OWN runtime budget
+    /// (`default_investigator_runtime_secs`, default 600s) is ABANDONED: killed
+    /// via kill_session semantics, its binding cleared, an "investigator_timeout"
+    /// audit written — and NO new investigator spawned this tick (next tick the
+    /// count check re-investigates or escalates). Without this a wedged-but-alive
+    /// investigator would pin the stuck run forever.
+    #[test]
+    fn watchdog_abandons_timed_out_investigator() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let stuck_uid = "ts-stuck-dddd-0";
+            let inv_uid = "ts-inv-dddd-0";
+            insert_live_session(&state, stuck_uid);
+            insert_live_session(&state, inv_uid); // investigator ALIVE but wedged
+            let mut t = fresh_running_task("wd-invtimeout", stuck_uid, 1);
+            t.investigator_uid = Some(inv_uid.to_string());
+            t.investigation_count = 1;
+            // Spawned well past the default 600s investigator budget => over budget.
+            t.investigator_started_at = Some(task::now_unix().saturating_sub(700));
+            task::save(&t).expect("save");
+
+            crate::control::methods::arm_continuous_spawn_spy_for_test();
+            sched.tick_once();
+
+            // No NEW investigator this tick (abandon -> continue; re-eval next tick).
+            let captured = crate::control::methods::take_continuous_spawn_spy_for_test();
+            assert!(captured.is_empty(), "abandon spawns no new investigator this tick");
+
+            let reloaded = task::load_one("wd-invtimeout").unwrap();
+            assert!(reloaded.investigator_uid.is_none(), "wedged investigator binding cleared");
+            assert!(reloaded.investigator_started_at.is_none(), "investigator clock cleared");
+            assert_eq!(reloaded.investigation_count, 1, "count NOT bumped by abandon");
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "the stuck WORKER run stays Running — only the investigator is abandoned",
+            );
+
+            // The INVESTIGATOR (not the worker) was killed via kill_session
+            // semantics: left in the registry with the operator-kill flag set.
+            {
+                let s = state.lock().unwrap();
+                let inv = s.sessions.get(inv_uid).expect("investigator left in registry");
+                assert!(
+                    inv.last_exit.operator_kill_requested(),
+                    "investigator killed via kill_session semantics",
+                );
+                let worker = s.sessions.get(stuck_uid).expect("worker still present");
+                assert!(
+                    !worker.last_exit.operator_kill_requested(),
+                    "the worker is NOT killed by abandon",
+                );
+            }
+
+            let runs = std::fs::read_to_string(task::runs_log_path("wd-invtimeout")).unwrap();
+            assert!(runs.contains("\"investigator_timeout\""), "timeout audit: {}", runs);
+            assert!(!runs.contains("\"escalated\""), "abandon is not an escalation: {}", runs);
+        });
+    }
+
+    /// `fresh_run_active` is FRESH-only: a Persistent task with a Running
+    /// `last_run` is EXEMPT from DUE-SKIP-ACTIVE (it reuses one live session, so
+    /// re-delivery is the intended persistent behavior).
+    #[test]
+    fn fresh_run_active_is_fresh_only() {
+        let mut fresh = fresh_running_task("fra-fresh", "ts-x", 60);
+        assert!(fresh_run_active(&fresh), "fresh + Running => active");
+        fresh.run_mode = RunMode::Persistent;
+        assert!(!fresh_run_active(&fresh), "persistent is exempt");
+        fresh.run_mode = RunMode::Fresh;
+        fresh.last_run.as_mut().unwrap().status = RunStatus::Done;
+        assert!(!fresh_run_active(&fresh), "a finished run is not active");
+    }
+
+    // ----- (e) DUE-SKIP-ACTIVE (Phase 3b) -----
+
+    /// A FRESH Periodic task that is DUE but whose prior run is still `Running`
+    /// is NOT re-fired (no overlapping fresh runs) — yet `next_fire_at` STILL
+    /// advances catch-up-once and `consecutive_failures` is NOT bumped.
+    /// (`max_runtime_secs=None` keeps the watchdog OFF so only DUE-SKIP-ACTIVE
+    /// is exercised.)
+    #[test]
+    fn due_check_skips_active_fresh_run_but_advances() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            sched.arm_fire_spy(FireOutcome::Fired); // would record a fire if one happened
+            let mut t = periodic_task("skip-active", 100, 1); // due (next_fire_at=1)
+            t.last_run = Some(RunRecord {
+                seq: 1,
+                fire_token: "ft-active-1".into(),
+                started_at: 1,
+                finished_at: None,
+                session_uid: Some("ts-active-0".into()),
+                status: RunStatus::Running,
+                trigger_source: "operator".into(),
+            });
+            t.run_count = 1;
+            task::save(&t).expect("save");
+
+            let t0 = task::now_unix();
+            sched.tick_once();
+            let t1 = task::now_unix();
+
+            assert!(
+                sched.fire_spy_calls().is_empty(),
+                "an active fresh run must not be re-fired",
+            );
+            let r = task::load_one("skip-active").unwrap();
+            assert!(
+                r.next_fire_at >= t0 + 100 && r.next_fire_at <= t1 + 100,
+                "next_fire_at advanced catch-up-once: {}",
+                r.next_fire_at,
+            );
+            assert!(r.next_fire_at > t1, "advanced into the future, not a re-fire");
+            assert_eq!(
+                r.consecutive_failures, 0,
+                "skip-active is benign — does not bump failures",
+            );
+            assert_eq!(
+                r.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "the active run is left untouched",
+            );
+        });
+    }
+
+    /// `advance_after_fire(SkipActive)` advances `next_fire_at` catch-up-once
+    /// (like Fired) but — unlike Fired — does NOT reset `consecutive_failures`,
+    /// and — unlike Skipped — DOES advance the clock.
+    #[test]
+    fn advance_skip_active_advances_without_touching_failures() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            let mut t = periodic_task("sa-advance", 100, 7);
+            t.consecutive_failures = 3; // pre-existing streak must be preserved
+            task::save(&t).expect("save");
+
+            sched.advance_after_fire("sa-advance", FireOutcome::SkipActive, 1000);
+
+            let r = task::load_one("sa-advance").unwrap();
+            assert_eq!(r.next_fire_at, 1100, "advanced now + every");
+            assert_eq!(r.last_fired_at, 1000);
+            assert_eq!(r.consecutive_failures, 3, "neither bumped nor reset");
         });
     }
 

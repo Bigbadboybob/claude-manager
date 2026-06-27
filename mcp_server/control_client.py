@@ -188,6 +188,17 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.pause",
     "continuous.run_now",
     "continuous.delete",
+    # Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11): the
+    # stuck-story agent tools. Both are genuinely Session-routable (unlike
+    # the continuous.* CRUD above): `report_done` is callable by any
+    # continuous-task agent to mark its own run complete, and `resolve_stuck`
+    # is callable by the daemon-spawned investigator to render its verdict
+    # (mark_unstuck / restart / escalate). Both are Operator-callable too, but
+    # the daemon dispatch gates them with reject_forged_operator (not
+    # require_operator), so a Session frame reaches the method body and its
+    # continuous_task_id auth.
+    "report_done",
+    "resolve_stuck",
 })
 
 

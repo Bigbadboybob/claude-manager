@@ -237,6 +237,27 @@ pub struct ContinuousTask {
     /// Phase 3 (backoff): consecutive-failure counter.
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// Phase 3b (stuck-story watchdog): how many investigators the watchdog has
+    /// spawned for the CURRENT fresh run. Reset to `0` on every new fresh fire;
+    /// once it reaches `[scheduler] max_investigations` the watchdog
+    /// auto-escalates (last_run → Stuck) instead of spawning another.
+    #[serde(default)]
+    pub investigation_count: u32,
+    /// Phase 3b (stuck-story watchdog): the session_uid of the live investigator
+    /// the watchdog spawned for the current stuck run, if any. `Some(_)` means
+    /// an investigation is in flight (the watchdog does nothing while it is
+    /// alive); cleared back to `None` on a new fresh fire and after every
+    /// `resolve_stuck` action.
+    #[serde(default)]
+    pub investigator_uid: Option<String>,
+    /// Wall-clock (unix secs) the current investigator was spawned — set WITH
+    /// `investigator_uid`. Lets the watchdog bound the investigator's OWN
+    /// runtime (`[scheduler] default_investigator_runtime_secs`) so a wedged-
+    /// but-alive investigator is abandoned rather than pinning the stuck run
+    /// forever. Only read while `investigator_uid` is `Some` (always set
+    /// together on spawn), so a stale value left after a clear is inert.
+    #[serde(default)]
+    pub investigator_started_at: Option<u64>,
     /// Phase 6 (fan-out): downstream task-id allowlist.
     #[serde(default)]
     pub downstream: Vec<String>,
@@ -293,6 +314,9 @@ impl ContinuousTask {
             max_runtime_secs: None,
             mem_cap_bytes: None,
             consecutive_failures: 0,
+            investigation_count: 0,
+            investigator_uid: None,
+            investigator_started_at: None,
             downstream: Vec::new(),
             enqueue_to: None,
             retention: Retention::default(),
@@ -772,6 +796,10 @@ mod tests {
         assert_eq!(task.next_fire_at, 0);
         assert_eq!(task.last_fired_at, 0);
         assert_eq!(task.consecutive_failures, 0);
+        // Phase 3b watchdog state: a pre-3b state.json fills these from
+        // `#[serde(default)]` — no investigations spawned, no live investigator.
+        assert_eq!(task.investigation_count, 0);
+        assert!(task.investigator_uid.is_none());
         assert!(task.downstream.is_empty());
         assert!(task.enqueue_to.is_none());
         assert!(task.compact_every.is_none());

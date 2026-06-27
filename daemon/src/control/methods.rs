@@ -1125,6 +1125,14 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             exited_at,
         }
     });
+    // Continuous Tasks Phase 3b completion signal (b): capture this session's
+    // continuous-task tag BEFORE the registry remove (after which `get(uid)`
+    // sees None) so a CLEAN exit of a continuous-task session can clear its
+    // ACTIVE run below.
+    let continuous_task_id = state
+        .sessions
+        .get(uid)
+        .and_then(|s| s.continuous_task_id.clone());
     let (workspace_id_opt, last_exit_opt) = match state.sessions.get(uid) {
         Some(sess) => {
             let le = sess.last_exit.build_last_exit(exited_at);
@@ -1150,6 +1158,29 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     }
     if let Some(tomb) = tombstone {
         state.record_exited(tomb);
+    }
+    // Continuous Tasks Phase 3b completion signal (b): a continuous-task session
+    // exiting CLEANLY clears its ACTIVE run (DESIGN_CONTINUOUS_TASKS.md §11). The
+    // DOUBLE guard (session_uid match + status==Running) keeps every kill path
+    // benign: operator kill → Done (fine); watchdog escalate sets Stuck FIRST so
+    // the kill's exit sees status!=Running → Stuck preserved; resolve_stuck
+    // restart re-fires a NEW last_run (new uid) so the killed uid mismatches →
+    // no-op; the investigator's own exit (its uid != last_run.session_uid) is a
+    // no-op too. `task::modify` is per-task flock disk IO with ZERO DaemonState
+    // re-entrancy, so it is safe under this reaper-held lock. Best-effort: a
+    // failed persist only leaves the run Running (the watchdog/orphan reconciler
+    // is the backstop), so log nothing louder than the swallow.
+    if let Some(ct_id) = continuous_task_id {
+        let _ = crate::continuous::task::modify(&ct_id, |t| {
+            if let Some(run) = t.last_run.as_mut() {
+                if run.session_uid.as_deref() == Some(uid)
+                    && matches!(run.status, crate::continuous::task::RunStatus::Running)
+                {
+                    run.status = crate::continuous::task::RunStatus::Done;
+                    run.finished_at = Some(crate::continuous::task::now_unix());
+                }
+            }
+        });
     }
     state.sessions.remove(uid);
 }
@@ -7023,6 +7054,14 @@ pub fn trigger(
         t.run_count = t.run_count.saturating_add(1);
         t.last_fired_at = started_at;
         t.in_flight = None;
+        // Phase 3b: every new FRESH fire starts a clean stuck-story. The
+        // watchdog's cap counter and any prior investigator binding belong to
+        // the run that just ended, not this one — reset them here (the single
+        // record step both fresh and persistent fires funnel through; for a
+        // persistent task these are inert no-ops, the watchdog is Fresh-only).
+        t.investigation_count = 0;
+        t.investigator_uid = None;
+        t.investigator_started_at = None;
     }) {
         // The session is already spawned + the prompt delivering; failing to
         // persist last_run only leaks the in_flight guard. Log loudly — the
@@ -7063,6 +7102,788 @@ pub fn trigger(
         "session_uid": session_uid,
         "run_mode": run_mode_label,
     }))
+}
+
+// ===================================================================
+// Continuous Tasks — Phase 3b (stuck-story state machine: completion
+// signal + investigator verdict). DESIGN_CONTINUOUS_TASKS.md §11.
+//
+// `report_done` (the continuous agent's explicit "my run is done") and
+// the clean-exit hook in `handle_session_exit` are the ONLY two signals
+// that clear an ACTIVE fresh run (last_run.status Running → Done); there
+// is deliberately NO idle-after-output auto-Done heuristic (an
+// idle-but-wedged trust-dialog hang must stay Running so the scheduler
+// watchdog catches it). `resolve_stuck` is the daemon-spawned
+// investigator's verdict (mark_unstuck / restart / escalate), and
+// `escalate_stuck` is the shared kill+Stuck+surface helper reused by
+// both `resolve_stuck`'s escalate action and the scheduler watchdog's
+// cap-reached auto-escalate.
+//
+// NOTIFY-THE-USER for v1 is the durable failure-surfacing trio
+// (DESIGN §11), NOT an active desktop push: there is no daemon-side
+// `notify_user` RPC (it is TUI-only, routed to ~/.cm/tui.sock). See
+// `escalate_stuck` for the trio.
+// ===================================================================
+
+#[derive(Deserialize, Default)]
+struct ReportDoneParams {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `report_done(reason?)` — Session-callable completion signal for a
+/// continuous-task agent (DESIGN_CONTINUOUS_TASKS.md §11). The daemon resolves
+/// WHICH task/run the caller is from its own session tag (no `task_id` on the
+/// wire), then flips the active run `Running → Done` IFF the caller owns it.
+///
+/// Auth + resolution: Operator callers are rejected (a continuous tick is always
+/// a Session). The task is resolved from the CALLER session's
+/// `continuous_task_id` read DIRECTLY off `state.sessions` — NOT
+/// `lookup_session_any`, whose `SessionViewAny` drops the field. A caller with
+/// no `continuous_task_id` is Unauthorized.
+///
+/// The mark is DOUBLE-guarded: it fires only when
+/// `last_run.session_uid == caller_uid` AND `last_run.status == Running`. Any
+/// other state (a stale/older run, an already-finished run, a sibling run) is a
+/// SOFT no-op that returns `Ok({done:false, …})` with a clear message — NEVER an
+/// error, so an agent calling it on a superseded run gets a clean signal. Clears
+/// nothing else (no in_flight / current_session_uid / run_count touch).
+pub fn report_done(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: ReportDoneParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("report_done params: {}", e)))?;
+
+    // Session-callable only — an Operator frame carries no continuous identity.
+    let caller_uid = match caller {
+        Caller::Session(s) => s.session_uid.clone(),
+        Caller::Operator(_) => {
+            return Err((
+                ErrorCode::Unauthorized,
+                "report_done is Session-callable only (a continuous-task agent reports its own run)"
+                    .into(),
+            ));
+        }
+    };
+
+    // Resolve the task from the caller session's continuous_task_id (read the
+    // DaemonSession field directly; SessionViewAny omits it). Brief lock, dropped
+    // before the disk modify.
+    let ct_id = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .sessions
+            .get(&caller_uid)
+            .and_then(|s| s.continuous_task_id.clone())
+    };
+    let ct_id = match ct_id {
+        Some(id) => id,
+        None => {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!(
+                    "report_done: caller session '{}' is not a continuous-task tick \
+                     (no continuous_task_id)",
+                    caller_uid
+                ),
+            ));
+        }
+    };
+
+    // Flip Running → Done IFF the caller owns the active run. `modify` runs the
+    // closure under the per-task flock (no DaemonState lock held here).
+    let now = crate::continuous::task::now_unix();
+    let mut marked = false;
+    let updated = match crate::continuous::task::modify(&ct_id, |t| {
+        if let Some(run) = t.last_run.as_mut() {
+            if run.session_uid.as_deref() == Some(caller_uid.as_str())
+                && matches!(run.status, crate::continuous::task::RunStatus::Running)
+            {
+                run.status = crate::continuous::task::RunStatus::Done;
+                run.finished_at = Some(now);
+                marked = true;
+            }
+        }
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("report_done: persist '{}': {}", ct_id, e),
+            ));
+        }
+    };
+
+    // Audit line only on a real completion (the no-op case is silent).
+    if marked {
+        let (seq, fire_token, session_uid) = updated
+            .last_run
+            .as_ref()
+            .map(|r| (r.seq, Some(r.fire_token.clone()), r.session_uid.clone()))
+            .unwrap_or((0, None, None));
+        if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+            &crate::continuous::runlog::RunLogLine {
+                seq,
+                ts: runlog_now_ts(),
+                task_id: ct_id.clone(),
+                event: "report_done".to_string(),
+                fire_token,
+                session_uid,
+                run_mode: Some("fresh".to_string()),
+                trigger_source: Some(format!("session:{}", caller_uid)),
+                status: Some("done".to_string()),
+                detail: p.reason.clone().map(Value::String),
+            },
+        ) {
+            eprintln!(
+                "cm-daemon: report_done runlog append failed for '{}': {}",
+                ct_id, e
+            );
+        }
+    }
+
+    let message = if marked {
+        "run marked done"
+    } else {
+        "no-op: caller is not the active run's session, or the run is no longer Running"
+    };
+    Ok(json!({
+        "ok": true,
+        "done": marked,
+        "task_id": ct_id,
+        "message": message,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ResolveStuckParams {
+    task_id: String,
+    seq: u64,
+    action: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `resolve_stuck(task_id, seq, action, reason?)` — the daemon-spawned
+/// investigator's verdict on a stuck FRESH run (DESIGN_CONTINUOUS_TASKS.md §11).
+/// Session-callable ONLY (the investigator is always a Session).
+///
+/// Auth (two gates): the caller session's `continuous_task_id` (read directly
+/// off `state.sessions`, NOT `lookup_session_any`) MUST equal `task_id`, AND the
+/// caller MUST be the task's CURRENT `investigator_uid`. The investigator is a
+/// DISTINCT session from the stuck worker, so it cannot self-resolve from its
+/// own tag alone — hence the explicit `task_id` + `seq` params.
+///
+/// Actions (each clears `investigator_uid` so the watchdog can re-engage):
+///   * `mark_unstuck` — the run is slow-but-real. Reset `last_run.started_at =
+///     now` (extend the watchdog clock); the original stuck session keeps
+///     running (NOT killed).
+///   * `restart` — wedged but the task is sound. Kill the stuck session
+///     (kill_session semantics) → clear `investigator_uid` → re-fire a brand-new
+///     FRESH run via `methods::trigger` (Operator caller, fresh fire_token). The
+///     kill-then-trigger ORDER is load-bearing: the re-fire mints a new last_run
+///     (new uid + seq) so the killed session's clean-exit guard mismatches.
+///   * `escalate` — needs a human. Delegates to [`escalate_stuck`] (kill + Stuck
+///     + surface), threading the caller's `reason`.
+///
+/// LOCK DISCIPLINE: no DaemonState lock is held across `kill_session` /
+/// `trigger` (both re-acquire it internally).
+pub fn resolve_stuck(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: ResolveStuckParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("resolve_stuck params: {}", e)))?;
+
+    // Containment-safe task_id allowlist BEFORE any load / path build.
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("resolve_stuck: {}", e)))?;
+
+    // Session-callable only.
+    let caller_uid = match caller {
+        Caller::Session(s) => s.session_uid.clone(),
+        Caller::Operator(_) => {
+            return Err((
+                ErrorCode::Unauthorized,
+                "resolve_stuck is Session-callable only (the investigator renders the verdict)"
+                    .into(),
+            ));
+        }
+    };
+
+    // Gate 1: the caller session must be a tick of THIS continuous task. Read the
+    // DaemonSession field directly (SessionViewAny omits continuous_task_id).
+    let caller_ct_id = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .sessions
+            .get(&caller_uid)
+            .and_then(|s| s.continuous_task_id.clone())
+    };
+    if caller_ct_id.as_deref() != Some(p.task_id.as_str()) {
+        return Err((
+            ErrorCode::Unauthorized,
+            format!(
+                "resolve_stuck: caller session '{}' is not a tick of continuous task '{}'",
+                caller_uid, p.task_id
+            ),
+        ));
+    }
+
+    // Gate 2: the caller must be the task's CURRENT investigator.
+    let task = crate::continuous::task::load_one(&p.task_id).ok_or((
+        ErrorCode::NotFound,
+        format!("resolve_stuck: continuous task '{}' not found", p.task_id),
+    ))?;
+    if task.investigator_uid.as_deref() != Some(caller_uid.as_str()) {
+        return Err((
+            ErrorCode::Unauthorized,
+            format!(
+                "resolve_stuck: caller '{}' is not the current investigator of task '{}'",
+                caller_uid, p.task_id
+            ),
+        ));
+    }
+
+    let reason = p.reason.clone().unwrap_or_default();
+    match p.action.as_str() {
+        "mark_unstuck" => {
+            // Extend the watchdog clock + release the investigation; the stuck
+            // session keeps running.
+            let now = crate::continuous::task::now_unix();
+            if let Err(e) = crate::continuous::task::modify(&p.task_id, |t| {
+                if let Some(run) = t.last_run.as_mut() {
+                    run.started_at = now;
+                }
+                t.investigator_uid = None;
+            }) {
+                return Err((
+                    ErrorCode::Internal,
+                    format!("resolve_stuck mark_unstuck persist '{}': {}", p.task_id, e),
+                ));
+            }
+            append_resolve_stuck_runlog(&task, p.seq, "unstuck", None);
+            Ok(json!({
+                "ok": true,
+                "action": "mark_unstuck",
+                "task_id": p.task_id,
+                "seq": p.seq,
+            }))
+        }
+        "restart" => {
+            // Kill the stuck session (kill_session semantics; caller_uid=None
+            // bypasses the descendant auth gate for this internal kill). A
+            // not-found / already-dead session is fine — we still re-fire.
+            if let Some(stuck_uid) =
+                task.last_run.as_ref().and_then(|r| r.session_uid.clone())
+            {
+                if let Err((code, msg)) =
+                    kill_session(state_arc, &json!({ "session_uid": stuck_uid }), None)
+                {
+                    eprintln!(
+                        "cm-daemon: resolve_stuck restart kill of '{}' for '{}' \
+                         failed (continuing to re-fire): {:?}: {}",
+                        stuck_uid, p.task_id, code, msg
+                    );
+                }
+            }
+            // Clear the investigation BEFORE the re-fire. (The new fresh fire's
+            // record step is what resets investigation_count per the new-fire
+            // rule — owned by the watchdog slice's trigger edit.)
+            if let Err(e) = crate::continuous::task::modify(&p.task_id, |t| {
+                t.investigator_uid = None;
+            }) {
+                return Err((
+                    ErrorCode::Internal,
+                    format!(
+                        "resolve_stuck restart clear investigator '{}': {}",
+                        p.task_id, e
+                    ),
+                ));
+            }
+            append_resolve_stuck_runlog(&task, p.seq, "restarted", None);
+            // Re-fire a brand-new FRESH run. Operator caller (bypasses the
+            // self-or-descendant scope gate); None fire_token → trigger mints a
+            // fresh one (never trips the duplicate-fire guard).
+            let refire = trigger(
+                state_arc,
+                &Caller::operator("continuous-resolve-stuck"),
+                &json!({ "task_id": p.task_id }),
+            )?;
+            Ok(json!({
+                "ok": true,
+                "action": "restart",
+                "task_id": p.task_id,
+                "seq": p.seq,
+                "refire": refire,
+            }))
+        }
+        "escalate" => {
+            escalate_stuck(state_arc, &task, p.seq, &reason)?;
+            Ok(json!({
+                "ok": true,
+                "action": "escalate",
+                "task_id": p.task_id,
+                "seq": p.seq,
+            }))
+        }
+        other => Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "resolve_stuck: unknown action '{}' (want mark_unstuck|restart|escalate)",
+                other
+            ),
+        )),
+    }
+}
+
+/// Shared auto-escalate helper for a stuck FRESH run (DESIGN_CONTINUOUS_TASKS.md
+/// §11). Reused by [`resolve_stuck`]'s `escalate` action AND the scheduler
+/// watchdog's cap-reached auto-escalate (the scheduler calls this with the
+/// loaded task, the run `seq`, and `reason = "max_investigations"`).
+///
+/// Steps:
+///   1. KILL the stuck session via kill_session semantics
+///      (`mark_operator_kill_requested` + `session.kill`, LEAVING the registry
+///      entry so the reaper broadcasts `ManifestDiff::Exited` + records the
+///      tombstone — NEVER a bare `state.sessions.remove`). `caller_uid=None`
+///      bypasses the descendant auth gate. A not-found / already-dead session is
+///      logged-and-continued (the Stuck flip is the durable surfacing).
+///   2. Flip `last_run.status → Stuck` + clear `investigator_uid`
+///      UNCONDITIONALLY (escalate is NOT Running-guarded). The kill's async
+///      reaper runs `handle_session_exit`, whose clean-exit Done-write IS
+///      Running-guarded — so both orderings converge to Stuck regardless of
+///      which write wins the per-task flock.
+///   3. Append a `runs.jsonl {event:"escalated", detail:{reason}}` audit line.
+///
+/// NOTIFY-THE-USER: this trio (Stuck status in state.json → continuous.list red
+/// glyph; the `ManifestDiff::Exited` broadcast the kill emits → manifest.watch,
+/// the session carries `continuous_task_id`; the runs.jsonl escalated line) IS
+/// the daemon's "notify" for v1. There is NO daemon-side `notify_user` RPC (it
+/// is TUI-only). An ACTIVE push (desktop notification) would be a NEW daemon
+/// channel and is out of scope.
+///
+/// LOCK DISCIPLINE: takes NO DaemonState lock itself — `kill_session` (and the
+/// reaper's on_exit) re-lock internally, so a caller (the scheduler tick) MUST
+/// NOT hold the DaemonState lock across this call. The disk modify + runlog are
+/// flock-only.
+pub fn escalate_stuck(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+    reason: &str,
+) -> Result<(), (ErrorCode, String)> {
+    // 1. Kill the stuck session (best-effort).
+    if let Some(stuck_uid) = task.last_run.as_ref().and_then(|r| r.session_uid.clone()) {
+        if let Err((code, msg)) =
+            kill_session(state_arc, &json!({ "session_uid": stuck_uid }), None)
+        {
+            eprintln!(
+                "cm-daemon: escalate_stuck kill of '{}' for task '{}' \
+                 failed (continuing to mark Stuck): {:?}: {}",
+                stuck_uid, task.task_id, code, msg
+            );
+        }
+    }
+
+    // 2. Flip last_run → Stuck + clear investigator_uid, UNCONDITIONALLY.
+    if let Err(e) = crate::continuous::task::modify(&task.task_id, |t| {
+        if let Some(run) = t.last_run.as_mut() {
+            run.status = crate::continuous::task::RunStatus::Stuck;
+        }
+        t.investigator_uid = None;
+    }) {
+        return Err((
+            ErrorCode::Internal,
+            format!("escalate_stuck: persist Stuck for '{}': {}", task.task_id, e),
+        ));
+    }
+
+    // 3. Audit line (best-effort).
+    if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+        &crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: runlog_now_ts(),
+            task_id: task.task_id.clone(),
+            event: "escalated".to_string(),
+            fire_token: task.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: task.last_run.as_ref().and_then(|r| r.session_uid.clone()),
+            run_mode: Some("fresh".to_string()),
+            trigger_source: Some("continuous-watchdog".to_string()),
+            status: Some("stuck".to_string()),
+            detail: Some(json!({ "reason": reason })),
+        },
+    ) {
+        eprintln!(
+            "cm-daemon: escalate_stuck runlog append failed for '{}': {}",
+            task.task_id, e
+        );
+    }
+
+    Ok(())
+}
+
+/// Abandon an investigator that has blown its OWN runtime budget
+/// (`[scheduler] default_investigator_runtime_secs`). Kill it via `kill_session`
+/// semantics (leave-in-registry → the reaper broadcasts `Exited`), clear the
+/// investigator binding, and audit. The watchdog then re-evaluates the still-
+/// stuck run by `investigation_count` on the next tick — spawning a fresh
+/// investigator if under the cap, else auto-escalating. Without this a wedged-
+/// but-alive investigator (one that never calls `resolve_stuck` and never exits)
+/// would pin the stuck run forever: the watchdog's live-investigator branch
+/// would `continue` every tick and the run would never escalate. Best-effort
+/// (a failed kill/clear/append is logged, not propagated).
+pub(crate) fn abandon_timed_out_investigator(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+    investigator_uid: &str,
+) {
+    if let Err((code, msg)) =
+        kill_session(state_arc, &json!({ "session_uid": investigator_uid }), None)
+    {
+        eprintln!(
+            "cm-daemon: abandon_timed_out_investigator kill of '{}' for task '{}' \
+             failed (continuing to clear binding): {:?}: {}",
+            investigator_uid, task.task_id, code, msg
+        );
+    }
+    if let Err(e) = crate::continuous::task::modify(&task.task_id, |t| {
+        t.investigator_uid = None;
+        t.investigator_started_at = None;
+    }) {
+        eprintln!(
+            "cm-daemon: abandon_timed_out_investigator: clear investigator for '{}': {}",
+            task.task_id, e
+        );
+    }
+    if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+        &crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: runlog_now_ts(),
+            task_id: task.task_id.clone(),
+            event: "investigator_timeout".to_string(),
+            fire_token: task.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: Some(investigator_uid.to_string()),
+            run_mode: Some("fresh".to_string()),
+            trigger_source: Some("continuous-watchdog".to_string()),
+            status: None,
+            detail: None,
+        },
+    ) {
+        eprintln!(
+            "cm-daemon: abandon_timed_out_investigator runlog append failed for '{}': {}",
+            task.task_id, e
+        );
+    }
+}
+
+/// Append a `runs.jsonl` audit line for a `resolve_stuck` action (`"unstuck"` /
+/// `"restarted"`). Best-effort: a failed append is logged, not propagated (the
+/// state mutation already landed). Carries the run's fire_token + session_uid
+/// from the pre-action task snapshot for correlation.
+fn append_resolve_stuck_runlog(
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+    event: &str,
+    detail: Option<Value>,
+) {
+    if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+        &crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: runlog_now_ts(),
+            task_id: task.task_id.clone(),
+            event: event.to_string(),
+            fire_token: task.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: task.last_run.as_ref().and_then(|r| r.session_uid.clone()),
+            run_mode: Some("fresh".to_string()),
+            trigger_source: Some("continuous-investigator".to_string()),
+            status: None,
+            detail,
+        },
+    ) {
+        eprintln!(
+            "cm-daemon: resolve_stuck runlog append ({}) failed for '{}': {}",
+            event, task.task_id, e
+        );
+    }
+}
+
+/// Copy the evidence for a stuck FRESH run into
+/// `~/.cm/continuous-tasks/<task_id>/stuck/<seq>/` so the spawned investigator
+/// (and a human) can see what the run was doing when the watchdog declared it
+/// stuck (DESIGN_CONTINUOUS_TASKS.md §11). Returns the snapshot dir path — the
+/// scheduler watchdog threads it into [`spawn_investigator`].
+///
+/// Three BEST-EFFORT artifacts (a missing source is fine — a trust-dialog hang
+/// may never have produced a transcript, and a task may have no NOTES.md):
+///   1. the run's transcript jsonl — copied ONLY when `transcript_path` is
+///      `Some(_)` AND the source file exists. Named after the source file (the
+///      claude transcript UUID) so snapshots of different runs don't collide;
+///      `transcript.jsonl` is the fallback name when the path has no file_name.
+///   2. `NOTES.md` from the task's worktree (the cross-fire continuity file).
+///   3. `metadata.json` — the RunRecord + `max_runtime_secs` + `elapsed_secs` +
+///      `reason` (so the investigator has the run identity + watchdog verdict
+///      context without parsing the transcript).
+///
+/// LOCK DISCIPLINE: takes NO DaemonState lock — the watchdog resolves the stuck
+/// session's `transcript_path` under its brief liveness-probe lock and threads
+/// it in (collect-then-act; pure fs I/O here). Each copy is logged-and-continued,
+/// NOT propagated: a partial snapshot beats none, and the investigator degrades
+/// gracefully on a missing file. Writes NEITHER runs.jsonl NOR state.json —
+/// those mutations belong to [`spawn_investigator`] / the watchdog.
+pub(crate) fn snapshot_stuck_run(
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+    transcript_path: Option<&std::path::Path>,
+    elapsed_secs: u64,
+    reason: &str,
+) -> std::path::PathBuf {
+    let dir = crate::continuous::task::task_dir(&task.task_id)
+        .join("stuck")
+        .join(seq.to_string());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "cm-daemon: snapshot_stuck_run mkdir {} failed: {}",
+            dir.display(),
+            e
+        );
+    }
+
+    // 1. Transcript jsonl (only if a path was resolved AND it exists on disk).
+    if let Some(src) = transcript_path {
+        if src.exists() {
+            let dest = match src.file_name() {
+                Some(name) => dir.join(name),
+                None => dir.join("transcript.jsonl"),
+            };
+            if let Err(e) = std::fs::copy(src, &dest) {
+                eprintln!(
+                    "cm-daemon: snapshot_stuck_run copy transcript {} -> {} failed: {}",
+                    src.display(),
+                    dest.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // 2. The worktree's NOTES.md (cross-fire continuity), if present.
+    let notes_src = PathBuf::from(&task.worktree_path).join("NOTES.md");
+    if notes_src.exists() {
+        let dest = dir.join("NOTES.md");
+        if let Err(e) = std::fs::copy(&notes_src, &dest) {
+            eprintln!(
+                "cm-daemon: snapshot_stuck_run copy NOTES.md {} -> {} failed: {}",
+                notes_src.display(),
+                dest.display(),
+                e
+            );
+        }
+    }
+
+    // 3. metadata.json — the run identity + watchdog verdict context.
+    let meta = json!({
+        "task_id": task.task_id,
+        "seq": seq,
+        "run": task.last_run,
+        "max_runtime_secs": task.max_runtime_secs,
+        "elapsed_secs": elapsed_secs,
+        "reason": reason,
+    });
+    match serde_json::to_string_pretty(&meta) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(dir.join("metadata.json"), s) {
+                eprintln!(
+                    "cm-daemon: snapshot_stuck_run write metadata.json in {} failed: {}",
+                    dir.display(),
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("cm-daemon: snapshot_stuck_run serialize metadata failed: {}", e)
+        }
+    }
+
+    dir
+}
+
+/// The daemon-constructed prompt handed to a freshly-spawned investigator. It
+/// points the agent at the snapshot dir + the worktree, enumerates the three
+/// verdicts, and pins the EXACT `resolve_stuck(...)` call shape — the
+/// investigator is a DISTINCT session from the stuck worker, so it must pass
+/// `task_id` + `seq` explicitly (it can't self-resolve from its own tag). Built
+/// as a multi-line string so [`spawn_agent_prompt_delivery`] wraps it in
+/// bracketed-paste (a bare newline would submit the prompt early).
+fn investigator_prompt(
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+    snapshot_dir: &std::path::Path,
+) -> String {
+    let budget = task
+        .max_runtime_secs
+        .map(|s| format!("{}s", s))
+        .unwrap_or_else(|| "its configured budget".to_string());
+    format!(
+        "You are the stuck-run investigator for continuous task \"{label}\" (task_id={task_id}).\n\
+         \n\
+         Run #{seq} of this task has exceeded its runtime budget ({budget}) and looks stuck: it \
+         is still alive but has not finished or called report_done.\n\
+         \n\
+         A snapshot of the run's evidence has been copied to:\n\
+         {snapshot}\n\
+         Read EVERYTHING in that directory: metadata.json (the run record, how long it has been \
+         running, and why it was flagged), the transcript .jsonl (the agent's conversation so far, \
+         if one was captured), and NOTES.md (the task's cross-run continuity notes, if present).\n\
+         \n\
+         Also inspect the live worktree at:\n\
+         {worktree}\n\
+         Run `git status` and `git diff` there to judge whether the stuck run has made real, sound \
+         progress on disk.\n\
+         \n\
+         Then decide EXACTLY ONE verdict:\n\
+         - mark_unstuck: the run is making real progress, just slow. Keep it running and reset its \
+         watchdog clock.\n\
+         - restart: the run is wedged but the task itself is sound. Kill it and start a fresh run.\n\
+         - escalate: the run needs a human. Stop it and alert the operator.\n\
+         \n\
+         Render your verdict by calling resolve_stuck EXACTLY ONCE:\n\
+         resolve_stuck(task_id=\"{task_id}\", seq={seq}, action=\"mark_unstuck\"|\"restart\"|\"escalate\", reason=\"<one line>\")\n\
+         \n\
+         After that single call you are done — you may report_done or exit.",
+        label = task.label,
+        task_id = task.task_id,
+        seq = seq,
+        budget = budget,
+        snapshot = snapshot_dir.display(),
+        worktree = task.worktree_path,
+    )
+}
+
+/// Spawn a FRESH claude investigator session for a stuck run (the scheduler
+/// watchdog calls this after [`snapshot_stuck_run`]; DESIGN_CONTINUOUS_TASKS.md
+/// §11). A near-verbatim restructure of `trigger`'s FRESH executor arm: mint a
+/// uid, compose `start_session` params via the SAME choke point
+/// (`compose_continuous_spawn_params` → `continuous_fresh_spawn`), then deliver
+/// the daemon-constructed verdict prompt on the detached delivery thread.
+///
+/// The investigator is ALWAYS a `claude-code` session regardless of the task's
+/// own engine (it reads snapshot files + git, not a codex/bash workload),
+/// labelled `"investigator"`, tagged with the task's `continuous_task_id` (so
+/// `list_sessions` groups it under the same task and the watchdog can find it via
+/// `investigator_uid`), and pinned to the task's OWN worktree (two claude
+/// sessions sharing one worktree is fine — claude transcripts are per-session
+/// UUID files). 80×24: headless, no caller terminal.
+///
+/// On a successful spawn it RECORDS the investigation: `investigator_uid =
+/// Some(uid)` + `investigation_count += 1` via `task::modify`, and appends a
+/// `runs.jsonl {event:"stuck", detail:{investigation:N}}` audit line. Returns
+/// `Ok({session_uid})`. A spawn failure propagates (the `?`) BEFORE any of those
+/// mutations, so a failed spawn never records a phantom investigator.
+///
+/// LOCK DISCIPLINE: NO DaemonState lock is held across the spawn —
+/// `compose_continuous_spawn_params` + `continuous_fresh_spawn` re-lock
+/// internally, and the input-handle clone is a SEPARATE brief lock dropped before
+/// the PTY write. The disk modify + runlog are flock-only. (The investigator's
+/// OWN runtime bound is enforced by the watchdog via `[scheduler]
+/// default_investigator_runtime_secs`; `compose_continuous_spawn_params` carries
+/// no per-session deadline, so the spawn itself is unbounded.)
+pub(crate) fn spawn_investigator(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+    snapshot_dir: &std::path::Path,
+) -> MethodResult {
+    let uid = new_daemon_minted_session_uid();
+    // ALWAYS claude — the investigator reads snapshot files + git state,
+    // regardless of the task's own engine (which may be codex/bash).
+    let engine = crate::continuous::task::Engine::Claude.as_session_type();
+    let working_dir = PathBuf::from(&task.worktree_path);
+
+    // Compose via the continuous spawn choke point (tags continuous_task_id +
+    // memory-caps + pins the worktree).
+    let full = compose_continuous_spawn_params(
+        state_arc,
+        &uid,
+        &task.workspace_id,
+        "investigator",
+        engine,
+        &working_dir,
+        Some(&task.task_id),
+        &task.task_id,
+        task.mem_cap_bytes,
+        80,
+        24,
+    )?;
+
+    // Spawn through the start_session choke point (spied in tests → no real
+    // claude). Propagate a spawn error BEFORE recording the investigation.
+    continuous_fresh_spawn(state_arc, &full)?;
+
+    // Deliver the daemon-constructed verdict prompt. Clone the input handle under
+    // a BRIEF state lock, drop it, THEN hand off to the detached delivery thread.
+    // A vanished session (fast-exit reaper removed the entry) skips delivery
+    // best-effort — the investigation is already recorded below.
+    let prompt = investigator_prompt(task, seq, snapshot_dir);
+    let handle_opt = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.sessions.get(&uid).map(|s| s.input_handle())
+    };
+    if let Some(handle) = handle_opt {
+        spawn_agent_prompt_delivery(handle, uid.clone(), prompt);
+    }
+
+    // Record the investigation: bind investigator_uid + its spawn time (the
+    // watchdog bounds the investigator's OWN runtime against this) + bump the
+    // count (the watchdog's cap check reads investigation_count next tick). The
+    // returned task carries the post-increment count for the audit line.
+    let now = crate::continuous::task::now_unix();
+    let updated = crate::continuous::task::modify(&task.task_id, |t| {
+        t.investigator_uid = Some(uid.clone());
+        t.investigator_started_at = Some(now);
+        t.investigation_count = t.investigation_count.saturating_add(1);
+    })
+    .map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!(
+                "spawn_investigator: persist investigator for '{}': {}",
+                task.task_id, e
+            ),
+        )
+    })?;
+
+    // Audit line (best-effort): the watchdog flagged run `seq` stuck and spawned
+    // investigator N. session_uid carries the STUCK run's uid; the investigator's
+    // own uid rides `detail` for correlation.
+    if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+        &crate::continuous::runlog::RunLogLine {
+            seq,
+            ts: runlog_now_ts(),
+            task_id: task.task_id.clone(),
+            event: "stuck".to_string(),
+            fire_token: task.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: task.last_run.as_ref().and_then(|r| r.session_uid.clone()),
+            run_mode: Some("fresh".to_string()),
+            trigger_source: Some("continuous-watchdog".to_string()),
+            status: Some("running".to_string()),
+            detail: Some(json!({
+                "investigation": updated.investigation_count,
+                "investigator_uid": uid,
+            })),
+        },
+    ) {
+        eprintln!(
+            "cm-daemon: spawn_investigator runlog append failed for '{}': {}",
+            task.task_id, e
+        );
+    }
+
+    Ok(json!({ "session_uid": uid }))
 }
 
 // ===================================================================
@@ -17114,6 +17935,55 @@ mod tests {
         });
     }
 
+    /// Phase 3b: every new FRESH fire RESETS the watchdog state — a stale
+    /// `investigation_count` / `investigator_uid` left over from the prior run
+    /// (e.g. one that was escalated or whose investigator never cleared) must not
+    /// leak into the new run. The record step zeroes them alongside writing the
+    /// new `Running` `last_run`.
+    #[test]
+    fn trigger_fresh_resets_watchdog_state() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-reset",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            // Stale watchdog state from a prior run.
+            task.investigation_count = 2;
+            task.investigator_uid = Some("ts-old-investigator-0".into());
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_spawn_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-reset" }),
+            )
+            .expect("trigger ok");
+            assert_eq!(resp["fired"], json!(true));
+            let _ = take_continuous_spawn_spy_for_test();
+
+            let reloaded = crate::continuous::task::load_one("ct-reset").unwrap();
+            assert_eq!(
+                reloaded.investigation_count, 0,
+                "fresh fire zeroes the investigation count",
+            );
+            assert!(
+                reloaded.investigator_uid.is_none(),
+                "fresh fire clears the investigator binding",
+            );
+            // The new run starts Running (the watchdog's active-run precondition).
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                crate::continuous::task::RunStatus::Running,
+            );
+        });
+    }
+
     /// `compose_continuous_spawn_params` is a thin wrapper that injects
     /// `continuous_task_id` and pins the worktree, delegating argv/env/cols to
     /// `compose_daemon_spawn_params` (no real `claude` binary needed).
@@ -17156,6 +18026,616 @@ mod tests {
                 .collect();
             assert_eq!(argv[0], "claude");
             assert!(argv.iter().any(|a| a == "--mcp-config"), "argv: {:?}", argv);
+        });
+    }
+
+    // --- Continuous Tasks Phase 3b: completion signal + stuck resolution ----
+
+    /// Spawn a real `/bin/sleep` DaemonSession tagged with `continuous_task_id`
+    /// and insert it under `uid` — the registry entry the Phase-3b auth + kill
+    /// paths read (no real claude). `DaemonSession::spawn` arms its reaper with
+    /// `on_exit=None`, so a killed session is LEFT in the registry (the
+    /// kill_session-semantics assertions rely on that). Caller cleans up via
+    /// `kill_all_sessions`.
+    fn insert_continuous_session(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        continuous_task_id: &str,
+    ) {
+        let mut sp = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+        sp.args = vec!["60".to_string()];
+        sp.session_type = "claude-code".to_string();
+        let mut ds = crate::session::DaemonSession::spawn(sp).expect("spawn /bin/sleep");
+        ds.continuous_task_id = Some(continuous_task_id.to_string());
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(uid.to_string(), ds);
+    }
+
+    /// Build a FRESH task with a `Running` `last_run` pinned to `session_uid`.
+    fn fresh_task_running(
+        task_id: &str,
+        worktree: &std::path::Path,
+        session_uid: &str,
+    ) -> crate::continuous::task::ContinuousTask {
+        let mut task = continuous_task(
+            task_id,
+            crate::continuous::task::Engine::Claude,
+            crate::continuous::task::RunMode::Fresh,
+            worktree,
+        );
+        task.last_run = Some(crate::continuous::task::RunRecord {
+            seq: 1,
+            fire_token: "ft-stuck-1".into(),
+            started_at: 1,
+            finished_at: None,
+            session_uid: Some(session_uid.to_string()),
+            status: crate::continuous::task::RunStatus::Running,
+            trigger_source: "operator".into(),
+        });
+        task.run_count = 1;
+        task
+    }
+
+    /// `report_done` from the run's OWN session flips Running → Done + sets
+    /// finished_at.
+    #[test]
+    fn report_done_marks_active_run_done() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let uid = fresh_test_uid();
+            let task = fresh_task_running("ct-rd", &wt, &uid);
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &uid, "ct-rd");
+
+            let resp = report_done(&state, &Caller::session(uid.clone()), &json!({}))
+                .expect("report_done ok");
+            assert_eq!(resp["done"], json!(true));
+            assert_eq!(resp["task_id"], json!("ct-rd"));
+
+            let reloaded = crate::continuous::task::load_one("ct-rd").unwrap();
+            let last = reloaded.last_run.expect("last_run");
+            assert_eq!(last.status, crate::continuous::task::RunStatus::Done);
+            assert!(last.finished_at.is_some(), "finished_at set");
+
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// `report_done` from a session that does NOT own the active run is a SOFT
+    /// no-op (Ok with done:false), leaving the run Running — never an error.
+    #[test]
+    fn report_done_uid_mismatch_is_soft_no_op() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            // The active run belongs to a DIFFERENT session uid.
+            let task = fresh_task_running("ct-rd-mm", &wt, "ts-other-run-0");
+            crate::continuous::task::save(&task).expect("save");
+
+            let caller_uid = fresh_test_uid();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &caller_uid, "ct-rd-mm");
+
+            let resp = report_done(&state, &Caller::session(caller_uid.clone()), &json!({}))
+                .expect("report_done ok (soft no-op)");
+            assert_eq!(resp["done"], json!(false));
+
+            let reloaded = crate::continuous::task::load_one("ct-rd-mm").unwrap();
+            assert_eq!(
+                reloaded.last_run.unwrap().status,
+                crate::continuous::task::RunStatus::Running,
+                "a non-owning caller must not flip the run",
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// `report_done` rejects an Operator caller and a Session caller that is not
+    /// a continuous-task tick (no continuous_task_id).
+    #[test]
+    fn report_done_rejects_operator_and_untagged_caller() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        // Operator caller: Unauthorized (a continuous tick is always a Session).
+        let err = report_done(&state, &Caller::operator("op"), &json!({}))
+            .expect_err("operator rejected");
+        assert_eq!(err.0, ErrorCode::Unauthorized);
+
+        // Session caller with NO continuous_task_id: Unauthorized.
+        let uid = fresh_test_uid();
+        {
+            let mut sp = crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.session_type = "claude-code".to_string();
+            let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            state.lock().unwrap().sessions.insert(uid.clone(), ds);
+        }
+        let err = report_done(&state, &Caller::session(uid.clone()), &json!({}))
+            .expect_err("untagged rejected");
+        assert_eq!(err.0, ErrorCode::Unauthorized);
+        kill_all_sessions(&state);
+    }
+
+    /// A continuous-task session exiting cleanly clears its ACTIVE run via
+    /// `handle_session_exit` (Running → Done + finished_at).
+    #[test]
+    fn clean_exit_marks_continuous_run_done() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let uid = fresh_test_uid();
+            let task = fresh_task_running("ct-exit", &wt, &uid);
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &uid, "ct-exit");
+
+            // handle_session_exit removes from the registry + drops the
+            // DaemonSession (SIGKILLing /bin/sleep) — no kill_all_sessions needed.
+            {
+                let mut s = state.lock().unwrap();
+                handle_session_exit(&mut s, &uid);
+            }
+
+            let reloaded = crate::continuous::task::load_one("ct-exit").unwrap();
+            let last = reloaded.last_run.expect("last_run");
+            assert_eq!(last.status, crate::continuous::task::RunStatus::Done);
+            assert!(last.finished_at.is_some());
+        });
+    }
+
+    /// The clean-exit Done write is DOUBLE-guarded: a non-active session's exit
+    /// (uid mismatch) leaves the run Running, and an already-Stuck run (escalate
+    /// set it) is NOT clobbered back to Done.
+    #[test]
+    fn clean_exit_no_op_on_uid_mismatch_and_when_not_running() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+
+            // (1) uid mismatch: the active run is owned by a DIFFERENT uid.
+            let exiting = fresh_test_uid();
+            let mut task = fresh_task_running("ct-exit-mm", &wt, "ts-active-run-0");
+            crate::continuous::task::save(&task).expect("save");
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &exiting, "ct-exit-mm");
+            {
+                let mut s = state.lock().unwrap();
+                handle_session_exit(&mut s, &exiting);
+            }
+            assert_eq!(
+                crate::continuous::task::load_one("ct-exit-mm")
+                    .unwrap()
+                    .last_run
+                    .unwrap()
+                    .status,
+                crate::continuous::task::RunStatus::Running,
+                "exit of a non-active session must not touch the active run",
+            );
+
+            // (2) status already Stuck (escalate set it): the guard preserves it.
+            let stuck_uid = fresh_test_uid();
+            task.task_id = "ct-exit-stuck".to_string();
+            if let Some(r) = task.last_run.as_mut() {
+                r.session_uid = Some(stuck_uid.clone());
+                r.status = crate::continuous::task::RunStatus::Stuck;
+            }
+            crate::continuous::task::save(&task).expect("save");
+            insert_continuous_session(&state, &stuck_uid, "ct-exit-stuck");
+            {
+                let mut s = state.lock().unwrap();
+                handle_session_exit(&mut s, &stuck_uid);
+            }
+            assert_eq!(
+                crate::continuous::task::load_one("ct-exit-stuck")
+                    .unwrap()
+                    .last_run
+                    .unwrap()
+                    .status,
+                crate::continuous::task::RunStatus::Stuck,
+                "a clean exit must not clobber an escalated Stuck run back to Done",
+            );
+        });
+    }
+
+    /// `resolve_stuck` `mark_unstuck` extends the watchdog clock
+    /// (started_at = now) and clears investigator_uid; the stuck session is NOT
+    /// killed (stays Running).
+    #[test]
+    fn resolve_stuck_mark_unstuck_extends_clock_and_clears_investigator() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stuck_uid = fresh_test_uid();
+            let inv_uid = fresh_test_uid();
+            let mut task = fresh_task_running("ct-unstuck", &wt, &stuck_uid);
+            task.investigator_uid = Some(inv_uid.clone());
+            task.investigation_count = 1;
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &inv_uid, "ct-unstuck");
+
+            let resp = resolve_stuck(
+                &state,
+                &Caller::session(inv_uid.clone()),
+                &json!({ "task_id": "ct-unstuck", "seq": 1, "action": "mark_unstuck" }),
+            )
+            .expect("mark_unstuck ok");
+            assert_eq!(resp["action"], json!("mark_unstuck"));
+
+            let reloaded = crate::continuous::task::load_one("ct-unstuck").unwrap();
+            assert!(reloaded.investigator_uid.is_none(), "investigator cleared");
+            let last = reloaded.last_run.unwrap();
+            assert_eq!(
+                last.status,
+                crate::continuous::task::RunStatus::Running,
+                "stuck session keeps running",
+            );
+            assert!(last.started_at > 1, "watchdog clock extended to now");
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// `resolve_stuck` `restart` kills the stuck session (kill_session
+    /// semantics — left in the registry, operator-kill flag set), clears
+    /// investigator_uid, and re-fires a brand-new FRESH run via trigger.
+    #[test]
+    fn resolve_stuck_restart_kills_and_refires() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stuck_uid = fresh_test_uid();
+            let inv_uid = fresh_test_uid();
+            let mut task = fresh_task_running("ct-restart", &wt, &stuck_uid);
+            task.investigator_uid = Some(inv_uid.clone());
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &stuck_uid, "ct-restart");
+            insert_continuous_session(&state, &inv_uid, "ct-restart");
+
+            arm_continuous_spawn_spy_for_test();
+            let resp = resolve_stuck(
+                &state,
+                &Caller::session(inv_uid.clone()),
+                &json!({ "task_id": "ct-restart", "seq": 1, "action": "restart" }),
+            )
+            .expect("restart ok");
+            assert_eq!(resp["action"], json!("restart"));
+            assert_eq!(resp["refire"]["fired"], json!(true));
+
+            // The re-fire reached the spawn boundary exactly once, tagged.
+            let captured = take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "one re-fire spawn");
+            assert_eq!(captured[0]["continuous_task_id"], json!("ct-restart"));
+
+            // The stuck session was killed via kill_session semantics: operator
+            // kill flag set, entry LEFT in the registry (not removed).
+            {
+                let s = state.lock().unwrap();
+                let stuck = s
+                    .sessions
+                    .get(&stuck_uid)
+                    .expect("stuck session left in registry");
+                assert!(
+                    stuck.last_exit.operator_kill_requested(),
+                    "stuck session killed via kill_session semantics",
+                );
+            }
+
+            // A brand-new FRESH run replaced the old one.
+            let reloaded = crate::continuous::task::load_one("ct-restart").unwrap();
+            assert_eq!(reloaded.run_count, 2);
+            assert!(reloaded.investigator_uid.is_none(), "investigator cleared");
+            let last = reloaded.last_run.unwrap();
+            assert_eq!(last.seq, 2);
+            assert_eq!(last.status, crate::continuous::task::RunStatus::Running);
+            assert_ne!(
+                last.session_uid.as_deref(),
+                Some(stuck_uid.as_str()),
+                "re-fire minted a new session uid",
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// `resolve_stuck` `escalate` kills the stuck session (kill_session
+    /// semantics), flips last_run → Stuck, clears investigator_uid, and writes
+    /// an `escalated` audit line.
+    #[test]
+    fn resolve_stuck_escalate_kills_and_marks_stuck() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stuck_uid = fresh_test_uid();
+            let inv_uid = fresh_test_uid();
+            let mut task = fresh_task_running("ct-escalate", &wt, &stuck_uid);
+            task.investigator_uid = Some(inv_uid.clone());
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &stuck_uid, "ct-escalate");
+            insert_continuous_session(&state, &inv_uid, "ct-escalate");
+
+            let resp = resolve_stuck(
+                &state,
+                &Caller::session(inv_uid.clone()),
+                &json!({
+                    "task_id": "ct-escalate",
+                    "seq": 1,
+                    "action": "escalate",
+                    "reason": "needs a human",
+                }),
+            )
+            .expect("escalate ok");
+            assert_eq!(resp["action"], json!("escalate"));
+
+            {
+                let s = state.lock().unwrap();
+                let stuck = s
+                    .sessions
+                    .get(&stuck_uid)
+                    .expect("stuck session left in registry");
+                assert!(
+                    stuck.last_exit.operator_kill_requested(),
+                    "stuck session killed via kill_session semantics",
+                );
+            }
+            let reloaded = crate::continuous::task::load_one("ct-escalate").unwrap();
+            assert_eq!(
+                reloaded.last_run.unwrap().status,
+                crate::continuous::task::RunStatus::Stuck,
+            );
+            assert!(reloaded.investigator_uid.is_none());
+
+            // An "escalated" audit line landed in runs.jsonl.
+            let runs = std::fs::read_to_string(
+                crate::continuous::task::runs_log_path("ct-escalate"),
+            )
+            .expect("runs.jsonl exists");
+            assert!(
+                runs.lines().any(|l| {
+                    serde_json::from_str::<crate::continuous::runlog::RunLogLine>(l)
+                        .map(|r| r.event == "escalated")
+                        .unwrap_or(false)
+                }),
+                "an 'escalated' line is present: {}",
+                runs,
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// `resolve_stuck` auth: an Operator caller, a tagged-but-not-investigator
+    /// session, and a session tagged with a DIFFERENT task are all rejected —
+    /// and none mutate the task.
+    #[test]
+    fn resolve_stuck_rejects_non_investigator_caller() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stuck_uid = fresh_test_uid();
+            let real_inv = fresh_test_uid();
+            let mut task = fresh_task_running("ct-auth", &wt, &stuck_uid);
+            task.investigator_uid = Some(real_inv.clone());
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+
+            // Operator caller → Unauthorized.
+            let err = resolve_stuck(
+                &state,
+                &Caller::operator("op"),
+                &json!({ "task_id": "ct-auth", "seq": 1, "action": "mark_unstuck" }),
+            )
+            .expect_err("operator rejected");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+
+            // A tagged-but-not-investigator session → Unauthorized (gate 2).
+            let other = fresh_test_uid();
+            insert_continuous_session(&state, &other, "ct-auth");
+            let err = resolve_stuck(
+                &state,
+                &Caller::session(other.clone()),
+                &json!({ "task_id": "ct-auth", "seq": 1, "action": "mark_unstuck" }),
+            )
+            .expect_err("non-investigator rejected");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+
+            // A session tagged with a DIFFERENT task → Unauthorized (gate 1).
+            let wrong_tag = fresh_test_uid();
+            insert_continuous_session(&state, &wrong_tag, "ct-other-task");
+            let err = resolve_stuck(
+                &state,
+                &Caller::session(wrong_tag.clone()),
+                &json!({ "task_id": "ct-auth", "seq": 1, "action": "mark_unstuck" }),
+            )
+            .expect_err("wrong-tag rejected");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+
+            // No rejected call mutated the task.
+            let reloaded = crate::continuous::task::load_one("ct-auth").unwrap();
+            assert_eq!(reloaded.investigator_uid.as_deref(), Some(real_inv.as_str()));
+            assert_eq!(
+                reloaded.last_run.unwrap().status,
+                crate::continuous::task::RunStatus::Running,
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// `snapshot_stuck_run` copies the resolved transcript jsonl (named after its
+    /// source file), the worktree's NOTES.md, and a metadata.json (carrying the
+    /// run record + reason + elapsed) into `stuck/<seq>/`.
+    #[test]
+    fn snapshot_stuck_run_writes_transcript_notes_and_metadata() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+
+            // A resolved transcript file somewhere outside the snapshot dir.
+            let transcript = home.join("3f8a-claude-uuid.jsonl");
+            std::fs::write(&transcript, "{\"role\":\"assistant\"}\n").unwrap();
+            // The worktree's NOTES.md (cross-fire continuity).
+            std::fs::write(wt.join("NOTES.md"), "carry-over notes\n").unwrap();
+
+            let mut task = fresh_task_running("ct-snap", &wt, "ts-stuck-aaaa-0");
+            task.max_runtime_secs = Some(60);
+
+            let dir = snapshot_stuck_run(
+                &task,
+                1,
+                Some(transcript.as_path()),
+                120,
+                "watchdog: max_runtime exceeded",
+            );
+            assert_eq!(
+                dir,
+                crate::continuous::task::task_dir("ct-snap")
+                    .join("stuck")
+                    .join("1"),
+            );
+
+            // Transcript copied under its SOURCE file name.
+            let copied =
+                std::fs::read_to_string(dir.join("3f8a-claude-uuid.jsonl")).expect("transcript");
+            assert_eq!(copied, "{\"role\":\"assistant\"}\n");
+            // NOTES.md copied.
+            assert_eq!(
+                std::fs::read_to_string(dir.join("NOTES.md")).expect("NOTES.md"),
+                "carry-over notes\n",
+            );
+            // metadata.json carries the run record + reason + elapsed.
+            let meta: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("metadata.json")).expect("metadata.json"),
+            )
+            .expect("valid json");
+            assert_eq!(meta["task_id"], json!("ct-snap"));
+            assert_eq!(meta["seq"], json!(1));
+            assert_eq!(meta["elapsed_secs"], json!(120));
+            assert_eq!(meta["reason"], json!("watchdog: max_runtime exceeded"));
+            assert_eq!(meta["max_runtime_secs"], json!(60));
+            assert!(meta["run"].is_object(), "run record serialized: {}", meta);
+        });
+    }
+
+    /// `snapshot_stuck_run` is best-effort per file: a None transcript path and a
+    /// worktree with no NOTES.md still produce the dir + metadata.json, with no
+    /// transcript/NOTES artifacts (a trust-dialog hang may never have a
+    /// transcript).
+    #[test]
+    fn snapshot_stuck_run_tolerates_missing_transcript_and_notes() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let task = fresh_task_running("ct-snap-min", &wt, "ts-stuck-bbbb-0");
+
+            let dir = snapshot_stuck_run(&task, 2, None, 5, "watchdog");
+            assert!(dir.join("metadata.json").exists(), "metadata.json written");
+            assert!(!dir.join("NOTES.md").exists(), "no NOTES.md to copy");
+            // The dir holds metadata.json only (no transcript, no NOTES.md).
+            let entries: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(entries, vec!["metadata.json".to_string()], "only metadata.json");
+        });
+    }
+
+    /// `spawn_investigator` composes a FRESH claude spawn labelled "investigator",
+    /// tagged with the task's continuous_task_id and pinned to its worktree; on a
+    /// successful spawn it binds `investigator_uid` + bumps `investigation_count`
+    /// and writes a `stuck` audit line. The spawn boundary is spied (no real
+    /// claude).
+    #[test]
+    fn spawn_investigator_tags_sets_investigator_and_logs_stuck() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = fresh_task_running("ct-inv", &wt, "ts-stuck-cccc-0");
+            task.max_runtime_secs = Some(60);
+            crate::continuous::task::save(&task).expect("save");
+
+            let snapshot_dir = crate::continuous::task::task_dir("ct-inv")
+                .join("stuck")
+                .join("1");
+
+            arm_continuous_spawn_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = spawn_investigator(&state, &task, 1, &snapshot_dir)
+                .expect("spawn_investigator ok");
+            let inv_uid = resp["session_uid"].as_str().expect("session_uid str");
+            assert!(is_valid_session_uid(inv_uid), "minted investigator uid valid");
+
+            // Composed params: a claude investigator tagged + pinned to the
+            // task's worktree, under the minted uid.
+            let captured = take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "exactly one investigator spawn");
+            let full = &captured[0];
+            assert_eq!(full["label"], json!("investigator"));
+            assert_eq!(full["session_type"], json!("claude-code"));
+            assert_eq!(full["continuous_task_id"], json!("ct-inv"));
+            assert_eq!(full["task_id"], json!("ct-inv"));
+            assert_eq!(
+                full["working_dir"].as_str().unwrap(),
+                wt.to_string_lossy().as_ref(),
+                "pinned to the task's worktree",
+            );
+            assert_eq!(full["uid"].as_str().unwrap(), inv_uid);
+
+            // The investigation was recorded on the task.
+            let reloaded = crate::continuous::task::load_one("ct-inv").unwrap();
+            assert_eq!(reloaded.investigator_uid.as_deref(), Some(inv_uid));
+            assert_eq!(reloaded.investigation_count, 1);
+
+            // A `stuck` audit line with investigation:1 landed in runs.jsonl.
+            let runs =
+                std::fs::read_to_string(crate::continuous::task::runs_log_path("ct-inv"))
+                    .expect("runs.jsonl exists");
+            let stuck = runs
+                .lines()
+                .filter_map(|l| {
+                    serde_json::from_str::<crate::continuous::runlog::RunLogLine>(l).ok()
+                })
+                .find(|r| r.event == "stuck")
+                .expect("a 'stuck' line is present");
+            assert_eq!(stuck.detail.as_ref().unwrap()["investigation"], json!(1));
+        });
+    }
+
+    /// `investigator_prompt` pins the EXACT `resolve_stuck` call (task_id + seq),
+    /// enumerates the three verdicts, and points at the snapshot dir + worktree.
+    #[test]
+    fn investigator_prompt_pins_resolve_stuck_call() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = fresh_task_running("ct-prompt", &wt, "ts-stuck-dddd-0");
+            task.max_runtime_secs = Some(120);
+            let snapshot_dir = crate::continuous::task::task_dir("ct-prompt")
+                .join("stuck")
+                .join("3");
+
+            let p = investigator_prompt(&task, 3, &snapshot_dir);
+            assert!(p.contains("ct-prompt"), "names the task: {}", p);
+            assert!(p.contains("resolve_stuck(task_id=\"ct-prompt\", seq=3"), "exact call: {}", p);
+            assert!(p.contains("mark_unstuck"), "lists mark_unstuck");
+            assert!(p.contains("restart"), "lists restart");
+            assert!(p.contains("escalate"), "lists escalate");
+            assert!(
+                p.contains(&snapshot_dir.display().to_string()),
+                "points at the snapshot dir",
+            );
+            assert!(
+                p.contains(wt.to_string_lossy().as_ref()),
+                "points at the worktree",
+            );
         });
     }
 
