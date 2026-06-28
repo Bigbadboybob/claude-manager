@@ -183,6 +183,15 @@ pub struct ModePreset {
 pub struct ContinuousTask {
     // ----- identity (Phase 2) -----
     pub task_id: String,
+    /// Optional backing planning-task UUID. When set, the spawned session's
+    /// `task_id` is this UUID instead of the continuous `task_id` slug, so a
+    /// subtask-spawning orchestrator (e.g. bug-triage) has a real planning
+    /// parent: `create_subtask` resolves `caller.task_id` via the planning API
+    /// (`tasks.id` is a UUID PK; `parent_task_id` is a UUID FK), and the
+    /// spawned subtasks nest under this row on the planning board. `None`
+    /// (default) keeps the legacy behavior (session `task_id` = the slug).
+    #[serde(default)]
+    pub planning_task_id: Option<String>,
     pub label: String,
     #[serde(default)]
     pub project: Option<String>,
@@ -288,6 +297,7 @@ impl ContinuousTask {
     ) -> Self {
         ContinuousTask {
             task_id,
+            planning_task_id: None,
             label,
             project: None,
             host_id: "local".into(),

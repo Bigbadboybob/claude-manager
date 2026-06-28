@@ -2559,16 +2559,27 @@ pub fn task_update_tree(
     // session" guard prevents removing a workspace the daemon
     // itself just auto-registered from a fresh spawn (the spawn
     // path adds to state.workspaces BEFORE the TUI's next push
-    // sees it). Operator-side `mcp_start_session` will fail
-    // NotFound if it later resolves a task to a removed
-    // workspace — same surface as the no-such-workspace path.
+    // sees it).
     let live_ws_ids: std::collections::HashSet<String> = state
         .sessions
         .values()
         .map(|s| s.workspace_id.clone())
         .collect();
+    // ALSO preserve workspaces bound to a task (`state.bindings`). A daemon-
+    // created subtask workspace (`create_subtask`) is awaiting its FIRST agent:
+    // it's not in the TUI's push (the TUI doesn't know the daemon-minted subtask
+    // yet) AND has no live session yet, so the two guards above would GC it out
+    // from under a headless orchestrator's `create_subtask`→`mcp_start_session`
+    // — exactly the NotFound this GC's prior comment flagged. `bindings` survives
+    // this push (only the daemon's startup manifest-load replaces it; this
+    // handler clears `task_workspaces` but never `bindings`), so it's the
+    // durable anchor that keeps the workspace alive until its agent spawns.
+    let bound_ws_ids: std::collections::HashSet<String> =
+        state.bindings.values().cloned().collect();
     state.workspaces.retain(|ws_id, _| {
-        pushed_ws_ids.contains(ws_id) || live_ws_ids.contains(ws_id)
+        pushed_ws_ids.contains(ws_id)
+            || live_ws_ids.contains(ws_id)
+            || bound_ws_ids.contains(ws_id)
     });
     Ok(json!({
         "ok": true,
@@ -5752,14 +5763,25 @@ pub fn mcp_start_session(
             Some(req_task) => state
                 .task_workspaces
                 .get(req_task)
+                // Headless fallback. `create_subtask` registers the new subtask
+                // in BOTH `task_workspaces` AND `bindings`, but the TUI's
+                // `task.update_tree` push CLEARS `task_workspaces` (full-replace
+                // from the TUI's view, which doesn't yet know the daemon-minted
+                // subtask) while leaving `bindings` untouched. So a headless
+                // orchestrator that `create_subtask`s then immediately
+                // `mcp_start_session`s the fix-agent races the TUI's clear and
+                // hits an empty `task_workspaces`. `bindings` survives every
+                // runtime push (only the daemon's own startup manifest-load
+                // replaces it), as does `state.workspaces` (merge-not-replace),
+                // so this fallback resolves the spawn reliably without a TUI.
+                .or_else(|| state.bindings.get(req_task))
                 .cloned()
                 .ok_or((
                     ErrorCode::NotFound,
                     format!(
                         "task '{}' has no bound workspace in the daemon's task \
-                         snapshot — the TUI must push task.update_tree with \
-                         `workspace_id` populated for descendant-task subtree \
-                         spawns to resolve (sub-2b-3 review-2 #1)",
+                         snapshot or bindings — neither the TUI's task.update_tree \
+                         nor create_subtask registered it (sub-2b-3 review-2 #1)",
                         req_task
                     ),
                 ))?,
@@ -7014,7 +7036,11 @@ pub fn trigger(
                 &task.label,
                 engine,
                 &working_dir,
-                Some(&task.task_id),
+                // Session task_id: the backing planning UUID when set (so a
+                // subtask-spawning orchestrator has a real planning parent for
+                // create_subtask), else the continuous slug (legacy behavior).
+                // The continuous_task_id tag below stays the slug regardless.
+                Some(task.planning_task_id.as_deref().unwrap_or(&task.task_id)),
                 &task.task_id,
                 task.mem_cap_bytes,
                 cols,
@@ -7936,6 +7962,12 @@ struct ContinuousCreateParams {
     /// Durable task id (planning slug, e.g. `"bug-triage"`). Doubles as the
     /// default worktree slug + workspace key. Validated by `validate_task_id`.
     task_id: String,
+    /// Optional backing planning-task UUID. When set, the spawned session's
+    /// `task_id` is this UUID (not the slug above), so an orchestrator that
+    /// spawns subtasks via `create_subtask` has a real planning parent. The
+    /// caller creates the planning row (POST /tasks) and passes its `id` here.
+    #[serde(default)]
+    planning_task_id: Option<String>,
     /// Human-readable sidebar label.
     label: String,
     /// Wire engine: `"claude"`|`"codex"`|`"bash"` (default `claude`).
@@ -8129,6 +8161,7 @@ pub fn continuous_create(
         p.schedule.clone(),
         p.default_prompt.clone(),
     );
+    task.planning_task_id = p.planning_task_id.clone();
     task.project = p.project.clone();
     task.repo = Some(p.repo_url.clone());
     if let Some(host) = p.host.clone() {
@@ -10047,6 +10080,48 @@ mod tests {
     }
 
     // --- Workspace resolution -----------------------------------------------
+
+    /// A daemon-created subtask workspace (present in `state.bindings`, with NO
+    /// live session and NOT in the TUI's push) must SURVIVE the task.update_tree
+    /// GC — else a headless orchestrator's create_subtask→mcp_start_session
+    /// races the TUI's push and the workspace is GC'd out from under it (the
+    /// documented NotFound). An unbound, sessionless workspace is still GC'd.
+    #[test]
+    fn task_update_tree_preserves_bound_subtask_workspace() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-subtask".to_string();
+            ws.worktree_path = Some(std::path::PathBuf::from("/tmp/sub-wt"));
+            s.workspaces.insert("ws-subtask".to_string(), ws);
+            // create_subtask registered this binding (survives the push).
+            s.bindings.insert("task-sub".to_string(), "ws-subtask".to_string());
+            // An unbound, sessionless workspace that SHOULD be GC'd (control).
+            let mut orphan = crate::manifest::ManifestWorkspace::default();
+            orphan.id = "ws-orphan".to_string();
+            s.workspaces.insert("ws-orphan".to_string(), orphan);
+        }
+        // TUI pushes a tree that knows NEITHER ws-subtask nor ws-orphan.
+        let resp = task_update_tree(
+            &state,
+            &json!({
+                "tasks": [{"task_id": "task-other", "parent_task_id": null, "workspace_id": "ws-other"}],
+                "workspaces": [{"workspace_id": "ws-other", "worktree_path": "/tmp/other"}],
+            }),
+        );
+        assert!(resp.is_ok(), "update_tree ok: {:?}", resp);
+        let s = state.lock().unwrap();
+        assert!(
+            s.workspaces.contains_key("ws-subtask"),
+            "bound subtask workspace must survive the GC",
+        );
+        assert!(s.workspaces.contains_key("ws-other"), "pushed workspace present");
+        assert!(
+            !s.workspaces.contains_key("ws-orphan"),
+            "unbound sessionless workspace is still GC'd",
+        );
+    }
 
     #[test]
     fn missing_workspace_returns_not_found() {
@@ -18890,6 +18965,51 @@ mod tests {
             assert_eq!(line.event, "fired");
             assert_eq!(line.run_mode.as_deref(), Some("fresh"));
             assert_eq!(line.session_uid.as_deref(), Some(session_uid));
+        });
+    }
+
+    /// When a continuous task carries a backing `planning_task_id`, the spawned
+    /// session's `task_id` is that planning UUID (so `create_subtask` resolves a
+    /// real planning parent), while the `continuous_task_id` tag stays the slug
+    /// (so sidebar grouping is unaffected). Mirrors the tagging test above.
+    #[test]
+    fn trigger_uses_planning_task_id_as_session_task_id_when_set() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-planning",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            task.planning_task_id = Some("planning-uuid-abc123".to_string());
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_spawn_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-planning" }),
+            )
+            .expect("trigger ok");
+            assert_eq!(resp["fired"], json!(true));
+
+            let captured = take_continuous_spawn_spy_for_test();
+            assert_eq!(captured.len(), 1, "exactly one spawn per fire");
+            let full = &captured[0];
+            // Session task_id is the PLANNING UUID (create_subtask parent).
+            assert_eq!(full["task_id"], json!("planning-uuid-abc123"));
+            // Continuous tag stays the SLUG (sidebar grouping unchanged).
+            assert_eq!(full["continuous_task_id"], json!("ct-planning"));
+
+            // The field round-trips through persistence.
+            let reloaded = crate::continuous::task::load_one("ct-planning").unwrap();
+            assert_eq!(
+                reloaded.planning_task_id.as_deref(),
+                Some("planning-uuid-abc123"),
+            );
         });
     }
 

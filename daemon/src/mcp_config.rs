@@ -101,10 +101,25 @@ pub fn build_env(
         "CM_DAEMON_SOCKET".into(),
         absolutized_socket_or_raw(&crate::default_socket_path()),
     );
-    env.insert(
-        "CM_TUI_SOCKET".into(),
-        absolutized_socket_or_raw(&crate::default_tui_socket_path()),
-    );
+    // CM_TUI_SOCKET pins where tui-routed MCP methods go (workflow_transition /
+    // workflow_done / create_subtask / list_subtasks / mark_subtask_done). With
+    // a TUI present (laptop) that's `tui.sock` — the TUI serves them. On a
+    // HEADLESS daemon host (e.g. cm-manager) there is NO `tui.sock`, so pinning
+    // to it makes every such call ENOENT; the daemon itself now serves these
+    // methods (API-backed subtask CRUD + daemon-side workflow controller), so
+    // pin to the daemon socket instead. "Is there a TUI?" is detected by the
+    // presence of `tui.sock` at spawn time: the TUI creates it at startup and
+    // spawns sessions only while running, so a laptop always sees it; a remote
+    // daemon host never does. This keeps laptop routing byte-for-byte unchanged
+    // while unblocking daemon-spawned agents (continuous orchestrators,
+    // MCP/remote workers) on headless hosts.
+    let tui_sock = crate::default_tui_socket_path();
+    let tui_sock_pin = if tui_sock.exists() {
+        absolutized_socket_or_raw(&tui_sock)
+    } else {
+        absolutized_socket_or_raw(&crate::default_socket_path())
+    };
+    env.insert("CM_TUI_SOCKET".into(), tui_sock_pin);
     // Workflow participant identity — see `WorkflowMeta`. Must be in the MCP
     // server's config env (this block), NOT just the agent's process env,
     // because the MCP child doesn't inherit the agent's env.
@@ -486,6 +501,58 @@ mod tests {
              reach TUI-only methods (workflow_transition / workflow_done / \
              create_subtask / etc.) from the daemon-spawned session",
         );
+    }
+
+    /// Headless heuristic: with NO `tui.sock` present, `CM_TUI_SOCKET` pins to
+    /// the DAEMON socket so tui-routed methods (create_subtask / list_subtasks /
+    /// mark_subtask_done / workflow_*) reach the daemon on a remote host instead
+    /// of ENOENT-ing on an absent `tui.sock`. With `tui.sock` present (laptop),
+    /// it stays the tui socket. Determinism: pin HOME to a tempdir and clear the
+    /// socket env overrides so path resolution is purely HOME-relative.
+    #[test]
+    fn build_env_tui_socket_pins_daemon_when_headless_else_tui() {
+        let _g = home_lock();
+        let prev_tui = std::env::var_os("CM_TUI_SOCKET");
+        let prev_daemon = std::env::var_os("CM_DAEMON_SOCKET");
+        unsafe {
+            std::env::remove_var("CM_TUI_SOCKET");
+            std::env::remove_var("CM_DAEMON_SOCKET");
+        }
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".cm")).unwrap();
+
+        // No tui.sock → headless → daemon socket.
+        let pin = build_env("ts-headless", None)
+            .remove("CM_TUI_SOCKET")
+            .expect("present");
+        assert!(
+            pin.ends_with("daemon.sock") && !pin.ends_with("tui.sock"),
+            "headless (no tui.sock) must pin CM_TUI_SOCKET to the daemon socket, got {:?}",
+            pin,
+        );
+
+        // Create tui.sock → TUI present → tui socket.
+        std::fs::write(tmp.path().join(".cm/tui.sock"), b"").unwrap();
+        let pin2 = build_env("ts-laptop", None)
+            .remove("CM_TUI_SOCKET")
+            .expect("present");
+        assert!(
+            pin2.ends_with("tui.sock"),
+            "with tui.sock present, CM_TUI_SOCKET must stay the tui socket, got {:?}",
+            pin2,
+        );
+
+        unsafe {
+            match prev_tui {
+                Some(v) => std::env::set_var("CM_TUI_SOCKET", v),
+                None => std::env::remove_var("CM_TUI_SOCKET"),
+            }
+            match prev_daemon {
+                Some(v) => std::env::set_var("CM_DAEMON_SOCKET", v),
+                None => std::env::remove_var("CM_DAEMON_SOCKET"),
+            }
+        }
     }
 
     #[test]
