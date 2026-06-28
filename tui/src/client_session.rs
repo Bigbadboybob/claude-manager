@@ -1043,6 +1043,10 @@ pub struct DaemonSessionSummary {
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
     pub worktree_path: Option<String>,
+    /// Continuous-task tag (`list_sessions` projects it). Lets the adoption
+    /// pass surface a daemon-spawned continuous session into the sidebar's
+    /// Continuous section, on whatever host it runs on.
+    pub continuous_task_id: Option<String>,
     /// Live daemon-side PTY window size (`last_cols`/`last_rows`).
     /// `None` from an older daemon that doesn't report it; the adopt
     /// scan's size reconcile skips sessions it can't measure.
@@ -1077,6 +1081,7 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
         workflow_run_id: str_field("workflow_run_id"),
         workflow_role: str_field("workflow_role"),
         worktree_path: str_field("worktree_path"),
+        continuous_task_id: str_field("continuous_task_id"),
         cols: u16_field("cols"),
         rows: u16_field("rows"),
     })

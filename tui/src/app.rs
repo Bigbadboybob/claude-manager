@@ -4975,189 +4975,230 @@ impl App {
     /// Reuses the restore-path attach machinery
     /// (`try_attach_via_daemon_with_deps`) wholesale.
     fn adopt_untracked_daemon_sessions(&mut self) {
-        let Some(socket) = self
-            .host_pool
-            .for_host(&cm_daemon::host_id::HostId::local())
-            .ok()
-            .and_then(|h| h.socket_path())
-        else {
-            return;
-        };
-        let summaries = match crate::client_session::rpc_list_daemon_sessions(
-            &socket,
-            crate::daemon_launch::operator_token(),
-        ) {
-            Ok(s) => s,
-            Err(_) => return, // best-effort; matches restore_sessions posture
-        };
-
-        // Self-healing size reconcile (runs every scan, independent of
-        // whether anything is adopted below). The daemon now reports each
-        // session's live PTY size; compare it against this terminal's pane
-        // size and re-assert any LOCAL session whose daemon PTY drifted.
-        // This closes the "skinny session" gap the best-effort attach-stream
-        // resize leaves open: a resize data frame that drops on a dead/
-        // replaced attach socket (Broken pipe) leaves the PTY stuck forever,
-        // and `resize_terminals` only re-fires on a size *change*. The
-        // reliable `session.resize` control RPC (fresh socket) fixes it
-        // within one scan — most visibly an MCP-spawned codex that inherited
-        // a momentarily-skinny caller's size. Only sessions with measurable
-        // drift are touched, so the common (already-correct) case sends no
-        // RPC and triggers no spurious SIGWINCH repaint.
+        // Scan EVERY configured host, not just local. A daemon-spawned session
+        // — an MCP agent OR a continuous-task session (e.g. the bug-triage
+        // orchestrator on `manager`) — must surface in the sidebar regardless
+        // of which host the operator last touched; host is a per-session
+        // attribute, never a global mode. The scan is non-blocking: it uses
+        // `live_socket_path` (a non-blocking `try_lock`, no tunnel spawn), so a
+        // host whose tunnel isn't warm yet is silently skipped rather than
+        // gating this every-5s main-thread scan on a ~3s SSH dial. A remote
+        // tunnel is warmed off-thread by its `manifest.watch` consumer; once
+        // up, the next scan adopts its sessions.
+        let local = cm_daemon::host_id::HostId::local();
+        let host_ids: Vec<cm_daemon::host_id::HostId> =
+            self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
         let want = self.last_term_size;
-        let drift_uids = {
-            let tracked_local: std::collections::HashSet<&str> = self
-                .workspaces
-                .iter()
-                .flat_map(|w| w.sessions.iter())
-                .filter(|s| s.host_id == cm_daemon::host_id::HostId::local())
-                .map(|s| s.uid.as_str())
-                .collect();
-            Self::select_size_drift_uids(&summaries, &tracked_local, want)
-        };
-        for uid in &drift_uids {
-            if let Err(e) = crate::client_session::rpc_session_resize(
-                &socket,
-                crate::daemon_launch::operator_token(),
-                uid,
-                want.0,
-                want.1,
-            ) {
-                eprintln!(
-                    "cm-tui: size reconcile resize {} -> {}x{} failed: {} \
-                     (will retry next adopt scan)",
-                    uid, want.0, want.1, e,
-                );
-            }
-        }
-
-        // Decide adoptees under an immutable borrow, then mutate.
-        //   - `managed_by_uid.is_some()`: agent-spawned only. TUI-/operator-
-        //     spawned sessions are `None` and are excluded (they're already
-        //     tracked anyway, but this is the authoritative gate).
-        //   - not already tracked in any workspace.
-        let tracked: std::collections::HashSet<&str> = self
-            .workspaces
-            .iter()
-            .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
-            .collect();
-        let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
-        drop(tracked);
-        if adoptees.is_empty() {
-            return;
-        }
-
         let (cols, rows) = self.last_term_size;
         let mut adopted_any = false;
-        for s in adoptees {
-            // worktree: daemon-reported > matching workspace's > temp_dir.
-            // Must end up `Some` on the workspace so the restore-path attach
-            // branch re-attaches it after a TUI restart.
-            let worktree: PathBuf = s
-                .worktree_path
-                .clone()
-                .map(PathBuf::from)
-                .or_else(|| {
-                    s.workspace_id.as_deref().and_then(|wid| {
+
+        for host in &host_ids {
+            let Some(socket) = self.host_pool.live_socket_path(host) else {
+                continue; // tunnel not up yet (or no socket transport); skip
+            };
+            let summaries = match crate::client_session::rpc_list_daemon_sessions(
+                &socket,
+                crate::daemon_launch::operator_token(),
+            ) {
+                Ok(s) => s,
+                Err(_) => continue, // best-effort; matches restore_sessions posture
+            };
+
+            // Self-healing size reconcile — LOCAL host only. The daemon reports
+            // each session's live PTY size; compare it against this terminal's
+            // pane size and re-assert any LOCAL session whose daemon PTY
+            // drifted. (Remote sessions size to their own attach, not this
+            // pane, so reconciling them against this pane would be wrong.) This
+            // closes the "skinny session" gap the best-effort attach-stream
+            // resize leaves open: a resize data frame that drops on a dead/
+            // replaced attach socket (Broken pipe) leaves the PTY stuck
+            // forever, and `resize_terminals` only re-fires on a size *change*.
+            // The reliable `session.resize` control RPC (fresh socket) fixes it
+            // within one scan — most visibly an MCP-spawned codex that
+            // inherited a momentarily-skinny caller's size. Only sessions with
+            // measurable drift are touched, so the common (already-correct)
+            // case sends no RPC and triggers no spurious SIGWINCH repaint.
+            if host == &local {
+                let drift_uids = {
+                    let tracked_local: std::collections::HashSet<&str> = self
+                        .workspaces
+                        .iter()
+                        .flat_map(|w| w.sessions.iter())
+                        .filter(|s| s.host_id == local)
+                        .map(|s| s.uid.as_str())
+                        .collect();
+                    Self::select_size_drift_uids(&summaries, &tracked_local, want)
+                };
+                for uid in &drift_uids {
+                    if let Err(e) = crate::client_session::rpc_session_resize(
+                        &socket,
+                        crate::daemon_launch::operator_token(),
+                        uid,
+                        want.0,
+                        want.1,
+                    ) {
+                        eprintln!(
+                            "cm-tui: size reconcile resize {} -> {}x{} failed: {} \
+                             (will retry next adopt scan)",
+                            uid, want.0, want.1, e,
+                        );
+                    }
+                }
+            }
+
+            // Decide adoptees under an immutable borrow, then mutate. Gate is
+            // in `select_daemon_adoptees`: agent-spawned (managed_by_uid) OR
+            // continuous-tagged, and not already tracked in any workspace.
+            let tracked: std::collections::HashSet<&str> = self
+                .workspaces
+                .iter()
+                .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
+                .collect();
+            let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
+            drop(tracked);
+            if adoptees.is_empty() {
+                continue;
+            }
+
+            for s in adoptees {
+                // worktree: daemon-reported > matching workspace's > temp_dir.
+                // Must end up `Some` on the workspace so the restore-path
+                // attach branch re-attaches it after a TUI restart.
+                let worktree: PathBuf = s
+                    .worktree_path
+                    .clone()
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        s.workspace_id.as_deref().and_then(|wid| {
+                            self.workspaces
+                                .iter()
+                                .find(|w| w.id.as_str() == wid)
+                                .and_then(|w| w.worktree_path.clone())
+                        })
+                    })
+                    .unwrap_or_else(std::env::temp_dir);
+
+                // Target workspace. A CONTINUOUS session gets special handling:
+                // a persistent task that RESPAWNS (new uid — e.g. after a daemon
+                // restart or a dead-session respawn) must NOT mint a fresh
+                // workspace each time. Reuse the workspace already holding this
+                // continuous task and DROP its stale (dead predecessor)
+                // session(s), so the sidebar shows ONE orchestrator entry, not
+                // one per respawn. Otherwise: the existing workspace matching the
+                // daemon's `workspace_id`, else a fresh synthetic workspace.
+                let continuous_ws: Option<String> =
+                    s.continuous_task_id.as_deref().and_then(|ct| {
                         self.workspaces
                             .iter()
-                            .find(|w| w.id.as_str() == wid)
-                            .and_then(|w| w.worktree_path.clone())
-                    })
-                })
-                .unwrap_or_else(std::env::temp_dir);
-
-            // Target workspace: the existing one matching the daemon's
-            // `workspace_id` (groups the session under the same task as the
-            // spawning agent), else a fresh synthetic workspace.
-            let target_ws_id: String = match s
-                .workspace_id
-                .as_deref()
-                .filter(|wid| self.workspaces.iter().any(|w| w.id.as_str() == *wid))
-            {
-                Some(wid) => wid.to_string(),
-                None => {
-                    let new_id = new_workspace_id();
-                    self.workspaces.push(Workspace {
-                        id: new_id.clone(),
-                        name: format!("agent: {}", s.label),
-                        is_closed: false,
-                        is_cloud: false,
-                        repo_url: None,
-                        worktree_path: Some(worktree.clone()),
-                        main_repo_path: None,
-                        worker_vm: None,
-                        worker_zone: None,
-                        sessions: Vec::new(),
-                        tombstones: Vec::new(),
-                        is_pushing: false,
+                            .find(|w| {
+                                w.sessions.iter().any(|sess| {
+                                    sess.continuous_task_id.as_deref() == Some(ct)
+                                })
+                            })
+                            .map(|w| w.id.clone())
                     });
-                    new_id
+                let target_ws_id: String = if let Some(wid) = continuous_ws {
+                    if let Some(ct) = s.continuous_task_id.as_deref() {
+                        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == wid) {
+                            w.sessions
+                                .retain(|sess| sess.continuous_task_id.as_deref() != Some(ct));
+                        }
+                    }
+                    wid
+                } else {
+                    match s
+                        .workspace_id
+                        .as_deref()
+                        .filter(|wid| self.workspaces.iter().any(|w| w.id.as_str() == *wid))
+                    {
+                        Some(wid) => wid.to_string(),
+                        None => {
+                            let new_id = new_workspace_id();
+                            self.workspaces.push(Workspace {
+                                id: new_id.clone(),
+                                name: format!("agent: {}", s.label),
+                                is_closed: false,
+                                is_cloud: false,
+                                repo_url: None,
+                                worktree_path: Some(worktree.clone()),
+                                main_repo_path: None,
+                                worker_vm: None,
+                                worker_zone: None,
+                                sessions: Vec::new(),
+                                tombstones: Vec::new(),
+                                is_pushing: false,
+                            });
+                            new_id
+                        }
+                    }
+                };
+
+                // Attach to the existing daemon session (uid-only; the daemon
+                // already owns argv/env/cwd) on THIS host. Transcript binding
+                // is deferred — the attach-stream replays the PTY ring buffer,
+                // so the session is live + visible without it.
+                let session = match try_attach_via_daemon_with_deps(
+                    &self.host_pool,
+                    &s.session_uid,
+                    &target_ws_id,
+                    &worktree,
+                    &s.session_type,
+                    &s.label,
+                    cols,
+                    rows,
+                    s.task_id.as_deref(),
+                    s.workflow_run_id.as_deref(),
+                    s.workflow_role.as_deref(),
+                    host,
+                    None,
+                ) {
+                    Ok(sess) => sess,
+                    // TOCTOU: the session exited between list and attach. Skip
+                    // (do NOT spawn — the TUI doesn't own this session).
+                    Err(_) => continue,
+                };
+
+                let ts = TerminalSession {
+                    uid: s.session_uid.clone(),
+                    label: s.label.clone(),
+                    session_type: normalize_session_type_to_internal(&s.session_type)
+                        .to_string(),
+                    session,
+                    status: SessionStatus::Running,
+                    last_write_at: None,
+                    transcript_id: None,
+                    generation: 0,
+                    // Attach path skips the post-spawn JSONL rebind primer
+                    // (mirrors `RestoreOutcome::Attached`).
+                    pending_jsonl_files: None,
+                    // VISIBLE by default — the whole point of adoption is that
+                    // agent-spawned sessions show up on screen.
+                    hidden: false,
+                    idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+                    burst_threshold: 0,
+                    pending_prompt: None,
+                    pending_clear: None,
+                    workflow_run_id: s.workflow_run_id.clone(),
+                    workflow_role: s.workflow_role.clone(),
+                    // Continuous-task tag straight from the daemon summary, so
+                    // a continuous session (scheduler/operator-spawned) adopts
+                    // into the sidebar's Continuous section on whatever host it
+                    // runs.
+                    continuous_task_id: s.continuous_task_id.clone(),
+                    last_delivery: None,
+                    task_id: s.task_id.clone(),
+                    notify_on_idle: false,
+                    pending_enter: None,
+                    created_at: Instant::now(),
+                    managed_by_uid: s.managed_by_uid.clone(),
+                    seeded_from_snapshot: None,
+                    preserved_last_exit: None,
+                    host_id: host.clone(),
+                };
+                if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == target_ws_id) {
+                    w.sessions.push(ts);
+                    adopted_any = true;
                 }
-            };
-
-            // Attach to the existing daemon session (uid-only; the daemon
-            // already owns argv/env/cwd). Transcript binding is deferred —
-            // the attach-stream replays the PTY ring buffer, so the session
-            // is live + visible without it.
-            let session = match try_attach_via_daemon_with_deps(
-                &self.host_pool,
-                &s.session_uid,
-                &target_ws_id,
-                &worktree,
-                &s.session_type,
-                &s.label,
-                cols,
-                rows,
-                s.task_id.as_deref(),
-                s.workflow_run_id.as_deref(),
-                s.workflow_role.as_deref(),
-                &cm_daemon::host_id::HostId::local(),
-                None,
-            ) {
-                Ok(sess) => sess,
-                // TOCTOU: the session exited between list and attach. Skip
-                // (do NOT spawn — the TUI doesn't own this session).
-                Err(_) => continue,
-            };
-
-            let ts = TerminalSession {
-                uid: s.session_uid.clone(),
-                label: s.label.clone(),
-                session_type: normalize_session_type_to_internal(&s.session_type).to_string(),
-                session,
-                status: SessionStatus::Running,
-                last_write_at: None,
-                transcript_id: None,
-                generation: 0,
-                // Attach path skips the post-spawn JSONL rebind primer
-                // (mirrors `RestoreOutcome::Attached`).
-                pending_jsonl_files: None,
-                // VISIBLE by default — the whole point of adoption is that
-                // agent-spawned sessions show up on screen.
-                hidden: false,
-                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
-                burst_threshold: 0,
-                pending_prompt: None,
-                pending_clear: None,
-                workflow_run_id: s.workflow_run_id.clone(),
-                workflow_role: s.workflow_role.clone(),
-                // DaemonSessionSummary carries no continuous tag; the
-                // adoption path leaves it None (Phase-1 plumbing).
-                continuous_task_id: None,
-                last_delivery: None,
-                task_id: s.task_id.clone(),
-                notify_on_idle: false,
-                pending_enter: None,
-                created_at: Instant::now(),
-                managed_by_uid: s.managed_by_uid.clone(),
-                seeded_from_snapshot: None,
-                preserved_last_exit: None,
-                host_id: cm_daemon::host_id::HostId::local(),
-            };
-            if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == target_ws_id) {
-                w.sessions.push(ts);
-                adopted_any = true;
             }
         }
 
@@ -5171,9 +5212,12 @@ impl App {
     }
 
     /// Select which daemon-session summaries the adoption pass should take:
-    /// agent-spawned (`managed_by_uid.is_some()` — TUI/operator spawns are
-    /// `None`) and not already tracked in any TUI workspace. Pure (no
-    /// `self`) so the gate + dedup is unit-testable without a live daemon.
+    /// agent-spawned (`managed_by_uid.is_some()`) OR continuous-tagged
+    /// (`continuous_task_id.is_some()` — scheduler/operator spawns whose
+    /// `managed_by_uid` is `None`), and not already tracked in any TUI
+    /// workspace. Plain TUI/operator spawns (both fields `None`) are excluded —
+    /// they're tracked through the normal spawn path. Pure (no `self`) so the
+    /// gate + dedup is unit-testable without a live daemon.
     fn select_daemon_adoptees(
         summaries: Vec<crate::client_session::DaemonSessionSummary>,
         tracked_uids: &std::collections::HashSet<&str>,
@@ -5181,7 +5225,11 @@ impl App {
         summaries
             .into_iter()
             .filter(|s| {
-                s.managed_by_uid.is_some()
+                // Agent-spawned (managed_by_uid) OR a continuous-task session
+                // (scheduler/operator-spawned, managed_by_uid=None) — both are
+                // daemon-owned sessions the TUI never launched, so both must be
+                // surfaced. Plain TUI-/operator-spawned sessions stay excluded.
+                (s.managed_by_uid.is_some() || s.continuous_task_id.is_some())
                     && !tracked_uids.contains(s.session_uid.as_str())
             })
             .collect()
@@ -20838,6 +20886,7 @@ mod adopt_daemon_session_tests {
             workflow_run_id: None,
             workflow_role: None,
             worktree_path: None,
+            continuous_task_id: None,
             cols: None,
             rows: None,
         }
@@ -20857,13 +20906,37 @@ mod adopt_daemon_session_tests {
     }
 
     #[test]
-    fn managed_by_none_is_never_adopted() {
+    fn plain_operator_spawn_is_never_adopted() {
+        // Neither agent-spawned (managed_by_uid) nor continuous-tagged → skip.
         let tracked: HashSet<&str> = HashSet::new();
         let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked);
         assert!(
             picked.is_empty(),
-            "TUI/operator-spawned sessions (managed_by_uid None) must not be adopted"
+            "plain TUI/operator-spawned sessions (both fields None) must not be adopted"
         );
+    }
+
+    #[test]
+    fn continuous_tagged_is_adopted_even_without_managed_by() {
+        // A continuous-task session is scheduler/operator-spawned, so its
+        // managed_by_uid is None — but it must still be adopted so the
+        // orchestrator surfaces in the sidebar's Continuous section.
+        let tracked: HashSet<&str> = HashSet::new();
+        let mut s = summary("bug-triage-orch", None);
+        s.continuous_task_id = Some("bug-triage".to_string());
+        let picked = App::select_daemon_adoptees(vec![s], &tracked);
+        let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
+        assert_eq!(uids, vec!["bug-triage-orch"]);
+    }
+
+    #[test]
+    fn continuous_tagged_but_tracked_is_skipped() {
+        // Even continuous-tagged, an already-tracked uid is not re-adopted.
+        let tracked: HashSet<&str> = ["bug-triage-orch"].into_iter().collect();
+        let mut s = summary("bug-triage-orch", None);
+        s.continuous_task_id = Some("bug-triage".to_string());
+        let picked = App::select_daemon_adoptees(vec![s], &tracked);
+        assert!(picked.is_empty(), "tracked continuous session must not double-adopt");
     }
 
     fn sized(uid: &str, cols: Option<u16>, rows: Option<u16>) -> DaemonSessionSummary {
