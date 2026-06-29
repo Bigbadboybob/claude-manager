@@ -1628,6 +1628,19 @@ enum VisualItem {
     ContinuousHeader,
 }
 
+/// One row in the dedicated continuous column (the two-column panel, S2 of
+/// DESIGN_CONTINUOUS_PANEL.md). A continuous-task orchestrator (`depth == 0`)
+/// followed by the subtasks it spawned (`depth == 1`, matched by
+/// `managed_by_uid`). Carries `(ws_idx, sess_idx)` exactly like
+/// `VisualItem::Session`, so the cursor + `active_session()` resolve a row
+/// identically; `depth` only drives render indentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContinuousRow {
+    pub ws_idx: usize,
+    pub sess_idx: usize,
+    pub depth: u8,
+}
+
 /// Modal input state.
 enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
@@ -7720,6 +7733,68 @@ impl App {
             }
         }
         items
+    }
+
+    /// Build the dedicated continuous column's rows (S2 of
+    /// DESIGN_CONTINUOUS_PANEL.md): each continuous-task orchestrator (a session
+    /// tagged `continuous_task_id`) at `depth 0`, followed by the subtasks it
+    /// spawned (sessions whose `managed_by_uid` is the orchestrator's uid, and
+    /// which are not themselves orchestrators) nested at `depth 1`. Orchestrators
+    /// ordered by label (then uid) for stable layout; subtasks by label under
+    /// each. Empty when `hide_continuous` (the master A-c hide) or when no
+    /// continuous session exists. Closed workspaces skipped, like the main
+    /// builders. Pure read — the render (S3) + cursor (S4) consume this.
+    fn visual_items_continuous(&self) -> Vec<ContinuousRow> {
+        if self.hide_continuous {
+            return Vec::new();
+        }
+        // Orchestrators: (ws_idx, sess_idx, uid, label).
+        let mut orchestrators: Vec<(usize, usize, &str, &str)> = Vec::new();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            for (si, ts) in ws.sessions.iter().enumerate() {
+                if ts.continuous_task_id.is_some() {
+                    orchestrators.push((wi, si, ts.uid.as_str(), ts.label.as_str()));
+                }
+            }
+        }
+        orchestrators.sort_by(|a, b| a.3.cmp(b.3).then(a.2.cmp(b.2)));
+
+        let mut rows = Vec::new();
+        for &(owi, osi, ouid, _) in &orchestrators {
+            rows.push(ContinuousRow {
+                ws_idx: owi,
+                sess_idx: osi,
+                depth: 0,
+            });
+            // Subtasks managed by this orchestrator (excluding orchestrators
+            // themselves — a continuous task nested under another stays
+            // top-level). Re-scan workspaces (immutable; small N).
+            let mut children: Vec<(usize, usize, &str)> = Vec::new();
+            for (wi, ws) in self.workspaces.iter().enumerate() {
+                if ws.is_closed {
+                    continue;
+                }
+                for (si, ts) in ws.sessions.iter().enumerate() {
+                    if ts.managed_by_uid.as_deref() == Some(ouid)
+                        && ts.continuous_task_id.is_none()
+                    {
+                        children.push((wi, si, ts.label.as_str()));
+                    }
+                }
+            }
+            children.sort_by(|a, b| a.2.cmp(b.2));
+            for (cwi, csi, _) in children {
+                rows.push(ContinuousRow {
+                    ws_idx: cwi,
+                    sess_idx: csi,
+                    depth: 1,
+                });
+            }
+        }
+        rows
     }
 
     /// Navigate the cursor up or down. +1 = down, -1 = up.
@@ -20877,6 +20952,73 @@ mod remote_reconnect_tests {
         );
 
         match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Continuous-panel S2: `visual_items_continuous` nests the subtasks an
+    /// orchestrator spawned (matched by `managed_by_uid`) under it, orders
+    /// orchestrators by label, excludes plain sessions, and is empty when
+    /// `hide_continuous`.
+    #[test]
+    fn visual_items_continuous_nests_subtasks_under_orchestrators() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+
+        let mk = |uid: &str, cont: Option<&str>, mgr: Option<&str>, label: &str| {
+            let (mut ts, _tx, _teof) = session_with_injected_exit(
+                uid,
+                cm_daemon::host_id::HostId::local(),
+                false,
+            );
+            ts.continuous_task_id = cont.map(String::from);
+            ts.managed_by_uid = mgr.map(String::from);
+            ts.label = label.into();
+            ts
+        };
+        // One workspace: Z-orchestrator + its 2 subtasks (out of label order),
+        // a plain session, and an A-orchestrator (no subtasks).
+        let mut ws = workspace_with(mk("orch-z", Some("ct-z"), None, "Z orch"));
+        ws.sessions.push(mk("sub-b", None, Some("orch-z"), "BUG-2"));
+        ws.sessions.push(mk("sub-a", None, Some("orch-z"), "BUG-1"));
+        ws.sessions.push(mk("plain", None, None, "plain worker"));
+        ws.sessions.push(mk("orch-a", Some("ct-a"), None, "A orch"));
+        app.workspaces.push(ws);
+
+        let rows = app.visual_items_continuous();
+        let resolved: Vec<(&str, u8)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    r.depth,
+                )
+            })
+            .collect();
+        // A-orch (label "A orch") first, no children; then Z-orch with BUG-1,
+        // BUG-2 nested (sorted by label). Plain session excluded.
+        assert_eq!(
+            resolved,
+            vec![("orch-a", 0), ("orch-z", 0), ("sub-a", 1), ("sub-b", 1)],
+        );
+
+        app.hide_continuous = true;
+        assert!(
+            app.visual_items_continuous().is_empty(),
+            "A-c master hide empties the continuous column",
+        );
+
+        match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
