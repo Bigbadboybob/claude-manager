@@ -6332,6 +6332,66 @@ impl App {
         }
     }
 
+    /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-
+    /// reattach already recovers a remote session whose attach stream died
+    /// (transport EOF → reconnecting → retry → rebind once the daemon/tunnel
+    /// returns). This adds two operator overrides on top:
+    ///
+    ///   1. **Accelerate** in-flight reconnects — clear each queued entry's
+    ///      retry throttle + reset its attempt budget, so the next drain tries
+    ///      immediately and keeps trying (rather than waiting out the 2s
+    ///      interval or having a partly-spent budget).
+    ///   2. **Revive** remote sessions that already gave up (settled to
+    ///      `exited` after the sustained-failure cap). With daemon-side session
+    ///      durability the daemon may have RESTORED the session since it
+    ///      settled — so clear the slot's `exited` flag, mark it reconnecting,
+    ///      and requeue. A genuinely-gone session simply re-settles to exited.
+    ///
+    /// Returns the number of sessions nudged (for the status line). No-op for
+    /// local sessions (they have no remote daemon to reattach to).
+    fn nudge_remote_reconnects(&mut self) -> usize {
+        // (1) Un-throttle + refresh the budget on every queued reconnect.
+        for p in self.pending_remote_reattach.iter_mut() {
+            p.last_attempt_at = None;
+            p.attempts = 0;
+        }
+        let accelerated = self.pending_remote_reattach.len();
+
+        // (2) Revive exited remote sessions. An exited session is never in
+        // `reconnecting_sessions` (the cap path removes it), so no membership
+        // check is needed. Clear `exited` in place, then requeue below.
+        let local = cm_daemon::host_id::HostId::local();
+        let mut revived: Vec<(String, ManifestEntry)> = Vec::new();
+        for wi in 0..self.workspaces.len() {
+            if self.workspaces[wi].is_closed {
+                continue;
+            }
+            let ws_id = self.workspaces[wi].id.clone();
+            for si in 0..self.workspaces[wi].sessions.len() {
+                let ts = &mut self.workspaces[wi].sessions[si];
+                if ts.host_id != local && ts.session.exited && !ts.uid.is_empty() {
+                    ts.session.exited = false;
+                    revived.push((ws_id.clone(), ts.to_manifest_entry()));
+                }
+            }
+        }
+        for (ws_id, entry) in &revived {
+            self.reconnecting_sessions.insert(entry.uid.clone());
+            if !self
+                .pending_remote_reattach
+                .iter()
+                .any(|p| p.entry.uid == entry.uid)
+            {
+                self.pending_remote_reattach
+                    .push(PendingRemoteReattach::new(ws_id.clone(), entry.clone()));
+            }
+        }
+        if !revived.is_empty() {
+            self.needs_redraw = true;
+        }
+        accelerated + revived.len()
+    }
+
     /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
     /// transcript path via the agent strategy, builds a `SaveSpec`, and
     /// either toasts on success or re-opens the modal with the error
@@ -10086,11 +10146,23 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
+                        // A-r doubles as "reconnect now": accelerate in-flight
+                        // remote reconnects and revive any that gave up (the
+                        // daemon may have restored them since). Addresses the
+                        // "A-r doesn't clear a frozen remote pane" gap.
+                        let nudged = self.nudge_remote_reconnects();
                         // Also force a full physical repaint — A-r doubles
                         // as the "fix my screen" recovery if ratatui's diff
                         // model ever desyncs from the terminal.
                         self.force_clear = true;
-                        self.set_status_msg("Refreshing + redrawing...");
+                        if nudged > 0 {
+                            self.set_status_msg(&format!(
+                                "Refreshing + reconnecting {} remote session(s)...",
+                                nudged,
+                            ));
+                        } else {
+                            self.set_status_msg("Refreshing + redrawing...");
+                        }
                         return true;
                     }
                     KeyCode::Char('e') => {
@@ -20801,6 +20873,92 @@ mod remote_reconnect_tests {
             !app.workspaces[0].sessions[0].session.exited,
             "the preserved slot is not exited",
         );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// S4: the `A-r` "reconnect now" lever (`nudge_remote_reconnects`). It
+    /// REVIVES a remote session that gave up (settled to `exited` — the daemon
+    /// may have restored it since), ACCELERATES an in-flight reconnect (clears
+    /// the throttle + resets the attempt budget), and leaves LOCAL sessions
+    /// alone (they have no remote daemon to reattach to).
+    #[test]
+    fn ar_nudge_revives_exited_remote_accelerates_pending_ignores_local() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let local_sock = home.join(".cm/daemon.sock");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&local_sock);
+        app.sessions_restored = false;
+
+        // (a) A remote session that GAVE UP (settled to exited).
+        let (mut gaveup, _g_tx, _g_teof) =
+            session_with_injected_exit("uid-gaveup", manager_host(), false);
+        gaveup.session.exited = true;
+        app.workspaces.push(workspace_with(gaveup));
+
+        // (b) A LOCAL exited session — must be left alone.
+        let (mut local_ts, _l_tx, _l_teof) = session_with_injected_exit(
+            "uid-local",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        local_ts.session.exited = true;
+        app.workspaces[0].sessions.push(local_ts);
+
+        // (c) An in-flight reconnect with a SPENT budget + recent attempt.
+        let (recon, _r_tx, _r_teof) =
+            session_with_injected_exit("uid-recon", manager_host(), false);
+        let recon_entry = recon.to_manifest_entry();
+        app.workspaces[0].sessions.push(recon);
+        app.reconnecting_sessions.insert("uid-recon".into());
+        let mut spent = PendingRemoteReattach::new("ws-remote".into(), recon_entry);
+        spent.attempts = 10;
+        spent.last_attempt_at = Some(Instant::now());
+        app.pending_remote_reattach.push(spent);
+
+        let nudged = app.nudge_remote_reconnects();
+        assert!(nudged >= 2, "revived + accelerated counted");
+
+        // (a) revived: exited cleared, reconnecting, queued.
+        let g = app.workspaces[0]
+            .sessions
+            .iter()
+            .find(|s| s.uid == "uid-gaveup")
+            .unwrap();
+        assert!(!g.session.exited, "exited cleared so the reconnect can rebind");
+        assert!(app.reconnecting_sessions.contains("uid-gaveup"));
+        assert!(app
+            .pending_remote_reattach
+            .iter()
+            .any(|p| p.entry.uid == "uid-gaveup"));
+
+        // (b) local untouched.
+        let l = app.workspaces[0]
+            .sessions
+            .iter()
+            .find(|s| s.uid == "uid-local")
+            .unwrap();
+        assert!(l.session.exited, "local sessions are never reattached");
+        assert!(!app.reconnecting_sessions.contains("uid-local"));
+
+        // (c) accelerated: throttle cleared + budget reset.
+        let pr = app
+            .pending_remote_reattach
+            .iter()
+            .find(|p| p.entry.uid == "uid-recon")
+            .unwrap();
+        assert_eq!(pr.attempts, 0, "A-r reset the attempt budget");
+        assert!(pr.last_attempt_at.is_none(), "A-r cleared the retry throttle");
 
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
