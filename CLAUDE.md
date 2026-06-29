@@ -96,7 +96,7 @@ Sessions view:
 - `A-c` — hide/show continuous sessions entirely (master hide). `A-C` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off; on = a third pane splits off the right (terminal | main | continuous), off = continuous sessions sit at the bottom of the main sidebar. Both persisted.
 - `A-e` — session settings (label, idle/burst timers, hidden, notify-on-idle, **global perms** — Tab to the field, Space to toggle)
 - `A-v` — toggle Status / Task sub-view
-- `A-[` — push (cloud) · `A-]` — pull (cloud)  *(moved off `A-p`/`A-l`)*
+- `A-9` — push (cloud) · `A-0` — pull (cloud)  *(moved off `A-p`/`A-l`)*
 - `A-r` — refresh
 
 Planning view:

@@ -32,7 +32,7 @@ Tier-4 architectural change per `DESIGN_REMOVE_GLOBAL_HOST.md`: retire the globa
 
 ## ~~P2 — Two-column continuous panel (TUI)~~ ✅ DONE (S1–S5)
 
-Shipped per `DESIGN_CONTINUOUS_PANEL.md`. `A-C` toggles a dedicated continuous column (terminal | main | continuous) where orchestrators carry their spawned subtasks nested (`├`/`└` tree, matched by `managed_by_uid`); `A-h`/`A-l` move the unified cursor between columns, `A-j`/`A-k` within. Persisted (`continuous_column_on` on the manifest). Came with the **keybinding reshuffle** (S1): retired the `A-H` host-switcher, hide→`A-H`, push/pull→`A-[`/`A-]`, freeing `A-h`/`A-l`. Local-only (TUI) — no deploy. TUI 659 green. (Possible follow-ups: multihost grouping inside the column; transitive nesting depth; verify `A-[` registers across terminals.)
+Shipped per `DESIGN_CONTINUOUS_PANEL.md`. `A-C` toggles a dedicated continuous column (terminal | main | continuous) where orchestrators carry their spawned subtasks nested (`├`/`└` tree, matched by `managed_by_uid`); `A-h`/`A-l` move the unified cursor between columns, `A-j`/`A-k` within. Persisted (`continuous_column_on` on the manifest). Came with the **keybinding reshuffle** (S1): retired the `A-H` host-switcher, hide→`A-H`, push/pull→`A-9`/`A-0`, freeing `A-h`/`A-l`. Local-only (TUI) — no deploy. TUI 659 green. (Possible follow-ups: multihost grouping inside the column; transitive nesting depth.)
 
 ## ~~P3 — `continuous.update` + autocompact~~ ✅ DONE (deployed)
 

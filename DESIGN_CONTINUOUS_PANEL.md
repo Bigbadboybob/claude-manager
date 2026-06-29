@@ -19,7 +19,7 @@ Give continuous tasks (orchestrators) and the subtasks they spawn their own dedi
 3. **Nav-key reshuffle** (free `A-h`/`A-l` for left/right column nav):
    - retire the `A-H` host-switcher (`cycle_active_host`) — global host is being retired anyway; `active_host` stays at its `local` default (new sessions go local).
    - `toggle_session_hidden`: `A-h` → **`A-H`**.
-   - `push_active`: `A-p` → **`A-[`**; `pull_active`: `A-l` → **`A-]`**. (Caveat: Alt+`[` can collide with the CSI escape introducer; verify it registers, else pick alternates — low stakes, cloud-only ops.)
+   - `push_active`: `A-p` → **`A-9`**; `pull_active`: `A-l` → **`A-0`**. (Originally tried `A-[`/`A-]`, but Alt+`[` can collide with the CSI escape introducer; digits deliver cleanly.)
    - `A-h` → column-nav **LEFT**; `A-l` → column-nav **RIGHT**.
 4. **Nesting** in the continuous column: each orchestrator (continuous session) is a parent; sessions whose `managed_by_uid` is that orchestrator's uid render indented underneath (tree glyphs `├`/`└`). Direct children first; transitive (a subtask's subtask) deferred unless trivial.
 
@@ -36,7 +36,7 @@ When `A-C` is OFF there is no continuous column → `cursor_column` is forced to
 
 ## Slice plan
 
-- **S1 — Keybinding reshuffle** (self-contained, no panel yet): retire `A-H` host-switch; hide→`A-H`; push→`A-[`; pull→`A-]`; `A-h`/`A-l` freed (left unbound for now). Update CLAUDE.md keybinding docs. *Verify:* hide/push/pull on the new keys; A-h/A-l do nothing yet; tests green.
+- **S1 — Keybinding reshuffle** (self-contained, no panel yet): retire `A-H` host-switch; hide→`A-H`; push→`A-9`; pull→`A-0`; `A-h`/`A-l` freed (left unbound for now). Update CLAUDE.md keybinding docs. *Verify:* hide/push/pull on the new keys; A-h/A-l do nothing yet; tests green.
 - **S2 — Continuous-column builder + nesting**: `visual_items_continuous()` (orchestrator → nested `managed_by_uid` children). Main builders gate the continuous section on `!continuous_column_on`. Pure data + unit tests (nesting, ordering, hide interplay). No render yet.
 - **S3 — Layout + render + `A-C` toggle**: split the sidebar region into main|continuous when on; render both lists; `A-C` toggles `continuous_column_on` (persisted). Cursor stays in Main this slice.
 - **S4 — Cursor column dimension + `A-h`/`A-l` nav**: `SidebarColumn` + `cursor_column`; `A-h`/`A-l` switch columns + clamp; `navigate` per-column; focused-row highlight in the active column only. *Verify:* drive the cursor across columns; `active_session()` shows the right session; tests.

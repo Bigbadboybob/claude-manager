@@ -10402,16 +10402,15 @@ impl App {
                         self.start_new_session();
                         return true;
                     }
-                    // Cloud push/pull moved off A-p / A-l so the vim keys are
-                    // free for continuous-panel column nav (A-l → RIGHT, S4).
-                    // A-[ / A-] (rarely-used cloud ops). NOTE: Alt+[ can collide
-                    // with the CSI escape introducer on some terminals — if it
-                    // doesn't register, these need alternates.
-                    KeyCode::Char('[') => {
+                    // Cloud push/pull moved off A-p / A-l (freed for the
+                    // continuous-panel column nav, S4) to A-9 / A-0 — digits
+                    // deliver cleanly (unlike Alt+[, which can collide with the
+                    // CSI escape introducer). Rarely-used cloud ops.
+                    KeyCode::Char('9') => {
                         self.push_active();
                         return true;
                     }
-                    KeyCode::Char(']') => {
+                    KeyCode::Char('0') => {
                         self.pull_active();
                         return true;
                     }
@@ -14792,8 +14791,8 @@ impl App {
             ("A-f    workflow", "A-t  planning"),
             ("A-o    stop wf", "A-c  hide-cont"),
             ("A-b    snapshot", "A-C  cont-col"),
-            ("A-O    reopen ws", "A-[  push"),
-            ("PgUp/Dn scroll", "A-]  pull"),
+            ("A-O    reopen ws", "A-9  push"),
+            ("PgUp/Dn scroll", "A-0  pull"),
             ("A-Ent  newline", ""),
         ];
         let help_rows = help_entries.len() as u16;
