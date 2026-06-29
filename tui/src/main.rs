@@ -2,6 +2,7 @@ mod agent;
 mod agent_memory;
 mod api;
 mod app;
+mod attach_worker;
 mod attached_pty;
 mod backend;
 mod client_session;
@@ -341,6 +342,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_deferred_remote_reattach();
         log_slow_phase("drain_deferred_remote_reattach", t.elapsed());
+        // Bind any remote sessions the off-thread attach worker finished
+        // attaching (non-blocking). Independent of the dispatch above — results
+        // can land ticks after their request, even when the pending queue is
+        // empty.
+        let t = Instant::now();
+        app.drain_attach_results();
+        log_slow_phase("drain_attach_results", t.elapsed());
 
         // Part 1: periodically surface agent-spawned ("phantom") daemon
         // sessions in the sidebar. Self-throttled to ~5s (the daemon never

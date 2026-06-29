@@ -1112,6 +1112,64 @@ pub fn rpc_list_daemon_sessions(
     Ok(arr.iter().filter_map(parse_daemon_session_summary).collect())
 }
 
+/// Background per-remote-host session-list poller. One thread per non-local
+/// host that, every `SESSION_POLL_INTERVAL`, fetches the daemon's session list
+/// over the (already-warmed) tunnel and posts `(host_id, summaries)` on the
+/// returned channel. Mirrors `manifest_watch::spawn_per_host`.
+///
+/// This exists so the TUI's `adopt_untracked_daemon_sessions` scan never runs a
+/// SYNCHRONOUS remote `list_sessions` RPC on the MAIN thread — that was the
+/// every-5s main-thread round-trip that, over a slow/flaky WAN tunnel, stalled
+/// the UI ("can't type"). The blocking RPC is fine HERE because it's off the
+/// main thread; the main loop only does a non-blocking `try_recv` on the
+/// channel + caches the latest list per host. Local host is excluded — the
+/// adopt scan fetches it synchronously (cheap local socket).
+///
+/// `live_socket_path` (non-blocking, never spawns a tunnel) gates each poll so
+/// a cold/unreachable host is silently skipped; the per-host `manifest.watch`
+/// consumer warms the tunnel, and the next poll picks it up.
+pub fn spawn_session_pollers(
+    host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
+    hosts: &crate::hosts::HostsConfig,
+) -> (
+    Option<std::sync::mpsc::Receiver<(cm_daemon::host_id::HostId, Vec<DaemonSessionSummary>)>>,
+    Vec<std::thread::JoinHandle<()>>,
+) {
+    const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut threads = Vec::new();
+    let local = cm_daemon::host_id::HostId::local();
+    for host in &hosts.hosts {
+        if host.id == local {
+            continue;
+        }
+        let pool = std::sync::Arc::clone(host_pool);
+        let host_id = host.id.clone();
+        let tx = tx.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("cm-tui-session-poll-{}", host_id.as_str()))
+            .spawn(move || loop {
+                if let Some(socket) = pool.live_socket_path(&host_id) {
+                    if let Ok(summaries) =
+                        rpc_list_daemon_sessions(&socket, crate::daemon_launch::operator_token())
+                    {
+                        // App dropped the receiver → shut the thread down.
+                        if tx.send((host_id.clone(), summaries)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                std::thread::sleep(SESSION_POLL_INTERVAL);
+            })
+            .expect("spawn session-poll thread");
+        threads.push(thread);
+    }
+    // Drop the original sender so the receiver disconnects when ALL per-host
+    // pollers exit (mirrors manifest_watch::spawn_per_host).
+    drop(tx);
+    (Some(rx), threads)
+}
+
 /// `session.set_transcript_path` RPC. Sub-2b-1 review #1: the
 /// TUI's transcript-discovery detector (the
 /// `pending_jsonl_files` → `transcript_id` binding in

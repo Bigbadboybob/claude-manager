@@ -107,9 +107,16 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(config: &Config) -> Self {
+        // 30s global timeout (was 5s). The planning fetch runs on the backend
+        // thread (`backend::do_refresh`), NOT the main loop, so a generous
+        // timeout never freezes the UI — it just lets a slow fetch over a flaky
+        // WAN link to a remote API host complete instead of erroring with
+        // `json: timeout: global`. The backend re-fetches every 5s, so a
+        // genuinely-dead host still surfaces a stale list rather than hanging
+        // the app. Matches the CLI client's 30s.
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
                 .build(),
         );
         ApiClient {

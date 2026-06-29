@@ -3531,6 +3531,34 @@ pub struct App {
     /// Same lifecycle convention as `_manifest_watch_threads`.
     /// 12e-r2 F2: per-host (Vec).
     pub _workflow_watch_threads: Vec<std::thread::JoinHandle<()>>,
+    /// Background per-remote-host `list_sessions` poller channel. Drained per
+    /// tick into `remote_session_lists`; the adopt scan reads that cache so the
+    /// MAIN thread never does a synchronous remote `list_sessions` RPC (that
+    /// every-5s round-trip over a slow tunnel was the "TUI freezes" regression).
+    pub session_poll_rx: Option<
+        std::sync::mpsc::Receiver<(
+            cm_daemon::host_id::HostId,
+            Vec<crate::client_session::DaemonSessionSummary>,
+        )>,
+    >,
+    /// Thread handles for the per-remote-host session pollers (lifecycle like
+    /// `_manifest_watch_threads`).
+    pub _session_poll_threads: Vec<std::thread::JoinHandle<()>>,
+    /// Latest daemon session list per REMOTE host, fed off-thread by the
+    /// session pollers. The adopt scan reads this instead of a synchronous RPC.
+    pub remote_session_lists: std::collections::HashMap<
+        cm_daemon::host_id::HostId,
+        Vec<crate::client_session::DaemonSessionSummary>,
+    >,
+    /// Off-thread remote-attach worker. `Some` in production; `None` in tests
+    /// (which exercise the synchronous inline reattach path). When present, the
+    /// deferred-reattach drain DISPATCHES attaches to it instead of blocking the
+    /// main thread, and `drain_attach_results` binds the ready sessions.
+    pub attach_worker: Option<crate::attach_worker::AttachWorker>,
+    /// Remote sessions whose attach is in-flight on the worker (uid → the queued
+    /// entry, kept so a failed attach can be re-queued / capped). Prevents
+    /// re-dispatching an attach that's already running.
+    pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
     /// side-channels — the attach-stream End frame (immediate,
@@ -3855,6 +3883,10 @@ impl App {
         // delivers WorkflowEvent broadcasts to the main loop.
         let (workflow_watch_rx, _workflow_watch_threads) =
             crate::workflow_watch::spawn_per_host(&host_pool, &hosts);
+        // Per-remote-host session-list pollers: fetch `list_sessions` OFF the
+        // main thread so the adopt scan never blocks the UI on a remote RPC.
+        let (session_poll_rx, _session_poll_threads) =
+            crate::client_session::spawn_session_pollers(&host_pool, &hosts);
 
         // Push fanout worker. Owns its own thread; receives
         // owned snapshots from the main thread via mpsc and
@@ -3862,6 +3894,18 @@ impl App {
         // path. See `push_worker` module doc for design.
         let push_worker =
             crate::push_worker::PushWorker::spawn(std::sync::Arc::clone(&host_pool));
+        // Off-thread remote-attach worker (production). The deferred-reattach
+        // drain dispatches to it so a slow tunnel attach never blocks the UI.
+        // Tests use the SYNCHRONOUS inline reattach path (no worker) so the
+        // deferred-reattach assertions stay deterministic — no real background
+        // attach thread to race.
+        let attach_worker = if cfg!(test) {
+            None
+        } else {
+            Some(crate::attach_worker::AttachWorker::spawn(std::sync::Arc::clone(
+                &host_pool,
+            )))
+        };
 
         App {
             tasks: Vec::new(),
@@ -3906,12 +3950,17 @@ impl App {
             _manifest_watch_threads,
             workflow_watch_rx,
             _workflow_watch_threads,
+            session_poll_rx,
+            _session_poll_threads,
+            remote_session_lists: std::collections::HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             hosts,
             host_pool,
             active_host,
             skipped_manifest_entries: HashMap::new(),
             pending_remote_reattach: Vec::new(),
+            attach_worker,
+            attaching: HashMap::new(),
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
@@ -4940,6 +4989,23 @@ impl App {
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
+        // Drain the off-thread session pollers into the per-host cache FIRST
+        // (cheap, non-blocking). The remote branch of the adopt scan reads this
+        // cache instead of issuing a synchronous remote `list_sessions` RPC on
+        // the main thread. Keep the latest list per host (later sends supersede
+        // earlier). Collect-then-insert to avoid an immutable+mutable `self`
+        // borrow overlap.
+        let drained: Vec<(
+            cm_daemon::host_id::HostId,
+            Vec<crate::client_session::DaemonSessionSummary>,
+        )> = self
+            .session_poll_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for (host, summaries) in drained {
+            self.remote_session_lists.insert(host, summaries);
+        }
         // Never adopt before the manifest is restored. Against an empty
         // `self.workspaces` every manifest-backed daemon session looks
         // "untracked", so adoption would mint duplicate workspaces and
@@ -4975,50 +5041,31 @@ impl App {
     /// Reuses the restore-path attach machinery
     /// (`try_attach_via_daemon_with_deps`) wholesale.
     fn adopt_untracked_daemon_sessions(&mut self) {
-        // Scan EVERY configured host, not just local. A daemon-spawned session
-        // — an MCP agent OR a continuous-task session (e.g. the bug-triage
-        // orchestrator on `manager`) — must surface in the sidebar regardless
-        // of which host the operator last touched; host is a per-session
-        // attribute, never a global mode. The scan is non-blocking: it uses
-        // `live_socket_path` (a non-blocking `try_lock`, no tunnel spawn), so a
-        // host whose tunnel isn't warm yet is silently skipped rather than
-        // gating this every-5s main-thread scan on a ~3s SSH dial. A remote
-        // tunnel is warmed off-thread by its `manifest.watch` consumer; once
-        // up, the next scan adopts its sessions.
+        // Surface daemon-spawned sessions (MCP agents + continuous-task
+        // sessions like the bug-triage orchestrator) on EVERY configured host,
+        // but NEVER block the main thread on a remote host:
+        //   - LOCAL host: discover + attach SYNCHRONOUSLY here (cheap local
+        //     socket; the round-trip never leaves the box).
+        //   - REMOTE hosts: read the off-thread session-poller cache and DEFER
+        //     each attach through `pending_remote_reattach` (the same machinery
+        //     the restore path uses). A synchronous remote `list_sessions`/
+        //     attach on the main thread over a slow/flaky WAN tunnel was the
+        //     "TUI freezes / can't type" regression — this removes it entirely.
         let local = cm_daemon::host_id::HostId::local();
-        let host_ids: Vec<cm_daemon::host_id::HostId> =
-            self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
         let want = self.last_term_size;
         let (cols, rows) = self.last_term_size;
-        let mut adopted_any = false;
 
-        for host in &host_ids {
-            let Some(socket) = self.host_pool.live_socket_path(host) else {
-                continue; // tunnel not up yet (or no socket transport); skip
-            };
-            let summaries = match crate::client_session::rpc_list_daemon_sessions(
+        // ===================== LOCAL host (synchronous) ======================
+        let mut adopted_any = false;
+        if let Some(socket) = self.host_pool.live_socket_path(&local) {
+            if let Ok(summaries) = crate::client_session::rpc_list_daemon_sessions(
                 &socket,
                 crate::daemon_launch::operator_token(),
             ) {
-                Ok(s) => s,
-                Err(_) => continue, // best-effort; matches restore_sessions posture
-            };
-
-            // Self-healing size reconcile — LOCAL host only. The daemon reports
-            // each session's live PTY size; compare it against this terminal's
-            // pane size and re-assert any LOCAL session whose daemon PTY
-            // drifted. (Remote sessions size to their own attach, not this
-            // pane, so reconciling them against this pane would be wrong.) This
-            // closes the "skinny session" gap the best-effort attach-stream
-            // resize leaves open: a resize data frame that drops on a dead/
-            // replaced attach socket (Broken pipe) leaves the PTY stuck
-            // forever, and `resize_terminals` only re-fires on a size *change*.
-            // The reliable `session.resize` control RPC (fresh socket) fixes it
-            // within one scan — most visibly an MCP-spawned codex that
-            // inherited a momentarily-skinny caller's size. Only sessions with
-            // measurable drift are touched, so the common (already-correct)
-            // case sends no RPC and triggers no spurious SIGWINCH repaint.
-            if host == &local {
+                // Self-healing size reconcile (local only): re-assert this
+                // terminal's pane size on any LOCAL session whose daemon PTY
+                // drifted. Closes the "skinny session" gap that the best-effort
+                // attach-stream resize leaves open.
                 let drift_uids = {
                     let tracked_local: std::collections::HashSet<&str> = self
                         .workspaces
@@ -5044,170 +5091,250 @@ impl App {
                         );
                     }
                 }
-            }
 
-            // Decide adoptees under an immutable borrow, then mutate. Gate is
-            // in `select_daemon_adoptees`: agent-spawned (managed_by_uid) OR
-            // continuous-tagged, and not already tracked in any workspace.
-            let tracked: std::collections::HashSet<&str> = self
-                .workspaces
-                .iter()
-                .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
-                .collect();
-            let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
-            drop(tracked);
-            if adoptees.is_empty() {
-                continue;
-            }
-
-            for s in adoptees {
-                // worktree: daemon-reported > matching workspace's > temp_dir.
-                // Must end up `Some` on the workspace so the restore-path
-                // attach branch re-attaches it after a TUI restart.
-                let worktree: PathBuf = s
-                    .worktree_path
-                    .clone()
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        s.workspace_id.as_deref().and_then(|wid| {
-                            self.workspaces
-                                .iter()
-                                .find(|w| w.id.as_str() == wid)
-                                .and_then(|w| w.worktree_path.clone())
-                        })
-                    })
-                    .unwrap_or_else(std::env::temp_dir);
-
-                // Target workspace. A CONTINUOUS session gets special handling:
-                // a persistent task that RESPAWNS (new uid — e.g. after a daemon
-                // restart or a dead-session respawn) must NOT mint a fresh
-                // workspace each time. Reuse the workspace already holding this
-                // continuous task and DROP its stale (dead predecessor)
-                // session(s), so the sidebar shows ONE orchestrator entry, not
-                // one per respawn. Otherwise: the existing workspace matching the
-                // daemon's `workspace_id`, else a fresh synthetic workspace.
-                let continuous_ws: Option<String> =
-                    s.continuous_task_id.as_deref().and_then(|ct| {
-                        self.workspaces
-                            .iter()
-                            .find(|w| {
-                                w.sessions.iter().any(|sess| {
-                                    sess.continuous_task_id.as_deref() == Some(ct)
-                                })
-                            })
-                            .map(|w| w.id.clone())
-                    });
-                let target_ws_id: String = if let Some(wid) = continuous_ws {
-                    if let Some(ct) = s.continuous_task_id.as_deref() {
-                        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == wid) {
-                            w.sessions
-                                .retain(|sess| sess.continuous_task_id.as_deref() != Some(ct));
-                        }
-                    }
-                    wid
-                } else {
-                    match s
-                        .workspace_id
-                        .as_deref()
-                        .filter(|wid| self.workspaces.iter().any(|w| w.id.as_str() == *wid))
+                let tracked: std::collections::HashSet<&str> = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
+                    .collect();
+                let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
+                drop(tracked);
+                for s in adoptees {
+                    let (target_ws_id, worktree) = self.resolve_adopt_workspace(&s);
+                    // Attach to the existing daemon session (uid-only; the
+                    // daemon already owns argv/env/cwd). Transcript binding is
+                    // deferred — the attach-stream replays the ring buffer.
+                    let session = match try_attach_via_daemon_with_deps(
+                        &self.host_pool,
+                        &s.session_uid,
+                        &target_ws_id,
+                        &worktree,
+                        &s.session_type,
+                        &s.label,
+                        cols,
+                        rows,
+                        s.task_id.as_deref(),
+                        s.workflow_run_id.as_deref(),
+                        s.workflow_role.as_deref(),
+                        &local,
+                        None,
+                    ) {
+                        Ok(sess) => sess,
+                        // TOCTOU: the session exited between list and attach.
+                        Err(_) => continue,
+                    };
+                    let ts = self.build_adopted_terminal_session(&s, session, &local);
+                    if let Some(w) =
+                        self.workspaces.iter_mut().find(|w| w.id == target_ws_id)
                     {
-                        Some(wid) => wid.to_string(),
-                        None => {
-                            let new_id = new_workspace_id();
-                            self.workspaces.push(Workspace {
-                                id: new_id.clone(),
-                                name: format!("agent: {}", s.label),
-                                is_closed: false,
-                                is_cloud: false,
-                                repo_url: None,
-                                worktree_path: Some(worktree.clone()),
-                                main_repo_path: None,
-                                worker_vm: None,
-                                worker_zone: None,
-                                sessions: Vec::new(),
-                                tombstones: Vec::new(),
-                                is_pushing: false,
-                            });
-                            new_id
-                        }
+                        w.sessions.push(ts);
+                        adopted_any = true;
                     }
-                };
-
-                // Attach to the existing daemon session (uid-only; the daemon
-                // already owns argv/env/cwd) on THIS host. Transcript binding
-                // is deferred — the attach-stream replays the PTY ring buffer,
-                // so the session is live + visible without it.
-                let session = match try_attach_via_daemon_with_deps(
-                    &self.host_pool,
-                    &s.session_uid,
-                    &target_ws_id,
-                    &worktree,
-                    &s.session_type,
-                    &s.label,
-                    cols,
-                    rows,
-                    s.task_id.as_deref(),
-                    s.workflow_run_id.as_deref(),
-                    s.workflow_role.as_deref(),
-                    host,
-                    None,
-                ) {
-                    Ok(sess) => sess,
-                    // TOCTOU: the session exited between list and attach. Skip
-                    // (do NOT spawn — the TUI doesn't own this session).
-                    Err(_) => continue,
-                };
-
-                let ts = TerminalSession {
-                    uid: s.session_uid.clone(),
-                    label: s.label.clone(),
-                    session_type: normalize_session_type_to_internal(&s.session_type)
-                        .to_string(),
-                    session,
-                    status: SessionStatus::Running,
-                    last_write_at: None,
-                    transcript_id: None,
-                    generation: 0,
-                    // Attach path skips the post-spawn JSONL rebind primer
-                    // (mirrors `RestoreOutcome::Attached`).
-                    pending_jsonl_files: None,
-                    // VISIBLE by default — the whole point of adoption is that
-                    // agent-spawned sessions show up on screen.
-                    hidden: false,
-                    idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
-                    burst_threshold: 0,
-                    pending_prompt: None,
-                    pending_clear: None,
-                    workflow_run_id: s.workflow_run_id.clone(),
-                    workflow_role: s.workflow_role.clone(),
-                    // Continuous-task tag straight from the daemon summary, so
-                    // a continuous session (scheduler/operator-spawned) adopts
-                    // into the sidebar's Continuous section on whatever host it
-                    // runs.
-                    continuous_task_id: s.continuous_task_id.clone(),
-                    last_delivery: None,
-                    task_id: s.task_id.clone(),
-                    notify_on_idle: false,
-                    pending_enter: None,
-                    created_at: Instant::now(),
-                    managed_by_uid: s.managed_by_uid.clone(),
-                    seeded_from_snapshot: None,
-                    preserved_last_exit: None,
-                    host_id: host.clone(),
-                };
-                if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == target_ws_id) {
-                    w.sessions.push(ts);
-                    adopted_any = true;
                 }
             }
         }
-
         if adopted_any {
-            // Persist (round-trips to tui-sessions.json so the adopted
-            // session re-attaches on restart via the restore path) and push
-            // the updated state to the daemon.
+            // Persist (round-trips to tui-sessions.json so the adopted session
+            // re-attaches on restart via the restore path) + redraw.
             self.save_session_manifest();
             self.needs_redraw = true;
+        }
+
+        // ============== REMOTE hosts (off-thread cache + defer) ==============
+        self.adopt_remote_via_deferred_reattach(&local);
+    }
+
+    /// Queue untracked REMOTE daemon sessions for deferred attach. Reads the
+    /// off-thread session-poller cache (never a synchronous remote RPC) and
+    /// pushes each new adoptee into `pending_remote_reattach`, which
+    /// `drain_deferred_remote_reattach` attaches off the blocking path (gated
+    /// on tunnel warmth, throttled). The workspace slot is created here (cheap,
+    /// local) so the drain has somewhere to land the session.
+    fn adopt_remote_via_deferred_reattach(&mut self, local: &cm_daemon::host_id::HostId) {
+        // Snapshot the cache (cloned) so the per-adoptee `&mut self` workspace
+        // work below doesn't conflict with borrowing `remote_session_lists`.
+        let remote: Vec<(
+            cm_daemon::host_id::HostId,
+            Vec<crate::client_session::DaemonSessionSummary>,
+        )> = self
+            .remote_session_lists
+            .iter()
+            .filter(|(h, _)| *h != local)
+            .map(|(h, s)| (h.clone(), s.clone()))
+            .collect();
+        if remote.is_empty() {
+            return;
+        }
+        let tracked: std::collections::HashSet<String> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.sessions.iter().map(|s| s.uid.clone()))
+            .collect();
+        let pending: std::collections::HashSet<String> = self
+            .pending_remote_reattach
+            .iter()
+            .map(|p| p.entry.uid.clone())
+            .collect();
+        for (host, summaries) in remote {
+            for s in summaries {
+                // Same gate as `select_daemon_adoptees`, plus: not already
+                // tracked AND not already queued for a deferred attach.
+                let is_adoptee = (s.managed_by_uid.is_some()
+                    || s.continuous_task_id.is_some())
+                    && !tracked.contains(&s.session_uid)
+                    && !pending.contains(&s.session_uid);
+                if !is_adoptee {
+                    continue;
+                }
+                let (target_ws_id, _worktree) = self.resolve_adopt_workspace(&s);
+                let entry = Self::manifest_entry_from_summary(&s, &host);
+                self.pending_remote_reattach
+                    .push(PendingRemoteReattach::new(target_ws_id, entry));
+            }
+        }
+    }
+
+    /// Resolve (target workspace id, worktree) for an adoptee, creating a
+    /// synthetic workspace if needed. Shared by the local (synchronous) and
+    /// remote (deferred) adoption paths. A CONTINUOUS session reuses the
+    /// workspace already holding that continuous task and drops the stale dead
+    /// predecessor session(s) — so a persistent-task respawn (new uid) shows
+    /// ONE sidebar entry, not one per respawn. Otherwise: the existing
+    /// workspace matching the daemon's `workspace_id`, else a fresh synthetic.
+    fn resolve_adopt_workspace(
+        &mut self,
+        s: &crate::client_session::DaemonSessionSummary,
+    ) -> (String, PathBuf) {
+        // worktree: daemon-reported > matching workspace's > temp_dir. Must end
+        // up `Some` on the workspace so the restore path re-attaches it.
+        let worktree: PathBuf = s
+            .worktree_path
+            .clone()
+            .map(PathBuf::from)
+            .or_else(|| {
+                s.workspace_id.as_deref().and_then(|wid| {
+                    self.workspaces
+                        .iter()
+                        .find(|w| w.id.as_str() == wid)
+                        .and_then(|w| w.worktree_path.clone())
+                })
+            })
+            .unwrap_or_else(std::env::temp_dir);
+
+        let continuous_ws: Option<String> =
+            s.continuous_task_id.as_deref().and_then(|ct| {
+                self.workspaces
+                    .iter()
+                    .find(|w| {
+                        w.sessions
+                            .iter()
+                            .any(|sess| sess.continuous_task_id.as_deref() == Some(ct))
+                    })
+                    .map(|w| w.id.clone())
+            });
+        let target_ws_id: String = if let Some(wid) = continuous_ws {
+            if let Some(ct) = s.continuous_task_id.as_deref() {
+                if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == wid) {
+                    w.sessions
+                        .retain(|sess| sess.continuous_task_id.as_deref() != Some(ct));
+                }
+            }
+            wid
+        } else {
+            match s
+                .workspace_id
+                .as_deref()
+                .filter(|wid| self.workspaces.iter().any(|w| w.id.as_str() == *wid))
+            {
+                Some(wid) => wid.to_string(),
+                None => {
+                    let new_id = new_workspace_id();
+                    self.workspaces.push(Workspace {
+                        id: new_id.clone(),
+                        name: format!("agent: {}", s.label),
+                        is_closed: false,
+                        is_cloud: false,
+                        repo_url: None,
+                        worktree_path: Some(worktree.clone()),
+                        main_repo_path: None,
+                        worker_vm: None,
+                        worker_zone: None,
+                        sessions: Vec::new(),
+                        tombstones: Vec::new(),
+                        is_pushing: false,
+                    });
+                    new_id
+                }
+            }
+        };
+        (target_ws_id, worktree)
+    }
+
+    /// Build a freshly-adopted `TerminalSession` from a daemon summary + an
+    /// already-opened attach `session`, on `host`. Used by the LOCAL adopt path
+    /// (the remote path defers the attach + builds the slot in the drain).
+    fn build_adopted_terminal_session(
+        &self,
+        s: &crate::client_session::DaemonSessionSummary,
+        session: crate::session::Session,
+        host: &cm_daemon::host_id::HostId,
+    ) -> TerminalSession {
+        TerminalSession {
+            uid: s.session_uid.clone(),
+            label: s.label.clone(),
+            session_type: normalize_session_type_to_internal(&s.session_type).to_string(),
+            session,
+            status: SessionStatus::Running,
+            last_write_at: None,
+            transcript_id: None,
+            generation: 0,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: s.workflow_run_id.clone(),
+            workflow_role: s.workflow_role.clone(),
+            continuous_task_id: s.continuous_task_id.clone(),
+            last_delivery: None,
+            task_id: s.task_id.clone(),
+            notify_on_idle: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: s.managed_by_uid.clone(),
+            seeded_from_snapshot: None,
+            preserved_last_exit: None,
+            host_id: host.clone(),
+        }
+    }
+
+    /// Build a `ManifestEntry` from a daemon session summary for a REMOTE
+    /// adoptee, so it can ride `pending_remote_reattach` → the deferred-reattach
+    /// drain (which attaches off the main thread). Mirrors
+    /// `TerminalSession::to_manifest_entry`'s field mapping.
+    fn manifest_entry_from_summary(
+        s: &crate::client_session::DaemonSessionSummary,
+        host: &cm_daemon::host_id::HostId,
+    ) -> cm_daemon::manifest::ManifestEntry {
+        cm_daemon::manifest::ManifestEntry {
+            uid: s.session_uid.clone(),
+            managed_by_uid: s.managed_by_uid.clone(),
+            generation: 0,
+            label: s.label.clone(),
+            session_type: normalize_session_type_to_internal(&s.session_type).to_string(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            burst_threshold: 0,
+            workflow_run_id: s.workflow_run_id.clone(),
+            workflow_role: s.workflow_role.clone(),
+            continuous_task_id: s.continuous_task_id.clone(),
+            task_id: s.task_id.clone(),
+            notify_on_idle: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: host.clone(),
         }
     }
 
@@ -5642,7 +5769,19 @@ impl App {
             }
         };
 
-        Some(TerminalSession {
+        Some(Self::build_remote_terminal_session(entry, session))
+    }
+
+    /// Build the `TerminalSession` slot for a remote reattach/adopt from its
+    /// `ManifestEntry` + an already-opened attach `session`. Split out of
+    /// `try_reattach_remote_session` so the OFF-THREAD attach worker can do the
+    /// (blocking, tunnel-bound) attach while the MAIN thread does only this
+    /// (cheap) slot build when the result comes back.
+    fn build_remote_terminal_session(
+        entry: &ManifestEntry,
+        session: crate::session::Session,
+    ) -> TerminalSession {
+        TerminalSession {
             uid: entry.uid.clone(),
             label: entry.label.clone(),
             session_type: entry.session_type.clone(),
@@ -5671,7 +5810,7 @@ impl App {
             seeded_from_snapshot: entry.seeded_from_snapshot.clone(),
             preserved_last_exit: entry.last_exit.clone(),
             host_id: entry.host_id.clone(),
-        })
+        }
     }
 
     /// Phase 4 startup-freeze fix: reattach remote sessions that
@@ -5690,8 +5829,160 @@ impl App {
     /// path's session-gone posture: no retry, no data loss). An entry whose
     /// tunnel never comes up simply stays queued (and preserved) — cheap to
     /// re-probe and never lost.
+    /// Production dispatch phase of the deferred remote reattach: for each
+    /// queued entry whose tunnel is ALREADY warm (non-blocking probe), hand the
+    /// blocking attach to the off-thread `attach_worker` and move it to
+    /// `attaching` (in-flight). Cold tunnels / missing workspaces stay queued;
+    /// closed workspaces drop (their raw entry rides on disk). The ready
+    /// sessions are bound by `drain_attach_results`.
+    fn dispatch_deferred_remote_attaches(&mut self) {
+        let now = Instant::now();
+        let (cols, rows) = self.last_term_size;
+        let active_run_ids: std::collections::HashSet<String> = self
+            .workflow_runs
+            .iter()
+            .map(|r| r.run_id.clone())
+            .collect();
+        let pending = std::mem::take(&mut self.pending_remote_reattach);
+        let mut still_pending: Vec<PendingRemoteReattach> = Vec::new();
+        for p in pending {
+            if self.host_pool.live_socket_path(&p.entry.host_id).is_none() {
+                still_pending.push(p);
+                continue;
+            }
+            let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == p.ws_id) else {
+                still_pending.push(p);
+                continue;
+            };
+            if self.workspaces[ws_idx].is_closed {
+                continue;
+            }
+            // Reconnect throttle: don't re-dispatch the SAME reconnecting
+            // session faster than the retry interval.
+            if self.reconnecting_sessions.contains(&p.entry.uid) {
+                if let Some(last) = p.last_attempt_at {
+                    if now.duration_since(last) < REMOTE_REATTACH_RETRY_INTERVAL {
+                        still_pending.push(p);
+                        continue;
+                    }
+                }
+            }
+            let Some(worktree) = self.workspaces[ws_idx].worktree_path.clone() else {
+                still_pending.push(p);
+                continue;
+            };
+            let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
+            let entry_for_attach = cleaned.unwrap_or_else(|| p.entry.clone());
+            let req = crate::attach_worker::AttachRequest {
+                ws_id: p.ws_id.clone(),
+                entry: entry_for_attach,
+                worktree,
+                cols,
+                rows,
+                attempts: p.attempts,
+            };
+            let dispatched = self
+                .attach_worker
+                .as_ref()
+                .map(|w| w.request(req))
+                .unwrap_or(false);
+            if dispatched {
+                self.attaching.insert(p.entry.uid.clone(), p);
+            } else {
+                still_pending.push(p); // worker gone — retry next tick
+            }
+        }
+        self.pending_remote_reattach = still_pending;
+    }
+
+    /// Bind the results the off-thread `attach_worker` produced. Called per
+    /// main-loop tick (non-blocking `try_iter`). On success: rebind an existing
+    /// (reconnecting) slot in place, or create a new slot. On failure: re-queue
+    /// for retry, or — past the reconnect cap — mark the slot exited.
+    pub fn drain_attach_results(&mut self) {
+        let results: Vec<crate::attach_worker::AttachResult> = match self.attach_worker.as_ref()
+        {
+            Some(w) => w.result_rx.try_iter().collect(),
+            None => return,
+        };
+        if results.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for result in results {
+            let queued = self.attaching.remove(&result.entry.uid);
+            match result.session {
+                Some(session) => {
+                    let Some(ws_idx) =
+                        self.workspaces.iter().position(|w| w.id == result.ws_id)
+                    else {
+                        continue; // workspace vanished — drop the fresh session
+                    };
+                    if let Some(existing) = self.workspaces[ws_idx]
+                        .sessions
+                        .iter()
+                        .position(|s| s.uid == result.entry.uid)
+                    {
+                        // Reconnect: rebind the PTY in place, preserving slot
+                        // metadata. Dropping the old dead `Session` only sends
+                        // `Msg::Shutdown` — it does NOT kill the daemon session.
+                        let slot = &mut self.workspaces[ws_idx].sessions[existing];
+                        slot.session = session;
+                        slot.status = SessionStatus::Running;
+                        self.reconnecting_sessions.remove(&result.entry.uid);
+                    } else {
+                        let ts =
+                            Self::build_remote_terminal_session(&result.entry, session);
+                        self.workspaces[ws_idx].sessions.push(ts);
+                    }
+                    self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
+                    changed = true;
+                }
+                None => {
+                    if let Some(mut p) = queued {
+                        p.attempts = p.attempts.saturating_add(1);
+                        p.last_attempt_at = Some(Instant::now());
+                        let reconnecting =
+                            self.reconnecting_sessions.contains(&result.entry.uid);
+                        if reconnecting && p.attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
+                            if let Some(ws_idx) =
+                                self.workspaces.iter().position(|w| w.id == p.ws_id)
+                            {
+                                if let Some(idx) = self.workspaces[ws_idx]
+                                    .sessions
+                                    .iter()
+                                    .position(|s| s.uid == p.entry.uid)
+                                {
+                                    self.workspaces[ws_idx].sessions[idx]
+                                        .session
+                                        .exited = true;
+                                }
+                            }
+                            self.reconnecting_sessions.remove(&result.entry.uid);
+                            changed = true;
+                        } else {
+                            self.pending_remote_reattach.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            self.needs_redraw = true;
+            self.save_session_manifest();
+        }
+    }
+
     pub fn drain_deferred_remote_reattach(&mut self) {
         if self.pending_remote_reattach.is_empty() {
+            return;
+        }
+        // PRODUCTION: dispatch attaches to the off-thread worker so a slow
+        // tunnel never blocks the main thread; the ready sessions are bound by
+        // `drain_attach_results`. The inline body below is the SYNCHRONOUS
+        // fallback used by tests (which build `App` with no `attach_worker`).
+        if self.attach_worker.is_some() {
+            self.dispatch_deferred_remote_attaches();
             return;
         }
         let now = Instant::now();
@@ -5708,6 +5999,14 @@ impl App {
         let pending = std::mem::take(&mut self.pending_remote_reattach);
         let mut still_pending: Vec<PendingRemoteReattach> = Vec::new();
         let mut reattached_any = false;
+        // Throttle: at most ONE remote attach per drain call (per main-loop
+        // tick). The attach itself is a synchronous ~1-2s round-trip over the
+        // (possibly slow) tunnel, so a burst of pending sessions — e.g. a
+        // continuous orchestrator plus its just-spawned agents all surfacing on
+        // first connect — would freeze the UI for SECONDS if attached together.
+        // One-per-tick keeps the app interactive (input is handled between
+        // ticks); the rest stay queued and attach on subsequent ticks.
+        let mut attached_one = false;
         for p in pending {
             // Non-blocking liveness probe. `live_socket_path` never calls
             // `ensure_alive`, so the MAIN thread can't trigger a tunnel spawn;
@@ -5733,6 +6032,11 @@ impl App {
             // their entries on disk (the save path serializes the closed
             // workspace's skipped entries), so this is no data loss.
             if self.workspaces[ws_idx].is_closed {
+                continue;
+            }
+            // One attach per tick (see `attached_one` above) — defer the rest.
+            if attached_one {
+                still_pending.push(p);
                 continue;
             }
             // A live slot with this uid already exists. Two cases:
@@ -5768,6 +6072,7 @@ impl App {
                     }
                     let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
                     let entry_for_attach = cleaned.as_ref().unwrap_or(&p.entry);
+                    attached_one = true; // this tick's one attach (see throttle)
                     let outcome = {
                         let ws_ref = &self.workspaces[ws_idx];
                         self.try_reattach_remote_session(
@@ -5857,6 +6162,7 @@ impl App {
             // resolves the socket without a spawn wait. Two simultaneous
             // immutable borrows of `self` (the helper + the `&Workspace` arg)
             // are fine; the owned `Option<TerminalSession>` outlives them.
+            attached_one = true; // this tick's one attach (see throttle)
             let outcome = {
                 let ws_ref = &self.workspaces[ws_idx];
                 self.try_reattach_remote_session(entry_for_attach, ws_ref, (cols, rows))
