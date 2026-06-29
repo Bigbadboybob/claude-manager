@@ -5722,10 +5722,23 @@ fn spawn_persistent_prompt_delivery(
         .spawn(move || {
             std::thread::sleep(AGENT_PROMPT_SETTLE);
             if compact {
-                // `/clear` is a single-line slash command — raw body, no bracket.
-                if let Err(e) = handle.write_and_stamp(b"/clear") {
+                // Auto-compact: `/compact` SUMMARIZES the conversation and
+                // continues on the condensed context — bounding unbounded growth
+                // across fires/restarts while preserving working continuity (the
+                // agent's on-disk memory is independent of it). Single-line slash
+                // command, raw body, no bracketed paste.
+                //
+                // Unlike `/clear` (an instant reset), `/compact` runs an async
+                // summarization TURN that is NOT finished when the command
+                // returns. So deliver `/compact` ALONE this fire and let it run —
+                // it completes long before the next scheduled fire. The prompt is
+                // deliberately NOT delivered now (it would land mid-summarization
+                // and get mangled); it resumes on the NEXT fire, on the freshly-
+                // summarized context. One compaction thus "costs" a single fire's
+                // prompt, which at the `compact_every` cadence is negligible.
+                if let Err(e) = handle.write_and_stamp(b"/compact") {
                     eprintln!(
-                        "cm-daemon: persistent /clear body write failed for {}: {}",
+                        "cm-daemon: persistent /compact body write failed for {}: {}",
                         session_uid, e
                     );
                     return;
@@ -5733,18 +5746,20 @@ fn spawn_persistent_prompt_delivery(
                 std::thread::sleep(AGENT_ENTER_GAP);
                 if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
                     eprintln!(
-                        "cm-daemon: persistent /clear Enter write failed for {}: {}",
+                        "cm-daemon: persistent /compact Enter write failed for {}: {}",
                         session_uid, e
                     );
                     return;
                 }
-                // Let the agent process /clear (transcript rotation) before the
-                // next prompt lands.
-                std::thread::sleep(AGENT_PROMPT_SETTLE);
                 eprintln!(
-                    "cm-daemon: persistent auto-compact /clear delivered for {}",
+                    "cm-daemon: persistent auto-compact /compact delivered for {} \
+                     (prompt resumes next fire)",
                     session_uid
                 );
+                // Compact-only fire — the prompt resumes on the next scheduled
+                // fire, on the summarized context. Do NOT fall through to the
+                // prompt body below.
+                return;
             }
             let body = prompt.trim_end_matches(['\r', '\n']);
             let payload = agent_paste_payload(body);
@@ -7541,12 +7556,14 @@ pub fn trigger(
     // too; the try_modify above already released the flock.
     match persistent_target {
         // PERSISTENT, pinned session ALIVE: deliver the prompt to the EXISTING
-        // PTY (no respawn — prior context preserved). Auto-`/clear`-compact every
-        // `compact_every` runs. The handle was already cloned out under the brief
+        // PTY (no respawn — prior context preserved). Auto-`/compact` every
+        // `compact_every` runs (a compact-only fire; the prompt resumes next
+        // fire). The handle was already cloned out under the brief
         // liveness-probe lock above, so no lock is held here.
         Some((live_uid, handle_opt)) => {
             // The run just armed is `seq` (== run_count+1). compact-after-N gates
-            // on it so the Nth, 2Nth, … fire `/clear`s before delivering.
+            // on it so the Nth, 2Nth, … fire `/compact`s (only) before the
+            // prompt resumes on the following fire.
             let compact =
                 matches!(task.compact_every, Some(n) if n > 0 && seq % n as u64 == 0);
             // Under the delivery test spy `handle_opt` is None — record the
@@ -21150,7 +21167,7 @@ mod tests {
     /// (seq 2, 2%2==0) `/clear`s before delivering; the 3rd (seq 3, 3%2==1) does
     /// not. Two consecutive fires exercise the modulo gate.
     #[test]
-    fn trigger_persistent_compact_after_n_clears_at_nth() {
+    fn trigger_persistent_compact_after_n_compacts_at_nth() {
         with_continuous_home(|home| {
             let wt = home.join("wt");
             std::fs::create_dir_all(&wt).unwrap();
