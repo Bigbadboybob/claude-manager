@@ -9372,7 +9372,32 @@ pub fn create_subtask(
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
 
     // Parent metadata from the planning API (task_tree is empty headless).
-    let parent_row = api_get_task(&creds, &parent_task_id).map_err(|e| e.to_method_err())?;
+    // HARDENING (parent-deleted self-heal): if the parent planning row is
+    // GONE — e.g. someone `A-x`'d it off the board, which hard-deletes a
+    // non-cloud task — don't 404 the agent. The live caller session's
+    // workspace still carries the repo_url + worktree, so everything the
+    // subtask needs is in hand; we just create a TOP-LEVEL task
+    // (parent_task_id = null) instead, since `tasks.parent_task_id` is an FK
+    // that a dangling id would violate anyway. ONLY a clean 404 falls back —
+    // a transport/auth/5xx error still propagates (we can't tell if the
+    // parent really exists, so retrying is safer than silently orphaning).
+    let parent_row: Value = match api_get_task(&creds, &parent_task_id) {
+        Ok(row) => row,
+        Err(PlanningClientError::ApiError { status: 404, .. }) => {
+            eprintln!(
+                "cm-daemon: create_subtask parent task {} not found on the \
+                 planning API (deleted?); creating '{}' as a TOP-LEVEL task \
+                 instead of failing",
+                parent_task_id, p.name,
+            );
+            Value::Null
+        }
+        Err(e) => return Err(e.to_method_err()),
+    };
+    let parent_exists = !parent_row.is_null();
+    // The FK we actually write into the new row: Some(parent) only when the
+    // parent row exists; None (top-level) when it was deleted.
+    let effective_parent_id: Option<String> = parent_exists.then(|| parent_task_id.clone());
     let parent_repo_url: String = parent_row
         .get("repo_url")
         .and_then(Value::as_str)
@@ -9392,7 +9417,13 @@ pub fn create_subtask(
     // Project: explicit arg > inherit from parent.
     let project = p.project.clone().or(parent_project);
 
-    let slug_chain = build_slug_chain_via_api(&creds, &parent_task_id, &parent_row, &leaf_slug);
+    // The slug chain walks the parent's ancestry via the API; with no parent
+    // row there's nothing to walk, so the chain is just this leaf.
+    let slug_chain = if parent_exists {
+        build_slug_chain_via_api(&creds, &parent_task_id, &parent_row, &leaf_slug)
+    } else {
+        leaf_slug.clone()
+    };
     let request_short_id = make_request_short_id();
     let unique_slug = format!("{}-{}", slug_chain, request_short_id);
 
@@ -9485,7 +9516,9 @@ pub fn create_subtask(
         "slug": unique_slug,
         "source": "claude",
         "is_cloud": false,
-        "parent_task_id": parent_task_id,
+        // null when the parent was deleted (top-level fallback) — never a
+        // dangling FK that the API insert would reject.
+        "parent_task_id": effective_parent_id,
         "worktree_mode": p.worktree_mode,
     });
     if let Some(pr) = &p.prompt {
@@ -9585,7 +9618,7 @@ pub fn create_subtask(
         }
         state
             .task_tree
-            .insert(new_task_id.clone(), Some(parent_task_id.clone()));
+            .insert(new_task_id.clone(), effective_parent_id.clone());
         state
             .task_workspaces
             .insert(new_task_id.clone(), workspace_id_for_new.clone());
@@ -20376,6 +20409,86 @@ mod tests {
                 "wip_branch: {}",
                 wip
             );
+            drop(reqs);
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// HARDENING: when the parent planning row is GONE (404 on
+    /// `GET /tasks/{parent}` — e.g. an `A-x` board delete hard-removed it),
+    /// create_subtask must NOT fail. It falls back to creating a TOP-LEVEL
+    /// task: `parent_task_id = null` (so the `tasks.parent_task_id` FK can't
+    /// reject the insert), repo_url + worktree from the still-live caller
+    /// workspace, and a bare-leaf slug (no ancestry to walk).
+    #[test]
+    fn create_subtask_missing_parent_falls_back_to_top_level() {
+        with_home_and_repo("subtaskrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some(name.to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-parent" {
+                    // Parent row was deleted off the board.
+                    (404, r#"{"detail":"Task not found"}"#.to_string())
+                } else if method == "POST" && path == "/tasks" {
+                    (
+                        200,
+                        r#"{"id":"task-child-top","name":"topchild","status":"running","worktree_mode":"branch","parent_task_id":null}"#
+                            .to_string(),
+                    )
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let result = create_subtask(
+                &state,
+                &json!({"name": "topchild", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect("create_subtask must SUCCEED even when the parent row is gone");
+            assert_eq!(result["task_id"], "task-child-top");
+
+            // Registered as TOP-LEVEL (no parent) in the headless auth tree.
+            {
+                let s = state.lock().unwrap();
+                assert_eq!(
+                    s.task_tree.get("task-child-top"),
+                    Some(&None),
+                    "a parentless subtask must register as top-level (None)",
+                );
+            }
+
+            // The POST body carries a NULL parent_task_id (never a dangling
+            // FK) and a bare-leaf slug (no parent chain), with repo_url taken
+            // from the live workspace.
+            let reqs = stub.requests.lock().unwrap();
+            let post = reqs
+                .iter()
+                .find(|r| r.method == "POST" && r.path == "/tasks")
+                .expect("POST /tasks captured");
+            let body: Value = serde_json::from_str(&post.body).expect("post body json");
+            assert!(
+                body["parent_task_id"].is_null(),
+                "parent_task_id must be null in the top-level fallback, got {}",
+                body["parent_task_id"],
+            );
+            assert_eq!(body["repo_url"], name, "repo_url falls back to the workspace");
+            let slug = body["slug"].as_str().unwrap();
+            assert!(slug.starts_with("topchild-"), "bare-leaf slug expected: {}", slug);
             drop(reqs);
 
             kill_all_sessions(&state);
