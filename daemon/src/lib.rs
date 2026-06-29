@@ -433,6 +433,13 @@ pub fn run() -> anyhow::Result<()> {
             );
         }
     }
+    // P0 session durability (S1): point the daemon at its OWN durable
+    // session registry (distinct from the TUI's tui-sessions.json the
+    // load above read). Setting this enables the lifecycle persist
+    // hooks; tests leave it `None` so they never touch the real
+    // `~/.cm/`. See DESIGN_SESSION_DURABILITY.md.
+    initial_state.daemon_sessions_path =
+        Some(state::default_daemon_sessions_path());
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
 
     // 12h: spawn the TLS-TCP listener if daemon.toml carries

@@ -659,6 +659,15 @@ fn run_detector(
                 session.generation = session.generation.saturating_add(1);
             }
             session.transcript_path = Some(path_str);
+            // P0 session durability (S1): this is the HEADLESS transcript-
+            // bind path (no TUI runs `session.set_transcript_path`), so
+            // persisting here is what makes a restart able to resume an
+            // MCP-spawned subtask session's history. The assignment above
+            // is the last use of `session`, so its `&mut s.sessions`
+            // borrow has ended — `s` is free for the immutable persist.
+            if changed {
+                s.persist_sessions_best_effort();
+            }
             return DetectorOutcome::Bound;
         }
         // Tight poll for the first minute (binds the common case

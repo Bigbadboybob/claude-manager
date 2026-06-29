@@ -1043,6 +1043,13 @@ pub(crate) fn start_session_with_spawn_fn(
     // means session-removal paths don't need explicit cleanup.
     session.watcher_handle = watcher_handle;
     state.sessions.insert(session_uid.clone(), session);
+    // P0 session durability (S1): persist the registry now that the
+    // new session is live, so a daemon restart can restore it. Covers
+    // every production spawn — `mcp_start_session` and
+    // `create_session` both funnel through here. Best-effort + small;
+    // the transcript_id fills in later via the detector's own persist
+    // hook once the engine writes its JSONL.
+    state.persist_sessions_best_effort();
     // Option B (criterion #4): broadcast a manifest `Added` so live
     // `manifest.watch` subscribers can render the new session — symmetric with
     // the `Exited` broadcast in `handle_session_exit`. The TUI's consumer adopts
@@ -1196,6 +1203,12 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
         });
     }
     state.sessions.remove(uid);
+    // P0 session durability (S1): persist the registry now that the
+    // session is gone, so the durable file converges to live state and
+    // a restart won't try to restore an already-exited session within
+    // the staleness window. Best-effort; runs under the reaper/kill
+    // lock that guards the remove above.
+    state.persist_sessions_best_effort();
 }
 
 /// Sanity-check for a TUI-supplied session uid. Slice 10c-e-3b-fix:
@@ -2342,9 +2355,17 @@ pub fn set_transcript_path(
         session.generation = session.generation.saturating_add(1);
     }
     session.transcript_path = Some(p.transcript_path);
+    let generation = session.generation;
+    // P0 session durability (S1): a freshly-resolved transcript is the
+    // resume key — persist so a restart can `--resume` this session's
+    // history. The read of `generation` above ends the `&mut session`
+    // borrow, freeing `state` for the immutable persist call.
+    if changed {
+        state.persist_sessions_best_effort();
+    }
     Ok(json!({
         "ok": true,
-        "generation": session.generation,
+        "generation": generation,
     }))
 }
 
@@ -13774,6 +13795,101 @@ mod tests {
 
     fn make_state_arc() -> Arc<Mutex<DaemonState>> {
         Arc::new(Mutex::new(DaemonState::new()))
+    }
+
+    /// P0 session durability (S1): the `session.set_transcript_path`
+    /// RPC must persist the freshly-resolved `transcript_id` to the
+    /// daemon's durable file — that id is the `--resume` key a restart
+    /// needs. Drives the full RPC so it proves the lifecycle hook
+    /// actually fires (not merely the underlying writer the state-mod
+    /// tests already cover). The same hook sits on the headless
+    /// daemon-side detector path, which is where it matters most.
+    #[test]
+    fn set_transcript_path_persists_resume_key_to_daemon_sessions_file() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon-sessions.json");
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            s.daemon_sessions_path = Some(path.clone());
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-tp".to_string();
+            ws.worktree_path = Some(std::env::temp_dir());
+            s.workspaces.insert("ws-tp".to_string(), ws);
+            let mut sp = SpawnParams::new("ts-eeee-ffff", "tp", "/bin/sleep");
+            sp.args = vec!["120".to_string()];
+            sp.workspace_id = "ws-tp".to_string();
+            s.sessions.insert(
+                "ts-eeee-ffff".to_string(),
+                DaemonSession::spawn(sp).expect("spawn"),
+            );
+        }
+        let tpath =
+            "/home/u/.claude/projects/enc/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl";
+        set_transcript_path(
+            &state,
+            &json!({ "session_uid": "ts-eeee-ffff", "transcript_path": tpath }),
+        )
+        .expect("set_transcript_path ok");
+
+        let m: crate::manifest::Manifest =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ws = m.workspaces.get("ws-tp").expect("workspace persisted");
+        let e = ws
+            .sessions
+            .iter()
+            .find(|e| e.uid == "ts-eeee-ffff")
+            .expect("session persisted");
+        assert_eq!(
+            e.transcript_id.as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            "the transcript-bind hook persisted the resume key",
+        );
+        // DaemonSession Drop SIGKILLs the sleep child when `state` drops.
+    }
+
+    /// P0 session durability (S1): the PRIMARY hook — a real
+    /// `start_session` RPC must persist the freshly-spawned session to
+    /// the durable file, so a restart can restore it. Exercises the
+    /// same spawn funnel `mcp_start_session` / `create_session` use,
+    /// through the real method (not a hand-built `DaemonSession`).
+    #[test]
+    fn start_session_persists_new_session_to_daemon_sessions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon-sessions.json");
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            s.daemon_sessions_path = Some(path.clone());
+        }
+        let wt = std::env::temp_dir();
+        start_session(
+            &state,
+            &json!({
+                "uid": "ts-1a2b3c4d5e6f0011-0",
+                "session_type": "bash",
+                "workspace_id": "ws-ss",
+                "working_dir": wt.to_str().unwrap(),
+                "worktree_path": wt.to_str().unwrap(),
+                "label": "persist-me",
+                "argv": ["/bin/sleep", "120"],
+            }),
+        )
+        .expect("start_session ok");
+
+        let m: crate::manifest::Manifest =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ws = m.workspaces.get("ws-ss").expect("workspace persisted");
+        assert!(
+            ws.sessions.iter().any(|e| {
+                e.uid == "ts-1a2b3c4d5e6f0011-0" && e.session_type == "bash"
+            }),
+            "the spawn hook persisted the new session",
+        );
+
+        // Drop the live session so its Drop SIGKILLs the sleep child.
+        state.lock().unwrap().sessions.clear();
     }
 
     /// 10d-2c-1 test helper: seed a minimal-but-valid

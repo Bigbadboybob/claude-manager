@@ -1096,6 +1096,79 @@ pub struct DaemonSession {
     pub watcher_handle: Option<JoinHandle<()>>,
 }
 
+/// Extract the transcript-file UUID (the resume key) from a stored
+/// `transcript_path`. Both engines name the file `<uuid>.jsonl`
+/// (Claude: `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`; Codex:
+/// `~/.codex/sessions/YYYY/MM/DD/<uuid>.jsonl`), so the file stem IS
+/// the id. The inverse of
+/// [`crate::transcript_detect::claude_transcript_path`] /
+/// [`codex_transcript_path`](crate::transcript_detect::codex_transcript_path),
+/// which rebuild a path from the id. Returns `None` for a pathless or
+/// extension-less value so the manifest records "no transcript yet"
+/// honestly rather than guessing.
+pub(crate) fn transcript_id_from_path(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+}
+
+impl DaemonSession {
+    /// Project this live session into a persistable
+    /// [`ManifestEntry`](crate::manifest::ManifestEntry) for the
+    /// daemon's own durable registry (P0 session durability, S1).
+    ///
+    /// Carries every field the daemon already tracks that a restart
+    /// needs to re-spawn + resume the session: `uid`, engine
+    /// (`session_type`), the resume key (`transcript_id`, derived
+    /// from `transcript_path`), the task/workspace/managed-by
+    /// identity, the workflow + continuous tags, and the
+    /// `global_perms` grant. Worktree path is NOT here — it comes
+    /// from the owning `ManifestWorkspace` (keyed by `workspace_id`)
+    /// when the registry is assembled in
+    /// [`DaemonState::build_daemon_manifest`](crate::state::DaemonState::build_daemon_manifest).
+    ///
+    /// TUI-only presentation fields the daemon doesn't model
+    /// (`hidden`, idle/burst timers, `notify_on_idle`,
+    /// `seeded_from_snapshot`) default to their inert values; the TUI
+    /// owns those in its own `tui-sessions.json`. `last_exit` is
+    /// `None` because this projection is for *live* sessions —
+    /// exits are recorded by the reaper's manifest mutation, not
+    /// here. `host_id` is always `local`: a daemon doesn't know its
+    /// own remote name (the operator's `hosts.toml` assigns it), so
+    /// the TUI overrides it at load time for remote-loaded sessions.
+    ///
+    /// **Mem-cap fields are intentionally NOT carried yet** —
+    /// `ManifestEntry` has no slots for them, and re-applying the cap
+    /// is a restore-spawn concern (S2), not a write-only-persist (S1)
+    /// one. See DESIGN_SESSION_DURABILITY.md.
+    pub fn to_manifest_entry(&self) -> crate::manifest::ManifestEntry {
+        crate::manifest::ManifestEntry {
+            uid: self.uid.clone(),
+            managed_by_uid: self.managed_by_uid.clone(),
+            generation: self.generation,
+            label: self.title.clone(),
+            session_type: self.session_type.clone(),
+            transcript_id: self
+                .transcript_path
+                .as_deref()
+                .and_then(transcript_id_from_path),
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: self.workflow_run_id.clone(),
+            workflow_role: self.workflow_role.clone(),
+            continuous_task_id: self.continuous_task_id.clone(),
+            task_id: self.task_id.clone(),
+            notify_on_idle: false,
+            global_perms: self.global_perms,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: crate::host_id::HostId::local(),
+        }
+    }
+}
+
 /// Phase-1 result of [`DaemonSession::spawn`]. Holds a live child
 /// + PTY infrastructure but **no reaper thread yet**. Returned by
 /// [`PendingSession::spawn`]; consumed by

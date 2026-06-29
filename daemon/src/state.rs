@@ -337,6 +337,16 @@ pub struct DaemonState {
     pub workspaces: HashMap<String, ManifestWorkspace>,
     /// `task_id → workspace_id` bindings from the same manifest.
     pub bindings: HashMap<String, String>,
+    /// Destination for the daemon's OWN durable session registry
+    /// (P0 session durability, S1) — a file distinct from the TUI's
+    /// `tui-sessions.json` so daemon-spawned sessions survive a
+    /// `systemctl restart cm-daemon`. `Some` in production (set by
+    /// [`crate::run`] to [`default_daemon_sessions_path`]); `None`
+    /// in tests so unit tests never touch the real `~/.cm/` — a
+    /// focused test sets it to a tempdir to exercise the lifecycle
+    /// hooks. When `None`, [`Self::persist_sessions_best_effort`] is
+    /// a no-op. See DESIGN_SESSION_DURABILITY.md.
+    pub daemon_sessions_path: Option<PathBuf>,
     /// Pending attach-ticket store. Slice 5 primitive; slice 10b
     /// wires `session.attach` / `attach.open` to allocate + consume
     /// through this. One allocator per daemon instance — tickets
@@ -577,6 +587,7 @@ impl Default for DaemonState {
             recently_exited: VecDeque::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
+            daemon_sessions_path: None,
             tickets: TicketAllocator::new(),
             attach_addr: String::new(),
             task_tree: HashMap::new(),
@@ -674,6 +685,85 @@ impl DaemonState {
         Ok(true)
     }
 
+    /// Project the LIVE daemon-owned session registry into a
+    /// [`Manifest`] suitable for persisting to `daemon-sessions.json`
+    /// (P0 session durability, S1).
+    ///
+    /// **`self.sessions` is the source of truth**, NOT
+    /// `self.workspaces[].sessions`. The latter is only ever
+    /// populated when a TUI-written `tui-sessions.json` seeded it at
+    /// load — the production spawn path inserts into `self.sessions`
+    /// and never mirrors into the workspace entry. So we rebuild each
+    /// workspace's `sessions` vec from scratch: one entry per live
+    /// `DaemonSession`, filed under its `workspace_id`, with the
+    /// workspace's metadata (crucially `worktree_path`, the restore
+    /// cwd) cloned from `self.workspaces` when known.
+    ///
+    /// Only workspaces that actually own a live session are emitted —
+    /// restore needs no others, and a headless daemon's `workspaces`
+    /// map is exactly the set auto-registered at spawn anyway. All
+    /// `bindings` are kept (small, and symmetric with
+    /// [`Self::load_manifest_from_disk`]).
+    pub fn build_daemon_manifest(&self) -> Manifest {
+        let mut workspaces: HashMap<String, ManifestWorkspace> = HashMap::new();
+        for sess in self.sessions.values() {
+            let ws = workspaces
+                .entry(sess.workspace_id.clone())
+                .or_insert_with(|| match self.workspaces.get(&sess.workspace_id) {
+                    // Clone the known metadata but start the sessions
+                    // vec empty — we fill it from the live registry.
+                    Some(w) => ManifestWorkspace {
+                        sessions: Vec::new(),
+                        tombstones: Vec::new(),
+                        ..w.clone()
+                    },
+                    // No metadata snapshot (shouldn't happen — spawn
+                    // auto-registers — but stay defensive): a minimal
+                    // entry keyed by id, no worktree path. Restore will
+                    // fall back to a fresh spawn for such a session.
+                    None => ManifestWorkspace {
+                        id: sess.workspace_id.clone(),
+                        ..Default::default()
+                    },
+                });
+            ws.sessions.push(sess.to_manifest_entry());
+        }
+        Manifest {
+            workspaces,
+            bindings: self.bindings.clone(),
+            view: None,
+            hide_continuous: false,
+        }
+    }
+
+    /// Atomically write the daemon's durable session registry to
+    /// `path` (P0 session durability, S1). Builds the manifest from
+    /// the live registry, serializes it, and rename-swaps it into
+    /// place so a reader (or a crash) never sees a half-written file.
+    pub fn save_daemon_sessions(&self, path: &Path) -> std::io::Result<()> {
+        let manifest = self.build_daemon_manifest();
+        write_manifest_atomic(path, &manifest)
+    }
+
+    /// Best-effort persist to [`Self::daemon_sessions_path`]. A no-op
+    /// when the path is unset (tests, or a daemon configured without
+    /// durability). Called from the session lifecycle hooks
+    /// (spawn / exit / transcript-bind). A write failure is logged
+    /// and swallowed — losing one snapshot is recoverable (the next
+    /// lifecycle event rewrites the full state), and a persist error
+    /// must never fail the RPC that triggered it.
+    pub fn persist_sessions_best_effort(&self) {
+        if let Some(path) = &self.daemon_sessions_path {
+            if let Err(e) = self.save_daemon_sessions(path) {
+                eprintln!(
+                    "cm-daemon: failed to persist daemon sessions to {}: {}",
+                    path.display(),
+                    e,
+                );
+            }
+        }
+    }
+
     /// 10d-1: unified session lookup across daemon-owned
     /// (`self.sessions`) and TUI-pushed (`self.tui_sessions`)
     /// maps. Daemon-owned wins on collision — `self.sessions`
@@ -736,6 +826,47 @@ pub fn default_manifest_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".cm/tui-sessions.json")
+}
+
+/// Default path for the daemon's OWN durable session registry (P0
+/// session durability, S1). DELIBERATELY distinct from
+/// [`default_manifest_path`]: the TUI owns `tui-sessions.json`, the
+/// daemon owns `daemon-sessions.json`, so the two writers never
+/// contend (decision 1 in DESIGN_SESSION_DURABILITY.md). The TUI
+/// learns about daemon-owned sessions via `list_sessions` /
+/// `manifest.watch`, not by reading this file.
+pub fn default_daemon_sessions_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".cm/daemon-sessions.json")
+}
+
+/// Serialize `manifest` and write it to `path` atomically: write to
+/// a uniquely-named temp file in the same directory, then `rename`
+/// over the target (atomic on the same filesystem). A reader never
+/// observes a partial file, and a crash mid-write leaves the prior
+/// good file intact.
+///
+/// The temp name is made unique per write (pid + a process-global
+/// counter) so two concurrent writers — e.g. the spawn hook on the
+/// RPC thread and the exit hook on the reaper thread — never clobber
+/// each other's partial temp file. Each writes a complete snapshot,
+/// so whichever `rename` lands last wins with a fully-valid manifest.
+fn write_manifest_atomic(path: &Path, manifest: &Manifest) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
+    std::fs::write(&tmp, json.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -825,6 +956,143 @@ mod tests {
         assert!(state.sessions.is_empty());
         assert!(state.workspaces.is_empty());
         assert!(state.bindings.is_empty());
+    }
+
+    // ---- P0 session durability (S1): persist ------------------------
+
+    /// Spawn a real (sleep) daemon session, then project the registry
+    /// into a manifest and assert it carries every re-spawn input: the
+    /// engine, the resume key (`transcript_id` = stem of
+    /// `transcript_path`), the task/workspace/managed-by identity, the
+    /// continuous tag, the perms grant, and the workspace's worktree
+    /// path (the restore cwd). `state.sessions` — NOT
+    /// `workspaces[].sessions` — must be the source of truth.
+    #[test]
+    fn build_daemon_manifest_projects_live_sessions_with_respawn_fields() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let mut state = DaemonState::default();
+        let wt = std::env::temp_dir().join("cm-s1-build-wt");
+        let _ = std::fs::create_dir_all(&wt);
+        state.workspaces.insert(
+            "ws-1".to_string(),
+            ManifestWorkspace {
+                id: "ws-1".to_string(),
+                worktree_path: Some(wt.clone()),
+                // A stale session here MUST be ignored — the live
+                // registry is authoritative.
+                sessions: vec![entry("ts-stale-should-be-dropped")],
+                ..Default::default()
+            },
+        );
+        let mut sp = SpawnParams::new("ts-aaaa-bbbb", "bug-002", "/bin/sleep");
+        sp.args = vec!["120".to_string()];
+        sp.workspace_id = "ws-1".to_string();
+        sp.session_type = "codex".to_string();
+        sp.task_id = Some("task-xyz".to_string());
+        sp.managed_by_uid = Some("ts-parent".to_string());
+        sp.continuous_task_id = Some("ct-1".to_string());
+        sp.global_perms = true;
+        let mut sess = DaemonSession::spawn(sp).expect("spawn");
+        sess.transcript_path = Some(
+            "/home/u/.claude/projects/enc/11111111-2222-3333-4444-555555555555.jsonl"
+                .to_string(),
+        );
+        sess.generation = 3;
+        state.sessions.insert("ts-aaaa-bbbb".to_string(), sess);
+
+        let m = state.build_daemon_manifest();
+        let ws = m.workspaces.get("ws-1").expect("workspace persisted");
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(wt.as_path()),
+            "worktree carried — it's the restore cwd",
+        );
+        assert_eq!(
+            ws.sessions.len(),
+            1,
+            "exactly the live session, not the stale workspace entry",
+        );
+        let e = &ws.sessions[0];
+        assert_eq!(e.uid, "ts-aaaa-bbbb");
+        assert_eq!(e.session_type, "codex", "engine carried");
+        assert_eq!(e.label, "bug-002");
+        assert_eq!(e.task_id.as_deref(), Some("task-xyz"));
+        assert_eq!(e.managed_by_uid.as_deref(), Some("ts-parent"));
+        assert_eq!(e.continuous_task_id.as_deref(), Some("ct-1"));
+        assert!(e.global_perms, "perms grant carried");
+        assert_eq!(e.generation, 3);
+        assert_eq!(
+            e.transcript_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "transcript_id = file stem of transcript_path (the --resume key)",
+        );
+        // The DaemonSession's Drop SIGKILLs the sleep child on scope exit.
+    }
+
+    /// End-to-end: configure a `daemon_sessions_path`, spawn a session,
+    /// `persist_sessions_best_effort()`, then load the written file with
+    /// a fresh state's `load_manifest_from_disk` and confirm the session
+    /// + its worktree survived the round-trip. This is the S1 contract:
+    /// a restart reading the file sees the session it must restore.
+    #[test]
+    fn persist_round_trips_through_load_manifest_from_disk() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon-sessions.json");
+        let wt = std::env::temp_dir().join("cm-s1-roundtrip-wt");
+        let _ = std::fs::create_dir_all(&wt);
+
+        let mut state = DaemonState::default();
+        state.daemon_sessions_path = Some(path.clone());
+        state.workspaces.insert(
+            "ws-rt".to_string(),
+            ManifestWorkspace {
+                id: "ws-rt".to_string(),
+                worktree_path: Some(wt.clone()),
+                ..Default::default()
+            },
+        );
+        state.bindings.insert("task-rt".to_string(), "ws-rt".to_string());
+        let mut sp = SpawnParams::new("ts-cccc-dddd", "rt", "/bin/sleep");
+        sp.args = vec!["120".to_string()];
+        sp.workspace_id = "ws-rt".to_string();
+        sp.task_id = Some("task-rt".to_string());
+        let sess = DaemonSession::spawn(sp).expect("spawn");
+        state.sessions.insert("ts-cccc-dddd".to_string(), sess);
+
+        state.persist_sessions_best_effort();
+        assert!(path.exists(), "persist wrote the durable file");
+
+        // A fresh state — as if the daemon just restarted — reads it.
+        let mut restored = DaemonState::default();
+        let found = restored
+            .load_manifest_from_disk(&path)
+            .expect("load ok");
+        assert!(found, "file present and parsed");
+        let ws = restored.workspaces.get("ws-rt").expect("workspace restored");
+        assert_eq!(ws.worktree_path.as_deref(), Some(wt.as_path()));
+        assert_eq!(ws.sessions.len(), 1);
+        assert_eq!(ws.sessions[0].uid, "ts-cccc-dddd");
+        assert_eq!(ws.sessions[0].task_id.as_deref(), Some("task-rt"));
+        assert_eq!(
+            restored.bindings.get("task-rt").map(String::as_str),
+            Some("ws-rt"),
+            "task→workspace binding survived",
+        );
+    }
+
+    /// With no `daemon_sessions_path` set (the test/disabled default),
+    /// the persist hook is a strict no-op — it must never write to the
+    /// real `~/.cm/`. Guards the cfg-free test-isolation contract.
+    #[test]
+    fn persist_is_noop_when_path_unset() {
+        let state = DaemonState::default();
+        assert!(state.daemon_sessions_path.is_none());
+        // Must not panic, must not write anywhere.
+        state.persist_sessions_best_effort();
+        // An empty registry projects to an empty manifest.
+        let m = state.build_daemon_manifest();
+        assert!(m.workspaces.is_empty());
     }
 
     #[test]
