@@ -286,8 +286,9 @@ pub fn dispatch_request(
     req: &Request,
 ) -> DispatchOutcome {
     match req.method.as_str() {
-        // No state needed — pure shape check on `req.caller`.
-        "ping" => DispatchOutcome::Done(dispatch_ping(req)),
+        // Reads the caller's session (when known) to report its
+        // own perms + scope; still pongs for unknown callers.
+        "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
 
         // `start_session` manages its own locking. The reaper
         // thread's cleanup callback re-acquires the state mutex
@@ -397,6 +398,9 @@ pub fn dispatch_request(
         // of an already-spawned daemon session with workflow
         // context. Operator-only — a Session caller doing this
         // could declare itself a participant of any run.
+        "session.set_global_perms" => {
+            DispatchOutcome::Done(dispatch_set_global_perms(state, req))
+        }
         "session.set_workflow_context" => {
             DispatchOutcome::Done(dispatch_set_workflow_context(state, req))
         }
@@ -1111,6 +1115,29 @@ fn dispatch_set_workflow_context(
     }
 }
 
+/// `session.set_global_perms` — TUI grants/revokes a session's
+/// global-permissions flag (global-perms feature). Operator-only: a
+/// Session caller flipping this would be a trivial self-escalation,
+/// defeating the descendant-only auth model. See
+/// `methods::set_global_perms`.
+fn dispatch_set_global_perms(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.set_global_perms is Operator-callable only — a \
+         Session caller granting itself global perms would be a \
+         self-escalation past the descendant-only auth model",
+    ) {
+        return resp;
+    }
+    match methods::set_global_perms(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `task.update_tree` — TUI-pushed task-tree snapshot
 /// (slice 10d-mcp-surface-2a). Operator-only.
 fn dispatch_task_update_tree(
@@ -1590,16 +1617,36 @@ fn dispatch_read_session_output(
 /// `caller_kind` is appended as an additive field for Session
 /// callers — useful diagnostic when an operator is reading raw
 /// dispatcher logs, doesn't change any existing client behavior.
-fn dispatch_ping(req: &Request) -> Response {
+fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match &req.caller {
-        Caller::Session(s) => Response::ok(
-            req.id.clone(),
-            serde_json::json!({
-                "pong": true,
-                "uid": s.session_uid,
-                "caller_kind": "session",
-            }),
-        ),
+        Caller::Session(s) => {
+            // Self-context: report the caller's own grant + scope so
+            // an agent can tell whether it holds global perms and
+            // what task/workspace it's bound to — without a second
+            // round-trip. An unknown uid (e.g. post-restart) still
+            // pongs, with `global_perms=false` and null scope.
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            let (global_perms, task_id, workspace_id) =
+                match st.sessions.get(&s.session_uid) {
+                    Some(sess) => (
+                        sess.global_perms,
+                        sess.task_id.clone(),
+                        Some(sess.workspace_id.clone()),
+                    ),
+                    None => (false, None, None),
+                };
+            Response::ok(
+                req.id.clone(),
+                serde_json::json!({
+                    "pong": true,
+                    "uid": s.session_uid,
+                    "caller_kind": "session",
+                    "global_perms": global_perms,
+                    "task_id": task_id,
+                    "workspace_id": workspace_id,
+                }),
+            )
+        }
         Caller::Operator(_) => Response::err(
             req.id.clone(),
             ErrorCode::Unauthorized,
@@ -1659,13 +1706,72 @@ mod tests {
         // exactly the TUI's old shape.
         assert_eq!(result["pong"], true);
         assert_eq!(result["uid"], "ts-abc-123");
-        // `caller_kind` is the only additive field — clients that
-        // ignore it are unaffected.
+        // `caller_kind` and the self-context fields are additive —
+        // clients that ignore them are unaffected.
         assert_eq!(result["caller_kind"], "session");
+        // Self-context (global-perms feature): an unknown caller
+        // (not in the registry) reports `global_perms=false` and
+        // null scope, but the keys are always present so an agent
+        // can branch on them unconditionally.
+        assert_eq!(result["global_perms"], false);
+        assert_eq!(result["task_id"], serde_json::Value::Null);
+        assert_eq!(result["workspace_id"], serde_json::Value::Null);
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(3),
-            "only three keys present: pong, uid, caller_kind. Any other key drift would be a client-visible change.",
+            Some(6),
+            "keys: pong, uid, caller_kind, global_perms, task_id, workspace_id. \
+             Any other key drift would be a client-visible change.",
+        );
+    }
+
+    /// A live session carrying `global_perms` has its grant + scope
+    /// reflected back in `ping`, and that grant lets `list_sessions`
+    /// return a session in a DIFFERENT workspace (which a normal
+    /// taskless caller could never see).
+    #[test]
+    fn ping_and_list_reflect_global_perms_grant() {
+        let state = make_state();
+        // Insert a global caller in ws-1 and an unrelated target in ws-2.
+        {
+            let mut sp = crate::session::SpawnParams::new("ts-global", "test", "/bin/sleep");
+            sp.args = vec!["30".into()];
+            sp.workspace_id = "ws-1".into();
+            sp.global_perms = true;
+            let sess = crate::session::PendingSession::spawn(sp)
+                .expect("spawn global")
+                .arm_reaper(None)
+                .expect("arm global");
+            state.lock().unwrap().sessions.insert("ts-global".into(), sess);
+        }
+        add_session_with_reaper_cleanup(&state, "ts-other", "ws-2", "claude-code");
+
+        // ping reports the grant + scope.
+        let ping = dispatch_request(
+            &state,
+            &session_request("ping", serde_json::Value::Null, "ts-global"),
+        )
+        .into_response();
+        let pr = ping.result.expect("ping result");
+        assert_eq!(pr["global_perms"], true);
+        assert_eq!(pr["workspace_id"], "ws-1");
+
+        // list_sessions returns the cross-workspace target for the global caller.
+        let list = dispatch_request(
+            &state,
+            &session_request("list_sessions", serde_json::json!({}), "ts-global"),
+        )
+        .into_response();
+        let arr = list.result.expect("list result");
+        let uids: Vec<&str> = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["session_uid"].as_str())
+            .collect();
+        assert!(
+            uids.contains(&"ts-other"),
+            "global caller must see the cross-workspace session; got {:?}",
+            uids,
         );
     }
 
@@ -7636,6 +7742,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: Some(run_id.to_string()),
                 workflow_role: Some(role.to_string()),
+                global_perms: false,
             },
         );
     }

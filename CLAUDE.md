@@ -12,7 +12,8 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 - **`mcp_server/`** — MCP server exposing tools that agents running inside the TUI can call:
   - `propose_task(...)` — push a task to the planning backlog.
   - `workflow_transition(to, prompt)` / `workflow_done(reason)` — workflow participants use these to hand off control or end a run. Events land in `~/.cm/workflow-runs/<id>/events.jsonl` and the TUI tails that file as its workflow control plane.
-  - `ping`, `list_sessions`, `mcp_start_session`, `send_input`, `read_session_output`, `kill_session` — agent orchestration. Routed per-method by the resolver: session/PTY-touching methods go to `~/.cm/daemon.sock` (the daemon owns the registry); workflow-touching methods stay on `~/.cm/tui.sock`. Auth keys off `CM_TUI_SESSION_ID` injected when the TUI spawns the agent; descendant-only scope.
+  - `ping`, `list_sessions`, `list_sessions_grouped`, `mcp_start_session`, `send_input`, `read_session_output`, `kill_session` — agent orchestration. Routed per-method by the resolver: session/PTY-touching methods go to `~/.cm/daemon.sock` (the daemon owns the registry); workflow-touching methods stay on `~/.cm/tui.sock`. Auth keys off `CM_TUI_SESSION_ID` injected when the TUI spawns the agent; descendant-only scope by default. `ping` now reports the caller's own `global_perms` / `task_id` / `workspace_id`; `list_sessions` entries carry `task_id` / `workspace_id` / `global_perms` and `list_sessions_grouped` returns them as a workspace→task tree.
+  - **Global permissions**: a session may carry a `global_perms` flag that short-circuits the descendant-only scope — it can list/prompt/read/kill/spawn against ANY session. Granted by the operator (A-e session-settings toggle → `session.set_global_perms` RPC) or propagated by an already-global agent via `start_session(global_perms=true)` (escalation-guarded in `mcp_start_session`: honored only if the caller is itself global). The flag lives on `DaemonSession`/`TerminalSession`/`ManifestEntry`; auth short-circuits in `daemon/src/control/auth.rs::check_session_caller` and its TUI mirror `caller_authorized_for`. See AGENT_ORCHESTRATION.md → "Global permissions".
   - `start_workflow`, `stop_workflow`, `get_workflow_state`, `list_workflows` — orchestrator-side workflow control. Caller is the orchestrator, NOT a participant.
   - `create_subtask`, `list_subtasks`, `mark_subtask_done` — subtasks fork off a parent task with `parent_task_id` set. `worktree_mode="branch"` creates a new worktree under `cm-sub/<slug-chain>-<short_id>`.
 
@@ -20,7 +21,9 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 You have tools that can spawn subtasks, start sessions, send input to other sessions, kill sessions, start workflows, and create subtasks. **Before using any of them, state your intent in plain language and ask the user to confirm.** The tools will not refuse you, but the user expects to stay in the loop. Apply the same convention to anything destructive (killing a session, marking a subtask done, stopping a workflow).
 
-Read-only tools (`ping`, `list_sessions`, `read_session_output`, `get_workflow_state`, `list_workflows`, `list_subtasks`) don't need pre-approval — call them as needed.
+Read-only tools (`ping`, `list_sessions`, `list_sessions_grouped`, `read_session_output`, `get_workflow_state`, `list_workflows`, `list_subtasks`) don't need pre-approval — call them as needed.
+
+If you hold **global permissions** (`ping().global_perms == true`), you can reach sessions outside your own task tree. The convention matters *more*, not less, there: state your intent and confirm before driving unrelated work, and never pass `global_perms=true` to `start_session` without explicit user say-so.
 
 ## On `signal 9` from a Bash tool
 
@@ -90,7 +93,7 @@ Sessions view:
 - `A-w` — close session
 - `A-h` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden)
 - `A-H` — switch active host (cycles through entries in `~/.cm/hosts.toml`; see Multi-host below)
-- `A-e` — session settings
+- `A-e` — session settings (label, idle/burst timers, hidden, notify-on-idle, **global perms** — Tab to the field, Space to toggle)
 - `A-v` — toggle Status / Task sub-view
 - `A-p` — push (cloud)
 - `A-l` — pull (cloud)

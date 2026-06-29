@@ -187,6 +187,16 @@ pub fn check_session_caller(
         None => return AuthDecision::TargetNotInRegistry,
     };
 
+    // Global-perms grant: a global caller reaches ANY live target,
+    // bypassing the task-tree / workspace scope rule. The
+    // caller-exists and target-exists gates above still apply (a
+    // global caller acting on a missing target still gets a clean
+    // `TargetNotInRegistry`), so the only thing the grant skips is
+    // the scope decision below. See `DaemonSession.global_perms`.
+    if caller.global_perms {
+        return AuthDecision::Allow;
+    }
+
     caller_reaches_target(
         state,
         &caller.task_id,
@@ -216,6 +226,13 @@ pub fn check_session_caller_for_exited(
         None => return AuthDecision::CallerNotInRegistry,
     };
     if caller_uid == target_uid {
+        return AuthDecision::Allow;
+    }
+    // Global-perms grant applies to read-after-exit too: a global
+    // caller can read any exited session's final output, not just
+    // its own task tree's. Mirrors the live-target short-circuit in
+    // `check_session_caller`.
+    if caller.global_perms {
         return AuthDecision::Allow;
     }
     caller_reaches_target(
@@ -471,6 +488,104 @@ mod tests {
             AuthDecision::OutOfScope,
             "tasked callers must NOT get workspace-scope fall-back \
              (round-1 widening lesson — TUI rule has no such fallback)",
+        );
+    }
+
+    /// Build a session with `global_perms = true`. Global callers
+    /// short-circuit the scope rule for any target.
+    fn make_session_global(
+        uid: &str,
+        workspace_id: &str,
+        task_id: Option<&str>,
+    ) -> DaemonSession {
+        let mut p = SpawnParams::new(uid, format!("test-{}", uid), "/bin/sleep");
+        p.args = vec!["3".to_string()];
+        p.workspace_id = workspace_id.to_string();
+        p.task_id = task_id.map(str::to_string);
+        p.global_perms = true;
+        let pending = crate::session::PendingSession::spawn(p)
+            .expect("test PendingSession::spawn");
+        pending.arm_reaper(None).expect("test arm_reaper")
+    }
+
+    // ============================================================
+    // Global-perms grant: a global caller reaches ANY target,
+    // bypassing the task-tree / workspace scope rule. The
+    // foundational gates (caller-exists, target-exists) still
+    // apply. Non-global callers must be entirely unaffected.
+    // ============================================================
+
+    /// Global caller reaches a target in a different workspace
+    /// (a normal taskless caller would be OutOfScope here).
+    #[test]
+    fn global_caller_reaches_cross_workspace_target() {
+        let g = make_session_global("ts-g", "ws-1", None);
+        let b = make_session("ts-b", "ws-2");
+        let state = state_with(vec![g, b]);
+        assert_eq!(
+            check_session_caller(&state, "ts-g", "ts-b"),
+            AuthDecision::Allow,
+        );
+    }
+
+    /// Global caller reaches an unrelated task's session (a normal
+    /// tasked caller would be OutOfScope — no descendant link).
+    #[test]
+    fn global_caller_reaches_unrelated_task_target() {
+        let g = make_session_global("ts-g", "ws-1", Some("task-g"));
+        let b = make_session_tasked("ts-b", "ws-2", Some("task-unrelated"));
+        let mut state = state_with(vec![g, b]);
+        state.task_tree.insert("task-g".into(), None);
+        state.task_tree.insert("task-unrelated".into(), None);
+        state.task_tree_pushed = true;
+        assert_eq!(
+            check_session_caller(&state, "ts-g", "ts-b"),
+            AuthDecision::Allow,
+        );
+    }
+
+    /// Global caller acting on a missing live target still gets a
+    /// clean `TargetNotInRegistry` — the grant skips scope, not the
+    /// existence gate.
+    #[test]
+    fn global_caller_still_gets_target_not_in_registry_for_missing_target() {
+        let g = make_session_global("ts-g", "ws-1", None);
+        let state = state_with(vec![g]);
+        assert_eq!(
+            check_session_caller(&state, "ts-g", "ts-missing"),
+            AuthDecision::TargetNotInRegistry,
+        );
+    }
+
+    /// Global caller can read any EXITED session's final output,
+    /// regardless of task/workspace.
+    #[test]
+    fn global_caller_reaches_arbitrary_exited_target() {
+        let g = make_session_global("ts-g", "ws-1", Some("task-g"));
+        let state = state_with(vec![g]);
+        assert_eq!(
+            check_session_caller_for_exited(
+                &state,
+                "ts-g",
+                "ts-dead",
+                Some("task-unrelated"),
+                "ws-other",
+            ),
+            AuthDecision::Allow,
+        );
+    }
+
+    /// Regression guard: the grant must NOT widen non-global
+    /// callers — a normal taskless caller is still OutOfScope for a
+    /// cross-workspace target.
+    #[test]
+    fn non_global_caller_cross_workspace_still_denied() {
+        let a = make_session("ts-a", "ws-1");
+        let b = make_session("ts-b", "ws-2");
+        let state = state_with(vec![a, b]);
+        assert_eq!(
+            check_session_caller(&state, "ts-a", "ts-b"),
+            AuthDecision::OutOfScope,
         );
     }
 

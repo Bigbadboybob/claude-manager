@@ -1052,6 +1052,10 @@ pub struct DaemonSessionSummary {
     /// scan's size reconcile skips sessions it can't measure.
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    /// Global-permissions grant (`list_sessions` projects it). Carried
+    /// through adoption so a surfaced daemon-owned session keeps its
+    /// grant in the TUI's in-memory model + manifest.
+    pub global_perms: bool,
 }
 
 /// Parse one `list_sessions` array entry into a [`DaemonSessionSummary`].
@@ -1084,6 +1088,10 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
         continuous_task_id: str_field("continuous_task_id"),
         cols: u16_field("cols"),
         rows: u16_field("rows"),
+        global_perms: entry
+            .get("global_perms")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -1262,6 +1270,29 @@ pub fn rpc_set_workflow_context(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// `session.set_global_perms` RPC (global-perms feature). The TUI
+/// grants/revokes a live daemon-owned session's global-permissions
+/// flag so the daemon's Session-caller auth honors the change
+/// immediately. Operator-only on the daemon side — see
+/// `methods::set_global_perms` for why a Session caller is refused.
+pub fn rpc_set_global_perms(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    global_perms: bool,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.set_global_perms".into(),
+        params: serde_json::json!({
+            "uid": uid,
+            "global_perms": global_perms,
+        }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
 /// `task.update_tree` RPC. Sub-2a Finding #1: pushes the TUI's
 /// current task tree to the daemon as a full-replace snapshot.
 /// The daemon caches it in `DaemonState.task_tree` for the
@@ -1317,6 +1348,7 @@ pub fn rpc_tui_update_sessions_snapshot(
                 "hidden": s.hidden,
                 "workflow_run_id": s.workflow_run_id,
                 "workflow_role": s.workflow_role,
+                "global_perms": s.global_perms,
             })
         })
         .collect();
@@ -1342,6 +1374,7 @@ pub struct TuiSessionSnapshotPush<'a> {
     pub hidden: bool,
     pub workflow_run_id: Option<&'a str>,
     pub workflow_role: Option<&'a str>,
+    pub global_perms: bool,
 }
 
 /// 10d-2c-2-1: push the full workflow-definitions map to the
@@ -2054,6 +2087,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-b",
@@ -2063,6 +2097,7 @@ mod tests {
                 hidden: true,
                 workflow_run_id: Some("wf-1"),
                 workflow_role: Some("worker"),
+                global_perms: false,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-snap", &first)
@@ -2092,6 +2127,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-c",
@@ -2101,6 +2137,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-snap", &second)
@@ -2208,6 +2245,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             }],
         );
         assert!(
@@ -2266,6 +2304,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: Some("wf-r"),
                 workflow_role: Some("worker"),
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-restored-2",
@@ -2275,6 +2314,7 @@ mod tests {
                 hidden: true,
                 workflow_run_id: Some("wf-r"),
                 workflow_role: Some("reviewer"),
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-restored-3",
@@ -2284,6 +2324,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-restore", &restored)
@@ -2378,6 +2419,7 @@ mod tests {
             hidden: false,
             workflow_run_id: None,
             workflow_role: None,
+            global_perms: false,
         }];
         rpc_tui_update_sessions_snapshot(&socket, "op-filter", &filtered)
             .expect("filtered push ok");
@@ -2424,6 +2466,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-b",
@@ -2433,6 +2476,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-live", &live)
@@ -2478,6 +2522,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-b",
@@ -2487,6 +2532,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-tui1-live", &first)
@@ -2512,6 +2558,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-c",
@@ -2521,6 +2568,7 @@ mod tests {
                 hidden: false,
                 workflow_run_id: None,
                 workflow_role: None,
+                global_perms: false,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-tui2-restore", &second)

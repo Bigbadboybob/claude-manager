@@ -42,6 +42,7 @@ pub struct TuiSessionRow {
     pub hidden: bool,
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
+    pub global_perms: bool,
 }
 
 enum PushCommand {
@@ -331,6 +332,7 @@ fn push_tui_sessions(
             hidden: s.hidden,
             workflow_run_id: s.workflow_run_id.as_deref(),
             workflow_role: s.workflow_role.as_deref(),
+            global_perms: s.global_perms,
         })
         .collect();
     match crate::client_session::rpc_tui_update_sessions_snapshot(

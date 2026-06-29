@@ -469,6 +469,16 @@ pub struct SpawnParams {
     /// funnel that sets it lands in Phase 2. See
     /// DESIGN_CONTINUOUS_TASKS.md §6.
     pub continuous_task_id: Option<String>,
+    /// Global-permissions grant. When `true`, this session's
+    /// Session-caller auth checks (`auth::check_session_caller` and
+    /// `check_session_caller_for_exited`) short-circuit to `Allow`
+    /// for ANY target — the session can prompt, read, kill, and
+    /// spawn against every other session regardless of task tree or
+    /// workspace. Granted only by the operator (TUI) or by a caller
+    /// that is itself global (the `mcp_start_session` escalation
+    /// guard), so a normal agent can never self-promote. `false` is
+    /// the default and the safe baseline (descendant-only scope).
+    pub global_perms: bool,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -561,6 +571,10 @@ impl SpawnParams {
             workflow_role: None,
             // Phase-1 continuous wire field: non-continuous default.
             continuous_task_id: None,
+            // Global perms default to off — descendant-only scope is
+            // the safe baseline. Only the operator (TUI) or a global
+            // caller can flip this true at spawn time.
+            global_perms: false,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -935,6 +949,14 @@ pub struct DaemonSession {
     /// session is a tick of, carried through from `SpawnParams`.
     /// `None` for ordinary sessions. See DESIGN_CONTINUOUS_TASKS.md §6.
     pub continuous_task_id: Option<String>,
+    /// Global-permissions grant for this session's Session-caller
+    /// auth. When `true`, `auth::check_session_caller` /
+    /// `check_session_caller_for_exited` short-circuit to `Allow`
+    /// for any target, and `list_sessions` returns every session
+    /// rather than the caller's task-tree slice. Carried from
+    /// `SpawnParams` through `arm_reaper`. See the field doc on
+    /// `SpawnParams.global_perms` for the grant rules.
+    pub global_perms: bool,
     /// Sub-2b-1 review-r#2 #2: transcript generation counter.
     /// Initialized to 0; incremented by `session.set_transcript_path`
     /// when the incoming path differs from `transcript_path`
@@ -1134,6 +1156,8 @@ struct PendingSessionInner {
     /// Phase-1 continuous wire field, carried SpawnParams →
     /// DaemonSession alongside the workflow tags.
     continuous_task_id: Option<String>,
+    /// Global-perms grant, carried SpawnParams → DaemonSession.
+    global_perms: bool,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
     /// from `PendingSession::spawn` → `arm_reaper` →
     /// `DaemonSession`. The fanout already holds an Arc clone
@@ -1453,6 +1477,7 @@ impl PendingSession {
                 workflow_run_id: params.workflow_run_id,
                 workflow_role: params.workflow_role,
                 continuous_task_id: params.continuous_task_id,
+                global_perms: params.global_perms,
                 last_activity_at,
                 title: params.title,
                 fanout,
@@ -1510,6 +1535,7 @@ impl PendingSession {
             workflow_run_id,
             workflow_role,
             continuous_task_id,
+            global_perms,
             last_activity_at,
             title,
             fanout,
@@ -1593,6 +1619,7 @@ impl PendingSession {
             workflow_run_id,
             workflow_role,
             continuous_task_id,
+            global_perms,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
             // path-change. Subscribed-from-spawn callers

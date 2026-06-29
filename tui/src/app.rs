@@ -149,6 +149,14 @@ pub struct TerminalSession {
     /// If true, fire a desktop notification each time this session
     /// transitions Running → Idle. Off by default; toggled in A-e settings.
     pub notify_on_idle: bool,
+    /// Global-permissions grant. When true, this session's MCP
+    /// agent can prompt, read, and control ANY other session
+    /// (not just its task-tree descendants) — the TUI-side mirror
+    /// of `cm_daemon::session::DaemonSession::global_perms`. Granted
+    /// by the operator (A-e session settings / the new-session form)
+    /// or propagated from a global caller via `start_session`.
+    /// Persisted in the manifest. Off by default (safe baseline).
+    pub global_perms: bool,
     /// Marker that an Enter keystroke is queued to be written to the PTY at
     /// or after `fire_at`. Used to introduce a deliberate gap between the body
     /// of a multi-KB workflow prompt and the trailing Enter so the receiving
@@ -235,6 +243,7 @@ impl TerminalSession {
             continuous_task_id: self.continuous_task_id.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: self.notify_on_idle,
+            global_perms: self.global_perms,
             seeded_from_snapshot: self.seeded_from_snapshot.clone(),
             // Read-modify-write the daemon-owned `last_exit`. The TUI
             // never inspects or mutates it — just hands it back
@@ -421,6 +430,7 @@ const ENTER_GAP: Duration = Duration::from_secs(10);
 // and `TOMBSTONE_RETENTION_SECS` live in the daemon crate (slice
 // 10a-types of doc/persistent-host-daemon.md). Module-level `use`
 // brings them into scope so existing bare references inside this
+// file (`ManifestEntry { ...     global_perms: false,
 // file (`ManifestEntry { ... }`, `SessionTombstone { ... }` etc.)
 // resolve unchanged.
 //
@@ -1068,6 +1078,7 @@ fn make_simple_session_with_uid(
         last_delivery: None,
         task_id: None,
         notify_on_idle: false,
+        global_perms: false,
         pending_enter: None,
         created_at: Instant::now(),
         managed_by_uid: None,
@@ -1670,11 +1681,15 @@ enum InputMode {
         burst_threshold: String,
         hidden: bool,
         notify_on_idle: bool,
+        /// Global-permissions grant. When on, this session's MCP agent
+        /// can prompt/read/control ANY session, not just descendants.
+        global_perms: bool,
         /// Read-only provenance: name of the agent-memory snapshot this
         /// session was cloned from, if any. Surfaced at the bottom of the
         /// dialog when `Some`. Not editable from settings.
         seeded_from_snapshot: Option<String>,
-        /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden, 4 = notify on idle
+        /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden,
+        /// 4 = notify on idle, 5 = global perms
         active_field: u8,
     },
     /// Renaming a workspace. Only the display label changes — the branch
@@ -2003,6 +2018,7 @@ pub(crate) enum SubmitAction {
         burst_threshold: u16,
         hidden: bool,
         notify_on_idle: bool,
+        global_perms: bool,
     },
     SaveWorkspaceName {
         ws_index: usize,
@@ -2090,6 +2106,7 @@ pub(crate) struct SessionSettingsMut<'a> {
     pub burst_threshold: &'a mut String,
     pub hidden: &'a mut bool,
     pub notify_on_idle: &'a mut bool,
+    pub global_perms: &'a mut bool,
     pub active_field: &'a mut u8,
 }
 
@@ -2567,7 +2584,7 @@ pub(crate) fn handle_session_settings(
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 5;
+            *state.active_field = (*state.active_field + 1) % 6;
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') if *state.active_field == 3 => {
@@ -2576,6 +2593,10 @@ pub(crate) fn handle_session_settings(
         }
         KeyCode::Char(' ') if *state.active_field == 4 => {
             *state.notify_on_idle = !*state.notify_on_idle;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') if *state.active_field == 5 => {
+            *state.global_perms = !*state.global_perms;
             InputOutcome::Consumed
         }
         KeyCode::Enter => {
@@ -2596,6 +2617,7 @@ pub(crate) fn handle_session_settings(
                 burst_threshold: new_burst,
                 hidden: *state.hidden,
                 notify_on_idle: *state.notify_on_idle,
+                global_perms: *state.global_perms,
             })
         }
         KeyCode::Backspace => {
@@ -5341,6 +5363,9 @@ impl App {
             last_delivery: None,
             task_id: s.task_id.clone(),
             notify_on_idle: false,
+            // Carry the grant from the adopted daemon-owned session
+            // so the TUI's send_input auth agrees with the daemon.
+            global_perms: s.global_perms,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: s.managed_by_uid.clone(),
@@ -5373,6 +5398,7 @@ impl App {
             continuous_task_id: s.continuous_task_id.clone(),
             task_id: s.task_id.clone(),
             notify_on_idle: false,
+            global_perms: s.global_perms,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: host.clone(),
@@ -5753,6 +5779,7 @@ impl App {
             last_delivery: None,
             task_id: entry.task_id.clone(),
             notify_on_idle: entry.notify_on_idle,
+            global_perms: entry.global_perms,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: entry.managed_by_uid.clone(),
@@ -5866,6 +5893,7 @@ impl App {
             last_delivery: None,
             task_id: entry.task_id.clone(),
             notify_on_idle: entry.notify_on_idle,
+            global_perms: entry.global_perms,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: entry.managed_by_uid.clone(),
@@ -6501,6 +6529,7 @@ impl App {
                             },
                             hidden: ts.hidden,
                             notify_on_idle: ts.notify_on_idle,
+                            global_perms: ts.global_perms,
                             seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
                             active_field: 0,
                         };
@@ -8773,6 +8802,7 @@ impl App {
         label: &str,
         task_id: Option<String>,
         prompt: Option<&str>,
+        global_perms: bool,
     ) -> std::io::Result<String> {
         // 12e-r8 F1: derive the target host from the CALLER's
         // pinned host_id, NOT from `self.active_host`.
@@ -8913,6 +8943,7 @@ impl App {
             last_delivery: None,
             task_id,
             notify_on_idle: false,
+            global_perms,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: Some(caller_uid.to_string()),
@@ -8925,8 +8956,58 @@ impl App {
             host_id: caller_host.clone(),
         };
         self.workspaces[ws_index].sessions.push(ts);
+        // Mirror the grant onto the daemon-owned session so the
+        // daemon's Session-caller auth honors it (the TerminalSession
+        // flag above only covers TUI-routed methods like send_input).
+        // The escalation guard ran in `control::methods::start_session`
+        // before this call, so the grant here is already authorized.
+        if global_perms {
+            if let Some(socket) = self.host_pool.live_socket_path(&caller_host) {
+                if let Err(e) = crate::client_session::rpc_set_global_perms(
+                    &socket,
+                    crate::daemon_launch::operator_token(),
+                    &session_uid,
+                    true,
+                ) {
+                    self.set_status_msg(&format!(
+                        "spawned {} but failed to set global perms on the daemon: {}",
+                        session_uid, e,
+                    ));
+                }
+            }
+        }
         self.save_session_manifest();
         Ok(session_uid)
+    }
+
+    /// Grant or revoke a live session's global-permissions flag (the
+    /// operator path: A-e session settings). Updates the in-memory
+    /// `TerminalSession`, pushes the change to the session's host
+    /// daemon so its Session-caller auth honors it immediately, and
+    /// persists the manifest. Returns the new value, or an error
+    /// string for the status line.
+    pub fn set_session_global_perms(
+        &mut self,
+        uid: &str,
+        value: bool,
+    ) -> Result<bool, String> {
+        let (wi, si) = crate::control::methods::find_live_session(&self.workspaces, uid)
+            .ok_or_else(|| format!("session {} not found", uid))?;
+        let host = self.workspaces[wi].sessions[si].host_id.clone();
+        // Push to the daemon first so a failed RPC doesn't leave the
+        // TUI's view diverged from the daemon's auth state.
+        if let Some(socket) = self.host_pool.live_socket_path(&host) {
+            crate::client_session::rpc_set_global_perms(
+                &socket,
+                crate::daemon_launch::operator_token(),
+                uid,
+                value,
+            )
+            .map_err(|e| format!("daemon rejected global-perms change: {}", e))?;
+        }
+        self.workspaces[wi].sessions[si].global_perms = value;
+        self.save_session_manifest();
+        Ok(value)
     }
 
     /// Process planning editor events (non-blocking).
@@ -10397,6 +10478,7 @@ impl App {
                 burst_threshold,
                 hidden,
                 notify_on_idle,
+                global_perms,
                 seeded_from_snapshot: _,
                 active_field,
             } => handle_session_settings(
@@ -10408,6 +10490,7 @@ impl App {
                     burst_threshold,
                     hidden,
                     notify_on_idle,
+                    global_perms,
                     active_field,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids },
@@ -10653,7 +10736,14 @@ impl App {
                 burst_threshold,
                 hidden,
                 notify_on_idle,
+                global_perms,
             } => {
+                // Apply the plain fields in place, and capture the uid +
+                // whether the global-perms grant changed — the grant has
+                // to round-trip to the daemon (its Session-caller auth
+                // keys off the DaemonSession flag), so it can't be set by
+                // a local field assignment alone.
+                let mut perms_change: Option<(String, bool)> = None;
                 if let Some(ws) = self.workspaces.get_mut(ws_index) {
                     if let Some(ts) = ws.sessions.get_mut(session_index) {
                         if !name.trim().is_empty() {
@@ -10663,10 +10753,29 @@ impl App {
                         ts.burst_threshold = burst_threshold;
                         ts.hidden = hidden;
                         ts.notify_on_idle = notify_on_idle;
+                        if ts.global_perms != global_perms {
+                            perms_change = Some((ts.uid.clone(), global_perms));
+                        }
                     }
                 }
                 self.save_session_manifest();
-                self.set_status_msg("Settings saved");
+                match perms_change {
+                    Some((uid, value)) => {
+                        match self.set_session_global_perms(&uid, value) {
+                            Ok(true) => self.set_status_msg(
+                                "Settings saved — global permissions GRANTED",
+                            ),
+                            Ok(false) => self.set_status_msg(
+                                "Settings saved — global permissions revoked",
+                            ),
+                            Err(e) => self.set_status_msg(&format!(
+                                "Settings saved, but global-perms change failed: {}",
+                                e,
+                            )),
+                        }
+                    }
+                    None => self.set_status_msg("Settings saved"),
+                }
             }
             SubmitAction::SaveWorkspaceName { ws_index, name } => {
                 if !name.is_empty() {
@@ -11089,6 +11198,7 @@ impl App {
                         hidden: ts.hidden,
                         workflow_run_id: ts.workflow_run_id.clone(),
                         workflow_role: ts.workflow_role.clone(),
+                        global_perms: ts.global_perms,
                     });
                 }
             }
@@ -11611,6 +11721,7 @@ impl App {
             last_delivery: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
@@ -11819,6 +11930,7 @@ impl App {
             last_delivery: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
@@ -13584,7 +13696,7 @@ impl App {
                         *active_field,
                     );
                 }
-                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, seeded_from_snapshot, active_field, .. } => {
+                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, seeded_from_snapshot, active_field, .. } => {
                     self.draw_session_settings(
                         frame,
                         area,
@@ -13593,6 +13705,7 @@ impl App {
                         burst_threshold,
                         *hidden,
                         *notify_on_idle,
+                        *global_perms,
                         seeded_from_snapshot.as_deref(),
                         *active_field,
                     );
@@ -13945,14 +14058,16 @@ impl App {
         burst_threshold: &str,
         hidden: bool,
         notify_on_idle: bool,
+        global_perms: bool,
         seeded_from_snapshot: Option<&str>,
         active_field: u8,
     ) {
         let width = 55u16.min(area.width.saturating_sub(4));
         // Seeded-from line is a 2-line block (blank + "Seeded from: <name>")
         // only when the field is set; otherwise the dialog keeps its old
-        // size so the unrelated common case doesn't grow.
-        let height = if seeded_from_snapshot.is_some() { 17u16 } else { 15u16 };
+        // size so the unrelated common case doesn't grow. +2 rows for the
+        // global-perms field (blank + line).
+        let height = if seeded_from_snapshot.is_some() { 19u16 } else { 17u16 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -13983,6 +14098,16 @@ impl App {
         let hidden_style = if active_field == 3 { white } else { dim };
         let notify_marker = if notify_on_idle { "[x]" } else { "[ ]" };
         let notify_style = if active_field == 4 { white } else { dim };
+        let perms_marker = if global_perms { "[x]" } else { "[ ]" };
+        // Highlight the grant in yellow when on — it's a privileged,
+        // cross-session capability, not a routine toggle.
+        let perms_style = if active_field == 5 {
+            Style::default().fg(Color::Yellow)
+        } else if global_perms {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)
+        } else {
+            dim
+        };
 
         let mut lines = vec![
             Line::from(vec![
@@ -14013,6 +14138,19 @@ impl App {
                 Span::styled(" Notify on idle: ", dim),
                 Span::styled(notify_marker, notify_style),
                 Span::styled(if active_field == 4 { "  Space to toggle" } else { "" }, dim),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("   Global perms: ", dim),
+                Span::styled(perms_marker, perms_style),
+                Span::styled(
+                    if active_field == 5 {
+                        "  Space — control ANY session"
+                    } else {
+                        ""
+                    },
+                    dim,
+                ),
             ]),
         ];
 
@@ -16411,6 +16549,7 @@ mod stop_workflow_local_cleanup_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::local(),
@@ -16565,6 +16704,7 @@ mod manifest_entry_seeded_from_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: Some("reviewer-strict".into()),
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::local(),
@@ -16609,6 +16749,7 @@ mod manifest_entry_seeded_from_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::local(),
@@ -16668,6 +16809,7 @@ mod manifest_entry_seeded_from_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: Some(cm_daemon::manifest::LastExit {
                 code: Some(137),
@@ -16729,6 +16871,7 @@ mod manifest_entry_seeded_from_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: Some(stored_exit.clone()),
             host_id: cm_daemon::host_id::HostId::local(),
@@ -16772,6 +16915,7 @@ mod manifest_entry_seeded_from_tests {
             continuous_task_id: None,
             task_id: loaded.task_id.clone(),
             notify_on_idle: loaded.notify_on_idle,
+            global_perms: loaded.global_perms,
             seeded_from_snapshot: loaded.seeded_from_snapshot.clone(),
             last_exit: preserved_last_exit.clone(),
             host_id: loaded.host_id.clone(),
@@ -17813,6 +17957,7 @@ mod transcript_rebind_tests {
             task_id: None,
             last_delivery: None,
             notify_on_idle: false,
+            global_perms: false,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
@@ -17966,6 +18111,7 @@ mod rotation_binding_tests {
             task_id: None,
             last_delivery: None,
             notify_on_idle: false,
+            global_perms: false,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
@@ -19252,6 +19398,7 @@ mod pending_workflow_events_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::new("manager"),
@@ -19438,6 +19585,7 @@ mod pending_workflow_events_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::new("manager"),
@@ -19621,6 +19769,7 @@ mod pending_workflow_events_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::new("manager"),
@@ -19749,6 +19898,7 @@ mod pending_workflow_events_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             // Unknown host → host_pool.for_host returns Err.
@@ -19861,6 +20011,7 @@ mod pending_workflow_events_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::new("manager"),
@@ -20175,6 +20326,7 @@ mod pending_workflow_events_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: cm_daemon::host_id::HostId::new("manager"),
@@ -20498,6 +20650,7 @@ mod remote_reconnect_tests {
             task_id: None,
             last_delivery: None,
             notify_on_idle: false,
+            global_perms: false,
             pending_enter: None,
             created_at: Instant::now(),
             managed_by_uid: None,
@@ -21265,6 +21418,7 @@ mod adopt_daemon_session_tests {
             continuous_task_id: None,
             cols: None,
             rows: None,
+            global_perms: false,
         }
     }
 
@@ -22979,6 +23133,7 @@ mod input_handler_tests {
     fn session_settings_tab_cycles_active_field() {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
+            let mut gp = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
                 ws_index: 1,
@@ -22988,6 +23143,7 @@ mod input_handler_tests {
                 burst_threshold: &mut burst,
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
+                global_perms: &mut gp,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -23001,6 +23157,7 @@ mod input_handler_tests {
     fn session_settings_backspace_pops_name_when_field_zero() {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
+            let mut gp = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
                 ws_index: 0,
@@ -23010,6 +23167,7 @@ mod input_handler_tests {
                 burst_threshold: &mut burst,
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
+                global_perms: &mut gp,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -23023,6 +23181,7 @@ mod input_handler_tests {
     fn session_settings_space_toggles_hidden_when_field_three() {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(3);
+            let mut gp = false;
         hidden = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
@@ -23033,6 +23192,7 @@ mod input_handler_tests {
                 burst_threshold: &mut burst,
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
+                global_perms: &mut gp,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -23046,6 +23206,7 @@ mod input_handler_tests {
     fn session_settings_enter_submits_save() {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
+            let mut gp = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
                 ws_index: 4,
@@ -23055,6 +23216,7 @@ mod input_handler_tests {
                 burst_threshold: &mut burst,
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
+                global_perms: &mut gp,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -23069,6 +23231,7 @@ mod input_handler_tests {
                 burst_threshold,
                 hidden,
                 notify_on_idle,
+                global_perms: _,
             }) => {
                 assert_eq!(ws_index, 4);
                 assert_eq!(session_index, 9);
@@ -23350,6 +23513,7 @@ mod input_handler_tests {
                 task_id: None,
                 last_delivery: None,
                 notify_on_idle: false,
+                global_perms: false,
                 pending_enter: None,
                 created_at: Instant::now(),
                 managed_by_uid: None,
@@ -26119,6 +26283,7 @@ mod slice_12e_tests {
             "test-label",
             None,
             None,
+            false,
         );
         match result {
             Err(e) => {
@@ -26413,6 +26578,7 @@ mod slice_12e_tests {
             continuous_task_id: None,
             task_id: None,
             notify_on_idle: false,
+            global_perms: false,
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: HostId::local(),
@@ -26435,6 +26601,7 @@ mod slice_12e_tests {
             seeded_from_snapshot: Some("snap1".into()),
             last_exit: None,
             host_id: HostId::new("manager"),
+            global_perms: false,
         };
         let ws = ManifestWorkspace {
             id: "ws-acc".into(),

@@ -166,7 +166,20 @@ When the MCP server receives a tool call, it includes its `CM_TUI_SESSION_ID` in
 - **`create_subtask` from a taskless caller**: errors. Subtasks need a parent task. The taskless agent should call `propose_task` instead to add a top-level task (existing tool, unchanged).
 - **Resolve transcript path for session S**: same workspace-or-task rule as above. Returns `{state, engine, transcript_path, generation}` (full contract in the Architecture section). `transcript_path` is `null` when `state == "pending"`; resolution falls back to the workspace's tombstone list when `state == "exited"`.
 
-There's no global access. An agent can't see or touch unrelated work.
+By default there's no global access — an agent can't see or touch unrelated work. The one exception is **global-permissions** sessions (below).
+
+#### Global permissions
+
+A session may carry a **`global_perms`** flag. When set, that session's caller short-circuits the scope rule above to authorized for **any** target: it can `list_sessions` across every task and workspace, and `send_input` / `read_session_output` / `kill_session` / `start_session` against any session — not just its task-tree descendants. This is the "privileged orchestrator" capability for an agent meant to supervise unrelated work.
+
+The flag lives on the session record on both sides of the auth split: `DaemonSession.global_perms` (daemon — gates daemon-routed `kill_session` / `read_session_output` / `list_sessions` / `start_session`) and `TerminalSession.global_perms` (TUI — gates the TUI-routed `send_input`). It persists in the manifest (`ManifestEntry.global_perms`) so the grant survives restart, and is checked in `daemon/src/control/auth.rs::check_session_caller` (short-circuit to `Allow`) and its TUI mirror `tui/src/control/methods.rs::caller_authorized_for`.
+
+Granting (two paths, both gated so a normal agent can never self-escalate):
+
+- **Operator (human)**: toggle "Global perms" in the A-e session-settings dialog. The TUI updates the live `DaemonSession` via the operator-only `session.set_global_perms` RPC and persists the manifest. This is also the bootstrap path for the first global agent.
+- **Agent propagation**: a session that is *already* global may pass `global_perms=true` to `start_session` to mint a global child. The daemon's `mcp_start_session` enforces an **escalation guard** — the grant is honored only if the caller itself is global; otherwise `unauthorized`. A non-global agent therefore cannot create a privileged child to escape its own scope.
+
+Like the rest of this model, `global_perms` is an **accidental-misuse guardrail, not a security boundary** (same-user processes can already impersonate each other — see the soft-token note above). Its job is to let a deliberately-privileged orchestrator reach across the session graph while keeping ordinary agents scoped. The prompt-level convention still applies: a global agent should state its intent and ask the user before driving unrelated sessions.
 
 ---
 

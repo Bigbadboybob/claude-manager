@@ -64,6 +64,12 @@ pub struct ExitedTombstone {
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
     pub worktree_path: Option<String>,
+    /// Global-perms grant the session carried while live. Kept on
+    /// the tombstone so the enriched `list_sessions(include_exited)`
+    /// output reports the same `global_perms` field for exited
+    /// sessions as for live ones (auth itself keys off the live
+    /// caller, never the tombstone).
+    pub global_perms: bool,
     pub exited_at: f64,
 }
 
@@ -533,6 +539,13 @@ pub struct TuiSessionSnapshot {
     pub workflow_run_id: Option<String>,
     #[serde(default)]
     pub workflow_role: Option<String>,
+    /// Global-permissions grant for this TUI-minted session, pushed
+    /// by the TUI's `tui.update_sessions_snapshot`. Lets the
+    /// daemon's unified view report the grant for TUI-owned
+    /// sessions too. `#[serde(default)]` keeps older pushes (no
+    /// field) loading as `false`.
+    #[serde(default)]
+    pub global_perms: bool,
 }
 
 /// 10d-1: unified session view used by future workflow-
@@ -552,6 +565,9 @@ pub struct SessionViewAny {
     pub workspace_id: Option<String>,
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
+    /// Global-permissions grant from whichever map the session was
+    /// found in.
+    pub global_perms: bool,
 }
 
 impl Default for DaemonState {
@@ -694,6 +710,7 @@ impl DaemonState {
                 workspace_id: Some(daemon_sess.workspace_id.clone()),
                 workflow_run_id: daemon_sess.workflow_run_id.clone(),
                 workflow_role: daemon_sess.workflow_role.clone(),
+                global_perms: daemon_sess.global_perms,
             });
         }
         if let Some(tui_sess) = self.tui_sessions.get(uid) {
@@ -704,6 +721,7 @@ impl DaemonState {
                 workspace_id: None,
                 workflow_run_id: tui_sess.workflow_run_id.clone(),
                 workflow_role: tui_sess.workflow_role.clone(),
+                global_perms: tui_sess.global_perms,
             });
         }
         None
@@ -743,6 +761,7 @@ mod tests {
             workflow_run_id: None,
             workflow_role: None,
             worktree_path: None,
+            global_perms: false,
             exited_at: 0.0,
         }
     }
@@ -796,6 +815,7 @@ mod tests {
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: crate::host_id::HostId::local(),
+            global_perms: false,
         }
     }
 

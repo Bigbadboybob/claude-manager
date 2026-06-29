@@ -410,12 +410,24 @@ def get_current_task() -> dict:
 
 @mcp.tool()
 def ping() -> dict:
-    """Check connectivity to the host TUI's control socket.
+    """Check connectivity AND learn who you are: your own identity, scope,
+    and permissions.
 
-    Returns the TUI's pong response, including the `session_uid` it sees
-    you as. Useful as a smoke test that the agent's MCP env was wired up
-    correctly (CM_TUI_SESSION_ID + CM_TUI_SOCKET must be set by the TUI
-    at spawn time).
+    Returns the host's pong response:
+        {pong, uid, caller_kind,
+         global_perms: bool,        # ← do you have global permissions?
+         task_id: str | null,       # ← the task you're bound to (if any)
+         workspace_id: str | null}  # ← the workspace you live in
+
+    `global_perms` is the one to check before you try to drive another
+    task's sessions: when true, you can prompt / read / kill / spawn
+    against ANY session anywhere (see `list_sessions`), not just your own
+    task tree. When false you're scoped to your task tree (or, if you
+    have no task, your workspace).
+
+    Also a smoke test that the agent's MCP env was wired up correctly
+    (CM_TUI_SESSION_ID + CM_DAEMON_SOCKET/CM_TUI_SOCKET must be set by
+    the host at spawn time).
     """
     try:
         return control_client.call("ping")
@@ -429,36 +441,14 @@ def ping() -> dict:
 # and `_READ_ALL_LIMIT` are imported from `mcp_server.monitor` (top of file).
 
 
-@mcp.tool()
-def list_sessions(
-    task_id: str | None = None,
-    include_exited: bool = False,
-) -> list[dict]:
-    """List sessions visible to you (your own task tree, or your whole
-    workspace if you have no task).
-
-    Args:
-        task_id: Optional explicit task scope. Leave unset to use the
-            default (your task, or whole workspace if taskless). A taskless
-            caller passing `task_id` gets `unauthorized`.
-        include_exited: When true, also include closed sessions
-            (state=`exited`). Default false. Read-after-exit still
-            works via `read_session_output` regardless of this flag.
-
-    Returns: list of {session_uid, label, type, state, idle, status,
-        managed_by_uid}.
-        state ∈ {"ready", "pending", "exited"}.
-        status ∈ {"starting", "working", "awaiting_input", "exited"} —
-            the legible summary of (state, idle); branch on this instead
-            of decoding the pair yourself. See the status legend on
-            `wait_for_session_idle`.
-    """
+def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
+    """Shared implementation behind `list_sessions` and
+    `list_sessions_grouped`: call the host, then enrich each entry with
+    the legible `status` word."""
     params: dict = {"include_exited": include_exited}
     if task_id:
         params["task_id"] = task_id
     sessions = control_client.call("list_sessions", params)
-    # Enrich each entry with the legible `status` derived from the
-    # daemon's raw (state, idle) — one word agents can branch on.
     for s in sessions:
         s["status"] = _session_status(
             s.get("state", "pending"), bool(s.get("idle", False))
@@ -467,11 +457,127 @@ def list_sessions(
 
 
 @mcp.tool()
+def list_sessions(
+    task_id: str | None = None,
+    include_exited: bool = False,
+) -> list[dict]:
+    """List sessions visible to you.
+
+    Scope: your own task tree (or your whole workspace if you have no
+    task). If you hold global permissions (check `ping().global_perms`),
+    this returns EVERY session across all tasks and workspaces. For a
+    readable tree grouped by workspace → task, use
+    `list_sessions_grouped` instead.
+
+    Args:
+        task_id: Optional explicit task scope. Leave unset for the default
+            (your task tree, or whole workspace if taskless; everything if
+            you're global). A non-global taskless caller passing `task_id`
+            gets `unauthorized`.
+        include_exited: When true, also include closed sessions
+            (state=`exited`). Default false. Read-after-exit still
+            works via `read_session_output` regardless of this flag.
+
+    Returns: list of per-session dicts:
+        {session_uid, label, type, state, idle, status, managed_by_uid,
+         task_id, workspace_id, workflow_run_id, workflow_role,
+         global_perms}
+        state ∈ {"ready", "pending", "exited"}.
+        status ∈ {"starting", "working", "awaiting_input", "exited"} —
+            the legible summary of (state, idle); branch on this instead
+            of decoding the pair yourself. See the status legend on
+            `wait_for_session_idle`.
+        managed_by_uid: the session that spawned this one (None if
+            operator-spawned) — the parent link for orchestration.
+        task_id / workspace_id: grouping keys (see `list_sessions_grouped`).
+        global_perms: true if THIS session is a privileged orchestrator.
+    """
+    return _list_sessions_raw(task_id, include_exited)
+
+
+@mcp.tool()
+def list_sessions_grouped(
+    task_id: str | None = None,
+    include_exited: bool = False,
+) -> dict:
+    """List visible sessions as a tree grouped by workspace → task — the
+    readable companion to `list_sessions`.
+
+    Use this when you're orchestrating across more than one task or
+    workspace (the common case once you hold global permissions) and want
+    the structure handed to you instead of bucketing a flat list yourself.
+
+    Args: same as `list_sessions`.
+
+    Returns:
+        {
+          "you": {                      # your own identity + scope
+             "session_uid", "task_id", "workspace_id", "global_perms"
+          },
+          "total": <int>,               # session count across all groups
+          "workspaces": [
+             {
+               "workspace_id": str | null,
+               "tasks": [
+                  {
+                    "task_id": str | null,   # null = taskless sessions
+                    "sessions": [ <same per-session dicts as list_sessions> ]
+                  }, ...
+               ]
+             }, ...
+          ]
+        }
+
+    Sessions with no workspace_id (e.g. some host-owned snapshots) land
+    under a `workspace_id: null` group; taskless sessions under a
+    `task_id: null` task within their workspace.
+    """
+    sessions = _list_sessions_raw(task_id, include_exited)
+
+    # Self-context so the agent can see at a glance whether it's
+    # privileged and where it sits — saves a separate ping().
+    try:
+        me = control_client.call("ping")
+        you = {
+            "session_uid": me.get("uid"),
+            "task_id": me.get("task_id"),
+            "workspace_id": me.get("workspace_id"),
+            "global_perms": bool(me.get("global_perms", False)),
+        }
+    except (control_client.ControlError, control_client.TransportError):
+        you = None
+
+    # Group by workspace_id, then task_id, preserving first-seen order so
+    # the output is stable across calls.
+    ws_order: list[str | None] = []
+    by_ws: dict[str | None, dict[str | None, list[dict]]] = {}
+    for s in sessions:
+        ws = s.get("workspace_id")
+        tid = s.get("task_id")
+        if ws not in by_ws:
+            by_ws[ws] = {}
+            ws_order.append(ws)
+        task_buckets = by_ws[ws]
+        task_buckets.setdefault(tid, []).append(s)
+
+    workspaces = []
+    for ws in ws_order:
+        tasks = [
+            {"task_id": tid, "sessions": sess}
+            for tid, sess in by_ws[ws].items()
+        ]
+        workspaces.append({"workspace_id": ws, "tasks": tasks})
+
+    return {"you": you, "total": len(sessions), "workspaces": workspaces}
+
+
+@mcp.tool()
 def start_session(
     type: str,
     label: str,
     prompt: str = "",
     task_id: str | None = None,
+    global_perms: bool = False,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -489,19 +595,30 @@ def start_session(
             activation flow uses). For a bash session this is just a
             command line.
         task_id: Optional task to bind to. Omitted = your own task (if
-            any) or no task. Cross-task binding is rejected.
+            any) or no task. Cross-task binding is rejected — UNLESS you
+            hold global permissions, in which case you may bind the child
+            to any task.
+        global_perms: Grant the new session global permissions (it can
+            then prompt/read/control ANY session). **Only honored if YOU
+            already hold global permissions** (check `ping().global_perms`);
+            a non-global caller passing this gets `unauthorized`. This is
+            how a privileged orchestrator spins up more privileged
+            workers. Leave false for ordinary, scoped children.
 
     Returns: {"session_uid": "<uid>"} for the freshly-spawned session.
 
     State your intent in plain language and ask the user to confirm
     before calling this tool. The user expects to be in the loop on
-    every spawn.
+    every spawn — doubly so when `global_perms=true`, which mints a child
+    that can reach across the whole session graph.
     """
     params: dict = {"type": type, "label": label}
     if prompt:
         params["prompt"] = prompt
     if task_id:
         params["task_id"] = task_id
+    if global_perms:
+        params["global_perms"] = True
     # Sub-2c review-2: single-decision binding (restoring the
     # round-8 #2 fix). `resolve_socket_route()` is called ONCE
     # to get both the chosen path AND the route-chose-daemon

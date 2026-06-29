@@ -1897,6 +1897,7 @@ mod tests {
                     hidden: false,
                     workflow_run_id: Some("r1".to_string()),
                     workflow_role: Some("worker".to_string()),
+                    global_perms: false,
                 },
             );
             s.tui_sessions_pushed = true;

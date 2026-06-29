@@ -358,6 +358,13 @@ pub struct ManifestEntry {
     pub task_id: Option<String>,
     #[serde(default)]
     pub notify_on_idle: bool,
+    /// Global-permissions grant for this session (see
+    /// `crate::session::DaemonSession::global_perms`). Persisted so
+    /// a privileged orchestrator keeps its grant across TUI/daemon
+    /// restart. `#[serde(default)]` keeps pre-existing manifests
+    /// (no field) loading as `false` — the safe baseline.
+    #[serde(default)]
+    pub global_perms: bool,
     /// Name of the agent-memory snapshot this session was cloned from, if
     /// any. Informational provenance only — used to surface "Seeded from:
     /// <name>" in session info. See DESIGN_AGENT_MEMORIES.md.
@@ -810,6 +817,7 @@ mod tests {
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: crate::host_id::HostId::new("manager"),
+            global_perms: false,
         };
         let s = serde_json::to_string(&entry).expect("serialize");
         assert!(
@@ -911,6 +919,7 @@ mod tests {
             seeded_from_snapshot: None,
             last_exit: None,
             host_id: crate::host_id::HostId::local(),
+            global_perms: false,
         };
         let s = serde_json::to_string(&tagged).expect("serialize");
         assert!(

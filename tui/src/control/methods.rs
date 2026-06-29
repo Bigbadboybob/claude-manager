@@ -89,6 +89,14 @@ pub fn locate_target(workspaces: &[Workspace], uid: &str) -> Option<TargetLocati
 pub struct CallerCtx {
     pub workspace_index: Option<usize>,
     pub task_id: Option<String>,
+    /// Global-permissions grant. When true, `caller_authorized_for`
+    /// short-circuits to authorized for ANY target, mirroring the
+    /// daemon's `auth::check_session_caller` global short-circuit.
+    /// Always false for tombstoned callers — a closed session can't
+    /// mutate anything, and reverting its read scope to descendant-
+    /// only on close is the safe default (we don't persist the grant
+    /// on the tombstone).
+    pub global_perms: bool,
     /// True when the caller is a tombstoned (already-closed) session.
     /// Read methods can still serve such callers — that's the whole
     /// point of Phase 2b retention. Mutating methods MUST refuse them
@@ -105,6 +113,7 @@ pub fn caller_ctx_or_tombstone(workspaces: &[Workspace], caller_uid: &str) -> Op
         return Some(CallerCtx {
             workspace_index: Some(wi),
             task_id: workspaces[wi].sessions[si].task_id.clone(),
+            global_perms: workspaces[wi].sessions[si].global_perms,
             is_tombstone: false,
         });
     }
@@ -112,6 +121,8 @@ pub fn caller_ctx_or_tombstone(workspaces: &[Workspace], caller_uid: &str) -> Op
         return Some(CallerCtx {
             workspace_index: Some(wi),
             task_id: workspaces[wi].tombstones[ti].task_id.clone(),
+            // Tombstoned callers never carry the grant (see CallerCtx doc).
+            global_perms: false,
             is_tombstone: true,
         });
     }
@@ -129,6 +140,7 @@ pub fn live_caller_ctx(
         return Ok(CallerCtx {
             workspace_index: Some(wi),
             task_id: workspaces[wi].sessions[si].task_id.clone(),
+            global_perms: workspaces[wi].sessions[si].global_perms,
             is_tombstone: false,
         });
     }
@@ -163,6 +175,12 @@ pub fn caller_authorized_for(
     let Some(caller_wi) = caller.workspace_index else {
         return false;
     };
+    // Global-perms grant: authorized for any target. Mirrors the
+    // daemon's `auth::check_session_caller` short-circuit so the TUI
+    // and daemon agree on who can act on what.
+    if caller.global_perms {
+        return true;
+    }
     match &caller.task_id {
         Some(task_id) => target_task_id
             .map(|tid| task_is_self_or_descendant_of(tasks, tid, task_id))
@@ -518,32 +536,39 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
 
     // Resolve scope: explicit task_id must be authorized (caller's own
     // or a descendant). Default = whatever the caller can see by auth.
+    // Global callers may scope to any task and otherwise see every
+    // session (no implicit own-task scope) — mirrors the daemon.
     if let Some(req) = p.task_id.as_deref() {
-        match caller.task_id.as_deref() {
-            None => {
-                // Taskless caller passing a task_id: unauthorized.
-                return Err((
-                    ErrorCode::Unauthorized,
-                    format!("taskless caller cannot scope to task {}", req),
-                ));
-            }
-            Some(own) => {
-                if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+        if !caller.global_perms {
+            match caller.task_id.as_deref() {
+                None => {
+                    // Taskless caller passing a task_id: unauthorized.
                     return Err((
                         ErrorCode::Unauthorized,
-                        format!(
-                            "task {} is not the caller's task or a descendant",
-                            req
-                        ),
+                        format!("taskless caller cannot scope to task {}", req),
                     ));
+                }
+                Some(own) => {
+                    if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                        return Err((
+                            ErrorCode::Unauthorized,
+                            format!(
+                                "task {} is not the caller's task or a descendant",
+                                req
+                            ),
+                        ));
+                    }
                 }
             }
         }
     }
-    let scope_task: Option<String> = p
-        .task_id
-        .clone()
-        .or_else(|| caller.task_id.clone());
+    let scope_task: Option<String> = p.task_id.clone().or_else(|| {
+        if caller.global_perms {
+            None
+        } else {
+            caller.task_id.clone()
+        }
+    });
 
     // Iterate every workspace — branch-mode subtasks live in their own
     // workspace different from the caller's, but they're still within
@@ -587,6 +612,14 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             "state": runtime.kind.as_wire(),
             "idle": runtime.idle,
             "managed_by_uid": ts.managed_by_uid,
+            // Grouping + perms metadata (parity with the daemon's
+            // list_sessions): lets the MCP layer group by
+            // workspace→task and flag privileged sessions.
+            "task_id": ts.task_id,
+            "workspace_id": ws.id,
+            "workflow_run_id": ts.workflow_run_id,
+            "workflow_role": ts.workflow_role,
+            "global_perms": ts.global_perms,
         }));
     }
         if p.include_exited {
@@ -608,6 +641,10 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                     "state": "exited",
                     "idle": Value::Null,
                     "managed_by_uid": tomb.managed_by_uid,
+                    "task_id": tomb.task_id,
+                    "workspace_id": ws.id,
+                    // Tombstones don't persist the grant — report false.
+                    "global_perms": false,
                 }));
             }
         }
@@ -788,6 +825,11 @@ struct StartSessionParams {
     label: String,
     #[serde(default)]
     prompt: Option<String>,
+    /// Grant the spawned child global perms. Honored only when the
+    /// caller is itself global (escalation guard) — mirrors the
+    /// daemon's `mcp_start_session`.
+    #[serde(default)]
+    global_perms: bool,
 }
 
 pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
@@ -804,10 +846,21 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     let Some(caller_wi) = caller.workspace_index else {
         return Err((ErrorCode::NotFound, "caller session not found".into()));
     };
+    // Global-perms escalation guard: only a global caller may grant
+    // global perms to a child. Mirrors the daemon.
+    if p.global_perms && !caller.global_perms {
+        return Err((
+            ErrorCode::Unauthorized,
+            "global_perms requires the caller to itself hold global \
+             permissions (escalation guard)".into(),
+        ));
+    }
     // task_id resolution. Allows binding to the caller's own task or
     // any descendant in the parent_task_id tree. Cross-task binding
-    // outside the descendant tree is unauthorized.
+    // outside the descendant tree is unauthorized — UNLESS the caller
+    // is global, in which case it can bind the child to any task.
     let task_id_for_new: Option<String> = match (p.task_id.as_deref(), caller.task_id.as_deref()) {
+        (Some(req), _) if caller.global_perms => Some(req.to_string()),
         (Some(req), None) => {
             return Err((
                 ErrorCode::Unauthorized,
@@ -851,6 +904,7 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         &p.label,
         task_id_for_new,
         p.prompt.as_deref(),
+        p.global_perms,
     )
     .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
     Ok(json!({"session_uid": new_uid}))
@@ -1945,6 +1999,7 @@ mod tests {
             seeded_from_snapshot: None,
             preserved_last_exit: None,
             host_id: crate::hosts::HostId::local(),
+            global_perms: false,
         }
     }
 
@@ -2357,8 +2412,29 @@ mod tests {
         CallerCtx {
             workspace_index: Some(0),
             task_id: Some(task.into()),
+            global_perms: false,
             is_tombstone: false,
         }
+    }
+
+    /// Global-perms grant: `caller_authorized_for` short-circuits to
+    /// authorized for ANY target (here a session in a different
+    /// workspace whose task is unrelated to the caller's), mirroring
+    /// the daemon's `auth::check_session_caller`. A non-global caller
+    /// with the same shape is denied.
+    #[test]
+    fn caller_authorized_for_global_caller_reaches_unrelated_target() {
+        let tasks = vec![
+            task_with_parent("A", None, "a"),
+            task_with_parent("B", None, "b"), // unrelated task
+        ];
+        let mut caller = caller_with_task("A");
+        caller.global_perms = true;
+        // target_wi=9 (a different workspace), target task "B" (unrelated).
+        assert!(caller_authorized_for(&caller, &tasks, 9, Some("B")));
+        // Non-global caller with the identical shape is denied.
+        let plain = caller_with_task("A");
+        assert!(!caller_authorized_for(&plain, &tasks, 9, Some("B")));
     }
 
     #[test]
@@ -2482,6 +2558,7 @@ mod tests {
             workspace_index: Some(0),
             task_id: None,
             is_tombstone: false,
+            global_perms: false,
         };
         assert!(!workflow_run_authorized(&caller, &tasks, &run));
     }

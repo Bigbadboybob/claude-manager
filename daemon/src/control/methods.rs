@@ -346,6 +346,13 @@ struct StartSessionParams {
     /// the workflow tags. See DESIGN_CONTINUOUS_TASKS.md §6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     continuous_task_id: Option<String>,
+    /// Global-permissions grant for the spawned session. The TUI
+    /// (operator caller) sets this when the human marks a session
+    /// global; `mcp_start_session` (agent caller) gates it behind
+    /// the caller's own grant. Plumbed onto `DaemonSession.global_perms`
+    /// and persisted in the manifest. Defaults to `false`.
+    #[serde(default)]
+    global_perms: bool,
 }
 
 fn default_session_type() -> String {
@@ -608,6 +615,11 @@ pub(crate) fn start_session_with_spawn_fn(
     // Phase-1 continuous wire field: carry the continuous-task tag
     // onto the DaemonSession. `None` for ordinary spawns.
     spawn_params.continuous_task_id = p.continuous_task_id.clone();
+    // Global-perms grant. This RPC is operator-only (the TUI), so
+    // the value is trusted here — the human (or a TUI flow acting
+    // for the human) is the authority on who gets global perms. The
+    // agent-facing escalation guard lives in `mcp_start_session`.
+    spawn_params.global_perms = p.global_perms;
     spawn_params.args = p.argv[1..].to_vec();
     spawn_params.working_dir = Some(working_dir);
     spawn_params.cols = p.cols;
@@ -1122,6 +1134,7 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             workflow_run_id: sess.workflow_run_id.clone(),
             workflow_role: sess.workflow_role.clone(),
             worktree_path,
+            global_perms: sess.global_perms,
             exited_at,
         }
     });
@@ -1748,15 +1761,30 @@ pub fn list_sessions(
     };
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
 
+    // Global-permissions grant: a global caller sees EVERY session
+    // (across all tasks and workspaces), not just its task-tree
+    // slice. Computed once here and consulted in the scope-auth
+    // gate, the default-scope resolution, and the per-session
+    // include filter below.
+    let caller_is_global = caller_uid
+        .and_then(|cuid| state.sessions.get(cuid))
+        .map(|s| s.global_perms)
+        .unwrap_or(false);
+
     // Sub-2a Finding #3: authorize the requested task scope
     // BEFORE iterating. Mirrors
     // `tui/src/control/methods.rs:498-521`:
     //   - Operator caller: no restriction.
+    //   - Global Session caller: no restriction (any task scope ok).
     //   - Taskless Session caller + explicit task_id: Unauthorized.
     //   - Tasked Session caller + explicit task_id: must be
     //     self-or-descendant of caller's task.
     if let Some(req_task) = p.task_id.as_deref() {
         if let Some(cuid) = caller_uid {
+            if caller_is_global {
+                // Global caller may scope to any task — skip the
+                // descendant/taskless gates entirely.
+            } else {
             let caller = state.sessions.get(cuid).ok_or_else(|| {
                 (
                     ErrorCode::Unauthorized,
@@ -1789,6 +1817,7 @@ pub fn list_sessions(
                     }
                 }
             }
+            }
         }
     }
 
@@ -1796,8 +1825,13 @@ pub fn list_sessions(
     // caller's own task (for Session callers). Operator callers
     // with no param have `scope_task = None` and see all
     // sessions; Operator callers WITH `task_id` filter to that
-    // subtree.
+    // subtree. Global Session callers behave like Operators here —
+    // no implicit own-task scope, so they default to seeing every
+    // session.
     let scope_task: Option<String> = p.task_id.clone().or_else(|| {
+        if caller_is_global {
+            return None;
+        }
         caller_uid
             .and_then(|cuid| state.sessions.get(cuid))
             .and_then(|s| s.task_id.clone())
@@ -1810,6 +1844,25 @@ pub fn list_sessions(
     // the current scope_task / caller_uid context? Used by both
     // the daemon-owned and TUI-owned loops below.
     let should_include = |uid: &str, task_id: Option<&str>| -> bool {
+        // Global caller: see everything. Honor an explicit task
+        // scope if one was passed, otherwise include unconditionally.
+        // (Routing a global caller through `check_session_caller`
+        // below would wrongly exclude TUI-owned targets that aren't
+        // in `state.sessions` — TargetNotInRegistry.)
+        if caller_is_global {
+            return match scope_task.as_deref() {
+                Some(scope) => task_id
+                    .map(|t| {
+                        crate::control::auth::task_is_self_or_descendant_of(
+                            &state.task_tree,
+                            t,
+                            scope,
+                        )
+                    })
+                    .unwrap_or(false),
+                None => true,
+            };
+        }
         match (scope_task.as_deref(), caller_uid) {
             // Explicit scope (param OR caller's task): include
             // only sessions whose task_id is self-or-descendant
@@ -1853,6 +1906,10 @@ pub fn list_sessions(
             "state": state_str,
             "idle": idle,
             "managed_by_uid": session.managed_by_uid,
+            // Global-permissions grant — surfaced so an agent (and
+            // the grouped MCP view) can tell which sessions are
+            // privileged orchestrators.
+            "global_perms": session.global_perms,
             // Adoption metadata (Part 1): lets the TUI surface
             // agent-spawned sessions in the sidebar, grouped under their
             // task/workspace. All already live on `DaemonSession`;
@@ -1925,6 +1982,15 @@ pub fn list_sessions(
             "state": "ready",
             "idle": false,
             "managed_by_uid": Value::Null,
+            // Task / workflow context from the TUI snapshot so the
+            // grouped MCP view can place TUI-owned sessions under
+            // their task. `workspace_id` isn't carried in the
+            // snapshot (TUI-owned), so it's null here.
+            "task_id": snap.task_id,
+            "workspace_id": Value::Null,
+            "workflow_run_id": snap.workflow_run_id,
+            "workflow_role": snap.workflow_role,
+            "global_perms": snap.global_perms,
         }));
     }
     // Recently-exited sessions, included only when the caller opts in
@@ -2390,6 +2456,64 @@ pub fn set_workflow_context(
         "ok": true,
         "daemon_owned": true,
     }))
+}
+
+// ============================================================
+// session.set_global_perms (global-perms feature)
+// ============================================================
+//
+// Operator-only RPC the TUI uses to grant or revoke a live
+// session's global-permissions flag — the human grant path (A-e
+// session settings toggle, and the post-spawn grant for an
+// operator who marks a session global at creation). Mutates
+// `DaemonSession.global_perms` so the daemon's Session-caller auth
+// (`auth::check_session_caller`) honors the change immediately for
+// already-running agents; no respawn needed.
+//
+// **Caller**: Operator only. A Session caller must NOT be able to
+// flip its own (or anyone's) grant — that would be a trivial
+// self-escalation, defeating the whole descendant-only model. The
+// only agent-side path to global perms is `mcp_start_session`'s
+// escalation-guarded spawn param (caller must already be global).
+//
+// Wire shape:   { uid: <session_uid>, global_perms: <bool> }
+// Response:     { ok: true, daemon_owned: bool }
+//
+// `daemon_owned: false` mirrors `set_workflow_context`: a no-op
+// success for a uid the daemon doesn't own (e.g. a TUI-local
+// session), so the TUI can fire this without branching.
+
+#[derive(Deserialize)]
+struct SetGlobalPermsParams {
+    uid: String,
+    global_perms: bool,
+}
+
+pub fn set_global_perms(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: SetGlobalPermsParams = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("session.set_global_perms params: {}", e),
+            )
+        })?;
+    if p.uid.trim().is_empty() {
+        return Err((
+            ErrorCode::InvalidParams,
+            "session.set_global_perms: 'uid' is required".into(),
+        ));
+    }
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    match state.sessions.get_mut(&p.uid) {
+        Some(s) => {
+            s.global_perms = p.global_perms;
+            Ok(json!({ "ok": true, "daemon_owned": true }))
+        }
+        None => Ok(json!({ "ok": true, "daemon_owned": false })),
+    }
 }
 
 /// Map daemon-side `session_type` (`"claude-code"` / `"codex"` /
@@ -5451,6 +5575,14 @@ struct McpStartSessionParams {
     prompt: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
+    /// Grant the spawned child global permissions. **Escalation
+    /// guard**: honored only when the CALLER is itself global — a
+    /// normal agent requesting `global_perms=true` here gets
+    /// `Unauthorized`. This is the one path by which global perms
+    /// propagate agent-to-agent; the operator's `start_session`
+    /// RPC is the other (human) grant path. Defaults to `false`.
+    #[serde(default)]
+    global_perms: bool,
 }
 
 /// Kitty keyboard Enter (CSI 13 u). codex and claude-code both enable the
@@ -5707,6 +5839,19 @@ pub fn mcp_start_session(
             ErrorCode::Unauthorized,
             format!("caller session '{}' not in daemon registry", cuid),
         ))?;
+        // Global-perms escalation guard: a caller may grant the new
+        // child global perms ONLY if the caller is itself global.
+        // This is the agent-to-agent propagation path the design
+        // allows; a normal agent cannot mint a privileged child to
+        // escape its own descendant-only scope.
+        if p.global_perms && !caller.global_perms {
+            return Err((
+                ErrorCode::Unauthorized,
+                "global_perms requires the caller to itself hold global \
+                 permissions; a non-global agent cannot grant global perms \
+                 to a child (escalation guard)".into(),
+            ));
+        }
         // Task auth: if caller supplied a task_id, it must be
         // self-or-descendant of caller's task. Taskless caller +
         // explicit task_id → Unauthorized.
@@ -6047,6 +6192,12 @@ pub fn mcp_start_session(
     }
     if let Some(tid) = task_id_for_spawn {
         full_params.insert("task_id".into(), Value::String(tid));
+    }
+    // Propagate the (guard-approved) global-perms grant to the
+    // child. The escalation guard above already verified the caller
+    // is global, so `start_session` can trust this value.
+    if p.global_perms {
+        full_params.insert("global_perms".into(), Value::Bool(true));
     }
     if let Some(cap) = cap_inherit.as_ref() {
         full_params.insert(
@@ -12270,6 +12421,7 @@ mod tests {
                     seeded_from_snapshot: None,
                     last_exit: None,
                     host_id: crate::host_id::HostId::local(),
+                    global_perms: false,
                 },
             );
         }
@@ -12513,6 +12665,7 @@ mod tests {
                     seeded_from_snapshot: None,
                     last_exit: None,
                     host_id: crate::host_id::HostId::local(),
+                    global_perms: false,
                 },
             );
         }
@@ -12707,6 +12860,7 @@ mod tests {
                     seeded_from_snapshot: None,
                     last_exit: None,
                     host_id: crate::host_id::HostId::local(),
+                    global_perms: false,
                 },
             );
         }
@@ -14270,6 +14424,7 @@ mod tests {
                         hidden: false,
                         workflow_run_id: Some("wf_different".into()),
                         workflow_role: Some("worker".into()),
+                        global_perms: false,
                     },
                 );
             }
@@ -14544,6 +14699,7 @@ mod tests {
                         hidden: false,
                         workflow_run_id: Some("wf_other_run".into()),
                         workflow_role: Some("manager".into()),
+                        global_perms: false,
                     },
                 );
             }
@@ -15199,6 +15355,116 @@ mod tests {
             )
             .expect("unknown uid no-ops");
             assert_eq!(resp["daemon_owned"], json!(false));
+        });
+    }
+
+    /// Global-perms feature: `set_global_perms` flips a live
+    /// session's grant so the daemon's Session-caller auth honors it
+    /// immediately. A non-global caller that was OutOfScope for a
+    /// cross-workspace target becomes Allowed once granted.
+    #[test]
+    fn set_global_perms_flips_live_grant_and_auth() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            // Caller in ws-1, unrelated target in ws-2.
+            for (uid, ws) in [("ts-grant", "ws-1"), ("ts-target", "ws-2")] {
+                let mut p = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+                p.args = vec!["3".to_string()];
+                p.workspace_id = ws.to_string();
+                let sess = crate::session::PendingSession::spawn(p)
+                    .expect("spawn")
+                    .arm_reaper(None)
+                    .expect("arm");
+                state.lock().unwrap().sessions.insert(uid.to_string(), sess);
+            }
+
+            // Before the grant: cross-workspace target is out of scope.
+            {
+                let st = state.lock().unwrap();
+                assert_eq!(
+                    crate::control::auth::check_session_caller(&st, "ts-grant", "ts-target"),
+                    crate::control::auth::AuthDecision::OutOfScope,
+                );
+            }
+
+            let resp = set_global_perms(
+                &state,
+                &json!({ "uid": "ts-grant", "global_perms": true }),
+            )
+            .expect("set_global_perms ok");
+            assert_eq!(resp["ok"], json!(true));
+            assert_eq!(resp["daemon_owned"], json!(true));
+
+            // After the grant: the caller reaches the unrelated target.
+            {
+                let st = state.lock().unwrap();
+                assert!(st.sessions.get("ts-grant").unwrap().global_perms);
+                assert_eq!(
+                    crate::control::auth::check_session_caller(&st, "ts-grant", "ts-target"),
+                    crate::control::auth::AuthDecision::Allow,
+                );
+            }
+
+            // Revoke returns the caller to scoped behavior.
+            set_global_perms(&state, &json!({ "uid": "ts-grant", "global_perms": false }))
+                .expect("revoke ok");
+            let st = state.lock().unwrap();
+            assert!(!st.sessions.get("ts-grant").unwrap().global_perms);
+        });
+    }
+
+    /// Unknown uid no-ops with `daemon_owned: false` (mirrors
+    /// `set_workflow_context`), so the TUI can fire it without
+    /// branching on session ownership.
+    #[test]
+    fn set_global_perms_unknown_uid_no_ops() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let resp = set_global_perms(
+                &state,
+                &json!({ "uid": "ts-nope", "global_perms": true }),
+            )
+            .expect("unknown uid no-ops");
+            assert_eq!(resp["daemon_owned"], json!(false));
+        });
+    }
+
+    /// Escalation guard: a NON-global caller requesting
+    /// `global_perms=true` on `mcp_start_session` is rejected
+    /// (Unauthorized) BEFORE any spawn happens — a normal agent
+    /// can't mint a privileged child to escape its scope.
+    #[test]
+    fn mcp_start_session_non_global_caller_cannot_grant_global_perms() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let mut p = crate::session::SpawnParams::new("ts-plain", "plain", "/bin/sleep");
+            p.args = vec!["3".to_string()];
+            p.workspace_id = "ws-1".to_string();
+            // Not global.
+            let sess = crate::session::PendingSession::spawn(p)
+                .expect("spawn")
+                .arm_reaper(None)
+                .expect("arm");
+            state.lock().unwrap().sessions.insert("ts-plain".to_string(), sess);
+
+            let err = mcp_start_session(
+                &state,
+                &json!({
+                    "type": "bash",
+                    "label": "child",
+                    "global_perms": true,
+                }),
+                Some("ts-plain"),
+            )
+            .expect_err("non-global caller must be refused the grant");
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            assert!(
+                err.1.contains("global"),
+                "message should name the escalation guard: {}",
+                err.1,
+            );
+            // No child was spawned — only the caller remains.
+            assert_eq!(state.lock().unwrap().sessions.len(), 1);
         });
     }
 
