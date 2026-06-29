@@ -9741,6 +9741,81 @@ fn default_close_worktree() -> bool {
     true
 }
 
+/// Allowed planning statuses for `set_subtask_status`. Mirrors the API's task
+/// status enum; the API validates too, but pre-checking here gives the agent a
+/// crisp error instead of a forwarded 4xx.
+const SUBTASK_STATUSES: &[&str] =
+    &["draft", "backlog", "running", "blocked", "done", "archived"];
+
+#[derive(Deserialize)]
+struct SetSubtaskStatusParams {
+    /// Target task. Omitted → the caller's OWN task (the common case: an agent
+    /// flagging its own task `blocked` = fix-ready).
+    #[serde(default)]
+    task_id: Option<String>,
+    status: String,
+}
+
+/// `set_subtask_status` — Session-callable. Set the planning status of the
+/// caller's own task (or a descendant) through the daemon's planning client.
+///
+/// The HEADLESS-capable analog of the cli-routed `update_task` (status only):
+/// on a headless host (e.g. cm-manager, where the `cli` package + `CM_API_URL`
+/// are NOT in the agent's MCP env) `update_task` is unavailable, so a bug-fix
+/// subtask agent had no way to signal `blocked` (fix-ready). This routes the
+/// status PATCH through the daemon, which holds the planning creds — no cli, no
+/// creds in agent env. Unlike `mark_subtask_done` it does NO session/worktree
+/// teardown: `blocked` means the work is waiting for review, so the session
+/// stays alive.
+///
+/// Returns `{"task_id": <id>, "status": <status>}`.
+pub fn set_subtask_status(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: SetSubtaskStatusParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("set_subtask_status params: {}", e)))?;
+    if !SUBTASK_STATUSES.contains(&p.status.as_str()) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("status must be one of {:?}, got '{}'", SUBTASK_STATUSES, p.status),
+        ));
+    }
+    let (target_task_id, api_url_cfg, api_token_cfg): (String, String, String) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "set_subtask_status is callable only by Session callers".into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        let own = caller.task_id.clone().ok_or((
+            ErrorCode::Unauthorized,
+            "taskless caller cannot set a task status; use propose_task for top-level tasks".into(),
+        ))?;
+        let target = p.task_id.clone().unwrap_or_else(|| own.clone());
+        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &target, &own) {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!("task {} is not the caller's task or a descendant", target),
+            ));
+        }
+        (
+            target,
+            state.config.api_url.clone(),
+            state.config.api_token.clone(),
+        )
+    };
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    api_update_task(&creds, &target_task_id, &json!({ "status": p.status }))
+        .map_err(|e| e.to_method_err())?;
+    Ok(json!({ "task_id": target_task_id, "status": p.status }))
+}
+
 /// Best-effort bounded wait until no LIVE session is tagged with
 /// `task_id`. `mark_subtask_done` SIGKILLs the subtask's sessions
 /// before removing its worktree; the reaper removes them
@@ -20410,6 +20485,69 @@ mod tests {
                 wip
             );
             drop(reqs);
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// `set_subtask_status` — Session-callable headless status PATCH. Sets the
+    /// caller's OWN task (task_id omitted) via PATCH /tasks/{id}, no
+    /// worktree/session teardown. Validates the status enum + self-or-
+    /// descendant auth, both BEFORE any API call.
+    #[test]
+    fn set_subtask_status_patches_own_task_no_teardown() {
+        with_home_and_repo("ssrepo", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-self", "ws-self", "task-self");
+
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "PATCH" && path == "/tasks/task-self" {
+                    (200, r#"{"id":"task-self","status":"blocked"}"#.to_string())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            // Default target = own task; status flips to blocked.
+            let result =
+                set_subtask_status(&state, &json!({ "status": "blocked" }), Some("ts-self"))
+                    .expect("set_subtask_status ok");
+            assert_eq!(result["task_id"], "task-self");
+            assert_eq!(result["status"], "blocked");
+
+            // The PATCH carried EXACTLY {"status":"blocked"} (status-only).
+            {
+                let reqs = stub.requests.lock().unwrap();
+                let patch = reqs
+                    .iter()
+                    .find(|r| r.method == "PATCH" && r.path == "/tasks/task-self")
+                    .expect("PATCH /tasks/task-self captured");
+                let body: Value = serde_json::from_str(&patch.body).expect("patch body json");
+                assert_eq!(body["status"], "blocked");
+                assert_eq!(body.as_object().unwrap().len(), 1, "status-only PATCH");
+            }
+
+            // Invalid status → InvalidParams, rejected before any API call.
+            let bad = set_subtask_status(&state, &json!({ "status": "bogus" }), Some("ts-self"))
+                .unwrap_err();
+            assert_eq!(bad.0, ErrorCode::InvalidParams);
+
+            // Operator / taskless caller (None) → Unauthorized.
+            let none_caller =
+                set_subtask_status(&state, &json!({ "status": "done" }), None).unwrap_err();
+            assert_eq!(none_caller.0, ErrorCode::Unauthorized);
+
+            // A target that's neither the caller's task nor a descendant →
+            // Unauthorized (cross-task scoping rejected, before any API call).
+            let cross = set_subtask_status(
+                &state,
+                &json!({ "status": "done", "task_id": "task-other" }),
+                Some("ts-self"),
+            )
+            .unwrap_err();
+            assert_eq!(cross.0, ErrorCode::Unauthorized);
 
             kill_all_sessions(&state);
             clear_api_env();

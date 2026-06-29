@@ -99,6 +99,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "task.update_tree",
     "resolve_authorized_session",
     "session.set_transcript_path",
+    # PTY resize (TIOCSWINSZ). Operator-only, TUI-called over the daemon
+    # socket on (re)attach; no MCP tool routes it. Listed for dispatch-
+    # surface alignment only.
+    "session.resize",
     # 10d-2c-1 review round-5 (F1): TUI pushes workflow context
     # onto an already-spawned daemon session via this RPC after
     # `launch_workflow` binds an Existing-slot participant.
@@ -106,6 +110,14 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "session.set_workflow_context",
     "propose_task",
     "mcp_start_session",
+    # Headless-capable subtask status PATCH. Unlike its create_subtask /
+    # list_subtasks / mark_subtask_done siblings (TUI-served on a laptop —
+    # see DAEMON_DISPATCHED_BUT_TUI_ROUTED), there is NO TUI handler, so it
+    # MUST route to the daemon on BOTH laptop and headless: a pure planning-
+    # API status passthrough the daemon owns directly. Lets a headless
+    # bug-fix agent flip its own task to `blocked` (fix-ready) when the
+    # cli-routed `update_task` is unavailable.
+    "set_subtask_status",
     # 10d-2b: workflow_transition / workflow_done flip from
     # MCP-server-side `_append_event` (direct events.jsonl
     # write) to daemon-side writers via 10d-2a's
@@ -220,6 +232,15 @@ DAEMON_METHODS: frozenset[str] = frozenset({
 # route there.
 DAEMON_DISPATCHED_BUT_TUI_ROUTED: frozenset[str] = frozenset({
     "send_input",
+    # Subtask CRUD: daemon-dispatched (API-backed, so headless orchestrators
+    # work — CM_TUI_SOCKET is pinned to daemon.sock on a headless host), but
+    # the TUI ALSO serves them on a laptop (it owns the task tree there), so
+    # Python routes them to CM_TUI_SOCKET. See `build_env` in
+    # daemon/src/mcp_config.rs. (`set_subtask_status` is deliberately NOT here
+    # — it has no TUI handler, so it's daemon-routed via DAEMON_METHODS.)
+    "create_subtask",
+    "list_subtasks",
+    "mark_subtask_done",
 })
 
 

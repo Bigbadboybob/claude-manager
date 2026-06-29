@@ -1459,6 +1459,35 @@ def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
 
 
 @mcp.tool()
+def set_subtask_status(status: str, task_id: str | None = None) -> dict:
+    """Set the planning status of your task (or a descendant subtask).
+
+    The headless-capable way to flip a task's status. It works even where
+    the cli-routed `update_task` is unavailable — e.g. a daemon-spawned
+    agent on a remote host whose MCP env lacks the planning `cli` package +
+    `CM_API_URL`. The status change routes through the daemon, which holds
+    the planning creds. Unlike `mark_subtask_done` it does NO worktree or
+    session teardown: `blocked` means the work is waiting for review, so
+    your session stays alive.
+
+    Common use: a bug-fix subtask agent flips its OWN task to `blocked`
+    (= fix-ready for the user to review/merge) after committing its fix.
+
+    Args:
+        status: One of "draft", "backlog", "running", "blocked", "done",
+            "archived".
+        task_id: Optional explicit task. Defaults to your own task. Must be
+            your task or a descendant; cross-task scoping is rejected.
+
+    Returns: {"task_id": <id>, "status": <status>}.
+    """
+    params: dict = {"status": status}
+    if task_id:
+        params["task_id"] = task_id
+    return control_client.call("set_subtask_status", params)
+
+
+@mcp.tool()
 def trigger(
     task_id: str,
     prompt: str = "",

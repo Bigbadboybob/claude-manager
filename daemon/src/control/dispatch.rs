@@ -497,6 +497,9 @@ pub fn dispatch_request(
         "mark_subtask_done" => {
             DispatchOutcome::Done(dispatch_mark_subtask_done(state, req))
         }
+        "set_subtask_status" => {
+            DispatchOutcome::Done(dispatch_set_subtask_status(state, req))
+        }
 
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the
@@ -713,6 +716,19 @@ fn dispatch_mark_subtask_done(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mark_subtask_done(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `set_subtask_status` — Session-callable mutation (headless-capable status
+/// PATCH). Same caller-uid extraction as `dispatch_create_subtask`.
+fn dispatch_set_subtask_status(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::set_subtask_status(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
