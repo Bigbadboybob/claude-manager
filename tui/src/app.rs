@@ -6839,9 +6839,9 @@ impl App {
         let (cols, rows) = self.last_term_size;
         let worktree = self.workspaces[wi].worktree_path.clone();
         let workspace_id_owned = self.workspaces[wi].id.clone();
-        // migrate-tui-local: snapshot active_host once at the top so
-        // every per-tombstone spawn dials the same daemon.
-        let active_host = self.active_host.clone();
+        // Restore INTO this workspace → use the workspace's host (not the
+        // global active_host, which could mismatch the worktree's host).
+        let active_host = self.workspaces[wi].host_id.clone();
         // migrate-tui-local Issue C: the daemon-routed spawn
         // below sends local-only paths (worktree + per-session
         // MCP config under `~/.cm/mcp/...`). A non-local active
@@ -7076,9 +7076,9 @@ impl App {
         }
 
         let (cols, rows) = self.last_term_size;
-        // migrate-tui-local: snapshot active_host + workspace id for
-        // the per-tombstone daemon spawn.
-        let active_host = self.active_host.clone();
+        // Resurrect INTO this workspace → use the workspace's host (not the
+        // global active_host).
+        let active_host = self.workspaces[wi].host_id.clone();
         // migrate-tui-local Issue C: the resurrect path resolves a
         // claude transcript path on the local filesystem and
         // hands it (plus the workspace's worktree) to the daemon.
@@ -13542,12 +13542,17 @@ impl App {
         // See `launch_from_plan` for the full backstory.
         parent_task_id: Option<&str>,
     ) {
-        // 12e-r7 F2: planning A-l into an existing workspace.
-        // Same shape as round-6 F1 for `spawn_session_on_workspace`:
-        // snapshot active_host, fail-fast on non-local. No
-        // orphan-disk concern (workspace already has a
-        // worktree), but the mistag bug-class is the same.
-        let active_host = self.active_host.clone();
+        // Planning A-l into an existing workspace → use THAT workspace's host
+        // (not the global active_host — the old read mistagged a session when
+        // the global differed from the workspace's worktree host). The guard
+        // then correctly fail-fasts on a remote workspace (TUI-initiated remote
+        // launch isn't supported yet — local-only paths can't be sent remote).
+        let active_host = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == workspace_id)
+            .map(|w| w.host_id.clone())
+            .unwrap_or_else(cm_daemon::host_id::HostId::local);
         if let Err(e) = guard_local_host_only(
             &active_host,
             "A-l launch-into-workspace",
@@ -21449,6 +21454,55 @@ mod remote_reconnect_tests {
         app.continuous_column_on = false;
         app.step_column(1);
         assert_eq!(app.cursor_column, SidebarColumn::Main);
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Global-host removal Phase B: a "launch into existing workspace" path
+    /// routes by the WORKSPACE's host, not the global `active_host`. With the
+    /// global = `local` but the workspace on `manager`, the local-only guard
+    /// fail-fasts on `manager` (proving it read the workspace host) instead of
+    /// proceeding and mistagging the session — the latent bug this fixes.
+    #[test]
+    fn launch_into_workspace_guards_on_workspace_host_not_global() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.active_host = cm_daemon::host_id::HostId::local(); // global says local
+        app.workspaces.clear();
+        let (seed, _t, _e) = session_with_injected_exit(
+            "seed",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        let mut ws = workspace_with(seed);
+        ws.id = "ws-mgr".into();
+        ws.host_id = cm_daemon::host_id::HostId("manager".into()); // but workspace on manager
+        ws.worktree_path = Some(std::path::PathBuf::from("/tmp/mgr-wt"));
+        ws.sessions.clear();
+        app.workspaces.push(ws);
+
+        app.launch_into_workspace("ws-mgr", "task-1", "Title", "https://repo", "proj", "do x", None);
+
+        let (msg, _) = app.status_msg.clone().expect("a status message was set");
+        assert!(
+            msg.contains("manager"),
+            "fail-fast names the WORKSPACE host (manager), not the global \
+             active_host (local): {}",
+            msg,
+        );
+        let after = app.workspaces.iter().find(|w| w.id == "ws-mgr").unwrap();
+        assert!(after.sessions.is_empty(), "guard fired before any spawn");
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
