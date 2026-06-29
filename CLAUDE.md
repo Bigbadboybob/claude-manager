@@ -92,8 +92,8 @@ Sessions view:
 - `A-a` — attach
 - `A-w` — close session
 - `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (global host is being removed — new sessions use the `local` default).
-- `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-C`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
-- `A-c` — hide/show continuous sessions entirely (master hide). `A-C` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off; on = a third pane splits off the right (terminal | main | continuous), off = continuous sessions sit at the bottom of the main sidebar. Both persisted.
+- `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-c`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
+- `A-c` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off. This is the single continuous control: ON = a third pane splits off the right (terminal | main | continuous) showing the continuous tree; OFF = continuous tasks are hidden entirely. Continuous tasks (an orchestrator + its subtasks, matched by `managed_by_uid` **or** task-tree `parent_task_id` so they group correctly across orchestrator respawns) render **only** in this column — never in the main sidebar. Persisted. (The old `A-C` column toggle + the separate `A-c` master-hide were merged into this one key.)
 - `A-e` — session settings (label, idle/burst timers, hidden, notify-on-idle, **global perms** — Tab to the field, Space to toggle)
 - `A-v` — toggle Status / Task sub-view
 - `A-9` — push (cloud) · `A-0` — pull (cloud)  *(moved off `A-p`/`A-l`)*

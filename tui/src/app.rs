@@ -3537,16 +3537,17 @@ pub struct App {
     pub activity_visible: bool,
     /// Continuous-Tasks Phase 1: when set, all three `visual_items_*`
     /// builders skip the continuous group (its `ContinuousHeader` + the
-    /// sessions under it). Off by default; `A-c` flips it. Persisted in
-    /// the session manifest like `view`.
+    /// sessions under it). DEPRECATED + unused — the master-hide concept was
+    /// folded into `continuous_column_on` (one toggle: column on = shown in the
+    /// column, off = hidden). Kept only so old manifests round-trip without a
+    /// schema break; never consulted for rendering.
     pub hide_continuous: bool,
-    /// Two-column continuous panel (DESIGN_CONTINUOUS_PANEL.md): when set, a
-    /// dedicated continuous COLUMN is split off the right of the sidebar
-    /// (orchestrators with nested subtasks) and the main builders STOP emitting
-    /// the bottom-of-sidebar continuous section. Off by default; `A-C` flips
-    /// it. Persisted in the manifest like `hide_continuous`. Distinct from
-    /// `hide_continuous` (the master hide): this only changes WHERE continuous
-    /// sessions render, not whether they're shown.
+    /// Continuous panel (DESIGN_CONTINUOUS_PANEL.md): the SINGLE continuous
+    /// control (toggled by `A-c`). When ON, a dedicated continuous COLUMN is
+    /// split off the right of the sidebar (orchestrators with nested subtasks);
+    /// when OFF, continuous tasks are hidden entirely. Either way the main
+    /// sidebar builders NEVER emit continuous sessions — they render only in the
+    /// column, never in both places. Off by default. Persisted in the manifest.
     pub continuous_column_on: bool,
     /// Result of the startup memory-cap preflight probe. Cached for
     /// the lifetime of the run; consulted in `spawn_agent_session`
@@ -7513,28 +7514,30 @@ impl App {
         if self.hosts.hosts.len() > 1 {
             return self.visual_items_status_multihost();
         }
+        let members = self.continuous_members();
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
-        // Continuous Tasks: sessions carrying a `continuous_task_id`
-        // are pulled out of the status buckets and sorted into their
-        // own section at the bottom (the divided-panel requirement).
-        let mut continuous: Vec<VisualItem> = Vec::new();
 
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed || self.is_past_workspace(wi) {
                 continue;
             }
+            // Continuous-orchestrator sessions + their subtasks live ONLY in the
+            // dedicated continuous column (or are hidden when it's off) — exclude
+            // them from the main sidebar so a continuous task never shows twice.
+            let visible: Vec<usize> = (0..ws.sessions.len())
+                .filter(|si| !members.contains(&(wi, *si)))
+                .collect();
             if ws.sessions.is_empty() {
                 no_session.push(VisualItem::WorkspaceHeader(wi));
+            } else if visible.is_empty() {
+                // Continuous-only workspace → nothing in the main sidebar.
+                continue;
             } else {
-                for (si, ts) in ws.sessions.iter().enumerate() {
+                for si in visible {
                     let item = VisualItem::Session(wi, si);
-                    if ts.continuous_task_id.is_some() {
-                        continuous.push(item);
-                        continue;
-                    }
-                    match ts.status {
+                    match ws.sessions[si].status {
                         SessionStatus::Running => running.push(item),
                         SessionStatus::Idle => idle.push(item),
                     }
@@ -7554,17 +7557,6 @@ impl App {
             }
         }
         items.extend(no_session);
-        // Continuous group at the bottom, behind a conditional
-        // separator (guard the double-separator / leading-separator
-        // cases so an all-continuous list doesn't open with a rule).
-        // `A-c` (hide_continuous) skips the whole group — header + sessions.
-        if !continuous.is_empty() && !self.hide_continuous && !self.continuous_column_on {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
-                items.push(VisualItem::Separator);
-            }
-            items.push(VisualItem::ContinuousHeader);
-            items.extend(continuous);
-        }
         items
     }
 
@@ -7574,13 +7566,14 @@ impl App {
     /// can't be host-tagged (workspace itself has no host) —
     /// they go in a single tail section after all host groups.
     fn visual_items_status_multihost(&self) -> Vec<VisualItem> {
-        // Per host: (running, idle, continuous). Continuous sessions
-        // nest within their host group, sorted to the bottom of that
-        // group behind a `ContinuousHeader` (lockstep with the
-        // single-host builder; the divided-panel requirement).
+        // Per host: (running, idle). Continuous-orchestrator sessions + their
+        // subtasks are EXCLUDED here — they render only in the dedicated
+        // continuous column (or are hidden when it's off), never in the main
+        // per-host groups.
+        let members = self.continuous_members();
         let mut by_host: std::collections::HashMap<
             cm_daemon::host_id::HostId,
-            (Vec<VisualItem>, Vec<VisualItem>, Vec<VisualItem>),
+            (Vec<VisualItem>, Vec<VisualItem>),
         > = std::collections::HashMap::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -7592,62 +7585,35 @@ impl App {
                 continue;
             }
             for (si, ts) in ws.sessions.iter().enumerate() {
-                let entry = by_host
-                    .entry(ts.host_id.clone())
-                    .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new()));
-                let item = VisualItem::Session(wi, si);
-                if ts.continuous_task_id.is_some() {
-                    entry.2.push(item);
+                if members.contains(&(wi, si)) {
                     continue;
                 }
+                let entry = by_host
+                    .entry(ts.host_id.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new()));
+                let item = VisualItem::Session(wi, si);
                 match ts.status {
                     SessionStatus::Running => entry.0.push(item),
                     SessionStatus::Idle => entry.1.push(item),
                 }
             }
         }
-        // `A-c` (hide_continuous) skips the per-host continuous
-        // subsection — and a host group with ONLY continuous sessions
-        // is dropped entirely (see the skip guards below) so no bare
-        // header is left behind.
-        // When the dedicated continuous COLUMN is on, the per-host continuous
-        // subsections move out of the main sidebar entirely — treat it like
-        // the master hide for this builder's purposes.
-        let hide_continuous = self.hide_continuous || self.continuous_column_on;
-        // Emit a host group (header + running + idle, then the
-        // continuous subsection behind a separator). Shared by the
-        // configured-host and orphan-host passes.
+        // Emit a host group (header + running + idle). A host group with no
+        // non-continuous sessions is dropped (no bare header).
         let push_host_group = |items: &mut Vec<VisualItem>,
                                id: cm_daemon::host_id::HostId,
-                               group: (
-            Vec<VisualItem>,
-            Vec<VisualItem>,
-            Vec<VisualItem>,
-        )| {
+                               group: (Vec<VisualItem>, Vec<VisualItem>)| {
             if !items.is_empty() {
                 items.push(VisualItem::Separator);
             }
             items.push(VisualItem::HostHeader(id));
-            let has_temp = !group.0.is_empty() || !group.1.is_empty();
             items.extend(group.0); // running
             items.extend(group.1); // idle
-            if !group.2.is_empty() && !hide_continuous {
-                if has_temp {
-                    items.push(VisualItem::Separator);
-                }
-                items.push(VisualItem::ContinuousHeader);
-                items.extend(group.2); // continuous
-            }
         };
         let mut items: Vec<VisualItem> = Vec::new();
         for host in &self.hosts.hosts {
             let group = by_host.remove(&host.id).unwrap_or_default();
-            // A continuous-only group is empty for display purposes when
-            // hide_continuous is set — skip it so no bare header survives.
-            if group.0.is_empty()
-                && group.1.is_empty()
-                && (group.2.is_empty() || hide_continuous)
-            {
+            if group.0.is_empty() && group.1.is_empty() {
                 continue;
             }
             push_host_group(&mut items, host.id.clone(), group);
@@ -7660,11 +7626,7 @@ impl App {
         orphan_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         for id in orphan_ids {
             let group = by_host.remove(&id).unwrap();
-            // Same continuous-only skip as the configured-host pass.
-            if group.0.is_empty()
-                && group.1.is_empty()
-                && (group.2.is_empty() || hide_continuous)
-            {
+            if group.0.is_empty() && group.1.is_empty() {
                 continue;
             }
             push_host_group(&mut items, id, group);
@@ -7681,10 +7643,21 @@ impl App {
     /// subheader. Standalone sessions render first; each workflow group
     /// follows. Past workspaces are hidden — reachable via the A-O picker.
     fn visual_items_task(&self) -> Vec<VisualItem> {
+        let members = self.continuous_members();
         let mut items = Vec::new();
         let mut first = true;
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed || self.is_past_workspace(wi) {
+                continue;
+            }
+            // Continuous-orchestrator sessions + their subtasks render only in
+            // the dedicated column (or are hidden when it's off). A workspace
+            // whose ONLY sessions are continuous members — the orchestrator's
+            // own workspace, a cm-sub subtask workspace — is skipped entirely so
+            // no bare header is left in the main sidebar.
+            if !ws.sessions.is_empty()
+                && (0..ws.sessions.len()).all(|si| members.contains(&(wi, si)))
+            {
                 continue;
             }
             if !first {
@@ -7695,15 +7668,11 @@ impl App {
 
             // Partition sessions by task_id bucket. Unbound sessions live in
             // the `None` bucket and render at workspace level (no subheader).
-            // Continuous sessions are pulled out entirely and sorted into
-            // their own section at the bottom of the workspace (the
-            // divided-panel requirement; lockstep with the status builders).
+            // Continuous members are excluded (they live in the column).
             let mut by_task: std::collections::BTreeMap<Option<String>, Vec<usize>> =
                 std::collections::BTreeMap::new();
-            let mut continuous: Vec<usize> = Vec::new();
             for (si, ts) in ws.sessions.iter().enumerate() {
-                if ts.continuous_task_id.is_some() {
-                    continuous.push(si);
+                if members.contains(&(wi, si)) {
                     continue;
                 }
                 by_task.entry(ts.task_id.clone()).or_default().push(si);
@@ -7801,69 +7770,132 @@ impl App {
                 }
             }
 
-            // Continuous group at the bottom of the workspace, behind a
-            // conditional separator (the WorkspaceHeader above guarantees
-            // a non-empty list, so guard only the double-separator case).
-            // `A-c` (hide_continuous) skips the whole group — header + sessions.
-            if !continuous.is_empty() && !self.hide_continuous && !self.continuous_column_on {
-                if !matches!(items.last(), Some(VisualItem::Separator)) {
-                    items.push(VisualItem::Separator);
-                }
-                items.push(VisualItem::ContinuousHeader);
-                for si in continuous {
-                    items.push(VisualItem::Session(wi, si));
-                }
-            }
         }
         items
     }
 
-    /// Build the dedicated continuous column's rows (S2 of
-    /// DESIGN_CONTINUOUS_PANEL.md): each continuous-task orchestrator (a session
-    /// tagged `continuous_task_id`) at `depth 0`, followed by the subtasks it
-    /// spawned (sessions whose `managed_by_uid` is the orchestrator's uid, and
-    /// which are not themselves orchestrators) nested at `depth 1`. Orchestrators
-    /// ordered by label (then uid) for stable layout; subtasks by label under
-    /// each. Empty when `hide_continuous` (the master A-c hide) or when no
-    /// continuous session exists. Closed workspaces skipped, like the main
-    /// builders. Pure read — the render (S3) + cursor (S4) consume this.
-    fn visual_items_continuous(&self) -> Vec<ContinuousRow> {
-        if self.hide_continuous {
-            return Vec::new();
+    /// Map each session task_id to its `parent_task_id` (from `self.tasks`).
+    /// The respawn-robust link a continuous subtask keeps to its orchestrator:
+    /// the orchestrator session's uid changes when it respawns (fresh context /
+    /// restart), but the TASK tree doesn't, so a subtask's `parent_task_id`
+    /// still points at the orchestrator's task.
+    fn task_parent_map(&self) -> std::collections::HashMap<&str, &str> {
+        self.tasks
+            .iter()
+            .filter_map(|t| Some((t.task_id.as_deref()?, t.parent_task_id.as_deref()?)))
+            .collect()
+    }
+
+    /// The set of `(ws_idx, sess_idx)` that belong to a continuous orchestrator's
+    /// tree: an orchestrator itself (`continuous_task_id`), or a subtask of one
+    /// — matched by `managed_by_uid == orchestrator.uid` (a direct child of the
+    /// CURRENT orchestrator session) OR by task-tree parent
+    /// (`parent_task_id == orchestrator.task_id`, which survives a respawn that
+    /// minted a new session uid — the latter is why BUG-007/008, spawned by a
+    /// prior orchestrator instance, still group under the live orchestrator).
+    ///
+    /// These render ONLY in the dedicated continuous column (when it's on) or
+    /// nowhere (when it's off) — the main sidebar builders exclude them, so a
+    /// continuous task never appears in both places. Closed workspaces skipped.
+    fn continuous_members(&self) -> std::collections::HashSet<(usize, usize)> {
+        use std::collections::HashSet;
+        let mut orch_uids: HashSet<&str> = HashSet::new();
+        let mut orch_tasks: HashSet<&str> = HashSet::new();
+        for ws in &self.workspaces {
+            if ws.is_closed {
+                continue;
+            }
+            for ts in &ws.sessions {
+                if ts.continuous_task_id.is_some() {
+                    orch_uids.insert(ts.uid.as_str());
+                    if let Some(t) = ts.task_id.as_deref() {
+                        orch_tasks.insert(t);
+                    }
+                }
+            }
         }
-        // Orchestrators: (ws_idx, sess_idx, uid, label).
-        let mut orchestrators: Vec<(usize, usize, &str, &str)> = Vec::new();
+        let parent_of = self.task_parent_map();
+        let mut keys: HashSet<(usize, usize)> = HashSet::new();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            for (si, ts) in ws.sessions.iter().enumerate() {
+                let by_uid = ts
+                    .managed_by_uid
+                    .as_deref()
+                    .is_some_and(|u| orch_uids.contains(u));
+                let by_task = ts
+                    .task_id
+                    .as_deref()
+                    .and_then(|t| parent_of.get(t).copied())
+                    .is_some_and(|p| orch_tasks.contains(p));
+                if ts.continuous_task_id.is_some() || by_uid || by_task {
+                    keys.insert((wi, si));
+                }
+            }
+        }
+        keys
+    }
+
+    /// Build the dedicated continuous column's rows (DESIGN_CONTINUOUS_PANEL.md):
+    /// each continuous-task orchestrator (a session tagged `continuous_task_id`)
+    /// at `depth 0`, followed by its subtasks nested at `depth 1`. A subtask
+    /// nests under an orchestrator when its `managed_by_uid` is that
+    /// orchestrator's uid OR its task's `parent_task_id` is the orchestrator's
+    /// task_id (the respawn-robust link — see `continuous_members`).
+    /// Orchestrators ordered by label (then uid); subtasks by label under each.
+    /// Closed workspaces skipped. Pure read — the render + cursor consume this;
+    /// it's only drawn/navigated when the column is on.
+    fn visual_items_continuous(&self) -> Vec<ContinuousRow> {
+        // Orchestrators: (ws_idx, sess_idx, uid, task_id, label).
+        let mut orchestrators: Vec<(usize, usize, &str, Option<&str>, &str)> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed {
                 continue;
             }
             for (si, ts) in ws.sessions.iter().enumerate() {
                 if ts.continuous_task_id.is_some() {
-                    orchestrators.push((wi, si, ts.uid.as_str(), ts.label.as_str()));
+                    orchestrators.push((
+                        wi,
+                        si,
+                        ts.uid.as_str(),
+                        ts.task_id.as_deref(),
+                        ts.label.as_str(),
+                    ));
                 }
             }
         }
-        orchestrators.sort_by(|a, b| a.3.cmp(b.3).then(a.2.cmp(b.2)));
+        orchestrators.sort_by(|a, b| a.4.cmp(b.4).then(a.2.cmp(b.2)));
+        let parent_of = self.task_parent_map();
 
         let mut rows = Vec::new();
-        for &(owi, osi, ouid, _) in &orchestrators {
+        for &(owi, osi, ouid, otask, _) in &orchestrators {
             rows.push(ContinuousRow {
                 ws_idx: owi,
                 sess_idx: osi,
                 depth: 0,
             });
-            // Subtasks managed by this orchestrator (excluding orchestrators
-            // themselves — a continuous task nested under another stays
-            // top-level). Re-scan workspaces (immutable; small N).
+            // Subtasks of this orchestrator (excluding orchestrators themselves
+            // — a continuous task nested under another stays top-level). Matched
+            // by managed_by_uid OR task-tree parent. Re-scan (immutable; small N).
             let mut children: Vec<(usize, usize, &str)> = Vec::new();
             for (wi, ws) in self.workspaces.iter().enumerate() {
                 if ws.is_closed {
                     continue;
                 }
                 for (si, ts) in ws.sessions.iter().enumerate() {
-                    if ts.managed_by_uid.as_deref() == Some(ouid)
-                        && ts.continuous_task_id.is_none()
-                    {
+                    if ts.continuous_task_id.is_some() {
+                        continue;
+                    }
+                    let by_uid = ts.managed_by_uid.as_deref() == Some(ouid);
+                    let by_task = otask.is_some()
+                        && ts
+                            .task_id
+                            .as_deref()
+                            .and_then(|t| parent_of.get(t).copied())
+                            == otask;
+                    if by_uid || by_task {
                         children.push((wi, si, ts.label.as_str()));
                     }
                 }
@@ -10162,16 +10194,14 @@ impl App {
                 self.needs_redraw = true;
                 return true;
             }
-            // Two-column continuous panel: Alt+Shift+C toggles the dedicated
-            // continuous COLUMN (orchestrators + nested subtasks split off the
-            // right of the sidebar). Distinct from Alt+c (the master hide).
-            // Checked BEFORE Alt+c so Char('c')+SHIFT routes here, not there.
-            // Persisted in the manifest like `hide_continuous`.
-            if key.modifiers.contains(KeyModifiers::ALT)
-                && (key.code == KeyCode::Char('C')
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::SHIFT)))
-            {
+            // Continuous panel: Alt+c toggles the dedicated continuous COLUMN
+            // (orchestrators + their nested subtasks, split off the right of the
+            // sidebar). It's the SINGLE continuous control — column ON shows the
+            // continuous tree in its own column; column OFF hides it entirely
+            // (continuous tasks never appear in the main sidebar either way).
+            // Persisted in the manifest. (The old Alt+Shift+C column toggle and
+            // the separate Alt+c master-hide were merged into this one key.)
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c') {
                 self.continuous_column_on = !self.continuous_column_on;
                 // Turning the column off strands a continuous-column cursor —
                 // pull it back to the main sidebar (restoring the saved spot).
@@ -10184,14 +10214,6 @@ impl App {
                         .unwrap_or(Cursor::Workspace(0));
                     self.cursor_column = SidebarColumn::Main;
                 }
-                self.needs_redraw = true;
-                return true;
-            }
-            // Continuous-Tasks Phase 1: Alt+c hides/shows the continuous
-            // section in all three sidebar builders. Persisted in the
-            // session manifest like `view`.
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c') {
-                self.hide_continuous = !self.hide_continuous;
                 self.needs_redraw = true;
                 return true;
             }
@@ -13958,9 +13980,9 @@ impl App {
 
         match self.view_mode {
             ViewMode::Sessions => {
-                // Two-column continuous panel: when `A-C` is on, split a third
-                // 36-col pane off the right for the dedicated continuous column
-                // (terminal | main | continuous). Off = today (terminal | main).
+                // Continuous panel: when `A-c` is on, split a third 36-col pane
+                // off the right for the dedicated continuous column
+                // (terminal | main | continuous). Off = terminal | main.
                 let cols = if self.continuous_column_on {
                     Layout::horizontal([
                         Constraint::Min(40),
@@ -14836,8 +14858,8 @@ impl App {
             ("A-e    settings", "A-,  activity"),
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
-            ("A-o    stop wf", "A-c  hide-cont"),
-            ("A-b    snapshot", "A-C  cont-col"),
+            ("A-o    stop wf", "A-c  cont-col"),
+            ("A-b    snapshot", ""),
             ("A-O    reopen ws", "A-9  push"),
             ("PgUp/Dn scroll", "A-0  pull"),
             ("A-Ent  newline", ""),
@@ -21317,10 +21339,90 @@ mod remote_reconnect_tests {
             vec![("orch-a", 0), ("orch-z", 0), ("sub-a", 1), ("sub-b", 1)],
         );
 
-        app.hide_continuous = true;
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Respawn-robust nesting: a subtask whose `managed_by_uid` points at a
+    /// PRIOR orchestrator instance (now gone — the orchestrator respawned with a
+    /// new uid) still nests under the live orchestrator via the TASK tree
+    /// (`parent_task_id == orchestrator.task_id`). This is the BUG-007/008 case
+    /// the user hit: only the current instance's child (BUG-009) nested before.
+    #[test]
+    fn visual_items_continuous_nests_orphaned_subtask_via_task_parent() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+
+        let mk = |uid: &str,
+                  cont: Option<&str>,
+                  mgr: Option<&str>,
+                  task: Option<&str>,
+                  label: &str| {
+            let (mut ts, _tx, _teof) =
+                session_with_injected_exit(uid, manager_host(), false);
+            ts.continuous_task_id = cont.map(String::from);
+            ts.managed_by_uid = mgr.map(String::from);
+            ts.task_id = task.map(String::from);
+            ts.label = label.into();
+            ts
+        };
+        let mk_task = |tid: &str, parent: Option<&str>| TaskEntry {
+            task_id: Some(tid.into()),
+            name: tid.into(),
+            api_status: TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: parent.map(String::from),
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        };
+
+        // Orchestrator (uid orch-NEW, task "orch-task"). Its subtask was spawned
+        // by the PRIOR instance "orch-OLD" (not present) — managed_by points at
+        // the dead uid, but the subtask's task parent is the orchestrator's task.
+        let mut ws = workspace_with(mk("orch-NEW", Some("ct"), None, Some("orch-task"), "Orchestrator"));
+        ws.sessions.push(mk("sub-orphan", None, Some("orch-OLD"), Some("sub-task"), "BUG-007"));
+        app.workspaces.push(ws);
+        app.tasks.push(mk_task("orch-task", None));
+        app.tasks.push(mk_task("sub-task", Some("orch-task")));
+
+        let rows = app.visual_items_continuous();
+        let resolved: Vec<(&str, u8)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    r.depth,
+                )
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("orch-NEW", 0), ("sub-orphan", 1)],
+            "an orphaned subtask (managed_by a dead prior orchestrator uid) MUST \
+             still nest under the live orchestrator via the task-tree parent link",
+        );
+        // And it's a continuous member → excluded from the main sidebar.
         assert!(
-            app.visual_items_continuous().is_empty(),
-            "A-c master hide empties the continuous column",
+            app.continuous_members().contains(&(0, 1)),
+            "the orphaned subtask must be classified as a continuous member",
         );
 
         match orig {
@@ -21329,9 +21431,11 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// Continuous-panel S3 gating: with `continuous_column_on`, the main
-    /// sidebar builder STOPS emitting the bottom continuous section (it moves
-    /// to the dedicated column); with it off, the section is present as today.
+    /// Continuous sessions render ONLY in the dedicated column — never in the
+    /// main sidebar, regardless of `continuous_column_on`. Column ON → shown in
+    /// the column; column OFF → hidden entirely (the render gate skips the
+    /// column). Either way the main sidebar excludes them, so a continuous task
+    /// never shows in both places.
     #[test]
     fn continuous_column_on_moves_continuous_out_of_main_sidebar() {
         let _guard = crate::test_support::home_lock();
@@ -21362,27 +21466,30 @@ mod remote_reconnect_tests {
         ws.sessions.push(plain);
         app.workspaces.push(ws);
 
-        // Column OFF: continuous shown in the main sidebar (header present).
-        app.continuous_column_on = false;
-        assert!(
-            app.visual_items()
-                .iter()
-                .any(|v| matches!(v, VisualItem::ContinuousHeader)),
-            "with the column off, the main sidebar carries the continuous section",
-        );
-
-        // Column ON: main sidebar drops it; the column builder carries it.
-        app.continuous_column_on = true;
-        assert!(
-            !app.visual_items()
-                .iter()
-                .any(|v| matches!(v, VisualItem::ContinuousHeader)),
-            "with the column on, the continuous section leaves the main sidebar",
-        );
-        assert!(
-            !app.visual_items_continuous().is_empty(),
-            "the dedicated column carries the orchestrator",
-        );
+        // Regardless of the column toggle, the main sidebar NEVER carries the
+        // orchestrator (Session(0,0)) nor a ContinuousHeader — but it keeps the
+        // plain session (Session(0,1)). The dedicated column always carries the
+        // orchestrator (its render is gated on `continuous_column_on`).
+        for on in [false, true] {
+            app.continuous_column_on = on;
+            let main = app.visual_items();
+            assert!(
+                !main.iter().any(|v| matches!(v, VisualItem::ContinuousHeader)),
+                "column_on={on}: main sidebar must never carry a ContinuousHeader",
+            );
+            assert!(
+                !main.iter().any(|v| matches!(v, VisualItem::Session(0, 0))),
+                "column_on={on}: the orchestrator must not appear in the main sidebar",
+            );
+            assert!(
+                main.iter().any(|v| matches!(v, VisualItem::Session(0, 1))),
+                "column_on={on}: the plain session must stay in the main sidebar",
+            );
+            assert!(
+                !app.visual_items_continuous().is_empty(),
+                "the dedicated column carries the orchestrator",
+            );
+        }
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
@@ -26073,123 +26180,19 @@ mod slice_12e_tests {
         );
     }
 
-    /// Continuous Tasks: `visual_items_status` pulls sessions
-    /// carrying a `continuous_task_id` into their own section,
-    /// emits a `ContinuousHeader`, sorts the group to the BOTTOM
-    /// (below the temporary sessions), and the header is
-    /// non-selectable (navigation skips it). See
-    /// DESIGN_CONTINUOUS_TASKS.md §12.
+    /// Continuous members (orchestrators + their subtasks) are excluded from
+    /// ALL three main sidebar builders — they live only in the dedicated
+    /// continuous column. The normal (non-continuous) session stays. Holds
+    /// regardless of `continuous_column_on` (the column's render gate is
+    /// separate; the main builders never carry continuous sessions). Replaces
+    /// the retired `continuous_sessions_sort_below_under_a_header` /
+    /// `hide_continuous_removes_group_from_all_builders` — continuous tasks no
+    /// longer render in the main sidebar at all (no `ContinuousHeader` there).
     #[test]
-    fn continuous_sessions_sort_below_under_a_header() {
+    fn continuous_members_excluded_from_all_main_builders() {
         let guard = crate::test_support::home_lock();
-        let (mut app, _tmp) =
-            build_app_with_hosts(&[("local", true)], &guard);
-        // One workspace: a normal (temporary) session followed by
-        // a continuous-tagged session. Both idle so status order
-        // can't be what sorts the continuous one down.
-        let mk = |uid: &str, label: &str, continuous: Option<&str>| {
-            let mut ts = make_simple_session_with_uid(
-                uid.into(),
-                label,
-                "bash",
-                crate::session::Session::new(
-                    "/bin/true",
-                    &[],
-                    80,
-                    24,
-                    None,
-                    HashMap::new(),
-                    None,
-                )
-                .expect("spawn"),
-                None,
-            );
-            ts.status = SessionStatus::Idle;
-            ts.continuous_task_id = continuous.map(|s| s.to_string());
-            ts
-        };
-        app.workspaces.push(Workspace {
-            id: "ws-0".into(),
-            name: "ws-0".into(),
-            is_closed: false,
-            is_cloud: false,
-            repo_url: None,
-            worktree_path: None,
-            main_repo_path: None,
-            worker_vm: None,
-            worker_zone: None,
-            host_id: cm_daemon::host_id::HostId::local(),
-            is_pushing: false,
-            sessions: vec![
-                mk("uid-normal", "normal", None),
-                mk("uid-cont", "continuous", Some("ct-1")),
-            ],
-            tombstones: Vec::new(),
-        });
-
-        let items = app.visual_items_status();
-
-        // ContinuousHeader is emitted exactly once.
-        let header_pos = items
-            .iter()
-            .position(|i| matches!(i, VisualItem::ContinuousHeader));
-        assert!(
-            header_pos.is_some(),
-            "a continuous-tagged session MUST emit a \
-             ContinuousHeader; got: {:?}",
-            items,
-        );
-        assert_eq!(
-            items
-                .iter()
-                .filter(|i| matches!(i, VisualItem::ContinuousHeader))
-                .count(),
-            1,
-            "exactly one ContinuousHeader expected; got: {:?}",
-            items,
-        );
-
-        // The continuous session sorts BELOW the normal one, and
-        // below the header (the divided-panel requirement).
-        let normal_pos = items
-            .iter()
-            .position(|i| matches!(i, VisualItem::Session(0, 0)))
-            .expect("normal session must be present");
-        let cont_pos = items
-            .iter()
-            .position(|i| matches!(i, VisualItem::Session(0, 1)))
-            .expect("continuous session must be present");
-        assert!(
-            normal_pos < header_pos.unwrap()
-                && header_pos.unwrap() < cont_pos,
-            "continuous session MUST sort below the normal \
-             session, under the ContinuousHeader; got: {:?}",
-            items,
-        );
-
-        // The header is non-selectable: navigating down from the
-        // normal session skips the Separator + ContinuousHeader and
-        // lands on the continuous session.
-        app.cursor = Cursor::Session(0, 0);
-        app.navigate(1);
-        assert_eq!(
-            app.cursor,
-            Cursor::Session(0, 1),
-            "navigation MUST skip the non-selectable \
-             ContinuousHeader and land on the continuous session",
-        );
-    }
-
-    /// Continuous Tasks `A-c`: when `hide_continuous` is set, all three
-    /// sidebar builders drop the continuous group entirely — the
-    /// `ContinuousHeader` AND the sessions under it. The normal
-    /// (temporary) session stays put. See DESIGN_CONTINUOUS_TASKS.md §12.
-    #[test]
-    fn hide_continuous_removes_group_from_all_builders() {
-        let guard = crate::test_support::home_lock();
-        // Build a workspace with one normal + one continuous session.
         let mk_ws = || {
-            let mk = |uid: &str, label: &str, continuous: Option<&str>| {
+            let mk = |uid: &str, label: &str, cont: Option<&str>, mgr: Option<&str>| {
                 let mut ts = make_simple_session_with_uid(
                     uid.into(),
                     label,
@@ -26207,7 +26210,8 @@ mod slice_12e_tests {
                     None,
                 );
                 ts.status = SessionStatus::Idle;
-                ts.continuous_task_id = continuous.map(|s| s.to_string());
+                ts.continuous_task_id = cont.map(|s| s.to_string());
+                ts.managed_by_uid = mgr.map(|s| s.to_string());
                 ts
             };
             Workspace {
@@ -26223,25 +26227,25 @@ mod slice_12e_tests {
                 host_id: cm_daemon::host_id::HostId::local(),
                 is_pushing: false,
                 sessions: vec![
-                    mk("uid-normal", "normal", None),
-                    mk("uid-cont", "continuous", Some("ct-1")),
+                    mk("uid-normal", "normal", None, None), // Session(0,0) — stays
+                    mk("uid-orch", "orch", Some("ct-1"), None), // Session(0,1) — orchestrator
+                    mk("uid-sub", "sub", None, Some("uid-orch")), // Session(0,2) — its subtask
                 ],
                 tombstones: Vec::new(),
             }
         };
-
-        // No ContinuousHeader and no Session(0, 1) (the continuous one)
-        // may appear; the normal Session(0, 0) must survive.
-        let assert_hidden = |items: &[VisualItem], builder: &str| {
+        let assert_excluded = |items: &[VisualItem], builder: &str| {
             assert!(
                 !items.iter().any(|i| matches!(i, VisualItem::ContinuousHeader)),
-                "{builder}: hide_continuous MUST drop the \
-                 ContinuousHeader; got: {items:?}",
+                "{builder}: no ContinuousHeader in the main sidebar; got: {items:?}",
             );
             assert!(
                 !items.iter().any(|i| matches!(i, VisualItem::Session(0, 1))),
-                "{builder}: hide_continuous MUST drop the continuous \
-                 session; got: {items:?}",
+                "{builder}: the orchestrator MUST be excluded; got: {items:?}",
+            );
+            assert!(
+                !items.iter().any(|i| matches!(i, VisualItem::Session(0, 2))),
+                "{builder}: the subtask MUST be excluded; got: {items:?}",
             );
             assert!(
                 items.iter().any(|i| matches!(i, VisualItem::Session(0, 0))),
@@ -26249,36 +26253,23 @@ mod slice_12e_tests {
             );
         };
 
-        // Single-host status builder + task builder.
-        {
-            let (mut app, _tmp) =
-                build_app_with_hosts(&[("local", true)], &guard);
+        // Single-host: status + task builders, both column states.
+        for on in [false, true] {
+            let (mut app, _tmp) = build_app_with_hosts(&[("local", true)], &guard);
             app.workspaces.push(mk_ws());
-            // Sanity: shown by default.
-            assert!(app
-                .visual_items_status()
-                .iter()
-                .any(|i| matches!(i, VisualItem::ContinuousHeader)));
-            app.hide_continuous = true;
-            assert_hidden(&app.visual_items_status(), "visual_items_status");
-            assert_hidden(&app.visual_items_task(), "visual_items_task");
+            app.continuous_column_on = on;
+            assert_excluded(&app.visual_items_status(), "visual_items_status");
+            assert_excluded(&app.visual_items_task(), "visual_items_task");
         }
-
-        // Multi-host status builder (>1 host routes through the
-        // multihost path; the local-default sessions nest under the
-        // local host group).
-        {
+        // Multi-host status builder (>1 host routes through the multihost path).
+        for on in [false, true] {
             let (mut app, _tmp) = build_app_with_hosts(
                 &[("local", true), ("manager", false)],
                 &guard,
             );
             app.workspaces.push(mk_ws());
-            assert!(app
-                .visual_items_status_multihost()
-                .iter()
-                .any(|i| matches!(i, VisualItem::ContinuousHeader)));
-            app.hide_continuous = true;
-            assert_hidden(
+            app.continuous_column_on = on;
+            assert_excluded(
                 &app.visual_items_status_multihost(),
                 "visual_items_status_multihost",
             );

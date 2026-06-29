@@ -2,6 +2,14 @@
 
 **Status:** ✅ SHIPPED (S1–S5, 2026-06-29). Decisions locked with the user 2026-06-29. All slices below landed; commits on branch `cm/daemon-side-workflow-execution-autonomous-cloud-wo`. TUI-only (runs locally — no deploy).
 
+## Revision (2026-06-29) — single toggle, column-only, respawn-robust nesting
+
+After live use, three changes (the original S1–S5 model is superseded where it conflicts):
+
+1. **Single toggle.** The dedicated column is now the SINGLE continuous control, bound to **`A-c`**. The old `A-C` (column toggle) and the separate `A-c` master-hide (`hide_continuous`) are gone — merged into one key. ON = column shown; OFF = continuous tasks hidden entirely. `hide_continuous` is retained on the manifest only for back-compat round-trip; it's never consulted.
+2. **Continuous only in the column.** The main sidebar builders (`visual_items_status`, `visual_items_status_multihost`, `visual_items_task`) now ALWAYS exclude continuous members — there is no "continuous at the bottom of the main sidebar" mode anymore. A continuous task renders only in the column (when on) or nowhere (when off); never in both. A workspace whose only sessions are continuous members is skipped in the main builders (no bare header).
+3. **Respawn-robust nesting.** A subtask nests under an orchestrator when its `managed_by_uid == orchestrator.uid` **OR** its task's `parent_task_id == orchestrator.task_id`. The task-tree link is the robust one: a continuous orchestrator that respawns gets a NEW session uid, orphaning the `managed_by_uid` of subtasks spawned by the prior instance — but the TASK tree doesn't change, so they still group correctly. This fixed the "only the current instance's child nests, the rest leak into main" bug. Implemented by `continuous_members()` (the exclusion set) + `task_parent_map()`, both consumed by the column builder and all three main builders.
+
 ## Goal
 
 Give continuous tasks (orchestrators) and the subtasks they spawn their own dedicated, **nested** sidebar column, instead of a flat section sorted to the bottom of the single sidebar. Toggle it with `A-C`; navigate between the main column and the continuous column with a unified left/right cursor.
