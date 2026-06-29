@@ -4,9 +4,9 @@ Open threads, captured 2026-06-29. Priority order; each item has enough context 
 
 ---
 
-## P0 — Session durability (the bug-002 kill) 🟢 S1+S2+S3+S5 DEPLOYED; only S4 left
+## P0 — Session durability (the bug-002 kill) ✅ COMPLETE (S1–S5)
 
-**STATUS:** persist (S1) + restore-at-same-uid (S2) + resume (S3) + continuous-orchestrator resume (S5) are committed (`17916fc` / `9d206ff` / `5a9cdb9` / `1bc059a` / `bdea0de`) and **LIVE on cm-manager**. Verified on prod: a restart restored BUG-007/008/009 AND the bug-triage orchestrator at their same uids, RESUMED, no scheduler double-spawn. S5 also fixed a latent bug — `continuous_fresh_spawn` never armed a transcript detector, so continuous sessions were stuck `pending`/unresumable; now fixed. **Only S4 remains:** TUI reattach coordination + frozen-pane UX (the TUI's auto-rebind to a daemon-respawned remote session; pairs with the P1 frozen-pane item below). Autocompact for the resumed orchestrator's growing context = P3. Full detail in `DESIGN_SESSION_DURABILITY.md`.
+**STATUS: DONE.** persist (S1) + restore-at-same-uid (S2) + resume (S3) + continuous-orchestrator resume (S5) + TUI reattach (S4) are all committed (`17916fc` / `9d206ff` / `5a9cdb9` / `1bc059a` / `bdea0de` / `d3c91ba`). The daemon side (S1–S5) is **LIVE on cm-manager** — verified on prod: a restart restored BUG-007/008/009 AND the bug-triage orchestrator at their same uids, RESUMED, no scheduler double-spawn. S4 (TUI, runs locally — no deploy) turned out composition-complete (the remote-reattach machinery already handles daemon restart) + added an `A-r` "reconnect now" lever. The bug-002 class of kill is fixed end-to-end. **Resolves the P1 frozen-pane item too.** Only follow-up: autocompact for the resumed orchestrator's growing context (P3). Full detail in `DESIGN_SESSION_DURABILITY.md`.
 
 **Agent sessions must survive daemon restarts.** A `systemctl restart cm-daemon` (every deploy) SIGKILLs all its PTYs → every ad-hoc subtask session dies and does NOT come back. bug-002's session was lost this way. **Unacceptable.**
 
@@ -16,9 +16,9 @@ Principle (memory: `feedback_sessions_user_owned_lifecycle`): a session is a **d
 - **Fix:** daemon-side **session persistence + restore** — persist the registry to disk; on restart, re-spawn each not-done session resuming its transcript (`claude --resume <sid>` / codex resume). Then deploys + crashes become transparent: sessions reappear alive, with history.
 - **Leverage:** this also makes every future daemon deploy painless (no session loss) — which de-risks `continuous.update` and all future backend work.
 
-## P1 — Frozen-pane UX (remote daemon restart) 🟠
+## ~~P1 — Frozen-pane UX (remote daemon restart)~~ ✅ RESOLVED by P0 S4
 
-When the remote daemon restarts (tunnel survives, sessions vanish *under* it), the TUI shows a **frozen attach pane**; `A-r` doesn't clear it. Distinct from the tunnel-keepalive reconnect work (there the *tunnel* dies). Need: detect "tunnel up but session gone/respawned" and surface it cleanly (exited — or, post-P0, restored). Pairs with P0.
+Was: when the remote daemon restarts the TUI showed a **frozen attach pane** and `A-r` didn't clear it. Fixed by P0 S4 (`d3c91ba`): the remote-reattach machinery already keeps the session reconnecting (`⟳`) and rebinds to the daemon-restored session once it's back (the daemon dies with no `End` frame → transport-EOF reconnect path, not the exited path); and `A-r` is now a "reconnect now" lever that accelerates/revives stuck reconnects.
 
 ## P1 — bug-triage review / merge (in progress) 🟠
 
