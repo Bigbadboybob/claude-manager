@@ -128,9 +128,12 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
 async def list_tasks(
     status: str | None = Query(None),
     project: str | None = Query(None),
+    include_archived: bool = Query(False),
     pool=Depends(get_pool),
 ):
-    return await db.list_tasks(pool, status=status, project=project)
+    return await db.list_tasks(
+        pool, status=status, project=project, include_archived=include_archived
+    )
 
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])

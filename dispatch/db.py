@@ -121,7 +121,8 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
 
 
 async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
-                     project: str | None = None) -> list[dict]:
+                     project: str | None = None,
+                     include_archived: bool = False) -> list[dict]:
     async with pool.acquire() as conn:
         conditions = []
         params = []
@@ -131,6 +132,12 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
         if project:
             params.append(project)
             conditions.append(f"project = ${len(params)}")
+        # Exclude archived rows by default: they're hidden in the TUI behind
+        # A-V and bloat the response (e.g. 262 of 431 rows / ~600KB) that the
+        # TUI re-fetches over a slow WAN. Callers needing them pass
+        # include_archived=True or filter explicitly by status='archived'.
+        if not include_archived and status != "archived":
+            conditions.append("status != 'archived'")
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         rows = await conn.fetch(
             f"""SELECT * FROM tasks {where} ORDER BY
