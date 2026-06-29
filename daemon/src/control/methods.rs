@@ -8756,6 +8756,142 @@ pub fn continuous_create(
     }))
 }
 
+/// Mutable subset of a continuous task's config that `continuous.update` can
+/// change on a LIVE task. Every field is optional — only the ones PRESENT in
+/// the request are applied (load-modify-save under flock). STRUCTURAL fields
+/// (task_id, engine, run_mode, workspace, worktree, repo) are intentionally
+/// absent: changing them would require recreating the worktree / respawning
+/// the session, which is `delete` + `create`'s job, not an in-place update.
+#[derive(Deserialize)]
+struct ContinuousUpdateParams {
+    task_id: String,
+    #[serde(default)]
+    default_prompt: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    /// Auto-compact cadence: `Some(n>0)` → `/clear` the persistent session
+    /// every nth fire (keeps the orchestrator's context bounded across
+    /// restarts/fires; its `.bug-triage/` disk memory survives the clear).
+    /// `Some(0)` DISABLES compaction (the fire check is `n > 0`).
+    #[serde(default)]
+    compact_every: Option<u32>,
+    #[serde(default)]
+    schedule: Option<crate::continuous::task::Schedule>,
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    modes: Option<std::collections::BTreeMap<String, crate::continuous::task::ModePreset>>,
+    #[serde(default)]
+    max_runtime_secs: Option<u32>,
+    #[serde(default)]
+    mem_cap_bytes: Option<u64>,
+    #[serde(default)]
+    supervise: Option<bool>,
+    #[serde(default)]
+    planning_task_id: Option<String>,
+}
+
+/// `continuous.update` — change a LIVE continuous task's mutable config in
+/// place (load-modify-save under flock) WITHOUT the delete+recreate that would
+/// lose run history and kill the session. The motivating case: set
+/// `compact_every` on an already-running orchestrator that was created without
+/// it, and steer its `default_prompt`. Applied fields take effect on the next
+/// fire / next watchdog tick (the live session keeps running). Operator-only
+/// (gated in `dispatch.rs`).
+///
+/// Returns `{ task_id, updated: [<field names>] }`.
+pub fn continuous_update(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ContinuousUpdateParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update params: {}", e)))?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update: {}", e)))?;
+    if crate::continuous::task::load_one(&p.task_id).is_none() {
+        return Err((
+            ErrorCode::NotFound,
+            format!("continuous.update: task '{}' not found", p.task_id),
+        ));
+    }
+    if let Some(dp) = &p.default_prompt {
+        if dp.trim().is_empty() {
+            return Err((
+                ErrorCode::InvalidParams,
+                "default_prompt must be non-empty when provided".into(),
+            ));
+        }
+    }
+    if let Some(l) = &p.label {
+        if l.trim().is_empty() {
+            return Err((
+                ErrorCode::InvalidParams,
+                "label must be non-empty when provided".into(),
+            ));
+        }
+    }
+
+    let mut updated: Vec<&'static str> = Vec::new();
+    crate::continuous::task::modify(&p.task_id, |t| {
+        if let Some(v) = &p.default_prompt {
+            t.default_prompt = v.clone();
+            updated.push("default_prompt");
+        }
+        if let Some(v) = &p.label {
+            t.label = v.clone();
+            updated.push("label");
+        }
+        if let Some(v) = p.compact_every {
+            // 0 disables (the fire check requires n > 0); store None so the
+            // persisted shape matches "disabled".
+            t.compact_every = if v == 0 { None } else { Some(v) };
+            updated.push("compact_every");
+        }
+        if let Some(v) = &p.schedule {
+            t.schedule = v.clone();
+            // Apply the new cadence immediately: recompute next_fire_at from
+            // now (catch-up-once semantics — never backfill missed slots).
+            if let crate::continuous::task::Schedule::Periodic { every_secs } = v {
+                t.next_fire_at = crate::continuous::task::now_unix()
+                    .saturating_add((*every_secs).max(1));
+            }
+            updated.push("schedule");
+        }
+        if let Some(v) = &p.skill {
+            t.skill = Some(v.clone());
+            updated.push("skill");
+        }
+        if let Some(v) = &p.modes {
+            t.modes = v.clone();
+            updated.push("modes");
+        }
+        if let Some(v) = p.max_runtime_secs {
+            t.max_runtime_secs = Some(v);
+            updated.push("max_runtime_secs");
+        }
+        if let Some(v) = p.mem_cap_bytes {
+            t.mem_cap_bytes = Some(v);
+            updated.push("mem_cap_bytes");
+        }
+        if let Some(v) = p.supervise {
+            t.supervise = v;
+            updated.push("supervise");
+        }
+        if let Some(v) = &p.planning_task_id {
+            t.planning_task_id = Some(v.clone());
+            updated.push("planning_task_id");
+        }
+    })
+    .map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("continuous.update persist '{}': {}", p.task_id, e),
+        )
+    })?;
+
+    Ok(json!({ "task_id": p.task_id, "updated": updated }))
+}
+
 /// `continuous.list` — the at-a-glance health read over every persisted
 /// continuous task (`load_all` — disk is the authority). No state lock needed;
 /// the projection is a snapshot, never a replay (the live edge rides
@@ -21055,6 +21191,73 @@ mod tests {
 
             let reloaded = crate::continuous::task::load_one("ct-pers-compact").unwrap();
             assert_eq!(reloaded.run_count, 3);
+        });
+    }
+
+    /// `continuous.update` edits a live task's mutable config IN PLACE
+    /// (compact_every, default_prompt, …) — applying only provided fields,
+    /// preserving untouched fields + run history (NOT a delete+recreate), with
+    /// `compact_every: 0` disabling, NotFound for a missing task, and
+    /// InvalidParams for an empty provided prompt.
+    #[test]
+    fn continuous_update_edits_live_config_in_place_preserving_history() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-up",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.run_count = 7; // pre-existing run history
+            task.label = "orig label".into();
+            task.default_prompt = "orig prompt".into();
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let res = continuous_update(
+                &state,
+                &json!({
+                    "task_id": "ct-up",
+                    "compact_every": 50,
+                    "default_prompt": "new steering prompt",
+                }),
+            )
+            .expect("update ok");
+            let updated: Vec<&str> = res["updated"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert!(updated.contains(&"compact_every"));
+            assert!(updated.contains(&"default_prompt"));
+
+            let reloaded = crate::continuous::task::load_one("ct-up").unwrap();
+            assert_eq!(reloaded.compact_every, Some(50));
+            assert_eq!(reloaded.default_prompt, "new steering prompt");
+            assert_eq!(reloaded.label, "orig label", "untouched fields preserved");
+            assert_eq!(reloaded.run_count, 7, "run history preserved — not a recreate");
+
+            // compact_every: 0 disables (stored as None).
+            continuous_update(&state, &json!({"task_id":"ct-up","compact_every":0}))
+                .expect("disable ok");
+            assert_eq!(
+                crate::continuous::task::load_one("ct-up").unwrap().compact_every,
+                None,
+            );
+
+            // Missing task → NotFound.
+            let err = continuous_update(&state, &json!({"task_id":"ct-missing","label":"x"}))
+                .unwrap_err();
+            assert_eq!(err.0, ErrorCode::NotFound);
+
+            // Empty provided prompt → InvalidParams.
+            let err2 =
+                continuous_update(&state, &json!({"task_id":"ct-up","default_prompt":"  "}))
+                    .unwrap_err();
+            assert_eq!(err2.0, ErrorCode::InvalidParams);
         });
     }
 

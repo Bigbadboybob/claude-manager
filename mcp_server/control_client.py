@@ -201,6 +201,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # pinned by DaemonMethodsAlignmentTests); not Python-routable.
     "trigger",
     "continuous.create",
+    "continuous.update",
     "continuous.list",
     "continuous.pause",
     "continuous.run_now",

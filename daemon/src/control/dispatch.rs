@@ -532,6 +532,7 @@ pub fn dispatch_request(
         // `methods::trigger` with the (already operator-validated) caller.
         "trigger" => DispatchOutcome::Done(dispatch_trigger(state, req)),
         "continuous.create" => DispatchOutcome::Done(dispatch_continuous_create(state, req)),
+        "continuous.update" => DispatchOutcome::Done(dispatch_continuous_update(state, req)),
         "continuous.list" => DispatchOutcome::Done(dispatch_continuous_list(state, req)),
         "continuous.pause" => DispatchOutcome::Done(dispatch_continuous_pause(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
@@ -807,6 +808,23 @@ fn dispatch_continuous_create(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
         return resp;
     }
     match methods::continuous_create(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.update` — Operator-only in-place edit of a live task's mutable
+/// config (`compact_every`, `default_prompt`, schedule, …) without the
+/// delete+recreate that would lose run history and kill the session.
+fn dispatch_continuous_update(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.update is Operator-callable only (the TUI / cloud control plane \
+         manages continuous-task config; agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_update(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
