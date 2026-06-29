@@ -733,6 +733,8 @@ impl DaemonState {
             bindings: self.bindings.clone(),
             view: None,
             hide_continuous: false,
+            // TUI-only view state; the daemon-owned registry doesn't track it.
+            continuous_column_on: false,
         }
     }
 

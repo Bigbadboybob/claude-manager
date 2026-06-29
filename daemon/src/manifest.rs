@@ -519,6 +519,13 @@ pub struct Manifest {
     /// `false` (section shown).
     #[serde(default)]
     pub hide_continuous: bool,
+    /// Two-column continuous panel (DESIGN_CONTINUOUS_PANEL.md): persisted
+    /// `A-C` toggle. When `true` the TUI splits a dedicated continuous COLUMN
+    /// off the right of the sidebar (orchestrators + nested subtasks) instead
+    /// of the bottom-of-sidebar section. Serde-default `false` so old manifests
+    /// load as "column off" (today's single-sidebar layout).
+    #[serde(default)]
+    pub continuous_column_on: bool,
 }
 
 #[cfg(test)]

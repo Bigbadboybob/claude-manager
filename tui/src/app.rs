@@ -3515,6 +3515,14 @@ pub struct App {
     /// sessions under it). Off by default; `A-c` flips it. Persisted in
     /// the session manifest like `view`.
     pub hide_continuous: bool,
+    /// Two-column continuous panel (DESIGN_CONTINUOUS_PANEL.md): when set, a
+    /// dedicated continuous COLUMN is split off the right of the sidebar
+    /// (orchestrators with nested subtasks) and the main builders STOP emitting
+    /// the bottom-of-sidebar continuous section. Off by default; `A-C` flips
+    /// it. Persisted in the manifest like `hide_continuous`. Distinct from
+    /// `hide_continuous` (the master hide): this only changes WHERE continuous
+    /// sessions render, not whether they're shown.
+    pub continuous_column_on: bool,
     /// Result of the startup memory-cap preflight probe. Cached for
     /// the lifetime of the run; consulted in `spawn_agent_session`
     /// to decide whether to wrap a spawn. See DESIGN_MEMORY_CAP.md
@@ -3750,6 +3758,7 @@ impl App {
             _ => SidebarView::Status,
         };
         let hide_continuous = manifest.hide_continuous;
+        let continuous_column_on = manifest.continuous_column_on;
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
@@ -3981,6 +3990,7 @@ impl App {
             activity_log,
             activity_visible: false,
             hide_continuous,
+            continuous_column_on,
             memory_cap_status,
             memory_kill_tx,
             memory_kill_rx,
@@ -4575,6 +4585,7 @@ impl App {
             bindings,
             view: Some(view.to_string()),
             hide_continuous: self.hide_continuous,
+            continuous_column_on: self.continuous_column_on,
         };
 
         let path = Self::manifest_path();
@@ -7478,7 +7489,7 @@ impl App {
         // separator (guard the double-separator / leading-separator
         // cases so an all-continuous list doesn't open with a rule).
         // `A-c` (hide_continuous) skips the whole group — header + sessions.
-        if !continuous.is_empty() && !self.hide_continuous {
+        if !continuous.is_empty() && !self.hide_continuous && !self.continuous_column_on {
             if !items.is_empty() && !matches!(items.last(), Some(VisualItem::Separator)) {
                 items.push(VisualItem::Separator);
             }
@@ -7530,7 +7541,10 @@ impl App {
         // subsection — and a host group with ONLY continuous sessions
         // is dropped entirely (see the skip guards below) so no bare
         // header is left behind.
-        let hide_continuous = self.hide_continuous;
+        // When the dedicated continuous COLUMN is on, the per-host continuous
+        // subsections move out of the main sidebar entirely — treat it like
+        // the master hide for this builder's purposes.
+        let hide_continuous = self.hide_continuous || self.continuous_column_on;
         // Emit a host group (header + running + idle, then the
         // continuous subsection behind a separator). Shared by the
         // configured-host and orphan-host passes.
@@ -7722,7 +7736,7 @@ impl App {
             // conditional separator (the WorkspaceHeader above guarantees
             // a non-empty list, so guard only the double-separator case).
             // `A-c` (hide_continuous) skips the whole group — header + sessions.
-            if !continuous.is_empty() && !self.hide_continuous {
+            if !continuous.is_empty() && !self.hide_continuous && !self.continuous_column_on {
                 if !matches!(items.last(), Some(VisualItem::Separator)) {
                     items.push(VisualItem::Separator);
                 }
@@ -10014,6 +10028,20 @@ impl App {
             // Phase 6: Alt+, toggles the activity feed strip.
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char(',') {
                 self.activity_visible = !self.activity_visible;
+                self.needs_redraw = true;
+                return true;
+            }
+            // Two-column continuous panel: Alt+Shift+C toggles the dedicated
+            // continuous COLUMN (orchestrators + nested subtasks split off the
+            // right of the sidebar). Distinct from Alt+c (the master hide).
+            // Checked BEFORE Alt+c so Char('c')+SHIFT routes here, not there.
+            // Persisted in the manifest like `hide_continuous`.
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (key.code == KeyCode::Char('C')
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::SHIFT)))
+            {
+                self.continuous_column_on = !self.continuous_column_on;
                 self.needs_redraw = true;
                 return true;
             }
@@ -13783,9 +13811,23 @@ impl App {
 
         match self.view_mode {
             ViewMode::Sessions => {
-                let cols =
-                    Layout::horizontal([Constraint::Min(40), Constraint::Length(SIDEBAR_WIDTH)])
-                        .split(content_area);
+                // Two-column continuous panel: when `A-C` is on, split a third
+                // 36-col pane off the right for the dedicated continuous column
+                // (terminal | main | continuous). Off = today (terminal | main).
+                let cols = if self.continuous_column_on {
+                    Layout::horizontal([
+                        Constraint::Min(40),
+                        Constraint::Length(SIDEBAR_WIDTH),
+                        Constraint::Length(SIDEBAR_WIDTH),
+                    ])
+                    .split(content_area)
+                } else {
+                    Layout::horizontal([
+                        Constraint::Min(40),
+                        Constraint::Length(SIDEBAR_WIDTH),
+                    ])
+                    .split(content_area)
+                };
 
                 let t = std::time::Instant::now();
                 self.draw_terminal(frame, cols[0]);
@@ -13794,6 +13836,12 @@ impl App {
                 let t = std::time::Instant::now();
                 self.draw_session_list(frame, cols[1]);
                 log_draw_section("sessions:list", t.elapsed());
+
+                if self.continuous_column_on {
+                    let t = std::time::Instant::now();
+                    self.draw_continuous_column(frame, cols[2]);
+                    log_draw_section("sessions:continuous", t.elapsed());
+                }
             }
             ViewMode::Planning => {
                 let t = std::time::Instant::now();
@@ -14506,6 +14554,80 @@ impl App {
         }
     }
 
+    /// Render the dedicated continuous column (S3) — orchestrators (depth 0)
+    /// with their spawned subtasks nested (depth 1, `├`-prefixed) from
+    /// `visual_items_continuous()`. Reuses `draw_session_list`'s indicator
+    /// glyphs (reconnecting `⟳` / hidden / Running spinner / Idle `●` / alert).
+    /// The cursor highlight + the `├`/`└` corner polish land in S4/S5.
+    fn draw_continuous_column(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Continuous ",
+                Style::default().fg(Color::White),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 2 || inner.width < 4 {
+            return;
+        }
+
+        let spinner = self.spinner_frame();
+        let rows = self.visual_items_continuous();
+        let mut items: Vec<ListItem> = Vec::new();
+        for r in rows.iter().take(inner.height as usize) {
+            let ts = &self.workspaces[r.ws_idx].sessions[r.sess_idx];
+            let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
+                ("\u{27f3}", Style::default().fg(Color::Yellow))
+            } else if ts.hidden {
+                (" ", Style::default())
+            } else {
+                match ts.status {
+                    SessionStatus::Running => (spinner, Style::default().fg(Color::Green)),
+                    SessionStatus::Idle => ("\u{25cf}", Style::default().fg(Color::White)),
+                }
+            };
+            let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+                self.alert_indicator()
+            } else {
+                (indicator, indicator_style)
+            };
+
+            let prefix_cells = if r.depth == 0 { 4 } else { 6 };
+            let max_name = (inner.width as usize).saturating_sub(prefix_cells);
+            let label = crate::planning::truncate_with_ellipsis(&ts.label, max_name);
+
+            let mut spans = vec![Span::styled(
+                format!(" {} ", indicator),
+                indicator_style,
+            )];
+            if r.depth >= 1 {
+                // Subtask nested under its orchestrator.
+                spans.push(Span::styled(
+                    "\u{251c} ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            // Orchestrators (depth 0) get a slightly brighter label so the
+            // parent/child split reads at a glance.
+            let label_style = if r.depth == 0 {
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.push(Span::styled(label, label_style));
+            items.push(ListItem::new(Line::from(spans)));
+        }
+        if items.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  (no continuous tasks)",
+                Style::default().fg(Color::DarkGray),
+            ))));
+        }
+        frame.render_widget(List::new(items), inner);
+    }
+
     fn draw_session_list(&self, frame: &mut Frame, area: Rect) {
         let view_label = match self.sidebar_view {
             SidebarView::Status => " Sessions ",
@@ -14535,19 +14657,19 @@ impl App {
         // bottom rows of the list and indicators vanish).
         let help_entries: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-d  done"),
-            ("A-a    attach", "A-x  delete"),
-            ("A-n    new ws", "A-p  push"),
-            ("A-s    +session", "A-l  pull"),
-            ("A-w    close sess", "A-v  view"),
-            ("A-W    close ws", "A-r  refresh"),
-            ("A-e    settings", "A-q  quit"),
-            ("A-h    hide", "A-y  history"),
-            ("A-f    workflow", "A-u  resume"),
-            ("A-o    stop wf", "A-,  activity"),
-            ("A-b    snapshot", "A-z  catalog"),
-            ("A-O    reopen ws", "A-H  switch host"),
-            ("PgUp   scroll up", "A-t  planning"),
-            ("PgDn   scroll dn", "A-c  continuous"),
+            ("A-h/l  column", "A-x  delete"),
+            ("A-a    attach", "A-v  view"),
+            ("A-n    new ws", "A-r  refresh"),
+            ("A-s    +session", "A-q  quit"),
+            ("A-w    close sess", "A-y  history"),
+            ("A-W    close ws", "A-u  resume"),
+            ("A-e    settings", "A-,  activity"),
+            ("A-H    hide", "A-z  catalog"),
+            ("A-f    workflow", "A-t  planning"),
+            ("A-o    stop wf", "A-c  hide-cont"),
+            ("A-b    snapshot", "A-C  cont-col"),
+            ("A-O    reopen ws", "A-[  push"),
+            ("PgUp/Dn scroll", "A-]  pull"),
             ("A-Ent  newline", ""),
         ];
         let help_rows = help_entries.len() as u16;
@@ -19599,6 +19721,7 @@ mod pending_workflow_events_tests {
             bindings: HashMap::new(),
             view: None,
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -19789,6 +19912,7 @@ mod pending_workflow_events_tests {
             bindings: HashMap::new(),
             view: None,
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -19976,6 +20100,7 @@ mod pending_workflow_events_tests {
             bindings: HashMap::new(),
             view: None,
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -20109,6 +20234,7 @@ mod pending_workflow_events_tests {
             bindings: HashMap::new(),
             view: None,
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -20224,6 +20350,7 @@ mod pending_workflow_events_tests {
             bindings: HashMap::new(),
             view: None,
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -21016,6 +21143,67 @@ mod remote_reconnect_tests {
         assert!(
             app.visual_items_continuous().is_empty(),
             "A-c master hide empties the continuous column",
+        );
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Continuous-panel S3 gating: with `continuous_column_on`, the main
+    /// sidebar builder STOPS emitting the bottom continuous section (it moves
+    /// to the dedicated column); with it off, the section is present as today.
+    #[test]
+    fn continuous_column_on_moves_continuous_out_of_main_sidebar() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+        let (mut orch, _t, _e) = session_with_injected_exit(
+            "orch",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        orch.continuous_task_id = Some("ct".into());
+        orch.label = "orch".into();
+        let mut ws = workspace_with(orch);
+        let (mut plain, _t2, _e2) = session_with_injected_exit(
+            "plain",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        plain.label = "plain".into();
+        ws.sessions.push(plain);
+        app.workspaces.push(ws);
+
+        // Column OFF: continuous shown in the main sidebar (header present).
+        app.continuous_column_on = false;
+        assert!(
+            app.visual_items()
+                .iter()
+                .any(|v| matches!(v, VisualItem::ContinuousHeader)),
+            "with the column off, the main sidebar carries the continuous section",
+        );
+
+        // Column ON: main sidebar drops it; the column builder carries it.
+        app.continuous_column_on = true;
+        assert!(
+            !app.visual_items()
+                .iter()
+                .any(|v| matches!(v, VisualItem::ContinuousHeader)),
+            "with the column on, the continuous section leaves the main sidebar",
+        );
+        assert!(
+            !app.visual_items_continuous().is_empty(),
+            "the dedicated column carries the orchestrator",
         );
 
         match orig {
@@ -26972,6 +27160,7 @@ mod slice_12e_tests {
             bindings: HashMap::new(),
             view: Some("status".to_string()),
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
@@ -27156,6 +27345,7 @@ remote_socket = "/remote/manager.sock"
             bindings: HashMap::new(),
             view: Some("task".to_string()),
             hide_continuous: false,
+            continuous_column_on: false,
         };
         std::fs::write(
             cm_dir.join("tui-sessions.json"),
