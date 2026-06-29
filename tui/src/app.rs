@@ -4610,6 +4610,40 @@ impl App {
         }
     }
 
+    /// Collapse duplicate-uid slots in a freshly-loaded manifest. A daemon
+    /// session is unique by `uid`, but a pre-fix adopt race (the off-thread
+    /// attach in-flight window, before the `attaching` dedup gate) could persist
+    /// the SAME uid across multiple synthetic workspaces — surfacing as phantom
+    /// duplicate sidebar entries (and, for a continuous orchestrator, a
+    /// duplicate orchestrator). Keep each uid in exactly ONE workspace (first by
+    /// sorted id, for determinism) and strip it from the rest; drop a workspace
+    /// that DEDUP emptied when it's open + unbound (pure adopt debris). Closed
+    /// (explicit user action) and bound workspaces are preserved even if
+    /// emptied; pre-existing empty workspaces are left untouched. Self-healing —
+    /// the duplicates evaporate on the next restart with no manual file edit.
+    fn dedup_manifest_uids(manifest: &mut cm_daemon::manifest::Manifest) {
+        let bound: HashSet<String> = manifest.bindings.values().cloned().collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut emptied: HashSet<String> = HashSet::new();
+        // Deterministic keeper: the lowest workspace id wins each uid.
+        let mut ids: Vec<String> = manifest.workspaces.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            if let Some(w) = manifest.workspaces.get_mut(&id) {
+                let had_sessions = !w.sessions.is_empty();
+                w.sessions.retain(|e| seen.insert(e.uid.clone()));
+                if had_sessions
+                    && w.sessions.is_empty()
+                    && !w.is_closed
+                    && !bound.contains(&id)
+                {
+                    emptied.insert(id);
+                }
+            }
+        }
+        manifest.workspaces.retain(|id, _| !emptied.contains(id));
+    }
+
     /// Hydrate `self.workspaces` from the on-disk manifest exactly once,
     /// decoupled from the cloud/planning API. Driven from the main loop.
     ///
@@ -4643,7 +4677,12 @@ impl App {
     /// real tasks, but also works standalone (workspaces without any bound
     /// tasks are legal).
     fn restore_sessions(&mut self) {
-        let manifest = Self::load_manifest();
+        let mut manifest = Self::load_manifest();
+        // Heal duplicate-uid slots BEFORE any downstream pass reads the
+        // workspaces (bound/useful computation, the spawn/reattach loop) so a
+        // manifest carrying pre-fix phantom duplicates collapses to one slot per
+        // daemon session on this restart.
+        Self::dedup_manifest_uids(&mut manifest);
         if manifest.workspaces.is_empty() && manifest.bindings.is_empty() {
             return;
         }
@@ -5175,15 +5214,17 @@ impl App {
             .iter()
             .map(|p| p.entry.uid.clone())
             .collect();
+        // In-flight uids: dispatched to the attach worker but not yet bound into
+        // a slot (so absent from BOTH `tracked` and `pending`). Without this set
+        // the 5s poll re-adopts a uid during the dispatch→result window, and
+        // because no workspace holds it yet, `resolve_adopt_workspace` mints a
+        // FRESH synthetic workspace each time — one phantom duplicate (and, for
+        // continuous sessions, a duplicate orchestrator) per poll until it binds.
+        let attaching: std::collections::HashSet<String> =
+            self.attaching.keys().cloned().collect();
         for (host, summaries) in remote {
             for s in summaries {
-                // Same gate as `select_daemon_adoptees`, plus: not already
-                // tracked AND not already queued for a deferred attach.
-                let is_adoptee = (s.managed_by_uid.is_some()
-                    || s.continuous_task_id.is_some())
-                    && !tracked.contains(&s.session_uid)
-                    && !pending.contains(&s.session_uid);
-                if !is_adoptee {
+                if !Self::is_remote_adoptee(&s, &tracked, &pending, &attaching) {
                     continue;
                 }
                 let (target_ws_id, _worktree) = self.resolve_adopt_workspace(&s);
@@ -5336,6 +5377,27 @@ impl App {
             last_exit: None,
             host_id: host.clone(),
         }
+    }
+
+    /// Gate for the REMOTE deferred-adopt path: a summary is adopted iff it's
+    /// agent-spawned (`managed_by_uid`) or continuous-tagged AND its uid is not
+    /// already represented ANYWHERE in the adopt pipeline — bound in a slot
+    /// (`tracked`), queued for a deferred attach (`pending`), or in-flight in the
+    /// off-thread attach worker (`attaching`). The `attaching` check is the one
+    /// that prevents phantom duplicates: during the dispatch→result window a uid
+    /// is in neither `tracked` nor `pending`, so without it the 5s poll re-adopts
+    /// and mints a fresh synthetic workspace each tick. Pure so the dedup is
+    /// unit-testable without a live daemon.
+    fn is_remote_adoptee(
+        s: &crate::client_session::DaemonSessionSummary,
+        tracked: &std::collections::HashSet<String>,
+        pending: &std::collections::HashSet<String>,
+        attaching: &std::collections::HashSet<String>,
+    ) -> bool {
+        (s.managed_by_uid.is_some() || s.continuous_task_id.is_some())
+            && !tracked.contains(&s.session_uid)
+            && !pending.contains(&s.session_uid)
+            && !attaching.contains(&s.session_uid)
     }
 
     /// Select which daemon-session summaries the adoption pass should take:
@@ -5913,30 +5975,38 @@ impl App {
             let queued = self.attaching.remove(&result.entry.uid);
             match result.session {
                 Some(session) => {
-                    let Some(ws_idx) =
-                        self.workspaces.iter().position(|w| w.id == result.ws_id)
-                    else {
-                        continue; // workspace vanished — drop the fresh session
-                    };
-                    if let Some(existing) = self.workspaces[ws_idx]
-                        .sessions
-                        .iter()
-                        .position(|s| s.uid == result.entry.uid)
-                    {
+                    // Bind by uid across ALL workspaces, not just `result.ws_id`.
+                    // A daemon session is unique by uid, so if a slot for it
+                    // already exists ANYWHERE (a reconnect, or a stray duplicate
+                    // that split into another synthetic workspace), rebind that
+                    // slot in place rather than pushing a second one.
+                    let existing =
+                        self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+                            w.sessions
+                                .iter()
+                                .position(|s| s.uid == result.entry.uid)
+                                .map(|si| (wi, si))
+                        });
+                    if let Some((wi, si)) = existing {
                         // Reconnect: rebind the PTY in place, preserving slot
                         // metadata. Dropping the old dead `Session` only sends
                         // `Msg::Shutdown` — it does NOT kill the daemon session.
-                        let slot = &mut self.workspaces[ws_idx].sessions[existing];
+                        let slot = &mut self.workspaces[wi].sessions[si];
                         slot.session = session;
                         slot.status = SessionStatus::Running;
                         self.reconnecting_sessions.remove(&result.entry.uid);
-                    } else {
+                        self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
+                        changed = true;
+                    } else if let Some(ws_idx) =
+                        self.workspaces.iter().position(|w| w.id == result.ws_id)
+                    {
                         let ts =
                             Self::build_remote_terminal_session(&result.entry, session);
                         self.workspaces[ws_idx].sessions.push(ts);
+                        self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
+                        changed = true;
                     }
-                    self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
-                    changed = true;
+                    // else: workspace vanished — drop the fresh session.
                 }
                 None => {
                     if let Some(mut p) = queued {
@@ -21243,6 +21313,84 @@ mod adopt_daemon_session_tests {
         s.continuous_task_id = Some("bug-triage".to_string());
         let picked = App::select_daemon_adoptees(vec![s], &tracked);
         assert!(picked.is_empty(), "tracked continuous session must not double-adopt");
+    }
+
+    #[test]
+    fn dedup_manifest_uids_collapses_duplicate_uid_workspaces() {
+        // A manifest carrying the phantom-duplicate shape (one daemon uid in
+        // several synthetic workspaces) must collapse to ONE open slot per uid
+        // on load — distinct uids untouched, closed/bound workspaces preserved.
+        use cm_daemon::manifest::Manifest;
+        let entry = |uid: &str| {
+            serde_json::json!({
+                "uid": uid, "label": "x", "session_type": "claude-code",
+                "transcript_id": null,
+            })
+        };
+        let mut m: Manifest = serde_json::from_value(serde_json::json!({
+            "workspaces": {
+                "ws-a": {"id":"ws-a","name":"agent: orch","sessions":[entry("u-orch")]},
+                "ws-b": {"id":"ws-b","name":"agent: orch","sessions":[entry("u-orch")]},
+                "ws-c": {"id":"ws-c","name":"agent: orch","sessions":[entry("u-orch")]},
+                "ws-keep": {"id":"ws-keep","name":"real","sessions":[entry("u-other")]},
+                "ws-closed": {"id":"ws-closed","name":"x","is_closed":true,
+                              "sessions":[entry("u-orch")]},
+            },
+            "bindings": {},
+        }))
+        .unwrap();
+
+        App::dedup_manifest_uids(&mut m);
+
+        // u-orch survives in exactly one OPEN workspace (lowest id, ws-a);
+        // the emptied open duplicates ws-b/ws-c are dropped.
+        assert!(m.workspaces.contains_key("ws-a"));
+        assert!(!m.workspaces.contains_key("ws-b"));
+        assert!(!m.workspaces.contains_key("ws-c"));
+        // Distinct uid is left alone.
+        assert_eq!(m.workspaces["ws-keep"].sessions[0].uid, "u-other");
+        // Closed workspace preserved (explicit user action) though its dup uid
+        // was stripped — stays as an empty closed slot.
+        assert!(m.workspaces.contains_key("ws-closed"));
+        assert!(m.workspaces["ws-closed"].sessions.is_empty());
+        // Exactly one slot for u-orch remains across the whole manifest.
+        let orch_slots = m
+            .workspaces
+            .values()
+            .flat_map(|w| w.sessions.iter())
+            .filter(|e| e.uid == "u-orch")
+            .count();
+        assert_eq!(orch_slots, 1, "one slot per daemon uid after dedup");
+    }
+
+    #[test]
+    fn in_flight_attaching_uid_is_not_re_adopted() {
+        // The remote deferred-adopt gate must skip a uid that's already
+        // in-flight in the off-thread attach worker (`attaching`). During the
+        // dispatch→result window that uid is in NEITHER `tracked` nor `pending`,
+        // so without the `attaching` check the 5s poll re-adopts it every tick
+        // and `resolve_adopt_workspace` mints a fresh synthetic workspace each
+        // time — the phantom-duplicate / 2-orchestrators bug.
+        use std::collections::HashSet as Set;
+        let tracked: Set<String> = Set::new();
+        let pending: Set<String> = Set::new();
+        let mut s = summary("orch", None);
+        s.continuous_task_id = Some("bug-triage".to_string());
+
+        // Not yet in-flight → it IS an adoptee (proves the path is live).
+        let empty: Set<String> = Set::new();
+        assert!(
+            App::is_remote_adoptee(&s, &tracked, &pending, &empty),
+            "a fresh continuous adoptee must be picked up",
+        );
+
+        // In-flight in the attach worker → must be skipped.
+        let attaching: Set<String> = ["orch".to_string()].into_iter().collect();
+        assert!(
+            !App::is_remote_adoptee(&s, &tracked, &pending, &attaching),
+            "an in-flight (attaching) uid must NOT be re-adopted — it would mint \
+             a duplicate workspace per poll",
+        );
     }
 
     fn sized(uid: &str, cols: Option<u16>, rows: Option<u16>) -> DaemonSessionSummary {
