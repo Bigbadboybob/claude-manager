@@ -361,7 +361,24 @@ def update_task(
         fields["parent_task_id"] = None if parent_task_id == "null" else parent_task_id
     if not fields:
         raise ValueError("No fields to update — pass at least one field.")
-    client = PlanningClient()
+    try:
+        client = PlanningClient()
+    except Exception as planning_unavailable:
+        # Headless deployment (e.g. a daemon-spawned agent on cm-manager):
+        # the cli-routed PlanningClient is unavailable — the `cli` package
+        # isn't deployed alongside the MCP server, and/or CM_API_URL /
+        # CM_API_TOKEN aren't in the agent's env. A STATUS-ONLY update can
+        # still go through the daemon-routed `set_subtask_status` (the daemon
+        # holds the planning creds). Any OTHER field has no headless path, so
+        # surface the original error. This lets a bug-fix subtask agent flag
+        # `blocked` (fix-ready) via its natural `update_task(status=...)` call
+        # without the orchestrator prompt needing to know the daemon routing.
+        if list(fields.keys()) == ["status"]:
+            return control_client.call(
+                "set_subtask_status",
+                {"status": fields["status"], "task_id": task_id},
+            )
+        raise planning_unavailable
     return _shape_task(client.update_task(task_id, **fields), full=True)
 
 
