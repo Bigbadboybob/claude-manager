@@ -4,9 +4,9 @@ Open threads, captured 2026-06-29. Priority order; each item has enough context 
 
 ---
 
-## P0 — Session durability (the bug-002 kill) 🟢 S1+S2+S3 done (not deployed)
+## P0 — Session durability (the bug-002 kill) 🟢 S1+S2+S3+S5 DEPLOYED; only S4 left
 
-**STATUS:** persist (S1) + restore (S2) + resume (S3) are committed (`17916fc` / `9d206ff` / `5a9cdb9`) and verified locally (unit tests + real daemon SIGKILL→restart→same-uid-restore loop). **Deploy to cm-manager pending user coordination** (the restart kills live sessions, then restore brings them back resumed — do S1+S2+S3 together). Remaining: S4 (TUI reattach coordination + frozen-pane UX — pairs with the P1 item below) + S5 (continuous-task resume). Full detail in `DESIGN_SESSION_DURABILITY.md`.
+**STATUS:** persist (S1) + restore-at-same-uid (S2) + resume (S3) + continuous-orchestrator resume (S5) are committed (`17916fc` / `9d206ff` / `5a9cdb9` / `1bc059a` / `bdea0de`) and **LIVE on cm-manager**. Verified on prod: a restart restored BUG-007/008/009 AND the bug-triage orchestrator at their same uids, RESUMED, no scheduler double-spawn. S5 also fixed a latent bug — `continuous_fresh_spawn` never armed a transcript detector, so continuous sessions were stuck `pending`/unresumable; now fixed. **Only S4 remains:** TUI reattach coordination + frozen-pane UX (the TUI's auto-rebind to a daemon-respawned remote session; pairs with the P1 frozen-pane item below). Autocompact for the resumed orchestrator's growing context = P3. Full detail in `DESIGN_SESSION_DURABILITY.md`.
 
 **Agent sessions must survive daemon restarts.** A `systemctl restart cm-daemon` (every deploy) SIGKILLs all its PTYs → every ad-hoc subtask session dies and does NOT come back. bug-002's session was lost this way. **Unacceptable.**
 
