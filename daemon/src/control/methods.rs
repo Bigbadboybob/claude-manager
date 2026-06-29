@@ -6815,6 +6815,13 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
             continue;
         };
         for e in ws.sessions.iter().filter(|e| restore_in_scope(e)) {
+            // S5: a continuous session is restored only if its task is a
+            // supervised-persistent one (else it stays scheduler-owned).
+            if let Some(ct) = &e.continuous_task_id {
+                if !continuous_restorable(ct) {
+                    continue;
+                }
+            }
             targets.push((ws_id.clone(), worktree.clone(), e.clone()));
         }
     }
@@ -6841,13 +6848,34 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
     eprintln!("cm-daemon: restored {}/{} session(s)", restored, total);
 }
 
-/// S2 restore-scope predicate: a plain, still-live agent/bash session.
-/// Continuous + workflow sessions have their own owners; exited entries
-/// must not be resurrected. See [`restore_sessions`].
+/// Restore-scope predicate (the part that needs no disk IO): a still-live,
+/// non-workflow session. Exited entries must not be resurrected; workflow
+/// participants are poller-owned. Continuous sessions are gated SEPARATELY by
+/// [`continuous_restorable`] (it loads the task to decide) — see
+/// [`restore_sessions`].
 fn restore_in_scope(e: &crate::manifest::ManifestEntry) -> bool {
-    e.last_exit.is_none()
-        && e.continuous_task_id.is_none()
-        && e.workflow_run_id.is_none()
+    e.last_exit.is_none() && e.workflow_run_id.is_none()
+}
+
+/// S5: should restore re-spawn a CONTINUOUS session, or leave it to the
+/// scheduler? Restore takes over exactly the set the scheduler would otherwise
+/// fresh-respawn — supervised, enabled, un-paused `Persistent` tasks (mirrors
+/// `scheduler::should_supervise` minus the `in_flight` gate, which restore
+/// clears itself). By restoring such a session ALIVE at its same uid before the
+/// scheduler's first tick, the scheduler's `session_is_dead(current_session_uid)`
+/// returns false → no fresh respawn → the orchestrator keeps its conversation
+/// across the restart (DESIGN_SESSION_DURABILITY.md S5).
+///
+/// Everything else continuous — `Fresh`-mode fires (transient one-shots the
+/// scheduler reconciles), non-supervised, paused/disabled, or a task whose
+/// record is gone — stays scheduler-owned (returns `false`).
+fn continuous_restorable(task_id: &str) -> bool {
+    crate::continuous::task::load_one(task_id).map_or(false, |tk| {
+        tk.run_mode == crate::continuous::task::RunMode::Persistent
+            && tk.supervise
+            && tk.enabled
+            && !tk.paused
+    })
 }
 
 /// Build the spawn params for restoring one persisted session (pure — no
@@ -6890,6 +6918,12 @@ fn compose_restore_params(
         }
         if let Some(parent) = &e.managed_by_uid {
             m.insert("managed_by_uid".into(), Value::String(parent.clone()));
+        }
+        // S5: keep the continuous tag so the restored session is filed under
+        // its task (list_sessions continuous section, handle_session_exit's
+        // continuous-completion clearing, and the scheduler's own bookkeeping).
+        if let Some(ct) = &e.continuous_task_id {
+            m.insert("continuous_task_id".into(), Value::String(ct.clone()));
         }
         // claude resume continues the SAME transcript file: set transcript_path
         // explicitly so resolve_authorized_session reports `ready` at once and
@@ -7023,6 +7057,19 @@ fn restore_one_session(
                 existing_ids,
             );
         }
+    }
+
+    // S5: for a restored continuous session, clear any stale `in_flight` guard
+    // on its task. If the restart caught the task mid-fire, the guard is now
+    // orphaned (the fire's session is the one we just restored ALIVE, so
+    // reconcile_orphans won't clear it — it only clears guards whose session is
+    // dead). Leaving it set would block both supervision and periodic fires.
+    // The restored session IS `current_session_uid`, so the scheduler picks up
+    // its schedule against it. A no-op when the restart wasn't mid-fire.
+    if let Some(ct) = &e.continuous_task_id {
+        let _ = crate::continuous::task::modify(ct, |t| {
+            t.in_flight = None;
+        });
     }
     Ok(result)
 }
@@ -14214,15 +14261,17 @@ mod tests {
         }
     }
 
-    /// The restore-scope predicate: plain live sessions are in scope;
-    /// continuous (scheduler-owned), workflow (poller-owned), and exited
-    /// (don't-resurrect) entries are out of scope.
+    /// The IO-free restore-scope predicate: live non-workflow sessions pass
+    /// (continuous included — its gating moved to `continuous_restorable`);
+    /// workflow (poller-owned) + exited (don't-resurrect) are out of scope.
     #[test]
-    fn restore_in_scope_filters_continuous_workflow_exited() {
+    fn restore_in_scope_filters_workflow_and_exited() {
         assert!(restore_in_scope(&me("ts-1111111111111111-0", "bash")));
+        // S5: a continuous entry now PASSES this predicate — whether it's
+        // actually restored is decided by continuous_restorable (loads the task).
         let mut c = me("ts-2222222222222222-0", "bash");
         c.continuous_task_id = Some("ct-1".into());
-        assert!(!restore_in_scope(&c), "continuous skipped");
+        assert!(restore_in_scope(&c), "continuous gated separately, not here");
         let mut w = me("ts-3333333333333333-0", "bash");
         w.workflow_run_id = Some("wf-1".into());
         assert!(!restore_in_scope(&w), "workflow participant skipped");
@@ -14234,6 +14283,39 @@ mod tests {
             exited_at: 0.0,
         });
         assert!(!restore_in_scope(&x), "exited not resurrected");
+    }
+
+    /// S5: `continuous_restorable` mirrors the scheduler's supervised-persistent
+    /// set — true only for an enabled, un-paused, supervised `Persistent` task;
+    /// false for fresh / non-supervised / paused / missing.
+    #[test]
+    fn continuous_restorable_only_for_supervised_persistent() {
+        use crate::continuous::task::{self, Engine, RunMode, Schedule, ContinuousTask};
+        with_temp_home(|| {
+            let mk = |id: &str| {
+                ContinuousTask::new(
+                    id.into(), id.into(), "ws".into(), "/tmp/r".into(),
+                    Engine::Claude, RunMode::Persistent, Schedule::OnDemand, "go".into(),
+                )
+            };
+            // supervised persistent -> restorable
+            let mut sup = mk("ct-sup"); sup.supervise = true;
+            task::save(&sup).unwrap();
+            assert!(continuous_restorable("ct-sup"));
+            // persistent but NOT supervised -> scheduler doesn't own respawn; skip
+            let nosup = mk("ct-nosup"); task::save(&nosup).unwrap();
+            assert!(!continuous_restorable("ct-nosup"));
+            // fresh mode -> transient; skip
+            let mut fresh = mk("ct-fresh"); fresh.supervise = true; fresh.run_mode = RunMode::Fresh;
+            task::save(&fresh).unwrap();
+            assert!(!continuous_restorable("ct-fresh"));
+            // paused -> skip (matches should_supervise)
+            let mut paused = mk("ct-paused"); paused.supervise = true; paused.paused = true;
+            task::save(&paused).unwrap();
+            assert!(!continuous_restorable("ct-paused"));
+            // missing task -> skip
+            assert!(!continuous_restorable("ct-does-not-exist"));
+        });
     }
 
     /// End-to-end S2: a `daemon-sessions.json` with a mix of sessions →
@@ -14287,7 +14369,7 @@ mod tests {
         assert_eq!(restored.task_id.as_deref(), Some("task-x"));
         assert!(
             !s.sessions.contains_key("ts-bbbbbbbbbbbbbbbb-0"),
-            "continuous session NOT restored (scheduler owns it)",
+            "continuous session NOT restored (task ct-1 absent → not restorable)",
         );
         assert!(
             !s.sessions.contains_key("ts-cccccccccccccccc-0"),
@@ -14300,6 +14382,80 @@ mod tests {
         drop(s);
         // Drop the restored bash child (its Drop SIGKILLs it).
         state.lock().unwrap().sessions.clear();
+    }
+
+    /// S5: a SUPERVISED-PERSISTENT continuous session IS restored (resumed at
+    /// its same uid so the scheduler's `session_is_dead(current_session_uid)`
+    /// is false → no fresh respawn), the continuous tag is carried, and a stale
+    /// `in_flight` guard (restart-caught-mid-fire) is cleared so the scheduler
+    /// isn't blocked.
+    #[test]
+    fn restore_resumes_supervised_continuous_and_clears_in_flight() {
+        use crate::continuous::task::{
+            self, ContinuousTask, Engine, InFlight, RunMode, Schedule,
+        };
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("ct-wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let uid = "ts-cccccccccccccccc-0";
+
+            let mut t = ContinuousTask::new(
+                "ct-orch".into(),
+                "orch".into(),
+                "ws-ct".into(),
+                wt.to_string_lossy().into_owned(),
+                Engine::Claude,
+                RunMode::Persistent,
+                Schedule::OnDemand,
+                "go".into(),
+            );
+            t.supervise = true;
+            t.current_session_uid = Some(uid.into());
+            t.in_flight = Some(InFlight {
+                fire_token: "ft-x".into(),
+                session_uid: uid.into(),
+                started_at: 0,
+            });
+            task::save(&t).unwrap();
+
+            // bash (not claude) so the test doesn't need a real claude binary;
+            // continuous_restorable keys off the TASK's run_mode, not the engine.
+            let mut e = me(uid, "bash");
+            e.continuous_task_id = Some("ct-orch".into());
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-ct".into();
+            ws.worktree_path = Some(wt.clone());
+            ws.sessions = vec![e];
+            let mut manifest = crate::manifest::Manifest::default();
+            manifest.workspaces.insert("ws-ct".into(), ws);
+            let path = home.join(".cm").join("daemon-sessions.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+            let state = make_state_arc();
+            state.lock().unwrap().daemon_sessions_path = Some(path.clone());
+            restore_sessions(&state);
+
+            {
+                let s = state.lock().unwrap();
+                let restored = s
+                    .sessions
+                    .get(uid)
+                    .expect("supervised continuous session restored alive");
+                assert_eq!(
+                    restored.continuous_task_id.as_deref(),
+                    Some("ct-orch"),
+                    "continuous tag carried onto the restored session",
+                );
+            }
+            let reloaded = task::load_one("ct-orch").expect("task still on disk");
+            assert!(
+                reloaded.in_flight.is_none(),
+                "stale in_flight cleared by restore so the scheduler isn't blocked",
+            );
+            state.lock().unwrap().sessions.clear();
+        });
     }
 
     /// S3: a claude entry with a `transcript_id` composes argv that RESUMES
