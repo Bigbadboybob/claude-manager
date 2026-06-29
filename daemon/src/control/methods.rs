@@ -6148,6 +6148,7 @@ pub fn mcp_start_session(
         &session_uid,
         None,
         configured_mcp_server_path.as_deref(),
+        None, // fresh agent spawn — never a resume
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
 
@@ -6514,6 +6515,11 @@ fn compose_daemon_spawn_params(
     cols: u16,
     rows: u16,
     auto_register_worktree: Option<&std::path::Path>,
+    // P0 S3 (restore-resume): `Some(transcript_id)` builds the argv to
+    // resume that transcript (claude `--resume`, codex `resume` subcommand);
+    // `None` is a fresh spawn. Only restore passes `Some`; every other
+    // caller passes `None`.
+    resume_session_id: Option<&str>,
 ) -> MethodResult {
     // P-2: prefer the daemon's configured `mcp_server_path` so the
     // written MCP config points at the server on the daemon's host.
@@ -6531,6 +6537,7 @@ fn compose_daemon_spawn_params(
         uid,
         None,
         configured_mcp_server_path.as_deref(),
+        resume_session_id,
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
     let mut argv = Vec::with_capacity(argv_tail.len() + 1);
@@ -6632,6 +6639,7 @@ fn compose_continuous_spawn_params(
         cols,
         rows,
         Some(working_dir),
+        None, // a continuous fire is a fresh conversation, never a resume
     )?;
     // A continuous fire has no launching caller to inherit a cap from (the
     // scheduler tick / Operator run_now is headless), so derive it from config:
@@ -6842,19 +6850,24 @@ fn restore_in_scope(e: &crate::manifest::ManifestEntry) -> bool {
         && e.workflow_run_id.is_none()
 }
 
-/// Rebuild the spawn for one persisted session and re-launch it at its same
-/// uid. Reuses the fresh-spawn composer (argv via `build_args`, env via
-/// `build_env` — deterministic from uid + engine, so the restored session is
-/// byte-identical to a fresh one modulo the harmless systemd-scope nonce), then
-/// layers on the persisted identity (`managed_by_uid`, `global_perms`) and
-/// re-applies the memory cap if the session had one and its cgroup prefix still
-/// exists (graceful-degrade to uncapped, never fail).
-fn restore_one_session(
+/// Build the spawn params for restoring one persisted session (pure — no
+/// spawn, so it's unit-testable). Reuses the fresh-spawn composer (argv via
+/// `build_args`, env via `build_env`) threaded with the resume key (claude
+/// `--resume <id>` / codex `resume` subcommand), then layers on the persisted
+/// identity (`global_perms`, `managed_by_uid`), claude's explicit
+/// `transcript_path` (resume continues the same file), and the re-applied
+/// memory cap (graceful-degrade to uncapped if the cgroup prefix is gone).
+fn compose_restore_params(
     state_arc: &Arc<Mutex<DaemonState>>,
     workspace_id: &str,
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
 ) -> MethodResult {
+    // S3 (resume): a persisted transcript_id means "continue this
+    // conversation" — the argv gets `--resume <id>` (claude) / the `resume`
+    // subcommand (codex). `None` → fresh spawn (a session that never bound a
+    // transcript falls back to fresh; never blocks — decision 3).
+    let resume = e.transcript_id.as_deref();
     let mut params = compose_daemon_spawn_params(
         state_arc,
         &e.uid,
@@ -6869,6 +6882,7 @@ fn restore_one_session(
         // Auto-register the workspace — state.workspaces was cleared on the
         // restart (headless hosts have no tui-sessions.json to reload it).
         Some(worktree),
+        resume,
     )?;
     if let Value::Object(m) = &mut params {
         if e.global_perms {
@@ -6876,6 +6890,24 @@ fn restore_one_session(
         }
         if let Some(parent) = &e.managed_by_uid {
             m.insert("managed_by_uid".into(), Value::String(parent.clone()));
+        }
+        // claude resume continues the SAME transcript file: set transcript_path
+        // explicitly so resolve_authorized_session reports `ready` at once and
+        // the persist hook re-records the (unchanged) transcript_id. A detector
+        // can't help here — the file pre-exists, so a new-file scan never binds
+        // it. (Codex resume writes a NEW rollout, so it relies on the detector
+        // armed after spawn instead.)
+        if e.session_type == "claude-code" {
+            if let Some(id) = resume {
+                if let Some(tp) =
+                    crate::transcript_detect::claude_transcript_path(worktree, id)
+                {
+                    m.insert(
+                        "transcript_path".into(),
+                        Value::String(tp.to_string_lossy().into_owned()),
+                    );
+                }
+            }
         }
         // Re-apply the memory cap (argv-level systemd-run wrap) when the
         // session was capped AND the cgroup prefix is still present. Mirrors
@@ -6935,7 +6967,64 @@ fn restore_one_session(
             }
         }
     }
-    start_session(state_arc, &params).map(|_| Value::Null)
+    Ok(params)
+}
+
+/// Rebuild + re-launch one persisted session at its same uid. Builds the
+/// params via [`compose_restore_params`], spawns via `start_session`, then arms
+/// a transcript detector for codex / fresh restores so the new transcript binds
+/// + persists (the restored session is byte-identical to a fresh one modulo the
+/// harmless systemd-scope nonce).
+fn restore_one_session(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+) -> MethodResult {
+    let resume = e.transcript_id.as_deref();
+
+    // Snapshot existing transcript ids BEFORE the spawn so the detector armed
+    // after start_session (codex resume + fresh restores) can find the NEW
+    // file. Empty for bash (no transcript engine).
+    let detector_engine =
+        crate::transcript_detect::DetectorEngine::from_session_type(&e.session_type);
+    let existing_ids: Vec<String> = match &detector_engine {
+        Some(crate::transcript_detect::DetectorEngine::ClaudeCode) => {
+            crate::transcript_detect::snapshot_claude_transcript_ids(worktree)
+        }
+        Some(crate::transcript_detect::DetectorEngine::Codex) => {
+            crate::transcript_detect::snapshot_codex_transcript_ids(worktree)
+        }
+        None => Vec::new(),
+    };
+
+    let params = compose_restore_params(state_arc, workspace_id, worktree, e)?;
+    let result = start_session(state_arc, &params)?;
+
+    // Arm a transcript detector so the session's transcript binds + persists.
+    // Needed for codex (resume writes a NEW rollout file) and for any FRESH
+    // restore (a brand-new transcript). Skipped for claude-resume (its
+    // transcript_path is set explicitly in compose_restore_params; the file
+    // pre-exists so a new-file scan would never bind it) and for bash (no
+    // transcript). Mirrors the detector `mcp_start_session` arms for fresh
+    // agent spawns.
+    let needs_detector = match (e.session_type.as_str(), resume.is_some()) {
+        ("claude-code", true) => false,
+        ("bash", _) => false,
+        _ => true,
+    };
+    if needs_detector {
+        if let Some(de) = detector_engine {
+            crate::transcript_detect::spawn_detector(
+                Arc::clone(state_arc),
+                e.uid.clone(),
+                de,
+                worktree.to_path_buf(),
+                existing_ids,
+            );
+        }
+    }
+    Ok(result)
 }
 
 /// Mint a fire_token idempotency key (`ft_<hex>-<hex>`) for a `trigger` call
@@ -8891,6 +8980,7 @@ pub fn create_session(
         p.cols,
         p.rows,
         Some(&worktree_path),
+        None, // fresh create — never a resume
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -8988,6 +9078,7 @@ pub fn add_session(
         p.cols,
         p.rows,
         None,
+        None, // fresh spawn — never a resume
     )?;
     let start_result = start_session(state_arc, &full)?;
 
@@ -9152,7 +9243,7 @@ fn resolve_workflow_spawn_program(
             return Ok(ov);
         }
     }
-    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override)
+    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override, None)
 }
 
 #[cfg(test)]
@@ -11039,7 +11130,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
 
         let full = compose_daemon_spawn_params(
-            &state, &uid, "ws-c", "label", "claude-code", &wt, None, 100, 40, Some(&wt),
+            &state, &uid, "ws-c", "label", "claude-code", &wt, None, 100, 40, Some(&wt), None,
         )
         .expect("compose ok");
 
@@ -14209,6 +14300,75 @@ mod tests {
         drop(s);
         // Drop the restored bash child (its Drop SIGKILLs it).
         state.lock().unwrap().sessions.clear();
+    }
+
+    /// S3: a claude entry with a `transcript_id` composes argv that RESUMES
+    /// (`--resume <id>`) and sets `transcript_path` to the same file (resume
+    /// continues it) — so the restored session continues its conversation and
+    /// is `ready` immediately. Pure (no spawn).
+    #[test]
+    fn compose_restore_params_resumes_claude_with_flag_and_transcript_path() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("rwt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            let mut e = me("ts-eeeeeeeeeeeeeeee-0", "claude-code");
+            let tid = "11111111-2222-3333-4444-555555555555";
+            e.transcript_id = Some(tid.into());
+            let params =
+                compose_restore_params(&state, "ws-x", &wt, &e).expect("compose ok");
+            let argv: Vec<String> = params["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                argv.windows(2).any(|w| w[0] == "--resume" && w[1] == tid),
+                "claude argv must resume the transcript: {:?}",
+                argv,
+            );
+            let tp = params
+                .get("transcript_path")
+                .and_then(|v| v.as_str())
+                .expect("transcript_path set for claude resume");
+            assert!(
+                tp.ends_with(&format!("{tid}.jsonl")),
+                "transcript_path points at the resumed file: {}",
+                tp,
+            );
+        });
+    }
+
+    /// S3: a claude entry with NO `transcript_id` composes a FRESH spawn — no
+    /// `--resume`, no `transcript_path` (the detector will bind the new one).
+    #[test]
+    fn compose_restore_params_fresh_when_no_transcript_id() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("rwt2");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            let e = me("ts-ffffffffffffffff-0", "claude-code"); // transcript_id None
+            let params =
+                compose_restore_params(&state, "ws-y", &wt, &e).expect("compose ok");
+            let argv: Vec<String> = params["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                !argv.iter().any(|a| a == "--resume"),
+                "fresh restore has no `--resume`: {:?}",
+                argv,
+            );
+            assert!(
+                params.get("transcript_path").is_none(),
+                "fresh restore sets no transcript_path",
+            );
+        });
     }
 
     /// 10d-2c-1 test helper: seed a minimal-but-valid

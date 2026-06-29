@@ -329,6 +329,7 @@ pub fn build_args(
     session_uid: &str,
     workflow: Option<&WorkflowMeta>,
     server_path_override: Option<&str>,
+    resume_session_id: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>)> {
     match session_type {
         "claude-code" => {
@@ -337,16 +338,36 @@ pub fn build_args(
             args.push("--dangerously-skip-permissions".to_string());
             args.push("--mcp-config".to_string());
             args.push(cfg.to_string_lossy().to_string());
+            // P0 S3 (resume): continue the prior transcript. Mirrors
+            // `tui/src/mcp_config.rs::claude_args` — `--resume <id>`
+            // after `--mcp-config`. Claude APPENDS to the same `<id>.jsonl`
+            // file, so the restored session's transcript_path is unchanged.
+            if let Some(sid) = resume_session_id {
+                args.push("--resume".to_string());
+                args.push(sid.to_string());
+            }
             Ok(("claude".to_string(), args))
         }
         "codex" => {
             let mut args = Vec::new();
+            // P0 S3 (resume): codex resumes via the `resume` SUBCOMMAND
+            // (must be the first arg) with the SESSION_ID positional at the
+            // END (so it isn't swallowed as a flag value). Mirrors
+            // `tui/src/mcp_config.rs::codex_args`. Unlike claude, codex
+            // resume writes a NEW rollout file — the caller arms a detector
+            // to rebind `transcript_path`.
+            if resume_session_id.is_some() {
+                args.push("resume".into());
+            }
             args.push("--dangerously-bypass-approvals-and-sandbox".into());
             // Same update-check disable the TUI applies — prevents
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
             args.push("check_for_update_on_startup=false".into());
             args.extend(codex_overrides(session_uid, workflow, server_path_override));
+            if let Some(sid) = resume_session_id {
+                args.push(sid.to_string());
+            }
             Ok(("codex".to_string(), args))
         }
         "bash" => {
@@ -662,7 +683,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("bash", "ts-bash-1", None, None).expect("ok");
+        let (prog, args) = build_args("bash", "ts-bash-1", None, None, None).expect("ok");
         assert_eq!(prog, "/bin/bash");
         assert!(args.is_empty(), "bash spawns raw with no args");
     }
@@ -672,7 +693,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("claude-code", "ts-claude-1", None, None).expect("ok");
+        let (prog, args) = build_args("claude-code", "ts-claude-1", None, None, None).expect("ok");
         assert_eq!(prog, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         let mcp_idx = args
@@ -706,12 +727,72 @@ mod tests {
         );
     }
 
+    // ---- P0 S3 (resume): build_args resume argv -----------------------
+
+    #[test]
+    fn build_args_claude_resume_appends_resume_flag() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args) =
+            build_args("claude-code", "ts-rsm-1", None, None, Some("sid-abc")).expect("ok");
+        assert_eq!(prog, "claude");
+        assert!(
+            args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-abc"),
+            "claude resume must append `--resume <id>`: {:?}",
+            args,
+        );
+    }
+
+    #[test]
+    fn build_args_codex_resume_uses_subcommand_and_trailing_id() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args) =
+            build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz")).expect("ok");
+        assert_eq!(prog, "codex");
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("resume"),
+            "codex resume must be the FIRST arg (subcommand): {:?}",
+            args,
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("sid-xyz"),
+            "codex SESSION_ID must be the trailing positional: {:?}",
+            args,
+        );
+    }
+
+    #[test]
+    fn build_args_no_resume_omits_resume_tokens() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (_p, claude) =
+            build_args("claude-code", "ts-nr-1", None, None, None).expect("ok");
+        assert!(
+            !claude.iter().any(|a| a == "--resume"),
+            "no `--resume` when not resuming: {:?}",
+            claude,
+        );
+        let (_p2, codex) = build_args("codex", "ts-nr-2", None, None, None).expect("ok");
+        assert_ne!(
+            codex.first().map(String::as_str),
+            Some("resume"),
+            "no resume subcommand when not resuming: {:?}",
+            codex,
+        );
+    }
+
     #[test]
     fn build_args_codex_returns_inline_overrides() {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args) = build_args("codex", "ts-codex-1", None, None).expect("ok");
+        let (prog, args) = build_args("codex", "ts-codex-1", None, None, None).expect("ok");
         assert_eq!(prog, "codex");
         assert!(
             args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
@@ -799,7 +880,7 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_42", role: "reviewer" };
         let (_prog, args) =
-            build_args("claude-code", "ts-wf-1", Some(&meta), None).expect("ok");
+            build_args("claude-code", "ts-wf-1", Some(&meta), None, None).expect("ok");
         let mcp_idx = args
             .iter()
             .position(|a| a == "--mcp-config")
@@ -871,7 +952,7 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_99", role: "manager" };
         let (_prog, args) =
-            build_args("codex", "ts-wf-codex", Some(&meta), None).expect("ok");
+            build_args("codex", "ts-wf-codex", Some(&meta), None, None).expect("ok");
         assert!(
             args.iter().any(|a| a.contains("CM_WORKFLOW_RUN_ID=\"wf_99\"")),
             "codex overrides must register the run id in the MCP env: {:?}",
@@ -898,7 +979,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let err = build_args("gcloud", "ts-x", None, None).expect_err("must reject");
+        let err = build_args("gcloud", "ts-x", None, None, None).expect_err("must reject");
         assert!(
             err.to_string().contains("claude-code | codex | bash"),
             "error must list supported types: {}",

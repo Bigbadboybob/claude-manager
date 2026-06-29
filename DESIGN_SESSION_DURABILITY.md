@@ -32,7 +32,7 @@ The daemon restores its own sessions across its own restart: each not-done sessi
 
 - **S1 — Persist. ✅ DONE (2026-06-29).** Daemon writes `daemon-sessions.json` on session create / exit / transcript-bind (atomic temp-file + rename). Round-trips the re-spawn fields. Write-only — no restore yet, so sessions still die on restart (S2 fixes that). *Verified by* 5 unit tests (build/round-trip/no-op + the real `start_session` and `set_transcript_path` RPC hooks). See "S1 — landed" below for what shipped and the decisions made during impl.
 - **S2 — Restore (no-resume). ✅ DONE (2026-06-29).** On startup (`lib.rs::run`, before the accept loop + scheduler), `restore_sessions` reads `daemon-sessions.json` and re-spawns each in-scope session at its **same uid** with rebuilt argv/env (`build_args` + `build_env` + the persisted cap wrap) — a FRESH conversation (no `--resume`), isolating spawn/registry mechanics from resume. Scope: plain agent/bash sessions; continuous (scheduler-owned), workflow (poller-owned), and exited entries are skipped. Never blocks startup (per-session best-effort). *Verified by* 2 unit tests (scope filter + real end-to-end respawn-at-same-uid carrying identity, skipping the rest). See "S2 — landed" below.
-- **S3 — Resume.** Add `--resume <transcript_id>` (claude) / codex resume to the restore spawn so history carries over. *Verify:* a codeword held only in the pre-restart conversation survives the restart.
+- **S3 — Resume. ✅ DONE (2026-06-29).** The restore spawn now carries the resume key: claude `--resume <id>`, codex `resume` subcommand (mirrors the TUI's proven `claude_args`/`codex_args`). claude sets `transcript_path` explicitly (resume continues the same file); codex/fresh arm a detector to bind the new transcript. *Verified by* unit tests (build_args resume both engines + compose_restore_params resume/fresh) AND a real local end-to-end loop: spawn a session → SIGKILL the daemon → restart → the session reappears alive at its same uid (`scripts`-style operator-socket harness). The codeword-survives-restart check with a real claude is the final on-cm-manager verification. See "S3 — landed" below.
 - **S4 — TUI coordination.** Ensure the TUI's restore/reattach path binds to the daemon-respawned session instead of double-spawning; reconcile with the deferred-remote-reattach flow. Resolve the **frozen-pane UX** (P1) in the same pass: during the restart window the TUI should show "restoring", then rebind.
 - **S5 — Continuous: resume too.** Restore resumes continuous sessions as well — the orchestrator keeps its conversation across restarts (decision 2). Must coordinate with the scheduler's supervise/respawn so it does NOT double-spawn: restore brings the orchestrator's session back (resumed, same uid); the scheduler then continues its schedule against the restored session instead of respawning a fresh one. Accept unbounded context growth for now (cached input; autocompact lands separately — TODO P3).
 
@@ -84,18 +84,22 @@ Files: `daemon/src/manifest.rs`, `daemon/src/session.rs`, `daemon/src/state.rs`,
 - **Scope deferrals:** continuous + workflow sessions are skipped (owned by the scheduler / poller); S5 makes the scheduler *resume* continuous sessions; workflow-participant restore is a later slice.
 - **Periodic flush still deferred** — fold into S5/later once continuous-resume ordering is settled. The lifecycle hooks already keep the file converged for ad-hoc sessions.
 
-## S3 implementation notes (START HERE on resume)
+## S3 — landed (what shipped + decisions made during impl)
 
-S3 = make restore RESUME the prior conversation instead of starting fresh. Small, focused:
+Files: `daemon/src/mcp_config.rs`, `daemon/src/control/methods.rs`.
 
-1. **Inject the resume flag into the rebuilt argv** in `restore_one_session` (only when the entry has a `transcript_id`):
-   - **claude-code:** `claude --resume <transcript_id> …` (verify flag placement vs the existing `--dangerously-skip-permissions --mcp-config <path>` — `--resume <id>` should precede or coexist; test the real CLI).
-   - **codex:** the codex resume invocation (check `codex` CLI — likely `codex resume <id>` or a `-c`/flag form; confirm against the installed `@openai/codex`).
-   - Apply BEFORE the mem-cap `systemd-run` wrap (the wrap must stay outermost).
-   - No `transcript_id` (e.g. a session that never bound one) → fall back to fresh (decision 3, never block).
-2. **Pass `transcript_path`** into the `start_session` params (resolve from `transcript_id` + worktree via `transcript_detect::claude_transcript_path` / `codex_transcript_path`) so `resolve_authorized_session` reports `ready` immediately rather than waiting for the detector to re-bind.
-3. **Verify** locally (temp HOME + operator socket per `reference_daemon_operator_socket_e2e`): hold a codeword in a session's conversation, restart the daemon, confirm the restored session knows the codeword (`--resume` worked).
-4. **THEN deploy persist+restore+resume together** to cm-manager in ONE restart (a lone S1/S2 deploy kills sessions with weaker/no continuity — net-negative). Coordinate the cm-manager restart with the user (it kills live sessions; restore brings them back resumed).
+- **`mcp_config::build_args` gained a `resume_session_id: Option<&str>` param.** claude appends `--resume <id>` after `--mcp-config`; codex prepends the `resume` SUBCOMMAND (first arg) with the SESSION_ID as the trailing positional — mirrors the TUI's proven `claude_args`/`codex_args` exactly. Threaded through `compose_daemon_spawn_params` (every other caller passes `None`: `create_session`, `compose_continuous_spawn_params`, `mcp_start_session`, `resolve_workflow_spawn_program`).
+- **`compose_restore_params`** (extracted from `restore_one_session`, pure/testable) passes `resume = e.transcript_id.as_deref()`. For claude it ALSO sets `transcript_path` explicitly (resume continues the SAME `<id>.jsonl` file → `ready` immediately + persist re-records the id). The mem-cap wrap stays OUTERMOST (applied after the resume argv).
+- **`restore_one_session`** arms a transcript detector after `start_session` for codex (resume writes a NEW rollout) and for any fresh restore — snapshotting ids before the spawn. Skipped for claude-resume (path set explicitly; the pre-existing file would never bind via a new-file scan) and bash.
+
+**Decisions made during impl:**
+- **No `transcript_id` → fall back to fresh** (decision 3): a session that never bound a transcript restores as a new conversation rather than blocking.
+- **Reversed the daemon's "TUI owns argv" stance for restore.** `daemon/src/mcp_config.rs`'s header notes slice 10c-e-3b deliberately removed argv resolution from the general `start_session` path. Restore is a NEW daemon-internal spawn caller (like `mcp_start_session`/`create_session`) that legitimately needs argv resolution, so adding resume to the daemon's `build_args` is consistent with that pattern, not a regression of it.
+- **codex transcript freshness across restarts** is handled by the post-spawn detector (it binds codex's new rollout and the persist hook records it), so a codex session resumes the LATEST conversation on each successive restart — not the stale original.
+
+## Deploy (when ready — needs user coordination)
+
+S1+S2+S3 are a complete unit. Deploy them TOGETHER to cm-manager in ONE restart (a lone S1/S2 deploy would kill sessions with weaker/no continuity — net-negative). The restart KILLS cm-manager's live sessions; restore brings them back resumed — so it must be coordinated with the user (it briefly drops the orchestrator + bug sessions, then they reappear). Final on-target verification: the codeword-survives-restart check with a real claude session. Build: `cargo build --release -p cm-daemon` → scp → atomic swap + `systemctl restart cm-daemon` (per `reference_manager_vm` / CLAUDE.md). S4 (TUI reattach coordination + frozen-pane UX) and S5 (continuous resume) remain.
 
 ## S1 implementation notes (from mapping the daemon — historical; S1 now landed)
 
