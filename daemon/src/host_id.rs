@@ -70,6 +70,15 @@ impl HostId {
     }
 }
 
+/// `local` is the default host — lets `ManifestWorkspace` (which gained a
+/// `host_id` field, DESIGN_REMOVE_GLOBAL_HOST.md) keep deriving `Default`, and
+/// any `HostId::default()` reads as the local machine.
+impl Default for HostId {
+    fn default() -> Self {
+        Self::local()
+    }
+}
+
 impl fmt::Display for HostId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)

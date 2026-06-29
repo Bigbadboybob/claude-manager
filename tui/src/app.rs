@@ -461,6 +461,13 @@ pub struct Workspace {
     pub main_repo_path: Option<PathBuf>,
     pub worker_vm: Option<String>,
     pub worker_zone: Option<String>,
+    /// Host this workspace's worktree lives on, set ONCE at creation (a
+    /// worktree can't move hosts). The single source of truth for "where do
+    /// this task's sessions run" — every session added to the workspace
+    /// inherits it. Retires the global `App::active_host` (see
+    /// DESIGN_REMOVE_GLOBAL_HOST.md). Persisted in `ManifestWorkspace`;
+    /// legacy manifests without it derive it from the first session's host.
+    pub host_id: cm_daemon::host_id::HostId,
     pub sessions: Vec<TerminalSession>,
     /// Records of closed sessions in this workspace. Resolver consults
     /// these (after `sessions`) to answer `read_session_output` for an
@@ -4583,6 +4590,7 @@ impl App {
                     repo_url: ws.repo_url.clone(),
                     worker_vm: ws.worker_vm.clone(),
                     worker_zone: ws.worker_zone.clone(),
+                    host_id: ws.host_id.clone(),
                     sessions: entries,
                     tombstones: ws.tombstones.clone(),
                 },
@@ -4878,6 +4886,15 @@ impl App {
                 main_repo_path: mw.main_repo_path.clone(),
                 worker_vm: mw.worker_vm.clone(),
                 worker_zone: mw.worker_zone.clone(),
+                // Backward-compat derive: a legacy manifest's workspace has no
+                // host_id (serde-defaults to local), so prefer the persisted
+                // sessions' host (authoritative — a worktree's host == its
+                // sessions' host); fall back to the persisted workspace host.
+                host_id: mw
+                    .sessions
+                    .first()
+                    .map(|s| s.host_id.clone())
+                    .unwrap_or_else(|| mw.host_id.clone()),
                 sessions: vec![],
                 tombstones: restored_tombstones,
                 is_pushing: false,
@@ -5208,7 +5225,8 @@ impl App {
                 let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
                 drop(tracked);
                 for s in adoptees {
-                    let (target_ws_id, worktree) = self.resolve_adopt_workspace(&s);
+                    let (target_ws_id, worktree) = self
+                        .resolve_adopt_workspace(&s, &cm_daemon::host_id::HostId::local());
                     // Attach to the existing daemon session (uid-only; the
                     // daemon already owns argv/env/cwd). Transcript binding is
                     // deferred — the attach-stream replays the ring buffer.
@@ -5296,7 +5314,7 @@ impl App {
                 if !Self::is_remote_adoptee(&s, &tracked, &pending, &attaching) {
                     continue;
                 }
-                let (target_ws_id, _worktree) = self.resolve_adopt_workspace(&s);
+                let (target_ws_id, _worktree) = self.resolve_adopt_workspace(&s, &host);
                 let entry = Self::manifest_entry_from_summary(&s, &host);
                 self.pending_remote_reattach
                     .push(PendingRemoteReattach::new(target_ws_id, entry));
@@ -5314,6 +5332,7 @@ impl App {
     fn resolve_adopt_workspace(
         &mut self,
         s: &crate::client_session::DaemonSessionSummary,
+        host: &cm_daemon::host_id::HostId,
     ) -> (String, PathBuf) {
         // worktree: daemon-reported > matching workspace's > temp_dir. Must end
         // up `Some` on the workspace so the restore path re-attaches it.
@@ -5369,6 +5388,8 @@ impl App {
                         main_repo_path: None,
                         worker_vm: None,
                         worker_zone: None,
+                        // The synthetic workspace adopts the session's host.
+                        host_id: host.clone(),
                         sessions: Vec::new(),
                         tombstones: Vec::new(),
                         is_pushing: false,
@@ -9918,6 +9939,9 @@ impl App {
                     main_repo_path,
                     worker_vm: task.worker_vm.clone(),
                     worker_zone: task.worker_zone.clone(),
+                    // Cloud (GCP-worker) tasks aren't a daemon `hosts.toml` host;
+                    // default the daemon-host attribute to local.
+                    host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: Vec::new(),
                     is_pushing: false,
@@ -12027,6 +12051,8 @@ impl App {
             main_repo_path: Some(main_repo),
             worker_vm: None,
             worker_zone: None,
+            // Same host the session was spawned on (the snapshot above).
+            host_id: active_host.clone(),
             sessions: vec![ts],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -12233,6 +12259,7 @@ impl App {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: host.clone(),
             sessions: vec![ts],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -12877,6 +12904,8 @@ impl App {
                 main_repo_path: Some(main_repo.clone()),
                 worker_vm: None,
                 worker_zone: None,
+                // The cloud-pull replacement worktree is always local.
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: vec![ts],
                 tombstones: Vec::new(),
                 is_pushing: false,
@@ -13406,6 +13435,8 @@ impl App {
             main_repo_path: Some(main_repo),
             worker_vm: None,
             worker_zone: None,
+            // Same host the subtask session was spawned on.
+            host_id: active_host.clone(),
             sessions: vec![ts],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -13759,6 +13790,8 @@ impl App {
                     main_repo_path: main_repo,
                     worker_vm: None,
                     worker_zone: None,
+                    // API task-sync provisions a local worktree.
+                    host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: Vec::new(),
                     is_pushing: false,
@@ -17414,6 +17447,7 @@ mod apply_manifest_diff_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![ts],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -18550,6 +18584,7 @@ mod rotation_binding_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions,
             tombstones: vec![],
             is_pushing: false,
@@ -18945,6 +18980,7 @@ mod pending_workflow_events_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: Vec::new(),
             tombstones: Vec::new(),
             is_pushing: false,
@@ -19073,6 +19109,7 @@ mod pending_workflow_events_tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -19512,6 +19549,7 @@ mod pending_workflow_events_tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -19717,6 +19755,7 @@ mod pending_workflow_events_tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -19834,6 +19873,7 @@ mod pending_workflow_events_tests {
             repo_url: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![entry],
             tombstones: Vec::new(),
         };
@@ -19956,6 +19996,7 @@ mod pending_workflow_events_tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -20025,6 +20066,7 @@ mod pending_workflow_events_tests {
             repo_url: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![entry],
             tombstones: Vec::new(),
         };
@@ -20144,6 +20186,7 @@ mod pending_workflow_events_tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -20213,6 +20256,7 @@ mod pending_workflow_events_tests {
             repo_url: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![mk(&uid_gone), mk(&uid_live)],
             tombstones: Vec::new(),
         };
@@ -20347,6 +20391,7 @@ mod pending_workflow_events_tests {
             repo_url: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![mk("uid-g1"), mk("uid-g2")],
             tombstones: Vec::new(),
         };
@@ -20463,6 +20508,7 @@ mod pending_workflow_events_tests {
             repo_url: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![entry.clone()],
             tombstones: Vec::new(),
         };
@@ -20611,6 +20657,7 @@ mod pending_workflow_events_tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -20745,6 +20792,7 @@ mod pending_workflow_events_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: Vec::new(),
             tombstones: Vec::new(),
             is_pushing: false,
@@ -20888,6 +20936,7 @@ mod pending_workflow_events_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![local_sess],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -20912,6 +20961,7 @@ mod pending_workflow_events_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![remote_sess],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -21113,6 +21163,7 @@ mod remote_reconnect_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![ts],
             tombstones: Vec::new(),
             is_pushing: false,
@@ -22350,6 +22401,7 @@ mod worktree_mode_tests {
             main_repo_path: main.map(PathBuf::from),
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: vec![],
             is_pushing: false,
@@ -24202,6 +24254,7 @@ mod input_handler_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: Vec::new(),
             tombstones: Vec::new(),
             is_pushing: false,
@@ -25936,6 +25989,7 @@ mod slice_12e_tests {
                 main_repo_path: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: vec![ts],
                 tombstones: Vec::new(),
                 is_pushing: false,
@@ -25981,6 +26035,7 @@ mod slice_12e_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             is_pushing: false,
             sessions: vec![{
                 let mut ts = make_simple_session_with_uid(
@@ -26061,6 +26116,7 @@ mod slice_12e_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             is_pushing: false,
             sessions: vec![
                 mk("uid-normal", "normal", None),
@@ -26162,6 +26218,7 @@ mod slice_12e_tests {
                 main_repo_path: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 is_pushing: false,
                 sessions: vec![
                     mk("uid-normal", "normal", None),
@@ -26733,6 +26790,7 @@ mod slice_12e_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             is_pushing: false,
             sessions: vec![caller_ts],
             tombstones: Vec::new(),
@@ -26997,6 +27055,7 @@ mod slice_12e_tests {
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             is_pushing: false,
             sessions: vec![caller_ts],
             tombstones: Vec::new(),
@@ -27344,6 +27403,7 @@ mod slice_12e_tests {
             repo_url: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![local_entry.clone(), remote_entry.clone()],
             tombstones: Vec::new(),
         };
@@ -27528,6 +27588,7 @@ remote_socket = "/remote/manager.sock"
                     repo_url: None,
                     worker_vm: None,
                     worker_zone: None,
+                    host_id: cm_daemon::host_id::HostId::local(),
                     sessions: vec![],
                     tombstones: vec![],
                 },
@@ -27574,6 +27635,7 @@ remote_socket = "/remote/manager.sock"
             main_repo_path: None,
             worker_vm: None,
             worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
             sessions: vec![],
             tombstones: vec![],
             is_pushing: false,

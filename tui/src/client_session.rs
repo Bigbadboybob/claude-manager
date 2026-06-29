@@ -1701,6 +1701,7 @@ mod tests {
                 repo_url: None,
                 worker_vm: None,
                 worker_zone: None,
+                host_id: cm_daemon::host_id::HostId::local(),
                 sessions: Vec::new(),
                 tombstones: Vec::new(),
             },

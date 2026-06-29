@@ -447,6 +447,13 @@ pub struct ManifestWorkspace {
     pub worker_vm: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_zone: Option<String>,
+    /// Host this workspace's worktree lives on (DESIGN_REMOVE_GLOBAL_HOST.md).
+    /// Set once at creation; the single source of truth replacing the global
+    /// `active_host`. Serde-default `local` so legacy manifests (no field)
+    /// load — the TUI then derives the real host from the workspace's first
+    /// session at load time.
+    #[serde(default = "default_local_host_id")]
+    pub host_id: crate::host_id::HostId,
     #[serde(default)]
     pub sessions: Vec<ManifestEntry>,
     /// Recently-closed sessions kept around so `read_session_output` can
@@ -962,5 +969,28 @@ mod tests {
         let back: ManifestEntry =
             serde_json::from_str(&s).expect("round-trip");
         assert_eq!(back.continuous_task_id.as_deref(), Some("bug-triage"));
+    }
+
+    /// DESIGN_REMOVE_GLOBAL_HOST.md Phase A: `ManifestWorkspace.host_id`
+    /// round-trips, and a legacy workspace (no `host_id` key) loads as `local`
+    /// (serde default) — the TUI then derives the real host from the
+    /// workspace's first session.
+    #[test]
+    fn manifest_workspace_host_id_round_trips_and_legacy_defaults_local() {
+        let mut ws = ManifestWorkspace {
+            id: "ws".into(),
+            host_id: crate::host_id::HostId("manager".into()),
+            ..Default::default()
+        };
+        ws.name = "n".into();
+        let json = serde_json::to_string(&ws).expect("serialize");
+        assert!(json.contains(r#""host_id":"manager""#), "host_id serialized: {}", json);
+        let back: ManifestWorkspace = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.host_id, crate::host_id::HostId("manager".into()));
+
+        // Legacy workspace JSON with no host_id key → defaults to local.
+        let legacy: ManifestWorkspace =
+            serde_json::from_str(r#"{"id":"ws","name":"n"}"#).expect("legacy load");
+        assert_eq!(legacy.host_id, crate::host_id::HostId::local());
     }
 }
