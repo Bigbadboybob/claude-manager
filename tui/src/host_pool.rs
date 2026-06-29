@@ -185,7 +185,15 @@ const STDERR_RING_CAP: usize = 32;
 /// How long `SshTunnel::spawn` waits for the local socket to
 /// appear before declaring the tunnel a failure. Matches the
 /// slice plan spec ("~3s").
-const SPAWN_SOCKET_WAIT: Duration = Duration::from_secs(3);
+// A fresh ssh handshake (TCP + kex + auth + channel) over a flaky/high-latency
+// WAN can occasionally exceed a few seconds. The readiness loop polls every
+// 50ms and returns the instant the socket binds, so a healthy tunnel still
+// completes in well under a second — this ceiling only governs how long we let
+// a SLOW handshake finish before killing + respawning it. The wait runs
+// off-thread (tunnel warming is on the manifest.watch consumer), so a generous
+// bound never freezes the UI. Was 3s, which timed out fresh tunnels while sshd
+// was throttled under a pile of (now keepalive-reaped) zombie tunnels.
+const SPAWN_SOCKET_WAIT: Duration = Duration::from_secs(8);
 
 /// Polling interval inside the spawn wait loop.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -728,6 +736,32 @@ impl SshTunnel {
                     None => spec.ssh_host.clone(),
                 };
                 let args: Vec<OsString> = vec![
+                    // Keepalive — the load-bearing fix for "remote sessions go
+                    // unresponsive and never reconnect". Without it, a dead TCP
+                    // transport (a network blip) leaves `ssh -N -L` running as a
+                    // ZOMBIE: its local socket still ACCEPTS connections (so the
+                    // `UnixStream::connect` readiness probe is fooled into
+                    // reporting the tunnel warm) while every RPC forwarded
+                    // through it hangs into a dead pipe → `read response frame`.
+                    // Auto-reconnect only ever fired on tunnel *death* (ssh
+                    // exits → socket EOF); a *hang* was invisible. ServerAlive
+                    // 5s×3 makes ssh detect the dead peer and EXIT within ~15s,
+                    // converting the undetectable hang into the death the
+                    // existing dead-tunnel respawn already heals.
+                    "-o".into(),
+                    "ServerAliveInterval=5".into(),
+                    "-o".into(),
+                    "ServerAliveCountMax=3".into(),
+                    // Exit immediately if the forward can't be established
+                    // (don't linger with a useless connection the readiness
+                    // probe would still pass once the socket binds).
+                    "-o".into(),
+                    "ExitOnForwardFailure=yes".into(),
+                    // Never block on an interactive auth prompt — stdin is
+                    // already null, so a prompt would hang the spawn until the
+                    // readiness timeout kills it. Fail fast instead.
+                    "-o".into(),
+                    "BatchMode=yes".into(),
                     "-N".into(),
                     "-L".into(),
                     forward.into(),
