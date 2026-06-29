@@ -14677,7 +14677,7 @@ impl App {
         let spinner = self.spinner_frame();
         let rows = self.visual_items_continuous();
         let mut items: Vec<ListItem> = Vec::new();
-        for r in rows.iter().take(inner.height as usize) {
+        for (i, r) in rows.iter().take(inner.height as usize).enumerate() {
             let ts = &self.workspaces[r.ws_idx].sessions[r.sess_idx];
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(Color::Yellow))
@@ -14704,9 +14704,18 @@ impl App {
                 indicator_style,
             )];
             if r.depth >= 1 {
-                // Subtask nested under its orchestrator.
+                // Subtask nested under its orchestrator. The LAST child (the
+                // next row starts a new orchestrator, or the list ends) gets the
+                // corner `└`; earlier children get the tee `├`. Lookahead uses
+                // the full `rows` (not the visible window).
+                let is_last_child = rows.get(i + 1).map_or(true, |nx| nx.depth == 0);
+                let glyph = if is_last_child {
+                    "\u{2514} "
+                } else {
+                    "\u{251c} "
+                };
                 spans.push(Span::styled(
-                    "\u{251c} ",
+                    glyph,
                     Style::default().fg(Color::DarkGray),
                 ));
             }

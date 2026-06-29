@@ -1,6 +1,6 @@
 # Design — Two-column continuous panel (TUI)
 
-**Status:** design + slice plan (P2 in TODO.md). Decisions locked with the user 2026-06-29.
+**Status:** ✅ SHIPPED (S1–S5, 2026-06-29). Decisions locked with the user 2026-06-29. All slices below landed; commits on branch `cm/daemon-side-workflow-execution-autonomous-cloud-wo`. TUI-only (runs locally — no deploy).
 
 ## Goal
 

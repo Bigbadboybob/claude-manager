@@ -30,9 +30,9 @@ Was: when the remote daemon restarts the TUI showed a **frozen attach pane** and
 
 Tier-4 architectural change per `DESIGN_REMOVE_GLOBAL_HOST.md`: retire the global `active_host`; host becomes workspace-scoped. Large + touches host switching — start with the pre-coding audit + slice plan.
 
-## P2 — Two-column continuous panel (TUI) 🟡
+## ~~P2 — Two-column continuous panel (TUI)~~ ✅ DONE (S1–S5)
 
-Tier-4 UI feature: split sidebar — attached pane LEFT, main + continuous columns RIGHT (50/50); `A-C` toggles the continuous column in/out; tasks spawned by continuous tasks nest under their orchestrator in the continuous column (even though not themselves continuous); unified cursor with left/right nav. Start with a design/slice plan for review before coding.
+Shipped per `DESIGN_CONTINUOUS_PANEL.md`. `A-C` toggles a dedicated continuous column (terminal | main | continuous) where orchestrators carry their spawned subtasks nested (`├`/`└` tree, matched by `managed_by_uid`); `A-h`/`A-l` move the unified cursor between columns, `A-j`/`A-k` within. Persisted (`continuous_column_on` on the manifest). Came with the **keybinding reshuffle** (S1): retired the `A-H` host-switcher, hide→`A-H`, push/pull→`A-[`/`A-]`, freeing `A-h`/`A-l`. Local-only (TUI) — no deploy. TUI 659 green. (Possible follow-ups: multihost grouping inside the column; transitive nesting depth; verify `A-[` registers across terminals.)
 
 ## ~~P3 — `continuous.update` + autocompact~~ ✅ DONE (deployed)
 
