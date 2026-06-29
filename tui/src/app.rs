@@ -11206,10 +11206,11 @@ impl App {
             idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
             repo_url,
             seed_from: None,
-            // Default the host choice to the global active_host: an operator
-            // who never touches the host field gets exactly today's behavior.
-            // ←/→ on field 5 picks a different configured host.
-            host_id: self.active_host.clone(),
+            // Default the host to `local` (the overwhelmingly common case)
+            // rather than a global mode the operator has to remember to set —
+            // the global active_host is retired (DESIGN_REMOVE_GLOBAL_HOST.md).
+            // ←/→ on the host field still picks any configured host per-task.
+            host_id: cm_daemon::host_id::HostId::local(),
             active_field: 0,
         };
     }
@@ -13306,12 +13307,12 @@ impl App {
         // `cm/<slug>` branch).
         in_place: bool,
     ) {
-        // 12e-r7 F2: planning A-l from the planning view
-        // creates a worktree + spawns a session. Same shape
-        // as round-6 F1 for `create_local_session`: snapshot
-        // active_host, fail-fast BEFORE worktree creation so
-        // a remote-host A-l doesn't leave an orphan dir.
-        let active_host = self.active_host.clone();
+        // Planning A-l creates a local worktree + spawns a session into it, so
+        // the host is local (the global active_host is retired —
+        // DESIGN_REMOVE_GLOBAL_HOST.md). The guard is now a structural
+        // invariant (always local) kept for symmetry with the other spawn
+        // paths until remote TUI-launch lands.
+        let active_host = cm_daemon::host_id::HostId::local();
         if let Err(e) = guard_local_host_only(
             &active_host,
             "A-l launch-from-plan",
@@ -25840,12 +25841,12 @@ mod slice_12e_tests {
         );
     }
 
-    /// Host picker: `start_new_session` seeds the form's `host_id` from the
-    /// current `active_host` — an operator who never touches the host field
-    /// creates on active_host, exactly as before the picker existed. Here
-    /// `A-H` first moves active_host to `manager`, then A-n inherits it.
+    /// Global-host removal: `start_new_session` seeds the form's `host_id` to
+    /// `local` — the overwhelmingly common case — rather than a global mode the
+    /// operator must remember to set. A non-local host is a per-task pick via
+    /// ←/→ on the host field.
     #[test]
-    fn a_n_form_defaults_host_to_active_host() {
+    fn a_n_form_defaults_host_to_local() {
         let guard = crate::test_support::home_lock();
         let (mut app, _tmp) = build_app_with_hosts(
             &[("local", true), ("manager", false)],
@@ -25855,15 +25856,13 @@ mod slice_12e_tests {
         app.config
             .repos
             .insert("r".into(), "https://github.com/a/b".into());
-        app.cycle_active_host();
-        assert_eq!(app.active_host, HostId::new("manager"));
         app.start_new_session();
         match &app.input_mode {
             InputMode::NewSession { host_id, .. } => {
                 assert_eq!(
                     *host_id,
-                    HostId::new("manager"),
-                    "A-n form must default the host to active_host",
+                    HostId::local(),
+                    "A-n form defaults the host to local (no global mode)",
                 );
             }
             _ => panic!("expected NewSession form open"),
