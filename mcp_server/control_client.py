@@ -103,6 +103,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # socket on (re)attach; no MCP tool routes it. Listed for dispatch-
     # surface alignment only.
     "session.resize",
+    # Operator-only grant of global session permissions (TUI A-e toggle →
+    # this RPC). No MCP tool routes it — an agent escalates via
+    # start_session(global_perms=true), not this. Listed for dispatch-surface
+    # alignment only.
+    "session.set_global_perms",
     # 10d-2c-1 review round-5 (F1): TUI pushes workflow context
     # onto an already-spawned daemon session via this RPC after
     # `launch_workflow` binds an Existing-slot participant.
