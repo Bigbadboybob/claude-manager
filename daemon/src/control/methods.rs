@@ -6815,10 +6815,15 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
             continue;
         };
         for e in ws.sessions.iter().filter(|e| restore_in_scope(e)) {
-            // S5: a continuous session is restored only if its task is a
-            // supervised-persistent one (else it stays scheduler-owned).
+            // S5: a continuous session is restored only if (a) its task is a
+            // supervised-persistent one AND (b) it has a transcript to RESUME.
+            // Without a transcript_id a fresh restore would spawn the
+            // orchestrator with NO prompt (idle + useless) AND make the
+            // scheduler think it's alive — strictly worse than letting the
+            // scheduler fresh-respawn-and-prompt it. So leave transcript-less
+            // continuous sessions to the scheduler.
             if let Some(ct) = &e.continuous_task_id {
-                if !continuous_restorable(ct) {
+                if !continuous_restorable(ct) || e.transcript_id.is_none() {
                     continue;
                 }
             }
@@ -7175,7 +7180,51 @@ fn continuous_fresh_spawn(state_arc: &Arc<Mutex<DaemonState>>, full: &Value) -> 
             return Ok(json!({ "session_uid": uid }));
         }
     }
-    start_session(state_arc, full)
+    // Snapshot transcript ids BEFORE the spawn so the detector armed below binds
+    // the NEW one. Continuous spawns previously skipped detection entirely, so
+    // the orchestrator stayed `pending` forever — never readable, never
+    // resumable on restart (S5). Parity with mcp_start_session / create_session.
+    let session_type = full
+        .get("session_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let uid = full
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let working_dir = full
+        .get("working_dir")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
+    let detector_engine =
+        crate::transcript_detect::DetectorEngine::from_session_type(session_type);
+    let existing: Vec<String> = match (&detector_engine, &working_dir) {
+        (Some(crate::transcript_detect::DetectorEngine::ClaudeCode), Some(wt)) => {
+            crate::transcript_detect::snapshot_claude_transcript_ids(wt)
+        }
+        (Some(crate::transcript_detect::DetectorEngine::Codex), Some(wt)) => {
+            crate::transcript_detect::snapshot_codex_transcript_ids(wt)
+        }
+        _ => Vec::new(),
+    };
+
+    let result = start_session(state_arc, full)?;
+
+    // Arm the detector so the session binds + persists its transcript_id —
+    // which makes it `ready` (readable) AND, crucially for S5, resumable: the
+    // persist hook records the transcript_id so a future restart's restore can
+    // `--resume` the orchestrator instead of fresh-respawning it.
+    if let (Some(de), Some(wt)) = (detector_engine, working_dir) {
+        crate::transcript_detect::spawn_detector(
+            Arc::clone(state_arc),
+            uid,
+            de,
+            wt,
+            existing,
+        );
+    }
+    Ok(result)
 }
 
 /// Roll back the spawn-window `in_flight` guard and write a `"fired"` failure
@@ -14421,8 +14470,10 @@ mod tests {
 
             // bash (not claude) so the test doesn't need a real claude binary;
             // continuous_restorable keys off the TASK's run_mode, not the engine.
+            // transcript_id present so the S5 resume-only guard admits it.
             let mut e = me(uid, "bash");
             e.continuous_task_id = Some("ct-orch".into());
+            e.transcript_id = Some("dead-beef-cafe".into());
             let mut ws = crate::manifest::ManifestWorkspace::default();
             ws.id = "ws-ct".into();
             ws.worktree_path = Some(wt.clone());
