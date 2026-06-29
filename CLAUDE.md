@@ -91,12 +91,11 @@ Sessions view:
 - `A-s` — add a session to the focused task
 - `A-a` — attach
 - `A-w` — close session
-- `A-h` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden)
-- `A-H` — switch active host (cycles through entries in `~/.cm/hosts.toml`; see Multi-host below)
+- `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (global host is being removed — new sessions use the `local` default).
+- `A-h` / `A-l` — **reserved** for the continuous-panel column nav (LEFT / RIGHT between the main + continuous columns); wired with the panel (see `DESIGN_CONTINUOUS_PANEL.md`). Currently no-ops.
 - `A-e` — session settings (label, idle/burst timers, hidden, notify-on-idle, **global perms** — Tab to the field, Space to toggle)
 - `A-v` — toggle Status / Task sub-view
-- `A-p` — push (cloud)
-- `A-l` — pull (cloud)
+- `A-[` — push (cloud) · `A-]` — pull (cloud)  *(moved off `A-p`/`A-l`)*
 - `A-r` — refresh
 
 Planning view:

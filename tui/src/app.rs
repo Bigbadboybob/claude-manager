@@ -10169,18 +10169,20 @@ impl App {
                         self.open_session_settings();
                         return true;
                     }
-                    // 12e: Alt+Shift+h on some terminals comes
-                    // through as KeyCode::Char('h') + SHIFT
-                    // modifier (instead of Char('H')). Handle
-                    // the shift-modifier case BEFORE the bare
-                    // 'h' (toggle-hidden) arm.
+                    // A-H toggles the focused session's hidden status. It took
+                    // over from the retired global-host switcher (`A-H` /
+                    // `cycle_active_host`) — the global `active_host` is being
+                    // removed; new sessions use the `local` default. Some
+                    // terminals deliver Alt+Shift+h as Char('h')+SHIFT, others
+                    // as Char('H'); match both. **Bare A-h is now FREE** — it
+                    // becomes continuous-panel column-nav LEFT (wired in S4).
+                    KeyCode::Char('H') => {
+                        self.toggle_session_hidden();
+                        return true;
+                    }
                     KeyCode::Char('h')
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        self.cycle_active_host();
-                        return true;
-                    }
-                    KeyCode::Char('h') => {
                         self.toggle_session_hidden();
                         return true;
                     }
@@ -10196,11 +10198,16 @@ impl App {
                         self.start_new_session();
                         return true;
                     }
-                    KeyCode::Char('p') => {
+                    // Cloud push/pull moved off A-p / A-l so the vim keys are
+                    // free for continuous-panel column nav (A-l → RIGHT, S4).
+                    // A-[ / A-] (rarely-used cloud ops). NOTE: Alt+[ can collide
+                    // with the CSI escape introducer on some terminals — if it
+                    // doesn't register, these need alternates.
+                    KeyCode::Char('[') => {
                         self.push_active();
                         return true;
                     }
-                    KeyCode::Char('l') => {
+                    KeyCode::Char(']') => {
                         self.pull_active();
                         return true;
                     }
@@ -10242,16 +10249,11 @@ impl App {
                         self.open_workflow_history();
                         return true;
                     }
-                    // 12e: A-H (Alt+Shift+H) cycles the active
-                    // host. The lowercase 'h' + SHIFT path is
-                    // handled above (before the bare 'h'
-                    // toggle-hidden arm); this arm catches
-                    // terminals that report bare uppercase
-                    // 'H' instead of 'h' + SHIFT.
-                    KeyCode::Char('H') => {
-                        self.cycle_active_host();
-                        return true;
-                    }
+                    // (Retired: A-H used to cycle the active host. A-H now
+                    // toggles session-hidden — handled at the top of this match
+                    // via Char('H') / Char('h')+SHIFT. The global active_host is
+                    // being removed; `cycle_active_host` is retained for tests +
+                    // the eventual workspace-scoped-host work.)
                     _ => {}
                 }
             }
