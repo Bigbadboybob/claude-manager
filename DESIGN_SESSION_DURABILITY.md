@@ -31,7 +31,7 @@ The daemon restores its own sessions across its own restart: each not-done sessi
 ## Slice plan
 
 - **S1 — Persist. ✅ DONE (2026-06-29).** Daemon writes `daemon-sessions.json` on session create / exit / transcript-bind (atomic temp-file + rename). Round-trips the re-spawn fields. Write-only — no restore yet, so sessions still die on restart (S2 fixes that). *Verified by* 5 unit tests (build/round-trip/no-op + the real `start_session` and `set_transcript_path` RPC hooks). See "S1 — landed" below for what shipped and the decisions made during impl.
-- **S2 — Restore (no-resume).** On startup, re-spawn persisted not-done sessions in their worktrees with rebuilt argv/env, same uid — but a FRESH conversation first (no `--resume`), to isolate the spawn/registry mechanics from resume correctness. *Verify:* restart daemon → sessions reappear alive at the same uid; TUI reattaches.
+- **S2 — Restore (no-resume). ✅ DONE (2026-06-29).** On startup (`lib.rs::run`, before the accept loop + scheduler), `restore_sessions` reads `daemon-sessions.json` and re-spawns each in-scope session at its **same uid** with rebuilt argv/env (`build_args` + `build_env` + the persisted cap wrap) — a FRESH conversation (no `--resume`), isolating spawn/registry mechanics from resume. Scope: plain agent/bash sessions; continuous (scheduler-owned), workflow (poller-owned), and exited entries are skipped. Never blocks startup (per-session best-effort). *Verified by* 2 unit tests (scope filter + real end-to-end respawn-at-same-uid carrying identity, skipping the rest). See "S2 — landed" below.
 - **S3 — Resume.** Add `--resume <transcript_id>` (claude) / codex resume to the restore spawn so history carries over. *Verify:* a codeword held only in the pre-restart conversation survives the restart.
 - **S4 — TUI coordination.** Ensure the TUI's restore/reattach path binds to the daemon-respawned session instead of double-spawning; reconcile with the deferred-remote-reattach flow. Resolve the **frozen-pane UX** (P1) in the same pass: during the restart window the TUI should show "restoring", then rebind.
 - **S5 — Continuous: resume too.** Restore resumes continuous sessions as well — the orchestrator keeps its conversation across restarts (decision 2). Must coordinate with the scheduler's supervise/respawn so it does NOT double-spawn: restore brings the orchestrator's session back (resumed, same uid); the scheduler then continues its schedule against the restored session instead of respawning a fresh one. Accept unbounded context growth for now (cached input; autocompact lands separately — TODO P3).
@@ -68,16 +68,34 @@ Files: `daemon/src/session.rs`, `daemon/src/state.rs`, `daemon/src/lib.rs`, `dae
 - **`ManifestEntry` has NO mem-cap fields, and it's constructed in 29 literal sites** across daemon + tui. Adding fields breaks all 29. Mem-cap is a *restore-spawn* input (re-apply the cap), not a *persist* concern → **deferred to S2**, where the spawn rebuild needs it and the field-add + 29-site fix lands together. (Risks §"Memory-cap inheritance" tracks this.)
 - **No periodic flush thread in S1 — deferred to S2.** A timer-flush would clobber `daemon-sessions.json` with empty state on every fresh restart (S1 has no restore, so the daemon boots empty and a flush would erase the file before anything reads it). Once S2's restore populates `state.sessions` at startup *before* any flush, a debounced periodic flush becomes safe and captures non-hooked mutations (workflow-context set, etc.). Until then, the lifecycle hooks are sufficient (and don't clobber).
 
-## S2 implementation notes (START HERE on resume)
+## S2 — landed (what shipped + decisions made during impl)
 
-Restore = the daemon, at startup, reads `daemon-sessions.json` and re-spawns each not-done session at its **same uid** in its worktree. Build it in this order:
+Files: `daemon/src/manifest.rs`, `daemon/src/session.rs`, `daemon/src/state.rs`, `daemon/src/control/methods.rs`, `daemon/src/lib.rs`, `tui/src/app.rs`.
 
-1. **Add mem-cap fields to `ManifestEntry`** (`memory_cap_soft_bytes`, `memory_cap_hard_bytes`, `cgroup_prefix` — all `#[serde(default, skip_serializing_if=...)]`), extend `to_manifest_entry()` to carry them, and fix the ~29 literal constructors (mechanical — add the three `: None`). This is the schema prep restore needs.
-2. **Reconstruct the spawn.** For each persisted not-done entry, rebuild `SpawnParams` from durable inputs: engine/`session_type`, worktree (`working_dir` from the workspace's `worktree_path`), `task_id`/`managed_by_uid`/workflow+continuous tags/`global_perms`, mem-cap triple, and the rebuilt MCP env via `mcp_config::build_env`. **Rebuild argv** (don't persist a stale argv) to match what `mcp_start_session`/`create_session` originally built — including the mem-cap `systemd-run` wrap. S2 first lands a FRESH spawn (no `--resume`) to isolate spawn/registry mechanics; **S3** adds `--resume <transcript_id>` (claude) / codex resume.
-3. **Same-uid re-register**, before the control listener accepts (so the TUI can't reattach mid-spawn). Skip done/exited tombstones strictly (honor user done/delete).
-4. **Never block startup** (decision 3): any spawn/resume failure → log + continue (fall back to fresh in S3); pre-trust the worktree (`reference_headless_claude_trust_dialog`).
-5. **Then** add the debounced periodic flush (now safe — see S1 finding above).
-6. **Verify** locally first (temp HOME + operator socket per `reference_daemon_operator_socket_e2e`), THEN deploy persist+restore **together** to cm-manager in ONE restart (a lone S1 deploy would kill sessions with no restore — net-negative). Coordinate the cm-manager restart with the user (it kills live sessions; restore brings them back).
+- **`ManifestEntry` gained the mem-cap triple** (`memory_cap_soft_bytes` / `memory_cap_hard_bytes` / `cgroup_prefix`, all `#[serde(default, skip…)]`); `to_manifest_entry()` carries them; 28 literal constructors across daemon + tui were updated (mechanical `: None`).
+- **`state::read_daemon_sessions(path)`** — parse-don't-apply reader (distinct from `load_manifest_from_disk`, which would clobber live `state.workspaces`).
+- **`methods::restore_sessions(&state)`** — reads the file, then for each in-scope entry calls `restore_one_session`, which **rebuilds the spawn** via `compose_daemon_spawn_params` (argv `build_args` + env `build_env`, deterministic from uid+engine) + re-applies the persisted cap wrap, layers on `global_perms`/`managed_by_uid`, and calls `start_session` at the **same uid**. `restore_in_scope` = `last_exit.is_none() && continuous_task_id.is_none() && workflow_run_id.is_none()`.
+- **Wired in `lib.rs::run`** before the poller/scheduler + accept loop.
+
+**Decisions made during impl:**
+- **Rebuild argv, do NOT persist a recipe.** `build_args`/`build_env` are deterministic from `(uid, engine, mcp_server_path)`; `wrap_with_systemd_run`'s only non-determinism (the systemd unit nonce) is harmless on restart (old scope is gone → new scope name). Rebuild is actually *more* robust than a persisted recipe: a session restored after a deploy picks up the *current* socket/config layout, not a stale snapshot. So S1's `ManifestEntry` file shape was sufficient (just needed mem-cap fields).
+- **Pre-trust is free.** `claude_trust::maybe_pretrust_for_spawn` runs inside `DaemonSession::spawn` itself, so restore (→ `start_session` → spawn) pre-trusts the worktree automatically (decision 3 / `reference_headless_claude_trust_dialog`).
+- **Cap graceful-degrade.** Re-apply the cap only if its persisted cgroup prefix still `is_dir()`; else restore uncapped + log (never fail the spawn).
+- **Scope deferrals:** continuous + workflow sessions are skipped (owned by the scheduler / poller); S5 makes the scheduler *resume* continuous sessions; workflow-participant restore is a later slice.
+- **Periodic flush still deferred** — fold into S5/later once continuous-resume ordering is settled. The lifecycle hooks already keep the file converged for ad-hoc sessions.
+
+## S3 implementation notes (START HERE on resume)
+
+S3 = make restore RESUME the prior conversation instead of starting fresh. Small, focused:
+
+1. **Inject the resume flag into the rebuilt argv** in `restore_one_session` (only when the entry has a `transcript_id`):
+   - **claude-code:** `claude --resume <transcript_id> …` (verify flag placement vs the existing `--dangerously-skip-permissions --mcp-config <path>` — `--resume <id>` should precede or coexist; test the real CLI).
+   - **codex:** the codex resume invocation (check `codex` CLI — likely `codex resume <id>` or a `-c`/flag form; confirm against the installed `@openai/codex`).
+   - Apply BEFORE the mem-cap `systemd-run` wrap (the wrap must stay outermost).
+   - No `transcript_id` (e.g. a session that never bound one) → fall back to fresh (decision 3, never block).
+2. **Pass `transcript_path`** into the `start_session` params (resolve from `transcript_id` + worktree via `transcript_detect::claude_transcript_path` / `codex_transcript_path`) so `resolve_authorized_session` reports `ready` immediately rather than waiting for the detector to re-bind.
+3. **Verify** locally (temp HOME + operator socket per `reference_daemon_operator_socket_e2e`): hold a codeword in a session's conversation, restart the daemon, confirm the restored session knows the codeword (`--resume` worked).
+4. **THEN deploy persist+restore+resume together** to cm-manager in ONE restart (a lone S1/S2 deploy kills sessions with weaker/no continuity — net-negative). Coordinate the cm-manager restart with the user (it kills live sessions; restore brings them back resumed).
 
 ## S1 implementation notes (from mapping the daemon — historical; S1 now landed)
 

@@ -509,6 +509,16 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // P0 session durability (S2): re-spawn the sessions the daemon was running
+    // before it stopped (read from daemon-sessions.json, written by S1). Runs
+    // HERE — after the listener is bound but BEFORE the accept loop below and
+    // before the scheduler — so (a) a reconnecting TUI can't reattach a session
+    // mid-restore, and (b) restored sessions exist before the scheduler's
+    // supervise pass (it owns continuous sessions, which restore skips, but the
+    // ordering keeps S5's coordination simple). Best-effort + per-session
+    // isolated; it never blocks startup.
+    control::methods::restore_sessions(&state);
+
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,
     // delivers activation prompts, and runs finalization/fresh-respawn for

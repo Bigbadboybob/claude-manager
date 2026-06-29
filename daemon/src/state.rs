@@ -842,6 +842,27 @@ pub fn default_daemon_sessions_path() -> PathBuf {
         .join(".cm/daemon-sessions.json")
 }
 
+/// Read (parse, do NOT apply) the daemon's durable session registry from
+/// `path` (P0 session durability, S2 — restore). Distinct from
+/// [`DaemonState::load_manifest_from_disk`], which mutates `self.workspaces`
+/// / `self.bindings`: restore must NOT overwrite live state with the daemon
+/// file — it iterates the returned manifest and re-spawns each session
+/// through `start_session`, which re-registers each workspace itself.
+///
+/// `Ok(None)` when the file is absent (clean boot — nothing to restore).
+/// Parse failures bubble up so the caller can log + continue with no restored
+/// sessions (never fatal — restore must never block startup).
+pub fn read_daemon_sessions(path: &Path) -> std::io::Result<Option<Manifest>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let manifest: Manifest = serde_json::from_str(&contents)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Some(manifest))
+}
+
 /// Serialize `manifest` and write it to `path` atomically: write to
 /// a uniquely-named temp file in the same directory, then `rename`
 /// over the target (atomic on the same filesystem). A reader never
@@ -929,6 +950,9 @@ mod tests {
 
     fn entry(uid: &str) -> ManifestEntry {
         ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: uid.into(),
             managed_by_uid: None,
             generation: 0,

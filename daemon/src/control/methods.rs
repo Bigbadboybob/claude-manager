@@ -6745,6 +6745,199 @@ fn resolve_continuous_cap(
     Some((effective, effective, prefix.to_string_lossy().into_owned()))
 }
 
+// ===================================================================
+// P0 session durability — S2 (restore). DESIGN_SESSION_DURABILITY.md.
+// ===================================================================
+
+/// At daemon startup, re-spawn the sessions the daemon was running before it
+/// stopped, reading the durable registry S1 persisted to
+/// `daemon-sessions.json`. This is the half that makes a `systemctl restart
+/// cm-daemon` (every deploy) transparent: ad-hoc agent sessions reappear alive
+/// at the SAME uid instead of vanishing (the bug-002 kill).
+///
+/// **Scope (S2):** plain agent / `bash` sessions only.
+///   - Continuous-tagged sessions are owned by the scheduler's
+///     supervise/respawn — restoring them here would double-spawn (S5 makes
+///     the scheduler resume instead).
+///   - Workflow participants are owned by the poller + workflow-run state — a
+///     separate restore concern (later slice).
+///   - Exited entries are skipped (the exit hook normally removes them; this
+///     guards a crash that raced the removal — don't resurrect a dead session).
+///
+/// **Fresh, not resumed (S2):** re-spawns a NEW conversation at the same uid to
+/// isolate spawn/registry mechanics. S3 adds `--resume <transcript_id>` so the
+/// conversation carries over — that's the user-visible payoff.
+///
+/// **Never blocks startup** (decision 3): every per-session failure is logged
+/// and skipped; one bad entry can't wedge the daemon. Runs before the control
+/// listener accepts (caller ordering in `lib.rs::run`) so a reconnecting TUI
+/// can't reattach mid-spawn.
+pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
+    let path = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.daemon_sessions_path.clone()
+    };
+    let Some(path) = path else { return };
+    let manifest = match crate::state::read_daemon_sessions(&path) {
+        Ok(Some(m)) => m,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: could not read durable session registry {} ({}); \
+                 starting with no restored sessions",
+                path.display(),
+                e,
+            );
+            return;
+        }
+    };
+
+    // Collect (workspace_id, worktree, entry) for every in-scope session.
+    let mut targets: Vec<(String, std::path::PathBuf, crate::manifest::ManifestEntry)> =
+        Vec::new();
+    for (ws_id, ws) in &manifest.workspaces {
+        let Some(worktree) = ws.worktree_path.clone() else {
+            for e in ws.sessions.iter().filter(|e| restore_in_scope(e)) {
+                eprintln!(
+                    "cm-daemon: cannot restore session {} — workspace {} has no \
+                     worktree path; skipping",
+                    e.uid, ws_id,
+                );
+            }
+            continue;
+        };
+        for e in ws.sessions.iter().filter(|e| restore_in_scope(e)) {
+            targets.push((ws_id.clone(), worktree.clone(), e.clone()));
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let total = targets.len();
+    eprintln!(
+        "cm-daemon: restoring {} session(s) from {}",
+        total,
+        path.display(),
+    );
+    let mut restored = 0usize;
+    for (ws_id, worktree, e) in targets {
+        match restore_one_session(state_arc, &ws_id, &worktree, &e) {
+            Ok(_) => restored += 1,
+            Err((_code, msg)) => eprintln!(
+                "cm-daemon: restore of session {} failed: {} — skipping \
+                 (startup continues)",
+                e.uid, msg,
+            ),
+        }
+    }
+    eprintln!("cm-daemon: restored {}/{} session(s)", restored, total);
+}
+
+/// S2 restore-scope predicate: a plain, still-live agent/bash session.
+/// Continuous + workflow sessions have their own owners; exited entries
+/// must not be resurrected. See [`restore_sessions`].
+fn restore_in_scope(e: &crate::manifest::ManifestEntry) -> bool {
+    e.last_exit.is_none()
+        && e.continuous_task_id.is_none()
+        && e.workflow_run_id.is_none()
+}
+
+/// Rebuild the spawn for one persisted session and re-launch it at its same
+/// uid. Reuses the fresh-spawn composer (argv via `build_args`, env via
+/// `build_env` — deterministic from uid + engine, so the restored session is
+/// byte-identical to a fresh one modulo the harmless systemd-scope nonce), then
+/// layers on the persisted identity (`managed_by_uid`, `global_perms`) and
+/// re-applies the memory cap if the session had one and its cgroup prefix still
+/// exists (graceful-degrade to uncapped, never fail).
+fn restore_one_session(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+) -> MethodResult {
+    let mut params = compose_daemon_spawn_params(
+        state_arc,
+        &e.uid,
+        workspace_id,
+        &e.label,
+        &e.session_type,
+        worktree,
+        e.task_id.as_deref(),
+        // ManifestEntry doesn't persist PTY size; the TUI resizes on attach.
+        80,
+        24,
+        // Auto-register the workspace — state.workspaces was cleared on the
+        // restart (headless hosts have no tui-sessions.json to reload it).
+        Some(worktree),
+    )?;
+    if let Value::Object(m) = &mut params {
+        if e.global_perms {
+            m.insert("global_perms".into(), Value::Bool(true));
+        }
+        if let Some(parent) = &e.managed_by_uid {
+            m.insert("managed_by_uid".into(), Value::String(parent.clone()));
+        }
+        // Re-apply the memory cap (argv-level systemd-run wrap) when the
+        // session was capped AND the cgroup prefix is still present. Mirrors
+        // compose_continuous_spawn_params' wrap, but driven by the PERSISTED
+        // triple rather than config. Graceful-degrade to uncapped if the
+        // prefix is gone (e.g. user systemd manager not up yet) — never fail
+        // the spawn (decision 3).
+        if let (Some(soft), Some(hard), Some(prefix)) = (
+            e.memory_cap_soft_bytes,
+            e.memory_cap_hard_bytes,
+            e.cgroup_prefix.as_ref(),
+        ) {
+            if prefix.is_dir() {
+                let argv: Vec<String> = m
+                    .get("argv")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some((program, tail)) = argv.split_first() {
+                    let cap_spec = crate::mcp_config::CapSpec {
+                        soft_bytes: soft,
+                        hard_bytes: hard,
+                        session_uid: &e.uid,
+                        cgroup_prefix: prefix.as_path(),
+                    };
+                    let (wrapped_program, wrapped_args, _cgroup_path) =
+                        crate::mcp_config::wrap_with_systemd_run(
+                            program,
+                            tail,
+                            Some(&cap_spec),
+                        );
+                    let mut wrapped = Vec::with_capacity(wrapped_args.len() + 1);
+                    wrapped.push(Value::String(wrapped_program));
+                    wrapped.extend(wrapped_args.into_iter().map(Value::String));
+                    m.insert("argv".into(), Value::Array(wrapped));
+                    m.insert("memory_cap_bytes".into(), Value::Number(soft.into()));
+                    m.insert(
+                        "memory_cap_hard_bytes".into(),
+                        Value::Number(hard.into()),
+                    );
+                    m.insert(
+                        "cgroup_prefix".into(),
+                        Value::String(prefix.to_string_lossy().into_owned()),
+                    );
+                }
+            } else {
+                eprintln!(
+                    "cm-daemon: restored session {} had a memory cap but its \
+                     cgroup prefix {} is gone — restoring UNCAPPED",
+                    e.uid,
+                    prefix.display(),
+                );
+            }
+        }
+    }
+    start_session(state_arc, &params).map(|_| Value::Null)
+}
+
 /// Mint a fire_token idempotency key (`ft_<hex>-<hex>`) for a `trigger` call
 /// that didn't supply one. Same `nanos`+counter recipe as
 /// [`new_daemon_minted_session_uid`], distinct prefix. A minted token is fresh
@@ -12425,6 +12618,9 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    memory_cap_soft_bytes: None,
+                    memory_cap_hard_bytes: None,
+                    cgroup_prefix: None,
                     uid: uid.clone(),
                     managed_by_uid: None,
                     generation: 0,
@@ -12669,6 +12865,9 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    memory_cap_soft_bytes: None,
+                    memory_cap_hard_bytes: None,
+                    cgroup_prefix: None,
                     uid: uid.clone(),
                     managed_by_uid: None,
                     generation: 0,
@@ -12864,6 +13063,9 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    memory_cap_soft_bytes: None,
+                    memory_cap_hard_bytes: None,
+                    cgroup_prefix: None,
                     uid: uid.clone(),
                     managed_by_uid: None,
                     generation: 0,
@@ -13889,6 +14091,123 @@ mod tests {
         );
 
         // Drop the live session so its Drop SIGKILLs the sleep child.
+        state.lock().unwrap().sessions.clear();
+    }
+
+    // ---- P0 session durability (S2): restore ------------------------
+
+    /// Minimal live plain-session `ManifestEntry` for restore tests.
+    fn me(uid: &str, session_type: &str) -> crate::manifest::ManifestEntry {
+        crate::manifest::ManifestEntry {
+            uid: uid.into(),
+            managed_by_uid: None,
+            generation: 0,
+            label: format!("L-{uid}"),
+            session_type: session_type.into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            task_id: None,
+            notify_on_idle: false,
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            global_perms: false,
+            seeded_from_snapshot: None,
+            last_exit: None,
+            host_id: crate::host_id::HostId::local(),
+        }
+    }
+
+    /// The restore-scope predicate: plain live sessions are in scope;
+    /// continuous (scheduler-owned), workflow (poller-owned), and exited
+    /// (don't-resurrect) entries are out of scope.
+    #[test]
+    fn restore_in_scope_filters_continuous_workflow_exited() {
+        assert!(restore_in_scope(&me("ts-1111111111111111-0", "bash")));
+        let mut c = me("ts-2222222222222222-0", "bash");
+        c.continuous_task_id = Some("ct-1".into());
+        assert!(!restore_in_scope(&c), "continuous skipped");
+        let mut w = me("ts-3333333333333333-0", "bash");
+        w.workflow_run_id = Some("wf-1".into());
+        assert!(!restore_in_scope(&w), "workflow participant skipped");
+        let mut x = me("ts-4444444444444444-0", "bash");
+        x.last_exit = Some(crate::manifest::LastExit {
+            code: Some(0),
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 0.0,
+        });
+        assert!(!restore_in_scope(&x), "exited not resurrected");
+    }
+
+    /// End-to-end S2: a `daemon-sessions.json` with a mix of sessions →
+    /// `restore_sessions` re-spawns the plain one ALIVE at its same uid
+    /// (carrying its persisted identity) and skips continuous / workflow
+    /// / exited entries.
+    #[test]
+    fn restore_sessions_respawns_plain_at_same_uid_and_skips_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon-sessions.json");
+        let wt = std::env::temp_dir();
+
+        let mut ws = crate::manifest::ManifestWorkspace::default();
+        ws.id = "ws-r".into();
+        ws.worktree_path = Some(wt.clone());
+        let mut plain = me("ts-aaaaaaaaaaaaaaaa-0", "bash");
+        plain.global_perms = true;
+        plain.managed_by_uid = Some("ts-ffffffffffffffff-0".into());
+        plain.task_id = Some("task-x".into());
+        let mut cont = me("ts-bbbbbbbbbbbbbbbb-0", "bash");
+        cont.continuous_task_id = Some("ct-1".into());
+        let mut wf = me("ts-cccccccccccccccc-0", "bash");
+        wf.workflow_run_id = Some("wf-1".into());
+        let mut exited = me("ts-dddddddddddddddd-0", "bash");
+        exited.last_exit = Some(crate::manifest::LastExit {
+            code: Some(0),
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 0.0,
+        });
+        ws.sessions = vec![plain, cont, wf, exited];
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest.workspaces.insert("ws-r".into(), ws);
+        std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let state = make_state_arc();
+        state.lock().unwrap().daemon_sessions_path = Some(path.clone());
+        restore_sessions(&state);
+
+        let s = state.lock().unwrap();
+        let restored = s
+            .sessions
+            .get("ts-aaaaaaaaaaaaaaaa-0")
+            .expect("plain session restored alive at its same uid");
+        assert!(restored.global_perms, "persisted global_perms carried");
+        assert_eq!(
+            restored.managed_by_uid.as_deref(),
+            Some("ts-ffffffffffffffff-0"),
+            "persisted managed_by_uid carried",
+        );
+        assert_eq!(restored.task_id.as_deref(), Some("task-x"));
+        assert!(
+            !s.sessions.contains_key("ts-bbbbbbbbbbbbbbbb-0"),
+            "continuous session NOT restored (scheduler owns it)",
+        );
+        assert!(
+            !s.sessions.contains_key("ts-cccccccccccccccc-0"),
+            "workflow participant NOT restored",
+        );
+        assert!(
+            !s.sessions.contains_key("ts-dddddddddddddddd-0"),
+            "exited session NOT resurrected",
+        );
+        drop(s);
+        // Drop the restored bash child (its Drop SIGKILLs it).
         state.lock().unwrap().sessions.clear();
     }
 

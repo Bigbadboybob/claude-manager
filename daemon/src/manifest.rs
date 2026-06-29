@@ -358,6 +358,25 @@ pub struct ManifestEntry {
     pub task_id: Option<String>,
     #[serde(default)]
     pub notify_on_idle: bool,
+    /// Memory-cap soft limit (bytes) this session was spawned with, when
+    /// capped. P0 session durability (S2): persisted in
+    /// `daemon-sessions.json` so daemon-side RESTORE can re-apply the
+    /// cap when re-spawning — the cap is an argv-level `systemd-run`
+    /// wrap, so it must be reconstructed, not inherited. `None` for
+    /// uncapped sessions. Inert in the TUI's `tui-sessions.json` (the
+    /// TUI never reads these back); `#[serde(default, skip…)]` keeps
+    /// the wire shape unchanged for uncapped sessions. See
+    /// DESIGN_SESSION_DURABILITY.md and
+    /// [`crate::session::DaemonSession::memory_cap_soft_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_cap_soft_bytes: Option<u64>,
+    /// Memory-cap hard limit (bytes). See [`Self::memory_cap_soft_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_cap_hard_bytes: Option<u64>,
+    /// Parent cgroup prefix the cap scope was created under. See
+    /// [`Self::memory_cap_soft_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_prefix: Option<PathBuf>,
     /// Global-permissions grant for this session (see
     /// `crate::session::DaemonSession::global_perms`). Persisted so
     /// a privileged orchestrator keeps its grant across TUI/daemon
@@ -800,6 +819,9 @@ mod tests {
     #[test]
     fn t_g3b_explicit_host_id() {
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "ts-12b-mgr".into(),
             managed_by_uid: None,
             generation: 0,
@@ -902,6 +924,9 @@ mod tests {
 
         // A continuous-tagged entry round-trips the id.
         let tagged = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "ts-cont".into(),
             managed_by_uid: None,
             generation: 0,

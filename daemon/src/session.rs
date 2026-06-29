@@ -1161,6 +1161,12 @@ impl DaemonSession {
             continuous_task_id: self.continuous_task_id.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: false,
+            // S2: carry the cap triple so restore can re-apply the
+            // argv-level systemd-run wrap (a memory cap is NOT inherited
+            // across a process restart — it must be reconstructed).
+            memory_cap_soft_bytes: self.memory_cap_soft_bytes,
+            memory_cap_hard_bytes: self.memory_cap_hard_bytes,
+            cgroup_prefix: self.cgroup_prefix.clone(),
             global_perms: self.global_perms,
             seeded_from_snapshot: None,
             last_exit: None,

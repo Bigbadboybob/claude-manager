@@ -229,6 +229,9 @@ impl TerminalSession {
     /// between the save path and the reconnect path.
     pub(crate) fn to_manifest_entry(&self) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: self.uid.clone(),
             managed_by_uid: self.managed_by_uid.clone(),
             generation: self.generation,
@@ -5384,6 +5387,9 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: s.session_uid.clone(),
             managed_by_uid: s.managed_by_uid.clone(),
             generation: 0,
@@ -16535,6 +16541,9 @@ mod stop_workflow_local_cleanup_tests {
 
     fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
         ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "sess-u1".to_string(),
             managed_by_uid: None,
             generation: 0,
@@ -16690,6 +16699,9 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "ts-abc".into(),
             managed_by_uid: None,
             generation: 0,
@@ -16735,6 +16747,9 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "ts-abc".into(),
             managed_by_uid: None,
             generation: 0,
@@ -16795,6 +16810,9 @@ mod manifest_entry_seeded_from_tests {
         // the round-trip preserves the flag so the toast renders
         // correctly post-restart.
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "ts-abc".into(),
             managed_by_uid: None,
             generation: 0,
@@ -16857,6 +16875,9 @@ mod manifest_entry_seeded_from_tests {
             exited_at: 1_700_000_000.0,
         };
         let initial = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "ts-cap-killed".into(),
             managed_by_uid: None,
             generation: 0,
@@ -16901,6 +16922,9 @@ mod manifest_entry_seeded_from_tests {
         // the pre-fix `last_exit: None`, the assertion at the end of
         // this test would fail.
         let rebuilt = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: loaded.uid.clone(),
             managed_by_uid: loaded.managed_by_uid.clone(),
             generation: loaded.generation,
@@ -19384,6 +19408,9 @@ mod pending_workflow_events_tests {
         // Manifest on disk: workspace ws-r with one session pinned to host
         // "manager".
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: uid.clone(),
             managed_by_uid: None,
             generation: 0,
@@ -19571,6 +19598,9 @@ mod pending_workflow_events_tests {
         // Manifest entry pinned to "manager" with a STALE workflow_run_id
         // (no active runs exist → it's Detached/Done from the TUI's POV).
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: uid.clone(),
             managed_by_uid: None,
             generation: 0,
@@ -19755,6 +19785,9 @@ mod pending_workflow_events_tests {
 
         // Manifest: [gone, live] — gone FIRST so its failure precedes live.
         let mk = |uid: &str| ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: uid.into(),
             managed_by_uid: None,
             generation: 0,
@@ -19884,6 +19917,9 @@ mod pending_workflow_events_tests {
         std::fs::create_dir_all(&cm_dir).unwrap();
 
         let mk = |uid: &str| ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: uid.into(),
             managed_by_uid: None,
             generation: 0,
@@ -19997,6 +20033,9 @@ mod pending_workflow_events_tests {
         let local_sock = cm_dir.join("daemon.sock");
 
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "uid-ssh".into(),
             managed_by_uid: None,
             generation: 0,
@@ -20312,6 +20351,9 @@ mod pending_workflow_events_tests {
             is_pushing: false,
         });
         let entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: uid.clone(),
             managed_by_uid: None,
             generation: 0,
@@ -26564,6 +26606,9 @@ mod slice_12e_tests {
         // be skipped + preserved).
         let mut workspaces = HashMap::new();
         let local_entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "uid-local".into(),
             managed_by_uid: None,
             generation: 0,
@@ -26584,6 +26629,9 @@ mod slice_12e_tests {
             host_id: HostId::local(),
         };
         let remote_entry = ManifestEntry {
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
             uid: "uid-remote".into(),
             managed_by_uid: Some("agent-X".into()),
             generation: 7,
