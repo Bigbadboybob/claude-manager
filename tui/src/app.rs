@@ -6438,6 +6438,53 @@ impl App {
         accelerated + revived.len()
     }
 
+    /// Re-arm the deferred-reattach worklist for ONE workspace: accelerate any
+    /// of its entries already queued in `pending_remote_reattach`, and re-queue
+    /// any non-local entry that's stranded in `skipped_manifest_entries`
+    /// (a deferred reattach that failed and was dropped from the retry queue,
+    /// e.g. a transient post-restart attach race). Returns how many entries are
+    /// now armed.
+    ///
+    /// Drives the `A-a`-on-an-empty-remote-workspace path: rather than spawning
+    /// a junk local session, A-a asks the deferred-reattach machinery to
+    /// reconnect the daemon-owned remote session for this workspace.
+    fn rearm_remote_reattach_for_workspace(&mut self, ws_id: &str) -> usize {
+        let local = cm_daemon::host_id::HostId::local();
+        let mut armed = 0usize;
+        // (1) Accelerate entries already queued for THIS workspace.
+        for p in self
+            .pending_remote_reattach
+            .iter_mut()
+            .filter(|p| p.ws_id == ws_id)
+        {
+            p.last_attempt_at = None;
+            p.attempts = 0;
+            armed += 1;
+        }
+        // (2) Re-queue stranded skipped entries (preserved on disk but no
+        //     longer being retried). Skip locals and any uid already pending.
+        if let Some(entries) = self.skipped_manifest_entries.get(ws_id).cloned() {
+            for entry in entries {
+                if entry.host_id == local || entry.uid.is_empty() {
+                    continue;
+                }
+                let already = self
+                    .pending_remote_reattach
+                    .iter()
+                    .any(|p| p.entry.uid == entry.uid);
+                if !already {
+                    self.pending_remote_reattach
+                        .push(PendingRemoteReattach::new(ws_id.to_string(), entry));
+                    armed += 1;
+                }
+            }
+        }
+        if armed > 0 {
+            self.needs_redraw = true;
+        }
+        armed
+    }
+
     /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
     /// transcript path via the agent strategy, builds a `SaveSpec`, and
     /// either toasts on success or re-opens the modal with the error
@@ -12212,17 +12259,44 @@ impl App {
             None => return,
         };
         let (cols, rows) = self.last_term_size;
-        // attach_active runs only on an EMPTY workspace (checked below), so
-        // there's no existing session to inherit a host from; the worktree is
-        // a local path, so the first session spawns locally — independent of
-        // the global active_host (which only seeds NEW workspaces).
-        let spawn_host = crate::hosts::HostId::local();
-        let ws = &self.workspaces[wi];
 
-        if !ws.sessions.is_empty() {
-            self.set_status_msg("Workspace already has sessions");
+        {
+            let ws = &self.workspaces[wi];
+            if !ws.sessions.is_empty() {
+                self.set_status_msg("Workspace already has sessions");
+                return;
+            }
+        }
+
+        // Host comes from the WORKSPACE (global-host removal). attach_active
+        // runs on an EMPTY workspace, so for a REMOTE workspace A-a means
+        // "reconnect the daemon-owned remote session", NOT "spawn a fresh
+        // local one": the worktree is a path on the remote host that doesn't
+        // exist locally, so a local spawn would land claude in $HOME and
+        // orphan the real session (the reported bug). Re-arm the
+        // deferred-reattach worklist (picking up any entry stranded in
+        // `skipped_manifest_entries`) and let `drain_deferred_remote_reattach`
+        // resolve it — it reattaches if the session is still alive on the
+        // daemon, or the row stays a ghost (close with A-w) if it ended.
+        let spawn_host = self.workspaces[wi].host_id.clone();
+        if spawn_host != crate::hosts::HostId::local() {
+            let ws_id = self.workspaces[wi].id.clone();
+            let n = self.rearm_remote_reattach_for_workspace(&ws_id);
+            if n > 0 {
+                self.set_status_msg(&format!(
+                    "Reconnecting remote session on `{}`…",
+                    spawn_host,
+                ));
+            } else {
+                self.set_status_msg(&format!(
+                    "Nothing to reconnect on `{}` — the remote session ended; A-w to close this row",
+                    spawn_host,
+                ));
+            }
             return;
         }
+
+        let ws = &self.workspaces[wi];
         if ws.is_cloud && ws.worker_vm.is_none() {
             self.set_status_msg("Waiting for cloud VM assignment...");
             return;
@@ -12255,11 +12329,12 @@ impl App {
             // migrate-tui-local Issue C: the local-claude branch
             // sends the workspace's local-filesystem worktree
             // (and per-session MCP config under `~/.cm/mcp/...`)
-            // to the daemon. A non-local active host would route
-            // those at a daemon that can't read them. The
-            // cloud-VM branch above and the bash-fallback below
-            // don't talk to the daemon, so the guard scopes to
-            // this arm only.
+            // to the daemon. `spawn_host` is already proven `local`
+            // by the remote early-return above, so this guard is now
+            // defensive (a future caller that reaches here with a
+            // non-local host still fail-fasts rather than mistagging
+            // a session). The cloud-VM branch above and the
+            // bash-fallback below don't talk to the daemon.
             if let Err(e) = guard_local_host_only(&spawn_host, "A-a attach-active") {
                 self.set_status_msg(&format!("{}", e));
                 None
@@ -21425,6 +21500,84 @@ mod remote_reconnect_tests {
         );
         let after = app.workspaces.iter().find(|w| w.id == "ws-mgr").unwrap();
         assert!(after.sessions.is_empty(), "guard fired before any spawn");
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Reported bug: `A-a` on an EMPTY workspace whose host is REMOTE spawned a
+    /// fresh LOCAL claude (in `$HOME`, since the remote worktree path doesn't
+    /// exist locally) — orphaning the real daemon-owned session. `attach_active`
+    /// hardcoded `spawn_host = local`. Fix: it derives the host from the
+    /// WORKSPACE and, for a remote workspace, re-arms the deferred-reattach
+    /// worklist (picking up an entry stranded in `skipped_manifest_entries`)
+    /// instead of spawning anything local.
+    #[test]
+    fn attach_active_on_empty_remote_workspace_rearms_reattach_not_local_spawn() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+
+        // An empty `manager` workspace whose remote session ended up stranded
+        // in `skipped_manifest_entries` (the bug-001 ghost-row shape: the
+        // restore-time reattach failed and the entry was dropped from the
+        // retry queue, leaving the workspace with no live session).
+        let (seed, _t, _e) =
+            session_with_injected_exit("seed", manager_host(), false);
+        let mut ws = workspace_with(seed);
+        ws.id = "ws-mgr".into();
+        ws.host_id = manager_host();
+        ws.worktree_path = Some(std::path::PathBuf::from("/remote/only/wt"));
+        ws.sessions.clear();
+        app.workspaces.push(ws);
+
+        let (ghost_ts, _t2, _e2) =
+            session_with_injected_exit("uid-ghost", manager_host(), false);
+        let entry = ghost_ts.to_manifest_entry();
+        assert_eq!(entry.uid, "uid-ghost");
+        assert_eq!(entry.host_id, manager_host());
+        app.skipped_manifest_entries
+            .insert("ws-mgr".into(), vec![entry]);
+
+        // Focus the empty remote workspace and attach.
+        app.cursor = Cursor::Workspace(0);
+        let before_pending = app.pending_remote_reattach.len();
+        app.attach_active();
+
+        // NO local session was spawned into the workspace.
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "A-a on a remote workspace MUST NOT spawn a local session",
+        );
+        // The stranded remote entry was re-armed for reattach.
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            before_pending + 1,
+            "the stranded skipped entry must be re-queued for deferred reattach",
+        );
+        assert!(
+            app.pending_remote_reattach
+                .iter()
+                .any(|p| p.entry.uid == "uid-ghost"),
+            "the re-armed entry must be the stranded ghost uid",
+        );
+        // Status tells the operator we're reconnecting the REMOTE session.
+        let (msg, _) = app.status_msg.clone().expect("status message set");
+        assert!(
+            msg.contains("Reconnecting") && msg.contains("manager"),
+            "status must say it's reconnecting the remote session: {}",
+            msg,
+        );
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
