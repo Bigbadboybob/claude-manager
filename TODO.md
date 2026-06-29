@@ -34,13 +34,11 @@ Tier-4 architectural change per `DESIGN_REMOVE_GLOBAL_HOST.md`: retire the globa
 
 Tier-4 UI feature: split sidebar — attached pane LEFT, main + continuous columns RIGHT (50/50); `A-C` toggles the continuous column in/out; tasks spawned by continuous tasks nest under their orchestrator in the continuous column (even though not themselves continuous); unified cursor with left/right nav. Start with a design/slice plan for review before coding.
 
-## P3 — `continuous.update` + autocompact 🟢
+## ~~P3 — `continuous.update` + autocompact~~ ✅ DONE (deployed)
 
-No `continuous.update` method exists (only create/list/pause/run_now/delete; create is idempotent-reuse) → can't change a live task's config. Needed to:
-- set `compact_every` (autocompact) on the orchestrator. It IS persistent (confirmed: one session across 8 fires), but `compact_every: None`, so its context grows unbounded across fires. **Minor** per user, but real long-term.
-- update the orchestrator `default_prompt` (steer subtask agents to `set_subtask_status` + `ssh trader`, not `update_task`/gcloud).
+`continuous.update` (operator-only, in-place load-modify-save of a live task's mutable config — `compact_every`, `default_prompt`, schedule, …, preserving run history) is committed + **live on cm-manager**. Autocompact switched from `/clear` (wipe) to **`/compact` (summarize)** per user — a compact fire delivers `/compact` alone (it's an async turn) and the prompt resumes the next fire. The bug-triage orchestrator now has **`compact_every: 16`** (~48h) set via `continuous.update` (run_count preserved = no recreate). Its context is now bounded across fires/restarts.
 
-Alternative without the new method: delete + recreate the task with the new config — loses run-log history + kills the session (the `.bug-triage/` memory survives, it's in the worktree).
+Remaining nicety (not blocking): updating the orchestrator's `default_prompt` to steer subtask agents to `set_subtask_status` + `ssh trader` (not `update_task`/gcloud) — `continuous.update` now supports it; just needs the desired prompt text. And TUI integration for `continuous.update` (an editor) whenever the two-column continuous panel (P2) lands.
 
 ## P3 — Other headless planning tools 🟢
 
