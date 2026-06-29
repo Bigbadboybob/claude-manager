@@ -216,9 +216,11 @@ pub(crate) fn fixed_path_provider(
 /// per host in `hosts`. All consumers share a single
 /// `mpsc::Sender` so the App's drain loop reads events from
 /// every host through one `Receiver`. Pre-r2 we spawned a
-/// single consumer bound to `active_host` at App::new — a
-/// later `cycle_active_host` left sessions on the new host
-/// without live event streaming.
+/// single consumer bound to the (now-removed) global host at
+/// App::new — sessions on any other host got no live event
+/// streaming. Per-host consumers cover every configured host
+/// from startup, which is what makes the per-workspace host
+/// model work.
 ///
 /// Single-host case: still one consumer, no overhead.
 pub fn spawn_per_host(

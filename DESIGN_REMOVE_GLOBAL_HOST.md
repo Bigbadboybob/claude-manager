@@ -1,7 +1,12 @@
 # Design: Retire the global `active_host` — host is a per-workspace attribute
 
-Status: **proposed** (drawn up after the focused all-hosts-adoption fix).
-Scope: `tui/` only. No daemon, API, or workflow changes.
+Status: **✅ SHIPPED (Phases A–D, 2026-06-29).** Branch
+`cm/daemon-side-workflow-execution-autonomous-cloud-wo`. TUI-only — runs
+locally, no deploy. `cargo test -p claude-manager-tui` green (657 passed). See
+the "Completion" section at the bottom.
+Scope: `tui/` only. No daemon, API, or workflow changes. (One additive daemon
+crate change landed: `ManifestWorkspace.host_id` + `impl Default for HostId`,
+since the manifest schema is daemon-owned.)
 
 ## Problem
 
@@ -129,3 +134,36 @@ Daemon/API/workflow code (host already per-session there). `hosts.toml` format
 (unchanged). The reconnect/tunnel-warming machinery (unchanged — `spawn_per_host`
 already warms every configured host on startup, which is exactly what makes the
 always-show-all-hosts model work).
+
+## Completion (2026-06-29)
+
+All four phases landed. What shipped, against the plan:
+
+- **Phase A** — `Workspace.host_id` + `ManifestWorkspace.host_id` (both default
+  `local`, `#[serde(default)]`). Backward-compat: a persisted workspace with no
+  field derives from its first session's host (else `local`). Every
+  workspace-creation site sets it to the host already in use there (save/restore,
+  adopt — `resolve_adopt_workspace` gained a `host: &HostId` param —, cloud
+  provision/pull/task-sync → local). `impl Default for HostId` added so
+  `ManifestWorkspace` keeps deriving `Default`. Tests:
+  `manifest_workspace_host_id_round_trips_and_legacy_defaults_local`.
+- **Phase B** — add-session / tombstone-restore / designer-resurrect /
+  `launch_into_workspace` now read `workspace.host_id`, not the global. The
+  latent bug (add-session-to-manager-task-while-global-local) is fixed and pinned
+  by `launch_into_workspace_guards_on_workspace_host_not_global`.
+- **Phase C** — A-n form defaults the host field to `local`
+  (`a_n_form_defaults_host_to_local`); `launch_from_plan` uses a local host var.
+  Routing is by the form's chosen host (`a_n_submit_routes_by_chosen_host`).
+- **Phase D** — deleted `App::active_host`, `cycle_active_host`, the `A-H`
+  host-cycler keybinding (A-H now toggles session-hidden), and the HostHeader
+  `*`/yellow active highlight (headers render neutral). Updated the
+  `guard_local_host_only` error message (no more "A-H"), CLAUDE.md, and the
+  status-bar help. Deleted the cycle-specific tests
+  (`t_g3e_active_host_cycle`, `cycle_active_host_single_host_shows_hint`,
+  `t_g3e_new_session_inherits`); retargeted the host-routing /
+  watch-consumer / pool-fallback / mcp-spawn tests off `active_host` onto the
+  per-workspace / per-caller model.
+
+Net: the global "current host" concept is gone. Host is decided once, at
+task-creation time, and is fixed for the workspace's life. `cargo test -p
+claude-manager-tui` → 657 passed.

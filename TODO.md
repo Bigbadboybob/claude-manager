@@ -26,9 +26,9 @@ Was: when the remote daemon restarts the TUI showed a **frozen attach pane** and
 - **bug-001 / 003 / 004 / 005 / 006 / 007 / 008** — investigate-only `NOTES.md`; read + decide per bug. ⚠️ **bug-001**: its proposed fix may be *insufficient* (the `set_delta` race) — needs the live-log dig via `ssh trader`.
 - **Decision pending:** pause the orchestrator? It keeps spawning new bugs (now at 008) — churn while we stabilize.
 
-## P2 — Global-host (`A-H`) removal 🟡
+## ~~P2 — Global-host (`A-H`) removal~~ ✅ DONE (Phases A–D)
 
-Tier-4 architectural change per `DESIGN_REMOVE_GLOBAL_HOST.md`: retire the global `active_host`; host becomes workspace-scoped. Large + touches host switching — start with the pre-coding audit + slice plan.
+Shipped per `DESIGN_REMOVE_GLOBAL_HOST.md`. The global `App::active_host` + `cycle_active_host` + the `A-H` host-cycler + the HostHeader `*` highlight are all gone. Host is now a per-workspace attribute (`Workspace.host_id` / `ManifestWorkspace.host_id`, default `local`, legacy-derive from first session): A-n's form picks it (defaults `local`), and add-session / workflow-respawn / MCP-spawn / launch-into-workspace inherit the workspace's (or caller's) host — fixing the latent add-session-mistags-host bug (Phase B). `A-H` now toggles session-hidden. TUI-only (no deploy). `cargo test -p claude-manager-tui` → 657 passed. Completion notes in `DESIGN_REMOVE_GLOBAL_HOST.md`.
 
 ## ~~P2 — Two-column continuous panel (TUI)~~ ✅ DONE (S1–S5)
 

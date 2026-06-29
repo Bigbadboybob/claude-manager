@@ -162,7 +162,9 @@ Changes to Python files under `api/`, `dispatch/`, or `cli/` need a redeploy + r
 
 ## Multi-host (`hosts.toml`)
 
-The TUI can drive sessions on multiple host daemons declared in `~/.cm/hosts.toml`. `local` is always present (synthesized when the file is missing or doesn't declare it). Each entry has `name`, `transport` (`unix` or `ssh-unix`), and transport-specific fields. Switch the active host with `A-H` in the Sessions view; the sidebar groups sessions by host.
+The TUI can drive sessions on multiple host daemons declared in `~/.cm/hosts.toml`. `local` is always present (synthesized when the file is missing or doesn't declare it). Each entry has `name`, `transport` (`unix` or `ssh-unix`), and transport-specific fields. The sidebar groups sessions by host.
+
+**Host is a per-workspace attribute, not a global mode** (`DESIGN_REMOVE_GLOBAL_HOST.md`). There is no global "active host" switcher — the retired `A-H` host-cycler is gone (`A-H` now toggles session-hidden). A session's host comes from the workspace it was created in: the A-n form carries a host field (←/→ to pick a configured host; defaults to `local`), and every other create path (A-s add-session, workflow respawn, MCP spawn) inherits the workspace's / caller's host. New sessions default to `local`; non-local hosts are a per-task pick.
 
 Example `~/.cm/hosts.toml`:
 

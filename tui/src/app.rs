@@ -630,8 +630,8 @@ pub(crate) fn guard_local_host_only(
     Err(std::io::Error::other(format!(
         "{} on non-local host `{}` is not yet supported — \
          daemon-side path resolution is deferred to Phase 3 \
-         (see daemon/NOTES.md slice 12g). Switch active_host \
-         to `local` (A-H) before retrying, or wait for the \
+         (see daemon/NOTES.md slice 12g). Retarget this \
+         workspace to `local` before retrying, or wait for the \
          follow-up slice that adds remote-execution support.",
         op_name,
         host_id.as_str(),
@@ -3661,13 +3661,6 @@ pub struct App {
     /// hold a `SocketPathProvider` closure that refreshes the
     /// path on each reconnect (F2 fix).
     pub host_pool: std::sync::Arc<crate::host_pool::HostPool>,
-    /// 12e: which host new sessions get pinned to. Mutates via
-    /// `A-H` (cycle through `hosts.hosts` in config order).
-    /// Existing sessions stay on their original `host_id` —
-    /// `A-H` only affects NEW-session creation. Defaults to
-    /// the `default = true` entry in `hosts.toml` (or the
-    /// synthesized local default if no file exists).
-    pub active_host: cm_daemon::host_id::HostId,
     /// 12e-r7 F1: manifest entries that were SKIPPED at
     /// restore time because their `host_id` failed the
     /// `guard_local_host_only` check. Keyed by workspace id;
@@ -3925,25 +3918,14 @@ impl App {
                 }
             };
         let host_pool = std::sync::Arc::new(host_pool);
-        // 12e: the default-active host is the one marked
-        // `default = true` in hosts.toml. The synthesized local
-        // default also flags itself default. Used for both the
-        // watch-consumer's path provider (subscribes to the
-        // active host's manifest events) and as the initial
-        // value of `App.active_host` for new-session creation.
-        let active_host = hosts
-            .default_host()
-            .map(|h| h.id.clone())
-            .unwrap_or_else(cm_daemon::host_id::HostId::local);
         // 12e-r2 F2 (Option A): per-host watch consumers. One
         // manifest.watch + one events.subscribe consumer per
-        // entry in `hosts.toml`, each bound to that host's
-        // path via the path provider. Single-host setups
-        // still get one consumer; multi-host setups stream
-        // events from every daemon in parallel and a later
-        // `cycle_active_host` doesn't need to re-target any
-        // consumer (they're already all live).
-        let _ = active_host; // moved into App below; consumers don't need it.
+        // entry in `hosts.toml`, each bound to that host's path
+        // via the path provider. Single-host setups still get one
+        // consumer; multi-host setups stream events from every
+        // daemon in parallel — every configured host is always
+        // live (which is what makes the always-show-all-hosts,
+        // no-global-active-host model work).
         // 10e-c: spawn the manifest.watch consumer. Without
         // daemon there's no manifest to subscribe to; spawning
         // a consumer that tight-loops trying to dial a non-
@@ -4031,7 +4013,6 @@ impl App {
             cap_kill_toasted: std::collections::HashSet::new(),
             hosts,
             host_pool,
-            active_host,
             skipped_manifest_entries: HashMap::new(),
             pending_remote_reattach: Vec::new(),
             attach_worker,
@@ -10388,11 +10369,11 @@ impl App {
                     }
                     // A-H toggles the focused session's hidden status. It took
                     // over from the retired global-host switcher (`A-H` /
-                    // `cycle_active_host`) — the global `active_host` is being
-                    // removed; new sessions use the `local` default. Some
-                    // terminals deliver Alt+Shift+h as Char('h')+SHIFT, others
-                    // as Char('H'); match both. **Bare A-h is now FREE** — it
-                    // becomes continuous-panel column-nav LEFT (wired in S4).
+                    // `cycle_active_host`, both removed — host is now a
+                    // per-workspace attribute, new sessions default to `local`).
+                    // Some terminals deliver Alt+Shift+h as Char('h')+SHIFT,
+                    // others as Char('H'); match both. **Bare A-h is now FREE** —
+                    // it becomes continuous-panel column-nav LEFT (wired in S4).
                     KeyCode::Char('H') => {
                         self.toggle_session_hidden();
                         return true;
@@ -10476,11 +10457,11 @@ impl App {
                         self.open_workflow_history();
                         return true;
                     }
-                    // (Retired: A-H used to cycle the active host. A-H now
+                    // (Retired: A-H used to cycle the global active host. A-H now
                     // toggles session-hidden — handled at the top of this match
-                    // via Char('H') / Char('h')+SHIFT. The global active_host is
-                    // being removed; `cycle_active_host` is retained for tests +
-                    // the eventual workspace-scoped-host work.)
+                    // via Char('H') / Char('h')+SHIFT. The global active_host and
+                    // `cycle_active_host` are gone — host is a per-workspace
+                    // attribute now, DESIGN_REMOVE_GLOBAL_HOST.md.)
                     _ => {}
                 }
             }
@@ -11256,56 +11237,8 @@ impl App {
         Self::tombstone_session(ws, si);
     }
 
-    /// Operator-driven kill for a daemon-attached session — slice
-    /// 10c-e-3b-fix2. Drop on `Session` is detach-only by design
-    /// (see the Drop comment in `session.rs`); A-w / workspace
-    /// teardown / task close / bulk-cleanup paths are responsible
-    /// for issuing the explicit kill BEFORE removing the
-    /// `TerminalSession` from `ws.sessions`. Without this the
-    /// daemon's child PTY keeps running after the operator
-    /// thought they closed it.
-    ///
-    /// No-op for local-PTY sessions (`daemon_session_uid = None`)
-    /// — dropping the master fd handles those.
-    ///
-    /// Best-effort: an RPC failure logs to stderr and continues.
-    /// The daemon's reaper-cleanup callback removes the session
-    /// from its registry when the child eventually exits anyway,
-    /// so a missed RPC means a slow teardown (orphan child runs
-    /// until exit), not a permanent leak.
-    /// 12e: cycle `active_host` through the entries in
-    /// `hosts.toml`. New sessions created with `A-n` / `A-s` /
-    /// `A-f` get pinned to the current `active_host`; existing
-    /// sessions keep their original host (the cycle only
-    /// affects creation, not migration).
-    ///
-    /// Single-host case (the synthesized local default, common
-    /// for users who haven't written `~/.cm/hosts.toml`): show
-    /// a hint in the status bar pointing them at the file
-    /// rather than silently doing nothing on `A-H`.
-    pub(crate) fn cycle_active_host(&mut self) {
-        if self.hosts.hosts.len() <= 1 {
-            self.set_status_msg(
-                "single host configured — add `~/.cm/hosts.toml` \
-                 to enable multi-host",
-            );
-            return;
-        }
-        // Walk `hosts.hosts` in config order, find current,
-        // pick the next (wrap).
-        let pos = self
-            .hosts
-            .hosts
-            .iter()
-            .position(|h| h.id == self.active_host)
-            .unwrap_or(0);
-        let next = (pos + 1) % self.hosts.hosts.len();
-        self.active_host = self.hosts.hosts[next].id.clone();
-        self.set_status_msg(&format!(
-            "active host: {}",
-            self.active_host.as_str(),
-        ));
-    }
+    // (Retired: `cycle_active_host` / `A-H` — the global active_host is gone;
+    // host is a per-workspace attribute. See DESIGN_REMOVE_GLOBAL_HOST.md.)
 
     /// 12e: route through `host_pool.for_host(&ts.host_id)` so a
     /// session pinned to a non-default host (created via `A-H`
@@ -15114,24 +15047,17 @@ impl App {
                     items.push(ListItem::new(line).style(base_style));
                 }
                 // 12e: host header rendered as a non-selectable
-                // bold-ish row. Active host gets a slight
-                // emphasis so the operator sees where new
-                // sessions will be pinned.
+                // bold-ish row, one per configured host.
                 VisualItem::HostHeader(host_id) => {
-                    let is_active = host_id == &self.active_host;
-                    let prefix = if is_active { "* " } else { "  " };
-                    let style = if is_active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
+                    // Global-host removal: there is no "active" host anymore —
+                    // every host header renders identically. The sidebar shows
+                    // all configured hosts; "which host" is a per-workspace
+                    // attribute, not a global mode.
+                    let line = Line::from(vec![Span::styled(
+                        format!("  {}", host_id.as_str()),
                         Style::default()
                             .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD)
-                    };
-                    let line = Line::from(vec![Span::styled(
-                        format!("{}{}", prefix, host_id.as_str()),
-                        style,
+                            .add_modifier(Modifier::BOLD),
                     )]);
                     items.push(ListItem::new(line));
                 }
@@ -19429,8 +19355,6 @@ mod pending_workflow_events_tests {
     #[test]
     fn local_a_n_in_place_not_rejected() {
         let mut app = build_app_for_buffer_tests();
-        // active_host defaults to local in build_app_for_buffer_tests.
-        assert_eq!(app.active_host, cm_daemon::host_id::HostId::local());
         let chosen = cm_daemon::host_id::HostId::local();
         app.create_local_session(&chosen, "no-such-repo-xyz", "label", None, 0, None, true);
         let st = status_text(&app);
@@ -19446,16 +19370,15 @@ mod pending_workflow_events_tests {
     }
 
     /// Host-picker A-n: the chosen host on the form (carried via
-    /// `SubmitAction::CreateLocalSession.host_id`) drives the create path,
-    /// NOT the global active_host. A chosen REMOTE host routes to the remote
-    /// path (proven by the in-place rejection that path issues); a chosen
-    /// LOCAL host routes to the existing local path. active_host stays local
-    /// throughout, so this also pins that A-H is NOT consulted at create time.
+    /// `SubmitAction::CreateLocalSession.host_id`) drives the create path.
+    /// A chosen REMOTE host routes to the remote path (proven by the in-place
+    /// rejection that path issues); a chosen LOCAL host routes to the existing
+    /// local path. Pins that the per-form host choice — not any global default
+    /// — is what selects the create path.
     #[test]
-    fn a_n_submit_routes_by_chosen_host_not_active_host() {
+    fn a_n_submit_routes_by_chosen_host() {
         // Remote choice → remote create path (rejects in-place, no workspace).
         let mut app = build_app_for_buffer_tests();
-        assert_eq!(app.active_host, cm_daemon::host_id::HostId::local());
         let before = app.workspaces.len();
         app.apply_submit_action(SubmitAction::CreateLocalSession {
             repo_url: "somerepo".into(),
@@ -21463,10 +21386,10 @@ mod remote_reconnect_tests {
     }
 
     /// Global-host removal Phase B: a "launch into existing workspace" path
-    /// routes by the WORKSPACE's host, not the global `active_host`. With the
-    /// global = `local` but the workspace on `manager`, the local-only guard
-    /// fail-fasts on `manager` (proving it read the workspace host) instead of
-    /// proceeding and mistagging the session — the latent bug this fixes.
+    /// routes by the WORKSPACE's host. With the workspace on `manager`, the
+    /// local-only guard fail-fasts on `manager` (proving it read the workspace
+    /// host) instead of proceeding and mistagging the session — the latent bug
+    /// this fixes.
     #[test]
     fn launch_into_workspace_guards_on_workspace_host_not_global() {
         let _guard = crate::test_support::home_lock();
@@ -21479,7 +21402,6 @@ mod remote_reconnect_tests {
         }
 
         let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
-        app.active_host = cm_daemon::host_id::HostId::local(); // global says local
         app.workspaces.clear();
         let (seed, _t, _e) = session_with_injected_exit(
             "seed",
@@ -21498,8 +21420,7 @@ mod remote_reconnect_tests {
         let (msg, _) = app.status_msg.clone().expect("a status message was set");
         assert!(
             msg.contains("manager"),
-            "fail-fast names the WORKSPACE host (manager), not the global \
-             active_host (local): {}",
+            "fail-fast names the WORKSPACE host (manager): {}",
             msg,
         );
         let after = app.workspaces.iter().find(|w| w.id == "ws-mgr").unwrap();
@@ -25794,52 +25715,12 @@ mod slice_12e_tests {
         (app, tmp)
     }
 
-    /// T_g3e_active_host_cycle (named acceptance test).
-    ///
-    /// `A-H` cycles `active_host` through `hosts.hosts` in
-    /// config order. Single-host setups show a hint rather than
-    /// silently rotating (no-op cycle).
-    #[test]
-    fn t_g3e_active_host_cycle() {
-        let guard = crate::test_support::home_lock();
-        let (mut app, _tmp) = build_app_with_hosts(
-            &[("local", true), ("manager", false), ("worker", false)],
-            &guard,
-        );
-        assert_eq!(app.active_host, HostId::local());
-        app.cycle_active_host();
-        assert_eq!(app.active_host, HostId::new("manager"));
-        app.cycle_active_host();
-        assert_eq!(app.active_host, HostId::new("worker"));
-        // Wraps around.
-        app.cycle_active_host();
-        assert_eq!(app.active_host, HostId::local());
-    }
-
-    /// 12e: single-host case (synthesized local default) shows
-    /// a status hint instead of silently no-op'ing.
-    #[test]
-    fn cycle_active_host_single_host_shows_hint() {
-        let guard = crate::test_support::home_lock();
-        let (mut app, _tmp) = build_app_with_hosts(
-            &[("local", true)],
-            &guard,
-        );
-        assert_eq!(app.hosts.hosts.len(), 1);
-        let before = app.active_host.clone();
-        app.cycle_active_host();
-        assert_eq!(app.active_host, before, "single-host MUST NOT change");
-        let msg = app
-            .status_msg
-            .as_ref()
-            .map(|(s, _)| s.as_str())
-            .unwrap_or("");
-        assert!(
-            msg.contains("single host") && msg.contains("hosts.toml"),
-            "single-host hint expected; got: {}",
-            msg,
-        );
-    }
+    // (Retired with the global active_host: `t_g3e_active_host_cycle` and
+    // `cycle_active_host_single_host_shows_hint` exercised `A-H` /
+    // `cycle_active_host`, both removed in DESIGN_REMOVE_GLOBAL_HOST.md Phase D.
+    // Host is now a per-workspace attribute — see
+    // `launch_into_workspace_guards_on_workspace_host_not_global` and
+    // `a_n_form_defaults_host_to_local`.)
 
     /// Global-host removal: `start_new_session` seeds the form's `host_id` to
     /// `local` — the overwhelmingly common case — rather than a global mode the
@@ -25907,97 +25788,12 @@ mod slice_12e_tests {
         }
     }
 
-    /// T_g3e_new_session_inherits (named acceptance test).
-    ///
-    /// Session creation paths (`A-n` / `A-s` / `A-f`) set the
-    /// new session's `host_id` to the current `active_host`.
-    /// The doc explicitly enumerates A-n / A-s / A-f as the
-    /// surface; this test pins the A-s call site via
-    /// `spawn_session_on_workspace`'s `host_id` assignment
-    /// (line ~9118) and the A-n / A-l path via
-    /// `create_local_session` (line ~8749).
-    ///
-    /// Verifies via source-text inspection: the
-    /// `ts.host_id = self.active_host.clone()` assignment
-    /// appears in both call sites. This is a structural pin —
-    /// if a future refactor accidentally drops the assignment,
-    /// new sessions would silently revert to the factory's
-    /// local default and `A-H` would have no effect on
-    /// creation.
-    #[test]
-    fn t_g3e_new_session_inherits() {
-        let src = include_str!("app.rs");
-
-        // A-n / A-l (planning launch -> create_local_session):
-        // pinned via the inline assignment.
-        let create_local_marker =
-            "12e: new sessions get pinned to the active host";
-        assert!(
-            src.contains(create_local_marker),
-            "create_local_session must carry the 12e \
-             active-host inheritance comment + assignment",
-        );
-
-        // A-s (spawn_session_on_workspace).
-        let spawn_workspace_marker =
-            "12e: A-s pins the new session to the active";
-        assert!(
-            src.contains(spawn_workspace_marker),
-            "spawn_session_on_workspace must carry the 12e \
-             active-host inheritance comment + assignment",
-        );
-
-        // MCP-spawned sessions follow the same rule (the doc's
-        // session-creation surface extends to descendant
-        // spawns from agent tools).
-        let mcp_marker = "12e: MCP-spawned sessions inherit";
-        assert!(
-            src.contains(mcp_marker),
-            "mcp_start_session must inherit active_host (12e)",
-        );
-
-        // Runtime end-to-end check: build an App with a
-        // non-default active host, drive the call paths, and
-        // verify the resulting TerminalSession carries that
-        // host_id.
-        let guard = crate::test_support::home_lock();
-        let (mut app, _tmp) = build_app_with_hosts(
-            &[("local", true), ("manager", false)],
-            &guard,
-        );
-        app.cycle_active_host();
-        assert_eq!(app.active_host, HostId::new("manager"));
-        // Build a TerminalSession by hand the way the factory
-        // path would, then assert the active_host injection.
-        // We don't go through the real spawn paths because
-        // those launch PTYs.
-        let mut ts = make_simple_session_with_uid(
-            "test-uid".into(),
-            "test-label",
-            "bash",
-            // Dummy Session — we won't read its PTY in this test.
-            crate::session::Session::new(
-                "/bin/true",
-                &[],
-                80,
-                24,
-                None,
-                HashMap::new(),
-                None,
-            )
-            .expect("spawn /bin/true for stub"),
-            None,
-        );
-        // Mimic the A-s call site: factory default is
-        // overwritten with active_host.
-        ts.host_id = app.active_host.clone();
-        assert_eq!(
-            ts.host_id,
-            HostId::new("manager"),
-            "new session must inherit active_host after the \
-             12e overwrite",
-        );
-    }
+    // (Retired with the global active_host: `t_g3e_new_session_inherits`
+    // pinned the `ts.host_id = self.active_host.clone()` injection at the A-n /
+    // A-s / A-f call sites. New sessions now inherit host from their WORKSPACE
+    // (DESIGN_REMOVE_GLOBAL_HOST.md Phases A–C); see
+    // `launch_into_workspace_guards_on_workspace_host_not_global` and
+    // `a_n_submit_routes_by_chosen_host`.)
 
     /// T_g3e_sidebar_groups_per_host (named acceptance test).
     ///
@@ -26644,19 +26440,19 @@ mod slice_12e_tests {
 
     /// 12e-r2 F2 (Option A): one watch consumer per
     /// configured host. A multi-host setup spawns N
-    /// manifest.watch + N events.subscribe consumers; a later
-    /// `cycle_active_host` doesn't tear them down or rebuild
-    /// them — they all stay live so sessions on any host get
-    /// streaming events.
+    /// manifest.watch + N events.subscribe consumers, all live
+    /// from startup, so sessions on any host get streaming
+    /// events — independent of which host new sessions target
+    /// (host is now a per-workspace attribute, not a global
+    /// switch; DESIGN_REMOVE_GLOBAL_HOST.md).
     #[test]
-    fn watch_consumers_follow_active_host_after_cycle() {
+    fn watch_consumers_one_per_configured_host() {
         let guard = crate::test_support::home_lock();
-        let (mut app, _tmp) = build_app_with_hosts(
+        let (app, _tmp) = build_app_with_hosts(
             &[("local", true), ("manager", false)],
             &guard,
         );
-        // Pre-cycle: 2 hosts → 2 manifest + 2 workflow
-        // consumers.
+        // 2 hosts → 2 manifest + 2 workflow consumers.
         let manifest_n = app._manifest_watch_threads.len();
         let workflow_n = app._workflow_watch_threads.len();
         assert_eq!(
@@ -26673,25 +26469,6 @@ mod slice_12e_tests {
              consumer per host",
         );
 
-        // Cycle active_host. The consumer count MUST NOT
-        // change — per-host consumers are already covering
-        // both hosts. A cycle is purely a tag-future-sessions
-        // operation; the streaming consumers are independent.
-        app.cycle_active_host();
-        assert_eq!(
-            app._manifest_watch_threads.len(),
-            manifest_n,
-            "cycle_active_host MUST NOT rebuild manifest \
-             consumers (they're per-host, already covering \
-             all configured hosts)",
-        );
-        assert_eq!(
-            app._workflow_watch_threads.len(),
-            workflow_n,
-            "cycle_active_host MUST NOT rebuild workflow \
-             consumers",
-        );
-
         // None of the threads should have died on their own
         // (consumers loop forever; they only exit on channel
         // disconnect or process exit). `is_finished` returns
@@ -26699,16 +26476,14 @@ mod slice_12e_tests {
         for (i, t) in app._manifest_watch_threads.iter().enumerate() {
             assert!(
                 !t.is_finished(),
-                "manifest watch consumer #{} should still be \
-                 alive after cycle_active_host",
+                "manifest watch consumer #{} should be alive",
                 i,
             );
         }
         for (i, t) in app._workflow_watch_threads.iter().enumerate() {
             assert!(
                 !t.is_finished(),
-                "workflow watch consumer #{} should still be \
-                 alive after cycle_active_host",
+                "workflow watch consumer #{} should be alive",
                 i,
             );
         }
@@ -26734,21 +26509,19 @@ mod slice_12e_tests {
 
     /// 12e-r8 F1 (named acceptance): `spawn_managed_session`
     /// MUST derive its target host from the CALLER's
-    /// `host_id` (resolved via `resolve_caller_host`), NOT
-    /// from `self.active_host` (the operator's transient
-    /// A-H selection). An agent's spawn rights belong to
-    /// the agent's context — same shape as Unix `fork()`
-    /// inheriting the parent's cwd.
+    /// `host_id` (resolved via `resolve_caller_host`). An
+    /// agent's spawn rights belong to the agent's context —
+    /// same shape as Unix `fork()` inheriting the parent's cwd.
     ///
-    /// Pre-r8: the guard checked `self.active_host`. If the
-    /// operator cycled to a non-local active_host while a
-    /// local-rooted agent was running, the agent's
-    /// `start_session` call would fail-fast rejected even
-    /// though `spawn on local where caller lives` was the
-    /// right answer. The bug class: caller-context derivation
-    /// gated on UI state.
+    /// Historically the guard gated on the (now-removed) global
+    /// `active_host`, so an operator viewing a non-local host
+    /// could fail-fast a local-rooted agent's `start_session`
+    /// even though `spawn on local where caller lives` was the
+    /// right answer. With the global host retired
+    /// (DESIGN_REMOVE_GLOBAL_HOST.md) the host is derived purely
+    /// from the caller's session — this pins that.
     #[test]
-    fn mcp_start_session_inherits_caller_host_not_active_host() {
+    fn mcp_start_session_inherits_caller_host() {
         use cm_daemon::host_id::HostId;
 
         let src = include_str!("app.rs");
@@ -26800,16 +26573,14 @@ mod slice_12e_tests {
              spawns when operator was viewing manager)",
         );
 
-        // Runtime: active_host=manager but caller=local. The
-        // spawn MUST succeed (not fail-fast) and route to
-        // local.
+        // Runtime: a local-rooted caller resolves to local and
+        // the spawn routes there — derived purely from the
+        // caller's own session, no global host in the picture.
         let guard = crate::test_support::home_lock();
         let (mut app, _tmp) = build_app_with_hosts(
             &[("local", true), ("manager", false)],
             &guard,
         );
-        app.cycle_active_host();
-        assert_eq!(app.active_host, HostId::new("manager"));
 
         // Plant a TUI session with host_id=local as the
         // caller. Use a workspace with a worktree so
@@ -27069,16 +26840,13 @@ mod slice_12e_tests {
         );
 
         // Runtime: plant a CALLER pinned to manager; the
-        // spawn MUST fail-fast. (operator's active_host is
-        // irrelevant for this check.)
+        // spawn MUST fail-fast — the guard keys off the
+        // caller's own host_id.
         let guard = crate::test_support::home_lock();
         let (mut app, _tmp) = build_app_with_hosts(
             &[("local", true), ("manager", false)],
             &guard,
         );
-        // Leave active_host = local (the default) to prove
-        // the guard checks caller, not active_host.
-        assert_eq!(app.active_host, HostId::local());
 
         let tmpdir = tempfile::tempdir().expect("worktree tempdir");
         let mut caller_ts = make_simple_session_with_uid(
@@ -28044,12 +27812,11 @@ remote_socket = "/remote/manager.sock"
     /// 12e-r3 F3: when `HostPool::from_config` fails, the
     /// App's `hosts` field MUST also fall back to the
     /// synthesized local default. Pre-r3 only the pool fell
-    /// back; `hosts` retained the multi-host config, so
-    /// `active_host` (derived from `hosts.default_host()`)
-    /// pointed at a host that wasn't in the pool. Every
-    /// `host_pool.for_host(&active_host)` would then fail
-    /// with `NotFound`, and `cycle_active_host` would walk
-    /// through hosts that the pool can't reach.
+    /// back; `hosts` retained the multi-host config, so a
+    /// workspace pinned to a host not in the pool would have
+    /// every `host_pool.for_host(...)` fail with `NotFound`.
+    /// Keeping `hosts` and `host_pool` in lockstep is the
+    /// invariant this pins.
     ///
     /// To deliberately fail `from_config`, write a hosts.toml
     /// that flips on the dir-resolution failure: unset
@@ -28067,8 +27834,8 @@ remote_socket = "/remote/manager.sock"
     /// HostsConfig::load Err. The existing App::new path
     /// already falls back to synthesized local default in
     /// that case (see line ~2810). After fallback, `hosts`
-    /// has the synthesized entry and `active_host == local`.
-    /// This test pins that consistency.
+    /// has the single synthesized local entry and the pool
+    /// agrees. This test pins that consistency.
     ///
     /// The r3 F3 fix is for the SEPARATE failure mode where
     /// HostsConfig::load succeeds but HostPool::from_config
@@ -28093,9 +27860,8 @@ remote_socket = "/remote/manager.sock"
             src.contains("(local, pool)"),
             "App::new's from_config Err branch must produce \
              (HostsConfig, HostPool) as a tuple — both \
-             rebound to the synthesized local default — so \
-             active_host derivation below sees the \
-             post-fallback config",
+             rebound to the synthesized local default so \
+             `hosts` and `host_pool` stay consistent",
         );
         // Make sure the rebinding actually returns BOTH from
         // the match.
@@ -28160,12 +27926,6 @@ tls_fingerprint = "deadbeef"
             1,
             "TLS-transport host triggers HostsConfig::load \
              Err → App falls back to synthesized local default",
-        );
-        assert_eq!(
-            app.active_host,
-            cm_daemon::host_id::HostId::local(),
-            "active_host must derive from the (now-synthesized) \
-             hosts config",
         );
         // The pool must contain the local host (consistency
         // check that `hosts` and `host_pool` agree).
