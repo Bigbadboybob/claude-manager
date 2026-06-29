@@ -4,7 +4,9 @@ Open threads, captured 2026-06-29. Priority order; each item has enough context 
 
 ---
 
-## P0 — Session durability (the bug-002 kill) 🔴
+## P0 — Session durability (the bug-002 kill) 🟢 S1+S2+S3 done (not deployed)
+
+**STATUS:** persist (S1) + restore (S2) + resume (S3) are committed (`17916fc` / `9d206ff` / `5a9cdb9`) and verified locally (unit tests + real daemon SIGKILL→restart→same-uid-restore loop). **Deploy to cm-manager pending user coordination** (the restart kills live sessions, then restore brings them back resumed — do S1+S2+S3 together). Remaining: S4 (TUI reattach coordination + frozen-pane UX — pairs with the P1 item below) + S5 (continuous-task resume). Full detail in `DESIGN_SESSION_DURABILITY.md`.
 
 **Agent sessions must survive daemon restarts.** A `systemctl restart cm-daemon` (every deploy) SIGKILLs all its PTYs → every ad-hoc subtask session dies and does NOT come back. bug-002's session was lost this way. **Unacceptable.**
 
