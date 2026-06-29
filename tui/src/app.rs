@@ -1592,6 +1592,16 @@ pub enum Cursor {
     Session(usize, usize),
 }
 
+/// Which sidebar column the cursor is navigating (two-column continuous panel,
+/// S4 of DESIGN_CONTINUOUS_PANEL.md). `Main` is the always-present sessions
+/// sidebar; `Continuous` is the dedicated column (only reachable when
+/// `continuous_column_on`). `A-h`/`A-l` move between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarColumn {
+    Main,
+    Continuous,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SidebarView {
     Status,
@@ -3425,6 +3435,14 @@ pub struct App {
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
     pub workspaces: Vec<Workspace>,
     pub cursor: Cursor,
+    /// Which sidebar column the cursor is in (S4). `Main` unless the user has
+    /// stepped right (`A-l`) into the continuous column. Forced back to `Main`
+    /// whenever the continuous column isn't shown.
+    pub cursor_column: SidebarColumn,
+    /// The `Main`-column cursor stashed when stepping into the continuous
+    /// column, restored on the way back (`A-h`) so a round-trip doesn't lose
+    /// the main selection.
+    pub saved_main_cursor: Option<Cursor>,
     pub sidebar_view: SidebarView,
     pub view_mode: ViewMode,
     pub planning: PlanningView,
@@ -3958,6 +3976,8 @@ impl App {
             tasks: Vec::new(),
             workspaces: Vec::new(),
             cursor: Cursor::Workspace(0),
+            cursor_column: SidebarColumn::Main,
+            saved_main_cursor: None,
             sidebar_view,
             view_mode: ViewMode::Sessions,
             planning: PlanningView::new(),
@@ -7811,9 +7831,68 @@ impl App {
         rows
     }
 
+    /// Move the cursor between sidebar columns (S4). `dir > 0` steps RIGHT
+    /// (toward the continuous column), `dir < 0` steps LEFT (back to main).
+    /// No-op when the continuous column isn't shown; entering an empty
+    /// continuous column is also a no-op. The main cursor is stashed on the
+    /// way in and restored on the way out so a round-trip is lossless.
+    fn step_column(&mut self, dir: i32) {
+        if !self.continuous_column_on {
+            self.cursor_column = SidebarColumn::Main;
+            return;
+        }
+        match (self.cursor_column, dir) {
+            (SidebarColumn::Main, d) if d > 0 => {
+                let rows = self.visual_items_continuous();
+                if let Some(r) = rows.first() {
+                    self.saved_main_cursor = Some(self.cursor.clone());
+                    self.cursor = Cursor::Session(r.ws_idx, r.sess_idx);
+                    self.cursor_column = SidebarColumn::Continuous;
+                    self.needs_redraw = true;
+                }
+            }
+            (SidebarColumn::Continuous, d) if d < 0 => {
+                self.cursor = self
+                    .saved_main_cursor
+                    .take()
+                    .unwrap_or(Cursor::Workspace(0));
+                self.cursor_column = SidebarColumn::Main;
+                self.needs_redraw = true;
+            }
+            _ => {}
+        }
+    }
+
     /// Navigate the cursor up or down. +1 = down, -1 = up.
     /// Skips non-selectable items (Separators, headers with sessions).
     fn navigate(&mut self, direction: i32) {
+        // S4: in the continuous column, navigate over its own row list
+        // (every row is a selectable session, so just wrap ±1).
+        if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
+            let rows = self.visual_items_continuous();
+            if rows.is_empty() {
+                // Column emptied out from under us — fall back to main.
+                self.cursor = self
+                    .saved_main_cursor
+                    .take()
+                    .unwrap_or(Cursor::Workspace(0));
+                self.cursor_column = SidebarColumn::Main;
+                return;
+            }
+            let cur = match &self.cursor {
+                Cursor::Session(wi, si) => rows
+                    .iter()
+                    .position(|r| r.ws_idx == *wi && r.sess_idx == *si)
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            let n = rows.len() as i32;
+            let next = (cur as i32 + direction).rem_euclid(n) as usize;
+            let r = rows[next];
+            self.cursor = Cursor::Session(r.ws_idx, r.sess_idx);
+            return;
+        }
+
         let items = self.visual_items();
         if items.is_empty() {
             return;
@@ -10042,6 +10121,17 @@ impl App {
                         && key.modifiers.contains(KeyModifiers::SHIFT)))
             {
                 self.continuous_column_on = !self.continuous_column_on;
+                // Turning the column off strands a continuous-column cursor —
+                // pull it back to the main sidebar (restoring the saved spot).
+                if !self.continuous_column_on
+                    && self.cursor_column == SidebarColumn::Continuous
+                {
+                    self.cursor = self
+                        .saved_main_cursor
+                        .take()
+                        .unwrap_or(Cursor::Workspace(0));
+                    self.cursor_column = SidebarColumn::Main;
+                }
                 self.needs_redraw = true;
                 return true;
             }
@@ -10287,6 +10377,17 @@ impl App {
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
                         self.toggle_session_hidden();
+                        return true;
+                    }
+                    // Continuous-panel column nav (S4): bare A-h / A-l move the
+                    // cursor LEFT / RIGHT between the main sidebar and the
+                    // continuous column. No-op when the column isn't shown.
+                    KeyCode::Char('h') => {
+                        self.step_column(-1);
+                        return true;
+                    }
+                    KeyCode::Char('l') => {
+                        self.step_column(1);
                         return true;
                     }
                     KeyCode::Char('b') => {
@@ -14609,15 +14710,29 @@ impl App {
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            // Orchestrators (depth 0) get a slightly brighter label so the
-            // parent/child split reads at a glance.
-            let label_style = if r.depth == 0 {
+            // Focus highlight: only when the cursor is actually IN this column
+            // (S4). Bold-white, matching the main sidebar's selected style.
+            let is_selected = self.cursor_column == SidebarColumn::Continuous
+                && matches!(
+                    &self.cursor,
+                    Cursor::Session(cwi, csi) if *cwi == r.ws_idx && *csi == r.sess_idx
+                );
+            let label_style = if is_selected {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else if r.depth == 0 {
+                // Orchestrators (depth 0) get a slightly brighter label so the
+                // parent/child split reads at a glance.
                 Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
             spans.push(Span::styled(label, label_style));
-            items.push(ListItem::new(Line::from(spans)));
+            let item_style = if is_selected {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            items.push(ListItem::new(Line::from(spans)).style(item_style));
         }
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
@@ -21205,6 +21320,76 @@ mod remote_reconnect_tests {
             !app.visual_items_continuous().is_empty(),
             "the dedicated column carries the orchestrator",
         );
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Continuous-panel S4: `A-l` steps the cursor into the continuous column
+    /// (onto the first row), `A-j/k` navigate within it (wrapping), `A-h`
+    /// returns to the saved main cursor, and stepping right is a no-op when the
+    /// column is off.
+    #[test]
+    fn column_nav_steps_into_continuous_navigates_and_returns() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+        let (mut orch, _t, _e) = session_with_injected_exit(
+            "orch",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        orch.continuous_task_id = Some("ct".into());
+        orch.label = "orch".into();
+        let mut ws = workspace_with(orch);
+        let (mut sub, _t2, _e2) = session_with_injected_exit(
+            "sub",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        sub.managed_by_uid = Some("orch".into());
+        sub.label = "BUG-1".into();
+        ws.sessions.push(sub);
+        app.workspaces.push(ws);
+        app.continuous_column_on = true;
+        app.cursor = Cursor::Workspace(0);
+        app.cursor_column = SidebarColumn::Main;
+
+        let cur_uid = |app: &App| match &app.cursor {
+            Cursor::Session(wi, si) => app.workspaces[*wi].sessions[*si].uid.clone(),
+            other => format!("{:?}", other),
+        };
+
+        // A-l → into the continuous column, on the orchestrator (first row).
+        app.step_column(1);
+        assert_eq!(app.cursor_column, SidebarColumn::Continuous);
+        assert_eq!(cur_uid(&app), "orch");
+
+        // A-j → the subtask; A-j again → wraps back to the orchestrator.
+        app.navigate(1);
+        assert_eq!(cur_uid(&app), "sub");
+        app.navigate(1);
+        assert_eq!(cur_uid(&app), "orch");
+
+        // A-h → back to main, restoring the saved cursor.
+        app.step_column(-1);
+        assert_eq!(app.cursor_column, SidebarColumn::Main);
+        assert_eq!(app.cursor, Cursor::Workspace(0));
+
+        // Column off → stepping right is a no-op (stays in main).
+        app.continuous_column_on = false;
+        app.step_column(1);
+        assert_eq!(app.cursor_column, SidebarColumn::Main);
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },

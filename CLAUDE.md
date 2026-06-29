@@ -92,7 +92,8 @@ Sessions view:
 - `A-a` — attach
 - `A-w` — close session
 - `A-H` — hide session's status indicator (also used to un-hide workflow participants, which default to hidden). Moved from `A-h`; the old `A-H` active-host switcher is retired (global host is being removed — new sessions use the `local` default).
-- `A-h` / `A-l` — **reserved** for the continuous-panel column nav (LEFT / RIGHT between the main + continuous columns); wired with the panel (see `DESIGN_CONTINUOUS_PANEL.md`). Currently no-ops.
+- `A-h` / `A-l` — move the sidebar cursor LEFT / RIGHT between the main column and the **continuous column** (when the continuous column is shown; see `A-C`). `A-j`/`A-k` stay vertical within the focused column. See `DESIGN_CONTINUOUS_PANEL.md`.
+- `A-c` — hide/show continuous sessions entirely (master hide). `A-C` — toggle the dedicated **continuous column** (orchestrators with their spawned subtasks nested) on/off; on = a third pane splits off the right (terminal | main | continuous), off = continuous sessions sit at the bottom of the main sidebar. Both persisted.
 - `A-e` — session settings (label, idle/burst timers, hidden, notify-on-idle, **global perms** — Tab to the field, Space to toggle)
 - `A-v` — toggle Status / Task sub-view
 - `A-[` — push (cloud) · `A-]` — pull (cloud)  *(moved off `A-p`/`A-l`)*
