@@ -3403,7 +3403,11 @@ struct PendingRemoteReattach {
     /// `manifest.watch` consumer — we keep retrying instead of giving up on
     /// the first failure. Only after [`REMOTE_REATTACH_MAX_ATTEMPTS`]
     /// sustained failures do we treat the session as genuinely gone. The
-    /// restore-deferred (non-reconnecting) path leaves this at 0.
+    /// restore-deferred (non-reconnecting) FRESH-attach path uses this bound
+    /// too — a transient failure there re-queues with `attempts + 1` rather
+    /// than dropping the entry (which stranded a live session until the next
+    /// restart); on give-up the raw entry stays preserved in
+    /// `skipped_manifest_entries`.
     attempts: u32,
     /// Wall-clock of the last reattach attempt, for throttling. The main loop
     /// can spin at ~1ms, so without this the bound would be exhausted in
@@ -6007,14 +6011,16 @@ impl App {
             if self.workspaces[ws_idx].is_closed {
                 continue;
             }
-            // Reconnect throttle: don't re-dispatch the SAME reconnecting
-            // session faster than the retry interval.
-            if self.reconnecting_sessions.contains(&p.entry.uid) {
-                if let Some(last) = p.last_attempt_at {
-                    if now.duration_since(last) < REMOTE_REATTACH_RETRY_INTERVAL {
-                        still_pending.push(p);
-                        continue;
-                    }
+            // Retry throttle: don't re-dispatch the SAME session faster than the
+            // retry interval — applies to a reconnecting slot AND a
+            // restore-deferred fresh attach (both carry `attempts` /
+            // `last_attempt_at`), so a genuinely-gone session can't burn an
+            // attach dispatch every tick. First attempt has `last_attempt_at`
+            // None → not throttled.
+            if let Some(last) = p.last_attempt_at {
+                if now.duration_since(last) < REMOTE_REATTACH_RETRY_INTERVAL {
+                    still_pending.push(p);
+                    continue;
                 }
             }
             let Some(worktree) = self.workspaces[ws_idx].worktree_path.clone() else {
@@ -6102,21 +6108,39 @@ impl App {
                         p.last_attempt_at = Some(Instant::now());
                         let reconnecting =
                             self.reconnecting_sessions.contains(&result.entry.uid);
-                        if reconnecting && p.attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
-                            if let Some(ws_idx) =
-                                self.workspaces.iter().position(|w| w.id == p.ws_id)
-                            {
-                                if let Some(idx) = self.workspaces[ws_idx]
-                                    .sessions
-                                    .iter()
-                                    .position(|s| s.uid == p.entry.uid)
+                        if p.attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
+                            // Bound reached → stop retrying (both a reconnecting
+                            // slot AND a restore-deferred fresh attach — pre-fix
+                            // a fresh attach re-queued FOREVER, spinning on a
+                            // genuinely-gone session). A reconnecting slot settles
+                            // to `exited`; a fresh entry has no slot — drop it from
+                            // the queue, leaving the raw entry preserved in
+                            // `skipped_manifest_entries` (rides on disk).
+                            if reconnecting {
+                                if let Some(ws_idx) =
+                                    self.workspaces.iter().position(|w| w.id == p.ws_id)
                                 {
-                                    self.workspaces[ws_idx].sessions[idx]
-                                        .session
-                                        .exited = true;
+                                    if let Some(idx) = self.workspaces[ws_idx]
+                                        .sessions
+                                        .iter()
+                                        .position(|s| s.uid == p.entry.uid)
+                                    {
+                                        self.workspaces[ws_idx].sessions[idx]
+                                            .session
+                                            .exited = true;
+                                    }
                                 }
+                                self.reconnecting_sessions.remove(&result.entry.uid);
+                            } else {
+                                eprintln!(
+                                    "cm-tui: deferred remote reattach of session {} \
+                                     on host {} gave up after {} attempts (session \
+                                     gone; entry preserved in skipped)",
+                                    p.entry.uid,
+                                    p.entry.host_id.as_str(),
+                                    p.attempts,
+                                );
                             }
-                            self.reconnecting_sessions.remove(&result.entry.uid);
                             changed = true;
                         } else {
                             self.pending_remote_reattach.push(p);
@@ -6314,6 +6338,16 @@ impl App {
                 self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
                 continue;
             }
+            // Retry throttle (parity with Case A + the off-thread dispatcher):
+            // don't re-attempt a restore-deferred fresh attach faster than the
+            // interval — keep it queued. First attempt has `last_attempt_at`
+            // None → not throttled.
+            if let Some(last) = p.last_attempt_at {
+                if now.duration_since(last) < REMOTE_REATTACH_RETRY_INTERVAL {
+                    still_pending.push(p);
+                    continue;
+                }
+            }
             let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
             let entry_for_attach = cleaned.as_ref().unwrap_or(&p.entry);
             // The tunnel is warm (gated above), so `for_host` inside the helper
@@ -6332,14 +6366,32 @@ impl App {
                     reattached_any = true;
                 }
                 None => {
-                    eprintln!(
-                        "cm-tui: deferred remote reattach of session {} ({}) \
-                         on host {} failed (session gone; entry preserved for \
-                         next save)",
-                        p.entry.uid,
-                        p.entry.label,
-                        p.entry.host_id.as_str(),
-                    );
+                    // `try_reattach_remote_session` returns None on ANY attach
+                    // error — including a TRANSIENT failure in the race right
+                    // after a tunnel respawn while the daemon session is alive.
+                    // Pre-fix this dropped the entry from the queue on the FIRST
+                    // failure (stranding a live session until the next restart);
+                    // mirror the reconnecting path instead — retry with a bound,
+                    // only giving up (leaving the raw entry preserved in
+                    // `skipped_manifest_entries`) after a sustained run.
+                    let attempts = p.attempts + 1;
+                    if attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
+                        eprintln!(
+                            "cm-tui: deferred remote reattach of session {} ({}) \
+                             on host {} gave up after {} attempts (session gone; \
+                             entry preserved for next save)",
+                            p.entry.uid,
+                            p.entry.label,
+                            p.entry.host_id.as_str(),
+                            attempts,
+                        );
+                    } else {
+                        still_pending.push(PendingRemoteReattach {
+                            attempts,
+                            last_attempt_at: Some(now),
+                            ..p
+                        });
+                    }
                 }
             }
         }
@@ -22185,6 +22237,83 @@ mod remote_reconnect_tests {
         assert!(
             app.pending_remote_reattach.is_empty(),
             "the work item is dropped from the retry queue on give-up",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// The "stranding" fix: a FRESH restore-deferred reattach (no live slot,
+    /// NOT reconnecting — the bug-001..006 ghost-row shape) whose attach fails
+    /// must KEEP retrying with a bound, not be dropped from the queue on the
+    /// first failure (which stranded a live remote session until the next
+    /// restart). It only gives up — leaving the raw entry preserved in
+    /// `skipped_manifest_entries` — after `REMOTE_REATTACH_MAX_ATTEMPTS`.
+    #[test]
+    fn fresh_deferred_reattach_retries_then_gives_up_bounded() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        // An EMPTY workspace (no slot for the uid) → the drain takes the FRESH
+        // attach path, not the reconnecting-slot (Case A) path.
+        let (seed, _tx, _teof) =
+            session_with_injected_exit("seed", ghost.clone(), false);
+        let mut ws = workspace_with(seed);
+        ws.id = "ws-remote".into();
+        ws.worktree_path = Some(home.join("wt"));
+        ws.sessions.clear();
+        app.workspaces.push(ws);
+
+        let (ghost_ts, _t2, _e2) =
+            session_with_injected_exit("uid-gone", ghost.clone(), false);
+        let entry = ghost_ts.to_manifest_entry();
+        app.skipped_manifest_entries
+            .insert("ws-remote".into(), vec![entry.clone()]);
+        app.pending_remote_reattach
+            .push(PendingRemoteReattach::new("ws-remote".into(), entry));
+        app.sessions_restored = false;
+        assert!(!app.reconnecting_sessions.contains("uid-gone"));
+
+        // First drain: the attach fails (ghost host) but it's the FIRST failure
+        // → re-queued, NOT stranded.
+        app.drain_deferred_remote_reattach();
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "a fresh attach failure must stay queued (the stranding fix), not drop",
+        );
+        assert_eq!(
+            app.pending_remote_reattach[0].attempts, 1,
+            "the failed attempt is counted toward the give-up bound",
+        );
+        assert!(
+            app.skipped_manifest_entries.contains_key("ws-remote"),
+            "the raw entry stays preserved on disk while retrying",
+        );
+
+        // Jump to one short of the bound + clear the throttle so this drain
+        // makes the FINAL attempt → give up (dropped from pending, still
+        // preserved in skipped).
+        app.pending_remote_reattach[0].attempts = REMOTE_REATTACH_MAX_ATTEMPTS - 1;
+        app.pending_remote_reattach[0].last_attempt_at = None;
+        app.drain_deferred_remote_reattach();
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "after the sustained-failure bound the fresh entry stops retrying",
+        );
+        assert!(
+            app.skipped_manifest_entries.contains_key("ws-remote"),
+            "giving up PRESERVES the raw entry in skipped (no data loss)",
         );
 
         match orig_home {
