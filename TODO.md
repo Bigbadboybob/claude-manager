@@ -1,57 +1,52 @@
 # TODO / Roadmap
 
-Open threads, captured 2026-06-29. Priority order; each item has enough context to resume cold.
+Open threads, refreshed 2026-06-29 (late session). Priority order; each item has enough context to resume cold.
 
 ---
 
-## P0 — Session durability (the bug-002 kill) ✅ COMPLETE (S1–S5)
+## ✅ Shipped (architecture / infra roadmap — all complete)
 
-**STATUS: DONE.** persist (S1) + restore-at-same-uid (S2) + resume (S3) + continuous-orchestrator resume (S5) + TUI reattach (S4) are all committed (`17916fc` / `9d206ff` / `5a9cdb9` / `1bc059a` / `bdea0de` / `d3c91ba`). The daemon side (S1–S5) is **LIVE on cm-manager** — verified on prod: a restart restored BUG-007/008/009 AND the bug-triage orchestrator at their same uids, RESUMED, no scheduler double-spawn. S4 (TUI, runs locally — no deploy) turned out composition-complete (the remote-reattach machinery already handles daemon restart) + added an `A-r` "reconnect now" lever. The bug-002 class of kill is fixed end-to-end. **Resolves the P1 frozen-pane item too.** Only follow-up: autocompact for the resumed orchestrator's growing context (P3). Full detail in `DESIGN_SESSION_DURABILITY.md`.
+- **P0 — Session durability (S1–S5)** — daemon persist + restore-at-same-uid + resume; live on cm-manager, exercised by ~5 restarts this session (bug restore, re-parent, deploys), each re-resumed all sessions, no orchestrator double-spawn. Detail in `DESIGN_SESSION_DURABILITY.md`.
+- **P1 — Frozen-pane UX** — resolved by P0 S4 (remote-reattach + `A-r` "reconnect now").
+- **P2 — Global-host removal (Phases A–D)** — `active_host`/`A-H` cycler/HostHeader highlight gone; host is per-workspace. `DESIGN_REMOVE_GLOBAL_HOST.md`.
+- **P2 — Two-column continuous panel** — shipped, then **reworked this session** (`DESIGN_CONTINUOUS_PANEL.md` revision): single `A-c` toggle (dropped `A-C` + master-hide), continuous tasks ONLY in the column (never main), respawn-robust nesting (`managed_by_uid` OR task-tree `parent_task_id`), and per-column cursor memory (re-entry lands where you left off).
+- **P3 — `continuous.update` + autocompact** — deployed; bug-triage orchestrator on `compact_every: 16`.
 
-**Agent sessions must survive daemon restarts.** A `systemctl restart cm-daemon` (every deploy) SIGKILLs all its PTYs → every ad-hoc subtask session dies and does NOT come back. bug-002's session was lost this way. **Unacceptable.**
+## ✅ Also done this session (not previously on the list)
 
-Principle (memory: `feedback_sessions_user_owned_lifecycle`): a session is a **durable, user-owned** thing. The orchestrator may drive/nudge it however makes sense, but **only the user marks it done or deletes it**; a backend restart must never erase it.
-
-- **Root cause:** the daemon keeps its session registry **in memory only** — only continuous tasks persist (via `~/.cm/continuous-tasks/*/state.json`). Ad-hoc sessions vanish on restart. Transcripts DO survive on disk (`~/.claude/projects/<encoded>/*.jsonl`), so resume is possible.
-- **Fix:** daemon-side **session persistence + restore** — persist the registry to disk; on restart, re-spawn each not-done session resuming its transcript (`claude --resume <sid>` / codex resume). Then deploys + crashes become transparent: sessions reappear alive, with history.
-- **Leverage:** this also makes every future daemon deploy painless (no session loss) — which de-risks `continuous.update` and all future backend work.
-
-## ~~P1 — Frozen-pane UX (remote daemon restart)~~ ✅ RESOLVED by P0 S4
-
-Was: when the remote daemon restarts the TUI showed a **frozen attach pane** and `A-r` didn't clear it. Fixed by P0 S4 (`d3c91ba`): the remote-reattach machinery already keeps the session reconnecting (`⟳`) and rebinds to the daemon-restored session once it's back (the daemon dies with no `End` frame → transport-EOF reconnect path, not the exited path); and `A-r` is now a "reconnect now" lever that accelerates/revives stuck reconnects.
-
-## P1 — bug-triage review / merge (in progress) 🟠
-
-- **bug-002** — fix `47e85e94` (tolerate missing/null/empty kalshi `markets`; +4 passing regression tests). Merge via **`/merge-main remote`** from a fresh session in its worktree → then `A-d` mark done.
-- **bug-001 / 003 / 004 / 005 / 006 / 007 / 008** — investigate-only `NOTES.md`; read + decide per bug. ⚠️ **bug-001**: its proposed fix may be *insufficient* (the `set_delta` race) — needs the live-log dig via `ssh trader`.
-- **Decision pending:** pause the orchestrator? It keeps spawning new bugs (now at 008) — churn while we stabilize.
-
-## ~~P2 — Global-host (`A-H`) removal~~ ✅ DONE (Phases A–D)
-
-Shipped per `DESIGN_REMOVE_GLOBAL_HOST.md`. The global `App::active_host` + `cycle_active_host` + the `A-H` host-cycler + the HostHeader `*` highlight are all gone. Host is now a per-workspace attribute (`Workspace.host_id` / `ManifestWorkspace.host_id`, default `local`, legacy-derive from first session): A-n's form picks it (defaults `local`), and add-session / workflow-respawn / MCP-spawn / launch-into-workspace inherit the workspace's (or caller's) host — fixing the latent add-session-mistags-host bug (Phase B). `A-H` now toggles session-hidden. TUI-only (no deploy). `cargo test -p claude-manager-tui` → 657 passed. Completion notes in `DESIGN_REMOVE_GLOBAL_HOST.md`.
-
-## ~~P2 — Two-column continuous panel (TUI)~~ ✅ DONE (S1–S5)
-
-Shipped per `DESIGN_CONTINUOUS_PANEL.md`. `A-C` toggles a dedicated continuous column (terminal | main | continuous) where orchestrators carry their spawned subtasks nested (`├`/`└` tree, matched by `managed_by_uid`); `A-h`/`A-l` move the unified cursor between columns, `A-j`/`A-k` within. Persisted (`continuous_column_on` on the manifest). Came with the **keybinding reshuffle** (S1): retired the `A-H` host-switcher, hide→`A-H`, push/pull→`A-9`/`A-0`, freeing `A-h`/`A-l`. Local-only (TUI) — no deploy. TUI 659 green. (Possible follow-ups: multihost grouping inside the column; transitive nesting depth.)
-
-## ~~P3 — `continuous.update` + autocompact~~ ✅ DONE (deployed)
-
-`continuous.update` (operator-only, in-place load-modify-save of a live task's mutable config — `compact_every`, `default_prompt`, schedule, …, preserving run history) is committed + **live on cm-manager**. Autocompact switched from `/clear` (wipe) to **`/compact` (summarize)** per user — a compact fire delivers `/compact` alone (it's an async turn) and the prompt resumes the next fire. The bug-triage orchestrator now has **`compact_every: 16`** (~48h) set via `continuous.update` (run_count preserved = no recreate). Its context is now bounded across fires/restarts.
-
-Remaining nicety (not blocking): updating the orchestrator's `default_prompt` to steer subtask agents to `set_subtask_status` + `ssh trader` (not `update_task`/gcloud) — `continuous.update` now supports it; just needs the desired prompt text. And TUI integration for `continuous.update` (an editor) whenever the two-column continuous panel (P2) lands.
-
-## P3 — Other headless planning tools 🟢
-
-`list_tasks` / `get_task` / `get_current_task` / `notify_user` are cli-routed → fail headless (memory: `reference_headless_planning_tools`). `update_task`'s status case is already fixed (daemon fallback). Daemon-route the rest if agents need them.
+- **A-a junk-local-spawn fix** — attaching to an empty *remote* workspace re-arms the deferred reattach instead of spawning a local claude in `$HOME` (commit `2cd1afb`).
+- **Disabled the resume-from-summary prompt on cm-manager** — `CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=999999` in `~/.claude/settings.json`, so daemon restarts re-resume cleanly without parking large sessions at the menu (memory: `reference_disable_resume_summary_prompt`). Confirmed working across a restart.
+- **Restored bug-001…006** from their transcripts (hand-crafted daemon manifest entries at their original uids) + **re-parented 001/003/004/005/006** to the live orchestrator uid so they nest robustly (survive being marked done).
 
 ---
 
-## Done this session (context, not a thread)
+## 🟠 Open
 
-- `set_subtask_status` (headless status PATCH) + `update_task` → `set_subtask_status` fallback.
-- `create_subtask` top-level fallback (parent-deleted self-heal); recreated the deleted orchestrator parent row; re-linked the 6 subtasks; flipped bugs to `blocked`.
-- ssh tunnel keepalive (hung-tunnel auto-reconnect); off-thread session poll + attach (TUI responsiveness); phantom-duplicate adoption dedup.
-- api: exclude archived from `GET /tasks`; dispatch `kind` migration (011) deployed (fixed the crash-loop).
-- `/merge-main remote` mode (fetch-before + push-after).
-- Deployed the current-main daemon (global_perms + my features) + mcp_server to cm-manager — consistent.
-- Docs: cm-manager `ssh trader` (CLAUDE.md); `gcp-instances` skill (pushed to predictionTrading).
+### P1 — bug-triage review/merge (active)
+- **bug-001** — fix `2e0c17b2` (gate cancel/placement-failure pending decrement on aggressive attribution; +138-line regression test) **merged to origin/main** ✅. Cleanup: `A-d` mark done + close session → drops the worktree.
+- **bug-002** — fix `47e85e94`/`b69afafd` (tolerate missing/empty kalshi `markets`) **merged to origin/main** ✅, task done + closed.
+- **bug-003 / 004 / 005 / 006 / 007 / 008** — still need review + merge as you go through them. The restored ones (003/004/005/006) are re-parented, so marking done keeps them nested until you close the session.
+- **Decision still pending:** pause the orchestrator? It's now spawning up to **bug-012** — churn while we stabilize.
+
+### P3 — Other headless planning tools 🟢 (reads DONE locally; deploy + notify_user pending)
+The READ tools (`list_tasks` / `get_task` / `get_current_task`) are **implemented + tested** (commit `0581a56`): daemon `list_tasks`/`get_task` RPC handlers (reuse `api_*` helpers); MCP routes through the daemon when headless, else PlanningClient; `get_current_task` composed from `ping` + `get_task`. daemon 442 + mcp 136 green.
+- **Pending: cm-manager deploy** (daemon binary + mcp_server → another clean restart) for it to take effect there.
+- **Still open: `notify_user`** — deferred. It needs a CROSS-HOST delivery path: on a headless host the user isn't attached, so a daemon `notify_user` would have to post to the planning API (a notifications row/endpoint the laptop TUI surfaces) or degrade to a logged no-op. Design the delivery, then add the daemon handler. (`update_task`'s status case already falls back to `set_subtask_status`; non-status `update_task` headless is also still cli-only.)
+Memory: `reference_headless_planning_tools`.
+
+### Deferred bug — reattach "stranding" 🟠
+In `drain_deferred_remote_reattach`, the **fresh-attach** failure path drops an entry from `pending_remote_reattach` after a *single* failure (the reconnecting-slot path correctly retries to `REMOTE_REATTACH_MAX_ATTEMPTS`). One transient post-restart attach failure can permanently strand a *live* remote session (recoverable only by another restart, or now `A-a` which re-arms it). Fix: mirror the reconnecting path's bounded retry in the fresh-attach `None` arm. Identified during the A-a fix; scoped out of that commit.
+
+### P3 niceties (non-blocking)
+- Update the orchestrator's `default_prompt` to steer subtask agents to `set_subtask_status` + `ssh trader` (the headless-tools fix above also makes `update_task`/`notify_user` work).
+- TUI editor for `continuous.update`.
+
+---
+
+## Done earlier this session (context, not threads)
+
+- `set_subtask_status` (headless status PATCH) + `update_task` → `set_subtask_status` fallback; `create_subtask` parent-deleted self-heal.
+- ssh tunnel keepalive; off-thread session poll + attach; phantom-duplicate adoption dedup.
+- api: exclude archived from `GET /tasks`; dispatch `kind` migration (011).
+- `/merge-main remote` mode (fetch-before + push-after); installed the `merge-main` skill on cm-manager.
+- Deployed current-main daemon + mcp_server to cm-manager.
