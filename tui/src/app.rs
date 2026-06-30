@@ -3450,6 +3450,12 @@ pub struct App {
     /// column, restored on the way back (`A-h`) so a round-trip doesn't lose
     /// the main selection.
     pub saved_main_cursor: Option<Cursor>,
+    /// The `Continuous`-column cursor stashed when stepping back to main,
+    /// restored on the way in (`A-l`) so re-entering the column lands on the
+    /// row you left off at (not always the first). Validated against the live
+    /// rows on restore — falls back to the first row if the saved session is
+    /// gone.
+    pub saved_continuous_cursor: Option<Cursor>,
     pub sidebar_view: SidebarView,
     pub view_mode: ViewMode,
     pub planning: PlanningView,
@@ -3968,6 +3974,7 @@ impl App {
             cursor: Cursor::Workspace(0),
             cursor_column: SidebarColumn::Main,
             saved_main_cursor: None,
+            saved_continuous_cursor: None,
             sidebar_view,
             view_mode: ViewMode::Sessions,
             planning: PlanningView::new(),
@@ -7915,8 +7922,11 @@ impl App {
     /// Move the cursor between sidebar columns (S4). `dir > 0` steps RIGHT
     /// (toward the continuous column), `dir < 0` steps LEFT (back to main).
     /// No-op when the continuous column isn't shown; entering an empty
-    /// continuous column is also a no-op. The main cursor is stashed on the
-    /// way in and restored on the way out so a round-trip is lossless.
+    /// continuous column is also a no-op. EACH column remembers the row you
+    /// left off at: the main cursor is stashed on the way in / restored on the
+    /// way out, and the continuous cursor likewise — so re-entering a column
+    /// lands where you were, not on its first row (the saved continuous spot is
+    /// validated against the live rows and falls back to the first if gone).
     fn step_column(&mut self, dir: i32) {
         if !self.continuous_column_on {
             self.cursor_column = SidebarColumn::Main;
@@ -7925,14 +7935,32 @@ impl App {
         match (self.cursor_column, dir) {
             (SidebarColumn::Main, d) if d > 0 => {
                 let rows = self.visual_items_continuous();
-                if let Some(r) = rows.first() {
-                    self.saved_main_cursor = Some(self.cursor.clone());
-                    self.cursor = Cursor::Session(r.ws_idx, r.sess_idx);
-                    self.cursor_column = SidebarColumn::Continuous;
-                    self.needs_redraw = true;
+                if rows.is_empty() {
+                    return;
                 }
+                // Restore the last continuous spot if it still exists; else the
+                // first row.
+                let target = self
+                    .saved_continuous_cursor
+                    .as_ref()
+                    .filter(|c| match c {
+                        Cursor::Session(wi, si) => {
+                            rows.iter().any(|r| r.ws_idx == *wi && r.sess_idx == *si)
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let r = rows[0];
+                        Cursor::Session(r.ws_idx, r.sess_idx)
+                    });
+                self.saved_main_cursor = Some(self.cursor.clone());
+                self.cursor = target;
+                self.cursor_column = SidebarColumn::Continuous;
+                self.needs_redraw = true;
             }
             (SidebarColumn::Continuous, d) if d < 0 => {
+                self.saved_continuous_cursor = Some(self.cursor.clone());
                 self.cursor = self
                     .saved_main_cursor
                     .take()
@@ -10205,9 +10233,12 @@ impl App {
                 self.continuous_column_on = !self.continuous_column_on;
                 // Turning the column off strands a continuous-column cursor —
                 // pull it back to the main sidebar (restoring the saved spot).
+                // Stash the continuous spot first so toggling back on + stepping
+                // in lands where you left off.
                 if !self.continuous_column_on
                     && self.cursor_column == SidebarColumn::Continuous
                 {
+                    self.saved_continuous_cursor = Some(self.cursor.clone());
                     self.cursor = self
                         .saved_main_cursor
                         .take()
@@ -21498,9 +21529,10 @@ mod remote_reconnect_tests {
     }
 
     /// Continuous-panel S4: `A-l` steps the cursor into the continuous column
-    /// (onto the first row), `A-j/k` navigate within it (wrapping), `A-h`
-    /// returns to the saved main cursor, and stepping right is a no-op when the
-    /// column is off.
+    /// (onto the first row on first entry, then onto the row you LEFT OFF at on
+    /// re-entry), `A-j/k` navigate within it (wrapping), `A-h` returns to the
+    /// saved main cursor, and stepping right is a no-op when the column is off.
+    /// Also pins the per-column position memory + its stale-row fallback.
     #[test]
     fn column_nav_steps_into_continuous_navigates_and_returns() {
         let _guard = crate::test_support::home_lock();
@@ -21551,10 +21583,36 @@ mod remote_reconnect_tests {
         app.navigate(1);
         assert_eq!(cur_uid(&app), "orch");
 
-        // A-h → back to main, restoring the saved cursor.
+        // Land on the subtask, then A-h → back to main (restores the saved main
+        // cursor) — and stashes the continuous spot (sub).
+        app.navigate(1);
+        assert_eq!(cur_uid(&app), "sub");
         app.step_column(-1);
         assert_eq!(app.cursor_column, SidebarColumn::Main);
         assert_eq!(app.cursor, Cursor::Workspace(0));
+
+        // A-l again → lands on the row we LEFT OFF at (sub), not the first row.
+        app.step_column(1);
+        assert_eq!(app.cursor_column, SidebarColumn::Continuous);
+        assert_eq!(
+            cur_uid(&app),
+            "sub",
+            "re-entering the column remembers the last continuous row",
+        );
+
+        // Stale-row fallback: leave (stashing sub), then remove the subtask so
+        // the saved row no longer exists; re-entry falls back to the first row.
+        app.step_column(-1);
+        assert_eq!(app.cursor_column, SidebarColumn::Main);
+        app.workspaces[0].sessions.pop(); // drop "sub"
+        app.step_column(1);
+        assert_eq!(app.cursor_column, SidebarColumn::Continuous);
+        assert_eq!(
+            cur_uid(&app),
+            "orch",
+            "a saved continuous row that's gone falls back to the first row",
+        );
+        app.step_column(-1);
 
         // Column off → stepping right is a no-op (stays in main).
         app.continuous_column_on = false;
