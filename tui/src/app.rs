@@ -1991,6 +1991,10 @@ pub(crate) enum InputOutcome {
     Cancel,
     /// Reset `input_mode` to `Normal` AND fire a side effect.
     Submit(SubmitAction),
+    /// Keep the modal OPEN but surface a status message — inline validation
+    /// feedback (e.g. a required field left empty) so a rejected keystroke
+    /// isn't a silent no-op.
+    Status(String),
 }
 
 /// Side effects requested by a `Submit` outcome. The dispatcher matches
@@ -2501,7 +2505,11 @@ pub(crate) fn handle_new_session(
                     host_id: state.host_id.clone(),
                 })
             } else {
-                InputOutcome::Consumed
+                // Empty Name field: pre-fix this was a silent no-op (Enter did
+                // "nothing"). Surface why instead.
+                InputOutcome::Status(
+                    "Name is required — type a session name (Tab to the Name field), then Enter".into(),
+                )
             }
         }
         KeyCode::Backspace => {
@@ -11087,6 +11095,12 @@ impl App {
                     return true;
                 }
                 self.apply_submit_action(action);
+                true
+            }
+            InputOutcome::Status(msg) => {
+                // Inline validation: keep the form open, just surface the
+                // message in the status bar.
+                self.set_status_msg(&msg);
                 true
             }
         }
@@ -23234,10 +23248,10 @@ mod input_handler_tests {
     }
 
     #[test]
-    fn new_session_enter_with_blank_label_stays_open() {
-        // When the label is empty, Enter is consumed but the modal does
-        // NOT close — pre-extraction behavior was `return true` without
-        // touching `input_mode`.
+    fn new_session_enter_with_blank_label_surfaces_required_message() {
+        // When the label is empty, Enter keeps the modal OPEN and surfaces a
+        // "Name is required" status — NOT a silent no-op (the reported "pressed
+        // Enter and nothing happened"). The form stays open (Status, not Submit).
         let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("   ", "", "2", "", 1);
         let outcome = handle_new_session(
@@ -23253,7 +23267,14 @@ mod input_handler_tests {
             ctx_no_repos(),
             &key(KeyCode::Enter),
         );
-        assert_consumed(&outcome);
+        match outcome {
+            InputOutcome::Status(msg) => assert!(
+                msg.to_lowercase().contains("required"),
+                "expected a 'Name is required' message, got {:?}",
+                msg,
+            ),
+            other => panic!("expected Status(required message), got {:?}", other),
+        }
     }
 
     #[test]
