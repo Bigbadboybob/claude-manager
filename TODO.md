@@ -34,8 +34,8 @@ The READ tools (`list_tasks` / `get_task` / `get_current_task`) are **implemente
 - **Still open: `notify_user`** — deferred. It needs a CROSS-HOST delivery path: on a headless host the user isn't attached, so a daemon `notify_user` would have to post to the planning API (a notifications row/endpoint the laptop TUI surfaces) or degrade to a logged no-op. Design the delivery, then add the daemon handler. (`update_task`'s status case already falls back to `set_subtask_status`; non-status `update_task` headless is also still cli-only.)
 Memory: `reference_headless_planning_tools`.
 
-### Deferred bug — reattach "stranding" 🟠
-In `drain_deferred_remote_reattach`, the **fresh-attach** failure path drops an entry from `pending_remote_reattach` after a *single* failure (the reconnecting-slot path correctly retries to `REMOTE_REATTACH_MAX_ATTEMPTS`). One transient post-restart attach failure can permanently strand a *live* remote session (recoverable only by another restart, or now `A-a` which re-arms it). Fix: mirror the reconnecting path's bounded retry in the fresh-attach `None` arm. Identified during the A-a fix; scoped out of that commit.
+### ~~Deferred bug — reattach "stranding"~~ ✅ FIXED (`d89928f`)
+Both deferred-reattach paths now bound the FRESH-attach retry like the reconnecting-slot path: the synchronous fallback no longer drops a fresh entry on the first failure (the stranding), and the production `drain_attach_results` no longer re-queues a fresh failure forever (the spin — its `attempts >= MAX` give-up was reconnecting-only); the dispatcher's retry throttle now applies to fresh entries too. Give-up after `REMOTE_REATTACH_MAX_ATTEMPTS` preserves the raw entry in `skipped_manifest_entries`. Test `fresh_deferred_reattach_retries_then_gives_up_bounded`; TUI 659 green.
 
 ### P3 niceties (non-blocking)
 - Update the orchestrator's `default_prompt` to steer subtask agents to `set_subtask_status` + `ssh trader` (the headless-tools fix above also makes `update_task`/`notify_user` work).
