@@ -123,6 +123,15 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # bug-fix agent flip its own task to `blocked` (fix-ready) when the
     # cli-routed `update_task` is unavailable.
     "set_subtask_status",
+    # Headless planning READS — daemon serves these (it holds the planning-API
+    # creds) so a daemon-spawned agent can inspect the board / its own task
+    # when the cli-routed PlanningClient isn't installed. The server.py tools
+    # pass `socket_path=route.path` explicitly (like propose_task), so the
+    # daemon route is taken on a headless host and PlanningClient on a laptop.
+    # (`get_current_task` is composed MCP-side from `ping` + `get_task` — no
+    # dedicated daemon method.)
+    "list_tasks",
+    "get_task",
     # 10d-2b: workflow_transition / workflow_done flip from
     # MCP-server-side `_append_event` (direct events.jsonl
     # write) to daemon-side writers via 10d-2a's

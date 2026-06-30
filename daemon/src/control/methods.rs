@@ -10521,6 +10521,46 @@ pub fn set_subtask_status(
     Ok(json!({ "task_id": target_task_id, "status": p.status }))
 }
 
+/// Read the daemon's planning-API creds from config (shared by the
+/// headless-read tools below). The daemon holds `api_url` + `api_token`, so
+/// these reads work on a headless host (cm-manager) where the cli-routed
+/// `PlanningClient` isn't installed alongside the MCP server.
+fn planning_creds(
+    state_arc: &Arc<Mutex<DaemonState>>,
+) -> Result<PlanningApiCreds, (ErrorCode, String)> {
+    let (api_url, api_token) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (state.config.api_url.clone(), state.config.api_token.clone())
+    };
+    PlanningApiCreds::from_config(&api_url, &api_token).map_err(|e| e.to_method_err())
+}
+
+/// Daemon-routed `list_tasks` (headless planning read). Returns the RAW
+/// planning-API task rows (`GET /tasks`); the MCP server applies the
+/// project/status/source filters + `_shape_task` shaping client-side, exactly
+/// as it does for the cli-routed path. Read-only → Operator + Session callable
+/// (a board read isn't task-scoped).
+pub fn list_tasks(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    let creds = planning_creds(state_arc)?;
+    let tasks = api_list_tasks(&creds).map_err(|e| e.to_method_err())?;
+    Ok(Value::Array(tasks))
+}
+
+/// Daemon-routed `get_task` — `GET /tasks/{id}`, raw row (MCP shapes it).
+/// Read-only → Operator + Session callable.
+pub fn get_task(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let task_id = params
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .ok_or((ErrorCode::InvalidParams, "get_task: 'task_id' is required".into()))?;
+    let creds = planning_creds(state_arc)?;
+    api_get_task(&creds, task_id).map_err(|e| e.to_method_err())
+}
+
+// (`get_current_task` has no dedicated daemon method: the MCP tool composes
+// it from `ping` — which already returns the caller's `task_id` /
+// `workspace_id` — plus `get_task` above.)
+
 /// Best-effort bounded wait until no LIVE session is tagged with
 /// `task_id`. `mark_subtask_done` SIGKILLs the subtask's sessions
 /// before removing its worktree; the reaper removes them

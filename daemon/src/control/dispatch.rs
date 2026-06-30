@@ -505,6 +505,14 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_set_subtask_status(state, req))
         }
 
+        // Headless planning READS: a daemon-spawned agent (no cli-routed
+        // PlanningClient) gets these served by the daemon, which holds the
+        // planning-API creds. Read-only (Operator + Session); return RAW api
+        // rows — the MCP server shapes/filters. (`get_current_task` is composed
+        // MCP-side from `ping` + `get_task`, so it needs no method here.)
+        "list_tasks" => DispatchOutcome::Done(dispatch_list_tasks(state, req)),
+        "get_task" => DispatchOutcome::Done(dispatch_get_task(state, req)),
+
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the
         // TUI can run interactive `A-n` / `A-s` against a REMOTE host.
@@ -708,6 +716,20 @@ fn dispatch_list_subtasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::list_subtasks(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_list_tasks(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::list_tasks(state) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_get_task(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::get_task(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -273,8 +273,19 @@ def list_tasks(
             "blocked", "done", "archived").
         source: Optional source filter ("user" or "claude"). Default returns both.
     """
-    client = PlanningClient()
-    tasks = client.list_tasks(project=project, status=status)
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        # Headless host: the daemon serves the read (it holds the planning-API
+        # creds). It returns ALL raw rows — the API `GET /tasks` has no
+        # project/status query — so filter client-side here.
+        tasks = control_client.call("list_tasks", {}, socket_path=route.path)
+        if project:
+            tasks = [t for t in tasks if t.get("project") == project]
+        if status:
+            tasks = [t for t in tasks if t.get("status") == status]
+    else:
+        client = PlanningClient()
+        tasks = client.list_tasks(project=project, status=status)
     if source:
         tasks = [t for t in tasks if t.get("source") == source]
     return [_shape_task(t, full=False) for t in tasks]
@@ -290,8 +301,12 @@ def get_task(task_id: str) -> dict:
     Args:
         task_id: Task UUID (find one via `list_tasks`).
     """
-    client = PlanningClient()
-    return _shape_task(client.get_task(task_id), full=True)
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        task = control_client.call("get_task", {"task_id": task_id}, socket_path=route.path)
+    else:
+        task = PlanningClient().get_task(task_id)
+    return _shape_task(task, full=True)
 
 
 @mcp.tool()
@@ -408,6 +423,23 @@ def get_current_task() -> dict:
     `update_task` with the returned `task.id` — note that `metadata` is
     REPLACED on PATCH, so merge first if you want to preserve other keys.
     """
+    route = control_client.resolve_socket_route()
+    if route.chose_daemon:
+        # Headless host: the cli-routed `get_caller_task` + PlanningClient path
+        # isn't available. `ping` already returns the caller's task_id +
+        # workspace_id; fetch the row via the daemon-served `get_task`.
+        # `is_tombstone` isn't surfaced headless — a live caller is False.
+        pong = control_client.call("ping", {}, socket_path=route.path)
+        task_id = pong.get("task_id")
+        workspace_id = pong.get("workspace_id")
+        if not task_id:
+            return {"task": None, "workspace_id": workspace_id, "is_tombstone": False}
+        task = control_client.call("get_task", {"task_id": task_id}, socket_path=route.path)
+        return {
+            "task": _shape_task(task, full=True),
+            "workspace_id": workspace_id,
+            "is_tombstone": False,
+        }
     ctx = control_client.call("get_caller_task")
     task_id = ctx.get("task_id")
     if not task_id:
