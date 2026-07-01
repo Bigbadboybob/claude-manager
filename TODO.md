@@ -40,6 +40,7 @@ Both deferred-reattach paths now bound the FRESH-attach retry like the reconnect
 ### P3 niceties (non-blocking)
 - Update the orchestrator's `default_prompt` to steer subtask agents to `set_subtask_status` + `ssh trader` (the headless-tools fix above also makes `update_task`/`notify_user` work).
 - TUI editor for `continuous.update`.
+- **Visual triage-stage indicator (NEEDS DESIGN — discuss first).** An at-a-glance way in the TUI to see what lifecycle stage each triage subtask session is in (investigate → propose → implement → review → merged). Open design Qs: where it lives (sidebar badge / color / a dedicated column), how the stage is sourced (the orchestrator's `.bug-triage/index.yaml` recorded `stage` vs live re-derivation from git+NOTES like `/triage-review` does), and refresh cadence. Raised 2026-06-30; not trivial — design discussion before building.
 
 ---
 
