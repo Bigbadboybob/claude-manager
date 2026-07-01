@@ -682,6 +682,30 @@ impl DaemonState {
         })?;
         self.workspaces = manifest.workspaces;
         self.bindings = manifest.bindings;
+        // Headless binding rehydration. The task→workspace `bindings` map is the
+        // daemon's restart-survivable resolver for `mcp_start_session(task_id=…)`
+        // — the re-spawn-into-an-EXISTING-subtask-worktree path. It is normally
+        // populated by `create_subtask`, but the persisted manifest can carry an
+        // empty/stale `bindings` (observed `{}` in the wild), and a HEADLESS
+        // daemon has no TUI `task.update_tree` push to repopulate `task_workspaces`
+        // either — so after a restart EVERY restored subtask's binding is lost and
+        // `start_session(task_id=<subtask>)` fails NotFound "no bound workspace".
+        // Each restored session already carries its task_id + workspace_id, so the
+        // binding is fully reconstructable here. Merge (`or_insert`) so an explicit
+        // persisted binding always wins over a derived one. Collect first to avoid
+        // borrowing `self.workspaces` while mutating `self.bindings`.
+        let derived: Vec<(String, String)> = self
+            .workspaces
+            .iter()
+            .flat_map(|(ws_id, ws)| {
+                ws.sessions
+                    .iter()
+                    .filter_map(move |s| s.task_id.as_ref().map(|tid| (tid.clone(), ws_id.clone())))
+            })
+            .collect();
+        for (task_id, ws_id) in derived {
+            self.bindings.entry(task_id).or_insert(ws_id);
+        }
         Ok(true)
     }
 
@@ -1190,6 +1214,66 @@ mod tests {
         let ws2 = state.workspaces.get("ws-2").expect("ws-2");
         assert!(ws2.is_closed);
         assert_eq!(state.bindings.get("task-foo").map(String::as_str), Some("ws-1"));
+    }
+
+    #[test]
+    fn load_rehydrates_bindings_from_restored_sessions() {
+        // Headless restart with an empty/stale persisted `bindings`: the
+        // task→workspace binding must be rebuilt from each restored session's
+        // task_id + workspace_id so `start_session(task_id=<subtask>)` resolves
+        // after a daemon restart with no TUI `task.update_tree` push.
+        let _g = lock();
+        let dir = TempDir::new().expect("tempdir");
+        let manifest_json = serde_json::json!({
+            "workspaces": {
+                "ws-sub": {
+                    "id": "ws-sub",
+                    "name": "subtask",
+                    "is_closed": false,
+                    "is_cloud": false,
+                    "sessions": [{
+                        "uid": "ts-sub", "generation": 0, "label": "bug-agent",
+                        "session_type": "claude", "task_id": "task-sub",
+                        "hidden": false, "idle_timeout_secs": 0,
+                        "burst_threshold": 0, "notify_on_idle": false
+                    }],
+                    "tombstones": []
+                },
+                "ws-explicit": {
+                    "id": "ws-explicit",
+                    "name": "explicit",
+                    "is_closed": false,
+                    "is_cloud": false,
+                    "sessions": [{
+                        "uid": "ts-exp", "generation": 0, "label": "exp",
+                        "session_type": "claude", "task_id": "task-pinned",
+                        "hidden": false, "idle_timeout_secs": 0,
+                        "burst_threshold": 0, "notify_on_idle": false
+                    }],
+                    "tombstones": []
+                }
+            },
+            // Empty for task-sub (the wild-observed case); an explicit pin for
+            // task-pinned that the session-derived value must NOT overwrite.
+            "bindings": { "task-pinned": "ws-pinned-explicit" }
+        })
+        .to_string();
+        let path = write_manifest(&dir, &manifest_json);
+
+        let mut state = DaemonState::new();
+        assert!(state.load_manifest_from_disk(&path).expect("load ok"));
+        // Derived from the restored session — was absent in persisted bindings.
+        assert_eq!(
+            state.bindings.get("task-sub").map(String::as_str),
+            Some("ws-sub"),
+            "binding rebuilt from the restored subtask session",
+        );
+        // Explicit persisted binding wins over the derivable one (or_insert).
+        assert_eq!(
+            state.bindings.get("task-pinned").map(String::as_str),
+            Some("ws-pinned-explicit"),
+            "explicit persisted binding not overwritten by session-derived value",
+        );
     }
 
     #[test]

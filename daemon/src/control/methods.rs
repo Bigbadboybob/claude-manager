@@ -1391,13 +1391,6 @@ pub fn send_input(
         ));
     }
 
-    // Build the write payload BEFORE the state lock — text +
-    // optional newline is just byte ops, no contention.
-    let mut payload = p.text.into_bytes();
-    if p.submit {
-        payload.push(b'\n');
-    }
-
     // Sub-2a Finding #2 TOCTOU fix: auth + Arc clone happen in
     // ONE critical section so the target session can't be
     // removed (or replaced with an entry the caller wouldn't
@@ -1410,8 +1403,9 @@ pub fn send_input(
     // post-write stamp were inlined here and the stream input
     // path didn't stamp at all — the handle pattern keeps the
     // invariant in one place so future input paths can't skip
-    // it.
-    let handle = {
+    // it. Also read the session_type so we can pick the right
+    // SUBMIT encoding below (see the agent/bash branch).
+    let (handle, is_agent) = {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Session-caller auth: under the same lock that does
         // the target lookup. Operator callers (`caller_uid:
@@ -1443,18 +1437,41 @@ pub fn send_input(
                 ),
             ));
         }
-        session.input_handle()
+        // claude-code / codex run a kitty-keyboard TUI; bash is a raw shell.
+        let is_agent = session.session_type != "bash";
+        (session.input_handle(), is_agent)
     };
-    // State lock is dropped — write + stamp happen on the
-    // handle's cloned Arcs.
-    handle.write_and_stamp(&payload).map_err(|e| {
-        (
-            ErrorCode::Internal,
-            format!("send_input write to PTY: {}", e),
-        )
-    })?;
 
-    Ok(json!({ "ok": true }))
+    // SUBMIT encoding depends on the target's input mode:
+    //   - AGENT (claude-code/codex): a bare `\n` does NOT submit a kitty-TUI
+    //     prompt — it just inserts a newline (and a rapid multi-line body is
+    //     swallowed as a paste). Deliver via the SAME detached-thread mechanism
+    //     the continuous fire path proved out (`spawn_agent_prompt_delivery`):
+    //     settle → bracketed body → gap → kitty-Enter (CSI 13 u). Returns
+    //     promptly; the prompt lands a couple seconds later. Callers that need
+    //     the reply use `send_input_and_wait`, which anchors on transcript
+    //     progress (NOT the brief send-time busy flip), so the async settle is
+    //     not a race for it. This is the fix for "orchestrator send_input to a
+    //     subtask delivers but never submits" — the bare-`\n` parity bug.
+    //   - BASH: `\n` IS the submit (a raw shell line). Keep the original
+    //     synchronous single write so the echo-back contract (and tests) hold.
+    if is_agent {
+        // Input was delivered NOW — flip idle false synchronously even though
+        // the PTY write is deferred to the delivery thread (which stamps too).
+        handle.stamp_activity();
+        spawn_agent_prompt_delivery(handle, p.session_uid.clone(), p.text);
+        Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
+    } else {
+        let mut payload = p.text.into_bytes();
+        payload.push(b'\n'); // submit=false is rejected above, so always Enter
+        handle.write_and_stamp(&payload).map_err(|e| {
+            (
+                ErrorCode::Internal,
+                format!("send_input write to PTY: {}", e),
+            )
+        })?;
+        Ok(json!({ "ok": true }))
+    }
 }
 
 // ============================================================
@@ -7564,8 +7581,25 @@ pub fn trigger(
             // The run just armed is `seq` (== run_count+1). compact-after-N gates
             // on it so the Nth, 2Nth, … fire `/compact`s (only) before the
             // prompt resumes on the following fire.
-            let compact =
-                matches!(task.compact_every, Some(n) if n > 0 && seq % n as u64 == 0);
+            //
+            // Compaction is a SCHEDULED-cadence concern: ONLY the periodic
+            // scheduler may turn a fire into a `/compact`. A manual
+            // `continuous.run_now`, an MCP `trigger` fan-out, or a
+            // `resolve_stuck` refire always runs the prompt. Otherwise an
+            // off-schedule fire that happens to land on a compact-multiple seq
+            // silently compacts instead of running a cycle — and worse, a
+            // scheduled fire close behind lands mid-`/compact` (the summarization
+            // turn is async and outlasts a few minutes) where its paste is
+            // dropped, so neither fire runs a cycle. Keying off the scheduler
+            // caller keeps the cadence intact while making operator fires always
+            // do what the operator asked: run now.
+            let is_scheduled_fire = matches!(
+                caller,
+                Caller::Operator(op)
+                    if op.token_id == crate::continuous::scheduler::SCHEDULER_CALLER_TOKEN
+            );
+            let compact = is_scheduled_fire
+                && matches!(task.compact_every, Some(n) if n > 0 && seq % n as u64 == 0);
             // Under the delivery test spy `handle_opt` is None — record the
             // delivery in lieu of a PTY write (production always carries a handle
             // in the live arm).
@@ -13811,6 +13845,32 @@ mod tests {
             "expected 'hello-send-input-test' in PTY output, got:\n{}",
             String::from_utf8_lossy(&accumulated)
         );
+    }
+
+    /// An AGENT session (claude-code/codex) must NOT get a bare `\n` submit —
+    /// that never submits a kitty-TUI prompt (the orchestrator-can't-drive-its-
+    /// subtasks bug). It takes the async `spawn_agent_prompt_delivery` path
+    /// (bracketed body → gap → kitty-Enter) and reports `delivery:agent-kitty-
+    /// async`, vs bash's synchronous `\n` write above.
+    #[test]
+    fn send_input_agent_session_uses_async_kitty_delivery() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-si-agent", &dir);
+        let uid = spawn_bash(&state, "ws-si-agent");
+        // Masquerade as a kitty-TUI agent so the agent branch is taken (the
+        // backing PTY is bash — it just receives harmless escape bytes).
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut(&uid).unwrap().session_type = "claude-code".to_string();
+        }
+        let params = json!({ "session_uid": &uid, "text": "implement the fix" });
+        let result = send_input(&state, &params, None).expect("send_input ok");
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery"], "agent-kitty-async",
+            "agent sessions submit via the async kitty-Enter path, not a bare newline",
+        );
+        kill_all_sessions(&state);
     }
 
     #[test]
@@ -21231,20 +21291,16 @@ mod tests {
             arm_continuous_delivery_spy_for_test();
             let state = Arc::new(Mutex::new(DaemonState::new()));
 
+            // Compaction is SCHEDULER-only: fire as the scheduler caller so the
+            // modulo gate is live (a manual operator fire never compacts — see
+            // `trigger_persistent_manual_fire_never_compacts`).
+            let sched = Caller::operator(crate::continuous::scheduler::SCHEDULER_CALLER_TOKEN);
             // Fire #1: seq=2 => compact.
-            trigger(
-                &state,
-                &Caller::operator("op"),
-                &json!({ "task_id": "ct-pers-compact" }),
-            )
-            .expect("fire 1");
+            trigger(&state, &sched, &json!({ "task_id": "ct-pers-compact" }))
+                .expect("fire 1");
             // Fire #2: seq=3 => no compact.
-            trigger(
-                &state,
-                &Caller::operator("op"),
-                &json!({ "task_id": "ct-pers-compact" }),
-            )
-            .expect("fire 2");
+            trigger(&state, &sched, &json!({ "task_id": "ct-pers-compact" }))
+                .expect("fire 2");
 
             let deliveries = take_continuous_delivery_spy_for_test();
             assert_eq!(deliveries.len(), 2);
@@ -21253,6 +21309,50 @@ mod tests {
 
             let reloaded = crate::continuous::task::load_one("ct-pers-compact").unwrap();
             assert_eq!(reloaded.run_count, 3);
+        });
+    }
+
+    /// PERSISTENT auto-compact is SCHEDULER-only: a MANUAL fire (operator
+    /// `continuous.run_now`, MCP `trigger`, …) that lands on a compact-multiple
+    /// seq must STILL run the prompt, never `/compact`. Regression guard for the
+    /// run_now/compact collision: an off-schedule run_now that hits a
+    /// compact-multiple seq used to `/compact` (doing nothing visible) and could
+    /// drop a scheduled fire's prompt landing mid-summarization.
+    #[test]
+    fn trigger_persistent_manual_fire_never_compacts() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-pers-manual",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.current_session_uid = Some("ts-live-mmmm-0".to_string());
+            task.compact_every = Some(2);
+            // Prior run_count=1 => this fire is seq=2 (a compact-multiple).
+            task.run_count = 1;
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_delivery_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+
+            // A non-scheduler operator caller (what run_now / MCP trigger use)
+            // on the compact-multiple seq 2: prompt, NOT compact.
+            trigger(
+                &state,
+                &Caller::operator("op"),
+                &json!({ "task_id": "ct-pers-manual" }),
+            )
+            .expect("manual fire");
+
+            let deliveries = take_continuous_delivery_spy_for_test();
+            assert_eq!(deliveries.len(), 1);
+            assert!(
+                !deliveries[0].2,
+                "manual fire on a compact-multiple seq must run the prompt, not /compact"
+            );
         });
     }
 

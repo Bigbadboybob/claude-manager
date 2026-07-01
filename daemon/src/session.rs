@@ -1788,6 +1788,20 @@ impl InputHandle {
         }
         Ok(())
     }
+
+    /// Bump the activity clock WITHOUT writing to the PTY. The agent
+    /// `send_input` path hands the actual PTY write to a detached delivery
+    /// thread (settle → bracketed body → gap → kitty-Enter), but the caller
+    /// delivered input *now* — so idle must flip false synchronously rather
+    /// than ~2.5s later when the thread's first write stamps. (The thread
+    /// also stamps on each of its writes; this is the immediate signal.)
+    pub fn stamp_activity(&self) {
+        let mut slot = self
+            .last_activity_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = Some(Instant::now());
+    }
 }
 
 impl DaemonSession {

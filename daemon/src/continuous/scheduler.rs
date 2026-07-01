@@ -47,6 +47,14 @@ use crate::workflow::poller::PanicRecord;
 /// identically-named const (different module path, no collision).
 pub const DEFAULT_TICK_INTERVAL_MICROS: u64 = 250_000;
 
+/// Operator-caller token the periodic scheduler fires under. It is the auth
+/// identity AND the provenance label on the run record. The persistent-fire
+/// auto-`/compact` cadence keys off it: ONLY a fire from this caller may turn
+/// into a `/compact` (see `methods::trigger`). Every other fire path — a manual
+/// `continuous.run_now`, the MCP `trigger` fan-out, a `resolve_stuck` refire —
+/// uses a different token and therefore always runs the prompt, never compacts.
+pub const SCHEDULER_CALLER_TOKEN: &str = "continuous-scheduler";
+
 /// Lower bound the scheduler respects no matter what `tick_interval` is set to.
 /// Mirrors the poller's floor; prevents a `tick_interval = 0`/tiny value from
 /// busy-looping a CPU core.
@@ -481,7 +489,7 @@ impl ContinuousScheduler {
                 fire_token: Some(fire_token),
                 session_uid: Some(session_uid),
                 run_mode: None,
-                trigger_source: Some("continuous-scheduler".to_string()),
+                trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
                 status: Some("orphaned".to_string()),
                 detail: None,
             }) {
@@ -553,7 +561,7 @@ impl ContinuousScheduler {
                 return spy.outcome;
             }
         }
-        let caller = Caller::operator("continuous-scheduler");
+        let caller = Caller::operator(SCHEDULER_CALLER_TOKEN);
         let params = serde_json::json!({ "task_id": task_id, "fire_token": fire_token });
         // Per-fire panic isolation. `trigger` is written to return `Err`, never
         // panic — but an unexpected panic for ONE task's config must not unwind
@@ -712,7 +720,7 @@ fn append_supervision_audit(tk: &ContinuousTask, fire_token: &str, now: u64) {
         fire_token: Some(fire_token.to_string()),
         session_uid: tk.current_session_uid.clone(),
         run_mode: Some("persistent".to_string()),
-        trigger_source: Some("continuous-scheduler".to_string()),
+        trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
         status: None,
         detail: None,
     }) {
