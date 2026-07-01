@@ -3462,12 +3462,15 @@ pub struct App {
     /// column, restored on the way back (`A-h`) so a round-trip doesn't lose
     /// the main selection.
     pub saved_main_cursor: Option<Cursor>,
-    /// The `Continuous`-column cursor stashed when stepping back to main,
+    /// The `Continuous`-column position stashed when stepping back to main,
     /// restored on the way in (`A-l`) so re-entering the column lands on the
-    /// row you left off at (not always the first). Validated against the live
-    /// rows on restore — falls back to the first row if the saved session is
-    /// gone.
-    pub saved_continuous_cursor: Option<Cursor>,
+    /// row you left off at (not always the first). Stored as the session UID
+    /// (NOT a `(ws_idx, sess_idx)` index) so it survives a manifest refresh
+    /// reindexing the workspaces/sessions between leaving and returning — the
+    /// index-based form silently fell back to the first row after any poll.
+    /// Resolved against the live rows on restore — falls back to the first row
+    /// if the saved session is gone.
+    pub saved_continuous_uid: Option<String>,
     pub sidebar_view: SidebarView,
     pub view_mode: ViewMode,
     pub planning: PlanningView,
@@ -3986,7 +3989,7 @@ impl App {
             cursor: Cursor::Workspace(0),
             cursor_column: SidebarColumn::Main,
             saved_main_cursor: None,
-            saved_continuous_cursor: None,
+            saved_continuous_uid: None,
             sidebar_view,
             view_mode: ViewMode::Sessions,
             planning: PlanningView::new(),
@@ -7936,6 +7939,7 @@ impl App {
         orchestrators.sort_by(|a, b| a.4.cmp(b.4).then(a.2.cmp(b.2)));
         let parent_of = self.task_parent_map();
 
+        use std::collections::BTreeMap;
         let mut rows = Vec::new();
         for &(owi, osi, ouid, otask, _) in &orchestrators {
             rows.push(ContinuousRow {
@@ -7943,10 +7947,12 @@ impl App {
                 sess_idx: osi,
                 depth: 0,
             });
-            // Subtasks of this orchestrator (excluding orchestrators themselves
-            // — a continuous task nested under another stays top-level). Matched
-            // by managed_by_uid OR task-tree parent. Re-scan (immutable; small N).
-            let mut children: Vec<(usize, usize, &str)> = Vec::new();
+            // This orchestrator's member sessions (excluding orchestrators
+            // themselves — a continuous task nested under another stays
+            // top-level). Matched by managed_by_uid OR task-tree parent. A
+            // member carries its own task_id so we can regroup below.
+            // Re-scan (immutable; small N). (wi, si, task_id, is_bash, label)
+            let mut members: Vec<(usize, usize, Option<&str>, bool, &str)> = Vec::new();
             for (wi, ws) in self.workspaces.iter().enumerate() {
                 if ws.is_closed {
                     continue;
@@ -7963,17 +7969,60 @@ impl App {
                             .and_then(|t| parent_of.get(t).copied())
                             == otask;
                     if by_uid || by_task {
-                        children.push((wi, si, ts.label.as_str()));
+                        members.push((
+                            wi,
+                            si,
+                            ts.task_id.as_deref(),
+                            ts.session_type == "bash",
+                            ts.label.as_str(),
+                        ));
                     }
                 }
             }
-            children.sort_by(|a, b| a.2.cmp(b.2));
-            for (cwi, csi, _) in children {
-                rows.push(ContinuousRow {
-                    ws_idx: cwi,
-                    sess_idx: csi,
-                    depth: 1,
-                });
+            // Group members by their subtask (task_id) so multiple sessions in
+            // ONE subtask nest together: e.g. a bash the operator adds to a
+            // subtask sits UNDER that subtask's agent, not as a flat sibling.
+            // The agent (non-bash) is the depth-1 anchor of each group; extra
+            // sessions nest at depth 2. A single-session subtask is unchanged
+            // (one depth-1 row) — so the common case looks identical.
+            // Members sharing a REAL task_id form one group (the extra session
+            // nests under the subtask's agent). A member with NO task_id (a
+            // managed_by_uid match with no planning task) is its OWN group — a
+            // distinct depth-1 entry, never merged with other taskless members.
+            let mut task_groups: BTreeMap<&str, Vec<(usize, usize, bool, &str)>> =
+                BTreeMap::new();
+            let mut session_groups: Vec<Vec<(usize, usize, bool, &str)>> = Vec::new();
+            for (wi, si, tid, is_bash, label) in members {
+                match tid {
+                    Some(t) => task_groups
+                        .entry(t)
+                        .or_default()
+                        .push((wi, si, is_bash, label)),
+                    None => session_groups.push(vec![(wi, si, is_bash, label)]),
+                }
+            }
+            session_groups.extend(task_groups.into_values());
+            // (anchor_label, group_rows) — ordered by anchor label so the
+            // one-session-per-subtask ordering matches the old label sort.
+            let mut groups: Vec<(String, Vec<ContinuousRow>)> = Vec::new();
+            for mut sessions in session_groups {
+                // Anchor first: agents (non-bash) before bash, then by label.
+                sessions.sort_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(b.3)));
+                let anchor_label = sessions[0].3.to_string();
+                let group_rows = sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &(wi, si, _, _))| ContinuousRow {
+                        ws_idx: wi,
+                        sess_idx: si,
+                        depth: if idx == 0 { 1 } else { 2 },
+                    })
+                    .collect();
+                groups.push((anchor_label, group_rows));
+            }
+            groups.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_label, group_rows) in groups {
+                rows.extend(group_rows);
             }
         }
         rows
@@ -7987,6 +8036,20 @@ impl App {
     /// way out, and the continuous cursor likewise — so re-entering a column
     /// lands where you were, not on its first row (the saved continuous spot is
     /// validated against the live rows and falls back to the first if gone).
+    /// The stable session UID at the current cursor — used to stash a column
+    /// position that survives a manifest reindex (indices shift on a refresh;
+    /// UIDs don't). None if the cursor isn't on a live session.
+    fn cursor_session_uid(&self) -> Option<String> {
+        match &self.cursor {
+            Cursor::Session(wi, si) => self
+                .workspaces
+                .get(*wi)
+                .and_then(|w| w.sessions.get(*si))
+                .map(|s| s.uid.clone()),
+            _ => None,
+        }
+    }
+
     fn step_column(&mut self, dir: i32) {
         if !self.continuous_column_on {
             self.cursor_column = SidebarColumn::Main;
@@ -7998,18 +8061,18 @@ impl App {
                 if rows.is_empty() {
                     return;
                 }
-                // Restore the last continuous spot if it still exists; else the
+                // Restore the last continuous spot by UID (stable across a
+                // manifest reindex) if that session is still a row; else the
                 // first row.
                 let target = self
-                    .saved_continuous_cursor
-                    .as_ref()
-                    .filter(|c| match c {
-                        Cursor::Session(wi, si) => {
-                            rows.iter().any(|r| r.ws_idx == *wi && r.sess_idx == *si)
-                        }
-                        _ => false,
+                    .saved_continuous_uid
+                    .as_deref()
+                    .and_then(|uid| {
+                        rows.iter().find(|r| {
+                            self.workspaces[r.ws_idx].sessions[r.sess_idx].uid == uid
+                        })
                     })
-                    .cloned()
+                    .map(|r| Cursor::Session(r.ws_idx, r.sess_idx))
                     .unwrap_or_else(|| {
                         let r = rows[0];
                         Cursor::Session(r.ws_idx, r.sess_idx)
@@ -8020,7 +8083,7 @@ impl App {
                 self.needs_redraw = true;
             }
             (SidebarColumn::Continuous, d) if d < 0 => {
-                self.saved_continuous_cursor = Some(self.cursor.clone());
+                self.saved_continuous_uid = self.cursor_session_uid();
                 self.cursor = self
                     .saved_main_cursor
                     .take()
@@ -10298,7 +10361,7 @@ impl App {
                 if !self.continuous_column_on
                     && self.cursor_column == SidebarColumn::Continuous
                 {
-                    self.saved_continuous_cursor = Some(self.cursor.clone());
+                    self.saved_continuous_uid = self.cursor_session_uid();
                     self.cursor = self
                         .saved_main_cursor
                         .take()
@@ -14860,7 +14923,9 @@ impl App {
                 (indicator, indicator_style)
             };
 
-            let prefix_cells = if r.depth == 0 { 4 } else { 6 };
+            // depth 0 → 4 cells, depth 1 → 6, depth 2 (session nested under a
+            // subtask) → 8 — each level indents 2 more before the label.
+            let prefix_cells = 4 + (r.depth as usize) * 2;
             let max_name = (inner.width as usize).saturating_sub(prefix_cells);
             let label = crate::planning::truncate_with_ellipsis(&ts.label, max_name);
 
@@ -14869,11 +14934,20 @@ impl App {
                 indicator_style,
             )];
             if r.depth >= 1 {
-                // Subtask nested under its orchestrator. The LAST child (the
-                // next row starts a new orchestrator, or the list ends) gets the
-                // corner `└`; earlier children get the tee `├`. Lookahead uses
-                // the full `rows` (not the visible window).
-                let is_last_child = rows.get(i + 1).map_or(true, |nx| nx.depth == 0);
+                // Tree glyph for a nested row (subtask under orchestrator, or a
+                // session under a subtask). Extra 2-space indent per level below
+                // depth 1 so a depth-2 session sits under its subtask's agent.
+                if r.depth >= 2 {
+                    spans.push(Span::raw("  ".repeat((r.depth - 1) as usize)));
+                }
+                // LAST sibling at THIS depth gets the corner `└`, earlier ones
+                // the tee `├`. Look past any DEEPER-nested rows to the next row
+                // at depth <= mine: if it's shallower (or none) I'm the last
+                // sibling; if it's the same depth another sibling follows.
+                let is_last_child = rows[i + 1..]
+                    .iter()
+                    .find(|nx| nx.depth <= r.depth)
+                    .map_or(true, |nx| nx.depth < r.depth);
                 let glyph = if is_last_child {
                     "\u{2514} "
                 } else {
@@ -21520,6 +21594,100 @@ mod remote_reconnect_tests {
         assert!(
             app.continuous_members().contains(&(0, 1)),
             "the orphaned subtask must be classified as a continuous member",
+        );
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// A subtask with MULTIPLE sessions — its agent + a bash the operator added
+    /// to the SAME task — groups together: the agent (non-bash) is the depth-1
+    /// anchor and the bash nests at depth 2, NOT as a flat depth-1 sibling.
+    /// Other subtasks stay their own depth-1 rows. (The user-reported bug.)
+    #[test]
+    fn visual_items_continuous_nests_extra_session_under_its_subtask() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+
+        let mk = |uid: &str,
+                  cont: Option<&str>,
+                  mgr: Option<&str>,
+                  task: Option<&str>,
+                  stype: &str,
+                  label: &str| {
+            let (mut ts, _tx, _teof) =
+                session_with_injected_exit(uid, manager_host(), false);
+            ts.continuous_task_id = cont.map(String::from);
+            ts.managed_by_uid = mgr.map(String::from);
+            ts.task_id = task.map(String::from);
+            ts.session_type = stype.into();
+            ts.label = label.into();
+            ts
+        };
+        let mk_task = |tid: &str, parent: Option<&str>| TaskEntry {
+            task_id: Some(tid.into()),
+            name: tid.into(),
+            api_status: TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: parent.map(String::from),
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        };
+
+        // Orchestrator + two subtasks; the FIRST subtask (BUG-8) has BOTH its
+        // agent AND a bash session the operator added to the same task.
+        let mut ws = workspace_with(mk(
+            "orch",
+            Some("ct"),
+            None,
+            Some("orch-task"),
+            "claude",
+            "Orchestrator",
+        ));
+        ws.sessions
+            .push(mk("agent-8", None, Some("orch"), Some("task-8"), "claude", "BUG-8"));
+        ws.sessions
+            .push(mk("bash-8", None, None, Some("task-8"), "bash", "bash"));
+        ws.sessions
+            .push(mk("agent-9", None, Some("orch"), Some("task-9"), "claude", "BUG-9"));
+        app.workspaces.push(ws);
+        app.tasks.push(mk_task("orch-task", None));
+        app.tasks.push(mk_task("task-8", Some("orch-task")));
+        app.tasks.push(mk_task("task-9", Some("orch-task")));
+
+        let rows = app.visual_items_continuous();
+        let resolved: Vec<(&str, u8)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    app.workspaces[r.ws_idx].sessions[r.sess_idx].uid.as_str(),
+                    r.depth,
+                )
+            })
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![("orch", 0), ("agent-8", 1), ("bash-8", 2), ("agent-9", 1)],
+            "the bash added to BUG-8's task nests UNDER its agent (depth 2), \
+             while BUG-9 stays its own depth-1 row",
         );
 
         match orig {
