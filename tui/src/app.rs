@@ -14888,6 +14888,22 @@ impl App {
     /// `visual_items_continuous()`. Reuses `draw_session_list`'s indicator
     /// glyphs (reconnecting `⟳` / hidden / Running spinner / Idle `●` / alert).
     /// The cursor highlight + the `├`/`└` corner polish land in S4/S5.
+    /// A continuous-column row "needs the operator" when its planning task is
+    /// raw-`blocked`. The orchestrators set `blocked` ONLY for a fix-ready
+    /// subtask awaiting review or an explicit human decision
+    /// (needs_human_decision / long_review / source_down); everything they
+    /// advance themselves stays `running`. We read the RAW `api_status` here
+    /// (not `task_status()`, which derives `Blocked` from any idle session and
+    /// would flag every idle row as needing a human).
+    fn session_needs_human(&self, ts: &TerminalSession) -> bool {
+        let Some(tid) = ts.task_id.as_deref() else {
+            return false;
+        };
+        self.tasks
+            .iter()
+            .any(|t| t.task_id.as_deref() == Some(tid) && matches!(t.api_status, TaskStatus::Blocked))
+    }
+
     fn draw_continuous_column(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -14914,7 +14930,17 @@ impl App {
             } else {
                 match ts.status {
                     SessionStatus::Running => (spinner, Style::default().fg(Color::Green)),
-                    SessionStatus::Idle => ("\u{25cf}", Style::default().fg(Color::White)),
+                    // Idle splits by who the ball is with: ● (white) = the
+                    // operator needs to act (fix-ready to review, or an explicit
+                    // human decision — raw planning status `blocked`); ◇ (dim) =
+                    // the orchestrator will advance it on its next fire.
+                    SessionStatus::Idle => {
+                        if self.session_needs_human(ts) {
+                            ("\u{25cf}", Style::default().fg(Color::White))
+                        } else {
+                            ("\u{25c7}", Style::default().fg(Color::DarkGray))
+                        }
+                    }
                 }
             };
             let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
