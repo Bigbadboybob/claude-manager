@@ -1,5 +1,8 @@
 import asyncio
+import glob
+import json
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -142,6 +145,91 @@ async def get_task(task_id: str, pool=Depends(get_pool)):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+# ---------------------------------------------------------------------------
+# Continuous tasks (read-only view)
+# ---------------------------------------------------------------------------
+#
+# The daemon persists each continuous orchestrator's state under
+# ~/.cm/continuous-tasks/<id>/state.json (co-located with this API on
+# cm-manager). We read those files directly for a read-only view rather than
+# opening the daemon control socket — no daemon-up dependency, and there is no
+# write path here (create/update/pause/delete stay operator-only on the daemon
+# socket). Any token-holder may read, so agents on either MCP copy can see it.
+CONTINUOUS_TASKS_DIR = os.path.expanduser(
+    os.environ.get("CM_CONTINUOUS_TASKS_DIR", "~/.cm/continuous-tasks")
+)
+
+
+def _cadence(schedule: dict) -> str:
+    kind = (schedule or {}).get("kind", "on_demand")
+    if kind == "periodic":
+        secs = schedule.get("every_secs") or 0
+        if secs and secs % 3600 == 0:
+            return f"every {secs // 3600}h"
+        if secs and secs % 60 == 0:
+            return f"every {secs // 60}m"
+        return f"every {secs}s" if secs else "periodic"
+    return kind
+
+
+def _read_continuous_states() -> list[dict]:
+    states = []
+    for sf in sorted(glob.glob(os.path.join(CONTINUOUS_TASKS_DIR, "*", "state.json"))):
+        try:
+            with open(sf) as f:
+                states.append(json.load(f))
+        except (OSError, ValueError):
+            # Missing dir / half-written file — skip; the view is best-effort.
+            continue
+    return states
+
+
+def _shape_subtask(t: dict) -> dict:
+    status = t.get("status")
+    return {
+        "task_id": t.get("id"),
+        "label": t.get("name") or t.get("slug"),
+        "status": status,
+        # `blocked` is the orchestrators' convention for "the operator must
+        # act" — a fix-ready subtask awaiting review, or an explicit human
+        # decision. Everything the orchestrator drives itself stays `running`.
+        "needs_human": status == "blocked",
+        "branch": t.get("wip_branch"),
+    }
+
+
+@app.get("/continuous", dependencies=[Depends(verify_token)])
+async def list_continuous(pool=Depends(get_pool)):
+    """Read-only view of the daemon's continuous orchestrators + their subtasks.
+
+    Any token-holder may read; there is no write path here.
+    """
+    states = await asyncio.to_thread(_read_continuous_states)
+    out = []
+    for st in states:
+        ptid = st.get("planning_task_id")
+        subs = await db.list_subtasks(pool, ptid) if ptid else []
+        shaped = [_shape_subtask(s) for s in subs]
+        out.append({
+            "task_id": st.get("task_id"),
+            "label": st.get("label"),
+            "planning_task_id": ptid,
+            "cadence": _cadence(st.get("schedule") or {}),
+            "schedule": st.get("schedule"),
+            "paused": st.get("paused", False),
+            "running_now": bool(st.get("in_flight")),
+            "run_count": st.get("run_count"),
+            "next_fire_at": st.get("next_fire_at"),
+            "last_run": st.get("last_run"),
+            "orchestrator_session": st.get("current_session_uid"),
+            "worktree_path": st.get("worktree_path"),
+            "subtask_count": len(shaped),
+            "needs_human_count": sum(1 for s in shaped if s["needs_human"]),
+            "subtasks": shaped,
+        })
+    return {"continuous_tasks": out}
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])

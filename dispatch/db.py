@@ -155,6 +155,19 @@ async def list_tasks(pool: asyncpg.Pool, status: str | None = None,
         return [_serialize(dict(r)) for r in rows]
 
 
+async def list_subtasks(pool: asyncpg.Pool, parent_task_id: str) -> list[dict]:
+    """Direct subtasks of ``parent_task_id`` (used by the read-only
+    continuous-task view). Archived rows excluded; ordered oldest-first."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM tasks
+               WHERE parent_task_id = $1 AND status != 'archived'
+               ORDER BY created_at""",
+            parent_task_id,
+        )
+        return [_serialize(dict(r)) for r in rows]
+
+
 async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
