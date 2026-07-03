@@ -504,6 +504,14 @@ pub fn dispatch_request(
         "set_subtask_status" => {
             DispatchOutcome::Done(dispatch_set_subtask_status(state, req))
         }
+        // Headless planning WRITE: general task PATCH (any columns), the
+        // update_task counterpart to set_subtask_status. Session-scoped
+        // (self-or-descendant). Lets a daemon-spawned agent do a full
+        // `update_task(...)` headless when the cli-routed PlanningClient is
+        // absent — not just the status-only path.
+        "update_task" => {
+            DispatchOutcome::Done(dispatch_update_task(state, req))
+        }
 
         // Headless planning READS: a daemon-spawned agent (no cli-routed
         // PlanningClient) gets these served by the daemon, which holds the
@@ -756,6 +764,17 @@ fn dispatch_set_subtask_status(state: &Arc<Mutex<DaemonState>>, req: &Request) -
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::set_subtask_status(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_update_task(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::update_task(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -10555,6 +10555,69 @@ pub fn set_subtask_status(
     Ok(json!({ "task_id": target_task_id, "status": p.status }))
 }
 
+/// Daemon-routed `update_task` (headless planning WRITE). A GENERAL task PATCH
+/// through the daemon (which holds the planning creds), so a daemon-spawned
+/// agent can update ANY of its task's columns — name, description, priority,
+/// difficulty, project, etc. — not just `status` (which `set_subtask_status`
+/// already covers). Session-scoped exactly like `set_subtask_status`: the
+/// caller may patch its own task or a descendant. Returns the updated task row
+/// (the MCP server `_shape_task`s it, matching the cli-routed path).
+///
+/// Params: `{ "task_id"?: <id, defaults to caller's own>, "fields": { <col>: <val>, ... } }`.
+pub fn update_task(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let fields = params
+        .get("fields")
+        .and_then(|v| v.as_object())
+        .filter(|o| !o.is_empty())
+        .ok_or((
+            ErrorCode::InvalidParams,
+            "update_task: 'fields' must be a non-empty object of columns to update".into(),
+        ))?
+        .clone();
+    let (target_task_id, api_url_cfg, api_token_cfg): (String, String, String) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "update_task is callable only by Session callers".into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        let own = caller.task_id.clone().ok_or((
+            ErrorCode::Unauthorized,
+            "taskless caller cannot update a task; use propose_task for top-level tasks".into(),
+        ))?;
+        let target = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| own.clone());
+        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &target, &own) {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!("task {} is not the caller's task or a descendant", target),
+            ));
+        }
+        (
+            target,
+            state.config.api_url.clone(),
+            state.config.api_token.clone(),
+        )
+    };
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    api_update_task(&creds, &target_task_id, &Value::Object(fields))
+        .map_err(|e| e.to_method_err())?;
+    // Re-read the row so the tool returns the updated task (api_update_task
+    // discards the PATCH response body).
+    api_get_task(&creds, &target_task_id).map_err(|e| e.to_method_err())
+}
+
 /// Read the daemon's planning-API creds from config (shared by the
 /// headless-read tools below). The daemon holds `api_url` + `api_token`, so
 /// these reads work on a headless host (cm-manager) where the cli-routed
