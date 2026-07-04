@@ -9877,9 +9877,18 @@ impl App {
         // header and workflow ops recognize it. Don't rebuild the row (its PTY,
         // label, and transcript are already correct). A non-workflow
         // re-broadcast (run_id None) is a plain no-op.
-        if let Some(existing) = self.workspaces[ws_idx]
-            .sessions
+        //
+        // Dedup by uid across ALL workspaces, not just `ws_idx` — every other
+        // adopt/bind path (drain_attach_results, is_remote_adoptee,
+        // adopt_untracked_daemon_sessions) does. The 5s remote-adoption poll can
+        // mint a synthetic `agent:<label>` workspace for the same uid (e.g. after
+        // an A-d teardown re-adopts from a stale session cache); a ws_idx-only
+        // check misses that copy and pushes a SECOND row → the transient
+        // duplicate seen after close-out.
+        if let Some(existing) = self
+            .workspaces
             .iter_mut()
+            .flat_map(|w| w.sessions.iter_mut())
             .find(|s| s.uid == uid)
         {
             if let Some(rid) = run_id.as_deref() {

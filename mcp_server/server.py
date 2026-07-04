@@ -383,16 +383,16 @@ def update_task(
         # the cli-routed PlanningClient is unavailable — the `cli` package
         # isn't deployed alongside the MCP server, and/or CM_API_URL /
         # CM_API_TOKEN aren't in the agent's env. Route the update through the
-        # daemon, which holds the planning creds. A STATUS-ONLY update goes via
-        # `set_subtask_status` (session-scoped, no worktree teardown); any other
-        # field set goes via the daemon's general `update_task` handler. Either
-        # way a daemon-spawned agent's natural `update_task(...)` call works
-        # headless without the orchestrator prompt needing to know the routing.
-        if list(fields.keys()) == ["status"]:
-            return control_client.call(
-                "set_subtask_status",
-                {"status": fields["status"], "task_id": task_id},
-            )
+        # daemon, which holds the planning creds, and column-allowlists +
+        # status-validates the fields. It re-reads the row, so the return is a
+        # full, `_shape_task`-shaped task — UNIFORM with the cli path (and the
+        # status-only case, which used to short-circuit to `set_subtask_status`
+        # and return a bare {task_id, status}). A daemon-spawned agent's natural
+        # `update_task(...)` call works headless without the orchestrator prompt
+        # needing to know the routing, and always sees the same shape.
+        #
+        # (The standalone `set_subtask_status` tool remains for callers that
+        # deliberately want the minimal {task_id, status} shape + no re-read.)
         return _shape_task(
             control_client.call("update_task", {"task_id": task_id, "fields": fields}),
             full=True,

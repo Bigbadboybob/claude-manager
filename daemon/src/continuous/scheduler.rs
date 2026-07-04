@@ -28,6 +28,7 @@
 //! the tick takes is a BRIEF, read-only session-liveness probe, dropped before
 //! any fire.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -72,6 +73,11 @@ const RECONCILE_GRACE_SECS: u64 = 60;
 /// Exponential-backoff ceiling for a persistently-failing task (seconds).
 const BACKOFF_CAP_SECS: u64 = 3600; // 1 hour
 
+/// Consecutive fire-launch failures after which the scheduler auto-pauses a
+/// task (circuit breaker) and emits an alert, rather than churning + backing
+/// off forever. The operator un-pauses after fixing the cause.
+const CONSECUTIVE_FAILURE_LIMIT: u32 = 5;
+
 /// Outcome of a single in-process fire, distilled from `methods::trigger`'s
 /// return into the three cases the ADVANCE phase branches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +112,12 @@ pub struct ContinuousScheduler {
     /// Latest panic from `run_loop`'s `catch_unwind` branch + a running count.
     /// `None` until the first panic. Mirrors the poller's field.
     panic_record: Arc<Mutex<Option<PanicRecord>>>,
+    /// Persistent-stall one-shot latch: `task_id -> the last_fired_at we already
+    /// alerted on`. Keeps `persistent_stall_pass` from re-alerting every tick for
+    /// the same wedged fire episode; a NEW fire (different `last_fired_at`)
+    /// re-arms. In-memory only — a daemon restart re-surfaces a still-stalled
+    /// orchestrator exactly once, which is the desired behavior.
+    stall_alerts: Mutex<HashMap<String, u64>>,
     /// Test-only: substitute the in-process fire so unit tests can drive the
     /// due-check / supervision / advance phases without spawning a real agent.
     /// Records the task_ids fired and returns a canned [`FireOutcome`].
@@ -142,6 +154,7 @@ impl ContinuousScheduler {
             tick_micros: Arc::new(AtomicU64::new(seed)),
             handle: Mutex::new(None),
             panic_record: Arc::new(Mutex::new(None)),
+            stall_alerts: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fire_spy: Mutex::new(None),
         }
@@ -272,12 +285,23 @@ impl ContinuousScheduler {
             if self.fire_task(&tk.task_id, &fire_token) == FireOutcome::Fired {
                 acted.insert(tk.task_id.clone());
                 append_supervision_audit(tk, &fire_token, now);
+                // Advance the schedule for THIS fire too — the due loop below
+                // skips `acted` tasks, so without this a due supervised task
+                // fires here AND again next tick (a double-fire). No-ops for
+                // non-Periodic schedules.
+                self.advance_after_fire(&tk.task_id, FireOutcome::Fired, now);
             }
         }
 
         // (c.2) WATCHDOG (Phase 3b) — fresh-hang detection over the SAME loaded
         // snapshot. Disjoint from the Persistent supervision above.
         self.watchdog_pass(&tasks, now);
+
+        // (c.3) PERSISTENT-STALL — the Persistent analogue of the Fresh
+        // watchdog: an ALIVE orchestrator that received a fire but produced no
+        // transcript growth within the stall budget is wedged. Surfaces only
+        // (no auto-act); off unless `persistent_max_stall_secs` is configured.
+        self.persistent_stall_pass(&tasks, now);
 
         // (d) DUE CHECK — pure read of the disk-loaded tasks. Consumer / Cron /
         // OnDemand are skipped (Periodic-only in Phase 3).
@@ -346,8 +370,10 @@ impl ContinuousScheduler {
         };
 
         for tk in tasks {
-            // FRESH-only + enabled.
-            if tk.run_mode != task::RunMode::Fresh || !tk.enabled {
+            // FRESH-only + enabled + NOT paused. A task paused mid-run keeps
+            // its live run, but the operator paused it deliberately — the
+            // watchdog must not investigate / escalate-kill a paused task's run.
+            if tk.run_mode != task::RunMode::Fresh || !tk.enabled || tk.paused {
                 continue;
             }
             // Must have an ACTIVE run.
@@ -449,6 +475,128 @@ impl ContinuousScheduler {
         }
     }
 
+    /// (c.3) Persistent-orchestrator stall detection — the Persistent analogue
+    /// of the Fresh `watchdog_pass`. A persistent orchestrator's session is
+    /// long-lived (it never exits between fires), so the Fresh "elapsed since
+    /// `started_at` > `max_runtime`" signal is meaningless. The stall signal is
+    /// instead: a fire was DELIVERED (`last_fired_at`) but the session's
+    /// transcript has NOT grown since (`mtime < last_fired_at`) after the budget
+    /// — the orchestrator received the prompt (or an interactive modal swallowed
+    /// it) and never produced output. `last_activity_at` can't be used: the
+    /// fire's OWN delivery write bumps it, so it can't tell "received-then-
+    /// wedged" from "worked-then-idle"; transcript mtime (wall-clock, advances
+    /// only on real assistant/tool turns) is the discriminating signal.
+    ///
+    /// SURFACE-ONLY: a daemon-log alert + a `"stalled"` runs.jsonl line, ONE per
+    /// fire episode via the in-memory `stall_alerts` latch. NO auto-kill / auto-
+    /// investigate — the dominant cause (a shared-account rate-limit modal, see
+    /// `reference_continuous_triage_setup`) would also block any investigator we
+    /// spawned, and auto-killing a possibly-healthy orchestrator is too
+    /// aggressive for a detector. Recovery stays the operator's call (the
+    /// documented `kill_session` → supervisor-respawn + re-fire path).
+    ///
+    /// OFF unless `[scheduler] persistent_max_stall_secs` is set (opt-in — a
+    /// generously large budget avoids false positives on legitimately long,
+    /// transcript-silent tool calls). Known limitation: if a modal appears
+    /// AFTER the fire's user-turn was already written (mid-turn rate-limit), the
+    /// transcript mtime is past `last_fired_at` and this misses it — a safe
+    /// direction (a miss, not a false alarm).
+    fn persistent_stall_pass(&self, tasks: &[ContinuousTask], now: u64) {
+        let Some(budget) = ({
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.config.scheduler.persistent_max_stall_secs
+        }) else {
+            return; // OFF (opt-in)
+        };
+        if budget == 0 {
+            return;
+        }
+
+        for tk in tasks {
+            // Persistent + enabled + NOT paused. A paused task's live session is
+            // intentionally idle (operator paused it) — not stalled.
+            if tk.run_mode != task::RunMode::Persistent || !tk.enabled || tk.paused {
+                continue;
+            }
+            // Never-fired (just created) is not a stall.
+            if tk.last_fired_at == 0 {
+                continue;
+            }
+            // Only a fire older than the budget can be judged stalled.
+            if now.saturating_sub(tk.last_fired_at) <= budget as u64 {
+                continue;
+            }
+            // The live orchestrator session. A DEAD session is supervision's job
+            // (dead-persistent respawn), NOT the stall detector's.
+            let Some(uid) = tk.current_session_uid.as_deref() else {
+                continue;
+            };
+            if self.session_is_dead(uid) {
+                continue;
+            }
+            // Ground truth: has the transcript grown since the fire? A path we
+            // can't resolve/stat (detector hasn't bound one yet) is "can't judge"
+            // → skip, conservative.
+            let Some(path) = self.session_transcript_path(uid) else {
+                continue;
+            };
+            let Some(mtime) = mtime_unix(&path) else {
+                continue;
+            };
+            if mtime >= tk.last_fired_at {
+                // Grew since the fire ⇒ healthy. Clear any stale latch so a
+                // LATER wedge on a future fire re-alerts.
+                self.stall_alerts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&tk.task_id);
+                continue;
+            }
+
+            // STALLED. One alert per fire episode (keyed on last_fired_at).
+            {
+                let mut latch =
+                    self.stall_alerts.lock().unwrap_or_else(|p| p.into_inner());
+                if latch.get(&tk.task_id) == Some(&tk.last_fired_at) {
+                    continue; // already surfaced this episode
+                }
+                latch.insert(tk.task_id.clone(), tk.last_fired_at);
+            }
+
+            let stalled_secs = now.saturating_sub(tk.last_fired_at);
+            eprintln!(
+                "cm-daemon: continuous task {} STALLED — fired {}s ago (session {}) but \
+                 its transcript has not grown since; the orchestrator may be parked at \
+                 an interactive modal. Surfacing only; recovery is the operator's call \
+                 (kill the session → supervisor respawns + re-fires).",
+                tk.task_id, stalled_secs, uid,
+            );
+            if let Err(e) = ContinuousRunLog::append(&RunLogLine {
+                seq: tk.last_run.as_ref().map(|r| r.seq).unwrap_or(tk.run_count as u64),
+                ts: now as f64,
+                task_id: tk.task_id.clone(),
+                event: "stalled".to_string(),
+                fire_token: tk.last_run.as_ref().map(|r| r.fire_token.clone()),
+                session_uid: Some(uid.to_string()),
+                run_mode: Some("persistent".to_string()),
+                trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
+                status: Some("running".to_string()),
+                detail: Some(
+                    format!(
+                        "no transcript growth for {}s after fire (budget {}s)",
+                        stalled_secs, budget
+                    )
+                    .into(),
+                ),
+            }) {
+                eprintln!(
+                    "cm-daemon: failed to append \"stalled\" audit line for {}: {}",
+                    tk.task_id, e,
+                );
+            }
+        }
+    }
+
     /// Phase (a): orphan any task whose `in_flight` spawn-window guard outlived
     /// its spawn window AND whose guarded session is dead (registry-absent or
     /// kernel-exited). Marks `last_run.status = Orphaned`, clears `in_flight`,
@@ -457,27 +605,67 @@ impl ContinuousScheduler {
     /// overdue on-disk guard from before a daemon restart clears here too.
     fn reconcile_orphans(&self, now: u64) {
         for tk in task::load_all() {
-            let Some(inflight) = tk.in_flight.as_ref() else {
+            // A run can be stranded `Running` with no live reaper to finish it
+            // when the daemon restarts / crashes / is SIGKILLed mid-run (systemd
+            // kills the whole cgroup, so the child dies without its clean-exit
+            // hook). Two shapes:
+            //   (1) `in_flight` is still armed — the fire died during/just after
+            //       spawn, before the record step cleared the guard; OR
+            //   (2) the record step already cleared `in_flight`, but `last_run`
+            //       is still `Running` against a now-dead session. This is the
+            //       common restart-mid-run case — and the one that silently
+            //       WEDGES a fresh periodic task forever: `fresh_run_active`
+            //       stays true, every due tick takes SkipActive, and the task
+            //       never fires again until a manual run_now.
+            // Resolve (session_uid, started_at, seq, fire_token) from whichever
+            // guard is present, then orphan the run + clear `in_flight`.
+            let stranded: Option<(String, u64, u64, String)> =
+                if let Some(inflight) = tk.in_flight.as_ref() {
+                    let seq = tk
+                        .last_run
+                        .as_ref()
+                        .map(|r| r.seq)
+                        .unwrap_or(tk.run_count as u64);
+                    Some((
+                        inflight.session_uid.clone(),
+                        inflight.started_at,
+                        seq,
+                        inflight.fire_token.clone(),
+                    ))
+                } else {
+                    match tk.last_run.as_ref() {
+                        Some(lr)
+                            if lr.status == RunStatus::Running && lr.session_uid.is_some() =>
+                        {
+                            Some((
+                                lr.session_uid.clone().unwrap(),
+                                lr.started_at,
+                                lr.seq,
+                                lr.fire_token.clone(),
+                            ))
+                        }
+                        _ => None,
+                    }
+                };
+            let Some((session_uid, started_at, seq, fire_token)) = stranded else {
                 continue;
             };
-            // Spawn-window grace: a just-armed guard whose session isn't in the
-            // registry yet is a healthy mid-spawn fire, not a leak.
-            if now.saturating_sub(inflight.started_at) < RECONCILE_GRACE_SECS {
+            // Spawn-window grace: a just-armed guard / just-started run whose
+            // session isn't in the registry yet is a healthy mid-spawn fire.
+            if now.saturating_sub(started_at) < RECONCILE_GRACE_SECS {
                 continue;
             }
-            if !self.session_is_dead(&inflight.session_uid) {
+            if !self.session_is_dead(&session_uid) {
                 continue;
             }
-            let fire_token = inflight.fire_token.clone();
-            let session_uid = inflight.session_uid.clone();
-            let seq = tk
-                .last_run
-                .as_ref()
-                .map(|r| r.seq)
-                .unwrap_or(tk.run_count as u64);
             let _ = task::modify(&tk.task_id, |t| {
                 if let Some(lr) = t.last_run.as_mut() {
                     lr.status = RunStatus::Orphaned;
+                    // A reconciled orphan IS terminal — stamp finished_at so the
+                    // run record and audit aren't left open forever.
+                    if lr.finished_at.is_none() {
+                        lr.finished_at = Some(now);
+                    }
                 }
                 t.in_flight = None;
             });
@@ -510,6 +698,7 @@ impl ContinuousScheduler {
     /// a successful fire resets the counter; a benign skip leaves `next_fire_at`
     /// to retry without bumping failures.
     fn advance_after_fire(&self, task_id: &str, outcome: FireOutcome, now: u64) {
+        let mut auto_paused: Option<(u64, u32)> = None; // (run seq, failure count)
         let _ = task::modify(task_id, |t| {
             let every = match &t.schedule {
                 Schedule::Periodic { every_secs } => (*every_secs).max(1),
@@ -542,9 +731,44 @@ impl ContinuousScheduler {
                     t.consecutive_failures = t.consecutive_failures.saturating_add(1);
                     t.next_fire_at =
                         now.saturating_add(backoff_secs(every, t.consecutive_failures));
+                    // Circuit breaker: after too many consecutive fire failures,
+                    // stop churning — pause the task and alert the operator, who
+                    // un-pauses after fixing the cause.
+                    if t.consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT && !t.paused {
+                        t.paused = true;
+                        let seq =
+                            t.last_run.as_ref().map(|r| r.seq).unwrap_or(t.run_count as u64);
+                        auto_paused = Some((seq, t.consecutive_failures));
+                    }
                 }
             }
         });
+        if let Some((seq, fails)) = auto_paused {
+            eprintln!(
+                "cm-daemon: continuous task {} AUTO-PAUSED (circuit breaker) after {} \
+                 consecutive fire failures",
+                task_id, fails,
+            );
+            if let Err(e) = ContinuousRunLog::append(&RunLogLine {
+                seq,
+                ts: now as f64,
+                task_id: task_id.to_string(),
+                event: "auto_paused".to_string(),
+                fire_token: None,
+                session_uid: None,
+                run_mode: None,
+                trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
+                status: Some("paused".to_string()),
+                detail: Some(
+                    format!("circuit breaker: {} consecutive fire failures", fails).into(),
+                ),
+            }) {
+                eprintln!(
+                    "cm-daemon: failed to append \"auto_paused\" audit line for {}: {}",
+                    task_id, e,
+                );
+            }
+        }
     }
 
     /// Fire a task in-process via `methods::trigger` with an internal Operator
@@ -750,6 +974,19 @@ fn collect_due(tasks: &[ContinuousTask], now: u64) -> Vec<String> {
         .collect()
 }
 
+/// A file's mtime as unix seconds, or `None` if it can't be stat'd (missing /
+/// permission / pre-epoch). Same wall-clock as [`task::now_unix`], so it
+/// compares directly against a task's `last_fired_at`. Used by
+/// [`ContinuousScheduler::persistent_stall_pass`] to read transcript growth.
+fn mtime_unix(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 /// Exponential, capped backoff (seconds) after `consecutive_failures` failed
 /// fires: `every_secs * 2^failures`, clamped to [`BACKOFF_CAP_SECS`]. Keeps a
 /// persistently-failing task from hot-looping.
@@ -869,6 +1106,43 @@ mod tests {
             );
             let runs =
                 std::fs::read_to_string(task::runs_log_path("recon")).expect("runs.jsonl");
+            assert!(runs.contains("\"orphaned\""), "orphan audit line: {}", runs);
+        });
+    }
+
+    #[test]
+    fn reconcile_orphans_recovers_dead_but_running_run_with_no_in_flight() {
+        // The restart-mid-run wedge (both HIGH findings): the record step
+        // already cleared in_flight, but last_run is still Running against a
+        // session that died with the daemon. Without reconciliation this stays
+        // Running forever -> fresh_run_active true -> every due tick SkipActives
+        // -> the task never fires again.
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            let now = 10_000u64;
+            let mut t = periodic_task("wedge", 100, now);
+            t.in_flight = None; // record step cleared it; the run outlived it
+            t.last_run = Some(RunRecord {
+                seq: 1,
+                fire_token: "ft-wedge".into(),
+                started_at: now - 1000, // past RECONCILE_GRACE_SECS
+                finished_at: None,
+                session_uid: Some("ts-dead-uid".into()), // absent from registry => dead
+                status: RunStatus::Running,
+                trigger_source: "operator".into(),
+            });
+            task::save(&t).expect("save");
+
+            assert!(fresh_run_active(&t), "precondition: wedged Running run");
+            sched.reconcile_orphans(now);
+
+            let reloaded = task::load_one("wedge").expect("load");
+            let lr = reloaded.last_run.as_ref().unwrap();
+            assert_eq!(lr.status, RunStatus::Orphaned, "dead-but-Running run orphaned");
+            assert_eq!(lr.finished_at, Some(now), "orphan stamps finished_at");
+            assert!(!fresh_run_active(&reloaded), "schedule is un-wedged");
+            let runs =
+                std::fs::read_to_string(task::runs_log_path("wedge")).expect("runs.jsonl");
             assert!(runs.contains("\"orphaned\""), "orphan audit line: {}", runs);
         });
     }
@@ -1003,6 +1277,29 @@ mod tests {
             let c = task::load_one("backoff").unwrap();
             assert_eq!(c.consecutive_failures, 0, "reset on success");
             assert_eq!(c.next_fire_at, now + 100, "back to one period");
+        });
+    }
+
+    #[test]
+    fn circuit_breaker_auto_pauses_at_consecutive_failure_limit() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            task::save(&periodic_task("cb", 100, 0)).expect("save");
+            let now = 1_000u64;
+            // Below the limit: keeps retrying with backoff, NOT paused.
+            for _ in 0..(CONSECUTIVE_FAILURE_LIMIT - 1) {
+                sched.advance_after_fire("cb", FireOutcome::Failed, now);
+            }
+            let before = task::load_one("cb").unwrap();
+            assert!(!before.paused, "not paused below the limit");
+            assert_eq!(before.consecutive_failures, CONSECUTIVE_FAILURE_LIMIT - 1);
+            // The failure that reaches the limit trips the breaker.
+            sched.advance_after_fire("cb", FireOutcome::Failed, now);
+            let tripped = task::load_one("cb").unwrap();
+            assert!(tripped.paused, "auto-paused at the failure limit");
+            assert_eq!(tripped.consecutive_failures, CONSECUTIVE_FAILURE_LIMIT);
+            let runs = std::fs::read_to_string(task::runs_log_path("cb")).expect("runs.jsonl");
+            assert!(runs.contains("\"auto_paused\""), "auto_paused audit line: {}", runs);
         });
     }
 
@@ -1182,6 +1479,86 @@ mod tests {
         });
         t.run_count = 1;
         t
+    }
+
+    /// A PERSISTENT orchestrator whose session is ALIVE but whose transcript has
+    /// not grown since the last fire (fired > budget ago) is STALLED: the pass
+    /// SURFACES it (a `"stalled"` runs.jsonl line) exactly once per fire episode
+    /// and does NOT mutate the run/task (surface-only — no pause, no spawn). A
+    /// second pass in the same episode does not re-alert (the in-memory latch).
+    #[test]
+    fn persistent_stall_pass_surfaces_wedged_orchestrator_once() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            state.lock().unwrap().config.scheduler.persistent_max_stall_secs = Some(100);
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let uid = "ts-persistent-stall-0";
+            insert_live_session(&state, uid);
+
+            // A transcript file whose mtime is the ground-truth "last output".
+            let home = std::env::var("HOME").expect("HOME");
+            let transcript = std::path::Path::new(&home).join("stall-transcript.jsonl");
+            std::fs::write(&transcript, b"{}\n").expect("write transcript");
+            state
+                .lock()
+                .unwrap()
+                .sessions
+                .get_mut(uid)
+                .unwrap()
+                .transcript_path = Some(transcript.to_string_lossy().into_owned());
+            let mtime = mtime_unix(&transcript).expect("mtime");
+
+            // A persistent orchestrator fired 1000s AFTER that last write, so the
+            // transcript has NOT grown since the fire.
+            let fired_at = mtime + 1000;
+            let mut t = ContinuousTask::new(
+                "pstall".into(),
+                "pstall".into(),
+                "ws-pstall".into(),
+                "/tmp/repo".into(),
+                Engine::Claude,
+                RunMode::Persistent,
+                Schedule::Periodic { every_secs: 3600 },
+                "go".into(),
+            );
+            t.last_fired_at = fired_at;
+            t.current_session_uid = Some(uid.into());
+            t.run_count = 5;
+            t.last_run = Some(RunRecord {
+                seq: 5,
+                fire_token: "ft-p-5".into(),
+                started_at: fired_at,
+                finished_at: None,
+                session_uid: Some(uid.into()),
+                status: RunStatus::Running,
+                trigger_source: "scheduler".into(),
+            });
+            task::save(&t).expect("save");
+
+            // now = past the budget after the fire.
+            let now = fired_at + 100 + 1;
+            let tasks = task::load_all();
+            sched.persistent_stall_pass(&tasks, now);
+
+            let runs =
+                std::fs::read_to_string(task::runs_log_path("pstall")).expect("runs.jsonl");
+            assert_eq!(runs.matches("\"stalled\"").count(), 1, "one stalled line: {}", runs);
+
+            // Surface-only: the run/task are untouched.
+            let reloaded = task::load_one("pstall").expect("load");
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "surface-only: run stays Running",
+            );
+            assert!(!reloaded.paused, "surface-only: not auto-paused");
+
+            // Idempotent within the episode: a second pass does NOT re-alert.
+            sched.persistent_stall_pass(&tasks, now + 1);
+            let runs2 =
+                std::fs::read_to_string(task::runs_log_path("pstall")).expect("runs.jsonl");
+            assert_eq!(runs2.matches("\"stalled\"").count(), 1, "no re-alert: {}", runs2);
+        });
     }
 
     /// A fresh run ALIVE past its `max_runtime_secs` (and under the investigation
@@ -1407,8 +1784,14 @@ mod tests {
     #[test]
     fn due_check_skips_active_fresh_run_but_advances() {
         let _tmp = with_temp_home(|| {
-            let sched = scheduler();
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
             sched.arm_fire_spy(FireOutcome::Fired); // would record a fire if one happened
+            // A genuinely-ACTIVE run has a LIVE session in the registry. Without
+            // one, reconcile_orphans now (correctly) treats the run as a dead
+            // stranded run and recovers it — so register a live session to
+            // isolate DUE-SKIP-ACTIVE from restart-reconciliation.
+            insert_live_session(&state, "ts-active-0");
             let mut t = periodic_task("skip-active", 100, 1); // due (next_fire_at=1)
             t.last_run = Some(RunRecord {
                 seq: 1,

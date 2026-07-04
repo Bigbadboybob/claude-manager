@@ -1160,6 +1160,20 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
         }
         None => (None, None),
     };
+    // Classify the continuous-run outcome from the exit BEFORE `last_exit_opt`
+    // is consumed by the broadcast below. A memory-cap (OOM) kill or a non-zero
+    // exit code is a genuine FAILURE — supervision and the consecutive-failure
+    // breaker must see it, not a false `Done`. A clean exit (code 0) or a bare
+    // signal (code None — an operator kill, indistinguishable from a
+    // signal-crash and historically treated as Done) finishes the run `Done`.
+    let continuous_terminal_status: Option<crate::continuous::task::RunStatus> =
+        last_exit_opt.as_ref().map(|le| {
+            if le.memory_cap_kill || matches!(le.code, Some(c) if c != 0) {
+                crate::continuous::task::RunStatus::Failed
+            } else {
+                crate::continuous::task::RunStatus::Done
+            }
+        });
     if let (Some(ws_id), Some(last_exit)) =
         (workspace_id_opt.as_ref(), last_exit_opt.as_ref())
     {
@@ -1190,13 +1204,15 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // re-entrancy, so it is safe under this reaper-held lock. Best-effort: a
     // failed persist only leaves the run Running (the watchdog/orphan reconciler
     // is the backstop), so log nothing louder than the swallow.
-    if let Some(ct_id) = continuous_task_id {
+    if let (Some(ct_id), Some(terminal_status)) =
+        (continuous_task_id, continuous_terminal_status)
+    {
         let _ = crate::continuous::task::modify(&ct_id, |t| {
             if let Some(run) = t.last_run.as_mut() {
                 if run.session_uid.as_deref() == Some(uid)
                     && matches!(run.status, crate::continuous::task::RunStatus::Running)
                 {
-                    run.status = crate::continuous::task::RunStatus::Done;
+                    run.status = terminal_status;
                     run.finished_at = Some(crate::continuous::task::now_unix());
                 }
             }
@@ -6832,6 +6848,67 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
         }
     };
 
+    // Headless binding + task-tree rehydration. A headless daemon has no TUI
+    // `task.update_tree` push, so after a restart both maps would start EMPTY —
+    // and each silently breaks a whole class of ops:
+    //   * `bindings` (task -> workspace) is the restart-survivable resolver for
+    //     `mcp_start_session(task_id=…)`; empty => "no bound workspace".
+    //   * `task_tree` (task -> parent) is the basis of ALL descendant-scope auth;
+    //     empty => every orchestrator->subtask op (`mark_subtask_done`,
+    //     `set_subtask_status`, `update_task`, `trigger`) fails the descendant
+    //     gate for pre-restart subtasks.
+    // Rebuild both here (before the empty-targets early-return below, so a task
+    // whose sessions all exited still gets its binding + auth edges). Bindings
+    // derive from the restored manifest (disk-only, always available);
+    // `task_tree` is best-effort from the planning API (the daemon holds the
+    // creds — a headless restart with the API briefly down just leaves it to
+    // the next `create_subtask`). `or_insert` so an explicit later value wins.
+    {
+        let derived_bindings: Vec<(String, String)> = manifest
+            .workspaces
+            .iter()
+            .flat_map(|(ws_id, ws)| {
+                ws.sessions
+                    .iter()
+                    .filter_map(move |s| s.task_id.clone().map(|t| (t, ws_id.clone())))
+            })
+            .collect();
+        let (api_url, api_token) = {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            (st.config.api_url.clone(), st.config.api_token.clone())
+        };
+        // No DaemonState lock held across this (potentially slow) HTTP call.
+        let tree_edges: Vec<(String, String)> =
+            PlanningApiCreds::from_config(&api_url, &api_token)
+                .ok()
+                .and_then(|creds| api_list_tasks(&creds).ok())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| {
+                            let id = row.get("id").and_then(|v| v.as_str())?.to_string();
+                            let parent =
+                                row.get("parent_task_id").and_then(|v| v.as_str())?.to_string();
+                            Some((id, parent))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        let (n_bind, n_edge) = (derived_bindings.len(), tree_edges.len());
+        {
+            let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            for (task_id, ws_id) in derived_bindings {
+                st.bindings.entry(task_id).or_insert(ws_id);
+            }
+            for (child, parent) in tree_edges {
+                st.task_tree.entry(child).or_insert(Some(parent));
+            }
+        }
+        eprintln!(
+            "cm-daemon: rehydrated {} task->workspace binding(s), {} task_tree edge(s) on restore",
+            n_bind, n_edge,
+        );
+    }
+
     // Collect (workspace_id, worktree, entry) for every in-scope session.
     let mut targets: Vec<(String, std::path::PathBuf, crate::manifest::ManifestEntry)> =
         Vec::new();
@@ -8659,6 +8736,12 @@ pub fn continuous_create(
     if p.repo_url.trim().is_empty() {
         return Err((ErrorCode::InvalidParams, "repo_url must be non-empty".into()));
     }
+    if p.compact_every == Some(1) {
+        return Err((
+            ErrorCode::InvalidParams,
+            "compact_every must be 0 (disabled) or >= 2 — a compact-only fire consumes the whole cycle, so the prompt would never run on schedule".into(),
+        ));
+    }
 
     // Worktree slug defaults to the (already allowlist-validated) task_id. A
     // caller-supplied slug feeds `<repo>-<slug>` + `cm/<slug>`, so guard it
@@ -8776,9 +8859,26 @@ pub fn continuous_create(
         task.retention = retention;
     }
     task.review_surface = p.review_surface.clone();
-    task.compact_every = p.compact_every;
+    // 0 disables for both (compact_every: the fire gate wants n >= 2;
+    // max_runtime_secs: the watchdog treats None as OFF but Some(0) as a
+    // hair-trigger). Normalize to None so the on-disk shape matches update().
+    task.compact_every = p.compact_every.filter(|&n| n != 0);
     task.supervise = p.supervise;
-    task.max_runtime_secs = p.max_runtime_secs;
+    task.max_runtime_secs = p.max_runtime_secs.filter(|&n| n != 0);
+    // A FRESH Periodic task needs a runtime budget: a fresh claude/codex run
+    // only leaves `Running` via `report_done` or process exit (it idles
+    // otherwise), so with the watchdog OFF (max_runtime_secs=None) a single
+    // missed `report_done` wedges the schedule forever (DUE-SKIP-ACTIVE). Default
+    // it to two periods when the caller didn't set one; an operator with a
+    // legitimately long run passes an explicit `max_runtime_secs`.
+    if task.max_runtime_secs.is_none()
+        && matches!(task.run_mode, crate::continuous::task::RunMode::Fresh)
+    {
+        if let crate::continuous::task::Schedule::Periodic { every_secs } = task.schedule {
+            task.max_runtime_secs =
+                Some(every_secs.saturating_mul(2).max(1).min(u32::MAX as u64) as u32);
+        }
+    }
     task.mem_cap_bytes = p.mem_cap_bytes;
 
     let record_created = match crate::continuous::task::create(&task) {
@@ -8881,6 +8981,12 @@ pub fn continuous_update(
             ));
         }
     }
+    if p.compact_every == Some(1) {
+        return Err((
+            ErrorCode::InvalidParams,
+            "compact_every must be 0 (disabled) or >= 2 — a compact-only fire consumes the whole cycle, so the prompt would never run on schedule".into(),
+        ));
+    }
 
     let mut updated: Vec<&'static str> = Vec::new();
     crate::continuous::task::modify(&p.task_id, |t| {
@@ -8917,7 +9023,9 @@ pub fn continuous_update(
             updated.push("modes");
         }
         if let Some(v) = p.max_runtime_secs {
-            t.max_runtime_secs = Some(v);
+            // 0 disables the watchdog (matches its `None ⇒ OFF`; a literal
+            // Some(0) false-trips it one second after started_at).
+            t.max_runtime_secs = if v == 0 { None } else { Some(v) };
             updated.push("max_runtime_secs");
         }
         if let Some(v) = p.mem_cap_bytes {
@@ -10578,6 +10686,59 @@ pub fn update_task(
             "update_task: 'fields' must be a non-empty object of columns to update".into(),
         ))?
         .clone();
+    // Column allowlist. A general planning PATCH may touch ONLY the agent-facing
+    // planning columns — the exact set the `update_task` MCP tool exposes.
+    // `TaskUpdate` (api/models.py) also accepts infra/dispatcher/identity columns
+    // (worker_vm / worker_zone / ttyd_url / is_cloud / kind / source / session_id
+    // / wip_branch / blocked_at / slug / repo_branch / worktree_mode); forwarding
+    // those verbatim let a Session caller flip `is_cloud`/`worker_vm` and chain to
+    // GCP cloud dispatch / VM deletion, or corrupt the daemon's own session /
+    // worktree bookkeeping. Reject unknown columns with a crisp error rather than
+    // a forwarded 4xx (or, worse, a silently-applied dangerous write).
+    const UPDATE_TASK_ALLOWED_COLS: &[&str] = &[
+        "name",
+        "description",
+        "prompt",
+        "status",
+        "priority",
+        "difficulty",
+        "project",
+        "depends",
+        "metadata",
+        "parent_task_id",
+    ];
+    let mut rejected: Vec<&str> = fields
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !UPDATE_TASK_ALLOWED_COLS.contains(k))
+        .collect();
+    if !rejected.is_empty() {
+        rejected.sort_unstable();
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "update_task: column(s) not permitted: {}. Allowed: {:?}",
+                rejected.join(", "),
+                UPDATE_TASK_ALLOWED_COLS,
+            ),
+        ));
+    }
+    // Status validation. The DB column has no CHECK constraint, so a typo'd
+    // status ("blockd") would silently corrupt the board state machine. Pre-check
+    // against the planning status enum (shared with `set_subtask_status`) for a
+    // crisp error instead of a poisoned row.
+    if let Some(status) = fields.get("status") {
+        let ok = status.as_str().is_some_and(|s| SUBTASK_STATUSES.contains(&s));
+        if !ok {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "update_task: status must be one of {:?}, got {}",
+                    SUBTASK_STATUSES, status,
+                ),
+            ));
+        }
+    }
     let (target_task_id, api_url_cfg, api_token_cfg): (String, String, String) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
@@ -14748,6 +14909,14 @@ mod tests {
         assert!(
             !s.sessions.contains_key("ts-dddddddddddddddd-0"),
             "exited session NOT resurrected",
+        );
+        // Headless bindings rehydration: the task->workspace binding is derived
+        // from the restored manifest, so mcp_start_session(task_id=…) resolves a
+        // workspace after a restart even without a TUI task.update_tree push.
+        assert_eq!(
+            s.bindings.get("task-x").map(String::as_str),
+            Some("ws-r"),
+            "restore rehydrates the task->workspace binding on a headless host",
         );
         drop(s);
         // Drop the restored bash child (its Drop SIGKILLs it).
@@ -22044,6 +22213,74 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(cross.0, ErrorCode::Unauthorized);
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// `update_task` (headless general PATCH): the happy path PATCHes the
+    /// allowed columns then re-reads the row; the column allowlist + status
+    /// validation reject BEFORE any API call — a disallowed infra column
+    /// (`is_cloud`/`worker_vm`, the GCP-dispatch / VM-deletion escalation the
+    /// review flagged) and a typo'd status never reach the planning API.
+    #[test]
+    fn update_task_allowlists_columns_and_validates_status() {
+        with_home_and_repo("uprepo", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-self", "ws-self", "task-self");
+
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if path == "/tasks/task-self" && (method == "PATCH" || method == "GET") {
+                    (
+                        200,
+                        r#"{"id":"task-self","name":"New name","status":"running"}"#.to_string(),
+                    )
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            // Happy path: allowed columns PATCH, then the row is re-read.
+            let ok = update_task(
+                &state,
+                &json!({ "fields": { "name": "New name", "status": "running" } }),
+                Some("ts-self"),
+            )
+            .expect("update_task ok");
+            assert_eq!(ok["id"], "task-self");
+            assert_eq!(ok["name"], "New name");
+
+            // A disallowed infra column is rejected BEFORE any API call.
+            let bad_col = update_task(
+                &state,
+                &json!({ "fields": { "is_cloud": true } }),
+                Some("ts-self"),
+            )
+            .unwrap_err();
+            assert_eq!(bad_col.0, ErrorCode::InvalidParams);
+            assert!(bad_col.1.contains("is_cloud"), "names the column: {}", bad_col.1);
+
+            // A mix of an allowed + a disallowed column still rejects.
+            let mixed = update_task(
+                &state,
+                &json!({ "fields": { "name": "ok", "worker_vm": "cm-worker-x" } }),
+                Some("ts-self"),
+            )
+            .unwrap_err();
+            assert_eq!(mixed.0, ErrorCode::InvalidParams);
+            assert!(mixed.1.contains("worker_vm"), "names the column: {}", mixed.1);
+
+            // A bad status is rejected before any API call.
+            let bad_status = update_task(
+                &state,
+                &json!({ "fields": { "status": "bogus" } }),
+                Some("ts-self"),
+            )
+            .unwrap_err();
+            assert_eq!(bad_status.0, ErrorCode::InvalidParams);
+            assert!(bad_status.1.contains("status"), "mentions status: {}", bad_status.1);
 
             kill_all_sessions(&state);
             clear_api_env();

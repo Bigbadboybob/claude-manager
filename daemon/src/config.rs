@@ -159,6 +159,20 @@ pub struct SchedulerConfig {
     /// this is the investigator-session analogue. Default `600` (10 min).
     #[serde(default = "default_scheduler_investigator_runtime_secs")]
     pub default_investigator_runtime_secs: u32,
+    /// Continuous Tasks: persistent-orchestrator stall detection. A persistent
+    /// (long-lived) orchestrator that received a fire but produced NO transcript
+    /// growth within this many SECONDS is wedged (e.g. parked at an interactive
+    /// rate-limit / trust modal a headless `send_input` can't drive). The
+    /// scheduler SURFACES it (daemon-log alert + a `"stalled"` runs.jsonl line),
+    /// one alert per fire episode — it does NOT auto-kill or auto-spawn, because
+    /// the dominant cause (shared-account rate-limit) would also block any
+    /// investigator we spawned; recovery stays the operator's call. `None`
+    /// (default) = OFF (opt-in — avoids false positives on genuinely-long tool
+    /// calls until the operator has calibrated a budget). A sane value is `1800`
+    /// (30 min). Applies to `RunMode::Persistent` only; the Fresh analogue is
+    /// per-task `max_runtime_secs` (the watchdog).
+    #[serde(default)]
+    pub persistent_max_stall_secs: Option<u32>,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -197,6 +211,7 @@ impl Default for SchedulerConfig {
             default_cap: default_scheduler_default_cap(),
             max_investigations: default_scheduler_max_investigations(),
             default_investigator_runtime_secs: default_scheduler_investigator_runtime_secs(),
+            persistent_max_stall_secs: None,
         }
     }
 }
