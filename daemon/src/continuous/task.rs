@@ -279,6 +279,14 @@ pub struct ContinuousTask {
     /// UX hint: where to surface this task for review.
     #[serde(default)]
     pub review_surface: Option<String>,
+    /// Review-discovery marker: whether the `/triage-review` skill can review
+    /// this task, and how. `"fix_first"` (bug/perf/scraper — the review queue is
+    /// mostly mergeable code fixes) | `"investigate_first"` (behavior/api-update
+    /// — mostly investigate-only proposals awaiting an operator decision) |
+    /// `None` (not reviewable via triage-review). Surfaced by `continuous.list`
+    /// so review discovery is config-driven, not hardcoded per skill.
+    #[serde(default)]
+    pub review_kind: Option<String>,
 }
 
 impl ContinuousTask {
@@ -331,6 +339,7 @@ impl ContinuousTask {
             enqueue_to: None,
             retention: Retention::default(),
             review_surface: None,
+            review_kind: None,
         }
     }
 }
@@ -817,6 +826,7 @@ mod tests {
         assert!(task.max_runtime_secs.is_none());
         assert!(task.mem_cap_bytes.is_none());
         assert!(task.review_surface.is_none());
+        assert!(task.review_kind.is_none());
         assert_eq!(task.run_count, 0);
         assert!(task.modes.is_empty());
         assert!(task.in_flight.is_none());

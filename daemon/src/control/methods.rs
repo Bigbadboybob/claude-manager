@@ -8693,6 +8693,10 @@ struct ContinuousCreateParams {
     retention: Option<crate::continuous::task::Retention>,
     #[serde(default)]
     review_surface: Option<String>,
+    /// Review-discovery marker (see `ContinuousTask::review_kind`):
+    /// `"fix_first"` | `"investigate_first"` | absent (not triage-reviewable).
+    #[serde(default)]
+    review_kind: Option<String>,
     #[serde(default)]
     compact_every: Option<u32>,
     #[serde(default)]
@@ -8859,6 +8863,7 @@ pub fn continuous_create(
         task.retention = retention;
     }
     task.review_surface = p.review_surface.clone();
+    task.review_kind = p.review_kind.clone();
     // 0 disables for both (compact_every: the fire gate wants n >= 2;
     // max_runtime_secs: the watchdog treats None as OFF but Some(0) as a
     // hair-trigger). Normalize to None so the on-disk shape matches update().
@@ -8940,6 +8945,10 @@ struct ContinuousUpdateParams {
     supervise: Option<bool>,
     #[serde(default)]
     planning_task_id: Option<String>,
+    /// Review-discovery marker (see `ContinuousTask::review_kind`). `Some(v)`
+    /// sets it; there is no "clear back to None" path (backfill-only).
+    #[serde(default)]
+    review_kind: Option<String>,
 }
 
 /// `continuous.update` — change a LIVE continuous task's mutable config in
@@ -9040,6 +9049,10 @@ pub fn continuous_update(
             t.planning_task_id = Some(v.clone());
             updated.push("planning_task_id");
         }
+        if let Some(v) = &p.review_kind {
+            t.review_kind = Some(v.clone());
+            updated.push("review_kind");
+        }
     })
     .map_err(|e| {
         (
@@ -9058,7 +9071,8 @@ pub fn continuous_update(
 ///
 /// Returns `{ tasks: [ { task_id, label, project, host_id, engine, run_mode,
 /// schedule, enabled, paused, run_count, current_session_uid, in_flight,
-/// next_fire_at, last_fired_at, last_outcome, last_run }, … ] }`.
+/// next_fire_at, last_fired_at, last_outcome, last_run, review_kind,
+/// review_surface }, … ] }`.
 pub fn continuous_list(
     _state_arc: &Arc<Mutex<DaemonState>>,
     _params: &Value,
@@ -9086,6 +9100,11 @@ pub fn continuous_list(
                 // (`Running`/`Done`/`Failed`/…); `null` before the first fire.
                 "last_outcome": t.last_run.as_ref().map(|r| r.status),
                 "last_run": t.last_run,
+                // Config-driven review discovery: which tasks `/triage-review`
+                // handles, and fix-first vs investigate-first. `null` = not
+                // reviewable via triage-review.
+                "review_kind": t.review_kind,
+                "review_surface": t.review_surface,
             })
         })
         .collect();
