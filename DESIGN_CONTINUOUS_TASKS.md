@@ -1,5 +1,7 @@
 # Design: Continuous Tasks
 
+> **Want to _create_ one, not understand the internals?** See **`HOWTO_CONTINUOUS_TASKS.md`** — the operator runbook (recipe, `continuous.create` params, prompt idioms, gotchas, review flow). This doc is the architecture.
+
 **Status:** Phases 1–3 + 3b **implemented and committed** (`13139f5`, `2df9cff`, `40cec61`, `1288044`, `02dc80a`): sidebar + wire field + `kind` column; the `trigger` funnel + FRESH executor + `continuous.*` CRUD; the daemon scheduler + restart recovery + PERSISTENT executor; the stuck-story (completion signal + watchdog + investigator). Phases 1–3 validated end-to-end on a live daemon (smoke test). Phase 4 (queue) **implemented 2026-07-04** (see the Phase-4 entry + DESIGN_SCRAPER_MIGRATION.md §3 for the two naming/scope deltas). Phase 5 (migration) largely superseded by the live triage migrations; Phase 6 (fan-out/cloud) remains. Key review decisions resolved (§18).
 **Provenance:** Synthesized from a 9-agent Ultracode design panel (4 recon → 3 competing architectures → judge → synthesis), then refined through review. Winning skeleton: the *trigger-API / extensibility-first* proposal, hardened with the *reliability-first* proposal's idempotency + restart-recovery + audit machinery and the *reuse-first* proposal's primitive-unification grafts.
 
