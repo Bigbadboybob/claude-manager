@@ -114,9 +114,21 @@ impl ApiClient {
         // `json: timeout: global`. The backend re-fetches every 5s, so a
         // genuinely-dead host still surfaces a stale list rather than hanging
         // the app. Matches the CLI client's 30s.
+        //
+        // max_idle_age 2s (default 15s): uvicorn's default keep-alive idle
+        // timeout is 5s — the same as the backend poll interval — so with the
+        // default pool age every poll reused a connection that was exactly at
+        // the server's kill threshold. When the server close crossed the WAN
+        // in flight with the next request, the request went into a dying
+        // socket and surfaced as `io: Peer disconnected` (ureq has no retry).
+        // Capping reuse at 2s means a pooled connection is only reused while
+        // the server is still guaranteed to hold it open; the 5s-idle poll
+        // opens a fresh connection instead, while back-to-back requests
+        // within one tick (tasks + plan-tasks) still share one.
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
                 .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .max_idle_age(std::time::Duration::from_secs(2))
                 .build(),
         );
         ApiClient {
@@ -139,14 +151,28 @@ impl ApiClient {
             Some(s) => format!("{}?status={}", self.url("/tasks"), s),
             None => self.url("/tasks"),
         };
-        let body = self
-            .agent
-            .get(&url)
-            .header("Authorization", &self.auth_header())
-            .call()?
-            .body_mut()
-            .read_json::<Vec<Task>>()?;
-        Ok(body)
+        let fetch = || -> anyhow::Result<Vec<Task>> {
+            let body = self
+                .agent
+                .get(&url)
+                .header("Authorization", &self.auth_header())
+                .call()?
+                .body_mut()
+                .read_json::<Vec<Task>>()?;
+            Ok(body)
+        };
+        // This is the recurring background poll: a single failure flips the
+        // status bar to "API: ..." and the ● indicator to disconnected until
+        // the next 5s tick. Retry once — but only for the fast-fail
+        // interrupted-transport class (server closed a keep-alive connection
+        // mid-flight, WAN blip) where a fresh connection is likely to
+        // succeed immediately. Timeouts and connect failures are excluded so
+        // a dead network can't double the 30s worst-case block on the
+        // backend thread.
+        match fetch() {
+            Err(e) if is_interrupted_transport(&e) => fetch(),
+            other => other,
+        }
     }
 
     pub fn get_task(&self, task_id: &str) -> anyhow::Result<Task> {
@@ -192,5 +218,137 @@ impl ApiClient {
             .header("Authorization", &self.auth_header())
             .call()?;
         Ok(())
+    }
+}
+
+/// True when the error is a transport interruption that fails fast —
+/// the peer closed the connection under the request (stale keep-alive
+/// reuse, server restart, WAN blip). These are the errors where one
+/// immediate retry on a fresh connection is safe for an idempotent GET.
+/// Deliberately excludes `ureq::Error::Timeout` and connect-phase
+/// failures: retrying those can block for another full timeout when the
+/// network is genuinely down.
+fn is_interrupted_transport(e: &anyhow::Error) -> bool {
+    match e.downcast_ref::<ureq::Error>() {
+        Some(ureq::Error::Io(io)) => matches!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Per-connection behavior for the stub API server.
+    enum Stub {
+        /// Read the request, then close without sending anything —
+        /// exactly what the client sees when uvicorn kills a keep-alive
+        /// connection under an in-flight request.
+        CloseNoResponse,
+        /// Read the request, respond with the given status and body.
+        Respond(u16, &'static str),
+    }
+
+    /// One accepted connection per `Stub` entry; the listener is dropped
+    /// afterwards so any surplus connection attempt fails with
+    /// ConnectionRefused instead of hanging the test. Returns the port
+    /// and a counter of accepted connections.
+    fn spawn_stub_api(behaviors: Vec<Stub>) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let conns_srv = conns.clone();
+        std::thread::spawn(move || {
+            for behavior in behaviors {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                conns_srv.fetch_add(1, Ordering::SeqCst);
+                // Drain the request head so the client's write completes
+                // before we act (a GET fits in one segment).
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                match behavior {
+                    Stub::CloseNoResponse => drop(stream),
+                    Stub::Respond(status, body) => {
+                        let resp = format!(
+                            "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                }
+            }
+        });
+        (port, conns)
+    }
+
+    fn client_for(port: u16) -> ApiClient {
+        let config = Config {
+            api_url: format!("http://127.0.0.1:{}", port),
+            api_token: "test-token".into(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        };
+        ApiClient::new(&config)
+    }
+
+    /// The mid-flight keep-alive close (`io: Peer disconnected`) recovers
+    /// via one retry on a fresh connection instead of surfacing as a
+    /// spurious "disconnected" flash in the status bar.
+    #[test]
+    fn list_tasks_retries_once_on_interrupted_transport() {
+        let (port, conns) =
+            spawn_stub_api(vec![Stub::CloseNoResponse, Stub::Respond(200, "[]")]);
+        let client = client_for(port);
+        let tasks = client.list_tasks(None).expect("retry must recover");
+        assert!(tasks.is_empty());
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "expected exactly one retry");
+    }
+
+    /// A persistently-broken transport still fails after the single
+    /// retry — the retry must not loop.
+    #[test]
+    fn list_tasks_gives_up_after_one_retry() {
+        let (port, conns) = spawn_stub_api(vec![
+            Stub::CloseNoResponse,
+            Stub::CloseNoResponse,
+            // Never reached unless the client (wrongly) retries twice.
+            Stub::Respond(200, "[]"),
+        ]);
+        let client = client_for(port);
+        let err = client.list_tasks(None).expect_err("must fail");
+        assert!(is_interrupted_transport(&err), "unexpected error: {err}");
+        assert_eq!(conns.load(Ordering::SeqCst), 2, "expected exactly one retry");
+    }
+
+    /// HTTP-level errors (4xx/5xx parsed from a live connection) are not
+    /// transport interruptions and must not be retried.
+    #[test]
+    fn list_tasks_does_not_retry_http_status_errors() {
+        let (port, conns) = spawn_stub_api(vec![
+            Stub::Respond(500, "{}"),
+            // Never reached unless the client (wrongly) retries.
+            Stub::Respond(200, "[]"),
+        ]);
+        let client = client_for(port);
+        let err = client.list_tasks(None).expect_err("must fail");
+        assert!(!is_interrupted_transport(&err), "unexpected error: {err}");
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "status errors must not retry");
     }
 }
