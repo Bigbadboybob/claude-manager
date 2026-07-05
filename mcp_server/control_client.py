@@ -232,6 +232,14 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # continuous_task_id auth.
     "report_done",
     "resolve_stuck",
+    # Continuous Tasks Phase 4 (DESIGN_SCRAPER_MIGRATION.md §3): named queues.
+    # Both genuinely Session-routable (bimodal on the daemon via
+    # reject_forged_operator): `enqueue` buffers a payload for a queue-fed
+    # Consumer task (e.g. an investigation agent pushing a scraper-creation
+    # proposal), `queue.stats` reads depth. No task-tree gate — the queue is a
+    # shared transport between producers and the consuming task.
+    "enqueue",
+    "queue.stats",
 })
 
 

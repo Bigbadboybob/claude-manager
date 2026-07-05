@@ -177,7 +177,7 @@ impl PlanningClientError {
 /// the fallback for the local-workstation case (where the
 /// daemon was launched from an interactive shell with the
 /// var exported).
-fn resolve_api_url(override_val: Option<&str>) -> Result<String, PlanningClientError> {
+pub(crate) fn resolve_api_url(override_val: Option<&str>) -> Result<String, PlanningClientError> {
     if let Some(s) = override_val {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
@@ -193,7 +193,7 @@ fn resolve_api_url(override_val: Option<&str>) -> Result<String, PlanningClientE
     Ok(trimmed.trim_end_matches('/').to_string())
 }
 
-fn resolve_api_token(override_val: Option<&str>) -> Result<String, PlanningClientError> {
+pub(crate) fn resolve_api_token(override_val: Option<&str>) -> Result<String, PlanningClientError> {
     if let Some(s) = override_val {
         let trimmed = s.trim();
         if !trimmed.is_empty() {

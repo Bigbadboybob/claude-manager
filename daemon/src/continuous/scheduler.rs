@@ -78,6 +78,22 @@ const BACKOFF_CAP_SECS: u64 = 3600; // 1 hour
 /// off forever. The operator un-pauses after fixing the cause.
 const CONSECUTIVE_FAILURE_LIMIT: u32 = 5;
 
+/// Consumer (Phase 4) inter-fire spacing (seconds). After a Consumer fire (or a
+/// run-active skip) the task is not re-evaluated for this long — a deep queue
+/// drains at ≤1 batch/min instead of hot-looping every 250 ms tick, while
+/// stragglers still beat the (much larger) `window_secs`. Also the Consumer
+/// failure-backoff BASE: `backoff_secs(CONSUMER_REFIRE_SPACING_SECS, n)` grows
+/// 2 min → 4 min → … capped at [`BACKOFF_CAP_SECS`].
+const CONSUMER_REFIRE_SPACING_SECS: u64 = 60;
+
+/// How long a fetched queue depth stays fresh (seconds). The Consumer due-check
+/// runs every tick (250 ms) but polls the planning API's `GET /queues/{q}` at
+/// most this often per queue — the depth cache in
+/// [`ContinuousScheduler::consumer_depth_snapshot`] serves the interim ticks. A
+/// fetch FAILURE also caches (as depth 0) so an API outage produces one error
+/// log per queue per TTL, not four per second.
+const QUEUE_DEPTH_CACHE_TTL_SECS: u64 = 30;
+
 /// Outcome of a single in-process fire, distilled from `methods::trigger`'s
 /// return into the three cases the ADVANCE phase branches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +134,15 @@ pub struct ContinuousScheduler {
     /// re-arms. In-memory only — a daemon restart re-surfaces a still-stalled
     /// orchestrator exactly once, which is the desired behavior.
     stall_alerts: Mutex<HashMap<String, u64>>,
+    /// Consumer depth cache: `queue -> (fetched_at, pending_depth)`. Serves the
+    /// due-check between API polls ([`QUEUE_DEPTH_CACHE_TTL_SECS`]). In-memory
+    /// only — a restart just re-polls.
+    queue_depths: Mutex<HashMap<String, (u64, u64)>>,
+    /// Test-only: canned per-queue depths so scheduler tests drive the Consumer
+    /// due-check without an HTTP server. `Some(map)` short-circuits
+    /// `consumer_depth_snapshot` entirely (missing queues read as depth 0).
+    #[cfg(test)]
+    depth_override: Mutex<Option<HashMap<String, u64>>>,
     /// Test-only: substitute the in-process fire so unit tests can drive the
     /// due-check / supervision / advance phases without spawning a real agent.
     /// Records the task_ids fired and returns a canned [`FireOutcome`].
@@ -155,6 +180,9 @@ impl ContinuousScheduler {
             handle: Mutex::new(None),
             panic_record: Arc::new(Mutex::new(None)),
             stall_alerts: Mutex::new(HashMap::new()),
+            queue_depths: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            depth_override: Mutex::new(None),
             #[cfg(test)]
             fire_spy: Mutex::new(None),
         }
@@ -303,23 +331,31 @@ impl ContinuousScheduler {
         // (no auto-act); off unless `persistent_max_stall_secs` is configured.
         self.persistent_stall_pass(&tasks, now);
 
-        // (d) DUE CHECK — pure read of the disk-loaded tasks. Consumer / Cron /
-        // OnDemand are skipped (Periodic-only in Phase 3).
-        let due = collect_due(&tasks, now);
+        // (c.4) CONSUMER DEPTH SNAPSHOT (Phase 4) — poll the planning API's
+        // queue stats for the queues of eligible Consumer tasks, throttled by
+        // the per-queue depth cache. Pure data for the due check below.
+        let depths = self.consumer_depth_snapshot(&tasks, now);
+
+        // (d) DUE CHECK — pure read of the disk-loaded tasks (+ the depth
+        // snapshot for Consumer). Cron / OnDemand are skipped.
+        let due = collect_due(&tasks, now, &depths);
 
         // (e) FIRE + ADVANCE — no DaemonState lock held across the fire.
         for task_id in due {
             if acted.contains(&task_id) {
                 continue;
             }
-            // DUE-SKIP-ACTIVE (Phase 3b): a FRESH task whose prior run is still
+            // DUE-SKIP-ACTIVE (Phase 3b): a task whose prior run is still
             // Running passes collect_due's `in_flight.is_none()` filter (trigger
-            // clears in_flight on return) but must NOT be re-fired — that would
-            // pile up overlapping fresh sessions. Skip the fire but still ADVANCE
-            // next_fire_at catch-up-once. Persistent tasks are exempt (one live
+            // clears in_flight on return) but must NOT be re-fired. For FRESH
+            // that would pile up overlapping fresh sessions; for a Consumer it
+            // would paste a second batch into a mid-run orchestrator (both run
+            // modes — a Consumer's prompt must end in `report_done`, same
+            // contract as periodic-fresh). Skip the fire but still ADVANCE
+            // next_fire_at. Periodic Persistent tasks are exempt (one live
             // session; re-delivery to the same PTY is the intended behavior).
             if let Some(tk) = tasks.iter().find(|t| t.task_id == task_id) {
-                if fresh_run_active(tk) {
+                if run_active_blocks_fire(tk) {
                     self.advance_after_fire(&task_id, FireOutcome::SkipActive, now);
                     continue;
                 }
@@ -328,6 +364,93 @@ impl ContinuousScheduler {
             let outcome = self.fire_task(&task_id, &fire_token);
             self.advance_after_fire(&task_id, outcome, now);
         }
+    }
+
+    /// Phase (c.4): per-queue pending depths for the Consumer due-check.
+    /// Only queues of ELIGIBLE Consumer tasks (enabled, un-paused, past their
+    /// `next_fire_at` gate) are polled; each queue at most once per
+    /// [`QUEUE_DEPTH_CACHE_TTL_SECS`] (fresh cache entries serve the interim
+    /// ticks). A fetch failure logs once and caches depth 0 for the TTL, so an
+    /// API outage cannot hot-loop error logs — and cannot fire the task (a
+    /// depth-0 Consumer is never due). No DaemonState lock is held across the
+    /// HTTP call (creds are cloned out under a brief lock).
+    fn consumer_depth_snapshot(
+        &self,
+        tasks: &[ContinuousTask],
+        now: u64,
+    ) -> HashMap<String, u64> {
+        let mut wanted: Vec<String> = Vec::new();
+        for t in tasks {
+            if !(t.enabled && !t.paused && t.next_fire_at <= now) {
+                continue;
+            }
+            if let Schedule::Consumer { queue, .. } = &t.schedule {
+                if !wanted.contains(queue) {
+                    wanted.push(queue.clone());
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return HashMap::new();
+        }
+        #[cfg(test)]
+        {
+            let g = self.depth_override.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(overrides) = g.as_ref() {
+                return wanted
+                    .iter()
+                    .map(|q| (q.clone(), overrides.get(q).copied().unwrap_or(0)))
+                    .collect();
+            }
+        }
+        let (api_url, api_token) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (s.config.api_url.clone(), s.config.api_token.clone())
+        };
+        let mut out = HashMap::new();
+        for q in wanted {
+            // Serve from cache when fresh.
+            {
+                let cache = self.queue_depths.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((fetched_at, depth)) = cache.get(&q) {
+                    if now.saturating_sub(*fetched_at) < QUEUE_DEPTH_CACHE_TTL_SECS {
+                        out.insert(q.clone(), *depth);
+                        continue;
+                    }
+                }
+            }
+            // Fetch (10s ureq timeout bounds a hung API; the failure path
+            // caches 0 so the stall repeats at most once per TTL per queue).
+            let depth = match crate::continuous::queue::QueueClient::from_overrides(
+                Some(&api_url),
+                Some(&api_token),
+            )
+            .and_then(|c| c.stats(&q))
+            {
+                Ok(stats) => stats.pending,
+                Err(e) => {
+                    eprintln!(
+                        "cm-daemon: continuous scheduler failed to poll depth for \
+                         queue '{}': {}",
+                        q,
+                        e.to_method_err().1,
+                    );
+                    0
+                }
+            };
+            self.queue_depths
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(q.clone(), (now, depth));
+            out.insert(q, depth);
+        }
+        out
+    }
+
+    /// Test-only: canned per-queue depths for the Consumer due-check.
+    #[cfg(test)]
+    fn set_depth_override(&self, depths: HashMap<String, u64>) {
+        *self.depth_override.lock().unwrap_or_else(|p| p.into_inner()) = Some(depths);
     }
 
     /// Phase (c.2) WATCHDOG — FRESH-hang detection + investigator dispatch
@@ -690,19 +813,27 @@ impl ContinuousScheduler {
         }
     }
 
-    /// Phase (e) advance: record the periodic fire and recompute `next_fire_at`.
-    /// CATCH-UP-ONCE — `next_fire_at = now + every_secs` recomputed from `now`,
+    /// Phase (e) advance: record the fire and recompute `next_fire_at`.
+    /// CATCH-UP-ONCE — `next_fire_at = now + spacing` recomputed from `now`,
     /// NEVER accumulated from `last_fired_at` (backfilling missed slots after
     /// downtime would fire a burst). On a hard failure, bump
     /// `consecutive_failures` and back the next fire off exponentially (capped);
     /// a successful fire resets the counter; a benign skip leaves `next_fire_at`
     /// to retry without bumping failures.
+    ///
+    /// `spacing` per schedule: Periodic uses `every_secs` (the cadence).
+    /// Consumer (Phase 4) uses [`CONSUMER_REFIRE_SPACING_SECS`] — for a Consumer
+    /// `next_fire_at` is a NOT-BEFORE gate, not a cadence: due-ness comes from
+    /// queue depth / window in `collect_due`, and the small spacing just rate-
+    /// limits re-evaluation (drain a deep queue at ≤1 batch/min; recheck a
+    /// run-active skip in a minute; back a failure off from a 60s base).
     fn advance_after_fire(&self, task_id: &str, outcome: FireOutcome, now: u64) {
         let mut auto_paused: Option<(u64, u32)> = None; // (run seq, failure count)
         let _ = task::modify(task_id, |t| {
             let every = match &t.schedule {
                 Schedule::Periodic { every_secs } => (*every_secs).max(1),
-                // Non-periodic can't reach here (collect_due filters Periodic);
+                Schedule::Consumer { .. } => CONSUMER_REFIRE_SPACING_SECS,
+                // Cron / OnDemand can't reach here (collect_due filters them);
                 // be defensive and leave scheduling untouched.
                 _ => return,
             };
@@ -934,6 +1065,23 @@ fn fresh_run_active(tk: &ContinuousTask) -> bool {
             .map_or(false, |r| r.status == RunStatus::Running)
 }
 
+/// Due-loop skip predicate, generalizing [`fresh_run_active`] for Phase 4:
+/// a CONSUMER task with a `Running` last run blocks in BOTH run modes — firing
+/// would claim a fresh batch and paste it into a mid-run orchestrator. The
+/// Consumer contract is therefore periodic-fresh-shaped: the prompt MUST end in
+/// `report_done` (or the session must exit) or the queue never drains again —
+/// recoverable via `continuous.run_now`, same as the documented periodic-fresh
+/// footgun. Periodic tasks keep the Phase-3b fresh-only semantics.
+fn run_active_blocks_fire(tk: &ContinuousTask) -> bool {
+    if matches!(tk.schedule, Schedule::Consumer { .. }) {
+        return tk
+            .last_run
+            .as_ref()
+            .map_or(false, |r| r.status == RunStatus::Running);
+    }
+    fresh_run_active(tk)
+}
+
 /// Append a `"supervised_restart"` audit line after a supervised respawn.
 fn append_supervision_audit(tk: &ContinuousTask, fire_token: &str, now: u64) {
     if let Err(e) = ContinuousRunLog::append(&RunLogLine {
@@ -957,18 +1105,43 @@ fn append_supervision_audit(tk: &ContinuousTask, fire_token: &str, now: u64) {
 }
 
 /// Phase (d) due predicate: the set of task_ids that should fire this tick.
-/// `enabled && !paused && in_flight.is_none() && Schedule::Periodic &&
-/// next_fire_at <= now`. Consumer / Cron / OnDemand are skipped (Phase 4+).
-/// Pure read — no DaemonState lock.
-fn collect_due(tasks: &[ContinuousTask], now: u64) -> Vec<String> {
+/// Common gate: `enabled && !paused && in_flight.is_none() && next_fire_at <=
+/// now`. Then per schedule:
+///   - `Periodic` — due (the gate IS the cadence).
+///   - `Consumer` (Phase 4) — due iff the queue has pending items AND (depth ≥
+///     `depth_threshold` (burst arm; a 0 threshold disables it) OR the oldest
+///     wait exceeds `window_secs` — approximated as time since the last fire; a
+///     never-fired task (`last_fired_at == 0`) satisfies the window arm
+///     outright, so the first item ever enqueued fires without a full window
+///     wait). `queue_depths` is the (c.4) snapshot; a queue missing from it
+///     reads as depth 0 (not due).
+///   - `Cron` / `OnDemand` — never due here.
+/// Pure read — no DaemonState lock, no I/O.
+fn collect_due(
+    tasks: &[ContinuousTask],
+    now: u64,
+    queue_depths: &HashMap<String, u64>,
+) -> Vec<String> {
     tasks
         .iter()
         .filter(|t| {
-            t.enabled
-                && !t.paused
-                && t.in_flight.is_none()
-                && matches!(t.schedule, Schedule::Periodic { .. })
-                && t.next_fire_at <= now
+            t.enabled && !t.paused && t.in_flight.is_none() && t.next_fire_at <= now
+        })
+        .filter(|t| match &t.schedule {
+            Schedule::Periodic { .. } => true,
+            Schedule::Consumer {
+                queue,
+                window_secs,
+                depth_threshold,
+                ..
+            } => {
+                let depth = queue_depths.get(queue).copied().unwrap_or(0);
+                depth > 0
+                    && ((*depth_threshold > 0 && depth >= *depth_threshold as u64)
+                        || t.last_fired_at == 0
+                        || now.saturating_sub(t.last_fired_at) >= *window_secs)
+            }
+            _ => false,
         })
         .map(|t| t.task_id.clone())
         .collect()
@@ -1225,7 +1398,73 @@ mod tests {
                 false,
             ),
         ];
-        assert_eq!(collect_due(&tasks, now), vec!["due".to_string()]);
+        // Empty depth snapshot: the Consumer task reads depth 0 -> not due.
+        assert_eq!(
+            collect_due(&tasks, now, &HashMap::new()),
+            vec!["due".to_string()],
+        );
+    }
+
+    // ----- (d) due check: Consumer (Phase 4) -----
+
+    fn consumer_task(id: &str, queue: &str, window_secs: u64, depth_threshold: u32) -> ContinuousTask {
+        let mut t = ContinuousTask::new(
+            id.into(),
+            id.into(),
+            format!("ws-{}", id),
+            "/tmp/r".into(),
+            Engine::Claude,
+            RunMode::Persistent,
+            Schedule::Consumer {
+                queue: queue.into(),
+                batch_max: 10,
+                window_secs,
+                depth_threshold,
+            },
+            "drain the batch".into(),
+        );
+        t.next_fire_at = 0;
+        t
+    }
+
+    /// Consumer due arms: depth ≥ threshold fires regardless of window; below
+    /// threshold the window (measured from last_fired_at) decides; an empty
+    /// queue never fires; a 0 threshold disables the burst arm.
+    #[test]
+    fn collect_due_consumer_depth_and_window_arms() {
+        let now = 10_000u64;
+        let depths: HashMap<String, u64> =
+            [("q".to_string(), 2u64)].into_iter().collect();
+
+        // Burst arm: threshold 2 met by depth 2 — due even mid-window.
+        let mut burst = consumer_task("burst", "q", 100_000, 2);
+        burst.last_fired_at = now - 10;
+        // Below threshold (3 > 2) + mid-window — not due.
+        let mut waiting = consumer_task("waiting", "q", 100_000, 3);
+        waiting.last_fired_at = now - 10;
+        // Below threshold but window elapsed — due (straggler drain).
+        let mut straggler = consumer_task("straggler", "q", 50, 3);
+        straggler.last_fired_at = now - 60;
+        // Empty queue — never due, even with the window long elapsed.
+        let mut empty = consumer_task("empty", "empty-q", 50, 1);
+        empty.last_fired_at = now - 60;
+        // Never fired (last_fired_at 0) + any depth — window arm satisfied
+        // immediately (first item fires without waiting a full window).
+        let first = consumer_task("first", "q", 100_000, 99);
+        // 0 threshold disables the burst arm; window still works.
+        let mut zero_thresh = consumer_task("zero-thresh", "q", 100_000, 0);
+        zero_thresh.last_fired_at = now - 10;
+        // next_fire_at gate (spacing/backoff) blocks even a deep queue.
+        let mut gated = consumer_task("gated", "q", 50, 1);
+        gated.last_fired_at = now - 60;
+        gated.next_fire_at = now + 30;
+
+        let tasks = vec![burst, waiting, straggler, empty, first, zero_thresh, gated];
+        let due = collect_due(&tasks, now, &depths);
+        assert_eq!(
+            due,
+            vec!["burst".to_string(), "straggler".to_string(), "first".to_string()],
+        );
     }
 
     // ----- (e) advance: catch-up-once + backoff -----
@@ -1352,6 +1591,92 @@ mod tests {
                 r.next_fire_at,
             );
             assert!(r.next_fire_at > t1, "next fire is in the future (no immediate re-fire)");
+        });
+    }
+
+    /// A Consumer task fires through `tick_once` when its queue is deep enough
+    /// (depth override stands in for the API poll) and advances by the small
+    /// Consumer spacing, not a periodic cadence.
+    #[test]
+    fn tick_once_fires_due_consumer_task_and_advances_by_spacing() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            sched.arm_fire_spy(FireOutcome::Fired);
+            sched.set_depth_override(
+                [("proposals".to_string(), 5u64)].into_iter().collect(),
+            );
+            task::save(&consumer_task("consumer-fire", "proposals", 21_600, 3))
+                .expect("save");
+
+            let t0 = task::now_unix();
+            sched.tick_once();
+            let t1 = task::now_unix();
+
+            assert_eq!(sched.fire_spy_calls(), vec!["consumer-fire".to_string()]);
+            let r = task::load_one("consumer-fire").unwrap();
+            assert!(
+                r.next_fire_at >= t0 + CONSUMER_REFIRE_SPACING_SECS
+                    && r.next_fire_at <= t1 + CONSUMER_REFIRE_SPACING_SECS,
+                "advanced by the Consumer spacing (not the window): {}",
+                r.next_fire_at,
+            );
+            assert_eq!(r.consecutive_failures, 0);
+        });
+    }
+
+    /// A Consumer task with an empty queue never fires, whatever the window.
+    #[test]
+    fn tick_once_skips_consumer_with_empty_queue() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            sched.arm_fire_spy(FireOutcome::Fired);
+            sched.set_depth_override(HashMap::new()); // all queues read depth 0
+            let mut t = consumer_task("consumer-empty", "proposals", 60, 1);
+            t.last_fired_at = 1; // window long elapsed
+            task::save(&t).expect("save");
+
+            sched.tick_once();
+
+            assert!(sched.fire_spy_calls().is_empty(), "empty queue never fires");
+        });
+    }
+
+    /// A Consumer whose last run is still Running is NOT re-fired — even in
+    /// Persistent run_mode (unlike Periodic-Persistent) — but its not-before
+    /// gate advances so the due check doesn't hot-loop. The batch waits for
+    /// `report_done`.
+    #[test]
+    fn tick_once_consumer_run_active_skips_both_run_modes() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            sched.arm_fire_spy(FireOutcome::Fired);
+            sched.set_depth_override(
+                [("proposals".to_string(), 50u64)].into_iter().collect(),
+            );
+            let mut t = consumer_task("consumer-active", "proposals", 60, 1);
+            assert_eq!(t.run_mode, RunMode::Persistent, "the harder case");
+            t.last_run = Some(RunRecord {
+                seq: 3,
+                fire_token: "ft-live".into(),
+                started_at: task::now_unix(),
+                finished_at: None,
+                session_uid: Some("ts-live".into()),
+                status: RunStatus::Running,
+                trigger_source: "operator".into(),
+            });
+            task::save(&t).expect("save");
+
+            let t0 = task::now_unix();
+            sched.tick_once();
+
+            assert!(sched.fire_spy_calls().is_empty(), "run-active Consumer must not re-fire");
+            let r = task::load_one("consumer-active").unwrap();
+            assert!(
+                r.next_fire_at >= t0 + CONSUMER_REFIRE_SPACING_SECS,
+                "SkipActive advances the not-before gate: {}",
+                r.next_fire_at,
+            );
+            assert_eq!(r.consecutive_failures, 0, "benign skip, not a failure");
         });
     }
 

@@ -7,6 +7,8 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import asyncpg
+
 from fastapi import FastAPI, Depends, HTTPException, Query
 
 from api.auth import verify_token
@@ -230,6 +232,116 @@ async def list_continuous(pool=Depends(get_pool)):
             "subtasks": shaped,
         })
     return {"continuous_tasks": out}
+
+
+# ---------------------------------------------------------------------------
+# Named queues (Continuous Tasks Phase 4 — sql/012_queue_items.sql)
+# ---------------------------------------------------------------------------
+#
+# Generic transport for queue-fed Consumer continuous tasks
+# (DESIGN_SCRAPER_MIGRATION.md §3). The API owns the table; external producers
+# (e.g. the aux scraperGeneration app) POST items over HTTPS with the bearer
+# token, and the daemon's scheduler claims/acks batches through these same
+# endpoints using its daemon.toml api_url/api_token.
+
+_QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# Soft payload cap — a queue item is a proposal/pointer, not a blob store.
+# Serialized-JSON bytes; 64 KiB is ~10x the largest expected AttributionBatch.
+_QUEUE_PAYLOAD_MAX_BYTES = 64 * 1024
+
+
+def _validate_queue_name(queue: str) -> None:
+    if not _QUEUE_NAME_RE.match(queue):
+        raise HTTPException(
+            status_code=400,
+            detail="queue name must match [A-Za-z0-9_-]{1,128}",
+        )
+
+
+@app.post("/queues/{queue}/items", dependencies=[Depends(verify_token)])
+async def enqueue_queue_item(queue: str, body: dict, pool=Depends(get_pool)):
+    """Enqueue one item: {payload, dedupe_key?, source?} ->
+    {enqueued, deduped, id, depth}. A dedupe_key that collides with a
+    not-yet-consumed item in the same queue coalesces (deduped: true)."""
+    _validate_queue_name(queue)
+    if "payload" not in body:
+        raise HTTPException(status_code=400, detail="missing required field: payload")
+    payload = body["payload"]
+    if not isinstance(payload, (dict, list)):
+        raise HTTPException(status_code=400, detail="payload must be a JSON object or array")
+    if len(json.dumps(payload)) > _QUEUE_PAYLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"payload exceeds {_QUEUE_PAYLOAD_MAX_BYTES} bytes; queue items "
+                   "are proposals/pointers — store bulk data elsewhere",
+        )
+    dedupe_key = body.get("dedupe_key")
+    if dedupe_key is not None and not isinstance(dedupe_key, str):
+        raise HTTPException(status_code=400, detail="dedupe_key must be a string")
+    source = body.get("source")
+    if source is not None and not isinstance(source, str):
+        raise HTTPException(status_code=400, detail="source must be a string")
+    return await db.enqueue_queue_item(
+        pool, queue, payload, dedupe_key=dedupe_key, source=source
+    )
+
+
+@app.get("/queues/{queue}", dependencies=[Depends(verify_token)])
+async def get_queue_stats(queue: str, pool=Depends(get_pool)):
+    """{queue, pending, claimed, oldest_pending_at} — the daemon's Consumer
+    due-check polls this."""
+    _validate_queue_name(queue)
+    return await db.queue_stats(pool, queue)
+
+
+@app.post("/queues/{queue}/claim", dependencies=[Depends(verify_token)])
+async def claim_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
+    """Atomically claim up to max_items oldest pending items:
+    {max_items, claimed_by} -> {items: [{id, payload, dedupe_key, source,
+    enqueued_at}]}. FOR UPDATE SKIP LOCKED — safe under concurrent claimers."""
+    _validate_queue_name(queue)
+    max_items = body.get("max_items")
+    if not isinstance(max_items, int) or max_items < 1 or max_items > 1000:
+        raise HTTPException(status_code=400, detail="max_items must be an int in [1, 1000]")
+    claimed_by = body.get("claimed_by")
+    if not isinstance(claimed_by, str) or not claimed_by:
+        raise HTTPException(status_code=400, detail="claimed_by must be a non-empty string")
+    items = await db.claim_queue_items(pool, queue, max_items, claimed_by)
+    return {"items": items}
+
+
+@app.post("/queues/{queue}/ack", dependencies=[Depends(verify_token)])
+async def ack_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
+    """claimed -> consumed: {ids} -> {acked}. Ids not in claimed state are
+    ignored (idempotent)."""
+    _validate_queue_name(queue)
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise HTTPException(status_code=400, detail="ids must be a list of strings")
+    try:
+        acked = await db.ack_queue_items(pool, queue, ids)
+    except asyncpg.DataError:
+        # Malformed UUIDs land here from the ::uuid[] cast — a client bug.
+        raise HTTPException(status_code=400, detail="ids must be UUIDs")
+    return {"acked": acked}
+
+
+@app.post("/queues/{queue}/requeue", dependencies=[Depends(verify_token)])
+async def requeue_queue_batch(queue: str, body: dict | None = None, pool=Depends(get_pool)):
+    """claimed -> pending (recovery after a crashed fire): {ids?} -> {requeued}.
+    No ids = requeue ALL claimed items in the queue."""
+    _validate_queue_name(queue)
+    ids = (body or {}).get("ids")
+    if ids is not None and (
+        not isinstance(ids, list) or not all(isinstance(i, str) for i in ids)
+    ):
+        raise HTTPException(status_code=400, detail="ids must be a list of strings")
+    try:
+        requeued = await db.requeue_queue_items(pool, queue, ids)
+    except asyncpg.DataError:
+        raise HTTPException(status_code=400, detail="ids must be UUIDs")
+    return {"requeued": requeued}
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])

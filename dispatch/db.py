@@ -334,3 +334,140 @@ async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
                RETURNING *""",
         )
         return _serialize(dict(row)) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Named queues (Continuous Tasks Phase 4 — sql/012_queue_items.sql)
+# ---------------------------------------------------------------------------
+#
+# Generic transport for queue-fed Consumer continuous tasks
+# (DESIGN_SCRAPER_MIGRATION.md §3). Free-form JSONB payloads; dedup is a
+# burst-coalescing partial unique index over not-yet-consumed items — the
+# INSERT catches UniqueViolation rather than ON CONFLICT (an ON CONFLICT
+# arbiter can't cleanly target the state-filtered partial index).
+
+
+async def enqueue_queue_item(
+    pool: asyncpg.Pool,
+    queue: str,
+    payload: dict | list,
+    dedupe_key: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """Insert one item. Returns {enqueued, deduped, id, depth} where `depth`
+    is the queue's pending count after the call (deduped or not)."""
+    async with pool.acquire() as conn:
+        item_id: str | None = None
+        deduped = False
+        try:
+            row = await conn.fetchrow(
+                """INSERT INTO queue_items (queue, payload, dedupe_key, source)
+                   VALUES ($1, $2, $3, $4)
+                   RETURNING id""",
+                queue, payload, dedupe_key, source,
+            )
+            item_id = str(row["id"])
+        except asyncpg.UniqueViolationError:
+            # Same dedupe_key already pending/claimed in this queue — coalesce.
+            deduped = True
+        depth = await conn.fetchval(
+            "SELECT count(*) FROM queue_items WHERE queue = $1 AND state = 'pending'",
+            queue,
+        )
+        return {
+            "enqueued": not deduped,
+            "deduped": deduped,
+            "id": item_id,
+            "depth": int(depth),
+        }
+
+
+async def queue_stats(pool: asyncpg.Pool, queue: str) -> dict:
+    """Pending/claimed counts + oldest pending timestamp for one queue."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT
+                   count(*) FILTER (WHERE state = 'pending')  AS pending,
+                   count(*) FILTER (WHERE state = 'claimed')  AS claimed,
+                   min(enqueued_at) FILTER (WHERE state = 'pending') AS oldest_pending_at
+               FROM queue_items WHERE queue = $1""",
+            queue,
+        )
+        oldest = row["oldest_pending_at"]
+        return {
+            "queue": queue,
+            "pending": int(row["pending"]),
+            "claimed": int(row["claimed"]),
+            "oldest_pending_at": oldest.isoformat() if oldest else None,
+        }
+
+
+async def claim_queue_items(
+    pool: asyncpg.Pool, queue: str, max_items: int, claimed_by: str,
+) -> list[dict]:
+    """Atomically claim up to `max_items` oldest pending items
+    (FOR UPDATE SKIP LOCKED — safe under concurrent claimers)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """UPDATE queue_items
+               SET state = 'claimed', claimed_at = now(), claimed_by = $3
+               WHERE id IN (
+                   SELECT id FROM queue_items
+                   WHERE queue = $1 AND state = 'pending'
+                   ORDER BY enqueued_at
+                   LIMIT $2
+                   FOR UPDATE SKIP LOCKED
+               )
+               RETURNING id, payload, dedupe_key, source, enqueued_at""",
+            queue, max_items, claimed_by,
+        )
+        # Preserve claim (oldest-first) order for the batch file.
+        rows = sorted(rows, key=lambda r: r["enqueued_at"])
+        return [
+            {
+                "id": str(r["id"]),
+                "payload": r["payload"],
+                "dedupe_key": r["dedupe_key"],
+                "source": r["source"],
+                "enqueued_at": r["enqueued_at"].isoformat(),
+            }
+            for r in rows
+        ]
+
+
+async def ack_queue_items(pool: asyncpg.Pool, queue: str, ids: list[str]) -> int:
+    """claimed -> consumed for the given ids (scoped to `queue`). Returns the
+    number of rows flipped; ids not in claimed state are ignored."""
+    if not ids:
+        return 0
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE queue_items
+               SET state = 'consumed', consumed_at = now()
+               WHERE queue = $1 AND state = 'claimed' AND id = ANY($2::uuid[])""",
+            queue, ids,
+        )
+        return int(result.split()[-1])
+
+
+async def requeue_queue_items(
+    pool: asyncpg.Pool, queue: str, ids: list[str] | None = None,
+) -> int:
+    """claimed -> pending (recovery after a crashed/failed fire). With no ids,
+    requeues ALL claimed items in the queue. Returns rows flipped."""
+    async with pool.acquire() as conn:
+        if ids:
+            result = await conn.execute(
+                """UPDATE queue_items
+                   SET state = 'pending', claimed_at = NULL, claimed_by = NULL
+                   WHERE queue = $1 AND state = 'claimed' AND id = ANY($2::uuid[])""",
+                queue, ids,
+            )
+        else:
+            result = await conn.execute(
+                """UPDATE queue_items
+                   SET state = 'pending', claimed_at = NULL, claimed_by = NULL
+                   WHERE queue = $1 AND state = 'claimed'""",
+                queue,
+            )
+        return int(result.split()[-1])

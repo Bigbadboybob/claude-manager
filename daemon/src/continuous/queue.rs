@@ -1,0 +1,377 @@
+//! Continuous Tasks Phase 4 — the daemon side of named queues
+//! (DESIGN_SCRAPER_MIGRATION.md §3, DESIGN_CONTINUOUS_TASKS.md §9).
+//!
+//! The planning API OWNS the `queue_items` table (sql/012); this module is a
+//! thin blocking HTTP client over its `/queues/{queue}/*` endpoints — the
+//! daemon never grows a psql client (resolves the doc's §18 open question #2).
+//! Callers:
+//!
+//!   - the scheduler's Consumer due-check polls [`QueueClient::stats`]
+//!     (throttled by a per-queue depth cache in `scheduler.rs`);
+//!   - `methods::trigger` claims a batch at fire time
+//!     ([`QueueClient::claim`]), writes it to `<worktree>/.queue/`, and acks
+//!     it consumed after delivery ([`QueueClient::ack`]) — or releases it
+//!     back to pending on a spawn failure ([`QueueClient::requeue`]);
+//!   - the `enqueue` / `queue.stats` RPC methods route agent/operator calls
+//!     through [`QueueClient::enqueue`] / [`QueueClient::stats`].
+//!
+//! ureq (blocking) + the config-first env-fallback credential chain — both
+//! inherited from `crate::planning_client` (see its module docs for why).
+//! Errors reuse [`PlanningClientError`] so the ErrorCode mapping
+//! (`to_method_err`) stays uniform across every API-talking method.
+
+use serde::Deserialize;
+use std::time::Duration;
+
+use crate::planning_client::{resolve_api_token, resolve_api_url, PlanningClientError};
+
+/// One claimed queue item, as returned by `POST /queues/{queue}/claim`.
+/// `payload` is the producer's free-form JSON — the daemon never parses it,
+/// it lands verbatim in the batch file the fired agent reads.
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+pub struct QueueItem {
+    pub id: String,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub enqueued_at: String,
+}
+
+/// `GET /queues/{queue}` — the Consumer due-check's input.
+#[derive(Clone, Debug, Deserialize)]
+pub struct QueueStats {
+    pub pending: u64,
+    pub claimed: u64,
+    #[serde(default)]
+    pub oldest_pending_at: Option<String>,
+}
+
+/// Queue-name allowlist (twin of `task::validate_task_id`, distinct error
+/// wording). Validated BEFORE any URL construction so an untrusted queue name
+/// can't smuggle path segments into the API request.
+pub fn validate_queue_name(queue: &str) -> Result<(), String> {
+    if queue.is_empty() {
+        return Err("queue name is empty".to_string());
+    }
+    if queue.len() > 128 {
+        return Err(format!("queue name too long: {} > 128", queue.len()));
+    }
+    for c in queue.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(format!(
+                "disallowed character in queue name {:?}: {:?}",
+                queue, c
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Blocking client over the planning API's `/queues/*` endpoints. Constructed
+/// per call-site from the daemon.toml overrides (config-first, env-fallback —
+/// the same chain as `planning_client::propose_task`).
+#[derive(Debug)]
+pub struct QueueClient {
+    api_url: String,
+    api_token: String,
+}
+
+impl QueueClient {
+    /// Resolve credentials or fail with the same `MissingConfig` diagnostics
+    /// the planning client raises (operator knows what to set).
+    pub fn from_overrides(
+        api_url_override: Option<&str>,
+        api_token_override: Option<&str>,
+    ) -> Result<Self, PlanningClientError> {
+        Ok(QueueClient {
+            api_url: resolve_api_url(api_url_override)?,
+            api_token: resolve_api_token(api_token_override)?,
+        })
+    }
+
+    fn agent() -> ureq::Agent {
+        ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(Duration::from_secs(10)))
+                .build(),
+        )
+    }
+
+    fn auth(&self) -> String {
+        format!("Bearer {}", self.api_token)
+    }
+
+    /// Shared POST-JSON → JSON plumbing. Maps ureq errors onto the planning
+    /// client's variants (`StatusCode` → `ApiError`, transport → `Transport`).
+    fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, PlanningClientError> {
+        let endpoint = format!("{}{}", self.api_url, path);
+        let mut response = match Self::agent()
+            .post(&endpoint)
+            .header("Authorization", &self.auth())
+            .send_json(body)
+        {
+            Ok(r) => r,
+            Err(ureq::Error::StatusCode(status)) => {
+                return Err(PlanningClientError::ApiError {
+                    status,
+                    body: String::new(),
+                });
+            }
+            Err(e) => return Err(PlanningClientError::Transport(e.to_string())),
+        };
+        response
+            .body_mut()
+            .read_json::<serde_json::Value>()
+            .map_err(|e| PlanningClientError::Transport(format!("decode response: {}", e)))
+    }
+
+    fn get_json(&self, path: &str) -> Result<serde_json::Value, PlanningClientError> {
+        let endpoint = format!("{}{}", self.api_url, path);
+        let mut response = match Self::agent()
+            .get(&endpoint)
+            .header("Authorization", &self.auth())
+            .call()
+        {
+            Ok(r) => r,
+            Err(ureq::Error::StatusCode(status)) => {
+                return Err(PlanningClientError::ApiError {
+                    status,
+                    body: String::new(),
+                });
+            }
+            Err(e) => return Err(PlanningClientError::Transport(e.to_string())),
+        };
+        response
+            .body_mut()
+            .read_json::<serde_json::Value>()
+            .map_err(|e| PlanningClientError::Transport(format!("decode response: {}", e)))
+    }
+
+    /// `POST /queues/{queue}/items` — returns the API's
+    /// `{enqueued, deduped, id, depth}` verbatim (the RPC method forwards it).
+    pub fn enqueue(
+        &self,
+        queue: &str,
+        payload: &serde_json::Value,
+        dedupe_key: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<serde_json::Value, PlanningClientError> {
+        let mut body = serde_json::json!({ "payload": payload });
+        if let Some(k) = dedupe_key {
+            body["dedupe_key"] = serde_json::Value::String(k.to_string());
+        }
+        if let Some(s) = source {
+            body["source"] = serde_json::Value::String(s.to_string());
+        }
+        self.post_json(&format!("/queues/{}/items", queue), &body)
+    }
+
+    /// `GET /queues/{queue}` — pending/claimed depth + oldest pending age.
+    pub fn stats(&self, queue: &str) -> Result<QueueStats, PlanningClientError> {
+        let v = self.get_json(&format!("/queues/{}", queue))?;
+        serde_json::from_value(v)
+            .map_err(|e| PlanningClientError::Transport(format!("decode stats: {}", e)))
+    }
+
+    /// `POST /queues/{queue}/claim` — atomically claim up to `max_items`
+    /// oldest pending items (`claimed_by` is the audit label, `<task>#<seq>`).
+    pub fn claim(
+        &self,
+        queue: &str,
+        max_items: u32,
+        claimed_by: &str,
+    ) -> Result<Vec<QueueItem>, PlanningClientError> {
+        let body = serde_json::json!({ "max_items": max_items, "claimed_by": claimed_by });
+        let v = self.post_json(&format!("/queues/{}/claim", queue), &body)?;
+        let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
+        serde_json::from_value(items)
+            .map_err(|e| PlanningClientError::Transport(format!("decode claim items: {}", e)))
+    }
+
+    /// `POST /queues/{queue}/ack` — claimed → consumed. Returns rows flipped.
+    pub fn ack(&self, queue: &str, ids: &[String]) -> Result<u64, PlanningClientError> {
+        let body = serde_json::json!({ "ids": ids });
+        let v = self.post_json(&format!("/queues/{}/ack", queue), &body)?;
+        Ok(v.get("acked").and_then(|a| a.as_u64()).unwrap_or(0))
+    }
+
+    /// `POST /queues/{queue}/requeue` — claimed → pending (crash recovery).
+    pub fn requeue(&self, queue: &str, ids: &[String]) -> Result<u64, PlanningClientError> {
+        let body = serde_json::json!({ "ids": ids });
+        let v = self.post_json(&format!("/queues/{}/requeue", queue), &body)?;
+        Ok(v.get("requeued").and_then(|r| r.as_u64()).unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planning_client::spawn_stub_api_for_test;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::planning_client::test_env_lock()
+    }
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+    }
+
+    #[test]
+    fn validate_queue_name_allowlist() {
+        assert!(validate_queue_name("scraper-creation-proposals").is_ok());
+        assert!(validate_queue_name("q_1").is_ok());
+        assert!(validate_queue_name(&"x".repeat(128)).is_ok());
+        for bad in ["", "a/b", "a b", "a;b", "../x", &"x".repeat(129) as &str] {
+            assert!(validate_queue_name(bad).is_err(), "expected reject for {:?}", bad);
+        }
+    }
+
+    /// Wire-shape pin for `stats`: GET /queues/{q}, bearer auth, decode.
+    #[test]
+    fn stats_sends_get_and_decodes() {
+        let _g = env_lock();
+        clear_env();
+        let (port, captured) = spawn_stub_api_for_test(
+            200,
+            r#"{"queue":"q1","pending":7,"claimed":2,"oldest_pending_at":"2026-07-04T00:00:00+00:00"}"#,
+        );
+        let client = QueueClient::from_overrides(
+            Some(&format!("http://127.0.0.1:{}", port)),
+            Some("tok-q"),
+        )
+        .expect("client");
+        let stats = client.stats("q1").expect("stats ok");
+        assert_eq!(stats.pending, 7);
+        assert_eq!(stats.claimed, 2);
+        assert_eq!(
+            stats.oldest_pending_at.as_deref(),
+            Some("2026-07-04T00:00:00+00:00"),
+        );
+        let cap = captured.lock().unwrap();
+        let (method, path) = cap.method_and_path();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/queues/q1");
+        assert_eq!(cap.auth_header().as_deref(), Some("Bearer tok-q"));
+    }
+
+    /// Wire-shape pin for `claim`: POST body carries max_items + claimed_by;
+    /// items decode into `QueueItem`s with free-form payloads.
+    #[test]
+    fn claim_sends_post_and_decodes_items() {
+        let _g = env_lock();
+        clear_env();
+        let (port, captured) = spawn_stub_api_for_test(
+            200,
+            r#"{"items":[{"id":"11111111-1111-1111-1111-111111111111","payload":{"url":"https://x"},"dedupe_key":"x.com","source":"aux","enqueued_at":"2026-07-04T00:00:00+00:00"}]}"#,
+        );
+        let client = QueueClient::from_overrides(
+            Some(&format!("http://127.0.0.1:{}", port)),
+            Some("tok"),
+        )
+        .expect("client");
+        let items = client.claim("q1", 10, "scraper-creation#4").expect("claim ok");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(items[0].payload["url"], "https://x");
+        assert_eq!(items[0].dedupe_key.as_deref(), Some("x.com"));
+        let cap = captured.lock().unwrap();
+        let (method, path) = cap.method_and_path();
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/queues/q1/claim");
+        let body: serde_json::Value =
+            serde_json::from_str(cap.raw.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap();
+        assert_eq!(body["max_items"], 10);
+        assert_eq!(body["claimed_by"], "scraper-creation#4");
+    }
+
+    /// `ack` posts the id list and surfaces the acked count.
+    #[test]
+    fn ack_sends_ids_and_returns_count() {
+        let _g = env_lock();
+        clear_env();
+        let (port, captured) = spawn_stub_api_for_test(200, r#"{"acked":2}"#);
+        let client = QueueClient::from_overrides(
+            Some(&format!("http://127.0.0.1:{}", port)),
+            Some("tok"),
+        )
+        .expect("client");
+        let n = client
+            .ack("q1", &["a".to_string(), "b".to_string()])
+            .expect("ack ok");
+        assert_eq!(n, 2);
+        let cap = captured.lock().unwrap();
+        let (_, path) = cap.method_and_path();
+        assert_eq!(path, "/queues/q1/ack");
+        let body: serde_json::Value =
+            serde_json::from_str(cap.raw.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap();
+        assert_eq!(body["ids"], serde_json::json!(["a", "b"]));
+    }
+
+    /// `enqueue` forwards payload + optional dedupe_key/source and returns the
+    /// API's response verbatim.
+    #[test]
+    fn enqueue_sends_payload_and_forwards_response() {
+        let _g = env_lock();
+        clear_env();
+        let (port, captured) = spawn_stub_api_for_test(
+            200,
+            r#"{"enqueued":true,"deduped":false,"id":"abc","depth":3}"#,
+        );
+        let client = QueueClient::from_overrides(
+            Some(&format!("http://127.0.0.1:{}", port)),
+            Some("tok"),
+        )
+        .expect("client");
+        let payload = serde_json::json!({"url": "https://y", "market": "M"});
+        let resp = client
+            .enqueue("q2", &payload, Some("y.com"), Some("session:s1"))
+            .expect("enqueue ok");
+        assert_eq!(resp["enqueued"], true);
+        assert_eq!(resp["depth"], 3);
+        let cap = captured.lock().unwrap();
+        let (_, path) = cap.method_and_path();
+        assert_eq!(path, "/queues/q2/items");
+        let body: serde_json::Value =
+            serde_json::from_str(cap.raw.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap();
+        assert_eq!(body["payload"]["url"], "https://y");
+        assert_eq!(body["dedupe_key"], "y.com");
+        assert_eq!(body["source"], "session:s1");
+    }
+
+    /// Non-2xx surfaces as ApiError with the status (4xx → InvalidParams via
+    /// the shared `to_method_err`).
+    #[test]
+    fn api_4xx_maps_to_api_error() {
+        let _g = env_lock();
+        clear_env();
+        let (port, _) = spawn_stub_api_for_test(400, r#"{"detail":"bad queue"}"#);
+        let client = QueueClient::from_overrides(
+            Some(&format!("http://127.0.0.1:{}", port)),
+            Some("tok"),
+        )
+        .expect("client");
+        let err = client.stats("q1").expect_err("must reject");
+        match err {
+            PlanningClientError::ApiError { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected ApiError, got {:?}", other),
+        }
+    }
+
+    /// Missing creds fail with the planning client's MissingConfig diagnostics.
+    #[test]
+    fn missing_creds_fail_loudly() {
+        let _g = env_lock();
+        clear_env();
+        let err = QueueClient::from_overrides(None, None).expect_err("must reject");
+        assert!(matches!(err, PlanningClientError::MissingConfig("CM_API_URL")));
+    }
+}

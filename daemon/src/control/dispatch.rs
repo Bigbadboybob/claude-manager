@@ -564,6 +564,14 @@ pub fn dispatch_request(
         "report_done" => DispatchOutcome::Done(dispatch_report_done(state, req)),
         "resolve_stuck" => DispatchOutcome::Done(dispatch_resolve_stuck(state, req)),
 
+        // Continuous Tasks Phase 4 (DESIGN_SCRAPER_MIGRATION.md §3) — named
+        // queues. Both bimodal (Operator OR Session) like `trigger`:
+        // `enqueue` buffers a payload for a queue-fed Consumer task (a
+        // producer agent doesn't own the consumer, so there is no task-tree
+        // gate); `queue.stats` is a read-only depth probe.
+        "enqueue" => DispatchOutcome::Done(dispatch_enqueue(state, req)),
+        "queue.stats" => DispatchOutcome::Done(dispatch_queue_stats(state, req)),
+
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
             ErrorCode::UnknownMethod,
@@ -951,6 +959,32 @@ fn dispatch_report_done(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::report_done(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `enqueue` — Continuous Tasks Phase 4. Buffer a free-form payload into a
+/// named queue for a Consumer task to drain. Operator + Session callable
+/// (forged-frame defense only): the queue is a shared transport, so a Session
+/// producer needs no task-tree relationship to the consuming task.
+fn dispatch_enqueue(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
+    match methods::enqueue(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `queue.stats` — Continuous Tasks Phase 4. Read-only depth probe
+/// (`{queue, pending, claimed, oldest_pending_at}`), Operator + Session.
+fn dispatch_queue_stats(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) {
+        return resp;
+    }
+    match methods::queue_stats(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -1713,6 +1713,67 @@ def trigger(
 
 
 @mcp.tool()
+def enqueue(
+    queue: str,
+    payload: dict,
+    dedupe_key: str = "",
+    source: str = "",
+) -> dict:
+    """Buffer an item into a named queue for a queue-fed continuous task.
+
+    Queues are the async input surface of Consumer-scheduled continuous tasks
+    (Continuous Tasks Phase 4): producers enqueue free-form JSON payloads; the
+    consuming task's scheduler claims them in batches (when the queue is deep
+    enough, or a batching window has elapsed) and delivers them to the
+    orchestrator as a staged batch file. Example: pushing a scraper-creation
+    proposal into `scraper-creation-proposals`.
+
+    The payload schema is a soft convention between you and the consuming
+    task's prompt — the daemon never parses it. Keep items small (proposals /
+    pointers, not blobs; 64 KiB cap).
+
+    Args:
+        queue: Queue name ([A-Za-z0-9_-], ≤128 chars). Enqueueing to a queue
+            no task consumes is allowed (items wait).
+        payload: Free-form JSON object for the consumer.
+        dedupe_key: Optional coalescing key — if an item with the same key is
+            already pending/claimed in this queue, this enqueue is dropped as
+            a duplicate ({"deduped": true}). After the earlier item is
+            consumed, the same key may enqueue again.
+        source: Optional provenance label; defaults to your session identity.
+
+    Returns:
+        {"enqueued": bool, "deduped": bool, "id": str | None, "depth": int}
+        where depth is the queue's pending count after the call.
+
+    Enqueueing only buffers data — it does not spawn anything itself, so you
+    do NOT need to ask the user first (the consuming task's own schedule
+    governs when work runs).
+    """
+    params: dict = {"queue": queue, "payload": payload}
+    if dedupe_key:
+        params["dedupe_key"] = dedupe_key
+    if source:
+        params["source"] = source
+    return control_client.call("enqueue", params)
+
+
+@mcp.tool()
+def queue_depth(queue: str) -> dict:
+    """Read a named queue's depth (Continuous Tasks Phase 4). Read-only.
+
+    Args:
+        queue: Queue name ([A-Za-z0-9_-], ≤128 chars).
+
+    Returns:
+        {"queue": str, "pending": int, "claimed": int,
+         "oldest_pending_at": str | None}. `pending` items await a batch
+        claim; `claimed` items are in (or stranded from) an in-flight batch.
+    """
+    return control_client.call("queue.stats", {"queue": queue})
+
+
+@mcp.tool()
 def report_done(reason: str | None = None) -> dict:
     """Signal that YOUR continuous-task run is complete (Continuous Tasks Phase 3b).
 

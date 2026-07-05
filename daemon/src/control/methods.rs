@@ -7439,13 +7439,19 @@ enum FireAbort {
 /// ONCE. Bash runs (run-and-exit → clean exit signals Done) and PERSISTENT
 /// sessions (reuse one live PTY, re-delivered each tick — no re-fire gate) are
 /// returned unchanged. Verified on cm-manager 2026-06-27.
+///
+/// Phase 4: a CONSUMER task gets the instruction in BOTH run modes — the
+/// scheduler's Consumer due-loop gates on `last_run.status != Running` for
+/// persistent too (a mid-run batch paste is never intended), so a persistent
+/// Consumer that never signals done never drains its queue again.
 fn with_completion_instruction(
     prompt: String,
     engine: crate::continuous::task::Engine,
     run_mode: crate::continuous::task::RunMode,
+    is_consumer: bool,
 ) -> String {
     use crate::continuous::task::{Engine, RunMode};
-    if engine == Engine::Bash || run_mode == RunMode::Persistent {
+    if engine == Engine::Bash || (run_mode == RunMode::Persistent && !is_consumer) {
         return prompt;
     }
     format!(
@@ -7454,6 +7460,152 @@ fn with_completion_instruction(
          signal before starting the next run.",
         prompt
     )
+}
+
+/// A staged Consumer batch (Phase 4): items claimed from the task's queue and
+/// written to `<worktree>/.queue/batch-<seq>.json`, awaiting delivery + ack.
+struct ConsumerBatch {
+    queue: String,
+    file: String,
+    count: usize,
+    ids: Vec<String>,
+}
+
+/// Queue client bound to the daemon's planning-API creds (config-first,
+/// env-fallback — the same chain every API-talking method uses).
+fn continuous_queue_client(
+    state_arc: &Arc<Mutex<DaemonState>>,
+) -> Result<crate::continuous::queue::QueueClient, (ErrorCode, String)> {
+    let (api_url, api_token) = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (s.config.api_url.clone(), s.config.api_token.clone())
+    };
+    crate::continuous::queue::QueueClient::from_overrides(Some(&api_url), Some(&api_token))
+        .map_err(|e| e.to_method_err())
+}
+
+/// Consumer fire (Phase 4): claim up to `batch_max` pending items and stage
+/// them as a JSON batch file under the task's worktree. `Ok(None)` for
+/// non-Consumer schedules. Called AFTER the `in_flight` guard is armed (one
+/// claimer per fire) and BEFORE the executor (the delivered prompt points at
+/// the staged file). A zero-item claim still stages a well-formed empty batch —
+/// a manual `run_now` on a drained queue delivers cleanly.
+///
+/// Failure semantics (claimed-at-fire, DESIGN_SCRAPER_MIGRATION.md §2): a
+/// claim/stage failure fails the FIRE (scheduler backs off). A stage failure
+/// releases the claim best-effort; items a release couldn't reach stay
+/// `claimed` — visible via `queue.stats`, recoverable via the requeue endpoint.
+fn stage_consumer_batch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task: &crate::continuous::task::ContinuousTask,
+    seq: u64,
+) -> Result<Option<ConsumerBatch>, (ErrorCode, String)> {
+    let crate::continuous::task::Schedule::Consumer {
+        queue, batch_max, ..
+    } = &task.schedule
+    else {
+        return Ok(None);
+    };
+    crate::continuous::queue::validate_queue_name(queue)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("trigger: {}", e)))?;
+    let client = continuous_queue_client(state_arc)?;
+    let claimed_by = format!("{}#{}", task.task_id, seq);
+    let items = client
+        .claim(queue, (*batch_max).max(1), &claimed_by)
+        .map_err(|e| e.to_method_err())?;
+    let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+    let dir = std::path::Path::new(&task.worktree_path).join(".queue");
+    let write_result = std::fs::create_dir_all(&dir).and_then(|()| {
+        let file = dir.join(format!("batch-{}.json", seq));
+        let doc = serde_json::json!({
+            "queue": queue,
+            "task_id": task.task_id,
+            "seq": seq,
+            "claimed_at": crate::continuous::task::now_unix(),
+            "items": items,
+        });
+        std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&doc).unwrap_or_default(),
+        )
+        .map(|()| file)
+    });
+    match write_result {
+        Ok(file) => Ok(Some(ConsumerBatch {
+            queue: queue.clone(),
+            file: file.display().to_string(),
+            count: ids.len(),
+            ids,
+        })),
+        Err(e) => {
+            release_consumer_batch(state_arc, queue, &ids, &task.task_id);
+            Err((
+                ErrorCode::Internal,
+                format!(
+                    "trigger: staging queue batch for '{}' under {}: {}",
+                    task.task_id, task.worktree_path, e
+                ),
+            ))
+        }
+    }
+}
+
+/// Best-effort claimed→consumed ack after a successful delivery. A failed or
+/// partial ack logs loudly and leaves the stragglers `claimed` — the fired
+/// runlog line already records the batch, and `queue.stats` surfaces them.
+fn ack_consumer_batch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    queue: &str,
+    ids: &[String],
+    task_id: &str,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    match continuous_queue_client(state_arc)
+        .and_then(|c| c.ack(queue, ids).map_err(|e| e.to_method_err()))
+    {
+        Ok(n) if n as usize == ids.len() => {}
+        Ok(n) => eprintln!(
+            "cm-daemon: trigger acked only {}/{} queue items for '{}' — the rest \
+             stay claimed (queue.stats / requeue to recover)",
+            n,
+            ids.len(),
+            task_id,
+        ),
+        Err((_, msg)) => eprintln!(
+            "cm-daemon: trigger failed to ack {} queue items for '{}': {} — they \
+             stay claimed (queue.stats / requeue to recover)",
+            ids.len(),
+            task_id,
+            msg,
+        ),
+    }
+}
+
+/// Best-effort claimed→pending release after a failed fire (spawn/stage
+/// failure). Items a failed release strands stay `claimed` — same recovery
+/// story as a failed ack.
+fn release_consumer_batch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    queue: &str,
+    ids: &[String],
+    task_id: &str,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    if let Err((_, msg)) = continuous_queue_client(state_arc)
+        .and_then(|c| c.requeue(queue, ids).map_err(|e| e.to_method_err()))
+    {
+        eprintln!(
+            "cm-daemon: trigger failed to release {} claimed queue items for '{}': {} \
+             — they stay claimed (queue.stats / requeue to recover)",
+            ids.len(),
+            task_id,
+            msg,
+        );
+    }
 }
 
 /// Returns `{fired:true, fire_token, session_uid, run_mode:"fresh"|"persistent"}`
@@ -7540,8 +7692,18 @@ pub fn trigger(
         task.default_prompt.clone()
     };
     // Auto-signal completion for FRESH agent runs so a periodic task re-fires
-    // (no per-skill `report_done` footgun). No-op for bash / persistent.
-    let resolved_prompt = with_completion_instruction(resolved_prompt, task.engine, task.run_mode);
+    // (no per-skill `report_done` footgun). No-op for bash / (non-Consumer)
+    // persistent; a Consumer gets it in both run modes (its due-loop gates on
+    // the Running status either way).
+    let resolved_prompt = with_completion_instruction(
+        resolved_prompt,
+        task.engine,
+        task.run_mode,
+        matches!(
+            task.schedule,
+            crate::continuous::task::Schedule::Consumer { .. }
+        ),
+    );
 
     // Provenance label for the run record + audit line.
     let trigger_source = match caller {
@@ -7643,6 +7805,39 @@ pub fn trigger(
     // run_mode label for the run record, audit line, and response.
     let run_mode_label = if is_persistent { "persistent" } else { "fresh" };
 
+    // ---- Consumer batch claim (Phase 4) -------------------------------------
+    // AFTER the in_flight guard (exactly one claimer per fire) and BEFORE the
+    // executor (the delivered prompt points at the staged batch file). A
+    // claim/stage failure fails the fire like a spawn failure would — clear
+    // the guard, audit, surface the error (the scheduler backs off).
+    let consumer_batch = match stage_consumer_batch(state_arc, &task, seq) {
+        Ok(b) => b,
+        Err(e) => {
+            continuous_clear_in_flight_after_failure(
+                &p.task_id,
+                seq,
+                &fire_token,
+                &session_uid,
+                run_mode_label,
+                &trigger_source,
+                &e.1,
+            );
+            return Err(e);
+        }
+    };
+    // Point the agent at the staged batch. The file (not an inline paste)
+    // keeps the PTY delivery small — DESIGN_SCRAPER_MIGRATION.md §2.
+    let resolved_prompt = match &consumer_batch {
+        Some(b) => format!(
+            "{}\n\n---\nQueue batch: {} item(s) claimed from queue '{}' and staged \
+             at {} — a JSON file: {{queue, task_id, seq, claimed_at, items: [{{id, \
+             payload, dedupe_key, source, enqueued_at}}]}}. Read it and process \
+             every item this run.",
+            resolved_prompt, b.count, b.queue, b.file,
+        ),
+        None => resolved_prompt,
+    };
+
     // ---- Executor (branched on run_mode) -----------------------------------
     // Lock discipline: NO DaemonState mutex and NO continuous-task flock is held
     // across a spawn or a prompt-delivery PTY write — `start_session` re-acquires
@@ -7726,6 +7921,9 @@ pub fn trigger(
             ) {
                 Ok(f) => f,
                 Err(e) => {
+                    if let Some(b) = &consumer_batch {
+                        release_consumer_batch(state_arc, &b.queue, &b.ids, &p.task_id);
+                    }
                     continuous_clear_in_flight_after_failure(
                         &p.task_id,
                         seq,
@@ -7740,6 +7938,9 @@ pub fn trigger(
             };
 
             if let Err(e) = continuous_fresh_spawn(state_arc, &full) {
+                if let Some(b) = &consumer_batch {
+                    release_consumer_batch(state_arc, &b.queue, &b.ids, &p.task_id);
+                }
                 continuous_clear_in_flight_after_failure(
                     &p.task_id,
                     seq,
@@ -7804,7 +8005,30 @@ pub fn trigger(
         );
     }
 
+    // Consumer (Phase 4): the batch is delivered — ack it consumed
+    // (best-effort; failures leave items claimed + logged).
+    if let Some(b) = &consumer_batch {
+        ack_consumer_batch(state_arc, &b.queue, &b.ids, &p.task_id);
+    }
+
     // Append the audit line (best-effort; the fire already happened).
+    // `detail` carries the caller's free-form `args` blob unparsed (the daemon
+    // does NOT interpret it), plus the staged batch pointer for a Consumer
+    // fire.
+    let detail = match &consumer_batch {
+        Some(b) => {
+            let mut d = json!({
+                "queue": b.queue,
+                "batch_count": b.count,
+                "batch_file": b.file,
+            });
+            if let Some(args) = &p.args {
+                d["args"] = args.clone();
+            }
+            Some(d)
+        }
+        None => p.args.clone(),
+    };
     if let Err(e) =
         crate::continuous::runlog::ContinuousRunLog::append(&crate::continuous::runlog::RunLogLine {
             seq,
@@ -7816,10 +8040,7 @@ pub fn trigger(
             run_mode: Some(run_mode_label.to_string()),
             trigger_source: Some(trigger_source.clone()),
             status: Some("running".to_string()),
-            // Carry the caller's free-form `args` blob into the audit line
-            // unparsed — the daemon does NOT interpret it (later phases thread
-            // it to the agent). `None` when the caller sent no args.
-            detail: p.args.clone(),
+            detail,
         })
     {
         eprintln!(
@@ -7833,6 +8054,85 @@ pub fn trigger(
         "fire_token": fire_token,
         "session_uid": session_uid,
         "run_mode": run_mode_label,
+    }))
+}
+
+// ===================================================================
+// Continuous Tasks — Phase 4 (named queues). The daemon-side write/read
+// surface over the planning API's queue endpoints: `enqueue` buffers a
+// payload for a Consumer task (agents + operators; e.g. the Wave-4
+// signal-source-investigation agent pushing scraper proposals), and
+// `queue.stats` reads depth. The queue is a shared transport — enqueue
+// is deliberately NOT task-tree-scoped (a producer doesn't own the
+// consumer); the payload is free-form JSON the daemon never parses.
+// ===================================================================
+
+#[derive(Deserialize)]
+struct EnqueueParams {
+    queue: String,
+    payload: Value,
+    #[serde(default)]
+    dedupe_key: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// `enqueue(queue, payload, dedupe_key?, source?)` — buffer one item into a
+/// named queue (Operator + Session). Forwards the API's
+/// `{enqueued, deduped, id, depth}` verbatim. An empty/missing `source`
+/// defaults to the caller's identity for provenance.
+pub fn enqueue(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: EnqueueParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("enqueue params: {}", e)))?;
+    crate::continuous::queue::validate_queue_name(&p.queue)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("enqueue: {}", e)))?;
+    // Mirror the API's shape check for a clean pre-HTTP error.
+    if !(p.payload.is_object() || p.payload.is_array()) {
+        return Err((
+            ErrorCode::InvalidParams,
+            "enqueue: payload must be a JSON object or array".to_string(),
+        ));
+    }
+    let source = p
+        .source
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| match caller {
+            Caller::Operator(_) => "operator".to_string(),
+            Caller::Session(s) => format!("session:{}", s.session_uid),
+        });
+    let client = continuous_queue_client(state_arc)?;
+    client
+        .enqueue(&p.queue, &p.payload, p.dedupe_key.as_deref(), Some(&source))
+        .map_err(|e| e.to_method_err())
+}
+
+#[derive(Deserialize)]
+struct QueueStatsParams {
+    queue: String,
+}
+
+/// `queue.stats(queue)` — read-only depth probe (Operator + Session):
+/// `{queue, pending, claimed, oldest_pending_at}`.
+pub fn queue_stats(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    _caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: QueueStatsParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.stats params: {}", e)))?;
+    crate::continuous::queue::validate_queue_name(&p.queue)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.stats: {}", e)))?;
+    let client = continuous_queue_client(state_arc)?;
+    let stats = client.stats(&p.queue).map_err(|e| e.to_method_err())?;
+    Ok(json!({
+        "queue": p.queue,
+        "pending": stats.pending,
+        "claimed": stats.claimed,
+        "oldest_pending_at": stats.oldest_pending_at,
     }))
 }
 
@@ -20515,29 +20815,197 @@ mod tests {
     }
 
     /// FRESH agent (claude/codex) prompts get the `report_done` completion
-    /// instruction appended (so a periodic task re-fires); bash + persistent are
-    /// left unchanged.
+    /// instruction appended (so a periodic task re-fires); bash + (non-Consumer)
+    /// persistent are left unchanged. A CONSUMER persistent prompt DOES get it —
+    /// the Consumer due-loop gates on Running in both run modes (Phase 4).
     #[test]
     fn completion_instruction_appended_for_fresh_agent_only() {
         use crate::continuous::task::{Engine, RunMode};
         let p = "do the triage".to_string();
-        let fresh_claude = with_completion_instruction(p.clone(), Engine::Claude, RunMode::Fresh);
+        let fresh_claude =
+            with_completion_instruction(p.clone(), Engine::Claude, RunMode::Fresh, false);
         assert!(fresh_claude.starts_with("do the triage"), "original prompt preserved");
         assert!(fresh_claude.contains("report_done"), "fresh claude gets the signal");
         assert!(
-            with_completion_instruction(p.clone(), Engine::Codex, RunMode::Fresh).contains("report_done"),
+            with_completion_instruction(p.clone(), Engine::Codex, RunMode::Fresh, false)
+                .contains("report_done"),
             "fresh codex gets the signal",
         );
         assert_eq!(
-            with_completion_instruction(p.clone(), Engine::Bash, RunMode::Fresh),
+            with_completion_instruction(p.clone(), Engine::Bash, RunMode::Fresh, false),
             p,
             "bash runs-and-exits — no signal appended",
         );
         assert_eq!(
-            with_completion_instruction(p.clone(), Engine::Claude, RunMode::Persistent),
+            with_completion_instruction(p.clone(), Engine::Claude, RunMode::Persistent, false),
             p,
             "persistent reuses its session — no re-fire gate, no signal appended",
         );
+        assert!(
+            with_completion_instruction(p.clone(), Engine::Claude, RunMode::Persistent, true)
+                .contains("report_done"),
+            "a persistent CONSUMER gets the signal — its due-loop gates on Running",
+        );
+        assert_eq!(
+            with_completion_instruction(p.clone(), Engine::Bash, RunMode::Fresh, true),
+            p,
+            "bash stays exempt even as a Consumer (run-and-exit signals Done)",
+        );
+    }
+
+    /// Phase 4: a Consumer fire claims a batch from its queue, stages it as
+    /// `<worktree>/.queue/batch-<seq>.json`, delivers, and acks the items
+    /// consumed. Wire-shape pins on the claim (max_items, claimed_by) and ack
+    /// (ids) requests; the runlog's fired line carries the batch pointer.
+    #[test]
+    fn trigger_consumer_claims_stages_and_acks_batch() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+                ("POST", "/queues/props/claim") => (
+                    200,
+                    r#"{"items":[
+                        {"id":"11111111-1111-1111-1111-111111111111","payload":{"url":"https://a"},"dedupe_key":"a.com","source":"aux","enqueued_at":"2026-07-04T00:00:00+00:00"},
+                        {"id":"22222222-2222-2222-2222-222222222222","payload":{"url":"https://b"},"dedupe_key":null,"source":null,"enqueued_at":"2026-07-04T00:00:01+00:00"}
+                    ]}"#
+                        .to_string(),
+                ),
+                ("POST", "/queues/props/ack") => (200, r#"{"acked":2}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+
+            let mut task = continuous_task(
+                "ct-consumer",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            task.schedule = crate::continuous::task::Schedule::Consumer {
+                queue: "props".into(),
+                batch_max: 5,
+                window_secs: 21_600,
+                depth_threshold: 3,
+            };
+            crate::continuous::task::save(&task).expect("save");
+
+            arm_continuous_spawn_spy_for_test();
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let resp = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-consumer" }),
+            )
+            .expect("trigger ok");
+            assert_eq!(resp["fired"], json!(true));
+            let _ = take_continuous_spawn_spy_for_test();
+
+            // The staged batch file: verbatim items under the worktree.
+            let batch_path = wt.join(".queue").join("batch-1.json");
+            let batch: Value = serde_json::from_str(
+                &std::fs::read_to_string(&batch_path).expect("batch file exists"),
+            )
+            .expect("batch file is JSON");
+            assert_eq!(batch["queue"], "props");
+            assert_eq!(batch["task_id"], "ct-consumer");
+            assert_eq!(batch["seq"], 1);
+            let items = batch["items"].as_array().expect("items array");
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0]["payload"]["url"], "https://a");
+            assert_eq!(items[1]["id"], "22222222-2222-2222-2222-222222222222");
+
+            // Wire shape: claim (max_items = batch_max, claimed_by = task#seq)
+            // then ack (both ids).
+            let reqs = stub.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "claim then ack: {:?}", reqs);
+            assert_eq!(reqs[0].path, "/queues/props/claim");
+            let claim_body: Value = serde_json::from_str(&reqs[0].body).unwrap();
+            assert_eq!(claim_body["max_items"], 5);
+            assert_eq!(claim_body["claimed_by"], "ct-consumer#1");
+            assert_eq!(reqs[1].path, "/queues/props/ack");
+            let ack_body: Value = serde_json::from_str(&reqs[1].body).unwrap();
+            assert_eq!(
+                ack_body["ids"],
+                json!([
+                    "11111111-1111-1111-1111-111111111111",
+                    "22222222-2222-2222-2222-222222222222"
+                ]),
+            );
+            drop(reqs);
+
+            // The fired audit line carries the batch pointer.
+            let runs = std::fs::read_to_string(
+                crate::continuous::task::runs_log_path("ct-consumer"),
+            )
+            .expect("runs.jsonl");
+            assert!(runs.contains("\"batch_count\":2"), "batch detail: {}", runs);
+            assert!(runs.contains("batch-1.json"), "batch file pointer: {}", runs);
+
+            clear_api_env();
+        });
+    }
+
+    /// Phase 4 failure path: when staging the batch file fails AFTER the claim
+    /// (worktree path is not a directory), the claim is released (requeue), the
+    /// in_flight guard clears, and the fire surfaces as an error — items are
+    /// not stranded.
+    #[test]
+    fn trigger_consumer_stage_failure_releases_claim() {
+        with_continuous_home(|home| {
+            // Worktree path is a FILE — `.queue/` creation must fail.
+            let wt = home.join("not-a-dir");
+            std::fs::write(&wt, "occupied").unwrap();
+            let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+                ("POST", "/queues/props/claim") => (
+                    200,
+                    r#"{"items":[{"id":"33333333-3333-3333-3333-333333333333","payload":{"u":1},"dedupe_key":null,"source":null,"enqueued_at":"2026-07-04T00:00:00+00:00"}]}"#
+                        .to_string(),
+                ),
+                ("POST", "/queues/props/requeue") => (200, r#"{"requeued":1}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+
+            let mut task = continuous_task(
+                "ct-consumer-fail",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            task.schedule = crate::continuous::task::Schedule::Consumer {
+                queue: "props".into(),
+                batch_max: 5,
+                window_secs: 60,
+                depth_threshold: 1,
+            };
+            crate::continuous::task::save(&task).expect("save");
+
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let err = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-consumer-fail" }),
+            )
+            .expect_err("stage failure must fail the fire");
+            assert_eq!(err.0, ErrorCode::Internal);
+
+            // Claim was released, guard cleared.
+            let reqs = stub.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "claim then requeue: {:?}", reqs);
+            assert_eq!(reqs[1].path, "/queues/props/requeue");
+            let rq_body: Value = serde_json::from_str(&reqs[1].body).unwrap();
+            assert_eq!(
+                rq_body["ids"],
+                json!(["33333333-3333-3333-3333-333333333333"]),
+            );
+            drop(reqs);
+            let reloaded =
+                crate::continuous::task::load_one("ct-consumer-fail").unwrap();
+            assert!(reloaded.in_flight.is_none(), "guard cleared on failure");
+
+            clear_api_env();
+        });
     }
 
     /// A caller-supplied `fire_token` that equals `last_run.fire_token` is a
