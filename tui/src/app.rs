@@ -4999,12 +4999,14 @@ impl App {
                             &ws,
                             (cols, rows),
                         ) {
-                            Some(ts) => ws.sessions.push(ts),
-                            None => {
-                                // Session-gone on a REACHABLE host (for_host
-                                // succeeded above). Preserve THIS entry only;
-                                // do NOT mark the host unreachable — sibling
-                                // live sessions on it must still reattach.
+                            Ok(ts) => ws.sessions.push(ts),
+                            Err(_) => {
+                                // Attach failed on a REACHABLE host (for_host
+                                // succeeded above) — session gone OR a transient
+                                // transport hiccup. Either way preserve THIS
+                                // entry only; do NOT mark the host unreachable —
+                                // sibling live sessions on it must still reattach,
+                                // and the deferred-reattach drain retries it.
                                 eprintln!(
                                     "cm-tui: skip restore of remote session {} \
                                      ({}) on host {} (session gone; entry \
@@ -5890,15 +5892,19 @@ impl App {
         entry: &ManifestEntry,
         ws: &Workspace,
         (cols, rows): (u16, u16),
-    ) -> Option<TerminalSession> {
+    ) -> Result<TerminalSession, crate::attach_worker::AttachFailureKind> {
+        use crate::attach_worker::AttachFailureKind;
         // A reattach binds to an EXISTING daemon session by uid; an empty
-        // uid (legacy entry) has nothing to attach to.
+        // uid (legacy entry) has nothing to attach to — treat as gone.
         if entry.uid.is_empty() {
-            return None;
+            return Err(AttachFailureKind::SessionGone);
         }
         // The remote worktree path (the Phase-3 create/add stored it on the
-        // workspace). Needed as the attach's working_dir.
-        let wt = ws.worktree_path.clone()?;
+        // workspace). Needed as the attach's working_dir. A missing path is a
+        // setup/transient condition, not a gone session — keep retrying.
+        let Some(wt) = ws.worktree_path.clone() else {
+            return Err(AttachFailureKind::TransportDown);
+        };
 
         let session = match try_attach_via_daemon_with_deps(
             &self.host_pool,
@@ -5921,19 +5927,25 @@ impl App {
         ) {
             Ok(s) => s,
             Err(e) => {
+                let kind = if crate::client_session::attach_failure_is_session_gone(&e) {
+                    AttachFailureKind::SessionGone
+                } else {
+                    AttachFailureKind::TransportDown
+                };
                 eprintln!(
                     "cm-tui: remote reattach of session {} ({}) on host {} \
-                     failed: {} (entry preserved for next save)",
+                     failed: {} ({:?}; entry preserved for next save)",
                     entry.uid,
                     entry.label,
                     entry.host_id.as_str(),
                     e,
+                    kind,
                 );
-                return None;
+                return Err(kind);
             }
         };
 
-        Some(Self::build_remote_terminal_session(entry, session))
+        Ok(Self::build_remote_terminal_session(entry, session))
     }
 
     /// Build the `TerminalSession` slot for a remote reattach/adopt from its
@@ -6010,11 +6022,25 @@ impl App {
             .collect();
         let pending = std::mem::take(&mut self.pending_remote_reattach);
         let mut still_pending: Vec<PendingRemoteReattach> = Vec::new();
+        // At most one dispatch per host per tick. The attach WORKER re-warms a
+        // dead/respawning tunnel itself (`try_attach_via_daemon_with_deps` →
+        // `host_pool.for_host` → `ensure_alive`), and its `SshTunnel::spawn`
+        // blocks ~1-3s; capping to one in-flight attach per host means an
+        // outage triggers ONE respawn attempt per tick rather than one per
+        // pending session (a genuinely-offline host would otherwise queue a
+        // spawn storm on the single worker thread). Remaining sessions on the
+        // same host ride the next tick.
+        let mut dispatched_hosts: std::collections::HashSet<cm_daemon::host_id::HostId> =
+            std::collections::HashSet::new();
         for p in pending {
-            if self.host_pool.live_socket_path(&p.entry.host_id).is_none() {
-                still_pending.push(p);
-                continue;
-            }
+            // NOTE: no `live_socket_path` gate here (removed in
+            // `cm/fix-frozen-remote-session`). That non-blocking probe never
+            // respawns a dead tunnel, and the only code that does
+            // (`ensure_alive`) was reachable ONLY from the off-thread watch
+            // consumers — so while the tunnel was down/respawning the drain
+            // gated off and could not self-heal, waiting on a 30s-backed-off
+            // consumer. Dispatching to the worker (which re-warms via
+            // `for_host`) makes the reattach path itself rebuild the tunnel.
             let Some(ws_idx) = self.workspaces.iter().position(|w| w.id == p.ws_id) else {
                 still_pending.push(p);
                 continue;
@@ -6038,6 +6064,11 @@ impl App {
                 still_pending.push(p);
                 continue;
             };
+            // One dispatch per host per tick (see `dispatched_hosts`).
+            if !dispatched_hosts.insert(p.entry.host_id.clone()) {
+                still_pending.push(p);
+                continue;
+            }
             let cleaned = untag_stale_workflow(&p.entry, &active_run_ids);
             let entry_for_attach = cleaned.unwrap_or_else(|| p.entry.clone());
             let req = crate::attach_worker::AttachRequest {
@@ -6115,8 +6146,24 @@ impl App {
                 }
                 None => {
                     if let Some(mut p) = queued {
-                        p.attempts = p.attempts.saturating_add(1);
                         p.last_attempt_at = Some(Instant::now());
+                        // Only a daemon-confirmed NotFound (SessionGone) burns
+                        // the give-up budget. TransportDown (tunnel down /
+                        // respawning, connect refused, RPC I/O timeout, any
+                        // non-NotFound code) means the daemon session is almost
+                        // certainly still alive — keep the slot reconnecting and
+                        // retry indefinitely (the worker re-warms the tunnel on
+                        // the next dispatch), so a deploy restart or tunnel churn
+                        // never settles a live session to `exited`.
+                        let session_gone = matches!(
+                            result.failure,
+                            Some(crate::attach_worker::AttachFailureKind::SessionGone)
+                        );
+                        if !session_gone {
+                            self.pending_remote_reattach.push(p);
+                            continue;
+                        }
+                        p.attempts = p.attempts.saturating_add(1);
                         let reconnecting =
                             self.reconnecting_sessions.contains(&result.entry.uid);
                         if p.attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
@@ -6275,7 +6322,7 @@ impl App {
                         )
                     };
                     match outcome {
-                        Some(fresh) => {
+                        Ok(fresh) => {
                             {
                                 let slot = &mut self.workspaces[ws_idx]
                                     .sessions[existing_idx];
@@ -6293,18 +6340,32 @@ impl App {
                                 p.attempts + 1,
                             );
                         }
-                        None => {
-                            // `live_socket_path` only proves the LOCAL
-                            // forwarded socket exists and the ssh child is
-                            // alive — the `session.attach`/`attach.open` RPCs
-                            // can still fail TRANSIENTLY in the race right
-                            // after a tunnel respawn while the daemon session
-                            // is very much alive. Giving up here on one
-                            // failure would reintroduce the freeze. Mirror the
-                            // manifest.watch consumer: keep retrying with a
-                            // bound, and only treat the session as genuinely
-                            // gone after a sustained run of failures with the
-                            // tunnel up.
+                        Err(crate::attach_worker::AttachFailureKind::TransportDown) => {
+                            // Transport hiccup (tunnel down/respawning, connect
+                            // refused, RPC I/O timeout) — the daemon session is
+                            // almost certainly still alive. Keep the slot
+                            // reconnecting and retry WITHOUT burning the give-up
+                            // budget, so a deploy restart / tunnel churn never
+                            // settles a live session to `exited`. Giving up here
+                            // would reintroduce the freeze.
+                            eprintln!(
+                                "cm-tui: reattach for remote session {} ({}) on \
+                                 host {} failed (transport down) — keeping \
+                                 reconnecting, will retry",
+                                p.entry.uid,
+                                p.entry.label,
+                                p.entry.host_id.as_str(),
+                            );
+                            still_pending.push(PendingRemoteReattach {
+                                last_attempt_at: Some(now),
+                                ..p
+                            });
+                        }
+                        Err(crate::attach_worker::AttachFailureKind::SessionGone) => {
+                            // The daemon reached us and reported NotFound — the
+                            // session is genuinely gone. Count toward the cap;
+                            // at the cap settle the slot to `exited` (revivable
+                            // via A-r).
                             let attempts = p.attempts + 1;
                             if attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
                                 {
@@ -6316,23 +6377,14 @@ impl App {
                                 reattached_any = true;
                                 eprintln!(
                                     "cm-tui: reconnecting remote session {} ({}) \
-                                     on host {} still unreachable after {} \
-                                     attempts — marking exited",
+                                     on host {} gone after {} attempts — marking \
+                                     exited",
                                     p.entry.uid,
                                     p.entry.label,
                                     p.entry.host_id.as_str(),
                                     attempts,
                                 );
                             } else {
-                                eprintln!(
-                                    "cm-tui: reattach attempt {} for remote \
-                                     session {} ({}) on host {} failed (tunnel \
-                                     up) — keeping reconnecting, will retry",
-                                    attempts,
-                                    p.entry.uid,
-                                    p.entry.label,
-                                    p.entry.host_id.as_str(),
-                                );
                                 still_pending.push(PendingRemoteReattach {
                                     attempts,
                                     last_attempt_at: Some(now),
@@ -6371,20 +6423,27 @@ impl App {
                 self.try_reattach_remote_session(entry_for_attach, ws_ref, (cols, rows))
             };
             match outcome {
-                Some(ts) => {
+                Ok(ts) => {
                     self.workspaces[ws_idx].sessions.push(ts);
                     self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
                     reattached_any = true;
                 }
-                None => {
-                    // `try_reattach_remote_session` returns None on ANY attach
-                    // error — including a TRANSIENT failure in the race right
-                    // after a tunnel respawn while the daemon session is alive.
-                    // Pre-fix this dropped the entry from the queue on the FIRST
-                    // failure (stranding a live session until the next restart);
-                    // mirror the reconnecting path instead — retry with a bound,
-                    // only giving up (leaving the raw entry preserved in
-                    // `skipped_manifest_entries`) after a sustained run.
+                Err(crate::attach_worker::AttachFailureKind::TransportDown) => {
+                    // Transport hiccup (tunnel down/respawning, connect refused,
+                    // RPC I/O timeout) — the daemon session is almost certainly
+                    // alive. Keep retrying WITHOUT burning the give-up budget so
+                    // an offline/churning host never strands a live restore-
+                    // deferred session; the raw entry stays in
+                    // `skipped_manifest_entries` meanwhile.
+                    still_pending.push(PendingRemoteReattach {
+                        last_attempt_at: Some(now),
+                        ..p
+                    });
+                }
+                Err(crate::attach_worker::AttachFailureKind::SessionGone) => {
+                    // The daemon reported NotFound — genuinely gone. Count toward
+                    // the cap; at the cap drop the queue entry (the raw entry is
+                    // preserved in `skipped_manifest_entries`, rides on disk).
                     let attempts = p.attempts + 1;
                     if attempts >= REMOTE_REATTACH_MAX_ATTEMPTS {
                         eprintln!(
@@ -19501,7 +19560,10 @@ mod pending_workflow_events_tests {
     /// Spin a best-effort in-process cm-daemon on `sock` for the remote-host
     /// TUI tests (real `dispatch_request`). Returns `(stop, handle)`; set the
     /// flag + poke the socket to stop it.
-    fn spawn_inproc_daemon(
+    ///
+    /// `pub(super)` so sibling test modules (e.g. `remote_reconnect_tests`)
+    /// can drive a real daemon that returns a genuine `NotFound` on attach.
+    pub(super) fn spawn_inproc_daemon(
         sock: std::path::PathBuf,
         state: std::sync::Arc<std::sync::Mutex<cm_daemon::state::DaemonState>>,
     ) -> (
@@ -22341,6 +22403,47 @@ mod remote_reconnect_tests {
         (app, ghost)
     }
 
+    /// Like [`app_with_ghost_unix_host`] but the ghost host points at a
+    /// specific (caller-provided) socket — used with `spawn_inproc_daemon` so
+    /// an attach reaches a LIVE daemon and gets a genuine `NotFound`
+    /// (classified `SessionGone`) rather than a dead-socket connect error
+    /// (classified `TransportDown`).
+    fn app_with_daemon_host(
+        cm_dir: &std::path::Path,
+        daemon_sock: &std::path::Path,
+    ) -> (App, cm_daemon::host_id::HostId) {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        let ghost = cm_daemon::host_id::HostId::new("ghost");
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: cm_dir.join("daemon.sock"),
+                    },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: ghost.clone(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: daemon_sock.to_path_buf(),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts).expect("pool"),
+        );
+        (app, ghost)
+    }
+
     /// A reconnecting remote session whose tunnel is UP but whose reattach
     /// attempt fails (no daemon) must KEEP retrying — not be flipped to exited
     /// on the first failure. `live_socket_path()` only proves the forwarded
@@ -22399,8 +22502,11 @@ mod remote_reconnect_tests {
             "the reattach work item stays queued for the next attempt",
         );
         assert_eq!(
-            app.pending_remote_reattach[0].attempts, 1,
-            "the failed attempt was counted toward the give-up bound",
+            app.pending_remote_reattach[0].attempts, 0,
+            "a TRANSPORT-DOWN failure (dead socket) must NOT burn the give-up \
+             budget — the daemon session is presumed alive, so it retries \
+             indefinitely (cm/fix-frozen-remote-session); only a daemon-\
+             confirmed NotFound counts toward the cap",
         );
 
         match orig_home {
@@ -22409,11 +22515,13 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// Bound check (nice-to-have): a genuinely-gone session settles to exited
-    /// after the give-up threshold instead of spinning "⟳ reconnecting"
-    /// forever.
+    /// A transport-down reattach NEVER settles to exited, no matter how long the
+    /// outage lasts — the daemon session is presumed alive, so the slot stays
+    /// reconnecting until the transport recovers. This is the core of the
+    /// frozen-remote-session fix: a deploy restart / tunnel churn that keeps the
+    /// forwarded socket un-dialable must not tear a live session down.
     #[test]
-    fn reconnect_settles_to_exited_after_sustained_failure() {
+    fn transport_down_reattach_never_settles_to_exited() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -22431,8 +22539,74 @@ mod remote_reconnect_tests {
         ws.worktree_path = Some(home.join("wt"));
         app.workspaces.push(ws);
         app.reconnecting_sessions.insert("uid-remote".to_string());
-        // Pre-load the item one short of the bound, with no throttle delay
-        // (last_attempt_at None) so this drain makes the FINAL attempt.
+        // Pre-load WAY past the old give-up bound to prove there is no cap for
+        // transport-down failures.
+        let mut item = PendingRemoteReattach::new(
+            "ws-remote".to_string(),
+            app.workspaces[0].sessions[0].to_manifest_entry(),
+        );
+        item.attempts = REMOTE_REATTACH_MAX_ATTEMPTS + 50;
+        app.pending_remote_reattach.push(item);
+        app.sessions_restored = false;
+
+        app.drain_deferred_remote_reattach();
+
+        assert!(
+            !app.workspaces[0].sessions[0].session.exited,
+            "a transport-down failure never marks the slot exited, even far past \
+             the (session-gone-only) give-up bound",
+        );
+        assert!(
+            app.reconnecting_sessions.contains("uid-remote"),
+            "the slot stays reconnecting through a sustained transport outage",
+        );
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "the work item stays queued to retry once the transport recovers",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Bound check: a genuinely-gone session (daemon reachable, returns
+    /// `NotFound`) settles to exited after the give-up threshold instead of
+    /// spinning "⟳ reconnecting" forever. Drives a real in-proc daemon so the
+    /// attach RPC returns a genuine `NotFound` → classified `SessionGone`.
+    #[test]
+    fn reconnect_settles_to_exited_after_session_gone() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        // A live in-proc daemon with NO sessions → any attach returns NotFound.
+        let mgr_sock = cm_dir.join("manager.sock");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            cm_daemon::state::DaemonState::new(),
+        ));
+        let (stop, dhandle) =
+            super::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
+
+        let (mut app, ghost) = app_with_daemon_host(&cm_dir, &mgr_sock);
+        let (ts, _tx, _teof) =
+            session_with_injected_exit("uid-gone", ghost.clone(), false);
+        let mut ws = workspace_with(ts);
+        ws.worktree_path = Some(wt);
+        app.workspaces.push(ws);
+        app.reconnecting_sessions.insert("uid-gone".to_string());
+        // One short of the bound, no throttle delay → this drain is the FINAL
+        // (cap-hitting) attempt.
         let mut item = PendingRemoteReattach::new(
             "ws-remote".to_string(),
             app.workspaces[0].sessions[0].to_manifest_entry(),
@@ -22445,7 +22619,8 @@ mod remote_reconnect_tests {
 
         assert!(
             app.workspaces[0].sessions[0].session.exited,
-            "after the sustained-failure bound the slot settles to exited",
+            "after the give-up bound a session-gone (NotFound) slot settles to \
+             exited",
         );
         assert!(
             app.reconnecting_sessions.is_empty(),
@@ -22456,38 +22631,51 @@ mod remote_reconnect_tests {
             "the work item is dropped from the retry queue on give-up",
         );
 
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = dhandle.join();
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
     }
 
-    /// The "stranding" fix: a FRESH restore-deferred reattach (no live slot,
-    /// NOT reconnecting — the bug-001..006 ghost-row shape) whose attach fails
-    /// must KEEP retrying with a bound, not be dropped from the queue on the
-    /// first failure (which stranded a live remote session until the next
-    /// restart). It only gives up — leaving the raw entry preserved in
-    /// `skipped_manifest_entries` — after `REMOTE_REATTACH_MAX_ATTEMPTS`.
+    /// The "stranding" fix + give-up bound: a FRESH restore-deferred reattach
+    /// (no live slot, NOT reconnecting — the bug-001..006 ghost-row shape)
+    /// against a REACHABLE daemon that reports `NotFound` (session gone) keeps
+    /// retrying with a bound, then gives up — leaving the raw entry preserved
+    /// in `skipped_manifest_entries` — after `REMOTE_REATTACH_MAX_ATTEMPTS`.
+    /// (A transport-down failure would retry forever; here the daemon is up and
+    /// the session is genuinely gone, so the cap applies.)
     #[test]
-    fn fresh_deferred_reattach_retries_then_gives_up_bounded() {
+    fn fresh_deferred_reattach_session_gone_retries_then_gives_up_bounded() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
         let cm_dir = home.join(".cm");
         std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
         let orig_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &home);
         }
 
-        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        // A live in-proc daemon with NO sessions → any attach returns NotFound.
+        let mgr_sock = cm_dir.join("manager.sock");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            cm_daemon::state::DaemonState::new(),
+        ));
+        let (stop, dhandle) =
+            super::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
+
+        let (mut app, ghost) = app_with_daemon_host(&cm_dir, &mgr_sock);
         // An EMPTY workspace (no slot for the uid) → the drain takes the FRESH
         // attach path, not the reconnecting-slot (Case A) path.
         let (seed, _tx, _teof) =
             session_with_injected_exit("seed", ghost.clone(), false);
         let mut ws = workspace_with(seed);
         ws.id = "ws-remote".into();
-        ws.worktree_path = Some(home.join("wt"));
+        ws.worktree_path = Some(wt);
         ws.sessions.clear();
         app.workspaces.push(ws);
 
@@ -22501,8 +22689,8 @@ mod remote_reconnect_tests {
         app.sessions_restored = false;
         assert!(!app.reconnecting_sessions.contains("uid-gone"));
 
-        // First drain: the attach fails (ghost host) but it's the FIRST failure
-        // → re-queued, NOT stranded.
+        // First drain: NotFound (session gone) but it's the FIRST failure →
+        // re-queued, NOT stranded, attempt counted.
         app.drain_deferred_remote_reattach();
         assert_eq!(
             app.pending_remote_reattach.len(),
@@ -22511,7 +22699,7 @@ mod remote_reconnect_tests {
         );
         assert_eq!(
             app.pending_remote_reattach[0].attempts, 1,
-            "the failed attempt is counted toward the give-up bound",
+            "a session-gone (NotFound) attempt is counted toward the give-up bound",
         );
         assert!(
             app.skipped_manifest_entries.contains_key("ws-remote"),
@@ -22533,6 +22721,8 @@ mod remote_reconnect_tests {
             "giving up PRESERVES the raw entry in skipped (no data loss)",
         );
 
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = dhandle.join();
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },

@@ -584,6 +584,49 @@ const DEFAULT_RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// success (atomic), so even a give-up can't leave a half-launched run visible.
 pub const START_WORKFLOW_RPC_READ_TIMEOUT: Duration = Duration::from_secs(150);
 
+/// A daemon-side RPC rejection (`resp.ok == false`), carried as a **typed**
+/// error so callers can branch on the machine-readable [`ErrorCode`] instead of
+/// string-matching the Display text. In particular the remote-reattach path
+/// distinguishes `NotFound` (the session is genuinely gone daemon-side → give
+/// up) from every other failure (transport / transient → keep retrying); see
+/// [`attach_failure_is_session_gone`].
+///
+/// `Display` reproduces the pre-typed `bail!` wording verbatim so existing logs
+/// and `.context(...)` chains read identically.
+#[derive(Debug, Clone)]
+pub struct DaemonRpcError {
+    pub method: String,
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for DaemonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "daemon RPC {} failed: {} ({:?})",
+            self.method, self.message, self.code,
+        )
+    }
+}
+
+impl std::error::Error for DaemonRpcError {}
+
+/// True if `err`'s chain carries a [`DaemonRpcError`] with `code == NotFound` —
+/// i.e. the attach RPCs reached the daemon and it reported the session doesn't
+/// exist. Every other failure (tunnel down, connect refused, RPC I/O timeout,
+/// any non-NotFound daemon code) is treated as transport/transient by the
+/// caller, which keeps the session reconnecting rather than giving up. The
+/// conservative default (unknown → NOT session-gone) is deliberate: on
+/// ambiguity we retry instead of tearing a live daemon session's slot down.
+pub(crate) fn attach_failure_is_session_gone(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<DaemonRpcError>()
+            .is_some_and(|e| e.code == ErrorCode::NotFound)
+    })
+}
+
 fn rpc_round_trip(daemon_socket: &Path, req: &Request) -> anyhow::Result<Response> {
     rpc_round_trip_with_read_timeout(daemon_socket, req, DEFAULT_RPC_READ_TIMEOUT)
 }
@@ -617,12 +660,13 @@ fn rpc_round_trip_with_read_timeout(
         .ok_or_else(|| anyhow::anyhow!("daemon closed connection before responding"))?;
     if !resp.ok {
         let err = resp.error.as_ref();
-        anyhow::bail!(
-            "daemon RPC {} failed: {} ({:?})",
-            req.method,
-            err.map(|e| e.message.as_str()).unwrap_or("<no message>"),
-            err.map(|e| e.code).unwrap_or(ErrorCode::Internal),
-        );
+        return Err(anyhow::Error::new(DaemonRpcError {
+            method: req.method.clone(),
+            code: err.map(|e| e.code).unwrap_or(ErrorCode::Internal),
+            message: err
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "<no message>".to_string()),
+        }));
     }
     Ok(resp)
 }
@@ -941,11 +985,13 @@ fn rpc_attach_open(
         .ok_or_else(|| anyhow::anyhow!("daemon closed attach socket before responding"))?;
     if !resp.ok {
         let err = resp.error.as_ref();
-        anyhow::bail!(
-            "attach.open failed: {} ({:?})",
-            err.map(|e| e.message.as_str()).unwrap_or("<no message>"),
-            err.map(|e| e.code).unwrap_or(ErrorCode::Internal),
-        );
+        return Err(anyhow::Error::new(DaemonRpcError {
+            method: "attach.open".to_string(),
+            code: err.map(|e| e.code).unwrap_or(ErrorCode::Internal),
+            message: err
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "<no message>".to_string()),
+        }));
     }
     let result = resp.result.context("attach.open response missing result")?;
     Ok(AttachOpenResp {
@@ -1530,6 +1576,67 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc as StdArc, Mutex};
     use tempfile::TempDir;
+
+    // --- attach failure classification (cm/fix-frozen-remote-session) --------
+
+    #[test]
+    fn attach_failure_notfound_is_session_gone() {
+        let err = anyhow::Error::new(DaemonRpcError {
+            method: "session.attach".into(),
+            code: ErrorCode::NotFound,
+            message: "no such session".into(),
+        });
+        assert!(attach_failure_is_session_gone(&err));
+    }
+
+    #[test]
+    fn attach_failure_notfound_detected_through_context_chain() {
+        // The reattach path wraps the RPC error with `.context("RPC
+        // session.attach")`; the classifier must still find the NotFound down
+        // the source chain.
+        let err = anyhow::Error::new(DaemonRpcError {
+            method: "attach.open".into(),
+            code: ErrorCode::NotFound,
+            message: "gone".into(),
+        })
+        .context("RPC attach.open")
+        .context("reattach uid-x");
+        assert!(attach_failure_is_session_gone(&err));
+    }
+
+    #[test]
+    fn attach_failure_non_notfound_codes_are_not_session_gone() {
+        for code in [
+            ErrorCode::Internal,
+            ErrorCode::Conflict,
+            ErrorCode::Unauthorized,
+            ErrorCode::InvalidParams,
+        ] {
+            let err = anyhow::Error::new(DaemonRpcError {
+                method: "session.attach".into(),
+                code,
+                message: "x".into(),
+            });
+            assert!(
+                !attach_failure_is_session_gone(&err),
+                "code {:?} must NOT be treated as session-gone (retry, don't \
+                 give up)",
+                code,
+            );
+        }
+    }
+
+    #[test]
+    fn attach_failure_plain_io_error_is_not_session_gone() {
+        // A tunnel-down / connect-refused failure carries no DaemonRpcError →
+        // classified TransportDown (retry forever), never gives up.
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "dial attach socket: connection refused",
+        ))
+        .context("RPC session.attach");
+        assert!(!attach_failure_is_session_gone(&err));
+    }
 
     /// P-3b: the start_workflow timeout must comfortably exceed the daemon's
     /// bounded worst case so A-f never falsely reports "launch failed" while the

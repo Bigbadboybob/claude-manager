@@ -31,14 +31,33 @@ pub struct AttachRequest {
     pub attempts: u32,
 }
 
-/// The outcome of an [`AttachRequest`]. `session` is `None` when the attach
-/// failed (session gone / host unreachable) — the main loop then re-queues for
-/// retry (or, past the cap, marks the slot exited).
+/// Why an attach attempt failed, so the main loop can pick a recovery policy
+/// without re-deriving it (the classification needs the raw `anyhow::Error`,
+/// which doesn't cross the channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachFailureKind {
+    /// The attach reached the daemon and it reported the session doesn't exist
+    /// (`ErrorCode::NotFound`). The daemon-side session is genuinely gone —
+    /// count this toward the give-up budget and eventually mark the slot exited.
+    SessionGone,
+    /// Anything else: tunnel down / respawning, connect refused, RPC I/O
+    /// timeout, or a non-NotFound daemon code. The daemon session is (almost
+    /// certainly) still alive; keep the slot reconnecting and retry WITHOUT
+    /// burning the give-up budget, so a transient transport outage never
+    /// tears a live session down.
+    TransportDown,
+}
+
+/// The outcome of an [`AttachRequest`]. `session` is `Some` on success. On
+/// failure it's `None` and [`Self::failure`] carries the reason so the main
+/// loop can retry-forever (transport) vs give-up-after-cap (session gone).
 pub struct AttachResult {
     pub ws_id: String,
     pub entry: cm_daemon::manifest::ManifestEntry,
     pub attempts: u32,
     pub session: Option<Session>,
+    /// `None` on success; `Some(kind)` classifies a failed attach.
+    pub failure: Option<AttachFailureKind>,
 }
 
 pub struct AttachWorker {
@@ -58,7 +77,7 @@ impl AttachWorker {
                 while let Ok(req) = cmd_rx.recv() {
                     // Blocking is fine HERE — off the main thread. The attach
                     // RPCs route through the entry's own host socket.
-                    let session = crate::app::try_attach_via_daemon_with_deps(
+                    let outcome = crate::app::try_attach_via_daemon_with_deps(
                         &host_pool,
                         &req.entry.uid,
                         &req.ws_id,
@@ -74,14 +93,25 @@ impl AttachWorker {
                         // Transcript binding survived on the remote daemon —
                         // don't push a wrong-for-remote local path over it.
                         None,
-                    )
-                    .ok();
+                    );
+                    let (session, failure) = match outcome {
+                        Ok(s) => (Some(s), None),
+                        Err(e) => {
+                            let kind = if crate::client_session::attach_failure_is_session_gone(&e) {
+                                AttachFailureKind::SessionGone
+                            } else {
+                                AttachFailureKind::TransportDown
+                            };
+                            (None, Some(kind))
+                        }
+                    };
                     if result_tx
                         .send(AttachResult {
                             ws_id: req.ws_id,
                             entry: req.entry,
                             attempts: req.attempts,
                             session,
+                            failure,
                         })
                         .is_err()
                     {
