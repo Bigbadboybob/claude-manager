@@ -134,4 +134,32 @@ recovery; S2–S4 harden around it.
   froze the operator's working sessions — that was exercising THIS gap (no-EOF
   half-open), not S1. S1 handles the daemon-restart case (clean EOF → re-queued →
   was starved). S3 handles the no-EOF case. Together they cover both triggers.
-- [ ] S4
+- [x] **S4 — DONE.** `A-r` (`nudge_remote_reconnects`) now also **force-reconnects
+  the FOCUSED remote session**, whatever state it's in — closing the
+  attached-but-dead LIMBO gap (not exited, not reconnecting, not queued) that
+  steps 1-2 and even the S3 watchdog can miss (a half-open whose generation
+  hasn't bumped yet). SURGICAL: only the one session the user is looking at is
+  torn down + re-queued (via the shared `requeue_remote_reconnect` helper), so
+  `A-r`-as-refresh never blips other healthy remote panes — that blanket-blip is
+  what left "all remote sessions unresponsive" before. `cursor_session_uid`
+  resolves the focus in both the main and continuous columns. Files: `app.rs`.
+  Tests: 3 (focused-limbo → reconnect / unfocused-healthy → left alone /
+  focused-local → ignored). Full TUI suite: 673 pass (same 1 load-flake).
+
+## Summary — all four slices land the fix
+
+- **S1** (`07e59f3`, on main): re-warm starvation — reattach drive was gated off
+  a non-blocking probe that never respawns the tunnel. Removed the gate; the
+  attach worker re-warms. + typed failure classification (NotFound → give up;
+  else retry forever).
+- **S3** (`1f5a173`, on main): half-open freeze — a tunnel death with no clean
+  EOF. Per-host tunnel-generation counter + per-tick watchdog re-queues attached
+  sessions whose tunnel was replaced.
+- **S4** (this commit): `A-r` manual override — force-reconnect the focused
+  remote session (the limbo case), surgically.
+- **S2** (deferred): stop tearing down *live* tunnels on a spurious `try_wait`
+  + clean stale `cm-host-*.sock`. Not required for the freeze fix; a churn/
+  cleanliness hardening. Left as a documented follow-up.
+
+Together S1 covers the daemon-restart freeze (clean EOF), S3 the tunnel-death
+freeze (no EOF), S4 the manual override for anything they miss.

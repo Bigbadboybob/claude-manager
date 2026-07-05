@@ -6646,6 +6646,18 @@ impl App {
     ///      durability the daemon may have RESTORED the session since it
     ///      settled — so clear the slot's `exited` flag, mark it reconnecting,
     ///      and requeue. A genuinely-gone session simply re-settles to exited.
+    ///   3. **Force-reconnect the FOCUSED remote session** (S4), whatever state
+    ///      it's in. Steps 1-2 only cover sessions already in the reconnect flow
+    ///      (pending) or that gave up (exited). A session whose attach stream
+    ///      died HALF-OPEN — no clean EOF and its tunnel generation not yet
+    ///      bumped (so the S3 watchdog hasn't caught it) — is NEITHER, so A-r
+    ///      couldn't clear it before (the reported "A-r doesn't clear a frozen
+    ///      remote pane" gap). This is SURGICAL: only the one session the user
+    ///      is looking at is torn down + re-queued, so A-r-as-refresh never
+    ///      blips other (healthy) remote panes — unlike a blanket reconnect-all,
+    ///      which is what left "all remote sessions unresponsive" before.
+    ///      `cursor_session_uid` resolves the focus in BOTH the main and
+    ///      continuous columns.
     ///
     /// Returns the number of sessions nudged (for the status line). No-op for
     /// local sessions (they have no remote daemon to reattach to).
@@ -6689,7 +6701,39 @@ impl App {
         if !revived.is_empty() {
             self.needs_redraw = true;
         }
-        accelerated + revived.len()
+
+        // (3) Force-reconnect the FOCUSED remote session (see doc comment).
+        // Only fires when the focus resolves to a remote session that isn't
+        // ALREADY in the reconnect flow (steps 1-2 / the S3 watchdog handle
+        // those) — i.e. the attached-but-dead half-open case A-r couldn't clear.
+        let mut forced = 0usize;
+        if let Some(uid) = self.cursor_session_uid() {
+            if !self.reconnecting_sessions.contains(&uid) {
+                let found = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+                    if w.is_closed {
+                        return None;
+                    }
+                    w.sessions
+                        .iter()
+                        .position(|s| s.uid == uid && s.host_id != local)
+                        .map(|si| (wi, si))
+                });
+                if let Some((wi, si)) = found {
+                    // Clear a genuine exit + drop it out of the Running sort,
+                    // then route through the shared reconnect helper (which
+                    // marks it reconnecting, clears its stale generation record,
+                    // and enqueues the rebind).
+                    self.workspaces[wi].sessions[si].session.exited = false;
+                    self.workspaces[wi].sessions[si].status = SessionStatus::Idle;
+                    if self.requeue_remote_reconnect(wi, si, "A-r force reconnect") {
+                        forced = 1;
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+        }
+
+        accelerated + revived.len() + forced
     }
 
     /// Re-arm the deferred-reattach worklist for ONE workspace: accelerate any
@@ -22265,6 +22309,129 @@ mod remote_reconnect_tests {
             .unwrap();
         assert_eq!(pr.attempts, 0, "A-r reset the attempt budget");
         assert!(pr.last_attempt_at.is_none(), "A-r cleared the retry throttle");
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    // --- S4: A-r force-reconnects the FOCUSED remote session ---------------
+
+    /// THE S4 fix: A-r force-reconnects the focused remote session even when
+    /// it's in the attached-but-dead LIMBO state (not exited, not reconnecting,
+    /// not queued) that steps 1-2 miss — the "A-r doesn't clear a frozen remote
+    /// pane" gap.
+    #[test]
+    fn a_r_force_reconnects_focused_limbo_remote_session() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.sessions_restored = false;
+        // Attached-but-dead: not exited, not reconnecting, not queued.
+        let (ts, _tx, _teof) = session_with_injected_exit("uid-limbo", manager_host(), false);
+        app.workspaces.push(workspace_with(ts));
+        app.cursor = Cursor::Session(0, 0); // focus it
+        assert!(!app.reconnecting_sessions.contains("uid-limbo"));
+
+        let n = app.nudge_remote_reconnects();
+
+        assert!(n >= 1, "the forced reconnect is counted");
+        assert!(
+            app.reconnecting_sessions.contains("uid-limbo"),
+            "A-r must force-reconnect the focused limbo remote session",
+        );
+        assert!(
+            app.pending_remote_reattach
+                .iter()
+                .any(|p| p.entry.uid == "uid-limbo"),
+            "and enqueue it for rebind",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Surgical: an UNFOCUSED healthy remote session is NOT torn down by A-r —
+    /// only the focused one. This is what avoids the "A-r made all remote
+    /// sessions unresponsive" blanket-blip behavior.
+    #[test]
+    fn a_r_force_reconnect_leaves_unfocused_remote_session_alone() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.sessions_restored = false;
+        let (a, _a_tx, _a_teof) = session_with_injected_exit("uid-a", manager_host(), false);
+        app.workspaces.push(workspace_with(a));
+        let (b, _b_tx, _b_teof) = session_with_injected_exit("uid-b", manager_host(), false);
+        app.workspaces[0].sessions.push(b);
+        app.cursor = Cursor::Session(0, 0); // focus uid-a only
+
+        app.nudge_remote_reconnects();
+
+        assert!(
+            app.reconnecting_sessions.contains("uid-a"),
+            "focused remote session is force-reconnected",
+        );
+        assert!(
+            !app.reconnecting_sessions.contains("uid-b"),
+            "an UNFOCUSED healthy remote session must be left alone (no blanket blip)",
+        );
+        assert!(
+            !app.pending_remote_reattach
+                .iter()
+                .any(|p| p.entry.uid == "uid-b"),
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// A focused LOCAL session is never force-reconnected (no remote daemon to
+    /// reattach to).
+    #[test]
+    fn a_r_focused_local_session_not_reconnected() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.sessions_restored = false;
+        let (ts, _tx, _teof) = session_with_injected_exit(
+            "uid-local",
+            cm_daemon::host_id::HostId::local(),
+            false,
+        );
+        app.workspaces.push(workspace_with(ts));
+        app.cursor = Cursor::Session(0, 0);
+
+        app.nudge_remote_reconnects();
+
+        assert!(!app.reconnecting_sessions.contains("uid-local"));
+        assert!(app.pending_remote_reattach.is_empty());
 
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
