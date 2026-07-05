@@ -128,6 +128,30 @@ def _check_parameter_confusion(field_name: str, value: str) -> None:
             )
 
 
+def _git_origin_url() -> str:
+    """Repo URL from ``git remote get-url origin``, with NO dependency on the
+    ``cli`` package.
+
+    propose_task's daemon path needs the repo URL to forward to the daemon (the
+    daemon doesn't know the agent's cwd), but it must not reach into
+    ``cli.planning_client`` to get it — ``cli/`` isn't deployed alongside the MCP
+    server on headless/remote hosts (cm-manager), which used to make propose_task
+    fail there even though the daemon path needs nothing else from ``cli``
+    (create_subtask etc. already work headless via the control socket)."""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"could not detect repo URL from git remote origin: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
 @mcp.tool()
 def propose_task(
     project: str,
@@ -184,21 +208,15 @@ def propose_task(
     # actual dial are bound to the same resolution.
     route = control_client.resolve_socket_route()
     if route.chose_daemon:
+        # Detect the repo URL to forward to the daemon with a plain
+        # `git remote get-url origin` shell-out (see _git_origin_url) — NOT via
+        # cli.planning_client, which isn't deployed on headless/remote hosts
+        # (cm-manager) and made propose_task fail there even though the daemon
+        # path needs nothing else from `cli`. Raises RuntimeError with no origin
+        # remote and OSError (FileNotFoundError) if git is absent.
         try:
-            from cli.planning_client import _detect_repo_url
-        except ModuleNotFoundError:
-            return (
-                "propose_task unavailable: the `cli` package is not installed "
-                "alongside the MCP server (headless/remote host)."
-            )
-        try:
-            repo_url = _detect_repo_url()
+            repo_url = _git_origin_url()
         except (RuntimeError, OSError) as e:
-            # _detect_repo_url shells out to `git remote get-url origin`; it
-            # raises RuntimeError when there's no origin remote and OSError
-            # (FileNotFoundError) when git is absent. Return a clear message
-            # instead of crashing the tool with an opaque traceback when the
-            # agent's cwd isn't a git repo with an origin.
             return (
                 f"propose_task: could not detect the repo URL from the current "
                 f"directory (no git 'origin' remote?): {e}"
