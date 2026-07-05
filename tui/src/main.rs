@@ -339,6 +339,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // `manifest.watch` consumer thread; a cheap no-op once the queue
         // drains. This is what keeps remote sessions coming online without a
         // blocking `for_host` on the startup critical path.
+        // S3: catch remote attach streams whose tunnel was replaced (died)
+        // without a clean EOF — the half-open freeze. Runs BEFORE the drain so
+        // a session detected stale this tick is re-queued and dispatched in the
+        // same pass. Cheap no-op when no tunnel has churned.
+        let t = Instant::now();
+        app.requeue_stale_generation_remote_sessions();
+        log_slow_phase("requeue_stale_generation_remote_sessions", t.elapsed());
         let t = Instant::now();
         app.drain_deferred_remote_reattach();
         log_slow_phase("drain_deferred_remote_reattach", t.elapsed());

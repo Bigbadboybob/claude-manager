@@ -337,6 +337,17 @@ fn cleanup_stale_local_socket(path: &Path) -> io::Result<()> {
 /// can observe the `None` state directly.
 pub struct ConnectionHandle {
     state: Mutex<HandleState>,
+    /// Monotonic tunnel-generation counter. Bumped every time
+    /// `ensure_alive` installs a FRESH `SshTunnel` (initial spawn or a
+    /// post-death respawn). A remote attach stream records the generation it
+    /// was dialed under; once this counter exceeds that recorded value the
+    /// stream's underlying tunnel process is gone, so the stream is dead even
+    /// if it never produced a clean EOF (the half-open case). Read WITHOUT the
+    /// `state` lock (plain atomic) so the main-loop watchdog
+    /// (`requeue_stale_generation_remote_sessions`) never blocks behind a
+    /// mid-spawn `ensure_alive`. UnixDirect/TcpTls handles never bump it
+    /// (no tunnel), so they stay at 0.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 enum HandleState {
@@ -369,6 +380,7 @@ impl ConnectionHandle {
     pub fn unix_direct(socket_path: PathBuf) -> Self {
         Self {
             state: Mutex::new(HandleState::UnixDirect { socket_path }),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -384,6 +396,7 @@ impl ConnectionHandle {
                 spec,
                 tunnel: None,
             }),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -393,7 +406,15 @@ impl ConnectionHandle {
     pub fn tcp_tls(spec: crate::tls_dialer::TlsDialerSpec) -> Self {
         Self {
             state: Mutex::new(HandleState::TcpTls { spec }),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Current tunnel generation (see [`Self::generation`]). Non-blocking
+    /// atomic read — safe from the main/UI thread. `0` means "no tunnel spawned
+    /// yet" (or a non-tunnel transport).
+    pub fn tunnel_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 12h: clone-out the TLS dialer spec for this handle.
@@ -528,6 +549,12 @@ impl ConnectionHandle {
                 if tunnel.is_none() {
                     let fresh = SshTunnel::spawn(spec)?;
                     *tunnel = Some(fresh);
+                    // A fresh tunnel means any attach stream on the PRIOR
+                    // tunnel is dead (the old ssh child exited / was replaced).
+                    // Bump so the main-loop watchdog re-queues those streams
+                    // even if they never produced a clean EOF (half-open).
+                    self.generation
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 }
                 Ok(())
             }
@@ -550,6 +577,8 @@ impl ConnectionHandle {
         } = &mut *state
         {
             *slot = Some(tunnel);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         } else {
             panic!("install_tunnel_for_test on a non-SshUnix handle");
         }
@@ -1148,6 +1177,26 @@ impl HostPool {
             .and_then(|h| h.socket_path_nonblocking())
     }
 
+    /// Current tunnel generation for `host_id` (see
+    /// [`ConnectionHandle::generation`]). `0` for an unknown host or a
+    /// transport with no tunnel lifecycle (UnixDirect/TcpTls). Non-blocking.
+    pub fn tunnel_generation(&self, host_id: &HostId) -> u64 {
+        self.entries
+            .get(host_id)
+            .map(|h| h.tunnel_generation())
+            .unwrap_or(0)
+    }
+
+    /// Test-only: force a host's tunnel generation, so watchdog tests can
+    /// simulate a tunnel respawn without spinning a real ssh child.
+    #[cfg(test)]
+    pub(crate) fn set_tunnel_generation_for_test(&self, host_id: &HostId, gen: u64) {
+        if let Some(h) = self.entries.get(host_id) {
+            h.generation
+                .store(gen, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// 12e-perf: record a successful push. Clears any Dead state
     /// for `host_id` and emits a one-shot "back online" log on the
     /// Dead → Live transition. No-op for untracked hosts.
@@ -1337,6 +1386,55 @@ mod tests {
     use crate::hosts::HostsConfig;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    // --- S3: tunnel-generation counter (half-open detection) -------------
+
+    /// The generation starts at 0 and bumps on every fresh tunnel install
+    /// (`install_tunnel_for_test` uses the same `fetch_add` as `ensure_alive`'s
+    /// respawn path). A monotonic bump per respawn is what lets the App
+    /// watchdog tell a stream's tunnel was replaced under it.
+    #[test]
+    fn tunnel_generation_bumps_on_each_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_socket = tmp.path().join("gen.sock");
+        let spec = SshTunnelSpec::with_explicit_socket(
+            "gen-host".into(),
+            None,
+            local_socket.clone(),
+            tmp.path().join("remote.sock"),
+            PathBuf::from("sleep"),
+            vec!["60".into()],
+        );
+        let handle = ConnectionHandle::ssh_unix(spec);
+        assert_eq!(handle.tunnel_generation(), 0, "no tunnel yet → gen 0");
+
+        let mk = || {
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn stub");
+            SshTunnel::from_child_for_test(child, local_socket.clone())
+        };
+        handle.install_tunnel_for_test(mk());
+        assert_eq!(handle.tunnel_generation(), 1, "first tunnel → gen 1");
+        handle.install_tunnel_for_test(mk());
+        assert_eq!(
+            handle.tunnel_generation(),
+            2,
+            "a respawn bumps to 2 → invalidates streams recorded at gen 1",
+        );
+    }
+
+    /// A UnixDirect (local) handle has no tunnel lifecycle → generation is
+    /// always 0, so the App watchdog never treats a local session as stale.
+    #[test]
+    fn unix_direct_generation_is_always_zero() {
+        let handle = ConnectionHandle::unix_direct(PathBuf::from("/tmp/x.sock"));
+        assert_eq!(handle.tunnel_generation(), 0);
+    }
 
     // ---------------------------------------------------------------
     // 12c surface (unchanged from the 12c commit): per-host pool

@@ -113,5 +113,25 @@ recovery; S2–S4 harden around it.
   `fresh_deferred_reattach_session_gone_retries_then_gives_up_bounded` (both drive
   a real in-proc daemon that returns `NotFound`). Full TUI suite: 665 pass.
 - [ ] S2
-- [ ] S3
+- [x] **S3 — DONE.** Tunnel-generation watchdog for the half-open freeze (a
+  remote attach stream whose ssh tunnel died WITHOUT a clean EOF — reproduced by
+  `SIGTERM`ing the tunnel; `transport_eof` never latches so the session was never
+  re-queued). `host_pool` now carries a per-host monotonic `generation`
+  (`AtomicU64`), bumped every `ensure_alive` respawn. Each attached remote
+  session records the generation it was dialed under (`attached_tunnel_generation`
+  map, captured at attach time on the worker thread). New per-tick watchdog
+  `requeue_stale_generation_remote_sessions` re-queues any attached remote
+  session whose recorded generation is behind the host's current one — routing
+  through the SAME reconnect path as a transport EOF (shared
+  `requeue_remote_reconnect` helper). A half-open tunnel is converted to a
+  respawned one within ~15s by the existing `ServerAlive` opts, bounding the
+  freeze to seconds. Files: `host_pool.rs`, `attach_worker.rs`, `app.rs`,
+  `main.rs`. Tests: 4 watchdog (`stale`/`current`/`unrecorded-baseline`/`local`)
+  + 2 host_pool generation-bump. Full TUI suite: 670 pass (1 pre-existing
+  load-flake, passes 10/10 in isolation).
+
+  Note: my earlier "S1 verification" `SIGTERM`'d the live tunnel repeatedly and
+  froze the operator's working sessions — that was exercising THIS gap (no-EOF
+  half-open), not S1. S1 handles the daemon-restart case (clean EOF → re-queued →
+  was starved). S3 handles the no-EOF case. Together they cover both triggers.
 - [ ] S4

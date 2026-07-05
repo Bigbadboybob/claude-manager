@@ -58,6 +58,12 @@ pub struct AttachResult {
     pub session: Option<Session>,
     /// `None` on success; `Some(kind)` classifies a failed attach.
     pub failure: Option<AttachFailureKind>,
+    /// The host tunnel-generation captured at attach time (`Some` on success,
+    /// `None` on failure). The main loop records it per-uid so the
+    /// stale-generation watchdog can tell when this stream's tunnel was later
+    /// replaced. Captured on the worker thread right after the attach so it
+    /// reflects the generation the stream was actually dialed under.
+    pub tunnel_generation: Option<u64>,
 }
 
 pub struct AttachWorker {
@@ -94,15 +100,21 @@ impl AttachWorker {
                         // don't push a wrong-for-remote local path over it.
                         None,
                     );
-                    let (session, failure) = match outcome {
-                        Ok(s) => (Some(s), None),
+                    let (session, failure, tunnel_generation) = match outcome {
+                        Ok(s) => {
+                            // Capture the generation the stream was dialed
+                            // under, on THIS thread right after the attach —
+                            // before any respawn can bump it out from under us.
+                            let gen = host_pool.tunnel_generation(&req.entry.host_id);
+                            (Some(s), None, Some(gen))
+                        }
                         Err(e) => {
                             let kind = if crate::client_session::attach_failure_is_session_gone(&e) {
                                 AttachFailureKind::SessionGone
                             } else {
                                 AttachFailureKind::TransportDown
                             };
-                            (None, Some(kind))
+                            (None, Some(kind), None)
                         }
                     };
                     if result_tx
@@ -112,6 +124,7 @@ impl AttachWorker {
                             attempts: req.attempts,
                             session,
                             failure,
+                            tunnel_generation,
                         })
                         .is_err()
                     {

@@ -3752,6 +3752,17 @@ pub struct App {
     /// per-uid shape of [`Self::alerts`]; the matching reattach
     /// worklist entry rides in [`Self::pending_remote_reattach`].
     reconnecting_sessions: std::collections::HashSet<String>,
+    /// Per-uid record of the host tunnel-generation each ATTACHED remote
+    /// session was dialed under (see `HostPool::tunnel_generation`). Written
+    /// when a remote attach succeeds (`drain_attach_results` /
+    /// `drain_deferred_remote_reattach`); read by the per-tick watchdog
+    /// `requeue_stale_generation_remote_sessions`, which re-queues any session
+    /// whose recorded generation is now behind the host's current one — i.e.
+    /// its tunnel was replaced (died), so its attach stream is dead even if it
+    /// never produced a clean EOF (the half-open freeze this closes, S3).
+    /// Transient + in-memory only. Cleared when the session is re-queued (and
+    /// re-inserted on the next successful attach).
+    attached_tunnel_generation: std::collections::HashMap<String, u64>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -4046,6 +4057,7 @@ impl App {
             alerts: HashMap::new(),
             last_alert_frame: 0,
             reconnecting_sessions: std::collections::HashSet::new(),
+            attached_tunnel_generation: std::collections::HashMap::new(),
         }
     }
 
@@ -6111,6 +6123,16 @@ impl App {
             let queued = self.attaching.remove(&result.entry.uid);
             match result.session {
                 Some(session) => {
+                    // Record the tunnel generation this stream was dialed under
+                    // (captured on the worker thread) so the stale-generation
+                    // watchdog can re-queue it when the tunnel is later
+                    // replaced. Fall back to a live read if the worker didn't
+                    // supply one.
+                    let gen = result.tunnel_generation.unwrap_or_else(|| {
+                        self.host_pool.tunnel_generation(&result.entry.host_id)
+                    });
+                    self.attached_tunnel_generation
+                        .insert(result.entry.uid.clone(), gen);
                     // Bind by uid across ALL workspaces, not just `result.ws_id`.
                     // A daemon session is unique by uid, so if a slot for it
                     // already exists ANYWHERE (a reconnect, or a stray duplicate
@@ -6210,6 +6232,100 @@ impl App {
         if changed {
             self.needs_redraw = true;
             self.save_session_manifest();
+        }
+    }
+
+    /// Mark a REMOTE session's slot `reconnecting` and enqueue it into the
+    /// deferred-reattach flow (idempotent per uid). Shared by the transport-EOF
+    /// exit path (`drain_pty_events`) and the tunnel-generation watchdog
+    /// (`requeue_stale_generation_remote_sessions`) so both route into the
+    /// exact same recovery machinery. `reason` is logged. Returns true if it
+    /// NEWLY enqueued the uid (so the caller can set `needs_redraw`); false if
+    /// the uid was already queued.
+    fn requeue_remote_reconnect(&mut self, wi: usize, si: usize, reason: &str) -> bool {
+        let ws_id = self.workspaces[wi].id.clone();
+        let entry = self.workspaces[wi].sessions[si].to_manifest_entry();
+        self.reconnecting_sessions.insert(entry.uid.clone());
+        // Drop the stale generation record — it's re-recorded on the next
+        // successful attach. Without this the watchdog would re-fire for this
+        // uid every tick until the reattach lands.
+        self.attached_tunnel_generation.remove(&entry.uid);
+        if self
+            .pending_remote_reattach
+            .iter()
+            .any(|p| p.entry.uid == entry.uid)
+        {
+            return false;
+        }
+        eprintln!(
+            "cm-tui: remote session {} ({}) on host {} lost its attach stream \
+             ({}) — marking reconnecting and requeuing for reattach",
+            entry.uid,
+            entry.label,
+            entry.host_id.as_str(),
+            reason,
+        );
+        self.pending_remote_reattach
+            .push(PendingRemoteReattach::new(ws_id, entry));
+        true
+    }
+
+    /// S3 (cm/fix-frozen-remote-session): catch a remote attach stream whose
+    /// SSH tunnel was replaced (died) but that never produced a clean EOF — the
+    /// half-open freeze (renders stale, normal indicator, dead to input; the
+    /// `transport_eof` latch never fires because there's no `read()==0`).
+    ///
+    /// For each ATTACHED remote session, compare the tunnel generation it was
+    /// dialed under against the host's CURRENT generation; if the host's is
+    /// newer, the underlying tunnel process is gone, so the stream is dead —
+    /// re-queue it through the same path a transport EOF takes. A half-open
+    /// tunnel is turned into a dead (respawned) one within ~15s by the
+    /// `ServerAlive` opts, which bumps the generation, so this bounds the
+    /// freeze to seconds instead of forever. Un-recorded live sessions are
+    /// baselined at the current generation (safety net for attach paths that
+    /// don't record explicitly). Cheap: one HashMap lookup + atomic read per
+    /// remote session per tick.
+    pub fn requeue_stale_generation_remote_sessions(&mut self) {
+        let local = cm_daemon::host_id::HostId::local();
+        let mut stale: Vec<(usize, usize)> = Vec::new();
+        let mut baseline: Vec<(String, u64)> = Vec::new();
+        for wi in 0..self.workspaces.len() {
+            if self.workspaces[wi].is_closed {
+                continue;
+            }
+            for si in 0..self.workspaces[wi].sessions.len() {
+                let ts = &self.workspaces[wi].sessions[si];
+                if ts.host_id == local || ts.uid.is_empty() || ts.session.exited {
+                    continue;
+                }
+                let uid = ts.uid.clone();
+                let host = ts.host_id.clone();
+                // A session already in the reconnect flow is handled there.
+                if self.reconnecting_sessions.contains(&uid) {
+                    continue;
+                }
+                let current = self.host_pool.tunnel_generation(&host);
+                match self.attached_tunnel_generation.get(&uid) {
+                    Some(&recorded) if current > recorded => stale.push((wi, si)),
+                    Some(_) => {}
+                    None => baseline.push((uid, current)),
+                }
+            }
+        }
+        for (uid, gen) in baseline {
+            self.attached_tunnel_generation.insert(uid, gen);
+        }
+        let mut changed = false;
+        for (wi, si) in stale {
+            // Drop it out of the Running sort (the stream is dead) and route
+            // into the reconnect flow via the shared helper.
+            self.workspaces[wi].sessions[si].status = SessionStatus::Idle;
+            if self.requeue_remote_reconnect(wi, si, "tunnel replaced (no EOF)") {
+                changed = true;
+            }
+        }
+        if changed {
+            self.needs_redraw = true;
         }
     }
 
@@ -6330,6 +6446,10 @@ impl App {
                                 slot.status = SessionStatus::Running;
                             }
                             self.reconnecting_sessions.remove(&p.entry.uid);
+                            self.attached_tunnel_generation.insert(
+                                p.entry.uid.clone(),
+                                self.host_pool.tunnel_generation(&p.entry.host_id),
+                            );
                             reattached_any = true;
                             eprintln!(
                                 "cm-tui: remote session {} ({}) on host {} \
@@ -6426,6 +6546,10 @@ impl App {
                 Ok(ts) => {
                     self.workspaces[ws_idx].sessions.push(ts);
                     self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
+                    self.attached_tunnel_generation.insert(
+                        p.entry.uid.clone(),
+                        self.host_pool.tunnel_generation(&p.entry.host_id),
+                    );
                     reattached_any = true;
                 }
                 Err(crate::attach_worker::AttachFailureKind::TransportDown) => {
@@ -8889,29 +9013,10 @@ impl App {
         // in `ws.sessions`, so `save_session_manifest` already
         // round-trips it; a skipped copy would double-write.
         if !remote_reconnect_requeue.is_empty() {
+            // Idempotent per uid inside the helper (the dead EventLoop emits one
+            // exit, but guard anyway). Shared with the stale-generation watchdog.
             for (wi, si) in remote_reconnect_requeue {
-                let ws_id = self.workspaces[wi].id.clone();
-                let entry = self.workspaces[wi].sessions[si].to_manifest_entry();
-                self.reconnecting_sessions.insert(entry.uid.clone());
-                // Idempotent: don't double-queue the same uid if a
-                // prior tick already enqueued it (the dead EventLoop
-                // emits one exit, but guard anyway).
-                if !self
-                    .pending_remote_reattach
-                    .iter()
-                    .any(|p| p.entry.uid == entry.uid)
-                {
-                    eprintln!(
-                        "cm-tui: remote session {} ({}) on host {} lost its \
-                         attach stream (transport EOF) — marking reconnecting \
-                         and requeuing for reattach",
-                        entry.uid,
-                        entry.label,
-                        entry.host_id.as_str(),
-                    );
-                    self.pending_remote_reattach
-                        .push(PendingRemoteReattach::new(ws_id, entry));
-                }
+                self.requeue_remote_reconnect(wi, si, "transport EOF");
             }
             self.needs_redraw = true;
         }
@@ -22570,6 +22675,121 @@ mod remote_reconnect_tests {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    // --- S3: stale-tunnel-generation watchdog (half-open freeze) -----------
+
+    /// THE S3 fix: an attached remote session whose recorded tunnel generation
+    /// is behind the host's current one — its tunnel was replaced (died) with
+    /// NO clean EOF, so `transport_eof` never fired — is re-queued for
+    /// reconnect. RED before S3: the session sits frozen (stale render, normal
+    /// indicator, dead to input) forever.
+    #[test]
+    fn stale_tunnel_generation_requeues_remote_session() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+
+        let (ts, _tx, _teof) = session_with_injected_exit("uid-r", ghost.clone(), false);
+        app.workspaces.push(workspace_with(ts));
+        // Attached under generation 1...
+        app.attached_tunnel_generation.insert("uid-r".into(), 1);
+        // ...but the host's tunnel has since respawned (generation 2).
+        app.host_pool.set_tunnel_generation_for_test(&ghost, 2);
+        assert!(!app.reconnecting_sessions.contains("uid-r"));
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(
+            app.reconnecting_sessions.contains("uid-r"),
+            "a stale-generation remote session must be marked reconnecting",
+        );
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "and re-queued into the deferred-reattach flow",
+        );
+        assert_eq!(app.pending_remote_reattach[0].entry.uid, "uid-r");
+        assert!(
+            !app.attached_tunnel_generation.contains_key("uid-r"),
+            "the stale record is cleared until the next successful attach \
+             (else the watchdog would re-fire every tick)",
+        );
+    }
+
+    /// A remote session recorded at the CURRENT generation is left alone.
+    #[test]
+    fn current_tunnel_generation_not_requeued() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        let (ts, _tx, _teof) = session_with_injected_exit("uid-r", ghost.clone(), false);
+        app.workspaces.push(workspace_with(ts));
+        app.attached_tunnel_generation.insert("uid-r".into(), 3);
+        app.host_pool.set_tunnel_generation_for_test(&ghost, 3);
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(
+            !app.reconnecting_sessions.contains("uid-r"),
+            "a session on the current generation must NOT be requeued",
+        );
+        assert!(app.pending_remote_reattach.is_empty());
+        assert_eq!(app.attached_tunnel_generation.get("uid-r"), Some(&3));
+    }
+
+    /// An attached remote session with NO recorded generation is baselined at
+    /// the current generation (safety net for attach paths that don't record
+    /// explicitly), NOT requeued.
+    #[test]
+    fn unrecorded_remote_session_is_baselined_not_requeued() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        let (ts, _tx, _teof) = session_with_injected_exit("uid-r", ghost.clone(), false);
+        app.workspaces.push(workspace_with(ts));
+        app.host_pool.set_tunnel_generation_for_test(&ghost, 5);
+        // No record for uid-r.
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(!app.reconnecting_sessions.contains("uid-r"));
+        assert!(app.pending_remote_reattach.is_empty());
+        assert_eq!(
+            app.attached_tunnel_generation.get("uid-r"),
+            Some(&5),
+            "an unrecorded live remote session is baselined at the current gen",
+        );
+    }
+
+    /// Local sessions are never touched by the generation watchdog, even if a
+    /// bogus generation is forced for the local host.
+    #[test]
+    fn local_session_ignored_by_generation_watchdog() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, _ghost) = app_with_ghost_unix_host(&cm_dir);
+        let local = cm_daemon::host_id::HostId::local();
+        let (ts, _tx, _teof) = session_with_injected_exit("uid-local", local.clone(), false);
+        app.workspaces.push(workspace_with(ts));
+        app.attached_tunnel_generation.insert("uid-local".into(), 1);
+        app.host_pool.set_tunnel_generation_for_test(&local, 9);
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(
+            !app.reconnecting_sessions.contains("uid-local"),
+            "local sessions have no tunnel and must be ignored",
+        );
+        assert!(app.pending_remote_reattach.is_empty());
     }
 
     /// Bound check: a genuinely-gone session (daemon reachable, returns
