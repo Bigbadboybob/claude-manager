@@ -94,12 +94,30 @@ const CONSUMER_REFIRE_SPACING_SECS: u64 = 60;
 /// log per queue per TTL, not four per second.
 const QUEUE_DEPTH_CACHE_TTL_SECS: u64 = 30;
 
+/// Post-compact settle spacing (seconds). A compact-only fire delivers
+/// `/compact`, whose summarization turn is async and can outlast a few
+/// minutes; a prompt pasted into the PTY mid-summarization is DROPPED by the
+/// agent TUI (the documented run_now/compact collision). So after a
+/// [`FireOutcome::FiredCompact`] the next fire is scheduled no sooner than
+/// this — it floors the per-schedule spacing (`max(every, this)`), which
+/// matters for Consumers whose [`CONSUMER_REFIRE_SPACING_SECS`] (60s) is well
+/// under a `/compact` turn. One stretched inter-fire gap every `compact_every`
+/// runs is noise next to a dropped batch prompt (which would strand the
+/// batch's items as consumed-but-unprocessed).
+const COMPACT_SETTLE_SPACING_SECS: u64 = 600;
+
 /// Outcome of a single in-process fire, distilled from `methods::trigger`'s
-/// return into the three cases the ADVANCE phase branches on.
+/// return into the cases the ADVANCE phase branches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FireOutcome {
     /// `Ok({fired:true})` — the fire happened. Reset `consecutive_failures`.
     Fired,
+    /// `Ok({fired:true, compact:true})` — a persistent compact-only fire: the
+    /// PTY got `/compact` instead of the prompt, and the run was recorded
+    /// already-Done at fire time (nothing will `report_done` it). Advances like
+    /// [`Fired`] but floors the spacing at [`COMPACT_SETTLE_SPACING_SECS`] so
+    /// the NEXT fire's paste cannot land mid-summarization and be dropped.
+    FiredCompact,
     /// `Ok({fired:false, reason:busy|paused|duplicate_fire_token})` — a benign
     /// skip (the `in_flight` guard / `paused` flag already prevents
     /// re-selection). Do NOT bump `consecutive_failures`. Leaves `next_fire_at`
@@ -843,6 +861,14 @@ impl ContinuousScheduler {
                     t.consecutive_failures = 0;
                     t.next_fire_at = now.saturating_add(every);
                 }
+                FireOutcome::FiredCompact => {
+                    // A compact-only fire: like Fired, but the next fire must
+                    // clear the async `/compact` summarization turn — a prompt
+                    // pasted mid-summarization is dropped. Floor the spacing.
+                    t.consecutive_failures = 0;
+                    t.next_fire_at =
+                        now.saturating_add(every.max(COMPACT_SETTLE_SPACING_SECS));
+                }
                 FireOutcome::Skipped => {
                     // Benign skip (busy/paused/duplicate): the in_flight guard /
                     // paused flag already blocks re-selection; leave
@@ -933,7 +959,11 @@ impl ContinuousScheduler {
         match result {
             Ok(Ok(v)) => {
                 if v.get("fired").and_then(|f| f.as_bool()).unwrap_or(false) {
-                    FireOutcome::Fired
+                    if v.get("compact").and_then(|c| c.as_bool()).unwrap_or(false) {
+                        FireOutcome::FiredCompact
+                    } else {
+                        FireOutcome::Fired
+                    }
                 } else {
                     // busy / paused / duplicate_fire_token — a benign skip.
                     FireOutcome::Skipped
@@ -1071,8 +1101,10 @@ fn fresh_run_active(tk: &ContinuousTask) -> bool {
 /// Consumer contract is therefore periodic-fresh-shaped: the prompt MUST end in
 /// `report_done` (or the session must exit) or the queue never drains again —
 /// recoverable via `continuous.run_now`, same as the documented periodic-fresh
-/// footgun. Periodic tasks keep the Phase-3b fresh-only semantics.
-fn run_active_blocks_fire(tk: &ContinuousTask) -> bool {
+/// footgun, or via the operator break-glass `continuous.force_done`. Periodic
+/// tasks keep the Phase-3b fresh-only semantics. `pub(crate)` so the trigger
+/// compact-boundary regression tests can assert the gate directly.
+pub(crate) fn run_active_blocks_fire(tk: &ContinuousTask) -> bool {
     if matches!(tk.schedule, Schedule::Consumer { .. }) {
         return tk
             .last_run
@@ -1550,6 +1582,41 @@ mod tests {
         assert_eq!(backoff_secs(100, 5), 3200);
         assert_eq!(backoff_secs(100, 6), BACKOFF_CAP_SECS); // 6400 -> capped
         assert_eq!(backoff_secs(100, 30), BACKOFF_CAP_SECS); // no overflow panic
+    }
+
+    /// A compact-only fire (`FiredCompact`) advances like a success but floors
+    /// the spacing at [`COMPACT_SETTLE_SPACING_SECS`]: the next fire must not
+    /// paste a prompt into the PTY while `/compact`'s async summarization turn
+    /// is still running (the paste would be dropped — for a Consumer that
+    /// strands the batch as consumed-but-unprocessed). A cadence LONGER than
+    /// the floor keeps its own spacing.
+    #[test]
+    fn fired_compact_floors_next_fire_at_settle_spacing() {
+        let _tmp = with_temp_home(|| {
+            let sched = scheduler();
+            let now = 1_000u64;
+
+            // Consumer spacing (60s) is well under the settle floor → floored.
+            let mut c = consumer_task("compact-consumer", "q", 50, 1);
+            c.consecutive_failures = 3;
+            task::save(&c).expect("save");
+            sched.advance_after_fire("compact-consumer", FireOutcome::FiredCompact, now);
+            let r = task::load_one("compact-consumer").unwrap();
+            assert_eq!(
+                r.next_fire_at,
+                now + COMPACT_SETTLE_SPACING_SECS,
+                "consumer spacing floored to the compact settle window",
+            );
+            assert_eq!(r.consecutive_failures, 0, "a compact fire is a success");
+            assert_eq!(r.last_fired_at, now);
+
+            // A Periodic cadence longer than the floor keeps its own spacing.
+            let every = COMPACT_SETTLE_SPACING_SECS + 100;
+            task::save(&periodic_task("compact-periodic", every, 0)).expect("save");
+            sched.advance_after_fire("compact-periodic", FireOutcome::FiredCompact, now);
+            let p = task::load_one("compact-periodic").unwrap();
+            assert_eq!(p.next_fire_at, now + every, "longer cadence unfloored");
+        });
     }
 
     /// A benign skip (busy/paused/duplicate) advances last_fired_at but neither

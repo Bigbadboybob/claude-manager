@@ -7805,24 +7805,63 @@ pub fn trigger(
     // run_mode label for the run record, audit line, and response.
     let run_mode_label = if is_persistent { "persistent" } else { "fresh" };
 
+    // ---- Auto-`/compact` decision (persistent live fires only) --------------
+    // The run just armed is `seq` (== run_count+1). compact-after-N gates on it
+    // so the Nth, 2Nth, … fire `/compact`s (only) before the prompt resumes on
+    // the following fire.
+    //
+    // Compaction is a SCHEDULED-cadence concern: ONLY the periodic scheduler
+    // may turn a fire into a `/compact`. A manual `continuous.run_now`, an MCP
+    // `trigger` fan-out, or a `resolve_stuck` refire always runs the prompt.
+    // Otherwise an off-schedule fire that happens to land on a compact-multiple
+    // seq silently compacts instead of running a cycle — and worse, a scheduled
+    // fire close behind lands mid-`/compact` (the summarization turn is async
+    // and outlasts a few minutes) where its paste is dropped, so neither fire
+    // runs a cycle. Keying off the scheduler caller keeps the cadence intact
+    // while making operator fires always do what the operator asked: run now.
+    //
+    // Decided HERE — above the Consumer batch claim — because a compact fire
+    // delivers `/compact` INSTEAD of the prompt: claiming a batch for it would
+    // ack items as consumed that no agent ever sees (silent item loss at every
+    // compact boundary), and recording it `Running` would wedge a Consumer
+    // forever (`run_active_blocks_fire` gates on the Running status, and the
+    // never-delivered prompt means nobody will ever `report_done` the run —
+    // the 2026-07-05 scraper-opt incident). A compact fire is therefore a
+    // self-contained maintenance run: no batch, and its run record is written
+    // already-finished (run end registered BEFORE the `/compact` goes out).
+    let is_scheduled_fire = matches!(
+        caller,
+        Caller::Operator(op)
+            if op.token_id == crate::continuous::scheduler::SCHEDULER_CALLER_TOKEN
+    );
+    let compact = persistent_target.is_some()
+        && is_scheduled_fire
+        && matches!(task.compact_every, Some(n) if n > 0 && seq % n as u64 == 0);
+
     // ---- Consumer batch claim (Phase 4) -------------------------------------
     // AFTER the in_flight guard (exactly one claimer per fire) and BEFORE the
     // executor (the delivered prompt points at the staged batch file). A
     // claim/stage failure fails the fire like a spawn failure would — clear
-    // the guard, audit, surface the error (the scheduler backs off).
-    let consumer_batch = match stage_consumer_batch(state_arc, &task, seq) {
-        Ok(b) => b,
-        Err(e) => {
-            continuous_clear_in_flight_after_failure(
-                &p.task_id,
-                seq,
-                &fire_token,
-                &session_uid,
-                run_mode_label,
-                &trigger_source,
-                &e.1,
-            );
-            return Err(e);
+    // the guard, audit, surface the error (the scheduler backs off). A compact
+    // fire never claims — its prompt is not delivered, so the items stay
+    // pending for the next (real) fire.
+    let consumer_batch = if compact {
+        None
+    } else {
+        match stage_consumer_batch(state_arc, &task, seq) {
+            Ok(b) => b,
+            Err(e) => {
+                continuous_clear_in_flight_after_failure(
+                    &p.task_id,
+                    seq,
+                    &fire_token,
+                    &session_uid,
+                    run_mode_label,
+                    &trigger_source,
+                    &e.1,
+                );
+                return Err(e);
+            }
         }
     };
     // Point the agent at the staged batch. The file (not an inline paste)
@@ -7850,28 +7889,8 @@ pub fn trigger(
         // fire). The handle was already cloned out under the brief
         // liveness-probe lock above, so no lock is held here.
         Some((live_uid, handle_opt)) => {
-            // The run just armed is `seq` (== run_count+1). compact-after-N gates
-            // on it so the Nth, 2Nth, … fire `/compact`s (only) before the
-            // prompt resumes on the following fire.
-            //
-            // Compaction is a SCHEDULED-cadence concern: ONLY the periodic
-            // scheduler may turn a fire into a `/compact`. A manual
-            // `continuous.run_now`, an MCP `trigger` fan-out, or a
-            // `resolve_stuck` refire always runs the prompt. Otherwise an
-            // off-schedule fire that happens to land on a compact-multiple seq
-            // silently compacts instead of running a cycle — and worse, a
-            // scheduled fire close behind lands mid-`/compact` (the summarization
-            // turn is async and outlasts a few minutes) where its paste is
-            // dropped, so neither fire runs a cycle. Keying off the scheduler
-            // caller keeps the cadence intact while making operator fires always
-            // do what the operator asked: run now.
-            let is_scheduled_fire = matches!(
-                caller,
-                Caller::Operator(op)
-                    if op.token_id == crate::continuous::scheduler::SCHEDULER_CALLER_TOKEN
-            );
-            let compact = is_scheduled_fire
-                && matches!(task.compact_every, Some(n) if n > 0 && seq % n as u64 == 0);
+            // `compact` was decided above (before the batch claim) — the Nth,
+            // 2Nth, … SCHEDULER fire delivers `/compact` instead of the prompt.
             // Under the delivery test spy `handle_opt` is None — record the
             // delivery in lieu of a PTY write (production always carries a handle
             // in the live arm).
@@ -7973,14 +7992,26 @@ pub fn trigger(
     // Record the fire + CLEAR the spawn-window guard in one atomic modify.
     // Phase 2's in_flight is a spawn-window guard ONLY — cleared as the trigger
     // returns (the delivery thread is detached); whole-run tracking is Phase 3.
+    //
+    // A COMPACT fire's run is recorded ALREADY-FINISHED (Done at fire time):
+    // its prompt is never delivered, so no agent will ever `report_done` it,
+    // and a persistent session never exits — a `Running` record here has no
+    // possible closer and wedges a Consumer's run-active gate forever. The run
+    // end is thus registered BEFORE the `/compact` reaches the PTY; the
+    // scheduler still spaces the next fire past the summarization turn (see
+    // `FireOutcome::FiredCompact`).
     if let Err(e) = crate::continuous::task::modify(&p.task_id, |t| {
         t.last_run = Some(crate::continuous::task::RunRecord {
             seq,
             fire_token: fire_token.clone(),
             started_at,
-            finished_at: None,
+            finished_at: if compact { Some(started_at) } else { None },
             session_uid: Some(session_uid.clone()),
-            status: crate::continuous::task::RunStatus::Running,
+            status: if compact {
+                crate::continuous::task::RunStatus::Done
+            } else {
+                crate::continuous::task::RunStatus::Running
+            },
             trigger_source: trigger_source.clone(),
         });
         t.current_session_uid = Some(session_uid.clone());
@@ -8014,7 +8045,7 @@ pub fn trigger(
     // Append the audit line (best-effort; the fire already happened).
     // `detail` carries the caller's free-form `args` blob unparsed (the daemon
     // does NOT interpret it), plus the staged batch pointer for a Consumer
-    // fire.
+    // fire, or the compact marker for a compact-only fire.
     let detail = match &consumer_batch {
         Some(b) => {
             let mut d = json!({
@@ -8022,6 +8053,13 @@ pub fn trigger(
                 "batch_count": b.count,
                 "batch_file": b.file,
             });
+            if let Some(args) = &p.args {
+                d["args"] = args.clone();
+            }
+            Some(d)
+        }
+        None if compact => {
+            let mut d = json!({ "compact": true });
             if let Some(args) = &p.args {
                 d["args"] = args.clone();
             }
@@ -8039,7 +8077,7 @@ pub fn trigger(
             session_uid: Some(session_uid.clone()),
             run_mode: Some(run_mode_label.to_string()),
             trigger_source: Some(trigger_source.clone()),
-            status: Some("running".to_string()),
+            status: Some(if compact { "done" } else { "running" }.to_string()),
             detail,
         })
     {
@@ -8054,6 +8092,7 @@ pub fn trigger(
         "fire_token": fire_token,
         "session_uid": session_uid,
         "run_mode": run_mode_label,
+        "compact": compact,
     }))
 }
 
@@ -8285,6 +8324,118 @@ pub fn report_done(
         "ok": true,
         "done": marked,
         "task_id": ct_id,
+        "message": message,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ForceDoneParams {
+    task_id: String,
+    seq: u64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `continuous.force_done(task_id, seq, reason?)` — operator BREAK-GLASS for a
+/// run wedged `Running`. Born from the 2026-07-05 scraper-opt incident: a run
+/// stranded `Running` starves a Consumer's due-gate, and both `report_done`
+/// and `resolve_stuck` are Session-callable only — the only recovery was
+/// puppeting the session via `send_input` and asking it to re-call
+/// `report_done`. This closes the run from the operator socket directly.
+///
+/// Operator-only (gated at dispatch like the other `continuous.*` CRUD arms).
+/// `seq` is REQUIRED and must match `last_run.seq` — the explicit handshake
+/// keeps a stale break-glass from closing a NEWER run that started between the
+/// operator reading state and firing this. A seq/status mismatch is a SOFT
+/// no-op (`Ok({done:false, …})` with the observed state in the message), never
+/// an error — mirroring `report_done`'s idempotent shape.
+pub fn continuous_force_done(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ForceDoneParams = serde_json::from_value(params.clone()).map_err(|e| {
+        (
+            ErrorCode::InvalidParams,
+            format!("continuous.force_done params: {}", e),
+        )
+    })?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.force_done: {}", e)))?;
+    crate::continuous::task::load_one(&p.task_id).ok_or((
+        ErrorCode::NotFound,
+        format!(
+            "continuous.force_done: continuous task '{}' not found",
+            p.task_id
+        ),
+    ))?;
+
+    let now = crate::continuous::task::now_unix();
+    let mut marked = false;
+    let mut observed: Option<(u64, crate::continuous::task::RunStatus)> = None;
+    let updated = match crate::continuous::task::modify(&p.task_id, |t| {
+        if let Some(run) = t.last_run.as_mut() {
+            observed = Some((run.seq, run.status));
+            if run.seq == p.seq
+                && matches!(run.status, crate::continuous::task::RunStatus::Running)
+            {
+                run.status = crate::continuous::task::RunStatus::Done;
+                run.finished_at = Some(now);
+                marked = true;
+            }
+        }
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err((
+                ErrorCode::Internal,
+                format!("continuous.force_done: persist '{}': {}", p.task_id, e),
+            ));
+        }
+    };
+
+    if marked {
+        let (fire_token, session_uid) = updated
+            .last_run
+            .as_ref()
+            .map(|r| (Some(r.fire_token.clone()), r.session_uid.clone()))
+            .unwrap_or((None, None));
+        if let Err(e) = crate::continuous::runlog::ContinuousRunLog::append(
+            &crate::continuous::runlog::RunLogLine {
+                seq: p.seq,
+                ts: runlog_now_ts(),
+                task_id: p.task_id.clone(),
+                event: "force_done".to_string(),
+                fire_token,
+                session_uid,
+                run_mode: None,
+                trigger_source: Some("operator".to_string()),
+                status: Some("done".to_string()),
+                detail: p.reason.clone().map(Value::String),
+            },
+        ) {
+            eprintln!(
+                "cm-daemon: continuous.force_done runlog append failed for '{}': {}",
+                p.task_id, e
+            );
+        }
+    }
+
+    let message = if marked {
+        "run force-closed (Running -> Done)".to_string()
+    } else {
+        match observed {
+            Some((seq, status)) => format!(
+                "no-op: last_run is seq {} in status {:?} (wanted seq {} Running)",
+                seq, status, p.seq
+            ),
+            None => "no-op: task has no last_run".to_string(),
+        }
+    };
+    Ok(json!({
+        "ok": true,
+        "done": marked,
+        "task_id": p.task_id,
+        "seq": p.seq,
         "message": message,
     }))
 }
@@ -22117,6 +22268,211 @@ mod tests {
                 !deliveries[0].2,
                 "manual fire on a compact-multiple seq must run the prompt, not /compact"
             );
+        });
+    }
+
+    /// REGRESSION (2026-07-05 scraper-opt incident): a persistent CONSUMER
+    /// crossing a `compact_every` boundary must not wedge. Before the fix, the
+    /// compact-multiple SCHEDULER fire claimed+acked a batch it never delivered
+    /// (silent item loss) and recorded a `Running` run whose prompt — and with
+    /// it the `report_done` instruction — never reached the agent, so nothing
+    /// could ever close the run; the Consumer run-active gate then skipped
+    /// every future fire (queue starved at ~35 pending; the operator had to
+    /// puppet the session over send_input). Now the compact fire claims no
+    /// batch and registers its run end AT FIRE TIME (Done before `/compact` is
+    /// injected). With compact_every=2: fire 1 = batch run (report_done lands)
+    /// → fire 2 = compact boundary (self-closing, no queue traffic) → fire 3 =
+    /// batch run again (fires, and ITS report_done lands).
+    #[test]
+    fn trigger_consumer_compact_boundary_does_not_wedge() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+                ("POST", "/queues/props/claim") => (
+                    200,
+                    r#"{"items":[{"id":"44444444-4444-4444-4444-444444444444","payload":{"u":1},"dedupe_key":null,"source":null,"enqueued_at":"2026-07-05T00:00:00+00:00"}]}"#
+                        .to_string(),
+                ),
+                ("POST", "/queues/props/ack") => (200, r#"{"acked":1}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+
+            let uid = fresh_test_uid();
+            let mut task = continuous_task(
+                "ct-consumer-compact",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.schedule = crate::continuous::task::Schedule::Consumer {
+                queue: "props".into(),
+                batch_max: 5,
+                window_secs: 60,
+                depth_threshold: 1,
+            };
+            task.compact_every = Some(2);
+            task.current_session_uid = Some(uid.clone());
+            crate::continuous::task::save(&task).expect("save");
+
+            // Real registry entry for the pinned session — report_done resolves
+            // the caller's continuous_task_id off it. The delivery spy is what
+            // makes trigger treat the pinned uid as live + records deliveries.
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            insert_continuous_session(&state, &uid, "ct-consumer-compact");
+            arm_continuous_delivery_spy_for_test();
+
+            let sched =
+                Caller::operator(crate::continuous::scheduler::SCHEDULER_CALLER_TOKEN);
+
+            // ---- Fire 1 (seq 1): a normal batch run. ----
+            let r1 = trigger(&state, &sched, &json!({ "task_id": "ct-consumer-compact" }))
+                .expect("fire 1");
+            assert_eq!(r1["fired"], json!(true));
+            assert_eq!(r1["compact"], json!(false));
+            // The agent finishes the batch and reports done.
+            let rd1 = report_done(&state, &Caller::session(uid.clone()), &json!({}))
+                .expect("report_done run 1");
+            assert_eq!(rd1["done"], json!(true));
+
+            // ---- Fire 2 (seq 2 == compact_every): the compact boundary. ----
+            let r2 = trigger(&state, &sched, &json!({ "task_id": "ct-consumer-compact" }))
+                .expect("fire 2");
+            assert_eq!(r2["fired"], json!(true));
+            assert_eq!(r2["compact"], json!(true), "boundary fire is the compact fire");
+
+            let after2 = crate::continuous::task::load_one("ct-consumer-compact").unwrap();
+            let run2 = after2.last_run.clone().expect("run 2 recorded");
+            assert_eq!(run2.seq, 2);
+            assert_eq!(
+                run2.status,
+                crate::continuous::task::RunStatus::Done,
+                "compact fire registers its run end at fire time — its prompt is \
+                 never delivered, so no agent could ever report_done it",
+            );
+            assert!(run2.finished_at.is_some(), "finished_at stamped");
+            // THE incident predicate: the scheduler's Consumer run-active gate
+            // must be OPEN after the boundary (it stayed closed forever before).
+            assert!(
+                !crate::continuous::scheduler::run_active_blocks_fire(&after2),
+                "due-gate must not block after a compact boundary",
+            );
+
+            // ---- Fire 3 (seq 3): a normal batch run again. ----
+            let r3 = trigger(&state, &sched, &json!({ "task_id": "ct-consumer-compact" }))
+                .expect("fire 3 — this is what wedged before the fix");
+            assert_eq!(r3["fired"], json!(true));
+            assert_eq!(r3["compact"], json!(false));
+            let rd3 = report_done(&state, &Caller::session(uid.clone()), &json!({}))
+                .expect("report_done run 3");
+            assert_eq!(rd3["done"], json!(true), "post-boundary run's report_done lands");
+
+            // Deliveries: prompt, /compact, prompt — all to the pinned session.
+            let deliveries = take_continuous_delivery_spy_for_test();
+            assert_eq!(deliveries.len(), 3);
+            assert!(!deliveries[0].2, "fire 1 delivers the prompt");
+            assert!(deliveries[1].2, "fire 2 delivers /compact");
+            assert!(!deliveries[2].2, "fire 3 delivers the prompt");
+            assert!(deliveries.iter().all(|d| d.1 == uid), "same pinned session");
+
+            // The compact fire claimed NOTHING: the queue API saw exactly two
+            // claim+ack pairs (fires 1 and 3). Before the fix, fire 2 claimed
+            // and acked a batch no agent ever saw — silent item loss at every
+            // compact boundary.
+            let reqs = stub.requests.lock().unwrap();
+            let paths: Vec<&str> = reqs.iter().map(|r| r.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    "/queues/props/claim",
+                    "/queues/props/ack",
+                    "/queues/props/claim",
+                    "/queues/props/ack",
+                ],
+                "compact boundary fire must not touch the queue",
+            );
+            drop(reqs);
+
+            // Audit trail: the boundary's fired line carries the compact marker
+            // and a closed status.
+            let runs = std::fs::read_to_string(
+                crate::continuous::task::runs_log_path("ct-consumer-compact"),
+            )
+            .expect("runs.jsonl");
+            let boundary = runs
+                .lines()
+                .filter_map(|l| {
+                    serde_json::from_str::<crate::continuous::runlog::RunLogLine>(l).ok()
+                })
+                .find(|l| l.event == "fired" && l.seq == 2)
+                .expect("fired line for seq 2");
+            assert_eq!(boundary.status.as_deref(), Some("done"));
+            assert_eq!(boundary.detail, Some(json!({ "compact": true })));
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// `continuous.force_done` — the operator break-glass for a run wedged
+    /// `Running` (the incident's recovery required puppeting the session over
+    /// send_input because report_done/resolve_stuck are Session-only). Closes
+    /// the run only on an exact `seq` match; a mismatched seq, a non-Running
+    /// run, or a repeat call is a SOFT no-op; a missing task is NotFound.
+    #[test]
+    fn continuous_force_done_closes_wedged_run_on_seq_match() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let task = fresh_task_running("ct-fd", &wt, "ts-wedged-0");
+            crate::continuous::task::save(&task).expect("save");
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+
+            // Wrong seq: soft no-op, run untouched (guards a stale break-glass
+            // racing a newer run).
+            let miss = continuous_force_done(&state, &json!({"task_id":"ct-fd","seq":9}))
+                .expect("seq mismatch is a soft no-op");
+            assert_eq!(miss["done"], json!(false));
+            assert_eq!(
+                crate::continuous::task::load_one("ct-fd")
+                    .unwrap()
+                    .last_run
+                    .unwrap()
+                    .status,
+                crate::continuous::task::RunStatus::Running,
+            );
+
+            // Matching seq: Running → Done + finished_at + audit line.
+            let hit = continuous_force_done(
+                &state,
+                &json!({"task_id":"ct-fd","seq":1,"reason":"operator break-glass"}),
+            )
+            .expect("force done");
+            assert_eq!(hit["done"], json!(true));
+            let reloaded = crate::continuous::task::load_one("ct-fd").unwrap();
+            let run = reloaded.last_run.expect("last_run");
+            assert_eq!(run.status, crate::continuous::task::RunStatus::Done);
+            assert!(run.finished_at.is_some());
+            let runs =
+                std::fs::read_to_string(crate::continuous::task::runs_log_path("ct-fd"))
+                    .expect("runs.jsonl");
+            assert!(runs.contains("\"force_done\""), "audit line: {}", runs);
+            assert!(
+                runs.contains("operator break-glass"),
+                "reason recorded: {}",
+                runs
+            );
+
+            // Already Done: soft no-op again (idempotent break-glass).
+            let again = continuous_force_done(&state, &json!({"task_id":"ct-fd","seq":1}))
+                .expect("idempotent");
+            assert_eq!(again["done"], json!(false));
+
+            // Missing task: NotFound.
+            let err = continuous_force_done(&state, &json!({"task_id":"ct-nope","seq":1}))
+                .expect_err("missing task");
+            assert_eq!(err.0, ErrorCode::NotFound);
         });
     }
 

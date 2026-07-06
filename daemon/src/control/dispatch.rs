@@ -553,6 +553,9 @@ pub fn dispatch_request(
         "continuous.pause" => DispatchOutcome::Done(dispatch_continuous_pause(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
+        "continuous.force_done" => {
+            DispatchOutcome::Done(dispatch_continuous_force_done(state, req))
+        }
 
         // Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11) — the
         // stuck-story agent tools. Both are bimodal (Operator OR Session) like
@@ -940,6 +943,30 @@ fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
         return resp;
     }
     match methods::continuous_delete(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.force_done` — operator BREAK-GLASS for a run wedged `Running`
+/// (born from the 2026-07-05 scraper-opt compact-boundary incident).
+/// Operator-only like the other `continuous.*` CRUD arms: `report_done` /
+/// `resolve_stuck` are Session-callable only, so without this the sole
+/// recovery for a stranded-Running run was puppeting the session over
+/// `send_input`. The method body requires an explicit `seq` match before
+/// flipping Running → Done.
+fn dispatch_continuous_force_done(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.force_done is Operator-callable only (a continuous agent \
+         reports its own run via report_done)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_force_done(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
