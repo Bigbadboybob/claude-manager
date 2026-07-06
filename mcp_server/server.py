@@ -2057,7 +2057,9 @@ def list_subtasks(task_id: str | None = None) -> list[dict]:
 
 
 @mcp.tool()
-def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
+def mark_subtask_done(
+    task_id: str, close_worktree: bool = True, force: bool = False
+) -> dict:
     """Mark a subtask done. Optionally tear down its worktree.
 
     Args:
@@ -2068,8 +2070,19 @@ def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
             stays so merge history is preserved — prune manually with
             `git branch -d cm-sub/<slug-chain>-<short_id>` once
             you're confident.
+        force: Discard an uncommitted worktree instead of refusing.
+            Default false — if the subtask's branch worktree has
+            uncommitted or untracked changes, this call is REFUSED with
+            a clear error and nothing is torn down (the `--force` git
+            remove would otherwise silently destroy that work). Merge or
+            commit first (the branch ref survives regardless), or pass
+            `force=true` to accept the loss. Only the working tree is at
+            risk; committed work on the branch is always preserved.
 
-    Returns: {"ok": true, "worktree_removed": bool}.
+    Returns: {"ok": true, "worktree_removed": bool}. On a dirty worktree
+    without `force`, returns an error (`{"error": ..., "message": ...}`)
+    and leaves everything intact — sessions still alive so you can go
+    merge.
 
     For branch-mode subtasks, run your `git merge` (or rebase, or
     cherry-pick) into the parent worktree BEFORE calling this — once
@@ -2082,7 +2095,7 @@ def mark_subtask_done(task_id: str, close_worktree: bool = True) -> dict:
     """
     return control_client.call(
         "mark_subtask_done",
-        {"task_id": task_id, "close_worktree": close_worktree},
+        {"task_id": task_id, "close_worktree": close_worktree, "force": force},
     )
 
 

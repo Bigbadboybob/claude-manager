@@ -10901,6 +10901,11 @@ struct MarkSubtaskDoneParams {
     task_id: String,
     #[serde(default = "default_close_worktree")]
     close_worktree: bool,
+    /// Discard an uncommitted subtask worktree instead of refusing to
+    /// tear it down. Default false: a dirty worktree is a hard error so
+    /// `git worktree remove --force` can't silently destroy unmerged work.
+    #[serde(default)]
+    force: bool,
 }
 
 fn default_close_worktree() -> bool {
@@ -11231,6 +11236,46 @@ pub fn mark_subtask_done(
     // worktree_mode label is authoritative from the API row.
     let task_row = api_get_task(&creds, &p.task_id).map_err(|e| e.to_method_err())?;
     let was_branch_mode = task_row.get("worktree_mode").and_then(Value::as_str) == Some("branch");
+
+    // Safety guard (checked BEFORE anything destructive — sessions are still
+    // alive here): refuse to tear down a branch worktree that has uncommitted
+    // changes. `remove_worktree` runs `git worktree remove --force`, which
+    // would silently destroy them. `force=true` overrides (the caller has
+    // accepted the loss). Committed work is preserved by the branch ref, so
+    // only the working tree is at risk. `is_in_place` worktrees ARE the main
+    // checkout (wt == main_repo) — never our dirt to judge; skip them.
+    if p.close_worktree && was_branch_mode && !p.force {
+        if let Some((_, Some(wt), mr_opt)) = &cleanup {
+            let is_in_place = mr_opt.as_ref() == Some(wt);
+            if !is_in_place {
+                match crate::worktree::worktree_is_dirty(wt) {
+                    Ok(true) => {
+                        return Err((
+                            ErrorCode::Conflict,
+                            format!(
+                                "subtask {} worktree has uncommitted changes at {} — \
+                                 commit or merge them first (the branch ref is preserved), \
+                                 or pass force=true to discard them. Nothing was torn down.",
+                                p.task_id,
+                                wt.display()
+                            ),
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        return Err((
+                            ErrorCode::Internal,
+                            format!(
+                                "could not check subtask {} worktree cleanliness: {} — \
+                                 pass force=true to skip the check",
+                                p.task_id, e
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     // Close the subtask's sessions FIRST, for ALL modes — a subtask marked done
     // has finished its work, so its sessions must not linger (git/PTY hygiene).
@@ -22933,6 +22978,88 @@ mod tests {
         let body: Value = serde_json::from_str(&patch.body).expect("patch body json");
         assert_eq!(body["status"], "done");
         drop(reqs);
+
+        kill_all_sessions(&state);
+        clear_api_env();
+    }
+
+    #[test]
+    fn mark_subtask_done_refuses_dirty_branch_worktree_without_force() {
+        // Safety guard: a branch subtask with uncommitted work must NOT be
+        // torn down (git worktree remove --force would destroy it). The call
+        // is refused with a Conflict, nothing is flipped to done, and the
+        // work survives.
+        let _g = crate::test_support::env_lock();
+        let state = make_state_arc();
+        seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+
+        // A real, DIRTY git worktree for the subtask (untracked file).
+        let wt = tempfile::tempdir().unwrap();
+        run_git(wt.path(), &["init", "-q"]);
+        run_git(wt.path(), &["config", "user.email", "t@t"]);
+        run_git(wt.path(), &["config", "user.name", "t"]);
+        std::fs::write(wt.path().join("wip.txt"), "uncommitted work").unwrap();
+
+        {
+            let mut s = state.lock().unwrap();
+            s.task_tree.insert("task-parent".into(), None);
+            s.task_tree
+                .insert("child-1".into(), Some("task-parent".into()));
+            s.workspaces.insert(
+                "ws-child".into(),
+                ManifestWorkspace {
+                    id: "ws-child".into(),
+                    name: "child".into(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: Some(wt.path().to_path_buf()),
+                    // != worktree_path, so this is NOT treated as in-place.
+                    main_repo_path: Some(std::path::PathBuf::from("/some/main")),
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    host_id: crate::host_id::HostId::local(),
+                    sessions: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+            );
+            s.task_workspaces
+                .insert("child-1".into(), "ws-child".into());
+        }
+
+        let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+            ("GET", "/tasks/child-1") => (
+                200,
+                r#"{"id":"child-1","worktree_mode":"branch","status":"running"}"#.to_string(),
+            ),
+            ("PATCH", "/tasks/child-1") => {
+                (200, r#"{"id":"child-1","status":"done"}"#.to_string())
+            }
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        set_api_env(stub.port);
+
+        // Without force: refused.
+        let err = mark_subtask_done(&state, &json!({"task_id": "child-1"}), Some("ts-orch"))
+            .expect_err("dirty worktree must be refused");
+        assert_eq!(err.0, ErrorCode::Conflict);
+        assert!(
+            err.1.contains("uncommitted"),
+            "error should explain the dirty worktree, got: {}",
+            err.1
+        );
+
+        // Nothing torn down: no PATCH-to-done was sent, the work survives.
+        let reqs = stub.requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| r.method == "PATCH"),
+            "a refused teardown must not flip the task to done"
+        );
+        drop(reqs);
+        assert!(
+            wt.path().join("wip.txt").exists(),
+            "uncommitted work must survive a refused teardown"
+        );
 
         kill_all_sessions(&state);
         clear_api_env();

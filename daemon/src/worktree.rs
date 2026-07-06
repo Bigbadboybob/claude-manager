@@ -382,6 +382,39 @@ pub fn remove_worktree(
     Err(stderr.trim().to_string())
 }
 
+/// True if `worktree_path` has uncommitted or untracked changes (a
+/// non-empty `git status --porcelain`).
+///
+/// Used to guard subtask teardown: `remove_worktree` runs `git worktree
+/// remove --force`, which silently destroys a dirty working tree, so
+/// `mark_subtask_done` refuses (absent `force=true`) when this returns
+/// true. Only the WORKING TREE is at risk — committed work lives on the
+/// branch ref, which the remove preserves — so an uncommitted/untracked
+/// change is exactly what we protect.
+///
+/// A missing worktree dir is treated as clean (`Ok(false)`): there's
+/// nothing to lose, and `remove_worktree` already handles the
+/// already-gone case idempotently, so the guard must not block it.
+pub fn worktree_is_dirty(worktree_path: &Path) -> Result<bool, String> {
+    if !worktree_path.exists() {
+        return Ok(false);
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| format!("spawn git status: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed in {}: {}",
+            worktree_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
 /// Resolve a repo shortname or URL to a local path.
 ///
 /// Checks ~/code/projects/<name> and the current directory.
@@ -906,5 +939,52 @@ mod tests {
                  (a concurrent winner's checkout)"
             );
         });
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            status.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    #[test]
+    fn worktree_is_dirty_tracks_working_tree_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "hi").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "init"]);
+
+        // Committed + clean → not dirty.
+        assert_eq!(worktree_is_dirty(repo), Ok(false));
+
+        // Untracked file → dirty (this is exactly what --force would nuke).
+        std::fs::write(repo.join("scratch.txt"), "wip").unwrap();
+        assert_eq!(worktree_is_dirty(repo), Ok(true));
+
+        // Stage + commit it → clean again.
+        git(repo, &["add", "scratch.txt"]);
+        git(repo, &["commit", "-q", "-m", "wip"]);
+        assert_eq!(worktree_is_dirty(repo), Ok(false));
+
+        // Uncommitted modification → dirty.
+        std::fs::write(repo.join("a.txt"), "changed").unwrap();
+        assert_eq!(worktree_is_dirty(repo), Ok(true));
+
+        // A path that doesn't exist is treated as clean (nothing to lose),
+        // so the teardown guard never blocks an already-gone worktree.
+        assert_eq!(worktree_is_dirty(&repo.join("nope")), Ok(false));
     }
 }

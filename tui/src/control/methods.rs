@@ -1423,6 +1423,11 @@ struct MarkSubtaskDoneParams {
     task_id: String,
     #[serde(default = "default_close_worktree")]
     close_worktree: bool,
+    /// Discard an uncommitted subtask worktree instead of refusing to
+    /// tear it down. Default false: a dirty worktree is a hard error so
+    /// `git worktree remove --force` can't silently destroy unmerged work.
+    #[serde(default)]
+    force: bool,
 }
 
 fn default_close_worktree() -> bool {
@@ -1536,6 +1541,43 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     } else {
         None
     };
+
+    // Safety guard (checked BEFORE Phase 2 closes any sessions): refuse to
+    // tear down a branch worktree that has uncommitted changes.
+    // `remove_worktree` runs `git worktree remove --force`, which would
+    // silently destroy them. `force=true` overrides. Committed work is
+    // preserved by the branch ref, so only the working tree is at risk.
+    // `cleanup_target` is already filtered to a real branch worktree here
+    // (None for in-place / already-cleaned), so no extra guard is needed.
+    if !p.force {
+        if let Some((_, _, wt)) = &cleanup_target {
+            match cm_daemon::worktree::worktree_is_dirty(wt) {
+                Ok(true) => {
+                    return Err((
+                        ErrorCode::Conflict,
+                        format!(
+                            "subtask {} worktree has uncommitted changes at {} — commit \
+                             or merge them first (the branch ref is preserved), or pass \
+                             force=true to discard them. Nothing was torn down.",
+                            p.task_id,
+                            wt.display()
+                        ),
+                    ));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    return Err((
+                        ErrorCode::Internal,
+                        format!(
+                            "could not check subtask {} worktree cleanliness: {} — pass \
+                             force=true to skip the check",
+                            p.task_id, e
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 
     // Phase 2 — perform cleanup. Sessions first (always), then the
     // worktree if applicable. We close sessions before the worktree
