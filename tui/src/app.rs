@@ -9946,7 +9946,11 @@ impl App {
             ManifestDiff::Exited { uid, last_exit } => {
                 let memory_cap_kill = last_exit.memory_cap_kill;
                 let mut found = false;
-                'outer: for ws in &mut self.workspaces {
+                // Workspace index holding the exited session IFF it's an
+                // agent-spawned ephemeral that should be PRUNED (see below).
+                // `None` = leave the row in place (ghost / user-owned).
+                let mut prune_ws: Option<usize> = None;
+                'outer: for (wi, ws) in self.workspaces.iter_mut().enumerate() {
                     for ts in &mut ws.sessions {
                         if ts.uid == uid {
                             ts.preserved_last_exit = Some(last_exit);
@@ -9957,6 +9961,37 @@ impl App {
                             // any indicator changes.
                             self.needs_redraw = true;
                             found = true;
+                            // Prune AGENT-SPAWNED, non-workflow sessions on
+                            // exit so they don't linger as frozen sidebar
+                            // rows. An orchestrator's spawn-and-kill children
+                            // (momentum-detective spawns/kills ~10/day) are
+                            // killed via the `kill_session` RPC/MCP from
+                            // OUTSIDE the TUI — the daemon drops them from its
+                            // live registry and broadcasts this `Exited` diff,
+                            // but the TUI's own row-removal only ever fired on
+                            // TUI-initiated (A-w) kills. Without a prune here
+                            // the diff just stamped `preserved_last_exit` and
+                            // the row stayed put, indistinguishable from a live
+                            // session. Gate:
+                            //   - `managed_by_uid.is_some()` — agent-spawned;
+                            //     the daemon already considers it gone and
+                            //     `list_sessions` (default) omits it, so match
+                            //     that by removing the row. User-created
+                            //     sessions (`None`) stay a ghost — the user
+                            //     owns their lifecycle (A-w to close).
+                            //   - `workflow_run_id.is_none()` — a workflow
+                            //     participant's slot must SURVIVE a fresh-
+                            //     context respawn (the daemon kills+respawns
+                            //     the PTY under the same slot), so never prune
+                            //     one on an exit diff.
+                            // Host-agnostic: the per-host manifest.watch
+                            // consumer routes remote (cm-manager) exit diffs
+                            // here too, so the remote repro is covered.
+                            if ts.managed_by_uid.is_some()
+                                && ts.workflow_run_id.is_none()
+                            {
+                                prune_ws = Some(wi);
+                            }
                             // Break both loops via label so
                             // `last_exit`'s move into the assignment
                             // above happens exactly once (rustc
@@ -9972,7 +10007,24 @@ impl App {
                     // stream toast (or vice versa) doesn't double-
                     // fire. Out-of-loop call so &mut self isn't
                     // contended by the workspaces iteration above.
+                    // Fire BEFORE the prune below so the toast's
+                    // caller-label lookup still resolves (the prune
+                    // tombstones the row, and `log_activity` falls
+                    // back to the tombstone label anyway, but firing
+                    // first keeps the live-session path unchanged).
                     self.try_emit_cap_kill_toast(&uid);
+                }
+                if let Some(wi) = prune_ws {
+                    // Same removal convention as A-w / task-close:
+                    // `tombstone_and_remove` kills any lingering daemon
+                    // binding (no-op if already dead), records a tombstone so
+                    // `read_session_output` still serves the final state,
+                    // drops the row, forgets reconnect bookkeeping, and
+                    // persists the manifest. Re-clamp the cursor in case it
+                    // sat on the removed row (the bulk helper doesn't).
+                    let target = uid.clone();
+                    self.tombstone_and_remove(wi, |ts| ts.uid == target);
+                    self.clamp_cursor();
                 }
                 // R5: untracked uid — `found` stays false; silent
                 // no-op. The diff referenced a session the TUI
@@ -18019,6 +18071,265 @@ mod apply_manifest_diff_tests {
             !app.needs_redraw,
             "unknown uid must NOT trigger a redraw",
         );
+    }
+
+    /// Build a fresh `/bin/true`-backed `TerminalSession` so the
+    /// exit-prune tests can add distinct rows to a workspace. Fields
+    /// default (`managed_by_uid == None`, `workflow_run_id == None`,
+    /// `host_id == local`); tests mutate the ones they care about.
+    fn make_exit_prune_session(uid: &str) -> TerminalSession {
+        let session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            std::collections::HashMap::new(),
+            None,
+        )
+        .expect("test PTY");
+        make_simple_session_with_uid(
+            uid.to_string(),
+            "test-label",
+            "claude",
+            session,
+            None,
+        )
+    }
+
+    /// An agent-spawned (`managed_by_uid` set), non-workflow session
+    /// that receives `ManifestDiff::Exited` is PRUNED from the sidebar
+    /// — the orchestrator spawn-and-kill ghost-row fix. The daemon has
+    /// already dropped it from its live registry (a `kill_session` RPC
+    /// from outside the TUI), so the row must go, matching the A-w
+    /// removal convention.
+    #[test]
+    fn exited_diff_prunes_agent_managed_session() {
+        let mut app = build_app_with_session("ts-agent");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        assert_eq!(app.workspaces[0].sessions.len(), 1);
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-agent".into(),
+            last_exit: LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        });
+
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "an agent-managed session must be removed from the \
+             sidebar on exit",
+        );
+    }
+
+    /// A USER-created session (`managed_by_uid == None`) is NOT
+    /// auto-removed on exit — it stays a ghost row with
+    /// `preserved_last_exit` set so the user (who owns its lifecycle)
+    /// closes it with A-w. Only its exit metadata is recorded.
+    #[test]
+    fn exited_diff_keeps_user_session_as_ghost() {
+        let mut app = build_app_with_session("ts-user");
+        assert!(app.workspaces[0].sessions[0].managed_by_uid.is_none());
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-user".into(),
+            last_exit: LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        });
+
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "user-created session must NOT be auto-removed on exit",
+        );
+        assert!(
+            app.workspaces[0].sessions[0].preserved_last_exit.is_some(),
+            "the ghost row still records its exit metadata",
+        );
+    }
+
+    /// A WORKFLOW PARTICIPANT (`workflow_run_id` set) is never pruned
+    /// on an exit diff even when it carries `managed_by_uid` — its slot
+    /// must SURVIVE a fresh-context respawn (the daemon kills+respawns
+    /// the PTY under the same slot), which would otherwise delete the
+    /// row mid-respawn.
+    #[test]
+    fn exited_diff_keeps_workflow_participant() {
+        let mut app = build_app_with_session("ts-wf");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.workspaces[0].sessions[0].workflow_run_id = Some("run-1".into());
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-wf".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        });
+
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "workflow-participant slot must survive a fresh-respawn \
+             exit diff",
+        );
+    }
+
+    /// Remote-host repro: a cm-manager-hosted agent session whose exit
+    /// diff arrives on the per-host `manifest.watch` stream is pruned
+    /// via the host-aware apply path (the actual reported bug — a
+    /// remote session viewed from the laptop TUI).
+    #[test]
+    fn exited_diff_prunes_remote_agent_managed_session() {
+        let mut app = build_app_with_session("ts-remote");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        let remote = cm_daemon::host_id::HostId::new("manager");
+        app.workspaces[0].sessions[0].host_id = remote.clone();
+
+        app.apply_manifest_diff_from_host(
+            remote,
+            ManifestDiff::Exited {
+                uid: "ts-remote".into(),
+                last_exit: LastExit {
+                    code: None,
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at: 1.0,
+                },
+            },
+        );
+
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "a remote agent-managed session must be pruned on exit \
+             (host-agnostic apply path)",
+        );
+    }
+
+    /// Cursor safety: when the cursor sits on the pruned row, the apply
+    /// path's `clamp_cursor` demotes it to the workspace rather than
+    /// leaving a dangling `Session(wi, si)` that later indexing (e.g.
+    /// the focused-terminal render) would panic on.
+    #[test]
+    fn exited_diff_prune_clamps_cursor_off_removed_row() {
+        let mut app = build_app_with_session("ts-cursor");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.cursor = Cursor::Session(0, 0);
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-cursor".into(),
+            last_exit: LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        });
+
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(
+            matches!(app.cursor, Cursor::Workspace(0)),
+            "cursor must clamp off the removed row, got {:?}",
+            app.cursor,
+        );
+    }
+
+    /// A cap-killed agent session still fires the cap-kill toast AND is
+    /// pruned — the toast fires before the removal so the activity feed
+    /// records why it died.
+    #[test]
+    fn exited_diff_cap_kill_toasts_and_prunes_agent_session() {
+        let mut app = build_app_with_session("ts-capkill");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-capkill".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: true,
+                kills_file_offset: Some(9),
+                exited_at: 1.0,
+            },
+        });
+
+        assert!(
+            app.cap_kill_toasted.contains("ts-capkill"),
+            "cap-kill toast must fire for the killed agent session",
+        );
+        assert!(
+            app.workspaces[0].sessions.is_empty(),
+            "a cap-killed agent session must also be pruned",
+        );
+    }
+
+    /// Idempotent: a duplicate `Exited` diff for an already-pruned uid
+    /// is a silent no-op (`found` stays false) — no panic, no spurious
+    /// redraw. Covers replayed diffs / snapshot+diff overlap.
+    #[test]
+    fn exited_diff_duplicate_after_prune_is_noop() {
+        let mut app = build_app_with_session("ts-dup");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+
+        let make = || ManifestDiff::Exited {
+            uid: "ts-dup".into(),
+            last_exit: LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        };
+        app.apply_manifest_diff(make());
+        assert!(app.workspaces[0].sessions.is_empty());
+
+        app.needs_redraw = false;
+        // Second diff for the now-absent uid: R5 silent no-op.
+        app.apply_manifest_diff(make());
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(
+            !app.needs_redraw,
+            "a duplicate exit diff for a removed uid must not redraw",
+        );
+    }
+
+    /// Only the TARGET row is pruned — a sibling agent session in the
+    /// same workspace is untouched and stays indexable. Guards against
+    /// the predicate matching too broadly.
+    #[test]
+    fn exited_diff_prune_leaves_sibling_sessions() {
+        let mut app = build_app_with_session("ts-keep");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        let mut sib = make_exit_prune_session("ts-drop");
+        sib.managed_by_uid = Some("orch".into());
+        app.workspaces[0].sessions.push(sib);
+        assert_eq!(app.workspaces[0].sessions.len(), 2);
+
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-drop".into(),
+            last_exit: LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            },
+        });
+
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "only the exited target is removed",
+        );
+        assert_eq!(app.workspaces[0].sessions[0].uid, "ts-keep");
     }
 
     /// T20-companion — non-Exited variants (`Added`, `Updated`,
