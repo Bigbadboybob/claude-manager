@@ -14,6 +14,7 @@ shape is missing required fields.
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -164,7 +165,7 @@ class StartSessionMethodSelectionTests(unittest.TestCase):
             ), mock.patch.object(control_client, "call", side_effect=fake_call):
                 from mcp_server import server as mcp_server
 
-                mcp_server.start_session(type="bash", label="test")
+                asyncio.run(mcp_server.start_session(type="bash", label="test"))
 
         self.assertEqual(
             captured.get("method"),
@@ -190,7 +191,7 @@ class StartSessionMethodSelectionTests(unittest.TestCase):
         ), mock.patch.object(control_client, "call", side_effect=fake_call):
             from mcp_server import server as mcp_server
 
-            mcp_server.start_session(type="bash", label="test")
+            asyncio.run(mcp_server.start_session(type="bash", label="test"))
 
         self.assertEqual(captured.get("method"), "mcp_start_session")
 
@@ -212,7 +213,7 @@ class StartSessionMethodSelectionTests(unittest.TestCase):
             ), mock.patch.object(control_client, "call", side_effect=fake_call):
                 from mcp_server import server as mcp_server
 
-                mcp_server.start_session(type="bash", label="test")
+                asyncio.run(mcp_server.start_session(type="bash", label="test"))
 
         self.assertEqual(
             captured.get("method"),
@@ -350,7 +351,7 @@ class StartSessionPassesResolvedSocketToCallTests(unittest.TestCase):
             ), mock.patch.object(control_client, "call", side_effect=fake_call):
                 from mcp_server import server as mcp_server
 
-                mcp_server.start_session(type="bash", label="test")
+                asyncio.run(mcp_server.start_session(type="bash", label="test"))
         self.assertEqual(captured.get("method"), "mcp_start_session")
         self.assertEqual(
             captured.get("socket_path"),
@@ -385,7 +386,7 @@ class StartSessionPassesResolvedSocketToCallTests(unittest.TestCase):
             ), mock.patch.object(control_client, "call", side_effect=fake_call):
                 from mcp_server import server as mcp_server
 
-                mcp_server.start_session(type="bash", label="test")
+                asyncio.run(mcp_server.start_session(type="bash", label="test"))
         self.assertEqual(captured.get("method"), "start_session")
         self.assertEqual(
             captured.get("socket_path"),

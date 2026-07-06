@@ -1,9 +1,21 @@
 """MCP server for Claude instances to propose tasks to the backlog."""
 
 import asyncio
+import json
 import os
+import re
 import sys
 import time
+
+# Optional: full JSON-Schema validation for the `schema=` structured-output
+# option on the spawn-and-run / send-and-wait tools. Absent on the lean
+# headless deploy (requirements.txt lists it, but a host that hasn't
+# re-installed won't have it) — we degrade to a minimal type+required check
+# (`_minimal_validate`) rather than hard-fail. See `_validate_schema`.
+try:
+    import jsonschema as _jsonschema
+except Exception:  # pragma: no cover - exercised only where the dep is absent
+    _jsonschema = None
 
 # Add project root to path so cli.planning_client is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -511,10 +523,18 @@ def ping() -> dict:
 # and `_READ_ALL_LIMIT` are imported from `mcp_server.monitor` (top of file).
 
 
+# Terminal geometry the daemon reports per session but that's pure noise
+# for orchestration — an agent never branches on PTY width/height. Dropped
+# from the MCP projection (P2 field trim) so the per-session dict is all
+# orchestration-relevant fields. Not a wire-shape change: these keys just
+# stop appearing.
+_SESSION_NOISE_FIELDS = ("cols", "rows")
+
+
 def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
     """Shared implementation behind `list_sessions` and
-    `list_sessions_grouped`: call the host, then enrich each entry with
-    the legible `status` word."""
+    `list_sessions_grouped`: call the host, enrich each entry with the
+    legible `status` word, and drop terminal-geometry noise."""
     params: dict = {"include_exited": include_exited}
     if task_id:
         params["task_id"] = task_id
@@ -523,6 +543,8 @@ def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
         s["status"] = _session_status(
             s.get("state", "pending"), bool(s.get("idle", False))
         )
+        for k in _SESSION_NOISE_FIELDS:
+            s.pop(k, None)
     return sessions
 
 
@@ -548,10 +570,13 @@ def list_sessions(
             (state=`exited`). Default false. Read-after-exit still
             works via `read_session_output` regardless of this flag.
 
-    Returns: list of per-session dicts:
+    Returns: a list of per-session dicts. (As a list-returning tool, the
+    list arrives wrapped as `{"result": [ ... ]}` on the wire; dict-returning
+    tools like `ping` are bare — a known shape split we keep for
+    back-compat.) Each dict:
         {session_uid, label, type, state, idle, status, managed_by_uid,
          task_id, workspace_id, workflow_run_id, workflow_role,
-         global_perms}
+         global_perms, continuous_task_id, worktree_path}
         state ∈ {"ready", "pending", "exited"}.
         status ∈ {"starting", "working", "awaiting_input", "exited"} —
             the legible summary of (state, idle); branch on this instead
@@ -561,6 +586,10 @@ def list_sessions(
             operator-spawned) — the parent link for orchestration.
         task_id / workspace_id: grouping keys (see `list_sessions_grouped`).
         global_perms: true if THIS session is a privileged orchestrator.
+        continuous_task_id: set if this session belongs to a continuous task.
+        worktree_path: the checkout the session runs in.
+    (Terminal geometry — `cols`/`rows` — is intentionally omitted; it's
+    noise for orchestration.)
     """
     return _list_sessions_raw(task_id, include_exited)
 
@@ -642,14 +671,31 @@ def list_sessions_grouped(
 
 
 @mcp.tool()
-def start_session(
+async def start_session(
     type: str,
     label: str,
     prompt: str = "",
     task_id: str | None = None,
     global_perms: bool = False,
+    wait: bool = False,
+    timeout_s: float = 600.0,
+    poll_interval_s: float = 2.0,
+    pending_idle_grace_s: float = 8.0,
+    schema: dict | None = None,
+    schema_retries: int = 1,
+    isolated: bool = False,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
+
+    With `wait=true` this is the one-call "spawn a worker, get its answer"
+    primitive — the cm analogue of Claude Code's `Agent(prompt)`: it
+    spawns, waits for the initial `prompt`'s reply, and returns the
+    worker's final message inline, so you don't have to hand-write the
+    spawn → `wait_for_session_idle` → `read_last_turn` sequence (and its
+    post-send race). Leave `wait=false` (default) for fire-and-forget
+    spawns you'll drive yourself. `isolated=true` additionally gives the
+    worker its own git worktree in one call — the analogue of
+    `Agent(isolation="worktree")`.
 
     Args:
         type: "claude-code", "codex", or "bash". A bash session is a raw
@@ -658,12 +704,14 @@ def start_session(
             injection, no transcript, but `send_input` and
             `wait_for_session_idle` still work (writes raw bytes + Enter
             to the PTY; idle flips via the same burst detector as
-            agents).
+            agents). A bash session has no transcript, so `wait=true`
+            returns after it goes quiet with `last_message=null`.
         label: Sidebar label for the new session.
         prompt: Optional initial prompt to deliver once the session is
             ready (queued via the same PendingWrite drainer the workflow
             activation flow uses). For a bash session this is just a
-            command line.
+            command line. Required in practice when `wait=true` — there's
+            nothing to wait for otherwise.
         task_id: Optional task to bind to. Omitted = your own task (if
             any) or no task. Cross-task binding is rejected — UNLESS you
             hold global permissions, in which case you may bind the child
@@ -674,17 +722,82 @@ def start_session(
             a non-global caller passing this gets `unauthorized`. This is
             how a privileged orchestrator spins up more privileged
             workers. Leave false for ordinary, scoped children.
+        isolated: Give the worker its OWN git worktree instead of sharing
+            the caller's. One flag instead of the two-step
+            `create_subtask(worktree_mode="branch")` + `start_session(
+            task_id=...)` dance — the cm analogue of Claude Code's
+            `Agent(isolation="worktree")`. Under the hood it branches a
+            subtask off your current task (so you must have a bound task),
+            creates its worktree, and binds the new session there. The
+            returned dict then also carries `task_id` (the subtask) and
+            `worktree_path` — merge that branch and call
+            `mark_subtask_done(task_id)` when finished. An explicit `task_id`
+            arg is ignored when isolated (the subtask is always a child of
+            YOUR task).
+        wait: Block until the spawned worker replies to `prompt`, then
+            return its final message (see Returns). Default false.
+        timeout_s / poll_interval_s / pending_idle_grace_s: Waiting knobs,
+            same semantics as `send_input_and_wait`. Only used when wait.
+        schema: Optional JSON Schema for structured output (only meaningful
+            with wait). The initial prompt is decorated with a "reply with
+            ONLY JSON matching this schema" instruction; the reply is
+            parsed + validated at the tool layer, with up to
+            `schema_retries` re-prompts on a miss. The parsed value comes
+            back as `result`.
+        schema_retries: Max re-prompts on a schema miss. Default 1.
 
-    Returns: {"session_uid": "<uid>"} for the freshly-spawned session.
+    Returns:
+        - wait=false: {"session_uid": "<uid>"} for the freshly-spawned
+          session (unchanged from before).
+        - wait=true: {session_uid, completed, timed_out, status, state,
+          idle, last_message}. `last_message` is the worker's final
+          assistant message (null for a bash/transcript-less session, or on
+          timeout before any reply). `session_uid` is ALWAYS present so you
+          can fall back to polling a slow worker that outran `timeout_s`.
+          With `schema`, also `result` (parsed value or null) and
+          `schema_error` (null on success, else the reason).
+        - isolated=true: the dict ALSO carries `task_id` (the branched
+          subtask) and `worktree_path` (its checkout), whatever `wait` is.
 
     State your intent in plain language and ask the user to confirm
     before calling this tool. The user expects to be in the loop on
     every spawn — doubly so when `global_perms=true`, which mints a child
     that can reach across the whole session graph.
     """
+    # isolated: branch a subtask worktree under the caller's task, then bind
+    # the new session there. Folds the create_subtask(branch)+start_session
+    # dance into one flag. Requires a bound task (create_subtask enforces it).
+    isolated_task_id: str | None = None
+    isolated_worktree: str | None = None
+    if isolated:
+        try:
+            sub = await asyncio.to_thread(
+                control_client.call,
+                "create_subtask",
+                {"name": label, "worktree_mode": "branch"},
+            )
+        except control_client.ControlError as e:
+            return {
+                "error": e.code,
+                "message": (
+                    f"isolated=true needs its own worktree, which requires a "
+                    f"bound task to branch from: {e.message}"
+                ),
+            }
+        isolated_task_id = sub.get("task_id") if isinstance(sub, dict) else None
+        isolated_worktree = sub.get("worktree_path") if isinstance(sub, dict) else None
+        # The isolated subtask is the session's task, overriding any arg.
+        task_id = isolated_task_id
+
+    body = prompt
+    if schema is not None and prompt:
+        body = prompt + _schema_instruction(schema)
+    elif schema is not None:
+        body = _schema_instruction(schema).lstrip("\n-")
+
     params: dict = {"type": type, "label": label}
-    if prompt:
-        params["prompt"] = prompt
+    if body:
+        params["prompt"] = body
     if task_id:
         params["task_id"] = task_id
     if global_perms:
@@ -704,7 +817,45 @@ def start_session(
     # method shape to the wrong server.
     route = control_client.resolve_socket_route()
     method = "mcp_start_session" if route.chose_daemon else "start_session"
-    return control_client.call(method, params, socket_path=route.path)
+    spawn = await asyncio.to_thread(
+        control_client.call, method, params, socket_path=route.path
+    )
+
+    def _with_isolation(d: dict) -> dict:
+        """Tag the subtask task_id / worktree_path onto a result so the
+        caller can later merge the branch and `mark_subtask_done`."""
+        if isolated and isinstance(d, dict):
+            d["task_id"] = isolated_task_id
+            d["worktree_path"] = isolated_worktree
+        return d
+
+    if not wait:
+        return _with_isolation(spawn)
+
+    session_uid = spawn.get("session_uid") if isinstance(spawn, dict) else None
+    if not session_uid:
+        # Nothing to wait on — hand back whatever spawn returned.
+        return _with_isolation(spawn)
+
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(0.5, min(poll_interval_s, 30.0))
+    grace = max(1.0, min(pending_idle_grace_s, 60.0))
+    # Fresh session: no transcript bound yet, so anchor on None — every
+    # assistant message it writes is the reply. `_await_reply` picks up the
+    # transcript path the moment the detector binds it.
+    res = await _await_reply(
+        session_uid,
+        engine="claude-code", transcript_path=None,
+        anchor_cursor=None, generation=0,
+        deadline=deadline, interval=interval, grace=grace,
+    )
+    res["session_uid"] = session_uid
+    if schema is not None:
+        res = await _settle_schema(
+            session_uid, res, schema, schema_retries,
+            deadline=deadline, interval=interval, grace=grace,
+        )
+    return _with_isolation(res)
 
 
 @mcp.tool()
@@ -767,6 +918,20 @@ def kill_session(session_uid: str) -> dict:
     return control_client.call("kill_session", {"session_uid": session_uid})
 
 
+# Advisory attached whenever a read/wait comes back with no readable output
+# because no transcript is bound. Turns the old silent null/[] — the bash
+# read dead-end an agent hits and can't explain — into a clear next step.
+_NO_TRANSCRIPT_NOTE = (
+    "No transcript is bound for this session, so there is no readable output "
+    "here. If this is a bash session it will NEVER bind one — a bash PTY's "
+    "output is not exposed through the MCP; redirect the command to a file "
+    "(e.g. `cmd > /tmp/out.txt 2>&1`) and read that, or spawn a "
+    "type='claude-code'/'codex' agent for readable transcript output. If this "
+    "is a freshly-spawned agent, its transcript may just not have bound yet — "
+    "poll again."
+)
+
+
 @mcp.tool()
 def read_session_output(
     session_uid: str,
@@ -774,6 +939,11 @@ def read_session_output(
     max_messages: int = 20,
 ) -> dict:
     """Read transcript messages from a session you can see.
+
+    Low-level primitive — pages FORWARD from a cursor. For the common
+    "what did it just say?" question use `read_last_turn`; reach for this
+    only when you actually need to walk history in order or resume a
+    forward scan from a saved cursor.
 
     Two-step: first calls `resolve_authorized_session` to authorize and
     get the transcript path; then reads the file directly with the
@@ -798,6 +968,8 @@ def read_session_output(
         - status: "starting"|"working"|"awaiting_input"|"exited" — the
           legible summary of (state, idle)
         - When state="pending", messages is empty and you can poll again.
+        - note: present only when no transcript is bound (messages empty).
+          Explains the bash-session read dead-end and what to do instead.
     """
     try:
         resolved = control_client.call(
@@ -814,7 +986,7 @@ def read_session_output(
     idle = bool(resolved.get("idle", False))
 
     if state == "pending" or transcript_path is None:
-        return {
+        out = {
             "messages": [],
             "cursor": None,
             "generation": generation,
@@ -822,6 +994,9 @@ def read_session_output(
             "idle": idle,
             "status": _session_status(state, idle),
         }
+        if transcript_path is None:
+            out["note"] = _NO_TRANSCRIPT_NOTE
+        return out
 
     parser = _parser_for(engine)
     messages, cursor = parser.read_messages(
@@ -867,6 +1042,8 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
         - status: "starting"|"working"|"awaiting_input"|"exited".
         - cursor: end cursor — pass to `read_session_output(since_cursor=)`
           if you later want to resume forward reads from here.
+        - note: present only when no transcript is bound (last_assistant is
+          null). Explains the bash-session read dead-end and what to do.
     """
     try:
         resolved = control_client.call(
@@ -892,6 +1069,7 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
             "idle": idle,
             "generation": generation,
             "cursor": None,
+            "note": _NO_TRANSCRIPT_NOTE,
         }
 
     n = max(0, min(context_messages, 100))
@@ -1163,6 +1341,13 @@ async def wait_for_session_idle(
     """Block until a session becomes idle (agent at the prompt), then
     return.
 
+    Low-level primitive. For the common cases prefer the front door:
+    `start_session(wait=true)` to spawn a worker and get its first reply,
+    `send_input_and_wait` to drive an existing session and get the reply,
+    or `wait_for_any_session_idle` to watch a fan-out of workers. Use this
+    bare wait only for a session you did NOT just prompt (no post-send
+    race to close), e.g. polling one you handed off earlier.
+
     "Idle" mirrors the same signal surfaced by `read_session_output`
     and `list_sessions`. An `exited` session is reported as idle (no
     PTY left to be busy on). Internally polls
@@ -1292,6 +1477,367 @@ async def wait_for_session_idle(
         await asyncio.sleep(interval)
 
 
+# ── Structured-output (schema=) helpers ────────────────────────────────
+#
+# The spawn-and-run / send-and-wait tools can take a `schema` (a JSON
+# Schema). When set, the outgoing prompt is decorated with an instruction
+# to reply with ONLY a JSON value matching it; the reply is then parsed and
+# validated at the tool layer, and on mismatch the worker is re-prompted up
+# to `schema_retries` times. This mirrors the Workflow `schema` option and
+# turns a free-running Claude/Codex worker into a structured function for
+# orchestration (no free-text parsing on the caller side).
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _schema_instruction(schema: dict) -> str:
+    """Suffix appended to a prompt to steer the worker to JSON-only output."""
+    return (
+        "\n\n---\nSTRUCTURED OUTPUT REQUIRED. End your turn with ONLY a "
+        "single JSON value that matches this JSON Schema — no prose after "
+        "it, no markdown fences:\n" + json.dumps(schema, indent=2)
+    )
+
+
+def _schema_correction(err: str, schema: dict) -> str:
+    """Re-prompt sent when a reply failed schema validation."""
+    return (
+        f"Your previous reply did not satisfy the required JSON output: {err}. "
+        "Reply again with ONLY a single JSON value matching this schema, "
+        "nothing else:\n" + json.dumps(schema, indent=2)
+    )
+
+
+def _first_json_span(text: str) -> str | None:
+    """Return the first balanced {...} or [...] span in `text`, or None.
+    String-aware (braces inside quoted strings don't count), so it survives
+    JSON embedded in surrounding prose."""
+    start = None
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(start, len(text)):
+        ch = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return text[start:j + 1]
+    return None
+
+
+def _extract_json(text: str) -> tuple[object, str | None]:
+    """Best-effort pull of a single JSON value out of an assistant message.
+    Tries, in order: fenced ```json blocks (last first — models often
+    explain, then emit), the whole trimmed message, then the first balanced
+    brace/bracket span. Returns (value, None) on success or (None, error)."""
+    if not text or not text.strip():
+        return None, "empty reply"
+    candidates: list[str] = []
+    candidates.extend(reversed(_JSON_FENCE_RE.findall(text)))
+    candidates.append(text.strip())
+    span = _first_json_span(text)
+    if span is not None:
+        candidates.append(span)
+    for c in candidates:
+        try:
+            return json.loads(c), None
+        except (ValueError, TypeError):
+            continue
+    return None, "no valid JSON found in reply"
+
+
+def _minimal_validate(value: object, schema: dict) -> str | None:
+    """Dependency-free fallback validator: checks top-level `type` and
+    (for objects) `required`. Returns None if OK, else an error string.
+    Used only when `jsonschema` is not installed."""
+    t = schema.get("type")
+    checks = {
+        "object": (dict, "a JSON object"),
+        "array": (list, "a JSON array"),
+        "string": (str, "a string"),
+        "boolean": (bool, "a boolean"),
+    }
+    if t in checks:
+        py_t, label = checks[t]
+        if not isinstance(value, py_t):
+            return f"expected {label}, got {type(value).__name__}"
+    elif t == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"expected an integer, got {type(value).__name__}"
+    elif t == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"expected a number, got {type(value).__name__}"
+    if isinstance(value, dict):
+        for key in schema.get("required", []) or []:
+            if key not in value:
+                return f"missing required field: {key!r}"
+    return None
+
+
+def _validate_schema(value: object, schema: dict | None) -> str | None:
+    """Return None if `value` conforms to `schema`, else a short error
+    string. Uses `jsonschema` when available; otherwise `_minimal_validate`.
+    A falsy/empty schema accepts any JSON value."""
+    if not isinstance(schema, dict) or not schema:
+        return None
+    if _jsonschema is not None:
+        try:
+            _jsonschema.validate(value, schema)
+            return None
+        except _jsonschema.ValidationError as e:
+            return f"schema validation failed: {e.message}"
+        except _jsonschema.SchemaError as e:
+            return f"invalid schema supplied: {e.message}"
+    return _minimal_validate(value, schema)
+
+
+# ── Shared spawn/send → await-reply core ───────────────────────────────
+
+
+async def _await_reply(
+    session_uid: str,
+    *,
+    engine: str,
+    transcript_path: str | None,
+    anchor_cursor: str | None,
+    generation: int,
+    deadline: float,
+    interval: float,
+    grace: float,
+) -> dict:
+    """Poll a session until its next reply lands and it goes quiet, or the
+    deadline passes. Completion is anchored on transcript progress past
+    `anchor_cursor` (a NEW assistant message must appear), so it can't
+    return the turn that was already there when polling began.
+
+    Shared by `send_input_and_wait` (anchor = the transcript end captured
+    just before the send) and `start_session(wait=True)` (anchor = None on
+    a fresh session whose transcript hasn't bound yet — everything it
+    writes is new). Transcript-less sessions (bash, detector-less daemon)
+    fall back to the bounded pending-idle wait with no message, exactly
+    like `wait_for_session_idle`.
+
+    Returns {completed, timed_out, status, state, idle, last_message}. The
+    caller frames it (adds `delivered` / `session_uid` / schema keys)."""
+    cursor = anchor_cursor
+    saw_new_assistant = False
+    last_message: dict | None = None
+    pending_idle_since: float | None = None
+    resolved_once = False
+
+    def _final_read() -> dict | None:
+        if transcript_path is None:
+            return last_message
+        try:
+            msgs, _ = _read_all_messages(engine, transcript_path, generation)
+        except OSError:
+            return last_message
+        return _last_assistant(msgs) or last_message
+
+    while True:
+        try:
+            resolved = await asyncio.to_thread(
+                control_client.call,
+                "resolve_authorized_session",
+                {"session_uid": session_uid},
+            )
+        except control_client.ControlError as e:
+            # Evicted-after-seen == exited mid-turn (see
+            # `wait_for_session_idle`). Read the final reply from the
+            # captured path — the file persists past exit.
+            if resolved_once and getattr(e, "code", None) == "not_found":
+                last_message = await asyncio.to_thread(_final_read)
+                return {
+                    "completed": True, "timed_out": False,
+                    "status": "exited", "state": "exited", "idle": True,
+                    "last_message": last_message,
+                }
+            raise
+        resolved_once = True
+        state = resolved.get("state", "pending")
+        idle = bool(resolved.get("idle", False))
+        # A fresh session's transcript may bind only AFTER polling begins —
+        # pick it up the moment it appears.
+        if transcript_path is None and resolved.get("transcript_path"):
+            transcript_path = resolved.get("transcript_path")
+            engine = resolved.get("engine", engine)
+            generation = int(resolved.get("generation", generation))
+        now = time.monotonic()
+
+        if state == "exited":
+            last_message = await asyncio.to_thread(_final_read)
+            out = {
+                "completed": True, "timed_out": False,
+                "status": "exited", "state": "exited", "idle": True,
+                "last_message": last_message,
+            }
+            if last_message is None and transcript_path is None:
+                out["note"] = _NO_TRANSCRIPT_NOTE
+            return out
+
+        if transcript_path is not None:
+            # Transcript-anchored: pull new messages since the anchor, latch
+            # the reply, complete only when a NEW assistant message exists
+            # AND the session is quiet at the prompt.
+            new_msgs, cursor = await asyncio.to_thread(
+                _parser_for(engine).read_messages,
+                transcript_path, generation, cursor, _READ_ALL_LIMIT,
+            )
+            for m in new_msgs:
+                if m.role == Role.ASSISTANT:
+                    saw_new_assistant = True
+                    last_message = m.to_dict()
+            if saw_new_assistant and state == "ready" and idle:
+                return {
+                    "completed": True, "timed_out": False,
+                    "status": _session_status(state, idle),
+                    "state": state, "idle": idle, "last_message": last_message,
+                }
+        else:
+            # Transcript-less fallback == `wait_for_session_idle` semantics.
+            if state == "ready" and idle:
+                return {
+                    "completed": True, "timed_out": False,
+                    "status": _session_status(state, idle),
+                    "state": state, "idle": idle, "last_message": None,
+                    "note": _NO_TRANSCRIPT_NOTE,
+                }
+            if state == "pending" and idle:
+                if pending_idle_since is None:
+                    pending_idle_since = now
+                elif now - pending_idle_since >= grace:
+                    return {
+                        "completed": True, "timed_out": False,
+                        "status": _session_status(state, idle),
+                        "state": state, "idle": idle, "last_message": None,
+                        "note": _NO_TRANSCRIPT_NOTE,
+                    }
+            else:
+                pending_idle_since = None
+
+        if now >= deadline:
+            return {
+                "completed": False, "timed_out": True,
+                "status": _session_status(state, idle),
+                "state": state, "idle": idle, "last_message": last_message,
+            }
+        await asyncio.sleep(interval)
+
+
+async def _send_and_await(
+    session_uid: str,
+    text: str,
+    submit: bool,
+    *,
+    deadline: float,
+    interval: float,
+    grace: float,
+) -> dict:
+    """Capture the transcript anchor, deliver `text`, then await the reply
+    to THIS input via `_await_reply`. Returns the `_await_reply` result with
+    `delivered: True` added, or {error, message} if the session won't
+    resolve. The body of the canonical `send_input_and_wait`."""
+    engine = "claude-code"
+    transcript_path: str | None = None
+    anchor_cursor: str | None = None
+    generation = 0
+    try:
+        pre = await asyncio.to_thread(
+            control_client.call,
+            "resolve_authorized_session",
+            {"session_uid": session_uid},
+        )
+        engine = pre.get("engine", "claude-code")
+        transcript_path = pre.get("transcript_path")
+        generation = int(pre.get("generation", 0))
+        if transcript_path is not None:
+            _pre_msgs, anchor_cursor = await asyncio.to_thread(
+                _read_all_messages, engine, transcript_path, generation
+            )
+    except control_client.ControlError as e:
+        return {"error": e.code, "message": e.message}
+
+    await asyncio.to_thread(
+        control_client.call,
+        "send_input",
+        {"session_uid": session_uid, "text": text, "submit": submit},
+    )
+    res = await _await_reply(
+        session_uid,
+        engine=engine, transcript_path=transcript_path,
+        anchor_cursor=anchor_cursor, generation=generation,
+        deadline=deadline, interval=interval, grace=grace,
+    )
+    res["delivered"] = True
+    return res
+
+
+async def _settle_schema(
+    session_uid: str,
+    res: dict,
+    schema: dict,
+    retries: int,
+    *,
+    deadline: float,
+    interval: float,
+    grace: float,
+) -> dict:
+    """Given a completed reply `res`, extract + validate JSON against
+    `schema`. On success, set `res["result"]` to the parsed value. On
+    mismatch, re-prompt (up to `retries` times, budget permitting) and
+    re-await; if it still fails — or the worker has exited / timed out /
+    the deadline passed — set `result=None` and `schema_error` to the
+    reason. Always returns a dict carrying both keys."""
+    attempts_left = max(0, int(retries))
+    while True:
+        content = ((res.get("last_message") or {}).get("content") or "")
+        value, err = _extract_json(content)
+        if err is None:
+            err = _validate_schema(value, schema)
+        if err is None:
+            res["result"] = value
+            res["schema_error"] = None
+            return res
+        stuck = (
+            attempts_left <= 0
+            or res.get("state") == "exited"
+            or res.get("timed_out")
+            or time.monotonic() >= deadline
+        )
+        if stuck:
+            res["result"] = None
+            res["schema_error"] = err
+            return res
+        attempts_left -= 1
+        nxt = await _send_and_await(
+            session_uid, _schema_correction(err, schema), True,
+            deadline=deadline, interval=interval, grace=grace,
+        )
+        if "error" in nxt:
+            res["result"] = None
+            res["schema_error"] = f"{err}; re-prompt failed: {nxt.get('message')}"
+            return res
+        res = nxt
+
+
 @mcp.tool()
 async def send_input_and_wait(
     session_uid: str,
@@ -1300,6 +1846,8 @@ async def send_input_and_wait(
     timeout_s: float = 600.0,
     poll_interval_s: float = 2.0,
     pending_idle_grace_s: float = 8.0,
+    schema: dict | None = None,
+    schema_retries: int = 1,
 ) -> dict:
     """Send a prompt to a session and block until it finishes replying,
     then return the reply. The canonical "ask an agent something and get
@@ -1330,6 +1878,15 @@ async def send_input_and_wait(
         pending_idle_grace_s: Grace for a transcript-less session to
             settle before reporting idle (see `wait_for_session_idle`).
             Default 8.
+        schema: Optional JSON Schema. When set, the prompt is decorated with
+            a "reply with ONLY JSON matching this schema" instruction, and
+            the reply is parsed + validated at the tool layer. On a
+            validation miss the worker is re-prompted up to `schema_retries`
+            times. The parsed object comes back as `result` — no free-text
+            parsing on your side. Requires a transcript-bound session (an
+            agent, not bash).
+        schema_retries: Max re-prompts on a schema miss before giving up.
+            Default 1.
 
     Returns: {delivered, completed, timed_out, status, state, idle,
         last_message}.
@@ -1340,6 +1897,9 @@ async def send_input_and_wait(
           deadline (agent may be stuck, or mid-tool-call on a very long
           turn) — inspect `status`/`state`, or `read_last_turn` to see
           partial progress.
+        When `schema` is set, two more keys: `result` (the parsed+validated
+        JSON value, or null if it never conformed) and `schema_error` (null
+        on success, else why validation failed after all retries).
 
     State your intent and ask the user before calling — this delivers
     input to another session, same as `send_input`.
@@ -1348,138 +1908,19 @@ async def send_input_and_wait(
     interval = max(0.5, min(poll_interval_s, 30.0))
     grace = max(1.0, min(pending_idle_grace_s, 60.0))
 
-    # Anchor: capture the transcript end BEFORE sending so we can tell the
-    # reply to THIS input apart from the turn that was already there. The
-    # file persists across exit, so the captured path also lets us read
-    # the final reply even if the agent exits right after answering.
-    engine = "claude-code"
-    transcript_path: str | None = None
-    anchor_cursor: str | None = None
-    generation = 0
-    try:
-        pre = await asyncio.to_thread(
-            control_client.call,
-            "resolve_authorized_session",
-            {"session_uid": session_uid},
-        )
-        engine = pre.get("engine", "claude-code")
-        transcript_path = pre.get("transcript_path")
-        generation = int(pre.get("generation", 0))
-        if transcript_path is not None:
-            _pre_msgs, anchor_cursor = await asyncio.to_thread(
-                _read_all_messages, engine, transcript_path, generation
-            )
-    except control_client.ControlError as e:
-        return {"error": e.code, "message": e.message}
-
-    # Deliver the input. Routes to the TUI's encoding-aware drainer
-    # (kitty Enter etc.), same as the standalone `send_input` tool.
-    await asyncio.to_thread(
-        control_client.call,
-        "send_input",
-        {"session_uid": session_uid, "text": text, "submit": submit},
+    body = text if schema is None else text + _schema_instruction(schema)
+    res = await _send_and_await(
+        session_uid, body, submit,
+        deadline=deadline, interval=interval, grace=grace,
     )
-
-    cursor = anchor_cursor
-    saw_new_assistant = False
-    last_message: dict | None = None
-    pending_idle_since: float | None = None
-    resolved_once = False
-
-    def _final_read() -> dict | None:
-        if transcript_path is None:
-            return last_message
-        try:
-            msgs, _ = _read_all_messages(engine, transcript_path, generation)
-        except OSError:
-            return last_message
-        return _last_assistant(msgs) or last_message
-
-    while True:
-        try:
-            resolved = await asyncio.to_thread(
-                control_client.call,
-                "resolve_authorized_session",
-                {"session_uid": session_uid},
-            )
-        except control_client.ControlError as e:
-            # Evicted-after-seen == exited mid-turn (see
-            # `wait_for_session_idle`). The agent answered then exited
-            # (one-shot) — read the final reply from the captured path.
-            if resolved_once and getattr(e, "code", None) == "not_found":
-                last_message = await asyncio.to_thread(_final_read)
-                return {
-                    "delivered": True, "completed": True, "timed_out": False,
-                    "status": "exited", "state": "exited", "idle": True,
-                    "last_message": last_message,
-                }
-            raise
-        resolved_once = True
-        state = resolved.get("state", "pending")
-        idle = bool(resolved.get("idle", False))
-        # A fresh agent's transcript may bind only AFTER we sent — pick it
-        # up the moment it appears.
-        if transcript_path is None and resolved.get("transcript_path"):
-            transcript_path = resolved.get("transcript_path")
-            engine = resolved.get("engine", engine)
-            generation = int(resolved.get("generation", generation))
-        now = time.monotonic()
-
-        if state == "exited":
-            last_message = await asyncio.to_thread(_final_read)
-            return {
-                "delivered": True, "completed": True, "timed_out": False,
-                "status": "exited", "state": "exited", "idle": True,
-                "last_message": last_message,
-            }
-
-        if transcript_path is not None:
-            # Transcript-anchored: pull new messages since the anchor,
-            # latch the reply, and complete only when a NEW assistant
-            # message exists AND the session is quiet at the prompt.
-            new_msgs, cursor = await asyncio.to_thread(
-                _parser_for(engine).read_messages,
-                transcript_path, generation, cursor, _READ_ALL_LIMIT,
-            )
-            for m in new_msgs:
-                if m.role == Role.ASSISTANT:
-                    saw_new_assistant = True
-                    last_message = m.to_dict()
-            if saw_new_assistant and state == "ready" and idle:
-                return {
-                    "delivered": True, "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle),
-                    "state": state, "idle": idle, "last_message": last_message,
-                }
-        else:
-            # Transcript-less fallback == `wait_for_session_idle` semantics
-            # (no reply to return).
-            if state == "ready" and idle:
-                return {
-                    "delivered": True, "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle),
-                    "state": state, "idle": idle, "last_message": None,
-                }
-            if state == "pending" and idle:
-                if pending_idle_since is None:
-                    pending_idle_since = now
-                elif now - pending_idle_since >= grace:
-                    return {
-                        "delivered": True, "completed": True,
-                        "timed_out": False,
-                        "status": _session_status(state, idle),
-                        "state": state, "idle": idle, "last_message": None,
-                    }
-            else:
-                pending_idle_since = None
-
-        if now >= deadline:
-            return {
-                "delivered": True, "completed": False, "timed_out": True,
-                "status": _session_status(state, idle),
-                "state": state, "idle": idle, "last_message": last_message,
-            }
-        await asyncio.sleep(interval)
+    if "error" in res:
+        return res
+    if schema is not None:
+        res = await _settle_schema(
+            session_uid, res, schema, schema_retries,
+            deadline=deadline, interval=interval, grace=grace,
+        )
+    return res
 
 
 @mcp.tool()
