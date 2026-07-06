@@ -157,6 +157,18 @@ recovery; S2–S4 harden around it.
   sessions whose tunnel was replaced.
 - **S4** (this commit): `A-r` manual override — force-reconnect the focused
   remote session (the limbo case), surgically.
+- **S5** (this work): the CPU fix. A half-open attach socket goes `POLLHUP`;
+  alacritty's EventLoop skips reading an interrupt event (`event_loop.rs:274`)
+  and SPINS at 100% CPU (observed: 11 spinning "PTY reader" threads = ~8 cores,
+  the single biggest CPU consumer on the box). Root: same no-clean-EOF as the
+  freeze. Fix: dup the attach socket fd onto `Session`
+  (`Session::attach_hup_fd`); the per-tick watchdog polls it for
+  `POLLHUP`/`POLLERR` (`attach_socket_hung_up`), and on a hit `request_shutdown`s
+  the spinning EventLoop (stops the spin *now*, not at reattach) + re-queues.
+  Turns "spin forever / ≤15s via generation" into "stop in <1 tick + reconnect
+  immediately." Files: `client_session.rs`, `session.rs`, `app.rs`. Tests: 2
+  (hung-up → requeue+shutdown / healthy → left alone).
+
 - **S2** (deferred): stop tearing down *live* tunnels on a spurious `try_wait`
   + clean stale `cm-host-*.sock`. Not required for the freeze fix; a churn/
   cleanliness hardening. Left as a documented follow-up.

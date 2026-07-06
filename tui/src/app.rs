@@ -6270,24 +6270,35 @@ impl App {
         true
     }
 
-    /// S3 (cm/fix-frozen-remote-session): catch a remote attach stream whose
-    /// SSH tunnel was replaced (died) but that never produced a clean EOF — the
-    /// half-open freeze (renders stale, normal indicator, dead to input; the
-    /// `transport_eof` latch never fires because there's no `read()==0`).
+    /// Catch a remote attach stream that's dead but that never produced a clean
+    /// EOF — the half-open freeze (renders stale, normal indicator, dead to
+    /// input; `transport_eof` never fires because there's no `read()==0`, and
+    /// alacritty's EventLoop SPINS at 100% CPU on the fd's `POLLHUP`). Two
+    /// triggers per attached remote session:
     ///
-    /// For each ATTACHED remote session, compare the tunnel generation it was
-    /// dialed under against the host's CURRENT generation; if the host's is
-    /// newer, the underlying tunnel process is gone, so the stream is dead —
-    /// re-queue it through the same path a transport EOF takes. A half-open
-    /// tunnel is turned into a dead (respawned) one within ~15s by the
-    /// `ServerAlive` opts, which bumps the generation, so this bounds the
-    /// freeze to seconds instead of forever. Un-recorded live sessions are
-    /// baselined at the current generation (safety net for attach paths that
-    /// don't record explicitly). Cheap: one HashMap lookup + atomic read per
-    /// remote session per tick.
+    ///   - **S5 socket HUP** — `session.attach_socket_hung_up()` polls the
+    ///     dup'd attach fd for `POLLHUP`/`POLLERR`. This is direct + fast (<1
+    ///     tick after the tunnel process dies) and is the same fd the spinning
+    ///     EventLoop can't act on. On a hit we `request_shutdown` the EventLoop
+    ///     to STOP the spin immediately, then re-queue.
+    ///   - **S3 stale generation** — the session's dialed-under tunnel
+    ///     generation is behind the host's current one (its tunnel was replaced
+    ///     under it). Catches the case where the fd hasn't HUP'd yet but a
+    ///     respawn already happened; `ServerAlive` turns a half-open tunnel into
+    ///     a respawn within ~15s, bumping the generation.
+    ///
+    /// Both re-queue through the same path a transport EOF takes. Un-recorded
+    /// live sessions are baselined at the current generation (safety net for
+    /// attach paths that don't record explicitly). Cheap: one non-blocking
+    /// `poll`, one HashMap lookup + atomic read per remote session per tick.
     pub fn requeue_stale_generation_remote_sessions(&mut self) {
         let local = cm_daemon::host_id::HostId::local();
-        let mut stale: Vec<(usize, usize)> = Vec::new();
+        // (wi, si, reason). Two triggers, both meaning "this attached remote
+        // stream is dead": S5 socket HUP (fast, direct — the fd this session's
+        // spinning alacritty EventLoop can't act on) and S3 stale generation
+        // (the tunnel was replaced under it). HUP wins the label since it's the
+        // stronger signal.
+        let mut dead: Vec<(usize, usize, &'static str)> = Vec::new();
         let mut baseline: Vec<(String, u64)> = Vec::new();
         for wi in 0..self.workspaces.len() {
             if self.workspaces[wi].is_closed {
@@ -6300,15 +6311,24 @@ impl App {
                 }
                 let uid = ts.uid.clone();
                 let host = ts.host_id.clone();
+                // S5: probe the attach socket for POLLHUP/POLLERR while we hold
+                // the borrow (cheap non-blocking poll of the dup'd fd).
+                let hung_up = ts.session.attach_socket_hung_up();
                 // A session already in the reconnect flow is handled there.
                 if self.reconnecting_sessions.contains(&uid) {
                     continue;
                 }
                 let current = self.host_pool.tunnel_generation(&host);
-                match self.attached_tunnel_generation.get(&uid) {
-                    Some(&recorded) if current > recorded => stale.push((wi, si)),
-                    Some(_) => {}
-                    None => baseline.push((uid, current)),
+                let stale_gen = matches!(
+                    self.attached_tunnel_generation.get(&uid),
+                    Some(&recorded) if current > recorded,
+                );
+                if hung_up {
+                    dead.push((wi, si, "socket hangup (POLLHUP)"));
+                } else if stale_gen {
+                    dead.push((wi, si, "tunnel replaced (no EOF)"));
+                } else if !self.attached_tunnel_generation.contains_key(&uid) {
+                    baseline.push((uid, current));
                 }
             }
         }
@@ -6316,11 +6336,13 @@ impl App {
             self.attached_tunnel_generation.insert(uid, gen);
         }
         let mut changed = false;
-        for (wi, si) in stale {
-            // Drop it out of the Running sort (the stream is dead) and route
-            // into the reconnect flow via the shared helper.
+        for (wi, si, reason) in dead {
+            // S5: stop the spinning EventLoop NOW (it's burning a core on the
+            // dead fd's POLLHUP) rather than waiting for the reattach to drop
+            // it. request_shutdown leaves the slot intact for the rebind.
+            self.workspaces[wi].sessions[si].session.request_shutdown();
             self.workspaces[wi].sessions[si].status = SessionStatus::Idle;
-            if self.requeue_remote_reconnect(wi, si, "tunnel replaced (no EOF)") {
+            if self.requeue_remote_reconnect(wi, si, reason) {
                 changed = true;
             }
         }
@@ -22842,6 +22864,76 @@ mod remote_reconnect_tests {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    // --- S5: socket-HUP watchdog (spinning-reader / CPU fix) ---------------
+
+    /// THE S5 fix: an attached remote session whose attach socket has HUNG UP
+    /// (peer closed → `POLLHUP`) is re-queued for reconnect AND its EventLoop is
+    /// shut down — even when the tunnel generation is CURRENT (the fd HUP'd
+    /// before any respawn). RED before S5: alacritty spins on the `POLLHUP` at
+    /// 100% CPU and the session freezes.
+    #[test]
+    fn hung_up_attach_socket_requeues_remote_session() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+
+        let (mut ts, _tx, _teof) = session_with_injected_exit("uid-hup", ghost.clone(), false);
+        // Make the attach fd look hung-up: a connected pair whose peer we drop
+        // → the kept end reports POLLHUP on poll.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(b);
+        ts.session.attach_hup_fd = Some(std::os::fd::OwnedFd::from(a));
+        app.workspaces.push(workspace_with(ts));
+        // Generation is CURRENT — so the HUP (not staleness) is the trigger.
+        app.attached_tunnel_generation.insert("uid-hup".into(), 1);
+        app.host_pool.set_tunnel_generation_for_test(&ghost, 1);
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(
+            app.reconnecting_sessions.contains("uid-hup"),
+            "a hung-up attach socket must be re-queued even at the current gen",
+        );
+        assert!(
+            app.pending_remote_reattach
+                .iter()
+                .any(|p| p.entry.uid == "uid-hup"),
+        );
+        assert!(
+            !app.attached_tunnel_generation.contains_key("uid-hup"),
+            "the generation record is cleared on requeue",
+        );
+    }
+
+    /// A HEALTHY (still-connected) attach socket is NOT requeued by the HUP
+    /// watchdog — no false teardown of a working remote session.
+    #[test]
+    fn healthy_attach_socket_not_requeued_by_hup_watchdog() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+
+        let (mut ts, _tx, _teof) = session_with_injected_exit("uid-ok", ghost.clone(), false);
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        ts.session.attach_hup_fd = Some(std::os::fd::OwnedFd::from(a));
+        app.workspaces.push(workspace_with(ts));
+        app.attached_tunnel_generation.insert("uid-ok".into(), 1);
+        app.host_pool.set_tunnel_generation_for_test(&ghost, 1);
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(
+            !app.reconnecting_sessions.contains("uid-ok"),
+            "a connected attach socket must NOT be torn down",
+        );
+        assert!(app.pending_remote_reattach.is_empty());
+        drop(b); // keep the peer alive across the poll above
     }
 
     // --- S3: stale-tunnel-generation watchdog (half-open freeze) -----------

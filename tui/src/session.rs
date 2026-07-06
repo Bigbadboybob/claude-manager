@@ -99,6 +99,11 @@ pub struct Session {
     /// `None` for local-PTY sessions — a local PTY has no detachable
     /// transport, so its exits are always genuine child exits.
     pub daemon_transport_eof: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// S5: a dup of the remote attach socket fd, for the main-loop HUP
+    /// watchdog (`App::requeue_stale_generation_remote_sessions`). `Some` only
+    /// for daemon-attached sessions; `None` for local-PTY sessions. See
+    /// [`Self::attach_socket_hung_up`].
+    pub attach_hup_fd: Option<std::os::fd::OwnedFd>,
 }
 
 impl Session {
@@ -262,6 +267,8 @@ impl Session {
             // A local PTY has no detachable transport, so its exits
             // are always genuine child exits — never a reconnect.
             daemon_transport_eof: None,
+            // Local PTY session — no attach socket to watch for HUP.
+            attach_hup_fd: None,
         })
     }
 
@@ -307,6 +314,7 @@ impl Session {
             // handler so a tunnel death on this re-attached remote
             // session triggers reconnect, not teardown.
             daemon_transport_eof: Some(cs.transport_eof),
+            attach_hup_fd: cs.hup_fd,
         })
     }
 
@@ -358,7 +366,40 @@ impl Session {
             // flag up too, so a dead attach stream on a remote
             // session reconnects instead of tearing down.
             daemon_transport_eof: Some(cs.transport_eof),
+            attach_hup_fd: cs.hup_fd,
         })
+    }
+
+    /// S5: true if the attach socket has hung up (`POLLHUP`) or errored
+    /// (`POLLERR`) — the tunnel died half-open. Non-blocking `poll(timeout=0)`
+    /// on the dup'd fd; `false` for a local session (no `attach_hup_fd`) or a
+    /// still-connected socket. This is the signal alacritty's EventLoop can't
+    /// act on (it skips reading an interrupt event and spins), so the main-loop
+    /// watchdog polls it here and tears the spinning loop down.
+    pub fn attach_socket_hung_up(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let Some(fd) = self.attach_hup_fd.as_ref() else {
+            return false;
+        };
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            // POLLHUP/POLLERR are always reported in revents regardless of
+            // events; request POLLIN so a readable-EOF also flags.
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: single valid pollfd, timeout 0 (non-blocking). EINTR just
+        // returns <=0 and we report "not hung up" this tick.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+    }
+
+    /// S5: ask this session's alacritty EventLoop to shut down (breaks a loop
+    /// that's spinning on a half-open socket's `POLLHUP`). Unlike dropping the
+    /// `Session`, this leaves the slot intact so the reconnect can rebind it.
+    /// Idempotent + best-effort (a gone receiver just fails the send).
+    pub fn request_shutdown(&self) {
+        let _ = self.sender.send(alacritty_terminal::event_loop::Msg::Shutdown);
     }
 
     /// Send raw bytes to the PTY (keyboard input).

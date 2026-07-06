@@ -277,6 +277,15 @@ pub struct ClientSession {
     /// EventLoop thread post-spawn); same latched-before-pipe-signal
     /// ordering as [`Self::memory_cap_kill`].
     pub transport_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// S5: a dup of the attach socket fd, kept for the main-loop HUP watchdog.
+    /// When a remote tunnel dies half-open the socket goes `POLLHUP`, but
+    /// alacritty's EventLoop skips reading an interrupt event and SPINS at
+    /// 100% CPU (never gets the EOF that would produce a child-exit to break
+    /// the loop). The watchdog polls THIS fd for `POLLHUP`/`POLLERR` to detect
+    /// that, then tears the spinning loop down + re-queues. Shares the file
+    /// description with the socket alacritty owns, so it reflects the real
+    /// state without touching alacritty's fd. `None` if the dup failed.
+    pub hup_fd: Option<std::os::fd::OwnedFd>,
 }
 
 // Post-review #15 (deferred): a `Drop` impl that calls
@@ -419,6 +428,15 @@ impl ClientSession {
             );
         }
 
+        // S5: dup the attach socket fd BEFORE it's moved into the AttachedPty
+        // (and thence into the EventLoop). The main-loop HUP watchdog polls
+        // this dup for `POLLHUP` to detect a half-open tunnel death that
+        // alacritty's EventLoop would otherwise spin on. Best-effort — a dup
+        // failure just disables the watchdog for this session (it still
+        // recovers via the generation watchdog / transport EOF).
+        let hup_fd: Option<std::os::fd::OwnedFd> =
+            attach_socket.try_clone().ok().map(std::os::fd::OwnedFd::from);
+
         // Step 5: morph the socket into an AttachedPty. From here
         // the connection is a one-way StreamFrame channel.
         let pty = AttachedPty::from_socket(
@@ -489,6 +507,7 @@ impl ClientSession {
             cgroup_path: start_result.cgroup_path.clone(),
             memory_cap_kill,
             transport_eof,
+            hup_fd,
         })
     }
 
