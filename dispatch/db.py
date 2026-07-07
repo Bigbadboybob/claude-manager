@@ -45,6 +45,7 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                    name: str | None = None, description: str | None = None,
                    difficulty: int | None = None, depends: list[str] | None = None,
                    source: str = "user", is_cloud: bool = False,
+                   kind: str = "oneshot",
                    parent_task_id: str | None = None,
                    worktree_mode: str = "inherit",
                    wip_branch: str | None = None,
@@ -67,15 +68,15 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                 """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
                                       status, project, slug, name, description,
                                       difficulty, depends, source, is_cloud,
-                                      parent_task_id, worktree_mode, wip_branch,
-                                      metadata)
+                                      kind, parent_task_id, worktree_mode,
+                                      wip_branch, metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                           $14, $15, $16, $17)
+                           $14, $15, $16, $17, $18)
                    RETURNING *""",
                 repo_url, repo_branch, prompt, priority,
                 status, project, slug, name, description,
                 difficulty, depends or [], source, is_cloud,
-                parent_task_id, worktree_mode, wip_branch, metadata,
+                kind, parent_task_id, worktree_mode, wip_branch, metadata,
             )
             return _serialize(dict(row))
 
@@ -91,15 +92,15 @@ async def add_task(pool: asyncpg.Pool, repo_url: str, repo_branch: str,
                     """INSERT INTO tasks (repo_url, repo_branch, prompt, priority,
                                           status, project, slug, name, description,
                                           difficulty, depends, source, is_cloud,
-                                          parent_task_id, worktree_mode, wip_branch,
-                                          metadata)
+                                          kind, parent_task_id, worktree_mode,
+                                          wip_branch, metadata)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                               $14, $15, $16, $17)
+                               $14, $15, $16, $17, $18)
                        RETURNING *""",
                     repo_url, repo_branch, prompt, priority,
                     status, project, attempt_slug, name, description,
                     difficulty, depends or [], source, is_cloud,
-                    parent_task_id, worktree_mode, wip_branch, metadata,
+                    kind, parent_task_id, worktree_mode, wip_branch, metadata,
                 )
                 return _serialize(dict(row))
             except asyncpg.UniqueViolationError as e:
@@ -291,7 +292,7 @@ async def count_dispatchable(pool: asyncpg.Pool) -> int:
                WHERE status IN ('running', 'blocked')
                  AND is_cloud = true
                  AND project IS NULL
-                 AND kind <> 'continuous'""",
+                 AND kind NOT IN ('continuous', 'backtest')""",
         )
         return row["n"]
 
@@ -326,7 +327,7 @@ async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
                    SELECT id FROM tasks
                    WHERE status = 'backlog' AND is_cloud = true
                          AND project IS NULL
-                         AND kind <> 'continuous'
+                         AND kind NOT IN ('continuous', 'backtest')
                    ORDER BY priority, created_at
                    LIMIT 1
                    FOR UPDATE SKIP LOCKED
@@ -334,6 +335,84 @@ async def claim_next_task(pool: asyncpg.Pool) -> dict | None:
                RETURNING *""",
         )
         return _serialize(dict(row)) if row else None
+
+
+async def claim_next_backtest_task(pool: asyncpg.Pool) -> dict | None:
+    """Atomically claim the next backtest task (cloud auto-backtest lane).
+
+    Separate lane from `claim_next_task`: backtests carry a project (for
+    board visibility) so the `project IS NULL` restriction doesn't apply,
+    and capacity is gated by CM_MAX_BACKTEST_WORKERS instead of
+    CM_MAX_WORKERS.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE tasks SET status = 'running', updated_at = now()
+               WHERE id = (
+                   SELECT id FROM tasks
+                   WHERE status = 'backlog' AND kind = 'backtest'
+                   ORDER BY priority, created_at
+                   LIMIT 1
+                   FOR UPDATE SKIP LOCKED
+               )
+               RETURNING *""",
+        )
+        return _serialize(dict(row)) if row else None
+
+
+async def count_dispatchable_backtests(pool: asyncpg.Pool) -> int:
+    """Backtest-lane capacity count. Counts only 'running' — a blocked
+    backtest is a terminal failure whose VM the reaper tears down; counting
+    blocked rows would let dead runs permanently eat lane slots."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT count(*) AS n FROM tasks WHERE status = 'running' AND kind = 'backtest'",
+        )
+        return row["n"]
+
+
+async def list_active_backtests(pool: asyncpg.Pool) -> list[dict]:
+    """Rows the backtest runaway reaper inspects: running backtests, plus
+    blocked backtests that still hold a VM (worker PATCHed blocked on
+    failure — the VM is kept briefly for ttyd debugging)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM tasks
+               WHERE kind = 'backtest'
+                 AND (status = 'running'
+                      OR (status = 'blocked' AND worker_vm IS NOT NULL))""",
+        )
+        return [_serialize(dict(r)) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Task artifacts (sql/013_task_artifacts.sql — cloud auto-backtest results)
+# ---------------------------------------------------------------------------
+
+
+async def add_task_artifact(pool: asyncpg.Pool, task_id: str, *,
+                            summary: dict,
+                            kind: str = "backtest-result",
+                            gcs_prefix: str | None = None,
+                            partial: bool = False) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO task_artifacts (task_id, kind, summary, gcs_prefix, partial)
+               VALUES ($1, $2, $3, $4, $5) RETURNING *""",
+            task_id, kind, summary, gcs_prefix, partial,
+        )
+        return _serialize(dict(row))
+
+
+async def list_task_artifacts(pool: asyncpg.Pool, task_id: str) -> list[dict]:
+    """All artifacts for a task, newest first (readers take [0] as latest)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM task_artifacts WHERE task_id = $1
+               ORDER BY created_at DESC""",
+            task_id,
+        )
+        return [_serialize(dict(r)) for r in rows]
 
 
 # ---------------------------------------------------------------------------

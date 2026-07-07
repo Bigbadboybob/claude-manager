@@ -101,3 +101,18 @@ class PlanningClient:
         r = self._client.client.patch(f"/tasks/{task_id}", json=fields)
         r.raise_for_status()
         return r.json()
+
+    def create_task(self, body: dict) -> dict:
+        """Generic POST /tasks with a caller-assembled body.
+
+        Used by `submit_backtest`, which needs fields propose_task's fixed
+        body doesn't carry (kind, metadata, parent_task_id, status)."""
+        r = self._client.client.post("/tasks", json=body)
+        r.raise_for_status()
+        return r.json()
+
+    def get_task_artifacts(self, task_id: str) -> list[dict]:
+        """Artifact rows for a task, newest first (cloud auto-backtest)."""
+        r = self._client.client.get(f"/tasks/{task_id}/artifacts")
+        r.raise_for_status()
+        return r.json()

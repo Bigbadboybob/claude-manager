@@ -521,6 +521,15 @@ pub fn dispatch_request(
         "list_tasks" => DispatchOutcome::Done(dispatch_list_tasks(state, req)),
         "get_task" => DispatchOutcome::Done(dispatch_get_task(state, req)),
 
+        // Cloud auto-backtest. `backtest.submit` is propose_task-like
+        // (Operator + Session; any bound agent may land a backlog row —
+        // the dispatcher/owner gate execution, and a taskless caller just
+        // lands a top-level row). `backtest.result` is a read like
+        // `get_task`. Both proxy the planning API with the daemon's creds
+        // so headless agents work without `cli/`.
+        "backtest.submit" => DispatchOutcome::Done(dispatch_backtest_submit(state, req)),
+        "backtest.result" => DispatchOutcome::Done(dispatch_backtest_result(state, req)),
+
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the
         // TUI can run interactive `A-n` / `A-s` against a REMOTE host.
@@ -786,6 +795,29 @@ fn dispatch_update_task(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::update_task(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `backtest.submit` — Session + Operator callable (no operator gating: an
+/// Operator frame gains nothing a Session frame doesn't have, matching
+/// `propose_task`). Caller uid threads through so a bound session's task
+/// becomes the submission's parent.
+fn dispatch_backtest_submit(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::backtest_submit(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `backtest.result` — read-only, no caller needed (like `get_task`).
+fn dispatch_backtest_result(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    match methods::backtest_result(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -7532,6 +7564,220 @@ mod tests {
             std::env::remove_var("CM_API_URL");
             std::env::remove_var("CM_API_TOKEN");
         }
+    }
+
+    // -- Cloud auto-backtest (backtest.submit / backtest.result) -----------
+
+    /// Point state.config at a stub API on `port` (bogus env cleared by the
+    /// caller under the env lock).
+    fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
+        let mut st = state.lock().unwrap();
+        st.config = crate::config::DaemonConfig {
+            mcp_server_path: String::new(),
+            api_url: format!("http://127.0.0.1:{}", port),
+            api_token: "bt-test-token".into(),
+            log_path: String::new(),
+            workflows_dir: String::new(),
+            auth: Default::default(),
+            tls: None,
+            repos_dir: String::new(),
+            allow_clone: false,
+            repos: Vec::new(),
+            scheduler: Default::default(),
+        };
+    }
+
+    /// Canned POST /tasks response for backtest.submit: the API mints
+    /// `run_key` server-side, so the stub row must carry it.
+    const BT_CREATED_ROW: &str = r#"{"id":"abcd1234-0000-0000-0000-000000000000","status":"backlog","metadata":{"backtest":{"run_key":"20260707-smoke-abcd1234"},"vm":{}}}"#;
+
+    /// Wire-shape pin: one POST /tasks with the full backtest body; the
+    /// result carries task_id + the SERVER-minted run_key. Explicit
+    /// repo_url → no GET /projects, so the one-shot stub suffices.
+    #[test]
+    fn backtest_submit_wire_shape_and_run_key() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let (port, captured) =
+            crate::planning_client::spawn_stub_api_for_test(200, BT_CREATED_ROW);
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "backtest.submit",
+                serde_json::json!({
+                    "branch": "cm/feat-x",
+                    "config": "analysis/backtests/configs/t1.yaml",
+                    "label": "t1 smoke",
+                    "regression": true,
+                    "repo_url": "https://github.com/x/pt",
+                }),
+            ),
+        )
+        .into_response();
+        assert!(resp.ok, "backtest.submit should succeed: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result.get("task_id").and_then(|v| v.as_str()),
+            Some("abcd1234-0000-0000-0000-000000000000"),
+        );
+        assert_eq!(
+            result.get("run_key").and_then(|v| v.as_str()),
+            Some("20260707-smoke-abcd1234"),
+            "run_key must be read back off the created row (server-minted)",
+        );
+        let cap = captured.lock().unwrap();
+        let (method, path) = cap.method_and_path();
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/tasks"));
+        let body_raw = cap.raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let body: serde_json::Value =
+            serde_json::from_str(body_raw).expect("POST body is JSON");
+        assert_eq!(body["kind"], "backtest");
+        assert_eq!(body["is_cloud"], true);
+        assert_eq!(body["status"], "backlog");
+        assert_eq!(body["source"], "claude");
+        assert_eq!(body["repo_url"], "https://github.com/x/pt");
+        assert_eq!(body["repo_branch"], "cm/feat-x");
+        assert_eq!(body["project"], "predictionTrading");
+        let bt = &body["metadata"]["backtest"];
+        assert_eq!(bt["branch"], "cm/feat-x");
+        assert_eq!(bt["config"], "analysis/backtests/configs/t1.yaml");
+        assert_eq!(bt["script"], "analysis.backtests.backtest_actrader_grid");
+        assert_eq!(bt["regression"], true);
+        let vm = &body["metadata"]["vm"];
+        assert_eq!(vm["project"], "prediction-market-scalper");
+        assert_eq!(vm["zone"], "us-east4-a");
+        assert_eq!(vm["machine_type"], "c2-standard-4");
+        assert_eq!(vm["image_family"], "cm-backtest-worker");
+        // Operator caller carries no session → no parent.
+        assert!(body.get("parent_task_id").is_none());
+    }
+
+    /// A bound Session caller's own task becomes the submission's parent
+    /// (board nesting), without any explicit parent_task_id param.
+    #[test]
+    fn backtest_submit_session_task_becomes_parent() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let (port, captured) =
+            crate::planning_client::spawn_stub_api_for_test(200, BT_CREATED_ROW);
+        let state = state_with_session_in_workspace("ts-bt", "ws-1");
+        set_stub_api_config(&state, port);
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("ts-bt")
+            .unwrap()
+            .task_id = Some("parent-task-9".into());
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "backtest.submit",
+                serde_json::json!({
+                    "branch": "main",
+                    "config": "configs/smoke.yaml",
+                    "repo_url": "https://github.com/x/pt",
+                }),
+                "ts-bt",
+            ),
+        )
+        .into_response();
+        assert!(resp.ok, "session submit should succeed: {:?}", resp.error);
+        let cap = captured.lock().unwrap();
+        let body_raw = cap.raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let body: serde_json::Value =
+            serde_json::from_str(body_raw).expect("POST body is JSON");
+        assert_eq!(body["parent_task_id"], "parent-task-9");
+    }
+
+    /// Validation failures are rejected BEFORE any HTTP: with no valid
+    /// creds anywhere, getting past validation would surface Internal
+    /// (missing CM_API_URL) — these must be InvalidParams instead.
+    #[test]
+    fn backtest_submit_validates_before_http() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let state = make_state();
+        for (label, params) in [
+            ("empty branch", serde_json::json!({"branch": "", "config": "c.yaml"})),
+            ("empty config", serde_json::json!({"branch": "main", "config": ""})),
+            (
+                "empty project",
+                serde_json::json!({"branch": "main", "config": "c.yaml", "project": ""}),
+            ),
+            (
+                "oversized config",
+                serde_json::json!({
+                    "branch": "main",
+                    "config": "x".repeat(32 * 1024 + 1),
+                }),
+            ),
+        ] {
+            let resp = dispatch_request(
+                &state,
+                &operator_request("backtest.submit", params),
+            )
+            .into_response();
+            assert!(!resp.ok, "{} must be rejected", label);
+            assert_eq!(
+                resp.error.unwrap().code,
+                ErrorCode::InvalidParams,
+                "{} must fail validation (InvalidParams), not reach HTTP (Internal)",
+                label,
+            );
+        }
+    }
+
+    /// backtest.result: a 4xx from the API (unknown task, or an API that
+    /// predates the artifacts endpoint) maps to InvalidParams via
+    /// `to_method_err`, matching every other planning proxy.
+    #[test]
+    fn backtest_result_maps_4xx_to_invalid_params() {
+        let _g = crate::planning_client::test_env_lock();
+        unsafe {
+            std::env::remove_var("CM_API_URL");
+            std::env::remove_var("CM_API_TOKEN");
+        }
+        let (port, _captured) = crate::planning_client::spawn_stub_api_for_test(
+            404,
+            r#"{"detail":"Task not found"}"#,
+        );
+        let state = make_state();
+        set_stub_api_config(&state, port);
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "backtest.result",
+                serde_json::json!({"task_id": "nonesuch"}),
+            ),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, ErrorCode::InvalidParams);
+    }
+
+    /// backtest.result requires task_id.
+    #[test]
+    fn backtest_result_requires_task_id() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request("backtest.result", serde_json::json!({})),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().code, ErrorCode::InvalidParams);
     }
 
     /// Sub-2b-1 review-r#4 #2: simulate the TUI's

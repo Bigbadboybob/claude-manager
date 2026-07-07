@@ -221,6 +221,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.pause",
     "continuous.run_now",
     "continuous.delete",
+    # Operator-only break-glass for a run wedged `Running` (2026-07-06
+    # compact-collision fix). Dispatch-surface alignment only; not
+    # Python-routable (same treatment as the continuous.* CRUD above).
+    "continuous.force_done",
     # Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11): the
     # stuck-story agent tools. Both are genuinely Session-routable (unlike
     # the continuous.* CRUD above): `report_done` is callable by any
@@ -240,6 +244,15 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # shared transport between producers and the consuming task.
     "enqueue",
     "queue.stats",
+    # Cloud auto-backtest: `backtest.submit` lands a kind='backtest' planning
+    # row via the daemon's planning creds (propose_task-like openness: any
+    # bound session may submit; the dispatcher gates execution), and
+    # `backtest.result` is a read (get_task + artifact rows in one
+    # round-trip). Both genuinely Session-routable and headless-capable —
+    # no TUI handler exists, so like `set_subtask_status` they MUST be
+    # daemon-routed under a daemon pin.
+    "backtest.submit",
+    "backtest.result",
 })
 
 

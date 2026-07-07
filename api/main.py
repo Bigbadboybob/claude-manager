@@ -12,7 +12,9 @@ import asyncpg
 from fastapi import FastAPI, Depends, HTTPException, Query
 
 from api.auth import verify_token
-from api.models import TaskCreate, TaskUpdate, TaskResponse
+from api.models import (
+    TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
+)
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from dispatch import db
 from dispatch.config import DB_DSN
@@ -21,26 +23,48 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cm.api")
 
 
-async def _delete_vm_bg(vm_name: str) -> None:
+def _vm_location(task: dict) -> tuple[str | None, str | None]:
+    """(project, zone) for a task's worker VM.
+
+    Backtest tasks carry the RESOLVED values in metadata.vm (stamped by the
+    dispatcher at launch); everything else returns (None, None) so deletion
+    falls back to the process-global config defaults.
+    """
+    vm_meta = (task.get("metadata") or {}).get("vm") or {}
+    return vm_meta.get("project"), vm_meta.get("zone") or task.get("worker_zone")
+
+
+async def _delete_vm_bg(vm_name: str, project: str | None = None,
+                        zone: str | None = None) -> None:
     """Delete a worker VM via gcloud, swallowing failures with a logged exception.
 
     Fire-and-forget helper used by request handlers that want VM teardown to
     happen out of band. Callers should schedule this with
-    ``_spawn_vm_deletion(vm_name)`` so the task handle is tracked on
+    ``_spawn_vm_deletion(vm_name, ...)`` so the task handle is tracked on
     ``app.state.pending_vm_deletions`` and awaited at shutdown.
+
+    ``project``/``zone`` of None fall back to delete_worker's config
+    defaults (claude-manager-prod); backtest VMs live elsewhere and pass
+    their metadata.vm location through.
     """
     try:
         from dispatch.vm import delete_worker
-        await asyncio.to_thread(delete_worker, vm_name)
+        kwargs = {}
+        if project:
+            kwargs["project"] = project
+        if zone:
+            kwargs["zone"] = zone
+        await asyncio.to_thread(delete_worker, vm_name, **kwargs)
         logger.info(f"Deleted VM {vm_name}")
     except Exception:
         logger.exception(f"Failed to delete VM {vm_name}")
 
 
-def _spawn_vm_deletion(vm_name: str) -> asyncio.Task:
+def _spawn_vm_deletion(vm_name: str, project: str | None = None,
+                       zone: str | None = None) -> asyncio.Task:
     """Schedule a background VM deletion and track the handle for shutdown."""
     pending = app.state.pending_vm_deletions
-    task = asyncio.create_task(_delete_vm_bg(vm_name))
+    task = asyncio.create_task(_delete_vm_bg(vm_name, project, zone))
     pending.add(task)
     task.add_done_callback(pending.discard)
     return task
@@ -109,6 +133,9 @@ NULLABLE_TASK_FIELDS = frozenset({
     "metadata",
 })
 
+BACKTEST_DEFAULT_SCRIPT = "analysis.backtests.backtest_actrader_grid"
+
+
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     prompt = body.prompt or ""
@@ -118,14 +145,48 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     if not slug and body.name:
         slug = _slugify(body.name)
 
+    is_cloud = body.is_cloud
+    metadata = body.metadata
+    if body.kind == "backtest":
+        bt = (metadata or {}).get("backtest")
+        if not isinstance(bt, dict):
+            raise HTTPException(
+                status_code=400, detail="backtest tasks require metadata.backtest"
+            )
+        if not bt.get("branch"):
+            raise HTTPException(
+                status_code=400, detail="metadata.backtest.branch is required"
+            )
+        if not bt.get("config"):
+            raise HTTPException(
+                status_code=400, detail="metadata.backtest.config is required"
+            )
+        bt.setdefault("script", BACKTEST_DEFAULT_SCRIPT)
+        is_cloud = True  # backtests are cloud-dispatched by definition
+
     task = await db.add_task(
         pool, body.repo_url, body.repo_branch, prompt, body.priority,
         status=body.status, project=body.project, slug=slug, name=body.name,
         description=body.description, difficulty=body.difficulty,
-        depends=body.depends, source=body.source, is_cloud=body.is_cloud,
+        depends=body.depends, source=body.source, is_cloud=is_cloud,
+        kind=body.kind,
         parent_task_id=body.parent_task_id, worktree_mode=body.worktree_mode,
-        wip_branch=body.wip_branch, metadata=body.metadata,
+        wip_branch=body.wip_branch, metadata=metadata,
     )
+
+    # Mint run_key server-side (needs the task id): <utcYYYYMMDD>-<label>-<task8>.
+    # Done here rather than by clients so every submit path (MCP laptop,
+    # daemon Rust proxy, PT-twin server) gets it from one implementation.
+    if body.kind == "backtest" and not task["metadata"]["backtest"].get("run_key"):
+        meta = task["metadata"]
+        label = meta["backtest"].get("label") or task.get("slug") or "backtest"
+        run_key = (
+            f"{datetime.now(timezone.utc):%Y%m%d}-"
+            f"{_slugify(label)[:24] or 'run'}-{str(task['id'])[:8]}"
+        )
+        meta["backtest"]["run_key"] = run_key
+        task = await db.update_task(pool, str(task["id"]), metadata=meta)
+
     return task
 
 
@@ -344,6 +405,57 @@ async def requeue_queue_batch(queue: str, body: dict | None = None, pool=Depends
     return {"requeued": requeued}
 
 
+# ---------------------------------------------------------------------------
+# Task artifacts (cloud auto-backtest results — sql/013_task_artifacts.sql)
+# ---------------------------------------------------------------------------
+
+# Same philosophy as the queue-payload cap: an artifact row is a compact
+# summary + a GCS pointer, not a blob store. Bulk results live in GCS.
+_ARTIFACT_SUMMARY_MAX_BYTES = 64 * 1024
+
+
+async def _get_task_or_400(pool, task_id: str) -> dict:
+    try:
+        task = await db.get_task(pool, task_id)
+    except asyncpg.DataError:
+        # Malformed UUID — a client bug, not a server error.
+        raise HTTPException(status_code=400, detail="task_id must be a UUID")
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.post("/tasks/{task_id}/artifacts", response_model=ArtifactResponse,
+          dependencies=[Depends(verify_token)])
+async def create_task_artifact(task_id: str, body: ArtifactCreate,
+                               pool=Depends(get_pool)):
+    """Attach a structured result artifact to a task (worker callback).
+
+    Backtest workers POST here after publishing bulk output to GCS; the
+    summary shape convention is {total_pnl, realized_pnl, fill_count,
+    taker_pct, partial, grid_rows[], baseline_delta?, gcs_pointer}.
+    """
+    await _get_task_or_400(pool, task_id)
+    if len(json.dumps(body.summary)) > _ARTIFACT_SUMMARY_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"summary exceeds {_ARTIFACT_SUMMARY_MAX_BYTES} bytes; "
+                   "artifacts are summaries — bulk results go to GCS",
+        )
+    return await db.add_task_artifact(
+        pool, task_id, kind=body.kind, summary=body.summary,
+        gcs_prefix=body.gcs_prefix, partial=body.partial,
+    )
+
+
+@app.get("/tasks/{task_id}/artifacts", response_model=list[ArtifactResponse],
+         dependencies=[Depends(verify_token)])
+async def list_task_artifacts(task_id: str, pool=Depends(get_pool)):
+    """All artifacts for a task, newest first."""
+    await _get_task_or_400(pool, task_id)
+    return await db.list_task_artifacts(pool, task_id)
+
+
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     task = await db.get_task(pool, task_id)
@@ -381,7 +493,7 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
                                     status="ready", current_task_id=None)
             logger.info(f"Released warm VM {task['worker_vm']} back to ready")
         else:
-            _spawn_vm_deletion(task["worker_vm"])
+            _spawn_vm_deletion(task["worker_vm"], *_vm_location(task))
 
     # Auto-set blocked_at when transitioning to blocked
     if fields.get("status") == "blocked" and "blocked_at" not in fields:
@@ -400,7 +512,7 @@ async def delete_task(task_id: str, pool=Depends(get_pool)):
         raise HTTPException(status_code=404, detail="Task not found")
 
     if task["worker_vm"]:
-        _spawn_vm_deletion(task["worker_vm"])
+        _spawn_vm_deletion(task["worker_vm"], *_vm_location(task))
         # VM tasks: mark done so dispatch daemon can clean up
         await db.update_task(pool, task_id, status="done")
     else:
@@ -487,9 +599,10 @@ async def delete_warm_pool(pool_id: str, pool=Depends(get_pool)):
 
 @app.get("/config", dependencies=[Depends(verify_token)])
 async def get_config():
-    from dispatch.config import MAX_WORKERS
+    from dispatch.config import MAX_WORKERS, MAX_BACKTEST_WORKERS
     return {
         "max_workers": MAX_WORKERS,
+        "max_backtest_workers": MAX_BACKTEST_WORKERS,
     }
 
 

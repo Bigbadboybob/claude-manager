@@ -61,6 +61,30 @@ class TaskUpdate(BaseModel):
     metadata: dict | None = None
 
 
+class ArtifactCreate(BaseModel):
+    """Structured result artifact POSTed by a worker (cloud auto-backtest).
+
+    `summary` carries the compact metrics dict — for backtests:
+    {total_pnl, realized_pnl, fill_count, taker_pct, partial, grid_rows[],
+    baseline_delta?, gcs_pointer} (shape enforced by the worker, not here).
+    Bulk output lives in GCS under `gcs_prefix`.
+    """
+    kind: str = "backtest-result"
+    summary: dict
+    gcs_prefix: str | None = None
+    partial: bool = False
+
+
+class ArtifactResponse(BaseModel):
+    id: str
+    task_id: str
+    kind: str
+    summary: dict
+    gcs_prefix: str | None
+    partial: bool
+    created_at: datetime
+
+
 class TaskResponse(BaseModel):
     id: str
     created_at: datetime

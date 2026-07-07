@@ -2316,6 +2316,263 @@ def resolve_stuck(
     return control_client.call("resolve_stuck", params)
 
 
+# ---------------------------------------------------------------------------
+# Cloud auto-backtest (submit + results)
+# ---------------------------------------------------------------------------
+
+_BACKTEST_VM_DEFAULTS = {
+    "project": "prediction-market-scalper",
+    "zone": "us-east4-a",
+    "machine_type": "c2-standard-4",
+    "image_family": "cm-backtest-worker",
+    "image_project": "prediction-market-scalper",
+}
+# GCE instance metadata caps values at 256KB; the whole backtest payload rides
+# one metadata attribute, so keep inline configs well under that.
+_BACKTEST_CONFIG_MAX_BYTES = 32 * 1024
+_BACKTEST_TERMINAL_STATUSES = ("done", "blocked", "archived")
+_BACKTEST_DEFAULT_SCRIPT = "analysis.backtests.backtest_actrader_grid"
+
+
+def _caller_task_id() -> str | None:
+    """The caller's bound task UUID, or None (unbound / unreachable).
+
+    Mirrors get_current_task's two branches. Failure to resolve identity
+    must NOT block a backtest submission — the row just lands top-level.
+    """
+    try:
+        route = control_client.resolve_socket_route()
+        if route.chose_daemon:
+            pong = control_client.call("ping", {}, socket_path=route.path)
+            return pong.get("task_id") or None
+        ctx = control_client.call("get_caller_task")
+        return ctx.get("task_id") or None
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def submit_backtest(
+    branch: str,
+    config: str,
+    script: str = _BACKTEST_DEFAULT_SCRIPT,
+    label: str = "",
+    baseline_ref: str = "",
+    notify: bool = False,
+    regression: bool = False,
+    repo_url: str = "",
+    project: str = "predictionTrading",
+    machine_type: str = "",
+    zone: str = "",
+) -> dict:
+    """Submit a backtest to run on an ephemeral cloud spot VM.
+
+    Creates a `kind="backtest"` task that the claude-manager dispatch
+    daemon picks up: it provisions a spot worker in the same GCP
+    project/zone as the market data (fast intra-zone window download),
+    runs the backtest, publishes bulk results to GCS, attaches a compact
+    metrics summary to the task, and tears the VM down. Read results back
+    with `get_backtest_result(task_id)`.
+
+    NOTE: this provisions a cloud VM (cheap spot instance, auto-deleted) —
+    state your intent before calling. Re-submitting is NOT idempotent:
+    every call creates a new task + run.
+
+    Args:
+        branch: Git ref of predictionTrading to check out and run.
+        config: EITHER a repo-relative path to a run config (e.g.
+            "analysis/backtests/configs/rbpf_targeted_t1.yaml") OR an
+            inline YAML string (window, market_ids, params/grid). Passed
+            through verbatim — the repo-side resolver disambiguates.
+        script: Module path of the runner. Defaults to the canonical grid
+            runner. "__cm_stub__" runs a CM-infrastructure smoke test with
+            fabricated results (no repo deps).
+        label: Short human label; becomes part of the run_key.
+        baseline_ref: Optional stored-baseline ref for an A/B delta.
+        notify: Ask for a notification on completion (delivery is owned by
+            the repo-side tooling; stored on the task).
+        regression: Deterministic regression mode (forces speed_factor=0).
+        repo_url: Repo to clone. Defaults to the `project`'s repo URL.
+        project: Planning project the task files under (board visibility;
+            also the repo-URL lookup key). Must be non-empty.
+        machine_type: Override the default c2-standard-4.
+        zone: Override the default us-east4-a.
+
+    Returns: {task_id, run_key, status} — run_key is minted server-side
+        and keys the GCS results prefix (backtests/<run_key>/).
+    """
+    if not branch or not branch.strip():
+        raise ValueError("submit_backtest: `branch` is required")
+    if not config or not config.strip():
+        raise ValueError("submit_backtest: `config` is required")
+    if not project or not project.strip():
+        raise ValueError("submit_backtest: `project` must be non-empty")
+    if len(config.encode("utf-8")) > _BACKTEST_CONFIG_MAX_BYTES:
+        raise ValueError(
+            f"submit_backtest: `config` exceeds {_BACKTEST_CONFIG_MAX_BYTES} "
+            "bytes — commit it to the repo and pass its path instead"
+        )
+    _check_parameter_confusion("label", label)
+    _check_parameter_confusion("config", config)
+
+    parent_task_id = _caller_task_id()
+
+    try:
+        client = PlanningClient()
+    except Exception:
+        # Headless deployment (daemon-spawned agent on cm-manager): the
+        # daemon proxies the submission with its own planning creds and
+        # resolves the repo_url default there.
+        params: dict = {
+            "branch": branch,
+            "config": config,
+            "script": script,
+            "label": label,
+            "baseline_ref": baseline_ref,
+            "notify": notify,
+            "regression": regression,
+            "project": project,
+        }
+        if repo_url:
+            params["repo_url"] = repo_url
+        if machine_type:
+            params["machine_type"] = machine_type
+        if zone:
+            params["zone"] = zone
+        if parent_task_id:
+            params["parent_task_id"] = parent_task_id
+        return control_client.call("backtest.submit", params)
+
+    if not repo_url:
+        projects = {p["name"]: p["repo_url"] for p in client.list_projects()}
+        repo_url = projects.get(project) or ""
+        if not repo_url:
+            raise ValueError(
+                f"submit_backtest: unknown project {project!r} — pass "
+                "repo_url explicitly"
+            )
+
+    vm = dict(_BACKTEST_VM_DEFAULTS)
+    if machine_type:
+        vm["machine_type"] = machine_type
+    if zone:
+        vm["zone"] = zone
+    backtest_meta = {
+        "branch": branch,
+        "config": config,
+        "script": script,
+        "label": label,
+        "baseline_ref": baseline_ref,
+        "notify": notify,
+        "regression": regression,
+    }
+    name = f"backtest: {label or script.rsplit('.', 1)[-1]} @ {branch}"
+    prompt = f"Cloud backtest {script} on {branch}" + (
+        f" (label: {label})" if label else ""
+    )
+    body = {
+        "repo_url": repo_url,
+        "repo_branch": branch,
+        "name": name,
+        "project": project,
+        "prompt": prompt,
+        "source": "claude",
+        "is_cloud": True,
+        "kind": "backtest",
+        "status": "backlog",
+        "metadata": {"backtest": backtest_meta, "vm": vm},
+    }
+    if parent_task_id:
+        body["parent_task_id"] = parent_task_id
+    task = client.create_task(body)
+    run_key = ((task.get("metadata") or {}).get("backtest") or {}).get("run_key")
+    return {"task_id": task["id"], "run_key": run_key, "status": task["status"]}
+
+
+def _read_backtest_result(task_id: str) -> dict:
+    """One synchronous read of task + artifacts, composed into the
+    get_backtest_result shape (module-level for testability)."""
+    try:
+        client = PlanningClient()
+        task = client.get_task(task_id)
+        artifacts = client.get_task_artifacts(task_id)
+    except (RuntimeError, ModuleNotFoundError):
+        res = control_client.call("backtest.result", {"task_id": task_id})
+        task = res["task"]
+        artifacts = res["artifacts"]
+
+    latest = artifacts[0] if artifacts else None
+    task_status = task.get("status")
+    if latest is None:
+        status = "no_result" if task_status in _BACKTEST_TERMINAL_STATUSES else "pending"
+    else:
+        status = "partial" if latest.get("partial") else "complete"
+    return {
+        "status": status,
+        "partial": bool(latest and latest.get("partial")),
+        "summary": latest.get("summary") if latest else None,
+        "gcs_prefix": latest.get("gcs_prefix") if latest else None,
+        "artifacts": [
+            {
+                "id": a.get("id"),
+                "kind": a.get("kind"),
+                "summary": a.get("summary"),
+                "gcs_prefix": a.get("gcs_prefix"),
+                "partial": a.get("partial"),
+                "created_at": a.get("created_at"),
+            }
+            for a in artifacts
+        ],
+        "task_status": task_status,
+    }
+
+
+@mcp.tool()
+async def get_backtest_result(
+    task_id: str,
+    wait: bool = False,
+    timeout_s: float = 600.0,
+    poll_interval_s: float = 15.0,
+) -> dict:
+    """Read the structured results of a backtest submitted via `submit_backtest`.
+
+    Returns the newest artifact attached to the task (compact metrics
+    summary + a GCS pointer to the bulk results dir), plus the full
+    artifact list (a run may attach a partial artifact on spot preemption
+    and a final one after resume).
+
+    `status` semantics:
+      - "complete": a final (non-partial) result is available.
+      - "partial": the newest result was published from an interrupted run
+        (preemption / pipeline failure) — you can re-call with wait=True to
+        wait for a final one if the task was re-queued.
+      - "pending": no result yet, task still queued/running.
+      - "no_result": task reached a terminal status (done/blocked/archived)
+        without ever attaching an artifact — inspect the task / ttyd.
+
+    Args:
+        task_id: The backtest task UUID from `submit_backtest`.
+        wait: Block until any artifact appears or the task goes terminal.
+        timeout_s: Max seconds to wait (clamped to [1, 86400]).
+        poll_interval_s: Seconds between polls (clamped to [5, 120]).
+
+    Returns: {status, partial, summary, gcs_prefix, artifacts, task_status}
+        (+ timed_out: true when a wait hit the deadline).
+    """
+    if not wait:
+        return await asyncio.to_thread(_read_backtest_result, task_id)
+    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    interval = max(5.0, min(poll_interval_s, 120.0))
+    while True:
+        result = await asyncio.to_thread(_read_backtest_result, task_id)
+        if result["artifacts"] or result["task_status"] in _BACKTEST_TERMINAL_STATUSES:
+            return result
+        if time.monotonic() >= deadline:
+            result["timed_out"] = True
+            return result
+        await asyncio.sleep(interval)
+
+
 def _require_workflow_env() -> tuple[str, str]:
     """Return (run_id, role) from env, or raise if not in a workflow session.
 

@@ -10586,6 +10586,37 @@ fn api_delete_task(
     Ok(())
 }
 
+/// GET /tasks/{id}/artifacts — structured result artifact rows, newest
+/// first (cloud auto-backtest).
+fn api_get_task_artifacts(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+) -> Result<Vec<Value>, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let mut resp = agent
+        .get(&creds.url(&format!("/tasks/{}/artifacts", task_id)))
+        .header("Authorization", &creds.auth())
+        .call()
+        .map_err(map_ureq_err)?;
+    resp.body_mut()
+        .read_json::<Vec<Value>>()
+        .map_err(|e| PlanningClientError::Transport(format!("decode get_task_artifacts: {}", e)))
+}
+
+/// GET /projects — [{name, repo_url}] (repo-URL default resolution for
+/// `backtest.submit`).
+fn api_list_projects(creds: &PlanningApiCreds) -> Result<Vec<Value>, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let mut resp = agent
+        .get(&creds.url("/projects"))
+        .header("Authorization", &creds.auth())
+        .call()
+        .map_err(map_ureq_err)?;
+    resp.body_mut()
+        .read_json::<Vec<Value>>()
+        .map_err(|e| PlanningClientError::Transport(format!("decode list_projects: {}", e)))
+}
+
 /// Generate a 7-hex-char id from nanos + an atomic counter. Ported
 /// verbatim from `tui/src/control/methods.rs::make_request_short_id`.
 /// Used by `create_subtask` for BOTH the slug suffix and the
@@ -11374,6 +11405,224 @@ pub fn get_task(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodRe
 // (`get_current_task` has no dedicated daemon method: the MCP tool composes
 // it from `ping` — which already returns the caller's `task_id` /
 // `workspace_id` — plus `get_task` above.)
+
+// ---------------------------------------------------------------------------
+// Cloud auto-backtest (backtest.submit / backtest.result)
+// ---------------------------------------------------------------------------
+
+fn default_backtest_script() -> String {
+    "analysis.backtests.backtest_actrader_grid".to_string()
+}
+
+fn default_backtest_project() -> String {
+    "predictionTrading".to_string()
+}
+
+/// GCE instance metadata caps values at 256KB; the whole backtest payload
+/// rides one attribute, so keep inline configs well under that. Mirrors
+/// `_BACKTEST_CONFIG_MAX_BYTES` in mcp_server/server.py.
+const BACKTEST_CONFIG_MAX_BYTES: usize = 32 * 1024;
+
+#[derive(Deserialize)]
+struct BacktestSubmitParams {
+    branch: String,
+    config: String,
+    #[serde(default = "default_backtest_script")]
+    script: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    baseline_ref: String,
+    #[serde(default)]
+    notify: bool,
+    #[serde(default)]
+    regression: bool,
+    #[serde(default)]
+    repo_url: Option<String>,
+    #[serde(default = "default_backtest_project")]
+    project: String,
+    #[serde(default)]
+    machine_type: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+    #[serde(default)]
+    parent_task_id: Option<String>,
+}
+
+/// `backtest.submit` — Session + Operator callable. Lands a `kind='backtest'`
+/// planning row via the daemon's planning creds so headless agents (daemon-
+/// spawned on cm-manager, no `cli/` package) can submit cloud backtests.
+///
+/// propose_task-like openness — DELIBERATE divergence from
+/// `set_subtask_status`/`update_task`: a taskless caller (or an Operator
+/// frame, which carries no session) may still submit; the row just lands
+/// top-level. Submission only creates a backlog row — the dispatch daemon
+/// and the operator gate execution.
+///
+/// `run_key` is minted SERVER-SIDE by the API inside POST /tasks (single
+/// implementation shared with the cli-routed path), so this method carries
+/// no date/slug logic — it reads the run_key back off the created row.
+pub fn backtest_submit(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: BacktestSubmitParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("backtest.submit params: {}", e)))?;
+    if p.branch.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "backtest.submit: 'branch' is required".into()));
+    }
+    if p.config.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "backtest.submit: 'config' is required".into()));
+    }
+    if p.project.trim().is_empty() {
+        return Err((ErrorCode::InvalidParams, "backtest.submit: 'project' must be non-empty".into()));
+    }
+    if p.config.len() > BACKTEST_CONFIG_MAX_BYTES {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "backtest.submit: 'config' exceeds {} bytes — commit it to the repo and pass its path instead",
+                BACKTEST_CONFIG_MAX_BYTES,
+            ),
+        ));
+    }
+
+    // Snapshot under the lock, then drop before any HTTP (lock discipline:
+    // the DaemonState mutex is never held across a planning-API call).
+    let (caller_task_id, api_url_cfg, api_token_cfg): (Option<String>, String, String) = {
+        let state = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let caller_task = caller_uid
+            .and_then(|u| state.sessions.get(u))
+            .and_then(|s| s.task_id.clone());
+        (
+            caller_task,
+            state.config.api_url.clone(),
+            state.config.api_token.clone(),
+        )
+    };
+    // Explicit param wins; else the caller's own task (nests on the board).
+    let parent_task_id = p.parent_task_id.clone().or(caller_task_id);
+
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+
+    let repo_url = match p.repo_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(url) => url.to_string(),
+        None => {
+            let projects = api_list_projects(&creds).map_err(|e| e.to_method_err())?;
+            projects
+                .iter()
+                .find(|row| row.get("name").and_then(Value::as_str) == Some(p.project.as_str()))
+                .and_then(|row| row.get("repo_url").and_then(Value::as_str))
+                .map(str::to_string)
+                .ok_or((
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "backtest.submit: unknown project '{}' — pass repo_url explicitly",
+                        p.project,
+                    ),
+                ))?
+        }
+    };
+
+    // VM defaults mirror `_BACKTEST_VM_DEFAULTS` in mcp_server/server.py
+    // (and BACKTEST_VM_DEFAULTS in dispatch/config.py — the dispatcher
+    // re-merges over its own defaults at launch, so these are the
+    // submission-time record of intent).
+    let vm = json!({
+        "project": "prediction-market-scalper",
+        "zone": p.zone.as_deref().filter(|s| !s.is_empty()).unwrap_or("us-east4-a"),
+        "machine_type": p.machine_type.as_deref().filter(|s| !s.is_empty()).unwrap_or("c2-standard-4"),
+        "image_family": "cm-backtest-worker",
+        "image_project": "prediction-market-scalper",
+    });
+    let metadata = json!({
+        "backtest": {
+            "branch": p.branch,
+            "config": p.config,
+            "script": p.script,
+            "label": p.label,
+            "baseline_ref": p.baseline_ref,
+            "notify": p.notify,
+            "regression": p.regression,
+        },
+        "vm": vm,
+    });
+    let short_name = p
+        .script
+        .rsplit('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("backtest");
+    let name = format!(
+        "backtest: {} @ {}",
+        if p.label.is_empty() { short_name } else { p.label.as_str() },
+        p.branch,
+    );
+    let prompt = if p.label.is_empty() {
+        format!("Cloud backtest {} on {}", p.script, p.branch)
+    } else {
+        format!("Cloud backtest {} on {} (label: {})", p.script, p.branch, p.label)
+    };
+    let mut body = json!({
+        "repo_url": repo_url,
+        "repo_branch": p.branch,
+        "name": name,
+        "project": p.project,
+        "prompt": prompt,
+        "source": "claude",
+        "is_cloud": true,
+        "kind": "backtest",
+        "status": "backlog",
+        "metadata": metadata,
+    });
+    if let Some(parent) = parent_task_id {
+        body["parent_task_id"] = Value::String(parent);
+    }
+
+    let row = api_create_task(&creds, &body).map_err(|e| e.to_method_err())?;
+    let task_id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or((ErrorCode::Internal, "backtest.submit: created task row has no id".into()))?
+        .to_string();
+    let run_key = row
+        .get("metadata")
+        .and_then(|m| m.get("backtest"))
+        .and_then(|b| b.get("run_key"))
+        .and_then(Value::as_str)
+        .ok_or((
+            ErrorCode::Internal,
+            format!(
+                "backtest.submit: task {} created but the API returned no metadata.backtest.run_key — \
+                 the planning API predates the backtest lane (deploy api/ to the manager)",
+                task_id,
+            ),
+        ))?
+        .to_string();
+    let status = row
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("backlog")
+        .to_string();
+    Ok(json!({ "task_id": task_id, "run_key": run_key, "status": status }))
+}
+
+/// `backtest.result` — read-only, Session + Operator callable (like
+/// `get_task`). Returns the RAW task row + artifact rows in one round-trip;
+/// the MCP server composes the status/partial shape. The wait loop lives
+/// MCP-side — the daemon never blocks a control-socket thread on a poll.
+pub fn backtest_result(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let task_id = params
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .ok_or((ErrorCode::InvalidParams, "backtest.result: 'task_id' is required".into()))?;
+    let creds = planning_creds(state_arc)?;
+    let task = api_get_task(&creds, task_id).map_err(|e| e.to_method_err())?;
+    let artifacts = api_get_task_artifacts(&creds, task_id).map_err(|e| e.to_method_err())?;
+    Ok(json!({ "task": task, "artifacts": artifacts }))
+}
 
 /// Best-effort bounded wait until no LIVE session is tagged with
 /// `task_id`. `mark_subtask_done` SIGKILLs the subtask's sessions

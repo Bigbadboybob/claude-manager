@@ -210,6 +210,7 @@ class PatchWorkerVmCleanupTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.deletions: list[str] = []
+        self.deletion_locations: list[tuple] = []
         self.warm_released: list[str] = []
         self.captured: dict = {}
         self.existing = _row(worker_vm="vm-7", status="running")
@@ -224,8 +225,9 @@ class PatchWorkerVmCleanupTests(unittest.IsolatedAsyncioTestCase):
         async def fake_list_warm(_pool):
             return []
 
-        def fake_spawn(vm_name):
+        def fake_spawn(vm_name, project=None, zone=None):
             self.deletions.append(vm_name)
+            self.deletion_locations.append((project, zone))
 
         self._patches = [
             mock.patch.object(api_main.db, "get_task", fake_get),
