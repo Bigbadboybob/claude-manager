@@ -141,8 +141,10 @@ pub struct SchedulerConfig {
     /// Default per-fire memory cap in BYTES, applied to continuous spawns as the
     /// memory-cap triple (`memory_cap_bytes` / `memory_cap_hard_bytes` /
     /// `cgroup_prefix`) unless a task overrides it via
-    /// `ContinuousTask::mem_cap_bytes`. `0` opts out (uncapped). Default
-    /// `1_073_741_824` (1 GiB).
+    /// `ContinuousTask::mem_cap_bytes`. `0` opts out (uncapped). Default `0`
+    /// (uncapped) — a non-zero cap needs a usable `systemd-run --user --scope`
+    /// (a reachable user manager bus); opt in per-task or set this on a host
+    /// where the capped path works.
     #[serde(default = "default_scheduler_default_cap")]
     pub default_cap: u64,
     /// Continuous Tasks Phase 3b (stuck-story watchdog): how many investigators
@@ -185,9 +187,15 @@ fn default_scheduler_tick_micros() -> u64 {
 }
 
 fn default_scheduler_default_cap() -> u64 {
-    // 1 GiB — the per-fire memory ceiling for continuous headless spawns
-    // (DESIGN_MEMORY_CAP.md). A per-task `mem_cap_bytes` overrides this.
-    1_073_741_824
+    // 0 — UNCAPPED by default. A per-fire memory cap requires a usable
+    // `systemd-run --user --scope` (a reachable user manager bus); when the
+    // daemon runs as a system service without one, a non-zero default only
+    // creates a boot trap for new tasks (they degrade to uncapped anyway, or —
+    // before the capability probe — failed the fire outright). Every live
+    // continuous task opts out (`mem_cap_bytes: 0`), so the safe, honest
+    // default matches usage: no cap unless a task explicitly sets one, or the
+    // operator sets `[scheduler] default_cap` on a host where caps work.
+    0
 }
 
 fn default_scheduler_max_investigations() -> u32 {
@@ -710,7 +718,7 @@ url = "git@github.com:u/other.git"
         assert!(cfg.scheduler.enabled, "scheduler on by default");
         assert_eq!(cfg.scheduler.tick_interval, 250_000, "poller-class µs tick");
         assert!(cfg.scheduler.max_worktrees.is_none(), "unguarded by default");
-        assert_eq!(cfg.scheduler.default_cap, 1_073_741_824, "1 GiB cap default");
+        assert_eq!(cfg.scheduler.default_cap, 0, "uncapped by default (opt-in caps)");
         // Phase 3b watchdog tunables fall back to their serde defaults too.
         assert_eq!(cfg.scheduler.max_investigations, 2, "two investigators by default");
         assert_eq!(
@@ -727,7 +735,7 @@ url = "git@github.com:u/other.git"
         assert!(s.enabled);
         assert_eq!(s.tick_interval, 250_000);
         assert_eq!(s.max_worktrees, None);
-        assert_eq!(s.default_cap, 1_073_741_824);
+        assert_eq!(s.default_cap, 0);
         assert_eq!(s.max_investigations, 2);
         assert_eq!(s.default_investigator_runtime_secs, 600);
     }
@@ -760,7 +768,7 @@ max_worktrees = 32
         assert_eq!(cfg.scheduler.tick_interval, 500_000);
         assert_eq!(cfg.scheduler.max_worktrees, Some(32));
         // `default_cap` was omitted → its serde default still applies.
-        assert_eq!(cfg.scheduler.default_cap, 1_073_741_824);
+        assert_eq!(cfg.scheduler.default_cap, 0);
         // The Phase 3b keys were omitted → their serde defaults still apply.
         assert_eq!(cfg.scheduler.max_investigations, 2);
         assert_eq!(cfg.scheduler.default_investigator_runtime_secs, 600);
@@ -793,7 +801,7 @@ default_investigator_runtime_secs = 1200
         assert_eq!(cfg.scheduler.default_investigator_runtime_secs, 1200);
         // Untouched keys keep their serde defaults.
         assert!(cfg.scheduler.enabled);
-        assert_eq!(cfg.scheduler.default_cap, 1_073_741_824);
+        assert_eq!(cfg.scheduler.default_cap, 0);
     }
 
     /// 12h: `[tls]` section parses when present. All three fields

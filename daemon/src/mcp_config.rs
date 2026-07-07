@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -462,6 +463,97 @@ fn run_nonce() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Cached outcome of the one-time `systemd-run --user --scope` capability probe.
+/// `Ok(())` = capable; `Err(reason)` = not usable from this process, with
+/// systemd-run's captured stderr/exit as the reason.
+static USER_SCOPE_CAPABILITY: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Probe (once per process) whether this process can actually create a
+/// `systemd-run --user --scope` unit with a `MemoryMax` property — the exact
+/// operation every memory-capped spawn depends on. Returns the authoritative
+/// answer; the cheap "`app.slice` directory exists" check the cap resolvers do
+/// is necessary but **not** sufficient.
+///
+/// ## Why the directory check isn't enough
+///
+/// `cm-daemon` may run as a **system** service (`cm-daemon.service`,
+/// `User=lucas`, `WantedBy=multi-user.target`) with no user-session
+/// environment — no `XDG_RUNTIME_DIR`, no `DBUS_SESSION_BUS_ADDRESS`, and often
+/// no running `user@<uid>.service` manager at all. In that state
+/// `systemd-run --user` fails at bus-connect ("Failed to connect to bus: No
+/// medium found") and never creates the scope; the child stays in the daemon's
+/// own `system.slice/cm-daemon.service` cgroup. `start_session`'s cgroup-scope
+/// verification then rejects that child ("cm-sess-*.scope did not materialize")
+/// and SIGKILLs it — failing the whole fire.
+///
+/// Crucially, the predicted `app.slice` cgroup path can **exist** (a live login
+/// session transiently started the user manager) while the daemon process still
+/// can't reach the bus (its own env lacks `XDG_RUNTIME_DIR`). So the directory
+/// check passes but the spawn fails — the exact flaky failure this probe closes.
+/// It runs the real command against `/bin/true` and reports what systemd-run
+/// actually says.
+///
+/// ## Caching
+///
+/// The result is cached for the process lifetime: the daemon's bus reachability
+/// is fixed by how the service was launched (its env is immutable), so
+/// re-probing every fire would only add cost without changing the answer. A
+/// daemon restart re-probes — so after an operator enables the capped path
+/// (`loginctl enable-linger <user>` + `Environment=XDG_RUNTIME_DIR=/run/user/<uid>`
+/// in the unit) a restart flips the cache to `Ok`.
+///
+/// Linux-only in practice (the crate root gates the memory-cap machinery to
+/// Linux); on a host with no `systemd-run` the exec fails and we report `Err`,
+/// which the resolvers treat as "run uncapped" — fail-closed to safe.
+pub fn user_scope_capable() -> &'static Result<(), String> {
+    USER_SCOPE_CAPABILITY.get_or_init(run_user_scope_probe)
+}
+
+fn run_user_scope_probe() -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    // `--scope` runs `/bin/true` synchronously in a fresh transient scope
+    // registered with the *user* manager and returns its exit status; the empty
+    // scope auto-releases when the child exits (no `--collect` needed, which
+    // keeps us compatible with older systemd). `-p MemoryMax=…` exercises the
+    // memory-controller delegation the real cap relies on, not just bus
+    // connectivity. 256 MiB is comfortably above anything `/bin/true` touches.
+    let unit = format!("cm-sess-capprobe-{}", run_nonce());
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            &format!("--unit={}", unit),
+            "-p",
+            "MemoryMax=268435456",
+            "-p",
+            "MemorySwapMax=0",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let code = o
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "killed by signal".to_string());
+            let detail = stderr.trim();
+            Err(if detail.is_empty() {
+                format!("systemd-run --user --scope exited {}", code)
+            } else {
+                format!("systemd-run --user --scope exited {}: {}", code, detail)
+            })
+        }
+        Err(e) => Err(format!("could not exec `systemd-run`: {}", e)),
+    }
 }
 
 #[cfg(test)]

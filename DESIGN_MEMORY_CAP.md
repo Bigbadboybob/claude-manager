@@ -299,6 +299,42 @@ The cap mechanism touches the kernel, so full coverage requires a real Linux + s
 | `cgroup.procs` is empty by the time watcher reads it | The runaway already exited. No-op. |
 | RSS read race (PID gone before /proc/PID/status read) | Skip and continue to the next PID. |
 
+## Daemon-side (headless) capping — the system-service trap
+
+Everything above assumes the spawner is the **TUI**, which runs inside the operator's login session and therefore inherits a working user systemd manager (`XDG_RUNTIME_DIR`, a live `user@<UID>.service`, the private socket). `cm-daemon` does **not** get that for free.
+
+On `cm-manager`, `cm-daemon.service` is a **system** unit (`/etc/systemd/system/cm-daemon.service`, `WantedBy=multi-user.target`) running as `User=lucas`. A system service started as another user gets **no user-session environment**: no `XDG_RUNTIME_DIR`, no `DBUS_SESSION_BUS_ADDRESS`, and (absent linger) no running `user@<UID>.service` at all. So the daemon's `systemd-run --user --scope` can't reach the user manager bus — it exits non-zero *before* creating the scope, the child stays in the daemon's own `system.slice/cm-daemon.service` cgroup, and `start_session`'s cgroup verification rejects + SIGKILLs it. The whole continuous fire fails.
+
+The trap is worse than a clean "no user manager": the predicted `app.slice` path can **exist** while the daemon still can't reach the bus. `user@<UID>.service` (and its `app.slice`) come up whenever `lucas` has *any* live login session (e.g. an operator SSH), then vanish when that session ends. So the old `app.slice`-`is_dir()` gate the cap resolvers used passed intermittently — the cap was applied, then `systemd-run --user` failed at spawn. Two identical fires at 21:50 and 21:52 UTC on 2026-07-06 failed this way while `systemd-run --user --scope true` run *interactively* as `lucas` completed in 26 ms.
+
+### Fix 1 (code): authoritative probe + degrade-to-uncapped
+
+`is_dir()` is necessary but not sufficient. `mcp_config::user_scope_capable()` runs the **real** operation once per process — `systemd-run --user --scope -p MemoryMax=… -- /bin/true`, capturing systemd-run's stderr/exit — and caches the result. Both cap resolvers (`resolve_continuous_cap`, `resolve_configured_participant_cap`) consult it after the `is_dir()` fast-path and, when it fails, run the spawn **UNCAPPED** with the captured reason logged (never a hard fire failure). This surfaces the true cause (`Failed to connect to bus…`) that the downstream cgroup-discovery timeout otherwise hid, and self-heals across hosts: the cap applies iff it actually works. The daemon's `[scheduler] default_cap` also defaults to `0` (uncapped) — a non-zero default only trapped new tasks; caps are opt-in per task.
+
+### Fix 2 (ops): make the capped path actually work on `cm-manager`
+
+To let an opt-in `mem_cap_bytes` task boot inside a genuine `cm-sess-*.scope`, give the daemon a reachable user manager. Two steps (uid is host-specific — `lucas` is `1001` on cm-manager; the drop-in uses the `%U` specifier so it's uid-agnostic):
+
+1. **Persist the user manager** so `/run/user/<UID>` and the private socket survive with no login session:
+   ```bash
+   sudo loginctl enable-linger lucas
+   ```
+2. **Point the daemon at it** via a unit drop-in (checked in at `deploy/cm-daemon.service.d/user-scope-cap.conf`):
+   ```ini
+   [Service]
+   Environment=XDG_RUNTIME_DIR=/run/user/%U
+   ```
+   Install + reload + restart:
+   ```bash
+   sudo mkdir -p /etc/systemd/system/cm-daemon.service.d
+   sudo cp deploy/cm-daemon.service.d/user-scope-cap.conf /etc/systemd/system/cm-daemon.service.d/
+   sudo systemctl daemon-reload && sudo systemctl restart cm-daemon
+   ```
+
+`systemd-run --user` talks to the manager over `$XDG_RUNTIME_DIR/systemd/private`, so `XDG_RUNTIME_DIR` + linger suffice; `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus` is only needed if a future path uses the session bus directly.
+
+**Verify** (after deploy): create a throwaway continuous task with an explicit `mem_cap_bytes` (or set `[scheduler] default_cap`), `continuous.run_now`, then confirm the spawned session's `/proc/<pid>/cgroup` basename matches `cm-sess-*.scope` and `journalctl -u cm-daemon` shows no degrade line. Before the ops fix (or on any host without a user manager), the same task boots **uncapped** with a single `systemd-run --user … not usable: <reason> — running UNCAPPED` log line — the intended graceful degrade.
+
 ## Open questions
 
 1. **Soft threshold default.** 6 GiB is a guess based on "Claude Code itself sits at ~1–2 GiB during normal use, plus some headroom for tool output." The right default is whatever value (a) you've never legitimately needed to exceed, and (b) is well below total RAM minus other workloads. Want me to instrument current sessions for a few days first to pick this from data instead of guessing?

@@ -802,14 +802,21 @@ pub(crate) fn start_session_with_spawn_fn(
         ) {
             Ok(p) => p,
             Err(e) => {
-                // pending.Drop pidfd-SIGKILLs the child.
+                // pending.Drop pidfd-SIGKILLs the child. The dominant real-world
+                // cause is `systemd-run --user` failing to reach a user manager
+                // bus (daemon running as a system service without one) — the
+                // wrapper exits before creating the scope, so the child stays in
+                // the daemon's own cgroup. The config-driven cap paths probe for
+                // this and degrade to uncapped (see mcp_config::user_scope_capable);
+                // an inherited/explicit cap that reaches here bypassed that gate.
                 return Err((
                     ErrorCode::Internal,
                     format!(
                         "cgroup discovery from /proc/{}/cgroup failed: {} \
                          (refusing to return a session whose memory cap \
                          hasn't been verified against this child's actual \
-                         cgroup)",
+                         cgroup — most likely `systemd-run --user --scope` \
+                         could not reach a user manager bus)",
                         pid, e
                     ),
                 ));
@@ -6752,13 +6759,22 @@ fn compose_continuous_spawn_params(
 /// `claude-code`/`codex` are capped (bash + unknown → `None`, parity with
 /// [`resolve_configured_participant_cap`] and DESIGN_MEMORY_CAP's bash default-off).
 ///
-/// The daemon has NO memory-cap preflight (that lives TUI-side), so the sole gate
-/// is the predicted `app.slice` cgroup prefix existing. When it is absent (e.g. a
-/// system service with no user systemd manager — no `enable-linger`), return
-/// `None` and run the fire UNCAPPED rather than emitting a partial/unbacked triple
-/// that `start_session` would reject + SIGKILL. Mirrors
-/// [`resolve_configured_participant_cap`]'s `is_dir` graceful-degrade gate and
-/// reuses its `CONFIGURED_CAP_PREFIX_OVERRIDE` test seam.
+/// Two gates, both graceful-degrade-to-uncapped (never a hard fire failure):
+///   1. The predicted `app.slice` cgroup prefix must exist (cheap negative
+///      fast-path — absent on a host with no user manager at all).
+///   2. `mcp_config::user_scope_capable()` — the AUTHORITATIVE probe. The
+///      `app.slice` directory existing is necessary but not sufficient: a
+///      system-service daemon (cm-daemon.service, `User=lucas`) can't reach the
+///      user manager bus even when a live login session created the slice, so
+///      `systemd-run --user` fails at spawn and `start_session` SIGKILLs the
+///      child. The probe runs the real command once and caches the result.
+///
+/// When either gate fails, return `None` and run the fire UNCAPPED rather than
+/// emitting a triple whose scope `start_session` would reject + SIGKILL. Mirrors
+/// [`resolve_configured_participant_cap`]'s gates and reuses its
+/// `CONFIGURED_CAP_PREFIX_OVERRIDE` test seam (which also bypasses the probe
+/// under `#[cfg(test)]`). See DESIGN_MEMORY_CAP.md → "Daemon-side (headless)
+/// capping — the system-service trap".
 fn resolve_continuous_cap(
     session_type: &str,
     mem_cap_bytes: Option<u64>,
@@ -6795,6 +6811,27 @@ fn resolve_continuous_cap(
              rather than failing the spawn",
             effective,
             prefix.display()
+        );
+        return None;
+    }
+    // The `app.slice` directory existing is necessary but NOT sufficient: the
+    // daemon may run as a *system* service (cm-daemon.service, User=lucas) that
+    // can't reach the user manager bus even when the slice exists (a live login
+    // session created it). `systemd-run --user` would then fail at spawn and
+    // start_session would SIGKILL the child + fail the fire. Probe the real
+    // operation and degrade to UNCAPPED (never a hard fire failure) when it
+    // can't work — surfacing systemd-run's actual error, which the raw
+    // cgroup-discovery timeout otherwise hides. The probe is skipped in unit
+    // tests (the prefix override already gates cap-on deterministically).
+    #[cfg(not(test))]
+    if let Err(reason) = crate::mcp_config::user_scope_capable() {
+        eprintln!(
+            "cm-daemon: continuous cap requested ({} bytes) but `systemd-run --user \
+             --scope` is not usable from this daemon: {} — running the fire UNCAPPED. \
+             To enable per-fire memory caps, run the daemon with a reachable user \
+             manager: `loginctl enable-linger <user>` and add \
+             `Environment=XDG_RUNTIME_DIR=/run/user/{}` to cm-daemon.service.",
+            effective, reason, uid,
         );
         return None;
     }
@@ -7239,6 +7276,28 @@ pub(crate) fn take_continuous_spawn_spy_for_test() -> Vec<Value> {
 
 #[cfg(test)]
 thread_local! {
+    /// Test seam: when armed, [`continuous_fresh_spawn`] returns this error
+    /// INSTEAD of spawning — exercising the trigger's boot-failure rollback
+    /// (in_flight clear + Consumer batch release) deterministically, without a
+    /// real capped `start_session` (which needs a live systemd-run scope). This
+    /// mimics exactly what a `cm-sess-*.scope`-never-materialized boot does:
+    /// `start_session` returns `Internal` after SIGKILLing the child.
+    static CONTINUOUS_SPAWN_FAIL: std::cell::RefCell<Option<(ErrorCode, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_continuous_spawn_fail_for_test(err: (ErrorCode, String)) {
+    CONTINUOUS_SPAWN_FAIL.with(|c| *c.borrow_mut() = Some(err));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_continuous_spawn_fail_for_test() {
+    CONTINUOUS_SPAWN_FAIL.with(|c| *c.borrow_mut() = None);
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test seam for the PERSISTENT executor's live-delivery boundary. When
     /// armed (`Some(vec)`), the persistent executor (1) treats a present
     /// `current_session_uid` as a LIVE session WITHOUT probing `state.sessions`
@@ -7272,6 +7331,12 @@ pub(crate) fn take_continuous_delivery_spy_for_test() -> Vec<(String, String, bo
 fn continuous_fresh_spawn(state_arc: &Arc<Mutex<DaemonState>>, full: &Value) -> MethodResult {
     #[cfg(test)]
     {
+        // Boot-failure injection (takes precedence over the record-only spy):
+        // return the armed error as if the capped `start_session` SIGKILLed a
+        // child whose `cm-sess-*.scope` never materialized.
+        if let Some(err) = CONTINUOUS_SPAWN_FAIL.with(|c| c.borrow_mut().take()) {
+            return Err(err);
+        }
         let spied = CONTINUOUS_SPAWN_SPY.with(|c| {
             if let Some(captured) = c.borrow_mut().as_mut() {
                 captured.push(full.clone());
@@ -10043,6 +10108,22 @@ fn resolve_configured_participant_cap(session_type: &str) -> Option<(u64, u64, S
              failing the launch",
             upper,
             prefix.display()
+        );
+        return None;
+    }
+    // Same authoritative gate as `resolve_continuous_cap`: the `app.slice`
+    // directory can exist while the daemon (as a system service) still can't
+    // reach the user manager bus, in which case `systemd-run --user` fails at
+    // spawn. Probe once and degrade to UNCAPPED rather than failing every
+    // capped launch at start_session's cgroup-scope verification.
+    #[cfg(not(test))]
+    if let Err(reason) = crate::mcp_config::user_scope_capable() {
+        eprintln!(
+            "cm-daemon: CM_SESSION_MEM_*_{} set but `systemd-run --user --scope` is \
+             not usable from this daemon: {} — running participant UNCAPPED. Enable \
+             the capped path with `loginctl enable-linger <user>` + \
+             `Environment=XDG_RUNTIME_DIR=/run/user/{}` on cm-daemon.service.",
+            upper, reason, uid,
         );
         return None;
     }
@@ -21199,6 +21280,76 @@ mod tests {
             let reloaded =
                 crate::continuous::task::load_one("ct-consumer-fail").unwrap();
             assert!(reloaded.in_flight.is_none(), "guard cleared on failure");
+
+            clear_api_env();
+        });
+    }
+
+    /// Phase 4 boot-failure path: a Consumer fire that CLAIMS a batch and then
+    /// fails to BOOT its session (the capped `cm-sess-*.scope` never
+    /// materializes — the cm-manager 2026-07-06 incident) must RELEASE the
+    /// claim (requeue), clear the in_flight guard, and surface the error — the
+    /// batch is not stranded (delivered=never AND requeued, not lost).
+    #[test]
+    fn trigger_consumer_boot_failure_releases_claim() {
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+                ("POST", "/queues/props/claim") => (
+                    200,
+                    r#"{"items":[{"id":"44444444-4444-4444-4444-444444444444","payload":{"u":1},"dedupe_key":null,"source":null,"enqueued_at":"2026-07-06T00:00:00+00:00"}]}"#
+                        .to_string(),
+                ),
+                ("POST", "/queues/props/requeue") => (200, r#"{"requeued":1}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+
+            let mut task = continuous_task(
+                "ct-consumer-boot",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Fresh,
+                &wt,
+            );
+            task.schedule = crate::continuous::task::Schedule::Consumer {
+                queue: "props".into(),
+                batch_max: 5,
+                window_secs: 60,
+                depth_threshold: 1,
+            };
+            crate::continuous::task::save(&task).expect("save");
+
+            // Arm a boot failure that mimics start_session's cgroup-scope reject.
+            arm_continuous_spawn_fail_for_test((
+                ErrorCode::Internal,
+                "cgroup discovery failed: cm-sess-*.scope did not materialize".into(),
+            ));
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let err = trigger(
+                &state,
+                &Caller::operator("op-token"),
+                &json!({ "task_id": "ct-consumer-boot" }),
+            )
+            .expect_err("boot failure must fail the fire");
+            assert_eq!(err.0, ErrorCode::Internal);
+            clear_continuous_spawn_fail_for_test();
+
+            // The batch WAS staged (claim succeeded), then the boot failed →
+            // the claim is released via requeue, not left stranded.
+            let reqs = stub.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "claim then requeue: {:?}", reqs);
+            assert_eq!(reqs[0].path, "/queues/props/claim");
+            assert_eq!(reqs[1].path, "/queues/props/requeue");
+            let rq_body: Value = serde_json::from_str(&reqs[1].body).unwrap();
+            assert_eq!(
+                rq_body["ids"],
+                json!(["44444444-4444-4444-4444-444444444444"]),
+            );
+            drop(reqs);
+            let reloaded =
+                crate::continuous::task::load_one("ct-consumer-boot").unwrap();
+            assert!(reloaded.in_flight.is_none(), "guard cleared on boot failure");
 
             clear_api_env();
         });

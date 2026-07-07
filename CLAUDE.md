@@ -196,7 +196,7 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
 - `/opt/cm-daemon/workflows/` — workflow TOMLs
 - `/home/lucas/.cm/daemon.sock` — control socket
 - `/home/lucas/.cm/daemon.toml` — daemon config (mode 0600). Sets `mcp_server_path`, `api_url = "http://localhost:8000"`, `api_token`, `log_path`, `workflows_dir`, and `[auth] mode = "ssh-trust"` (the SSH session IS the auth — no separate operator token over SSH-unix).
-- `/etc/systemd/system/cm-daemon.service` — `Restart=always`, runs as user `lucas`, `Environment=PATH=/opt/cm-daemon/mcp_server/.venv/bin:...`
+- `/etc/systemd/system/cm-daemon.service` — `Restart=always`, runs as user `lucas`, `Environment=PATH=/opt/cm-daemon/mcp_server/.venv/bin:...`. Being a **system** unit run as `lucas`, it has no user-session bus, so `systemd-run --user --scope` (memory caps) can't create scopes: the daemon's capability probe degrades every fire to **uncapped** by default. To enable per-session memory caps, install `deploy/cm-daemon.service.d/user-scope-cap.conf` (adds `XDG_RUNTIME_DIR=/run/user/%U`) + `loginctl enable-linger lucas`. See `DESIGN_MEMORY_CAP.md` → "Daemon-side (headless) capping".
 
 Deploying daemon-side changes:
 
