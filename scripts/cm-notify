@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# cm-notify — push a one-line operator alert to Telegram from a headless
+# cm-manager orchestrator (or any cm agent).
+#
+# SEND-ONLY: it only calls sendMessage, never getUpdates, so it does NOT
+# conflict with an interactive bot that long-polls the same token. Still, use
+# a DEDICATED bot for cm-manager (clean separation from the trading bot,
+# independent blast radius, future-proof if orchestrators ever need to receive).
+#
+# Use it ONLY for out-of-band blockers an agent cannot fix in code and the
+# operator must resolve — billing / credits exhausted, cloud IAM / gcloud
+# permissions, a disabled API, a revoked key. NOT for ordinary bugs or routine
+# findings (those flow through the normal lifecycle).
+#
+# Creds (NEVER commit these) live in ~/.cm/notify.env:
+#     TELEGRAM_BOT_TOKEN=123456789:ABC...
+#     TELEGRAM_CHAT_ID=<your chat id>
+# Override the env path with CM_NOTIFY_ENV. Tag the sender with CM_NOTIFY_TAG
+# (e.g. CM_NOTIFY_TAG=bug-triage) so you can tell which orchestrator alerted.
+#
+# Usage:
+#     cm-notify "bug-triage: OpenAI + Perplexity out of credits — refill billing"
+#
+set -euo pipefail
+
+msg="${*:-}"
+if [ -z "$msg" ]; then
+    echo "usage: cm-notify <message>" >&2
+    exit 2
+fi
+
+env_file="${CM_NOTIFY_ENV:-$HOME/.cm/notify.env}"
+if [ ! -f "$env_file" ]; then
+    echo "cm-notify: no creds file at $env_file (need TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a; . "$env_file"; set +a
+: "${TELEGRAM_BOT_TOKEN:?cm-notify: TELEGRAM_BOT_TOKEN not set in $env_file}"
+: "${TELEGRAM_CHAT_ID:?cm-notify: TELEGRAM_CHAT_ID not set in $env_file}"
+
+tag="${CM_NOTIFY_TAG:-orchestrator}"
+text="🔔 [cm-manager · ${tag}] ${msg}"
+
+body="$(mktemp)"
+trap 'rm -f "$body"' EXIT
+http="$(curl -sS --max-time 15 -o "$body" -w '%{http_code}' \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${text}" \
+    --data disable_web_page_preview=true)" || {
+    echo "cm-notify: curl failed reaching the Telegram API" >&2
+    exit 1
+}
+
+if [ "$http" = "200" ]; then
+    echo "cm-notify: sent"
+else
+    echo "cm-notify: Telegram returned HTTP $http:" >&2
+    cat "$body" >&2
+    echo >&2
+    exit 1
+fi
