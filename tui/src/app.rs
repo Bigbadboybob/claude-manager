@@ -4883,6 +4883,22 @@ impl App {
                 .filter(|t| now_secs - t.exited_at < TOMBSTONE_RETENTION_SECS)
                 .cloned()
                 .collect();
+            // P1 (Feature 3): soft-close accumulated "spent" litter on restore.
+            // A local, open, session-less, UNBOUND (no live task binding)
+            // workspace that still carries a recent tombstone is a finished
+            // subtask/detective workspace the pre-fix teardown left behind (its
+            // unique branch worktree dodged the orphan-duplicate skip above).
+            // Restore it hidden (is_closed) — keeping its tombstones so
+            // `read_session_output` still resolves — so the old pile-up clears on
+            // the next TUI start instead of lingering as empty headers. Gated on
+            // the manifest's own bindings (not self.tasks, which isn't loaded
+            // yet), so there's no "task not reconciled" race. Fresh unused slots
+            // (no tombstone) and still-bound workspaces are untouched.
+            let spent_litter = !mw.is_closed
+                && !mw.is_cloud
+                && mw.sessions.is_empty()
+                && !bound_ws_ids.contains(&mw.id)
+                && !restored_tombstones.is_empty();
             let mut ws = Workspace {
                 id: mw.id.clone(),
                 name: if mw.name.is_empty() {
@@ -4895,7 +4911,7 @@ impl App {
                 } else {
                     mw.name.clone()
                 },
-                is_closed: mw.is_closed,
+                is_closed: mw.is_closed || spent_litter,
                 is_cloud: mw.is_cloud,
                 repo_url: mw.repo_url.clone(),
                 worktree_path: mw.worktree_path.clone(),
@@ -10025,6 +10041,12 @@ impl App {
                     let target = uid.clone();
                     self.tombstone_and_remove(wi, |ts| ts.uid == target);
                     self.clamp_cursor();
+                    // P1 (Feature 3): auto-reap the workspace of a finished
+                    // agent-spawned / detective worker once its row is pruned,
+                    // if nothing live remains and its task is Done/gone — stops
+                    // the empty-workspace pile-up (~10/day) without waiting for
+                    // a manual A-W.
+                    self.maybe_reap_spent_workspace(wi);
                 }
                 // R5: untracked uid — `found` stays false; silent
                 // no-op. The diff referenced a session the TUI
@@ -13498,9 +13520,58 @@ impl App {
         self.tombstone_and_remove(wi, |ts| {
             ts.task_id.as_deref() == Some(target.as_str())
         });
+        // P1 (Feature 3): reap the workspace if that was its last live work.
+        // Without this the workspace is hidden only until `reconcile_tasks`
+        // drops the now-Done task, after which `is_past_workspace` no longer
+        // matches (no bound task) and the empty workspace reappears as an
+        // unbound header — the leftover the operator has to A-W by hand.
+        self.maybe_reap_spent_workspace(wi);
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
         self.set_status_msg("Marked done");
+    }
+
+    /// P1 (Feature 3): soft-close a "spent" workspace so it stops lingering
+    /// after its last subtask finishes. A workspace is spent when it is a
+    /// local (non-cloud), not-already-closed workspace that has **no live
+    /// sessions**, **no active (non-Done) bound task**, and **at least one
+    /// tombstone** (i.e. it was actually used — this excludes a freshly
+    /// created empty slot waiting for its first session). Soft-close means
+    /// `is_closed = true` (same as `close_active_workspace` / A-W), which
+    /// keeps it hidden via `is_past_workspace`'s `is_closed` branch even after
+    /// its Done task is reconciled away. Deliberately NOT a hard delete: the
+    /// tombstones (post-done `read_session_output`) and the git worktree are
+    /// preserved — only A-x (`delete_active`) force-removes those. Idempotent
+    /// and cheap; safe to call from any teardown site.
+    fn maybe_reap_spent_workspace(&mut self, wi: usize) {
+        let reap = self
+            .workspaces
+            .get(wi)
+            .is_some_and(|ws| Self::workspace_is_spent(ws, &self.tasks));
+        if reap {
+            if let Some(ws) = self.workspaces.get_mut(wi) {
+                ws.is_closed = true;
+            }
+            self.save_session_manifest();
+        }
+    }
+
+    /// Pure predicate behind [`Self::maybe_reap_spent_workspace`]: true when
+    /// `ws` is a local workspace that has finished its work and should be
+    /// hidden. Split out so the decision is side-effect-free and unit-testable
+    /// (the mutation + manifest write live in the caller). Spent ⟺ local
+    /// (non-cloud), not already closed, **no live sessions**, **at least one
+    /// tombstone** (it was used — excludes a freshly-created empty slot), and
+    /// **no bound task that isn't Done** (another active task keeps it open).
+    fn workspace_is_spent(ws: &Workspace, tasks: &[TaskEntry]) -> bool {
+        !ws.is_cloud
+            && !ws.is_closed
+            && ws.sessions.is_empty()
+            && !ws.tombstones.is_empty()
+            && !tasks.iter().any(|t| {
+                t.workspace_id.as_deref() == Some(&ws.id)
+                    && !matches!(t.api_status, TaskStatus::Done)
+            })
     }
 
     /// Delete whatever the cursor resolves to:
