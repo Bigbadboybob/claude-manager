@@ -15266,6 +15266,35 @@ impl App {
             .any(|t| t.task_id.as_deref() == Some(tid) && matches!(t.api_status, TaskStatus::Blocked))
     }
 
+    /// P3 (Feature 1): the operator-facing question an orchestrator has parked on
+    /// its planning task's metadata (`metadata.operator_question`), if any. A
+    /// headless orchestrator can't call the TUI-only `notify_user`, so it sets
+    /// this via `update_task(metadata=…)` (daemon-routed, works headless) and it
+    /// rides the existing task-metadata sync (`reconcile_tasks`) to here —
+    /// rendered as a distinct `◉` glyph + an inline text line in the continuous
+    /// column so a pending decision (e.g. a `needs_human_decision`) is visible
+    /// without attaching. The orchestrator clears it by writing the key back to
+    /// null once resolved (the question is pending until IT resolves, not until
+    /// the operator glances). Empty/whitespace is treated as absent.
+    fn session_question(&self, ts: &TerminalSession) -> Option<String> {
+        let tid = ts.task_id.as_deref()?;
+        let task = self.tasks.iter().find(|t| t.task_id.as_deref() == Some(tid))?;
+        Self::extract_operator_question(task.metadata.as_ref())
+    }
+
+    /// Pull `operator_question` out of a task's metadata bag, treating an
+    /// empty/whitespace value (or a missing key / non-string) as absent — so a
+    /// blank string never lights a content-less `◉`. Pure, so it's unit-testable
+    /// without an App or a live session.
+    fn extract_operator_question(metadata: Option<&serde_json::Value>) -> Option<String> {
+        let q = metadata?.get("operator_question")?.as_str()?.trim();
+        if q.is_empty() {
+            None
+        } else {
+            Some(q.to_string())
+        }
+    }
+
     fn draw_continuous_column(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -15285,6 +15314,9 @@ impl App {
         let mut items: Vec<ListItem> = Vec::new();
         for (i, r) in rows.iter().take(inner.height as usize).enumerate() {
             let ts = &self.workspaces[r.ws_idx].sessions[r.sess_idx];
+            // P3 (Feature 1): a parked operator-question wins the idle glyph and
+            // adds a dim inline text line below the row (see the second Line push).
+            let question = self.session_question(ts);
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(Color::Yellow))
             } else if ts.hidden {
@@ -15292,12 +15324,15 @@ impl App {
             } else {
                 match ts.status {
                     SessionStatus::Running => (spinner, Style::default().fg(Color::Green)),
-                    // Idle splits by who the ball is with: ● (white) = the
-                    // operator needs to act (fix-ready to review, or an explicit
-                    // human decision — raw planning status `blocked`); ◇ (dim) =
-                    // the orchestrator will advance it on its next fire.
+                    // Idle splits three ways: ◉ (cyan) = a pending operator
+                    // QUESTION the orchestrator parked (metadata.operator_question);
+                    // ● (white) = the operator must act (fix-ready to review, or an
+                    // explicit human decision — raw planning status `blocked`); ◇
+                    // (dim) = the orchestrator will advance it on its next fire.
                     SessionStatus::Idle => {
-                        if self.session_needs_human(ts) {
+                        if question.is_some() {
+                            ("\u{25c9}", Style::default().fg(Color::Cyan))
+                        } else if self.session_needs_human(ts) {
                             ("\u{25cf}", Style::default().fg(Color::White))
                         } else {
                             ("\u{25c7}", Style::default().fg(Color::DarkGray))
@@ -15368,7 +15403,21 @@ impl App {
             } else {
                 Style::default()
             };
-            items.push(ListItem::new(Line::from(spans)).style(item_style));
+            // P3 (Feature 1): render the parked question as a dim second line
+            // under the orchestrator row so it's readable without attaching.
+            let mut lines = vec![Line::from(spans)];
+            if let Some(q) = &question {
+                let qmax = (inner.width as usize).saturating_sub(prefix_cells + 2);
+                let qtext = crate::planning::truncate_with_ellipsis(q, qmax);
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(prefix_cells)),
+                    Span::styled(
+                        format!("\u{21b3} {}", qtext),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
+            items.push(ListItem::new(lines).style(item_style));
         }
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
@@ -17400,6 +17449,42 @@ fn copy_to_clipboard(text: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod operator_question_tests {
+    use super::*;
+
+    #[test]
+    fn extract_operator_question_reads_present_trims_and_ignores_blanks() {
+        // present → Some, trimmed.
+        assert_eq!(
+            App::extract_operator_question(Some(&serde_json::json!({
+                "operator_question": "  refill OpenAI billing  "
+            }))),
+            Some("refill OpenAI billing".to_string())
+        );
+        // empty / whitespace-only → None (a blank must never light a
+        // content-less ◉).
+        assert_eq!(
+            App::extract_operator_question(Some(&serde_json::json!({"operator_question": "   "}))),
+            None
+        );
+        assert_eq!(
+            App::extract_operator_question(Some(&serde_json::json!({"operator_question": ""}))),
+            None
+        );
+        // missing key / non-string value / absent metadata → None.
+        assert_eq!(
+            App::extract_operator_question(Some(&serde_json::json!({"other": "x"}))),
+            None
+        );
+        assert_eq!(
+            App::extract_operator_question(Some(&serde_json::json!({"operator_question": 42}))),
+            None
+        );
+        assert_eq!(App::extract_operator_question(None), None);
+    }
 }
 
 #[cfg(test)]
