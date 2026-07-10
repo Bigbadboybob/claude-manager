@@ -11659,40 +11659,32 @@ fn wait_for_task_sessions_gone(
 /// `worktree_path == main_repo_path` (in-place).
 ///
 /// Returns `{"ok": true, "worktree_removed": <bool>}`.
-pub fn mark_subtask_done(
+/// Shared teardown for both the Session-scoped [`mark_subtask_done`] and the
+/// Operator-scoped [`operator_mark_subtask_done`]. Snapshots the subtask's
+/// workspace, refuses to destroy a dirty branch worktree (unless `force`),
+/// closes its sessions, removes its worktree, then flips the task to `done`.
+/// Does NO auth — the two entry points below own that.
+fn teardown_subtask_done(
     state_arc: &Arc<Mutex<DaemonState>>,
-    params: &Value,
-    caller_uid: Option<&str>,
+    task_id: &str,
+    close_worktree: bool,
+    force: bool,
 ) -> MethodResult {
-    let p: MarkSubtaskDoneParams = serde_json::from_value(params.clone())
-        .map_err(|e| (ErrorCode::InvalidParams, format!("mark_subtask_done params: {}", e)))?;
+    // Rebuild the params struct so the teardown body below stays verbatim from
+    // the original single-function implementation.
+    let p = MarkSubtaskDoneParams {
+        task_id: task_id.to_string(),
+        close_worktree,
+        force,
+    };
 
-    // Auth (LIVE caller) + snapshot the subtask's local workspace paths
-    // + creds, then drop the lock.
+    // Snapshot the subtask's local workspace paths + creds, then drop the lock.
     let (cleanup, api_url_cfg, api_token_cfg): (
         Option<(String, Option<PathBuf>, Option<PathBuf>)>,
         String,
         String,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let cuid = caller_uid.ok_or((
-            ErrorCode::Unauthorized,
-            "mark_subtask_done is callable only by Session callers".into(),
-        ))?;
-        let caller = state.sessions.get(cuid).ok_or((
-            ErrorCode::Unauthorized,
-            format!("caller session '{}' not in daemon registry", cuid),
-        ))?;
-        let own = caller.task_id.as_deref().ok_or((
-            ErrorCode::Unauthorized,
-            "taskless caller cannot mark subtasks done".into(),
-        ))?;
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &p.task_id, own) {
-            return Err((
-                ErrorCode::Unauthorized,
-                format!("task {} is not the caller's task or a descendant", p.task_id),
-            ));
-        }
         // Resolve the subtask's workspace from the daemon-local maps.
         let cleanup = state
             .task_workspaces
@@ -11845,6 +11837,63 @@ pub fn mark_subtask_done(
         .map_err(|e| e.to_method_err())?;
 
     Ok(json!({ "ok": true, "worktree_removed": worktree_removed }))
+}
+
+pub fn mark_subtask_done(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: MarkSubtaskDoneParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("mark_subtask_done params: {}", e)))?;
+
+    // Auth: a LIVE Session caller that is the target task itself or an ancestor
+    // (the parent orchestrator marking its child done). Operator frames are
+    // rejected here — they go through `operator_mark_subtask_done` instead.
+    {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "mark_subtask_done is callable only by Session callers".into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        let own = caller.task_id.as_deref().ok_or((
+            ErrorCode::Unauthorized,
+            "taskless caller cannot mark subtasks done".into(),
+        ))?;
+        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &p.task_id, own) {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!("task {} is not the caller's task or a descendant", p.task_id),
+            ));
+        }
+    }
+
+    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force)
+}
+
+/// Operator-scoped counterpart to [`mark_subtask_done`]: tears down and marks
+/// done ANY subtask, with NO self-or-descendant scope check. Auth is enforced
+/// at the dispatch layer via `require_operator` (an agent cannot forge an
+/// Operator frame), so a caller reaching here is a trusted operator. This is
+/// what lets the triage-review reviewer auto-`A-d` an approved subtask over the
+/// operator socket without being that subtask's own session. Keeps the same
+/// dirty-worktree guard + `force` override as the Session path, so an approved
+/// teardown still cannot silently discard uncommitted work.
+pub fn operator_mark_subtask_done(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: MarkSubtaskDoneParams = serde_json::from_value(params.clone()).map_err(|e| {
+        (
+            ErrorCode::InvalidParams,
+            format!("operator.mark_subtask_done params: {}", e),
+        )
+    })?;
+    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force)
 }
 
 #[cfg(test)]

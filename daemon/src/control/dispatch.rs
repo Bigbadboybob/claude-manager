@@ -501,6 +501,14 @@ pub fn dispatch_request(
         "mark_subtask_done" => {
             DispatchOutcome::Done(dispatch_mark_subtask_done(state, req))
         }
+        // Operator-scoped teardown: full mark-done (kill sessions + remove
+        // worktree + flip status) for ANY subtask, no self-or-descendant
+        // scope. Operator-only via `require_operator` — the triage-review
+        // reviewer auto-`A-d`s an approved subtask over the operator socket
+        // without being that subtask's own session.
+        "operator.mark_subtask_done" => {
+            DispatchOutcome::Done(dispatch_operator_mark_subtask_done(state, req))
+        }
         "set_subtask_status" => {
             DispatchOutcome::Done(dispatch_set_subtask_status(state, req))
         }
@@ -771,6 +779,24 @@ fn dispatch_mark_subtask_done(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mark_subtask_done(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_operator_mark_subtask_done(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "operator.mark_subtask_done is Operator-callable only (the reviewer/operator \
+         tears down an approved subtask; a Session agent marks its own subtree done via \
+         mark_subtask_done)",
+    ) {
+        return resp;
+    }
+    match methods::operator_mark_subtask_done(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -2036,6 +2062,30 @@ mod tests {
         assert!(!resp.ok);
         let err = resp.error.expect("error body");
         assert_eq!(err.code, ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn operator_mark_subtask_done_rejects_session_caller() {
+        // The operator-scoped teardown must NOT be reachable by an agent (a
+        // Session frame) — only over the operator socket. Otherwise any agent
+        // could tear down an unrelated task's subtree with no scope check.
+        // `require_operator` rejects a Session caller before any registry
+        // lookup, so an unregistered uid still fails here.
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "operator.mark_subtask_done",
+                serde_json::json!({ "task_id": "some-task" }),
+                "ts-agent-1",
+            ),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.expect("error body").code,
+            ErrorCode::Unauthorized
+        );
     }
 
     // --- session.attach / attach.open (slice 10c-c) -------------------------
