@@ -156,27 +156,54 @@ fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf> {
         .or_else(crate::workflow::spawn::mcp_server_path)
 }
 
-/// Resolve the Python interpreter that runs `server.py`. Prefers a
-/// `.venv/bin/python` adjacent to the server (the cm-manager / any
-/// venv-based deployment layout — `/opt/cm-daemon/mcp_server/.venv/`), else
-/// falls back to bare `python`.
+/// Resolve the Python interpreter that runs `server.py`, in priority order:
+///
+///   1. `.venv/bin/python` adjacent to the server (the cm-manager / any
+///      venv-based deployment layout — `/opt/cm-daemon/mcp_server/.venv/`).
+///   2. `.venv/bin/python` at the repo root, i.e. the server dir's PARENT
+///      (the local-workstation layout — `<repo>/.venv` + `<repo>/mcp_server/`).
+///   3. Bare `python3` when it resolves on PATH, else bare `python`.
 ///
 /// Why this exists: the MCP config used a hardcoded `command: "python"`, but
 /// cm-manager has NO `python` on PATH (only `python3` + the venv) — so the
 /// participant's MCP server silently failed to start and the manager role's
 /// `workflow_done` / `workflow_transition` calls returned "No such tool
 /// available", wedging every headless run on the manager (observed in the
-/// cm-manager e2e). Detecting the adjacent venv resolves it there while
-/// leaving the local-workstation `python` (e.g. a conda/pyenv shim that owns
-/// the `mcp` deps) untouched — local has no `.venv` next to server.py.
-fn resolve_python_interpreter(server: &std::path::Path) -> String {
-    if let Some(dir) = server.parent() {
+/// cm-manager e2e). The repo-root venv + `python3` tiers were added after the
+/// same failure recurred LOCALLY: bare `python` there came from a conda base
+/// env, and removing conda made every spawned session's MCP server ENOENT.
+/// A bare interpreter name is a machine-state dependency; the venvs are not.
+///
+/// `is_file()` follows symlinks, so a venv whose interpreter symlink dangles
+/// (its base python was uninstalled) is skipped rather than returned.
+///
+/// Shared with the TUI (`tui/src/mcp_config.rs`), which previously hardcoded
+/// `"python"` — hence `pub`.
+pub fn resolve_python_interpreter(server: &std::path::Path) -> String {
+    let candidates = [
+        server.parent(),
+        server.parent().and_then(|d| d.parent()),
+    ];
+    for dir in candidates.into_iter().flatten() {
         let venv = dir.join(".venv/bin/python");
         if venv.is_file() {
             return venv.to_string_lossy().into_owned();
         }
     }
-    "python".to_string()
+    if path_has_python3() {
+        "python3".to_string()
+    } else {
+        "python".to_string()
+    }
+}
+
+/// Does `python3` resolve on this process's PATH?
+fn path_has_python3() -> bool {
+    std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path).any(|p| p.join("python3").is_file())
+        })
+        .unwrap_or(false)
 }
 
 /// Daemon-startup preflight: resolve the MCP server path + interpreter EXACTLY
@@ -669,15 +696,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_python_prefers_adjacent_venv_else_bare_python() {
-        let dir = TempDir::new().unwrap();
-        let server = dir.path().join("server.py");
+    fn resolve_python_prefers_adjacent_venv_then_repo_root_then_bare() {
+        // Layout: <root>/mcp_server/server.py — mirrors both deployments.
+        let root = TempDir::new().unwrap();
+        let srv_dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(&srv_dir).unwrap();
+        let server = srv_dir.join("server.py");
         std::fs::write(&server, "").unwrap();
-        // No venv next to it (the local-workstation layout) → bare python.
-        assert_eq!(resolve_python_interpreter(&server), "python");
 
-        // A `.venv/bin/python` next to it (the cm-manager layout) → that path.
-        let venv_bin = dir.path().join(".venv/bin");
+        // No venv anywhere → a bare interpreter NAME (python3 on any host
+        // that has it on PATH, python otherwise) — never a stale path.
+        let bare = resolve_python_interpreter(&server);
+        assert!(
+            bare == "python3" || bare == "python",
+            "no-venv fallback must be a bare interpreter name, got {bare}",
+        );
+
+        // Repo-root `.venv/bin/python` (local-workstation layout) → that path.
+        let root_venv_bin = root.path().join(".venv/bin");
+        std::fs::create_dir_all(&root_venv_bin).unwrap();
+        let root_py = root_venv_bin.join("python");
+        std::fs::write(&root_py, "").unwrap();
+        assert_eq!(
+            resolve_python_interpreter(&server),
+            root_py.to_string_lossy(),
+            "repo-root venv must beat the bare-name fallback",
+        );
+
+        // Adjacent `.venv/bin/python` (cm-manager layout) wins over repo root.
+        let venv_bin = srv_dir.join(".venv/bin");
         std::fs::create_dir_all(&venv_bin).unwrap();
         let venv_py = venv_bin.join("python");
         std::fs::write(&venv_py, "").unwrap();
@@ -685,6 +732,31 @@ mod tests {
             resolve_python_interpreter(&server),
             venv_py.to_string_lossy(),
             "must prefer the adjacent venv interpreter (cm-manager has no bare `python`)",
+        );
+    }
+
+    /// A venv whose python is a DANGLING symlink (its base interpreter was
+    /// uninstalled — the observed conda-removal failure) must be skipped,
+    /// not returned: `is_file()` follows links.
+    #[test]
+    fn resolve_python_skips_venv_with_dangling_interpreter_symlink() {
+        let root = TempDir::new().unwrap();
+        let srv_dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(&srv_dir).unwrap();
+        let server = srv_dir.join("server.py");
+        std::fs::write(&server, "").unwrap();
+        let venv_bin = srv_dir.join(".venv/bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("gone/python3"),
+            venv_bin.join("python"),
+        )
+        .unwrap();
+
+        let resolved = resolve_python_interpreter(&server);
+        assert!(
+            resolved == "python3" || resolved == "python",
+            "dangling venv symlink must fall through to a bare name, got {resolved}",
         );
     }
 

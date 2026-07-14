@@ -193,10 +193,15 @@ pub fn write_claude_mcp_config(
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
     let env = build_env(target, session_uid, workflow.as_ref());
+    // Interpreter resolution is shared with the daemon (venv-aware; bare
+    // `python` only as a last resort) — a hardcoded `"python"` here broke
+    // every spawned session's MCP server when the machine's `python` shim
+    // (conda) was removed. See `cm_daemon::mcp_config::resolve_python_interpreter`.
+    let python = cm_daemon::mcp_config::resolve_python_interpreter(&server);
     let config = json!({
         "mcpServers": {
             "claude-manager": {
-                "command": "python",
+                "command": python,
                 "args": [server.to_string_lossy()],
                 "env": env,
             }
@@ -219,7 +224,14 @@ pub fn codex_overrides(
     session_uid: &str,
     workflow: Option<&WorkflowMeta>,
 ) -> Vec<String> {
-    let server = crate::workflow::spawn::mcp_server_path()
+    let server_path = crate::workflow::spawn::mcp_server_path();
+    // Same venv-aware interpreter resolution as the Claude config —
+    // see `write_claude_mcp_config`.
+    let python = server_path
+        .as_deref()
+        .map(cm_daemon::mcp_config::resolve_python_interpreter)
+        .unwrap_or_else(|| "python".to_string());
+    let server = server_path
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let env = build_env(target, session_uid, workflow);
@@ -230,7 +242,10 @@ pub fn codex_overrides(
         .join(",");
     vec![
         "-c".into(),
-        r#"mcp_servers.claude-manager.command="python""#.into(),
+        format!(
+            r#"mcp_servers.claude-manager.command="{}""#,
+            escape_toml(&python)
+        ),
         "-c".into(),
         format!(
             r#"mcp_servers.claude-manager.args=["{}"]"#,
