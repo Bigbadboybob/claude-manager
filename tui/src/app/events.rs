@@ -256,7 +256,7 @@ pub(super) fn encode_mouse_for_pty(
         row: viewport_row as u16,
         ..*me
     };
-    input::event_to_bytes(&CrosstermEvent::Mouse(translated), &term_mode)
+    crate::input::event_to_bytes(&CrosstermEvent::Mouse(translated), &term_mode)
 }
 
 /// Decide the actual byte sequence to write for a workflow delivery body,
