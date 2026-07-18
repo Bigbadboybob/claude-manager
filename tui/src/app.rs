@@ -1199,6 +1199,61 @@ pub(crate) fn pre_spawn_transcript_path(
     }
 }
 
+/// Build the `gcloud` argv that opens a live, READ-ONLY attach to a
+/// cloud backtest worker's tmux. The backtest pipeline runs inside a
+/// ROOT-owned tmux session named `backtest` (see
+/// `worker/backtest_startup.sh`), so the remote command uses `sudo` to
+/// reach root's tmux server and `tmux attach -r` (read-only) so a
+/// watcher can never inject keystrokes into the live run.
+///
+/// `ssh -t` forces PTY allocation (tmux won't render otherwise) and the
+/// `TERM=xterm-256color` prefix gives tmux a sane terminal type.
+///
+/// `use_iap` routes through `--tunnel-through-iap` — needed when the
+/// client can't reach the VM's port 22 directly. When the target
+/// project's firewall already exposes tcp:22 (the PMS
+/// `default-allow-ssh 0.0.0.0/0` rule does), a direct SSH is ~3-5s
+/// faster and needs no rule change, so `false` is the default.
+///
+/// `vm` / `project` / `zone` are passed as discrete argv elements (this
+/// is spawned via `portable-pty`'s exec, NOT a shell), so no shell
+/// metacharacter escaping is required or possible — and the remote
+/// command string is a fixed literal with no interpolation, so a
+/// hostile VM name cannot inject into it.
+pub(crate) fn backtest_watch_ssh_args(
+    vm: &str,
+    project: &str,
+    zone: &str,
+    use_iap: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "compute".to_string(),
+        "ssh".to_string(),
+        vm.to_string(),
+        format!("--project={}", project),
+        format!("--zone={}", zone),
+    ];
+    if use_iap {
+        args.push("--tunnel-through-iap".to_string());
+    }
+    // `--` ends gcloud's own flags; everything after is passed to ssh.
+    // `-t` forces a TTY; the final element is the remote command.
+    args.push("--".to_string());
+    args.push("-t".to_string());
+    args.push("TERM=xterm-256color sudo tmux attach -r -t backtest".to_string());
+    args
+}
+
+/// Resolve whether the watch attach should tunnel through IAP. Direct
+/// SSH is the default (port 22 already open on the backtest project);
+/// the operator can force IAP — needed if their network blocks outbound
+/// :22 — with `CM_BACKTEST_SSH_IAP=1`.
+pub(crate) fn backtest_watch_use_iap() -> bool {
+    std::env::var("CM_BACKTEST_SSH_IAP")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// migrate-tui-local: free-function form of `App::try_spawn_via_daemon`
 /// so spawn sites that don't have `&App` (workflow respawn path,
 /// controller fresh-context respawn) can share the same daemon-
@@ -12013,6 +12068,19 @@ impl App {
                     self.backend.delete_plan_task(id);
                     return true;
                 }
+                PlanAction::WatchBacktest {
+                    task_id,
+                    kind,
+                    worker_vm,
+                    vm_project,
+                    vm_zone,
+                    title,
+                } => {
+                    self.watch_backtest(
+                        &task_id, &kind, worker_vm, vm_project, vm_zone, &title,
+                    );
+                    return true;
+                }
                 PlanAction::RefreshTasks => {
                     self.backend.refresh_plan_tasks();
                     return true;
@@ -14209,6 +14277,124 @@ impl App {
             self.workspaces[wi].sessions.push(ts);
             self.cursor = Cursor::Session(wi, si);
         }
+    }
+
+    /// `A-w` in the planning panel: attach a live, READ-ONLY terminal
+    /// view of a cloud backtest's worker tmux, rendered like any other
+    /// CM session. Spawns a LOCAL `gcloud compute ssh …` session (the
+    /// operator's laptop gcloud auth reaches the backtest project) that
+    /// runs `tmux attach -r -t backtest` on the worker VM.
+    ///
+    /// Graceful cases:
+    ///   - non-backtest task → status message, no spawn.
+    ///   - backtest not yet dispatched (no `worker_vm`) → status
+    ///     message, no spawn.
+    ///   - VM already gone → the `gcloud ssh` child fails and the
+    ///     session exits cleanly (surfaced as a normal exited session),
+    ///     no zombie.
+    fn watch_backtest(
+        &mut self,
+        task_id: &str,
+        kind: &str,
+        worker_vm: Option<String>,
+        vm_project: Option<String>,
+        vm_zone: Option<String>,
+        title: &str,
+    ) {
+        if kind != "backtest" {
+            self.set_status_msg(&format!(
+                "A-w watches cloud backtest runs — '{}' is kind={}",
+                title, kind
+            ));
+            return;
+        }
+        let vm = match worker_vm.filter(|s| !s.is_empty()) {
+            Some(vm) => vm,
+            None => {
+                self.set_status_msg(
+                    "Backtest not dispatched yet — no worker VM assigned. Retry once it's running.",
+                );
+                return;
+            }
+        };
+        // metadata.vm.project is authoritative: backtest VMs run in a
+        // DIFFERENT GCP project than the CM default (config.gcp_project),
+        // so falling back to the config default is a last-resort guard,
+        // not the expected path.
+        let project = vm_project
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.config.gcp_project.clone());
+        let zone = vm_zone
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.config.gcp_zone.clone());
+
+        let args = backtest_watch_ssh_args(&vm, &project, &zone, backtest_watch_use_iap());
+        let (cols, rows) = self.last_term_size;
+        let session = match Session::new(
+            "gcloud",
+            &args,
+            cols,
+            rows,
+            None,
+            Default::default(),
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_status_msg(&format!("watch backtest: spawn failed: {}", e));
+                return;
+            }
+        };
+        let mut ts = make_simple_session(&format!("watch {}", title), "bash", session, None);
+        ts.task_id = Some(task_id.to_string());
+
+        // Home the watch session in the backtest task's own cloud
+        // workspace (auto-provisioned during reconcile once worker_vm
+        // lands). Fall back to matching by VM, then to provisioning a
+        // minimal cloud workspace so the session always has a sidebar
+        // row.
+        let ws_idx = self
+            .tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+            .and_then(|t| t.workspace_id.clone())
+            .and_then(|wid| resolve_workspace_by_id(&self.workspaces, &wid))
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .position(|w| w.is_cloud && w.worker_vm.as_deref() == Some(vm.as_str()))
+            });
+        let ws_idx = match ws_idx {
+            Some(i) => i,
+            None => {
+                let ws = Workspace {
+                    color: None,
+                    pinned: false,
+                    id: new_workspace_id(),
+                    name: title.to_string(),
+                    is_closed: false,
+                    is_cloud: true,
+                    repo_url: None,
+                    worktree_path: None,
+                    main_repo_path: None,
+                    worker_vm: Some(vm.clone()),
+                    worker_zone: Some(zone.clone()),
+                    host_id: cm_daemon::host_id::HostId::local(),
+                    sessions: vec![],
+                    tombstones: Vec::new(),
+                    is_pushing: false,
+                };
+                self.workspaces.push(ws);
+                self.workspaces.len() - 1
+            }
+        };
+
+        self.clear_cap_kill_toast_state(&ts.uid);
+        let si = self.workspaces[ws_idx].sessions.len();
+        self.workspaces[ws_idx].sessions.push(ts);
+        self.cursor = Cursor::Session(ws_idx, si);
+        self.view_mode = ViewMode::Sessions;
+        self.set_status_msg(&format!("Watching backtest {} (read-only) on {}", title, vm));
     }
 
     /// Spawn a session on an existing workspace by type ("claude" / "codex" / "bash").
@@ -19354,6 +19540,89 @@ fn last_assistant_message_text(
         .find(|m| m.role == crate::agent::Role::Assistant)
         .map(|m| m.content)
         .ok_or_else(|| "Yank: no assistant messages in transcript yet".to_string())
+}
+
+#[cfg(test)]
+mod backtest_watch_tests {
+    use super::*;
+
+    #[test]
+    fn direct_ssh_args_shape() {
+        let args = backtest_watch_ssh_args(
+            "cm-bt-abc123",
+            "prediction-market-scalper",
+            "us-east4-a",
+            false,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "compute".to_string(),
+                "ssh".to_string(),
+                "cm-bt-abc123".to_string(),
+                "--project=prediction-market-scalper".to_string(),
+                "--zone=us-east4-a".to_string(),
+                "--".to_string(),
+                "-t".to_string(),
+                "TERM=xterm-256color sudo tmux attach -r -t backtest".to_string(),
+            ]
+        );
+        // Direct SSH must NOT tunnel through IAP.
+        assert!(!args.iter().any(|a| a == "--tunnel-through-iap"));
+    }
+
+    #[test]
+    fn iap_inserts_tunnel_flag_before_separator() {
+        let args = backtest_watch_ssh_args("vm1", "proj", "zone-b", true);
+        let tunnel_pos = args
+            .iter()
+            .position(|a| a == "--tunnel-through-iap")
+            .expect("iap flag present");
+        let sep_pos = args.iter().position(|a| a == "--").expect("separator present");
+        // The IAP flag is a gcloud flag, so it must precede the `--`
+        // that hands the rest to ssh.
+        assert!(tunnel_pos < sep_pos);
+    }
+
+    #[test]
+    fn attach_is_read_only_and_targets_root_backtest_tmux() {
+        // Read-only (`-r`) is the core safety guarantee — a watcher must
+        // never be able to send keystrokes into a live run. Root's tmux
+        // server needs `sudo`. The session name is the literal `backtest`.
+        let args = backtest_watch_ssh_args("vm", "p", "z", false);
+        let remote = args.last().expect("remote command present");
+        assert!(remote.contains("tmux attach -r -t backtest"), "got: {remote}");
+        assert!(remote.contains("sudo "), "root tmux needs sudo: {remote}");
+        assert!(remote.contains("-r "), "must be read-only: {remote}");
+    }
+
+    #[test]
+    fn vm_zone_project_are_discrete_argv_not_shell_interpolated() {
+        // Values with shell metacharacters land as isolated argv
+        // elements (no shell parses them), and the remote command is a
+        // fixed literal — so a hostile VM name cannot inject.
+        let args = backtest_watch_ssh_args("a b; rm -rf /", "p'x", "z\"y", false);
+        assert!(args.iter().any(|a| a == "a b; rm -rf /"));
+        assert!(args.iter().any(|a| a == "--project=p'x"));
+        assert!(args.iter().any(|a| a == "--zone=z\"y"));
+        // The remote command carries none of the injected content.
+        let remote = args.last().unwrap();
+        assert_eq!(remote, "TERM=xterm-256color sudo tmux attach -r -t backtest");
+    }
+
+    #[test]
+    fn use_iap_env_toggle() {
+        // Default (unset) = direct SSH.
+        std::env::remove_var("CM_BACKTEST_SSH_IAP");
+        assert!(!backtest_watch_use_iap());
+        for truthy in ["1", "true", "yes", "on"] {
+            std::env::set_var("CM_BACKTEST_SSH_IAP", truthy);
+            assert!(backtest_watch_use_iap(), "‘{truthy}’ should enable IAP");
+        }
+        std::env::set_var("CM_BACKTEST_SSH_IAP", "0");
+        assert!(!backtest_watch_use_iap());
+        std::env::remove_var("CM_BACKTEST_SSH_IAP");
+    }
 }
 
 #[cfg(test)]

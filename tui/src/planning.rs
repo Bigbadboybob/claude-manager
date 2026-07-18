@@ -98,6 +98,37 @@ pub struct PlanTask {
     /// — which is exactly the race the finding describes (local
     /// stub init happens BEFORE the next API reconcile).
     pub parent_task_id: Option<String>,
+    /// Task kind from the API row ("oneshot" | "continuous" | "backtest").
+    /// The `A-w` watch action fires only on `"backtest"`.
+    pub kind: String,
+    /// Worker VM name, once the backtest has been dispatched (`None` while
+    /// still queued). Mirrors the API `worker_vm` column.
+    pub worker_vm: Option<String>,
+    /// GCP project the worker VM lives in, from `metadata.vm.project`.
+    /// Backtest VMs run in a DIFFERENT project than the CM default
+    /// (`prediction-market-scalper`, not `claude-manager-prod`), so the
+    /// watch attach MUST use this rather than the config default.
+    pub vm_project: Option<String>,
+    /// GCP zone of the worker VM, from `metadata.vm.zone` (falls back to
+    /// the API `worker_zone` column).
+    pub vm_zone: Option<String>,
+    /// Backtest run key (`metadata.backtest.run_key`) — a stable
+    /// human-readable id used to title the watch session.
+    pub run_key: Option<String>,
+    /// Backtest label (`metadata.backtest.label`) — preferred over
+    /// `run_key` for the watch session title when present.
+    pub bt_label: Option<String>,
+}
+
+/// Pull a `"vm"` / `"backtest"` string field out of a task's free-form
+/// `metadata` JSONB bag. Returns `None` for absent / non-string values.
+fn meta_str(metadata: &Option<serde_json::Value>, group: &str, key: &str) -> Option<String> {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(group))
+        .and_then(|g| g.get(key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 impl PlanTask {
@@ -119,6 +150,13 @@ impl PlanTask {
             is_cloud: task.is_cloud,
             repo_url: task.repo_url.clone(),
             parent_task_id: task.parent_task_id.clone(),
+            kind: task.kind.clone(),
+            worker_vm: task.worker_vm.clone().filter(|s| !s.is_empty()),
+            vm_project: meta_str(&task.metadata, "vm", "project"),
+            vm_zone: meta_str(&task.metadata, "vm", "zone")
+                .or_else(|| task.worker_zone.clone().filter(|s| !s.is_empty())),
+            run_key: meta_str(&task.metadata, "backtest", "run_key"),
+            bt_label: meta_str(&task.metadata, "backtest", "label"),
         }
     }
 }
@@ -480,6 +518,28 @@ pub enum PlanAction {
     },
     DeleteTask {
         id: String,
+    },
+    /// Attach a live, READ-ONLY terminal view to a cloud backtest's
+    /// worker tmux. Emitted by `A-w` on a focused task. The app-side
+    /// handler validates (`kind`, `worker_vm`), builds the `gcloud
+    /// compute ssh … -t "sudo tmux attach -r -t backtest"` command,
+    /// spawns a local session bound to the task's workspace, and
+    /// switches to the Sessions view. All fields are snapshotted from
+    /// the planning row so the handler needs no re-lookup.
+    WatchBacktest {
+        task_id: String,
+        /// Task kind — the handler messages (not spawns) when this
+        /// isn't `"backtest"`, keeping `A-w` discoverable on any row.
+        kind: String,
+        /// `None`/empty until the dispatcher assigns a VM — handler
+        /// shows a "not dispatched yet" status instead of spawning.
+        worker_vm: Option<String>,
+        /// `metadata.vm.project` — the backtest VM's GCP project.
+        vm_project: Option<String>,
+        /// `metadata.vm.zone` (or the `worker_zone` column).
+        vm_zone: Option<String>,
+        /// Human-readable title for the session (label → run_key → vm).
+        title: String,
     },
     RefreshTasks,
 }
@@ -2033,6 +2093,34 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('r') => { return PlanAction::RefreshTasks; }
+                    // `A-w` (Watch): attach a live READ-ONLY view of the
+                    // focused backtest task's worker tmux. Snapshots the VM
+                    // coords off the row; the app-side handler validates
+                    // kind/dispatch and spawns the gcloud attach session.
+                    KeyCode::Char('w') => {
+                        self.cancel_visual();
+                        if let Some((pi, ti)) = self.selected_task_loc() {
+                            if let Some(task) =
+                                self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti))
+                            {
+                                let title = task
+                                    .bt_label
+                                    .clone()
+                                    .or_else(|| task.run_key.clone())
+                                    .or_else(|| task.worker_vm.clone())
+                                    .unwrap_or_else(|| task.slug.clone());
+                                return PlanAction::WatchBacktest {
+                                    task_id: task.id.clone(),
+                                    kind: task.kind.clone(),
+                                    worker_vm: task.worker_vm.clone(),
+                                    vm_project: task.vm_project.clone(),
+                                    vm_zone: task.vm_zone.clone(),
+                                    title,
+                                };
+                            }
+                        }
+                        return PlanAction::Consumed;
+                    }
                     KeyCode::Char('p') => {
                         self.cancel_visual();
                         let current = self.project_filter.map(|i| i + 1).unwrap_or(0);
@@ -4580,6 +4668,12 @@ mod tests {
             is_cloud: false,
             repo_url: String::new(),
             parent_task_id: parent.map(str::to_string),
+            kind: "oneshot".to_string(),
+            worker_vm: None,
+            vm_project: None,
+            vm_zone: None,
+            run_key: None,
+            bt_label: None,
         }
     }
 
@@ -4831,6 +4925,7 @@ mod tests {
             depends: None,
             source: "user".to_string(),
             is_cloud: false,
+            kind: "oneshot".to_string(),
             parent_task_id: None,
             worktree_mode: "inherit".to_string(),
             metadata: None,
@@ -4994,6 +5089,12 @@ mod tests {
             is_cloud: false,
             repo_url: stored.to_string(),
             parent_task_id: None,
+            kind: "oneshot".to_string(),
+            worker_vm: None,
+            vm_project: None,
+            vm_zone: None,
+            run_key: None,
+            bt_label: None,
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -5039,6 +5140,12 @@ mod tests {
             is_cloud: false,
             repo_url: "git@example.com:org/repo.git".to_string(),
             parent_task_id: Some("parent-id".to_string()),
+            kind: "oneshot".to_string(),
+            worker_vm: None,
+            vm_project: None,
+            vm_zone: None,
+            run_key: None,
+            bt_label: None,
         });
         view.project_data.push(pd);
         view.projects = view
@@ -5091,6 +5198,12 @@ mod tests {
             is_cloud: false,
             repo_url: "git@example.com:org/repo.git".to_string(),
             parent_task_id: None,
+            kind: "oneshot".to_string(),
+            worker_vm: None,
+            vm_project: None,
+            vm_zone: None,
+            run_key: None,
+            bt_label: None,
         });
         view.project_data.push(pd);
         view.projects = view
@@ -5142,6 +5255,12 @@ mod tests {
                 is_cloud: false,
                 repo_url: "git@example.com:org/repo.git".to_string(),
                 parent_task_id: None,
+                kind: "oneshot".to_string(),
+                worker_vm: None,
+                vm_project: None,
+                vm_zone: None,
+                run_key: None,
+                bt_label: None,
             });
             view.project_data.push(pd);
             view.projects = view
@@ -5206,6 +5325,12 @@ mod tests {
             is_cloud: false,
             repo_url: String::new(),
             parent_task_id: None,
+            kind: "oneshot".to_string(),
+            worker_vm: None,
+            vm_project: None,
+            vm_zone: None,
+            run_key: None,
+            bt_label: None,
         }
     }
 

@@ -36,6 +36,13 @@ pub struct Task {
     pub source: String,
     #[serde(default)]
     pub is_cloud: bool,
+    /// Task kind: "oneshot" (default), "continuous", or "backtest".
+    /// Backtest rows carry `metadata.backtest` (run_key, label, config,
+    /// branch) and `metadata.vm` (project, zone) and run the pipeline in
+    /// a root-owned tmux named "backtest" on the worker VM — the planning
+    /// panel's `A-w` watch action keys off this to attach read-only.
+    #[serde(default = "default_kind")]
+    pub kind: String,
     /// FK to another task. Null for top-level tasks. Phase 5 subtask field.
     #[serde(default)]
     pub parent_task_id: Option<String>,
@@ -52,6 +59,10 @@ pub struct Task {
 
 fn default_worktree_mode() -> String {
     "inherit".to_string()
+}
+
+fn default_kind() -> String {
+    "oneshot".to_string()
 }
 
 fn default_source() -> String {
