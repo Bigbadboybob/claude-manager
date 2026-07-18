@@ -17,7 +17,7 @@ from api.models import (
 )
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from dispatch import db
-from dispatch.config import DB_DSN
+from dispatch.config import DB_DSN, REPOS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cm.api")
@@ -529,11 +529,20 @@ async def delete_task(task_id: str, pool=Depends(get_pool)):
 async def list_projects(pool=Depends(get_pool)):
     """Return distinct project names and their repo URLs."""
     rows = await db.list_projects(pool)
-    # A project may have multiple repo_urls (different tasks) — pick the first
+    # A project may have multiple repo_urls in the tasks table (a task can be
+    # proposed from a different repo's context, e.g. an agent running in the
+    # claude-manager repo proposing a predictionTrading task — that row carries
+    # the WRONG repo_url). So the tasks-table value is only a fallback.
     seen = {}
     for r in rows:
         if r["project"] not in seen:
             seen[r["project"]] = r["repo_url"]
+    # Authoritative override: ~/.cm/projects/<name>/repo_url is the canonical
+    # clone URL for a project (REPOS, discovered at daemon start). This is what
+    # submit_backtest resolves against, so it must be right regardless of what
+    # stray tasks carry.
+    for name, url in REPOS.items():
+        seen[name] = url
     return [{"name": name, "repo_url": url} for name, url in seen.items()]
 
 

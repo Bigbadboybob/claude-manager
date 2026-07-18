@@ -117,25 +117,48 @@ publish_results() {
     fi
 }
 
-# $1 = partial ("true"/"false"). Wraps results/summary.json into the artifact
+# $1 = partial ("true"/"false"). Wraps the run's summary into the artifact
 # body: {kind, partial, gcs_prefix, summary:{...summary, partial, gcs_pointer,
-# run_key}}. Missing summary.json -> {"error":"no-summary", ...}.
+# run_key}}. Prefers the PT publisher's compact backtest_summary.json (the
+# designed contract shape); falls back to the grid runner's summary.json.
+# Non-finite floats (NaN/Infinity — common when a run has 0 trades) are coerced
+# to null: they are INVALID JSON and Postgres JSONB rejects them, which 500s the
+# artifact POST and leaves a successful run stuck "blocked".
 build_artifact_json() {
     PARTIAL="$1" RESULTS_DIR="$RESULTS_DIR" GCS_PREFIX="$GCS_PREFIX" RUN_KEY="$RUN_KEY" \
     python3 - <<'PYEOF'
-import json, os
+import json, math, os
 
 partial = os.environ["PARTIAL"] == "true"
 gcs = os.environ["GCS_PREFIX"]
-summary_path = os.path.join(os.environ["RESULTS_DIR"], "summary.json")
-try:
-    with open(summary_path) as f:
-        summary = json.load(f)
-    if not isinstance(summary, dict):
-        summary = {"error": "summary-not-a-dict", "raw_type": type(summary).__name__}
-except (OSError, ValueError) as e:
-    summary = {"error": "no-summary", "detail": str(e)}
+results_dir = os.environ["RESULTS_DIR"]
 
+summary = None
+for name in ("backtest_summary.json", "summary.json"):
+    try:
+        with open(os.path.join(results_dir, name)) as f:
+            loaded = json.load(f)
+    except (OSError, ValueError):
+        continue
+    if isinstance(loaded, dict):
+        summary = loaded
+        break
+if summary is None:
+    summary = {"error": "no-summary", "detail": "no readable summary json in results dir"}
+
+
+def _finite(o):
+    """Coerce NaN/Infinity -> None so the body is valid JSON (JSONB-storable)."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _finite(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_finite(v) for v in o]
+    return o
+
+
+summary = _finite(summary)
 summary["partial"] = partial
 summary["gcs_pointer"] = gcs
 summary["run_key"] = os.environ["RUN_KEY"]
@@ -144,7 +167,7 @@ print(json.dumps({
     "partial": partial,
     "gcs_prefix": gcs,
     "summary": summary,
-}))
+}, allow_nan=False))
 PYEOF
 }
 
