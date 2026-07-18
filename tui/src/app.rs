@@ -52,28 +52,7 @@ pub(crate) use model::{
     TerminalSession, Workspace, WorktreeMode,
 };
 
-/// Concatenated source of the `app` module tree, for the migration guard
-/// tests that assert invariants by scanning the source text. Pre-split these
-/// scans read the single monolithic app.rs; the corpus now spans the
-/// extracted submodules as well.
-// NOTE: extracted submodules come FIRST so that real definitions precede
-// the guard tests' own string literals (which live in the later files) in
-// `find()` scans, mirroring the pre-split file order.
-#[cfg(test)]
-const APP_SRC_FOR_SCAN: &str = concat!(
-    include_str!("app/model.rs"),
-    include_str!("app/nav.rs"),
-    include_str!("app/workflow_ui.rs"),
-    include_str!("app/persist.rs"),
-    include_str!("app/draw.rs"),
-    include_str!("app.rs"),
-    // events/remote/input hold test-mod helpers whose literals would
-    // shadow root definitions in find() scans — they stay after app.rs.
-    include_str!("app/input.rs"),
-    include_str!("app/events.rs"),
-    include_str!("app/remote.rs"),
-    include_str!("app/lifecycle.rs"),
-);
+
 
 mod dirs {
     use std::path::PathBuf;
@@ -1161,3 +1140,64 @@ impl App {
 // `log_tick` + its `TICK_LOG_MAX_BYTES` cap moved to
 // `crate::workflow::observer` (re-exported below) as the first extraction of
 // workflow-observation glue out of this file.
+
+/// Concatenated source of the `app` module tree, for the migration guard
+/// tests that assert invariants by scanning the source text. Pre-split these
+/// scans read the single monolithic app.rs; the corpus now spans the
+/// extracted submodules as well.
+// NOTE: extracted submodules come FIRST so that real definitions precede
+// the guard tests' own string literals (which live in the later files) in
+// `find()` scans, mirroring the pre-split file order.
+#[cfg(test)]
+const APP_SRC_FOR_SCAN: &str = concat!(
+    include_str!("app/model.rs"),
+    include_str!("app/nav.rs"),
+    include_str!("app/workflow_ui.rs"),
+    include_str!("app/persist.rs"),
+    include_str!("app/draw.rs"),
+    include_str!("app.rs"),
+    // Ordering rule: a file whose test-mod literals collide with a
+    // find()-scanned definition must come AFTER the file holding that
+    // definition. events/remote/input collided with root definitions
+    // during the split; new submodules must be placed by the same rule.
+    include_str!("app/input.rs"),
+    include_str!("app/events.rs"),
+    include_str!("app/remote.rs"),
+    include_str!("app/lifecycle.rs"),
+);
+
+/// Per-file view of the same corpus, for scans that must separate production
+/// from test code. Layout invariant (keep it): every app source file — this
+/// root included — carries ALL its `#[cfg(test)]` items at the tail, so
+/// production text is exactly the prefix before the first line-anchored
+/// `#[cfg(test)]`. No brace tracking: test string literals defeat it.
+#[cfg(test)]
+const APP_SRC_FILES: &[&str] = &[
+    include_str!("app/model.rs"),
+    include_str!("app/nav.rs"),
+    include_str!("app/workflow_ui.rs"),
+    include_str!("app/persist.rs"),
+    include_str!("app/draw.rs"),
+    include_str!("app.rs"),
+    include_str!("app/input.rs"),
+    include_str!("app/events.rs"),
+    include_str!("app/remote.rs"),
+    include_str!("app/lifecycle.rs"),
+];
+
+/// Production-only text of the app module tree: each file truncated at its
+/// first line-anchored `#[cfg(test)]`, for guards that pin "no such call
+/// site in production code".
+#[cfg(test)]
+fn app_prod_src() -> String {
+    let mut out = String::new();
+    let attr = "\n#[cfg(test)]";
+    for src in APP_SRC_FILES {
+        match src.find(attr) {
+            Some(i) => out.push_str(&src[..i]),
+            None => out.push_str(src),
+        }
+        out.push('\n');
+    }
+    out
+}

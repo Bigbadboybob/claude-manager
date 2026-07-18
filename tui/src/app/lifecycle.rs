@@ -5095,8 +5095,12 @@ mod slice_12e_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -5145,8 +5149,12 @@ mod slice_12e_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -5191,8 +5199,12 @@ mod slice_12e_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -5648,8 +5660,12 @@ remote_socket = "/remote/manager.sock"
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -5699,8 +5715,12 @@ remote_socket = "/remote/manager.sock"
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -5821,8 +5841,12 @@ remote_socket = "/remote/manager.sock"
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -5844,8 +5868,12 @@ remote_socket = "/remote/manager.sock"
             let rest = &src[start..];
             let end = rest[1..]
                 .find("\n    fn ")
-                .or_else(|| rest[1..].find("\n    pub fn "))
-                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .into_iter()
+                .chain(rest[1..].find("\n    pub fn "))
+                .chain(rest[1..].find("\n    pub(crate) fn "))
+                .chain(rest[1..].find("\n    pub(super) fn "))
+                .chain(rest[1..].find("\n#[cfg(test)]"))
+                .min()
                 .map(|i| 1 + i)
                 .unwrap_or(rest.len());
             let body = &rest[..end];
@@ -5891,8 +5919,12 @@ remote_socket = "/remote/manager.sock"
             let rest = &src[start..];
             let end = rest[1..]
                 .find("\n    fn ")
-                .or_else(|| rest[1..].find("\n    pub fn "))
-                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .into_iter()
+                .chain(rest[1..].find("\n    pub fn "))
+                .chain(rest[1..].find("\n    pub(crate) fn "))
+                .chain(rest[1..].find("\n    pub(super) fn "))
+                .chain(rest[1..].find("\n#[cfg(test)]"))
+                .min()
                 .map(|i| 1 + i)
                 .unwrap_or(rest.len());
             let body = &rest[..end];
@@ -5920,14 +5952,11 @@ remote_socket = "/remote/manager.sock"
         // worker. No `rpc_*`, no `for_host(`, no
         // `default_handle()` call sites in the push path of
         // app.rs.
-        let push_state_start = src
-            .find("pub(crate) fn push_state_to_daemon(")
-            .expect("must find push_state_to_daemon sig");
-        let push_section_end = src[push_state_start..]
-            .find("pub(crate) fn push_active(")
-            .map(|i| push_state_start + i)
-            .unwrap_or(src.len().min(push_state_start + 20000));
-        let push_section = &src[push_state_start..push_section_end];
+        // Scan ALL production code (per-file test-stripped): the rpc_*
+        // wrappers live on the push_worker thread, so no app production
+        // code anywhere may dial them (or default_handle) directly.
+        let push_section = crate::app::app_prod_src();
+        let push_section = push_section.as_str();
         assert!(
             !push_section.contains("self.host_pool.default_handle()"),
             "push helpers MUST NOT call \
@@ -6090,44 +6119,11 @@ mod migrate_tui_local_tests {
     /// when that file was deleted — the TUI owns no workflow logic.)
     #[test]
     fn t_migrate_no_tuilocal_sites_remain() {
-        let app_src = crate::app::APP_SRC_FOR_SCAN;
-
-        // Strip `#[cfg(test)]` test modules + the inline
-        // `mod tests` blocks so the scan is production-only.
-        // We walk the source and exclude any line inside an
-        // `#[cfg(test)] mod ...` block (depth-tracked).
-        let prod_only = |src: &str| -> String {
-            let mut out = String::new();
-            let mut in_test_mod = false;
-            let mut depth = 0i32;
-            for line in src.lines() {
-                if !in_test_mod {
-                    // Heuristic: a line that contains
-                    // `#[cfg(test)]` marks the START of a
-                    // test region. The next `mod ` (or `{`)
-                    // begins a brace-tracked block.
-                    if line.contains("#[cfg(test)]") {
-                        in_test_mod = true;
-                        // Don't include the attribute line.
-                        continue;
-                    }
-                    out.push_str(line);
-                    out.push('\n');
-                } else {
-                    // Track braces inside the test block.
-                    let opens = line.matches('{').count() as i32;
-                    let closes = line.matches('}').count() as i32;
-                    depth += opens - closes;
-                    if depth <= 0 {
-                        in_test_mod = false;
-                        depth = 0;
-                    }
-                }
-            }
-            out
-        };
-
-        let app_prod = prod_only(app_src);
+        // Production-only per-file scan: the concatenated corpus cannot be
+        // depth-stripped reliably (test string literals unbalance the brace
+        // count and swallow every later file), so the stripper runs per
+        // source file via crate::app::app_prod_src().
+        let app_prod = crate::app::app_prod_src();
 
         // The doc-comment + decision-doc references to
         // `SpawnTarget::TuiLocal` ARE allowed (we keep them
@@ -6157,8 +6153,12 @@ mod migrate_tui_local_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -6192,8 +6192,12 @@ mod migrate_tui_local_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -6221,8 +6225,12 @@ mod migrate_tui_local_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -6288,8 +6296,12 @@ mod migrate_tui_local_tests {
         let rest2 = &src[start2..];
         let end2 = rest2[1..]
             .find("\n    fn ")
-            .or_else(|| rest2[1..].find("\n    pub fn "))
-            .or_else(|| rest2[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest2[1..].find("\n    pub fn "))
+            .chain(rest2[1..].find("\n    pub(crate) fn "))
+            .chain(rest2[1..].find("\n    pub(super) fn "))
+            .chain(rest2[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest2.len());
         let body2 = &rest2[..end2];
@@ -6369,8 +6381,12 @@ mod migrate_tui_local_tests {
         // Bound the body and verify both branches exist.
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -6410,8 +6426,12 @@ mod migrate_tui_local_tests {
         let restore_rest = &src[restore_src_idx..];
         let restore_end = restore_rest[1..]
             .find("\n    fn ")
-            .or_else(|| restore_rest[1..].find("\n    pub fn "))
-            .or_else(|| restore_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(restore_rest[1..].find("\n    pub fn "))
+            .chain(restore_rest[1..].find("\n    pub(crate) fn "))
+            .chain(restore_rest[1..].find("\n    pub(super) fn "))
+            .chain(restore_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(restore_rest.len());
         let restore_body = &restore_rest[..restore_end];
@@ -6549,8 +6569,12 @@ mod migrate_tui_local_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -6582,8 +6606,12 @@ mod migrate_tui_local_tests {
         let rest2 = &src[start2..];
         let end2 = rest2[1..]
             .find("\n    fn ")
-            .or_else(|| rest2[1..].find("\n    pub fn "))
-            .or_else(|| rest2[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest2[1..].find("\n    pub fn "))
+            .chain(rest2[1..].find("\n    pub(crate) fn "))
+            .chain(rest2[1..].find("\n    pub(super) fn "))
+            .chain(rest2[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest2.len());
         let body2 = &rest2[..end2];
@@ -6745,8 +6773,12 @@ mod migrate_tui_local_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -6830,8 +6862,12 @@ mod migrate_tui_local_tests {
             let rest = &app_src[start..];
             let end = rest[1..]
                 .find("\n    fn ")
-                .or_else(|| rest[1..].find("\n    pub fn "))
-                .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+                .into_iter()
+                .chain(rest[1..].find("\n    pub fn "))
+                .chain(rest[1..].find("\n    pub(crate) fn "))
+                .chain(rest[1..].find("\n    pub(super) fn "))
+                .chain(rest[1..].find("\n#[cfg(test)]"))
+                .min()
                 .map(|i| 1 + i)
                 .unwrap_or(rest.len());
             let body = &rest[..end];
@@ -7035,8 +7071,12 @@ mod migrate_tui_local_tests {
         let rest = &src[start..];
         let end = rest[1..]
             .find("\n    fn ")
-            .or_else(|| rest[1..].find("\n    pub fn "))
-            .or_else(|| rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(rest[1..].find("\n    pub fn "))
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub(super) fn "))
+            .chain(rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(rest.len());
         let body = &rest[..end];
@@ -7154,8 +7194,12 @@ mod migrate_tui_local_tests {
         let spawn_rest = &src[spawn_idx..];
         let spawn_end = spawn_rest[1..]
             .find("\n    fn ")
-            .or_else(|| spawn_rest[1..].find("\n    pub fn "))
-            .or_else(|| spawn_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(spawn_rest[1..].find("\n    pub fn "))
+            .chain(spawn_rest[1..].find("\n    pub(crate) fn "))
+            .chain(spawn_rest[1..].find("\n    pub(super) fn "))
+            .chain(spawn_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(spawn_rest.len());
         let spawn_body = &spawn_rest[..spawn_end];
@@ -7177,8 +7221,12 @@ mod migrate_tui_local_tests {
         let tomb_rest = &src[tomb_idx..];
         let tomb_end = tomb_rest[1..]
             .find("\n    fn ")
-            .or_else(|| tomb_rest[1..].find("\n    pub fn "))
-            .or_else(|| tomb_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(tomb_rest[1..].find("\n    pub fn "))
+            .chain(tomb_rest[1..].find("\n    pub(crate) fn "))
+            .chain(tomb_rest[1..].find("\n    pub(super) fn "))
+            .chain(tomb_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(tomb_rest.len());
         let tomb_body = &tomb_rest[..tomb_end];
@@ -7320,8 +7368,12 @@ mod migrate_tui_local_tests {
         let open_rest = &src[open_idx..];
         let open_end = open_rest[1..]
             .find("\n    fn ")
-            .or_else(|| open_rest[1..].find("\n    pub fn "))
-            .or_else(|| open_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(open_rest[1..].find("\n    pub fn "))
+            .chain(open_rest[1..].find("\n    pub(crate) fn "))
+            .chain(open_rest[1..].find("\n    pub(super) fn "))
+            .chain(open_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(open_rest.len());
         let open_body = &open_rest[..open_end];
@@ -7478,8 +7530,12 @@ mod migrate_tui_local_tests {
         // 3. The attach-success arm sets outcome = Attached.
         let body_end = fn_rest[1..]
             .find("\n    fn ")
-            .or_else(|| fn_rest[1..].find("\n    pub fn "))
-            .or_else(|| fn_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(fn_rest[1..].find("\n    pub fn "))
+            .chain(fn_rest[1..].find("\n    pub(crate) fn "))
+            .chain(fn_rest[1..].find("\n    pub(super) fn "))
+            .chain(fn_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(fn_rest.len());
         let body = &fn_rest[..body_end];
@@ -7560,8 +7616,12 @@ mod migrate_tui_local_tests {
         let restore_rest = &src[restore_idx..];
         let restore_end = restore_rest[1..]
             .find("\n    fn ")
-            .or_else(|| restore_rest[1..].find("\n    pub fn "))
-            .or_else(|| restore_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(restore_rest[1..].find("\n    pub fn "))
+            .chain(restore_rest[1..].find("\n    pub(crate) fn "))
+            .chain(restore_rest[1..].find("\n    pub(super) fn "))
+            .chain(restore_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(restore_rest.len());
         let restore_body = &restore_rest[..restore_end];
@@ -7597,8 +7657,12 @@ mod migrate_tui_local_tests {
         let fn_rest = &src[fn_idx..];
         let fn_end = fn_rest[1..]
             .find("\n    fn ")
-            .or_else(|| fn_rest[1..].find("\n    pub fn "))
-            .or_else(|| fn_rest[1..].find("\n    pub(crate) fn "))
+            .into_iter()
+            .chain(fn_rest[1..].find("\n    pub fn "))
+            .chain(fn_rest[1..].find("\n    pub(crate) fn "))
+            .chain(fn_rest[1..].find("\n    pub(super) fn "))
+            .chain(fn_rest[1..].find("\n#[cfg(test)]"))
+            .min()
             .map(|i| 1 + i)
             .unwrap_or(fn_rest.len());
         let body = &fn_rest[..fn_end];
