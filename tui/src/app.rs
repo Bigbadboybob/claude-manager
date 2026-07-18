@@ -1240,9 +1240,27 @@ pub(crate) fn backtest_watch_ssh_args(
     // `-t` forces a TTY; the final element is the remote command.
     args.push("--".to_string());
     args.push("-t".to_string());
-    args.push("TERM=xterm-256color sudo tmux attach -r -t backtest".to_string());
+    args.push(BACKTEST_WATCH_REMOTE_CMD.to_string());
     args
 }
+
+/// The remote command run over ssh to open a read-only view of the
+/// backtest tmux.
+///
+/// It waits (bounded, ~120s) for the `backtest` session to appear before
+/// attaching, because `worker_vm`/`ttyd_url` are stamped at VM-CREATE
+/// time — before the in-VM startup script has created the tmux — so an
+/// operator who hits `A-w` the instant the task shows a VM would
+/// otherwise race the session into existence and get an immediate "no
+/// sessions" exit. When it appears, `exec tmux attach -r` replaces the
+/// wrapper (`-r` = read-only, the core safety guarantee); if it never
+/// does, it prints a clear message and exits non-zero so the session
+/// closes cleanly rather than hanging.
+///
+/// `sudo` is required because the pipeline tmux is ROOT-owned. On GCE
+/// the ssh login user has passwordless sudo (google-sudoers), verified
+/// against a live worker.
+pub(crate) const BACKTEST_WATCH_REMOTE_CMD: &str = "TERM=xterm-256color sudo sh -c 'i=0; while [ $i -lt 60 ]; do tmux has-session -t backtest 2>/dev/null && exec tmux attach -r -t backtest; i=$((i+1)); sleep 2; done; echo \"cm-watch: backtest tmux not present after 120s\"; exit 1'";
 
 /// Resolve whether the watch attach should tunnel through IAP. Direct
 /// SSH is the default (port 22 already open on the backtest project);
@@ -19555,8 +19573,8 @@ mod backtest_watch_tests {
             false,
         );
         assert_eq!(
-            args,
-            vec![
+            &args[..7],
+            &[
                 "compute".to_string(),
                 "ssh".to_string(),
                 "cm-bt-abc123".to_string(),
@@ -19564,9 +19582,9 @@ mod backtest_watch_tests {
                 "--zone=us-east4-a".to_string(),
                 "--".to_string(),
                 "-t".to_string(),
-                "TERM=xterm-256color sudo tmux attach -r -t backtest".to_string(),
             ]
         );
+        assert_eq!(args.last().unwrap(), BACKTEST_WATCH_REMOTE_CMD);
         // Direct SSH must NOT tunnel through IAP.
         assert!(!args.iter().any(|a| a == "--tunnel-through-iap"));
     }
@@ -19593,7 +19611,10 @@ mod backtest_watch_tests {
         let remote = args.last().expect("remote command present");
         assert!(remote.contains("tmux attach -r -t backtest"), "got: {remote}");
         assert!(remote.contains("sudo "), "root tmux needs sudo: {remote}");
-        assert!(remote.contains("-r "), "must be read-only: {remote}");
+        // The wrapper waits for the session (VM-create races tmux-create)
+        // and never sends keystrokes.
+        assert!(remote.contains("has-session -t backtest"), "waits for session: {remote}");
+        assert!(!remote.contains("send-keys"), "must never send keys: {remote}");
     }
 
     #[test]
@@ -19605,9 +19626,11 @@ mod backtest_watch_tests {
         assert!(args.iter().any(|a| a == "a b; rm -rf /"));
         assert!(args.iter().any(|a| a == "--project=p'x"));
         assert!(args.iter().any(|a| a == "--zone=z\"y"));
-        // The remote command carries none of the injected content.
+        // The remote command is a fixed literal — none of the injected
+        // content appears in it.
         let remote = args.last().unwrap();
-        assert_eq!(remote, "TERM=xterm-256color sudo tmux attach -r -t backtest");
+        assert_eq!(remote, BACKTEST_WATCH_REMOTE_CMD);
+        assert!(!remote.contains("rm -rf"));
     }
 
     #[test]
