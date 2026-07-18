@@ -567,6 +567,9 @@ pub fn dispatch_request(
         "continuous.create" => DispatchOutcome::Done(dispatch_continuous_create(state, req)),
         "continuous.update" => DispatchOutcome::Done(dispatch_continuous_update(state, req)),
         "continuous.list" => DispatchOutcome::Done(dispatch_continuous_list(state, req)),
+        "continuous.dispatch_pending" => {
+            DispatchOutcome::Done(dispatch_continuous_dispatch_pending(state, req))
+        }
         "continuous.pause" => DispatchOutcome::Done(dispatch_continuous_pause(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
@@ -951,6 +954,26 @@ fn dispatch_continuous_list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> R
         return resp;
     }
     match methods::continuous_list(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.dispatch_pending` — read-only index scan for operator-
+/// unblocked-but-unacknowledged issues (the TUI's Continuous-panel
+/// dispatch-pending indicator). Operator-only like the other reads.
+fn dispatch_continuous_dispatch_pending(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "continuous.dispatch_pending is Operator-callable only (the TUI / cloud \
+         control plane manages continuous-task lifecycle; agents fan out via `trigger`)",
+    ) {
+        return resp;
+    }
+    match methods::continuous_dispatch_pending(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

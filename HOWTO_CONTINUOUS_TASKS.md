@@ -86,7 +86,8 @@ Keep these **proven idioms** (every live orchestrator uses them):
 - **Step 0: sync to main** (`git fetch origin && git merge --ff-only origin/main`) — you never commit in your own worktree, so this is always a clean ff; your `.<task>/` memory is ignored and survives.
 - **Step 1: the deterministic gather** — a script/heredoc that produces the cycle's inputs. Reproduce whatever the old cron/harness did (log sample, DB snapshot, changelog diff). Sample, don't full-scan, when the source is huge (the trader daily log is ~1.8GB — a full scan times out; use `sample_logs`).
 - **Step 2: drive open subtasks** — `list_subtasks`; derive each one's stage from **artifacts** (git working tree + committed diff + NOTES.md), NOT its self-report; record a structured block in index.yaml **every cycle**; act by stage.
-- **Planning-status convention (load-bearing for the TUI).** Set a subtask `blocked` **only** when the ball is with the operator (a committed fix awaiting review, or an explicit human decision); everything the orchestrator advances itself stays `running`; reconcile each cycle. This drives the continuous column's **⚪ needs-you vs ◇ orchestrator-has-it** indicator — breaking the convention breaks the indicator.
+- **Planning-status convention (load-bearing for the TUI).** Set a subtask `blocked` **only** when the ball is with the operator (a committed fix awaiting review, or an explicit human decision); everything the orchestrator advances itself stays `running`; reconcile each cycle. This drives the continuous column's **⚪ needs-you vs ◇ orchestrator-has-it** indicator — breaking the convention breaks the indicator. (Full glyph legend: §"Continuous-column glyph legend" below.)
+- **Operator-directive ACK (load-bearing for the TUI).** When the operator unblocks an index issue out-of-band — clears its `blocked_reason` and leaves a dated `# OPERATOR <YYYY-MM-DD> …` comment in the entry (the `/triage-review` convention) — the TUI renders that issue as **○ dispatch pending** under you until you act. At **cycle start**, when you process such a directive, write `operator_ack: <YYYY-MM-DD>` (today, ≥ the directive date) into that issue's index entry — whether you dispatch a subtask, defer, or decide the directive needs no dispatch. The ack (or a live spawned subtask) is what clears the ○; without it the operator can't tell seen-and-handled from never-seen.
 - **Re-spawn exited agents into the SAME worktree** — `mcp_start_session(task_id=<existing subtask id from list_subtasks>, …)`, never `create_subtask` for an existing finding. An exited agent is a reason to restart work, not punt to the user.
 - **Adopt any pre-existing backlog** (e.g. the trader's own `index.yaml` `active` entries) with a clear dedup rule.
 - **Step N: summary → `./.<task>/cycle-log.md`** — one paragraph per cycle; this is your continuity.
@@ -166,6 +167,22 @@ Never disable the old job until the new task has fired a real cycle successfully
 - **Review its output:** `/triage-review <task>` (or no-arg to enumerate reviewable tasks via `review_kind`). Fix-first tasks → walk the merge queue; investigate-first → read the proposals + decide. The orchestrator NEVER merges triage fixes itself — you do — **unless** the task is explicitly designed to auto-merge high-confidence fixes (then it gates on build+test green and pushes only `main`).
 - **Pause / manual fire / delete:** `continuous.pause {task_id, paused:true}`, `continuous.run_now {task_id}`, `continuous.delete {task_id, gc?}`.
 - **Break-glass a run wedged `Running`:** `continuous.force_done {task_id, seq, reason?}` — operator-only; flips `last_run` Running → Done iff `seq` matches (read the seq off `state.json` first). Use when a run's end signal was lost and the run-active gate is starving fires (a Consumer's queue backing up is the tell). Before this existed the only recovery was `send_input`-puppeting the session into re-calling `report_done`.
+- **Dispatch-pending read:** `continuous.dispatch_pending` — per reviewable task (`review_kind` set), the index issues whose `blocked_reason` an operator cleared with a dated `# OPERATOR <date>` comment and no `operator_ack` yet. This is what feeds the TUI's ○ indicator (legend below); the TUI additionally drops issues whose `subtask_task_id` maps to a live planning task.
+
+---
+
+## Continuous-column glyph legend
+
+What each session row (and sub-line) in the TUI's Continuous column (`A-c`) means:
+
+| Glyph | Meaning |
+|---|---|
+| spinner (green) | Session actively producing output — orchestrator mid-cycle, or a subtask agent working. |
+| `●` (white) | **Operator action needed** — the row's planning task is raw-`blocked` (a committed fix awaiting `/triage-review`, or an explicit human decision). Load-bearing: `blocked` means *operator-action-needed*, nothing else (a merged-but-monitoring subtask goes back to `running`). |
+| `◉` (cyan) + `↳ text` line | **Operator question parked** (`metadata.operator_question`) — the orchestrator needs an answer; the question renders inline under the row. |
+| `○` (yellow) sub-line | **Dispatch pending** — the operator unblocked an index issue (cleared `blocked_reason` + dated `OPERATOR` directive) and the orchestrator hasn't acknowledged (`operator_ack`) or spawned a live subtask for it yet. One line per issue, e.g. `○ PERF-083 · dispatch pending (2026-07-18)`. Clears on ack or dispatch (polled ~30s). |
+| `◇` (dim) | Idle, **orchestrator has it** — nothing needs you; the next fire advances it. |
+| `⟳` (yellow) | Remote attach stream lost; auto-reconnecting (daemon-side work keeps running). |
 
 ---
 
@@ -186,6 +203,6 @@ Never disable the old job until the new task has fired a real cycle successfully
 
 - `DESIGN_CONTINUOUS_TASKS.md` — architecture, scheduler, run-mode executors, funnel, roadmap.
 - `AGENT_ORCHESTRATION.md` — the MCP tool surface an orchestrator drives (start_session, create_subtask, list_sessions, global perms).
-- `DESIGN_CONTINUOUS_PANEL.md` — the Sessions-view continuous column (⚪/◇ indicator) the planning-status convention feeds.
+- `DESIGN_CONTINUOUS_PANEL.md` — the Sessions-view continuous column; authoritative glyph legend (implementation view of the legend above).
 - The `/triage-review` skill — the human review/merge counterpart.
 - Live templates: `~/.cm/continuous-tasks/{bug,perf,scraper,behavior}-triage/state.json`, `api-update/state.json` — copy a `default_prompt`.

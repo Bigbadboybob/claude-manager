@@ -21,6 +21,7 @@
 //! (Phase 4) and downstream fan-out (Phase 6) are later phases — their struct
 //! fields are defined here but inert.
 
+pub mod dispatch_pending;
 pub mod queue;
 pub mod runlog;
 pub mod scheduler;

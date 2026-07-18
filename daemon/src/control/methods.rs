@@ -9627,6 +9627,44 @@ pub fn continuous_list(
     Ok(json!({ "tasks": items }))
 }
 
+/// `continuous.dispatch_pending` — read-only scan of every REVIEWABLE
+/// continuous task's `.<task>/index.yaml` for issues an operator has
+/// unblocked (blocked_reason cleared + a dated `OPERATOR <date>` comment)
+/// that the orchestrator hasn't acknowledged yet. Parse-on-demand: no
+/// scheduler involvement, no persisted state — the TUI's dispatch-pending
+/// poller calls this and applies the final planning-liveness filter (drop
+/// issues whose `subtask_task_id` maps to a live planning task) against its
+/// own synced task rows. Operator-only (gated in `dispatch.rs`).
+///
+/// Only tasks with `review_kind` set are scanned — those are the
+/// orchestrators that keep an index in their worktree; for anything else
+/// (and for a missing/unreadable index) the scan is silently empty. See
+/// `crate::continuous::dispatch_pending` for the tolerant parser + the
+/// cycle-start ACK contract (HOWTO_CONTINUOUS_TASKS.md).
+///
+/// Returns `{ tasks: [ { task_id, issues: [ { issue_id, title?,
+/// directive_date, subtask_task_id? }, … ] }, … ] }` — one entry per
+/// reviewable task, issues possibly empty (so a consumer can replace its
+/// cache wholesale and stale flags clear).
+pub fn continuous_dispatch_pending(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    _params: &Value,
+) -> MethodResult {
+    let tasks = crate::continuous::task::load_all();
+    let items: Vec<Value> = tasks
+        .iter()
+        .filter(|t| t.review_kind.is_some())
+        .map(|t| {
+            let issues = crate::continuous::dispatch_pending::scan_task(
+                &t.worktree_path,
+                &t.task_id,
+            );
+            json!({ "task_id": t.task_id, "issues": issues })
+        })
+        .collect();
+    Ok(json!({ "tasks": items }))
+}
+
 /// `continuous.pause` params.
 #[derive(serde::Deserialize)]
 struct ContinuousPauseParams {

@@ -1243,6 +1243,104 @@ pub fn spawn_session_pollers(
     (Some(rx), threads)
 }
 
+/// `continuous.dispatch_pending` RPC — per continuous task, the index issues
+/// an operator has unblocked (cleared `blocked_reason` + dated `OPERATOR`
+/// comment) that the orchestrator hasn't acknowledged yet. Keyed by
+/// continuous task_id; tasks the daemon doesn't consider reviewable are
+/// absent. The caller still applies the planning-liveness filter (drop
+/// issues whose `subtask_task_id` maps to a live planning task) — the daemon
+/// doesn't see planning rows. Operator-only on the daemon side.
+pub fn rpc_continuous_dispatch_pending(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+) -> anyhow::Result<
+    std::collections::HashMap<String, Vec<cm_daemon::continuous::dispatch_pending::PendingIssue>>,
+> {
+    #[derive(serde::Deserialize)]
+    struct TaskIssues {
+        task_id: String,
+        #[serde(default)]
+        issues: Vec<cm_daemon::continuous::dispatch_pending::PendingIssue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Report {
+        #[serde(default)]
+        tasks: Vec<TaskIssues>,
+    }
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "continuous.dispatch_pending".into(),
+        params: serde_json::json!({}),
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    let result = resp
+        .result
+        .context("continuous.dispatch_pending response missing result")?;
+    let report: Report = serde_json::from_value(result)
+        .context("continuous.dispatch_pending result shape")?;
+    Ok(report
+        .tasks
+        .into_iter()
+        .map(|t| (t.task_id, t.issues))
+        .collect())
+}
+
+/// Background per-host `continuous.dispatch_pending` poller — one thread per
+/// configured host (INCLUDING local: orchestrators can run on any daemon)
+/// that, every `DISPATCH_PENDING_POLL_INTERVAL`, fetches the daemon's
+/// dispatch-pending report and posts `(host_id, per-task map)` on the
+/// returned channel. Mirrors [`spawn_session_pollers`]: the blocking RPC is
+/// fine off the main thread; the main loop only drains the channel. A
+/// cold/unreachable host — or an older daemon without the method — is
+/// silently skipped and retried next interval (graceful degradation: the
+/// indicator simply doesn't light up).
+pub fn spawn_dispatch_pending_pollers(
+    host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
+    hosts: &crate::hosts::HostsConfig,
+) -> (
+    Option<
+        std::sync::mpsc::Receiver<(
+            cm_daemon::host_id::HostId,
+            std::collections::HashMap<
+                String,
+                Vec<cm_daemon::continuous::dispatch_pending::PendingIssue>,
+            >,
+        )>,
+    >,
+    Vec<std::thread::JoinHandle<()>>,
+) {
+    const DISPATCH_PENDING_POLL_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(30);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut threads = Vec::new();
+    for host in &hosts.hosts {
+        let pool = std::sync::Arc::clone(host_pool);
+        let host_id = host.id.clone();
+        let tx = tx.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("cm-tui-dispatch-pending-{}", host_id.as_str()))
+            .spawn(move || loop {
+                if let Some(socket) = pool.live_socket_path(&host_id) {
+                    if let Ok(map) = rpc_continuous_dispatch_pending(
+                        &socket,
+                        crate::daemon_launch::operator_token(),
+                    ) {
+                        // App dropped the receiver → shut the thread down.
+                        if tx.send((host_id.clone(), map)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                std::thread::sleep(DISPATCH_PENDING_POLL_INTERVAL);
+            })
+            .expect("spawn dispatch-pending poll thread");
+        threads.push(thread);
+    }
+    drop(tx);
+    (Some(rx), threads)
+}
+
 /// `session.set_transcript_path` RPC. Sub-2b-1 review #1: the
 /// TUI's transcript-discovery detector (the
 /// `pending_jsonl_files` → `transcript_id` binding in

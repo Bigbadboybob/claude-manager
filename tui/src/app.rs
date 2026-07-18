@@ -3643,6 +3643,34 @@ pub struct App {
         cm_daemon::host_id::HostId,
         Vec<crate::client_session::DaemonSessionSummary>,
     >,
+    /// Background per-host `continuous.dispatch_pending` poller channel
+    /// (`spawn_dispatch_pending_pollers`; every host incl. local, 30s).
+    /// Drained per tick into `continuous_dispatch_pending`. `None` in tests.
+    pub dispatch_pending_rx: Option<
+        std::sync::mpsc::Receiver<(
+            cm_daemon::host_id::HostId,
+            std::collections::HashMap<
+                String,
+                Vec<cm_daemon::continuous::dispatch_pending::PendingIssue>,
+            >,
+        )>,
+    >,
+    /// Thread handles for the dispatch-pending pollers (lifecycle like
+    /// `_session_poll_threads`).
+    pub _dispatch_pending_threads: Vec<std::thread::JoinHandle<()>>,
+    /// Latest dispatch-pending report per host → per continuous task_id:
+    /// index issues an operator unblocked (dated OPERATOR directive, cleared
+    /// blocked_reason, no ack) that MAY still await orchestrator dispatch.
+    /// Replaced wholesale per host on every poller delivery, so cleared
+    /// directives drop out. The render path applies the final
+    /// planning-liveness filter (`session_dispatch_pending`).
+    pub continuous_dispatch_pending: std::collections::HashMap<
+        cm_daemon::host_id::HostId,
+        std::collections::HashMap<
+            String,
+            Vec<cm_daemon::continuous::dispatch_pending::PendingIssue>,
+        >,
+    >,
     /// Off-thread remote-attach worker. `Some` in production; `None` in tests
     /// (which exercise the synchronous inline reattach path). When present, the
     /// deferred-reattach drain DISPATCHES attaches to it instead of blocking the
@@ -3974,6 +4002,14 @@ impl App {
         // main thread so the adopt scan never blocks the UI on a remote RPC.
         let (session_poll_rx, _session_poll_threads) =
             crate::client_session::spawn_session_pollers(&host_pool, &hosts);
+        // Per-host dispatch-pending pollers (Continuous panel's ○ indicator).
+        // Skipped under cfg(test) — like `attach_worker` — so unit tests never
+        // spawn a thread that dials the developer's real local daemon socket.
+        let (dispatch_pending_rx, _dispatch_pending_threads) = if cfg!(test) {
+            (None, Vec::new())
+        } else {
+            crate::client_session::spawn_dispatch_pending_pollers(&host_pool, &hosts)
+        };
 
         // Push fanout worker. Owns its own thread; receives
         // owned snapshots from the main thread via mpsc and
@@ -4044,6 +4080,9 @@ impl App {
             session_poll_rx,
             _session_poll_threads,
             remote_session_lists: std::collections::HashMap::new(),
+            dispatch_pending_rx,
+            _dispatch_pending_threads,
+            continuous_dispatch_pending: std::collections::HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             hosts,
             host_pool,
@@ -5164,6 +5203,26 @@ impl App {
             .unwrap_or_default();
         for (host, summaries) in drained {
             self.remote_session_lists.insert(host, summaries);
+        }
+        // Drain the dispatch-pending pollers likewise (cheap, non-blocking).
+        // Each delivery REPLACES that host's report wholesale, so a directive
+        // the orchestrator has since acked/dispatched drops off the panel.
+        let dp_drained: Vec<(
+            cm_daemon::host_id::HostId,
+            std::collections::HashMap<
+                String,
+                Vec<cm_daemon::continuous::dispatch_pending::PendingIssue>,
+            >,
+        )> = self
+            .dispatch_pending_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for (host, map) in dp_drained {
+            if self.continuous_dispatch_pending.get(&host) != Some(&map) {
+                self.needs_redraw = true;
+            }
+            self.continuous_dispatch_pending.insert(host, map);
         }
         // Never adopt before the manifest is restored. Against an empty
         // `self.workspaces` every manifest-backed daemon session looks
@@ -15295,6 +15354,53 @@ impl App {
         }
     }
 
+    /// Dispatch-pending issues to render under an orchestrator row (gap found
+    /// 2026-07-18): index issues an operator UNBLOCKED (cleared
+    /// `blocked_reason` + dated `OPERATOR` directive, per the daemon's
+    /// `continuous.dispatch_pending` scan) that the orchestrator has neither
+    /// acknowledged (`operator_ack`) nor dispatched. The daemon can't see
+    /// planning rows, so the liveness half of "not dispatched" is applied
+    /// HERE: an issue whose `subtask_task_id` maps to a live planning task is
+    /// dropped — the orchestrator already acted on it.
+    fn session_dispatch_pending(
+        &self,
+        ts: &TerminalSession,
+    ) -> Vec<&cm_daemon::continuous::dispatch_pending::PendingIssue> {
+        let Some(ct) = ts.continuous_task_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(issues) = self
+            .continuous_dispatch_pending
+            .get(&ts.host_id)
+            .and_then(|m| m.get(ct))
+        else {
+            return Vec::new();
+        };
+        issues
+            .iter()
+            .filter(|i| Self::issue_awaits_dispatch(i, &self.tasks))
+            .collect()
+    }
+
+    /// Planning-liveness half of the dispatch-pending predicate. Pure, so
+    /// it's unit-testable without an App: an issue still awaits dispatch
+    /// unless its `subtask_task_id` maps to a non-done planning row (Done —
+    /// or a task_id the board doesn't know, e.g. long-archived — is NOT
+    /// live: a finished subtask doesn't clear a directive, only the
+    /// orchestrator's ack or a fresh dispatch does).
+    fn issue_awaits_dispatch(
+        issue: &cm_daemon::continuous::dispatch_pending::PendingIssue,
+        tasks: &[TaskEntry],
+    ) -> bool {
+        match issue.subtask_task_id.as_deref() {
+            None => true,
+            Some(tid) => !tasks.iter().any(|t| {
+                t.task_id.as_deref() == Some(tid)
+                    && !matches!(t.api_status, TaskStatus::Done)
+            }),
+        }
+    }
+
     fn draw_continuous_column(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -15317,6 +15423,14 @@ impl App {
             // P3 (Feature 1): a parked operator-question wins the idle glyph and
             // adds a dim inline text line below the row (see the second Line push).
             let question = self.session_question(ts);
+            // Dispatch-pending sub-lines (hollow yellow ○): operator-unblocked
+            // index issues the orchestrator hasn't acted on yet. Orchestrator
+            // rows only — a subtask row can't own index-level state.
+            let pending = if r.depth == 0 {
+                self.session_dispatch_pending(ts)
+            } else {
+                Vec::new()
+            };
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(Color::Yellow))
             } else if ts.hidden {
@@ -15329,6 +15443,10 @@ impl App {
                     // ● (white) = the operator must act (fix-ready to review, or an
                     // explicit human decision — raw planning status `blocked`); ◇
                     // (dim) = the orchestrator will advance it on its next fire.
+                    // (A fourth state — ○ hollow yellow, dispatch pending — is a
+                    // per-ISSUE sub-line below the row, not a row glyph: the
+                    // operator unblocked an index issue and the orchestrator
+                    // hasn't acked/dispatched it yet.)
                     SessionStatus::Idle => {
                         if question.is_some() {
                             ("\u{25c9}", Style::default().fg(Color::Cyan))
@@ -15414,6 +15532,27 @@ impl App {
                     Span::styled(
                         format!("\u{21b3} {}", qtext),
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
+            // Dispatch-pending issues: one hollow-yellow ○ line each, under
+            // the orchestrator row (same visual slot as the question line) —
+            // approved-awaiting-dispatch is visible without attaching, and
+            // distinct from ● (operator must act) / ◇ (orchestrator has it).
+            for issue in &pending {
+                let imax = (inner.width as usize).saturating_sub(prefix_cells + 2);
+                let itext = crate::planning::truncate_with_ellipsis(
+                    &format!(
+                        "{} · dispatch pending ({})",
+                        issue.issue_id, issue.directive_date
+                    ),
+                    imax,
+                );
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(prefix_cells)),
+                    Span::styled(
+                        format!("\u{25cb} {}", itext),
+                        Style::default().fg(Color::Yellow),
                     ),
                 ]));
             }
@@ -17484,6 +17623,75 @@ mod operator_question_tests {
             None
         );
         assert_eq!(App::extract_operator_question(None), None);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_pending_filter_tests {
+    //! Planning-liveness half of the Continuous panel's dispatch-pending
+    //! (○) indicator: `issue_awaits_dispatch`. The parse half (cleared
+    //! blocked_reason + dated OPERATOR directive + no ack) is tested
+    //! daemon-side in `cm_daemon::continuous::dispatch_pending`.
+    use super::*;
+    use cm_daemon::continuous::dispatch_pending::PendingIssue;
+
+    fn issue(subtask: Option<&str>) -> PendingIssue {
+        PendingIssue {
+            issue_id: "PERF-083".into(),
+            title: None,
+            directive_date: "2026-07-18".into(),
+            subtask_task_id: subtask.map(String::from),
+        }
+    }
+
+    fn task(task_id: &str, status: TaskStatus) -> TaskEntry {
+        TaskEntry {
+            task_id: Some(task_id.into()),
+            name: task_id.into(),
+            api_status: status,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn no_subtask_awaits_dispatch() {
+        // The PERF-083 exemplar: directive written, nothing spawned yet.
+        assert!(App::issue_awaits_dispatch(&issue(None), &[]));
+    }
+
+    #[test]
+    fn live_subtask_means_already_dispatched() {
+        // The PERF-088 exemplar: OPERATOR comment present, but its subtask
+        // maps to a running planning task → the orchestrator already acted.
+        for status in [TaskStatus::Running, TaskStatus::Blocked, TaskStatus::Backlog] {
+            let tasks = vec![task("94e3b1aa", status.clone())];
+            assert!(
+                !App::issue_awaits_dispatch(&issue(Some("94e3b1aa")), &tasks),
+                "{:?} subtask must suppress the indicator",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn done_or_unknown_subtask_still_awaits() {
+        // A finished (or archived-away) subtask doesn't clear a directive —
+        // only the orchestrator's ack or a fresh dispatch does.
+        let done = vec![task("94e3b1aa", TaskStatus::Done)];
+        assert!(App::issue_awaits_dispatch(&issue(Some("94e3b1aa")), &done));
+        let unrelated = vec![task("other-task", TaskStatus::Running)];
+        assert!(App::issue_awaits_dispatch(&issue(Some("94e3b1aa")), &unrelated));
+        assert!(App::issue_awaits_dispatch(&issue(Some("94e3b1aa")), &[]));
     }
 }
 
@@ -22329,6 +22537,89 @@ mod remote_reconnect_tests {
         assert!(
             app.continuous_members().contains(&(0, 1)),
             "the orphaned subtask must be classified as a continuous member",
+        );
+
+        match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Dispatch-pending (○) wiring: `session_dispatch_pending` resolves the
+    /// poller cache by (host, continuous_task_id) and applies the
+    /// planning-liveness filter — the PERF-083 / PERF-088 exemplar from the
+    /// 2026-07-18 gap: an issue with no subtask stays pending; one whose
+    /// subtask maps to a live planning task drops; a report cached under a
+    /// DIFFERENT host never bleeds onto this host's orchestrator row.
+    #[test]
+    fn session_dispatch_pending_keys_by_host_and_filters_live_subtasks() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
+        app.workspaces.clear();
+
+        let (mut orch, _tx, _teof) =
+            session_with_injected_exit("orch", manager_host(), false);
+        orch.continuous_task_id = Some("perf-triage".into());
+        orch.label = "Perf Triage Orchestrator".into();
+        app.workspaces.push(workspace_with(orch));
+
+        let issue = |id: &str, subtask: Option<&str>| {
+            cm_daemon::continuous::dispatch_pending::PendingIssue {
+                issue_id: id.into(),
+                title: None,
+                directive_date: "2026-07-18".into(),
+                subtask_task_id: subtask.map(String::from),
+            }
+        };
+        // The live subtask planning row that suppresses PERF-088.
+        app.tasks.push(TaskEntry {
+            task_id: Some("94e3b1aa".into()),
+            name: "perf-088-investigate".into(),
+            api_status: TaskStatus::Running,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+        let report: std::collections::HashMap<_, _> = [(
+            "perf-triage".to_string(),
+            vec![issue("PERF-088", Some("94e3b1aa")), issue("PERF-083", None)],
+        )]
+        .into();
+
+        // Cached under the WRONG host → nothing renders for this session.
+        app.continuous_dispatch_pending
+            .insert(cm_daemon::host_id::HostId::local(), report.clone());
+        let ts = &app.workspaces[0].sessions[0];
+        assert!(
+            app.session_dispatch_pending(ts).is_empty(),
+            "a local-host report must not light a manager-host orchestrator",
+        );
+
+        // Cached under the session's host → PERF-083 only.
+        app.continuous_dispatch_pending
+            .insert(manager_host(), report);
+        let ts = &app.workspaces[0].sessions[0];
+        let pending = app.session_dispatch_pending(ts);
+        assert_eq!(
+            pending.iter().map(|i| i.issue_id.as_str()).collect::<Vec<_>>(),
+            vec!["PERF-083"],
+            "live-subtask PERF-088 must be filtered; subtask-less PERF-083 stays",
         );
 
         match orig {
