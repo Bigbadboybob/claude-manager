@@ -236,8 +236,11 @@ LOCAL_DSN="postgresql://predictionuser:predictionpass@localhost:5432/predictiond
 # ---------------------------------------------------------------------------
 BRANCH="${BT_BRANCH:-$REPO_BRANCH}"
 # Deploy keys authenticate over SSH — normalize an https origin to the
-# git@github.com form (a git@ origin passes through unchanged).
-SSH_URL=$(echo "$REPO_URL" | sed -E "s|https://github.com/([^/]+)/([^/]+?)(\.git)?$|git@github.com:\1/\2.git|")
+# Normalize an https github URL to the git@ SSH form (deploy-key auth); a git@
+# origin passes through unchanged. Swap ONLY the host prefix: GNU sed has no lazy
+# quantifier, so the old "([^/]+?)(\.git)?$" pattern doubled the suffix into
+# repo.git.git and clone-failed on any .git-suffixed https URL.
+SSH_URL=$(echo "$REPO_URL" | sed -E "s|^https://github.com/|git@github.com:|")
 if ! git clone -b "$BRANCH" "$SSH_URL" /workspace; then
     echo "[cm-backtest] FATAL: clone failed ($REPO_URL @ $BRANCH)"
     post_artifact "$(python3 -c "
