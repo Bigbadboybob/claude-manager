@@ -110,6 +110,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Operator-only reviewer auto-A-d (cm-notify / Telegram flow). No MCP
     # tool routes it. Listed for dispatch-surface alignment only.
     "operator.mark_subtask_done",
+    # TUI-called dispatch-pending indicator flow for operator-unblocked
+    # index issues. No MCP tool routes it. Listed for dispatch-surface
+    # alignment only.
+    "continuous.dispatch_pending",
     # Operator-only grant of global session permissions (TUI A-e toggle →
     # this RPC). No MCP tool routes it — an agent escalates via
     # start_session(global_perms=true), not this. Listed for dispatch-surface
