@@ -2653,7 +2653,7 @@ mod remote_reconnect_tests {
             cm_daemon::state::DaemonState::new(),
         ));
         let (stop, dhandle) =
-            super::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
+            crate::app::events::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
 
         let (mut app, ghost) = app_with_daemon_host(&cm_dir, &mgr_sock);
         let (ts, _tx, _teof) =
@@ -2723,7 +2723,7 @@ mod remote_reconnect_tests {
             cm_daemon::state::DaemonState::new(),
         ));
         let (stop, dhandle) =
-            super::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
+            crate::app::events::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
 
         let (mut app, ghost) = app_with_daemon_host(&cm_dir, &mgr_sock);
         // An EMPTY workspace (no slot for the uid) → the drain takes the FRESH
