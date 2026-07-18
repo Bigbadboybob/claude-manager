@@ -22,6 +22,16 @@ impl<'a> TerminalWidget<'a> {
     }
 }
 
+/// Current scrollback offset of `term`, in lines scrolled up from the live
+/// tail. `0` = the viewport is pinned to the tail (what `render` shows is
+/// live output). Same value `render` reads per-frame from
+/// `renderable_content().display_offset`; exposed so chrome (the terminal
+/// pane's "▲ scrollback" cue) can check it before the widget is built.
+/// Briefly locks the term.
+pub fn scrollback_offset(term: &Arc<FairMutex<Term<EventProxy>>>) -> usize {
+    term.lock().grid().display_offset()
+}
+
 impl Widget for TerminalWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let term = self.term.lock();

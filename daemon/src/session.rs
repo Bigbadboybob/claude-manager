@@ -1183,6 +1183,8 @@ impl DaemonSession {
             continuous_task_id: self.continuous_task_id.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: false,
+            // TUI-only presentation field (see doc comment above).
+            color: None,
             // S2: carry the cap triple so restore can re-apply the
             // argv-level systemd-run wrap (a memory cap is NOT inherited
             // across a process restart — it must be reconstructed).

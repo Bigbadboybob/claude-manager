@@ -1916,6 +1916,8 @@ mod tests {
         state_inner.workspaces.insert(
             ws_id.into(),
             cm_daemon::manifest::ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: ws_id.into(),
                 name: "test-ws".into(),
                 is_closed: false,
@@ -3890,8 +3892,16 @@ mod tests {
         // 'A'-byte count reaches payload_len. If chunking is
         // broken pre-fix5, the daemon dropped the whole 200 KiB
         // frame and the count stays at 0.
+        //
+        // The deadline is throughput headroom, not correctness: with
+        // 700+ tests running concurrently (many spawning their own
+        // PTYs/daemons) the echo can starve past 8s with a partial
+        // count that varies run to run. The regression this guards
+        // (oversized frames rejected by the daemon cap) pins the
+        // count at 0 regardless of deadline, so a generous budget
+        // costs nothing on the failure mode that matters.
         let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(8);
+            std::time::Instant::now() + std::time::Duration::from_secs(45);
         let mut a_count: usize = 0;
         let mut total_bytes: usize = 0;
         while std::time::Instant::now() < deadline {

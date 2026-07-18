@@ -513,11 +513,13 @@ fn with_stub_ctx<T>(f: impl FnOnce(AgentCtx<'_>) -> T) -> T {
     )
     .expect("dummy session");
     let ts = crate::app::TerminalSession {
+        color: None,
         uid: "test".into(),
         label: "test".into(),
         session_type: "claude".into(),
         session,
         status: crate::app::SessionStatus::Idle,
+        idle_since: None,
         last_write_at: None,
         transcript_id: None,
         generation: 0,
@@ -700,11 +702,13 @@ fn make_codex_test_session(transcript_id: &str) -> crate::app::TerminalSession {
     )
     .expect("dummy session");
     crate::app::TerminalSession {
+        color: None,
         uid: "codex-test".into(),
         label: "codex-test".into(),
         session_type: "codex".into(),
         session,
         status: crate::app::SessionStatus::Idle,
+        idle_since: None,
         last_write_at: None,
         transcript_id: Some(transcript_id.into()),
         generation: 0,

@@ -6,7 +6,7 @@ use alacritty_terminal::event::Event as TermEvent;
 use alacritty_terminal::term::TermMode;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
@@ -20,6 +20,7 @@ use crate::input;
 use crate::planning::{PlanAction, PlanningView, WorkspaceCandidate};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
+use crate::theme;
 use crate::workflow::{self, toml_schema::Engine, Workflow, WorkflowRun};
 // These live in `workflow::observer` now (workflow-observation glue split out
 // of this file); re-import so the call sites here read unchanged.
@@ -43,21 +44,38 @@ const SPINNER_INTERVAL_MS: u128 = 80;
 /// through the rainbow so it pops against the steady green-spinner / white-dot
 /// indicators around it.
 const ALERT_FRAME_MS: u128 = 120;
-/// Glyph pulse — the bead grows then shrinks. 6 frames.
+/// Glyph pulse — the bead grows then shrinks. 6 frames. The color it cycles
+/// through per frame is `theme::ALERT_RAINBOW`.
 const ALERT_PULSE: &[&str] = &["\u{00b7}", "\u{2022}", "\u{25cf}", "\u{25c9}", "\u{25cf}", "\u{2022}"];
-/// Rainbow the alert color cycles through, one step per frame. 7 colors —
-/// coprime with the 6-frame pulse, so the glyph size and color never re-lock
-/// into a short loop (full repeat period is lcm(6,7)=42 frames ≈ 5s), keeping
-/// the bead visually lively the whole time it's pending.
-const ALERT_RAINBOW: &[Color] = &[
-    Color::Rgb(255, 70, 70),   // red
-    Color::Rgb(255, 140, 0),   // orange
-    Color::Rgb(255, 225, 50),  // yellow
-    Color::Rgb(90, 230, 90),   // green
-    Color::Rgb(60, 220, 220),  // cyan
-    Color::Rgb(90, 150, 255),  // blue
-    Color::Rgb(225, 90, 230),  // magenta
-];
+
+/// Value spans for a color-picker field in the A-e settings dialogs: a
+/// "none" slot plus one swatch per `theme::USER_COLORS` entry, the current
+/// selection bracketed. Callers style their own label; a ←/→ hint is
+/// appended while the field is focused.
+fn color_picker_spans(current: Option<&str>, focused: bool) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme::DIM);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        if current.is_none() { "[none]" } else { " none " },
+        if current.is_none() {
+            Style::default().fg(theme::TEXT)
+        } else {
+            dim
+        },
+    ));
+    for (name, color) in theme::USER_COLORS {
+        let marker = if current == Some(*name) {
+            "[\u{25a0}]"
+        } else {
+            " \u{25a0} "
+        };
+        spans.push(Span::styled(marker, Style::default().fg(*color)));
+    }
+    if focused {
+        spans.push(Span::styled("  \u{2190}/\u{2192}", dim));
+    }
+    spans
+}
 /// Width of the Sessions-view sidebar in cells. The terminal panel takes the
 /// remaining width minus its own border (see `SIDEBAR_WIDTH + 2` in main.rs
 /// when sizing the PTY).
@@ -91,6 +109,298 @@ pub enum SessionStatus {
     Idle,
 }
 
+/// An idle session stays in "afterglow" (bright warm dot — it probably just
+/// finished and wants eyes) for this long after going idle.
+const IDLE_AFTERGLOW_WINDOW: Duration = Duration::from_secs(2 * 60);
+/// Past this idle age a session is "stale" — dim dot + dimmed label; it's
+/// been waiting long enough that it's background noise, not a fresh signal.
+const IDLE_STALE_THRESHOLD: Duration = Duration::from_secs(30 * 60);
+
+/// Display bucket for an idle session's age. Ordering of the variants is
+/// young → old.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdleAgeBucket {
+    /// Went idle < [`IDLE_AFTERGLOW_WINDOW`] ago: warm bright highlight.
+    Afterglow,
+    /// Between the two thresholds: the normal white idle dot.
+    Settled,
+    /// Idle > [`IDLE_STALE_THRESHOLD`] — or the age is unknown (`None`,
+    /// e.g. the spell started before a TUI restart): dimmed.
+    Stale,
+}
+
+/// Pure bucket classifier over "how long has this session been idle".
+/// `None` = unknown age → treated as old ([`IdleAgeBucket::Stale`]).
+fn idle_age_bucket(idle_for: Option<Duration>) -> IdleAgeBucket {
+    match idle_for {
+        Some(d) if d < IDLE_AFTERGLOW_WINDOW => IdleAgeBucket::Afterglow,
+        Some(d) if d < IDLE_STALE_THRESHOLD => IdleAgeBucket::Settled,
+        _ => IdleAgeBucket::Stale,
+    }
+}
+
+/// Bucket for a session's `idle_since` stamp as of `now`. Saturates to a
+/// zero age if `idle_since` is somehow in the future.
+fn idle_age_bucket_at(idle_since: Option<Instant>, now: Instant) -> IdleAgeBucket {
+    idle_age_bucket(idle_since.map(|t| now.saturating_duration_since(t)))
+}
+
+/// Pure candidate picker for the A-g "next needs attention" jump.
+///
+/// `rows` is every session row in sidebar visual order, projected down to
+/// `(has_alert, is_idle, hidden)`. Candidates are, in priority order:
+///   1. rows with a pending `notify_user` alert (alerts override hidden,
+///      matching the sidebar indicator), in visual order;
+///   2. idle, non-hidden rows without an alert, in visual order.
+/// `current` is the cursor's position in `rows` (if it's on a session row).
+/// Returns the row index to jump to: the candidate after `current` in the
+/// priority-ordered ring (wrapping), or the top-priority candidate when the
+/// cursor isn't on a candidate. `None` = nothing needs attention.
+fn next_attention_index(
+    rows: &[(bool, bool, bool)],
+    current: Option<usize>,
+) -> Option<usize> {
+    let mut candidates: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (has_alert, _, _))| *has_alert)
+        .map(|(i, _)| i)
+        .collect();
+    candidates.extend(
+        rows.iter()
+            .enumerate()
+            .filter(|(_, (has_alert, is_idle, hidden))| {
+                !*has_alert && *is_idle && !*hidden
+            })
+            .map(|(i, _)| i),
+    );
+    if candidates.is_empty() {
+        return None;
+    }
+    let cur_pos = current.and_then(|c| candidates.iter().position(|&i| i == c));
+    Some(match cur_pos {
+        Some(p) => candidates[(p + 1) % candidates.len()],
+        None => candidates[0],
+    })
+}
+
+// ── MRU quick-switch (A-;) ──────────────────────────────────────
+
+/// Most-recently-used session history depth. Enough to alt-tab through a
+/// realistic working set without the deque growing unbounded.
+const SESSION_MRU_CAP: usize = 16;
+
+/// Record `prev_uid` as the most recent focus in the MRU deque:
+/// dedup (an old occurrence moves to the front), push front, cap.
+fn mru_record(mru: &mut VecDeque<String>, prev_uid: &str, cap: usize) {
+    mru.retain(|u| u != prev_uid);
+    mru.push_front(prev_uid.to_string());
+    mru.truncate(cap);
+}
+
+/// In-progress A-; walk: the MRU ring frozen at the first press plus the
+/// current position in it. Slot 0 is the walk's starting focus (or a
+/// sentinel that never resolves when the walk started on a non-session
+/// row), so wrapping cycles back through the start like classic alt-tab.
+/// Cleared by any OTHER key press (see `handle_event`) — the closest a
+/// TUI can get to "the modifier was released".
+#[derive(Clone, Debug)]
+struct MruWalk {
+    list: Vec<String>,
+    pos: usize,
+}
+
+/// Pure walk-step picker for the A-; quick-switch. Scans forward from
+/// `pos + 1` (wrapping) for the first entry that `resolves` to a live,
+/// jumpable session and isn't the currently-focused uid. Returns the new
+/// walk position; `None` when nothing else in the ring is reachable.
+fn mru_next_walk_target(
+    list: &[String],
+    pos: usize,
+    current: Option<&str>,
+    resolves: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    if list.is_empty() {
+        return None;
+    }
+    let n = list.len();
+    let mut p = pos;
+    for _ in 0..n {
+        p = (p + 1) % n;
+        let uid = list[p].as_str();
+        if Some(uid) != current && resolves(uid) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// ── Fuzzy-find palette (A-p) ────────────────────────────────────
+
+/// Rows shown in the palette at once ("top ~15 matches").
+const PALETTE_MAX_RESULTS: usize = 15;
+
+/// What a palette row jumps to. Stored as stable IDs (session uid /
+/// workspace id), resolved against the live rows at submit time — a
+/// backend reconcile can reorder `App::workspaces` while the modal is
+/// open, so indices would misjump (same pattern as `SaveSnapshot`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PaletteTarget {
+    Session { uid: String },
+    Workspace { ws_id: String },
+}
+
+/// One searchable row in the A-p palette, snapshotted at modal open.
+#[derive(Clone, Debug)]
+pub(crate) struct PaletteCandidate {
+    pub target: PaletteTarget,
+    pub display: String,
+}
+
+/// Pure palette matcher: case-insensitive SUBSTRING filter over
+/// `displays`, ranked prefix-matches first, then other substring matches,
+/// each group in original (sidebar) order. Empty query = everything in
+/// order. Returns indices into `displays`.
+fn palette_match_indices(query: &str, displays: &[&str]) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return (0..displays.len()).collect();
+    }
+    let mut prefix: Vec<usize> = Vec::new();
+    let mut substr: Vec<usize> = Vec::new();
+    for (i, d) in displays.iter().enumerate() {
+        let dl = d.to_lowercase();
+        if dl.starts_with(&q) {
+            prefix.push(i);
+        } else if dl.contains(&q) {
+            substr.push(i);
+        }
+    }
+    prefix.extend(substr);
+    prefix
+}
+
+// ── Task-detail peek (A-i) ──────────────────────────────────────
+
+/// One logical line of the A-i info overlay, in plain data so the
+/// assembly functions below stay pure/unit-testable. The draw maps each
+/// variant to its style (labels DIM, values TEXT, title TEXT+BOLD,
+/// status colored by `TaskStatus`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PeekLine {
+    /// Headline (task or workspace name): TEXT + BOLD.
+    Title(String),
+    /// `label: value` — label DIM, value TEXT.
+    Field { label: String, value: String },
+    /// Task status line — value colored by the status.
+    Status { value: String, status: TaskStatus },
+    /// Free text (prompt body, session list rows): TEXT.
+    Text(String),
+    Blank,
+}
+
+fn task_status_label(s: &TaskStatus) -> &'static str {
+    match s {
+        TaskStatus::Running => "running",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Backlog => "backlog",
+        TaskStatus::Done => "done",
+    }
+}
+
+/// Peek body for a bound task: name, status, metadata, and the full
+/// prompt (the main payload — "what was this agent asked to do").
+/// `parent_name` is the resolved parent task's name when the caller
+/// could find it; the raw id is shown otherwise.
+fn peek_task_lines(task: &TaskEntry, parent_name: Option<&str>) -> Vec<PeekLine> {
+    let mut out = vec![
+        PeekLine::Title(task.name.clone()),
+        PeekLine::Status {
+            value: task_status_label(&task.api_status).to_string(),
+            status: task.api_status.clone(),
+        },
+    ];
+    if let Some(p) = task.project.as_deref() {
+        out.push(PeekLine::Field { label: "Project".into(), value: p.to_string() });
+    }
+    if let Some(pid) = task.parent_task_id.as_deref() {
+        let shown = parent_name.unwrap_or(pid).to_string();
+        out.push(PeekLine::Field { label: "Parent".into(), value: shown });
+    }
+    if let Some(b) = task.wip_branch.as_deref() {
+        out.push(PeekLine::Field { label: "Branch".into(), value: b.to_string() });
+    }
+    out.push(PeekLine::Blank);
+    out.push(PeekLine::Field { label: "Prompt".into(), value: String::new() });
+    match task.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            for l in p.lines() {
+                out.push(PeekLine::Text(l.to_string()));
+            }
+        }
+        None => out.push(PeekLine::Text("(no prompt)".into())),
+    }
+    out
+}
+
+/// Peek fallback when no task is bound: the workspace's identity plus its
+/// session roster. `sessions` rows are `(label, type, status)`.
+fn peek_workspace_lines(
+    name: &str,
+    worktree_path: Option<&str>,
+    main_repo_path: Option<&str>,
+    repo_url: Option<&str>,
+    host: &str,
+    sessions: &[(String, String, String)],
+) -> Vec<PeekLine> {
+    let mut out = vec![PeekLine::Title(name.to_string())];
+    if let Some(p) = worktree_path {
+        out.push(PeekLine::Field { label: "Worktree".into(), value: p.to_string() });
+    }
+    if let Some(p) = main_repo_path {
+        out.push(PeekLine::Field { label: "Main repo".into(), value: p.to_string() });
+    }
+    if let Some(u) = repo_url {
+        out.push(PeekLine::Field { label: "Repo".into(), value: u.to_string() });
+    }
+    out.push(PeekLine::Field { label: "Host".into(), value: host.to_string() });
+    out.push(PeekLine::Blank);
+    out.push(PeekLine::Field { label: "Sessions".into(), value: String::new() });
+    if sessions.is_empty() {
+        out.push(PeekLine::Text("(none)".into()));
+    } else {
+        for (label, stype, status) in sessions {
+            out.push(PeekLine::Text(format!("{} ({}) \u{2014} {}", label, stype, status)));
+        }
+    }
+    out
+}
+
+/// Peek header block for a Session cursor: identity + provenance + the
+/// last delivered prompt snippet when one is recorded.
+fn peek_session_lines(
+    label: &str,
+    session_type: &str,
+    uid: &str,
+    seeded_from: Option<&str>,
+    last_delivery: Option<&str>,
+) -> Vec<PeekLine> {
+    let mut out = vec![
+        PeekLine::Field {
+            label: "Session".into(),
+            value: format!("{} ({})", label, session_type),
+        },
+        PeekLine::Field { label: "Uid".into(), value: uid.to_string() },
+    ];
+    if let Some(s) = seeded_from {
+        out.push(PeekLine::Field { label: "Seeded from".into(), value: s.to_string() });
+    }
+    if let Some(d) = last_delivery {
+        out.push(PeekLine::Field { label: "Last prompt".into(), value: d.to_string() });
+    }
+    out
+}
+
 pub struct TerminalSession {
     /// Stable per-session id, generated at creation. Used to track the cursor
     /// across reconciles so duplicate labels don't confuse restoration.
@@ -100,6 +410,14 @@ pub struct TerminalSession {
     pub session_type: String, // "claude" or "bash" — immutable, survives renames
     pub session: Session,
     pub status: SessionStatus,
+    /// Start of the CURRENT idle spell — `Some(instant the status last
+    /// flipped Running→Idle)`, `None` while Running. Drives the idle-age
+    /// indicator buckets (afterglow / settled / stale) in the sidebar and
+    /// continuous column. In-memory only, never persisted: a TUI restart
+    /// just loses the age, and an unknown age renders as the oldest
+    /// bucket. Maintain via [`TerminalSession::set_status`] — direct
+    /// `status` writes on genuine transitions would strand a stale value.
+    pub idle_since: Option<Instant>,
     pub last_write_at: Option<Instant>,
     /// Current transcript file UUID (the JSONL filename). Unstable: `None`
     /// until the detector binds to a fresh file, and reset to `None` on
@@ -149,6 +467,10 @@ pub struct TerminalSession {
     /// If true, fire a desktop notification each time this session
     /// transitions Running → Idle. Off by default; toggled in A-e settings.
     pub notify_on_idle: bool,
+    /// User-assigned accent color — a name from `USER_COLORS`, set in
+    /// A-e settings. `None` = inherit the workspace color (or default
+    /// styling). Persisted via `ManifestEntry`.
+    pub color: Option<String>,
     /// Global-permissions grant. When true, this session's MCP
     /// agent can prompt, read, and control ANY other session
     /// (not just its task-tree descendants) — the TUI-side mirror
@@ -208,6 +530,23 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    /// Assign a new status while maintaining `idle_since` (the start of
+    /// the current idle spell): a genuine Running→Idle flip stamps
+    /// `Some(now)`, Idle→Running clears it back to `None`. Idempotent on
+    /// a repeated same-status assignment — a poll/reconnect path
+    /// re-asserting Idle must NOT restart the idle age (that would pin
+    /// the row in the bright "afterglow" bucket forever). Use this at
+    /// every production `status` write; only tests poke the field raw.
+    pub(crate) fn set_status(&mut self, new: SessionStatus) {
+        if self.status != new {
+            self.idle_since = match new {
+                SessionStatus::Idle => Some(Instant::now()),
+                SessionStatus::Running => None,
+            };
+        }
+        self.status = new;
+    }
+
     /// Rebind the session to a new transcript file (or `None` to mark the
     /// session as transcript-less while a fresh one is being detected).
     /// Bumps `generation` so any reader holding a cursor against the old
@@ -246,6 +585,7 @@ impl TerminalSession {
             continuous_task_id: self.continuous_task_id.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: self.notify_on_idle,
+            color: self.color.clone(),
             global_perms: self.global_perms,
             seeded_from_snapshot: self.seeded_from_snapshot.clone(),
             // Read-modify-write the daemon-owned `last_exit`. The TUI
@@ -468,6 +808,14 @@ pub struct Workspace {
     /// DESIGN_REMOVE_GLOBAL_HOST.md). Persisted in `ManifestWorkspace`;
     /// legacy manifests without it derive it from the first session's host.
     pub host_id: cm_daemon::host_id::HostId,
+    /// User-assigned accent color (name from `USER_COLORS`), set in A-e
+    /// settings. Cascades to sessions without their own color. Persisted
+    /// in `ManifestWorkspace`.
+    pub color: Option<String>,
+    /// Pinned workspaces sort to the top of the sidebar, ahead of the
+    /// status-ranked rest. Toggled in A-e settings; persisted in
+    /// `ManifestWorkspace`.
+    pub pinned: bool,
     pub sessions: Vec<TerminalSession>,
     /// Records of closed sessions in this workspace. Resolver consults
     /// these (after `sessions`) to answer `read_session_output` for an
@@ -1068,11 +1416,13 @@ fn make_simple_session_with_uid(
     pending_jsonl_files: Option<Vec<String>>,
 ) -> TerminalSession {
     TerminalSession {
+        color: None,
         uid,
         label: label.to_string(),
         session_type: session_type.to_string(),
         session,
         status: SessionStatus::Running,
+        idle_since: None,
         last_write_at: None,
         transcript_id: None,
         generation: 0,
@@ -1410,7 +1760,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     ts.pending_clear = None;
     ts.pending_enter = None;
     ts.last_delivery = None;
-    ts.status = SessionStatus::Idle;
+    ts.set_status(SessionStatus::Idle);
     // Kick a resize so the freshly-resumed agent (e.g. `claude
     // --resume`) repaints right away. The new Session's terminal
     // grid starts blank; the Resize msg drives a SIGWINCH to the
@@ -1717,19 +2067,29 @@ enum InputMode {
         /// Global-permissions grant. When on, this session's MCP agent
         /// can prompt/read/control ANY session, not just descendants.
         global_perms: bool,
+        /// Accent color for this session's sidebar row — a `USER_COLORS`
+        /// name, cycled with Space/←/→. `None` = inherit workspace color.
+        color: Option<String>,
         /// Read-only provenance: name of the agent-memory snapshot this
         /// session was cloned from, if any. Surfaced at the bottom of the
         /// dialog when `Some`. Not editable from settings.
         seeded_from_snapshot: Option<String>,
         /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden,
-        /// 4 = notify on idle, 5 = global perms
+        /// 4 = notify on idle, 5 = global perms, 6 = color
         active_field: u8,
     },
-    /// Renaming a workspace. Only the display label changes — the branch
-    /// and worktree path stay the same.
+    /// Workspace settings: display label (branch and worktree path stay
+    /// the same), accent color, and the pinned flag.
     WorkspaceSettings {
         ws_index: usize,
         name: String,
+        /// Accent color (`USER_COLORS` name); cascades to the workspace's
+        /// sessions unless they set their own.
+        color: Option<String>,
+        /// Pinned workspaces sort to the top of the sidebar.
+        pinned: bool,
+        /// 0 = name, 1 = color, 2 = pinned
+        active_field: u8,
     },
     /// Save the focused session as a named agent-memory snapshot. Opened
     /// via A-b in Sessions view; see `DESIGN_AGENT_MEMORIES.md` (chunk 3).
@@ -1776,11 +2136,16 @@ enum InputMode {
         /// input so it doesn't linger across mode transitions.
         status_msg: Option<String>,
     },
-    /// Renaming a task (updates the `name` field via the planning API and
-    /// updates the local TaskEntry so the sidebar subheader refreshes).
+    /// Task settings: rename (updates the `name` field via the planning
+    /// API and the local TaskEntry so the sidebar subheader refreshes)
+    /// plus the accent color (stored TUI-side in `App::task_colors`).
     TaskSettings {
         task_id: String,
         name: String,
+        /// Accent color (`USER_COLORS` name) for the sidebar task header.
+        color: Option<String>,
+        /// 0 = name, 1 = color
+        active_field: u8,
     },
     /// Picking which workflow to launch when more than one is defined.
     WorkflowPicker {
@@ -1831,6 +2196,25 @@ enum InputMode {
     PastWorkspacePicker {
         candidates: Vec<PastCandidate>,
         selected: usize,
+    },
+    /// Fuzzy-find palette over sessions + workspace headers (A-p,
+    /// Sessions view). Candidate rows are snapshotted at open; each
+    /// carries a stable id (`PaletteTarget`) resolved against the live
+    /// rows at submit time, so a mid-modal reconcile can't misjump.
+    SessionPalette {
+        candidates: Vec<PaletteCandidate>,
+        query: String,
+        selected: usize,
+    },
+    /// Read-only info overlay for the focused row (A-i, Sessions view):
+    /// bound-task detail (name/status/prompt) or the workspace fallback.
+    /// `lines` are assembled once at open. `max_scroll` is written back
+    /// by the draw each frame (the only place the final wrap width is
+    /// known) and clamps `scroll` in the handler.
+    TaskPeek {
+        lines: Vec<PeekLine>,
+        scroll: u16,
+        max_scroll: u16,
     },
     /// Generic y/N confirmation overlay. The action runs only on `y`/`Y`/Enter;
     /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-d, A-x).
@@ -2056,10 +2440,13 @@ pub(crate) enum SubmitAction {
         hidden: bool,
         notify_on_idle: bool,
         global_perms: bool,
+        color: Option<String>,
     },
-    SaveWorkspaceName {
+    SaveWorkspaceSettings {
         ws_index: usize,
         name: String,
+        color: Option<String>,
+        pinned: bool,
     },
     SaveSnapshot {
         workspace_id: String,
@@ -2078,6 +2465,7 @@ pub(crate) enum SubmitAction {
     SaveTaskName {
         task_id: String,
         name: String,
+        color: Option<String>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -2106,6 +2494,11 @@ pub(crate) enum SubmitAction {
     /// Picker chose a past workspace to reopen.
     ReopenPastWorkspace {
         ws_id: String,
+    },
+    /// A-p palette chose a row to jump the cursor to. Resolved against
+    /// the live workspaces/sessions at apply time.
+    PaletteJump {
+        target: PaletteTarget,
     },
     /// Confirmed Y on the "Restore N closed sessions?" prompt.
     RestoreTombstones {
@@ -2144,12 +2537,16 @@ pub(crate) struct SessionSettingsMut<'a> {
     pub hidden: &'a mut bool,
     pub notify_on_idle: &'a mut bool,
     pub global_perms: &'a mut bool,
+    pub color: &'a mut Option<String>,
     pub active_field: &'a mut u8,
 }
 
 pub(crate) struct WorkspaceSettingsMut<'a> {
     pub ws_index: usize,
     pub name: &'a mut String,
+    pub color: &'a mut Option<String>,
+    pub pinned: &'a mut bool,
+    pub active_field: &'a mut u8,
 }
 
 pub(crate) struct SaveSnapshotMut<'a> {
@@ -2372,6 +2769,8 @@ impl SnapshotCatalogMut<'_> {
 pub(crate) struct TaskSettingsMut<'a> {
     pub task_id: &'a str,
     pub name: &'a mut String,
+    pub color: &'a mut Option<String>,
+    pub active_field: &'a mut u8,
 }
 
 pub(crate) struct WorkflowLaunchConfirmMut<'a> {
@@ -2625,7 +3024,7 @@ pub(crate) fn handle_session_settings(
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 6;
+            *state.active_field = (*state.active_field + 1) % 7;
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') if *state.active_field == 3 => {
@@ -2638,6 +3037,14 @@ pub(crate) fn handle_session_settings(
         }
         KeyCode::Char(' ') if *state.active_field == 5 => {
             *state.global_perms = !*state.global_perms;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 6 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
+            InputOutcome::Consumed
+        }
+        KeyCode::Left if *state.active_field == 6 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
             InputOutcome::Consumed
         }
         KeyCode::Enter => {
@@ -2659,6 +3066,7 @@ pub(crate) fn handle_session_settings(
                 hidden: *state.hidden,
                 notify_on_idle: *state.notify_on_idle,
                 global_perms: *state.global_perms,
+                color: state.color.clone(),
             })
         }
         KeyCode::Backspace => {
@@ -2707,15 +3115,33 @@ pub(crate) fn handle_workspace_settings(
     };
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveWorkspaceName {
+        KeyCode::Tab | KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 1) % 3;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
+            InputOutcome::Consumed
+        }
+        KeyCode::Left if *state.active_field == 1 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') if *state.active_field == 2 => {
+            *state.pinned = !*state.pinned;
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
             ws_index: state.ws_index,
             name: state.name.trim().to_string(),
+            color: state.color.clone(),
+            pinned: *state.pinned,
         }),
-        KeyCode::Backspace => {
+        KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
             InputOutcome::Consumed
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if *state.active_field == 0 => {
             state.name.push(c);
             InputOutcome::Consumed
         }
@@ -2999,9 +3425,9 @@ fn read_transcript_head_tail(
 /// Both `text` and `error` (validation messages can quote control bytes)
 /// are sanitized before being placed into spans.
 fn rename_overlay_lines(text: &str, error: Option<&str>) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let white = Style::default().fg(Color::White);
-    let red = Style::default().fg(Color::Red);
+    let dim = Style::default().fg(theme::DIM);
+    let white = Style::default().fg(theme::TEXT);
+    let red = Style::default().fg(theme::ERROR);
 
     let mut lines = vec![
         Line::from(""),
@@ -3162,15 +3588,28 @@ pub(crate) fn handle_task_settings(
     };
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + 1) % 2;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
+            InputOutcome::Consumed
+        }
+        KeyCode::Left if *state.active_field == 1 => {
+            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
+            InputOutcome::Consumed
+        }
         KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
             task_id: state.task_id.to_string(),
             name: state.name.trim().to_string(),
+            color: state.color.clone(),
         }),
-        KeyCode::Backspace => {
+        KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
             InputOutcome::Consumed
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if *state.active_field == 0 => {
             state.name.push(c);
             InputOutcome::Consumed
         }
@@ -3354,6 +3793,118 @@ pub(crate) fn handle_past_workspace_picker(
     }
 }
 
+/// A-p fuzzy-find palette. Plain typed chars edit the query (this is a
+/// text filter — j/k must NOT move the selection), so selection movement
+/// rides Up/Down, Tab/BackTab, and Ctrl-j/Ctrl-k. Enter submits the
+/// selected row of the CURRENT filtered view; Esc / A-p close.
+pub(crate) fn handle_session_palette(
+    candidates: &[PaletteCandidate],
+    query: &mut String,
+    selected: &mut usize,
+    _ctx: InputCtx<'_>,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    // A-p toggles the palette closed (matches the open binding).
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('p') {
+        return InputOutcome::Cancel;
+    }
+    // Same filtered view the draw shows — selection indexes into it.
+    let displays: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+    let mut filtered = palette_match_indices(query, &displays);
+    filtered.truncate(PALETTE_MAX_RESULTS);
+    let flen = filtered.len();
+    match key.code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => match filtered.get(*selected).or(filtered.first()) {
+            Some(&ci) => InputOutcome::Submit(SubmitAction::PaletteJump {
+                target: candidates[ci].target.clone(),
+            }),
+            None => InputOutcome::Cancel,
+        },
+        KeyCode::Down | KeyCode::Tab => {
+            if flen > 0 {
+                *selected = (*selected + 1) % flen;
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            if flen > 0 {
+                *selected = if *selected == 0 { flen - 1 } else { *selected - 1 };
+            }
+            InputOutcome::Consumed
+        }
+        // Ctrl-j / Ctrl-k mirror Down / Up. These arms MUST precede the
+        // generic Char(c) arm — plain j/k fall through to typing.
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if flen > 0 {
+                *selected = (*selected + 1) % flen;
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if flen > 0 {
+                *selected = if *selected == 0 { flen - 1 } else { *selected - 1 };
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Backspace => {
+            query.pop();
+            *selected = 0;
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            query.push(c);
+            *selected = 0;
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
+/// A-i read-only peek: j/k, Up/Down, PgUp/PgDn scroll (no text input in
+/// this modal); Esc, q, or A-i again close. `max_scroll` comes from the
+/// modal state (written back by the draw) so scrolling clamps to the
+/// wrapped content height.
+pub(crate) fn handle_task_peek(
+    scroll: &mut u16,
+    max_scroll: u16,
+    event: &CrosstermEvent,
+) -> InputOutcome {
+    let CrosstermEvent::Key(key) = event else {
+        return InputOutcome::Consumed;
+    };
+    // A-i toggles the peek closed (matches the open binding).
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('i') {
+        return InputOutcome::Cancel;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => InputOutcome::Cancel,
+        KeyCode::Down | KeyCode::Char('j') => {
+            *scroll = scroll.saturating_add(1).min(max_scroll);
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *scroll = scroll.saturating_sub(1);
+            InputOutcome::Consumed
+        }
+        KeyCode::PageDown => {
+            *scroll = scroll.saturating_add(10).min(max_scroll);
+            InputOutcome::Consumed
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(10);
+            InputOutcome::Consumed
+        }
+        _ => InputOutcome::Consumed,
+    }
+}
+
 pub(crate) fn handle_workflow_history(
     _ctx: InputCtx<'_>,
     event: &CrosstermEvent,
@@ -3462,6 +4013,16 @@ pub struct App {
     /// column, restored on the way back (`A-h`) so a round-trip doesn't lose
     /// the main selection.
     pub saved_main_cursor: Option<Cursor>,
+    /// A-; quick-switch: session uids in most-recently-focused-first order
+    /// (the CURRENT focus is not in the deque — it's pushed when focus
+    /// moves off it). Deduped, capped at [`SESSION_MRU_CAP`]. Fed by the
+    /// user-driven nav paths via `note_session_focus_change`; reconcile-
+    /// driven cursor shuffles are deliberately NOT recorded (not user
+    /// intent). In-memory only.
+    pub session_mru: VecDeque<String>,
+    /// In-progress A-; walk (frozen ring + position). `None` when no walk
+    /// is active; reset by any other key press.
+    mru_walk: Option<MruWalk>,
     /// The `Continuous`-column position stashed when stepping back to main,
     /// restored on the way in (`A-l`) so re-entering the column lands on the
     /// row you left off at (not always the first). Stored as the session UID
@@ -3570,6 +4131,11 @@ pub struct App {
     /// sidebar builders NEVER emit continuous sessions — they render only in the
     /// column, never in both places. Off by default. Persisted in the manifest.
     pub continuous_column_on: bool,
+    /// User-assigned accent colors for planning tasks, keyed by task id.
+    /// Tasks live in the planning API, so their color rides in the local
+    /// manifest as a sidecar (`Manifest::task_colors`). Consumed by the
+    /// sidebar `TaskHeader` arm; edited via A-e on a task row.
+    pub task_colors: HashMap<String, String>,
     /// Result of the startup memory-cap preflight probe. Cached for
     /// the lifetime of the run; consulted in `spawn_agent_session`
     /// to decide whether to wrap a spawn. See DESIGN_MEMORY_CAP.md
@@ -3763,6 +4329,15 @@ pub struct App {
     /// blinking sidebar indicator, and it's cleared the moment the user
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
+    /// Fingerprint of every open-workspace idle session's `(uid, age
+    /// bucket)` set at the last `tick_idle_ages` evaluation. Idle ages only
+    /// matter at bucket granularity (afterglow → settled → stale), and an
+    /// idle session produces no PTY events to ride the normal repaint —
+    /// this is how a bucket-boundary crossing forces a redraw. Transient.
+    idle_bucket_fingerprint: u64,
+    /// Throttle stamp for `tick_idle_ages` (re-evaluated at most ~1/s;
+    /// buckets move on minute scales so per-iteration checks are waste).
+    last_idle_bucket_check: Option<Instant>,
     /// Last alert animation frame we forced a redraw for. An alerting session
     /// is usually idle (no PTY output → no redraws), so the heartbeat can't
     /// ride the normal event-driven repaint; `tick_alerts` flips `needs_redraw`
@@ -3838,6 +4413,7 @@ impl App {
         };
         let hide_continuous = manifest.hide_continuous;
         let continuous_column_on = manifest.continuous_column_on;
+        let task_colors = manifest.task_colors.clone();
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
@@ -4036,6 +4612,8 @@ impl App {
             cursor: Cursor::Workspace(0),
             cursor_column: SidebarColumn::Main,
             saved_main_cursor: None,
+            session_mru: VecDeque::new(),
+            mru_walk: None,
             saved_continuous_uid: None,
             sidebar_view,
             view_mode: ViewMode::Sessions,
@@ -4070,6 +4648,7 @@ impl App {
             activity_visible: false,
             hide_continuous,
             continuous_column_on,
+            task_colors,
             memory_cap_status,
             memory_kill_tx,
             memory_kill_rx,
@@ -4095,6 +4674,8 @@ impl App {
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
             last_alert_frame: 0,
+            idle_bucket_fingerprint: 0,
+            last_idle_bucket_check: None,
             reconnecting_sessions: std::collections::HashSet::new(),
             attached_tunnel_generation: std::collections::HashMap::new(),
         }
@@ -4292,7 +4873,7 @@ impl App {
     fn alert_indicator(&self) -> (&'static str, Style) {
         let f = self.alert_frame() as usize;
         let glyph = ALERT_PULSE[f % ALERT_PULSE.len()];
-        let color = ALERT_RAINBOW[f % ALERT_RAINBOW.len()];
+        let color = theme::ALERT_RAINBOW[f % theme::ALERT_RAINBOW.len()];
         (glyph, Style::default().fg(color).add_modifier(Modifier::BOLD))
     }
 
@@ -4321,6 +4902,48 @@ impl App {
         let frame = self.alert_frame();
         if frame != self.last_alert_frame {
             self.last_alert_frame = frame;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Repaint when an idle session's AGE BUCKET changes. Idle sessions
+    /// emit no PTY events, so without this the afterglow→settled→stale
+    /// indicator transitions (and the status-bar rollup color) would only
+    /// render on the next unrelated redraw. Throttled to ~1 Hz and only
+    /// flips `needs_redraw` when the fingerprint of `(uid, bucket)` pairs
+    /// actually changes — bucket boundaries are minutes apart, so this
+    /// never becomes a busy-repaint. Called once per main-loop iteration.
+    pub fn tick_idle_ages(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_idle_bucket_check
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_idle_bucket_check = Some(now);
+        // FNV-1a over each idle session's uid + bucket discriminant. Any
+        // session entering/leaving Idle also perturbs the fingerprint, but
+        // those paths already set `needs_redraw` themselves — this only
+        // needs to catch pure age progression.
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut fp = FNV_OFFSET;
+        let mut mix = |byte: u64| fp = (fp ^ byte).wrapping_mul(FNV_PRIME);
+        for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
+            for ts in &ws.sessions {
+                if ts.status != SessionStatus::Idle || ts.session.exited {
+                    continue;
+                }
+                for b in ts.uid.as_bytes() {
+                    mix(*b as u64);
+                }
+                mix(idle_age_bucket_at(ts.idle_since, now) as u64 + 1);
+            }
+        }
+        drop(mix);
+        if fp != self.idle_bucket_fingerprint {
+            self.idle_bucket_fingerprint = fp;
             self.needs_redraw = true;
         }
     }
@@ -4646,6 +5269,8 @@ impl App {
                     worker_vm: ws.worker_vm.clone(),
                     worker_zone: ws.worker_zone.clone(),
                     host_id: ws.host_id.clone(),
+                    color: ws.color.clone(),
+                    pinned: ws.pinned,
                     sessions: entries,
                     tombstones: ws.tombstones.clone(),
                 },
@@ -4669,6 +5294,7 @@ impl App {
             view: Some(view.to_string()),
             hide_continuous: self.hide_continuous,
             continuous_column_on: self.continuous_column_on,
+            task_colors: self.task_colors.clone(),
         };
 
         let path = Self::manifest_path();
@@ -4966,6 +5592,8 @@ impl App {
                     .first()
                     .map(|s| s.host_id.clone())
                     .unwrap_or_else(|| mw.host_id.clone()),
+                color: mw.color.clone(),
+                pinned: mw.pinned,
                 sessions: vec![],
                 tombstones: restored_tombstones,
                 is_pushing: false,
@@ -5472,6 +6100,8 @@ impl App {
                 None => {
                     let new_id = new_workspace_id();
                     self.workspaces.push(Workspace {
+                        color: None,
+                        pinned: false,
                         id: new_id.clone(),
                         name: format!("agent: {}", s.label),
                         is_closed: false,
@@ -5504,11 +6134,13 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> TerminalSession {
         TerminalSession {
+            color: None,
             uid: s.session_uid.clone(),
             label: s.label.clone(),
             session_type: normalize_session_type_to_internal(&s.session_type).to_string(),
             session,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: None,
             generation: 0,
@@ -5545,6 +6177,7 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -5923,11 +6556,13 @@ impl App {
         // value used in `session_uid_for_mcp` above. Don't generate a
         // fresh one here.
         let ts = TerminalSession {
+            color: entry.color.clone(),
             uid: restored_uid,
             label: entry.label.clone(),
             session_type: entry.session_type.clone(),
             session: s,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: entry.transcript_id.clone(),
             generation: entry.generation,
@@ -6045,11 +6680,13 @@ impl App {
         session: crate::session::Session,
     ) -> TerminalSession {
         TerminalSession {
+            color: entry.color.clone(),
             uid: entry.uid.clone(),
             label: entry.label.clone(),
             session_type: entry.session_type.clone(),
             session,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: entry.transcript_id.clone(),
             generation: entry.generation,
@@ -6226,7 +6863,7 @@ impl App {
                         // `Msg::Shutdown` — it does NOT kill the daemon session.
                         let slot = &mut self.workspaces[wi].sessions[si];
                         slot.session = session;
-                        slot.status = SessionStatus::Running;
+                        slot.set_status(SessionStatus::Running);
                         self.reconnecting_sessions.remove(&result.entry.uid);
                         self.remove_skipped_entry(&result.ws_id, &result.entry.uid);
                         changed = true;
@@ -6416,7 +7053,7 @@ impl App {
             // dead fd's POLLHUP) rather than waiting for the reattach to drop
             // it. request_shutdown leaves the slot intact for the rebind.
             self.workspaces[wi].sessions[si].session.request_shutdown();
-            self.workspaces[wi].sessions[si].status = SessionStatus::Idle;
+            self.workspaces[wi].sessions[si].set_status(SessionStatus::Idle);
             if self.requeue_remote_reconnect(wi, si, reason) {
                 changed = true;
             }
@@ -6540,7 +7177,7 @@ impl App {
                                 let slot = &mut self.workspaces[ws_idx]
                                     .sessions[existing_idx];
                                 slot.session = fresh.session;
-                                slot.status = SessionStatus::Running;
+                                slot.set_status(SessionStatus::Running);
                             }
                             self.reconnecting_sessions.remove(&p.entry.uid);
                             self.attached_tunnel_generation.insert(
@@ -6821,7 +7458,7 @@ impl App {
                     // marks it reconnecting, clears its stale generation record,
                     // and enqueues the rebind).
                     self.workspaces[wi].sessions[si].session.exited = false;
-                    self.workspaces[wi].sessions[si].status = SessionStatus::Idle;
+                    self.workspaces[wi].sessions[si].set_status(SessionStatus::Idle);
                     if self.requeue_remote_reconnect(wi, si, "A-r force reconnect") {
                         forced = 1;
                         self.needs_redraw = true;
@@ -7084,6 +7721,7 @@ impl App {
                             hidden: ts.hidden,
                             notify_on_idle: ts.notify_on_idle,
                             global_perms: ts.global_perms,
+                            color: ts.color.clone(),
                             seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
                             active_field: 0,
                         };
@@ -7095,6 +7733,9 @@ impl App {
                     self.input_mode = InputMode::WorkspaceSettings {
                         ws_index: wi,
                         name: ws.name.clone(),
+                        color: ws.color.clone(),
+                        pinned: ws.pinned,
+                        active_field: 0,
                     };
                 }
             }
@@ -7105,12 +7746,63 @@ impl App {
                     .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
+                let current_color = self.task_colors.get(&task_id).cloned();
                 self.input_mode = InputMode::TaskSettings {
                     task_id,
                     name: current_name,
+                    color: current_color,
+                    active_field: 0,
                 };
             }
         }
+    }
+
+    /// Stable re-sort that floats pinned workspaces to the top
+    /// immediately after a pin toggle (the full status-ranked sort
+    /// re-runs on the next `reconcile_tasks`, which applies the same
+    /// pinned-first key). Stability preserves the existing status order
+    /// within both the pinned and unpinned groups. The cursor is
+    /// re-resolved by workspace id / session uid so it stays on the
+    /// same row across the reorder.
+    fn resort_workspaces_for_pin(&mut self) {
+        let (saved_ws_id, saved_uid, saved_task) = match &self.cursor {
+            Cursor::Session(wi, si) => (
+                self.workspaces.get(*wi).map(|w| w.id.clone()),
+                self.workspaces
+                    .get(*wi)
+                    .and_then(|w| w.sessions.get(*si))
+                    .map(|s| s.uid.clone()),
+                None,
+            ),
+            Cursor::Workspace(wi) => {
+                (self.workspaces.get(*wi).map(|w| w.id.clone()), None, None)
+            }
+            Cursor::Task { ws_idx, task_id } => (
+                self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
+                None,
+                Some(task_id.clone()),
+            ),
+        };
+        self.workspaces.sort_by_key(|w| !w.pinned);
+        if let Some(id) = saved_ws_id {
+            if let Some(wi) = self.workspaces.iter().position(|w| w.id == id) {
+                self.cursor = if let Some(uid) = saved_uid {
+                    match self.workspaces[wi]
+                        .sessions
+                        .iter()
+                        .position(|s| s.uid == uid)
+                    {
+                        Some(si) => Cursor::Session(wi, si),
+                        None => Cursor::Workspace(wi),
+                    }
+                } else if let Some(task_id) = saved_task {
+                    Cursor::Task { ws_idx: wi, task_id }
+                } else {
+                    Cursor::Workspace(wi)
+                };
+            }
+        }
+        self.clamp_cursor();
     }
 
     /// Build the candidate list for the A-O picker and open it. Shows a
@@ -8516,6 +9208,411 @@ impl App {
         }
     }
 
+    /// A-g: jump the cursor to the next session that needs a human, in
+    /// priority order — pending `notify_user` alerts first, then idle
+    /// sessions (any age) — cycling in sidebar visual order (main column
+    /// rows first, then the continuous column's rows when it's shown).
+    /// Hidden sessions are skipped unless they hold an alert (alerts
+    /// override hidden, matching the sidebar indicator). Uses the same
+    /// cursor assignment navigation uses, so the attached terminal
+    /// follows; column bookkeeping mirrors `step_column` so a later
+    /// A-h/A-l lands back where you were.
+    fn jump_to_next_attention(&mut self) {
+        // (ws_idx, sess_idx, is_continuous_row) in sidebar visual order.
+        let mut rows: Vec<(usize, usize, bool)> = Vec::new();
+        for vi in self.visual_items() {
+            if let VisualItem::Session(wi, si) = vi {
+                rows.push((wi, si, false));
+            }
+        }
+        if self.continuous_column_on {
+            for r in self.visual_items_continuous() {
+                rows.push((r.ws_idx, r.sess_idx, true));
+            }
+        }
+        let flags: Vec<(bool, bool, bool)> = rows
+            .iter()
+            .map(|(wi, si, _)| {
+                let ts = &self.workspaces[*wi].sessions[*si];
+                (
+                    self.session_has_alert(&ts.uid),
+                    ts.status == SessionStatus::Idle && !ts.session.exited,
+                    ts.hidden,
+                )
+            })
+            .collect();
+        let current = match &self.cursor {
+            Cursor::Session(cwi, csi) => rows
+                .iter()
+                .position(|(wi, si, _)| wi == cwi && si == csi),
+            _ => None,
+        };
+        let Some(next) = next_attention_index(&flags, current) else {
+            self.set_status_msg("No sessions need attention");
+            return;
+        };
+        let (wi, si, to_continuous) = rows[next];
+        // Crossing between columns keeps step_column's saved-spot invariants.
+        if to_continuous && self.cursor_column == SidebarColumn::Main {
+            self.saved_main_cursor = Some(self.cursor.clone());
+        }
+        if !to_continuous && self.cursor_column == SidebarColumn::Continuous {
+            self.saved_continuous_uid = self.cursor_session_uid();
+        }
+        self.cursor_column = if to_continuous {
+            SidebarColumn::Continuous
+        } else {
+            SidebarColumn::Main
+        };
+        self.cursor = Cursor::Session(wi, si);
+        self.needs_redraw = true;
+    }
+
+    // ── MRU quick-switch (A-;) + palette jump plumbing ──────────────
+
+    /// uid → `(ws_idx, sess_idx)` among non-closed workspaces. `None`
+    /// when the session is gone for good (workspace closed or session
+    /// removed) — MRU jumps DROP such uids from the deque.
+    fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            if let Some(si) = ws.sessions.iter().position(|s| s.uid == uid) {
+                return Some((wi, si));
+            }
+        }
+        None
+    }
+
+    /// Resolve a uid to a jumpable cursor target: `(ws_idx, sess_idx,
+    /// lives_in_continuous_column)`. Continuous-member sessions are only
+    /// jumpable while the continuous column is shown — when it's off
+    /// they're hidden entirely, so a cursor there would sit on an
+    /// invisible row. Such uids are SKIPPED (kept in the MRU deque; they
+    /// come back when the column is toggled on), not dropped.
+    fn resolve_session_target(&self, uid: &str) -> Option<(usize, usize, bool)> {
+        let (wi, si) = self.find_session_by_uid(uid)?;
+        let continuous = self.continuous_members().contains(&(wi, si));
+        if continuous && !self.continuous_column_on {
+            return None;
+        }
+        Some((wi, si, continuous))
+    }
+
+    /// Move the cursor onto session `uid`, crossing sidebar columns with
+    /// the same saved-spot bookkeeping as `jump_to_next_attention` /
+    /// `step_column` (so a later A-h/A-l lands back where you were). The
+    /// terminal pane follows because it renders the cursor's session.
+    /// Returns false when the uid doesn't resolve to a visible row.
+    fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
+        let Some((wi, si, to_continuous)) = self.resolve_session_target(uid) else {
+            return false;
+        };
+        if to_continuous && self.cursor_column == SidebarColumn::Main {
+            self.saved_main_cursor = Some(self.cursor.clone());
+        }
+        if !to_continuous && self.cursor_column == SidebarColumn::Continuous {
+            self.saved_continuous_uid = self.cursor_session_uid();
+        }
+        self.cursor_column = if to_continuous {
+            SidebarColumn::Continuous
+        } else {
+            SidebarColumn::Main
+        };
+        self.cursor = Cursor::Session(wi, si);
+        self.needs_redraw = true;
+        true
+    }
+
+    /// MRU recording funnel. Every USER-driven cursor move (A-j/k, A-g,
+    /// A-h/l, the A-p palette jump, A-; itself) captures the focused
+    /// session uid BEFORE the move and calls this after: if focus landed
+    /// somewhere else, the previous session is pushed onto the MRU deque.
+    /// Reconcile-driven cursor shuffles never come through here — they
+    /// aren't user intent and must not pollute the history.
+    fn note_session_focus_change(&mut self, prev_uid: Option<String>) {
+        if self.cursor_session_uid() == prev_uid {
+            return;
+        }
+        if let Some(p) = prev_uid {
+            mru_record(&mut self.session_mru, &p, SESSION_MRU_CAP);
+        }
+    }
+
+    /// A-;: jump to the most recent OTHER session. Repeated presses walk
+    /// deeper into the MRU ring (classic alt-tab): the ring is frozen at
+    /// the first press of a walk and any other key resets the walk, so
+    /// press-press-press goes current → B → C → … and wraps back through
+    /// the start. Only the walk's STARTING focus is recorded into the
+    /// deque — sessions passed through mid-walk are transient and don't
+    /// reorder the history (matching classic alt-tab semantics), which is
+    /// also what makes a single press ping-pong A↔B.
+    fn mru_jump(&mut self) {
+        // Prune uids that are gone for good. Continuous-hidden sessions
+        // are NOT dead (resolve_session_target skips them instead).
+        let dead: Vec<String> = self
+            .session_mru
+            .iter()
+            .filter(|u| self.find_session_by_uid(u).is_none())
+            .cloned()
+            .collect();
+        if !dead.is_empty() {
+            self.session_mru.retain(|u| !dead.contains(u));
+        }
+
+        let current = self.cursor_session_uid();
+        let fresh_walk = self.mru_walk.is_none();
+        if fresh_walk {
+            // Freeze the ring: slot 0 = the walk's start (an empty
+            // sentinel when the cursor isn't on a session — it never
+            // resolves, so wrap-around skips it), then the MRU deque.
+            let mut list: Vec<String> = vec![current.clone().unwrap_or_default()];
+            for uid in &self.session_mru {
+                if !list.iter().any(|u| u == uid) {
+                    list.push(uid.clone());
+                }
+            }
+            self.mru_walk = Some(MruWalk { list, pos: 0 });
+        }
+        let picked = {
+            let walk = self.mru_walk.as_ref().expect("walk ensured above");
+            mru_next_walk_target(&walk.list, walk.pos, current.as_deref(), |u| {
+                self.resolve_session_target(u).is_some()
+            })
+            .map(|p| (p, walk.list[p].clone()))
+        };
+        let Some((pos, uid)) = picked else {
+            self.mru_walk = None;
+            self.set_status_msg("No recent session to switch to");
+            return;
+        };
+        if let Some(w) = self.mru_walk.as_mut() {
+            w.pos = pos;
+        }
+        if self.jump_cursor_to_session_uid(&uid) && fresh_walk {
+            if let Some(prev) = current {
+                mru_record(&mut self.session_mru, &prev, SESSION_MRU_CAP);
+            }
+        }
+    }
+
+    // ── Fuzzy-find palette (A-p) ────────────────────────────────────
+
+    /// Open the A-p palette over a snapshot of the current rows.
+    fn open_session_palette(&mut self) {
+        self.input_mode = InputMode::SessionPalette {
+            candidates: self.build_palette_candidates(),
+            query: String::new(),
+            selected: 0,
+        };
+    }
+
+    /// Candidate rows for the palette: every non-closed workspace (header
+    /// row) and its sessions, in `self.workspaces` order (the stable
+    /// backbone of sidebar order). Session rows show
+    /// "workspace / label", plus "[role]" for workflow participants and
+    /// the bound task's name; continuous members get a "⟳cont" tag and
+    /// are listed only while the continuous column is on (off = they're
+    /// hidden entirely and unjumpable).
+    fn build_palette_candidates(&self) -> Vec<PaletteCandidate> {
+        let members = self.continuous_members();
+        let mut out: Vec<PaletteCandidate> = Vec::new();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed {
+                continue;
+            }
+            out.push(PaletteCandidate {
+                target: PaletteTarget::Workspace { ws_id: ws.id.clone() },
+                display: ws.name.clone(),
+            });
+            for (si, ts) in ws.sessions.iter().enumerate() {
+                let is_continuous = members.contains(&(wi, si));
+                if is_continuous && !self.continuous_column_on {
+                    continue;
+                }
+                let mut display = format!("{} / {}", ws.name, ts.label);
+                if let Some(role) = ts.workflow_role.as_deref() {
+                    display.push_str(&format!(" [{}]", role));
+                }
+                if let Some(task) = ts
+                    .task_id
+                    .as_deref()
+                    .and_then(|tid| self.find_task_entry(tid))
+                {
+                    display.push_str(&format!(" \u{00b7} {}", task.name));
+                }
+                if is_continuous {
+                    display.push_str(" \u{27f3}cont");
+                }
+                out.push(PaletteCandidate {
+                    target: PaletteTarget::Session { uid: ts.uid.clone() },
+                    display,
+                });
+            }
+        }
+        out
+    }
+
+    /// Apply an A-p palette pick: resolve the stable id against the live
+    /// rows and move the cursor (recording the hop in the MRU history).
+    fn apply_palette_jump(&mut self, target: PaletteTarget) {
+        let prev = self.cursor_session_uid();
+        match target {
+            PaletteTarget::Session { uid } => {
+                if self.jump_cursor_to_session_uid(&uid) {
+                    self.note_session_focus_change(prev);
+                } else {
+                    self.set_status_msg("Session is gone");
+                }
+            }
+            PaletteTarget::Workspace { ws_id } => {
+                let Some(wi) = resolve_workspace_by_id(&self.workspaces, &ws_id) else {
+                    self.set_status_msg("Workspace is gone");
+                    return;
+                };
+                // Headers are selectable only when the workspace has no
+                // sessions (navigate()'s rule); otherwise land on the
+                // first session that resolves to a visible row.
+                let first_uid = self.workspaces[wi]
+                    .sessions
+                    .iter()
+                    .map(|s| s.uid.clone())
+                    .find(|u| self.resolve_session_target(u).is_some());
+                match first_uid {
+                    Some(uid) => {
+                        if self.jump_cursor_to_session_uid(&uid) {
+                            self.note_session_focus_change(prev);
+                        }
+                    }
+                    None if self.workspaces[wi].sessions.is_empty() => {
+                        if self.cursor_column == SidebarColumn::Continuous {
+                            self.saved_continuous_uid = self.cursor_session_uid();
+                        }
+                        self.cursor_column = SidebarColumn::Main;
+                        self.cursor = Cursor::Workspace(wi);
+                        self.note_session_focus_change(prev);
+                        self.needs_redraw = true;
+                    }
+                    None => {
+                        self.set_status_msg(
+                            "Workspace's sessions are hidden (continuous column off)",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Task-detail peek (A-i) ──────────────────────────────────────
+
+    fn find_task_entry(&self, task_id: &str) -> Option<&TaskEntry> {
+        self.tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+    }
+
+    /// Open the A-i info overlay for the focused row. Content is
+    /// assembled once at open (a read-only snapshot); `max_scroll` starts
+    /// at 0 and is written back by the first draw.
+    fn open_task_peek(&mut self) {
+        self.input_mode = InputMode::TaskPeek {
+            lines: self.build_peek_lines(),
+            scroll: 0,
+            max_scroll: 0,
+        };
+    }
+
+    /// Workspace-fallback peek body (no bound task): identity + roster.
+    fn workspace_peek_lines(&self, ws: &Workspace) -> Vec<PeekLine> {
+        let wt = ws.worktree_path.as_ref().map(|p| p.display().to_string());
+        let main = ws.main_repo_path.as_ref().map(|p| p.display().to_string());
+        let sessions: Vec<(String, String, String)> = ws
+            .sessions
+            .iter()
+            .map(|ts| {
+                let status = if ts.session.exited {
+                    "exited".to_string()
+                } else {
+                    match ts.status {
+                        SessionStatus::Running => "running".to_string(),
+                        SessionStatus::Idle => "idle".to_string(),
+                    }
+                };
+                (ts.label.clone(), ts.session_type.clone(), status)
+            })
+            .collect();
+        peek_workspace_lines(
+            &ws.name,
+            wt.as_deref(),
+            main.as_deref(),
+            ws.repo_url.as_deref(),
+            ws.host_id.as_str(),
+            &sessions,
+        )
+    }
+
+    /// Assemble the peek content for the focused row: bound-task detail
+    /// when a task resolves (session's `task_id` or the Task cursor's),
+    /// the workspace fallback otherwise; Session cursors get an identity
+    /// header block on top either way.
+    fn build_peek_lines(&self) -> Vec<PeekLine> {
+        let mut out: Vec<PeekLine> = Vec::new();
+        match &self.cursor {
+            Cursor::Session(wi, si) => {
+                let Some(ws) = self.workspaces.get(*wi) else {
+                    return vec![PeekLine::Text("Nothing focused.".into())];
+                };
+                let Some(ts) = ws.sessions.get(*si) else {
+                    return vec![PeekLine::Text("Nothing focused.".into())];
+                };
+                out.extend(peek_session_lines(
+                    &ts.label,
+                    &ts.session_type,
+                    &ts.uid,
+                    ts.seeded_from_snapshot.as_deref(),
+                    ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
+                ));
+                out.push(PeekLine::Blank);
+                match ts.task_id.as_deref().and_then(|t| self.find_task_entry(t)) {
+                    Some(task) => {
+                        let parent = task
+                            .parent_task_id
+                            .as_deref()
+                            .and_then(|p| self.find_task_entry(p))
+                            .map(|t| t.name.as_str());
+                        out.extend(peek_task_lines(task, parent));
+                    }
+                    None => out.extend(self.workspace_peek_lines(ws)),
+                }
+            }
+            Cursor::Task { ws_idx, task_id } => match self.find_task_entry(task_id) {
+                Some(task) => {
+                    let parent = task
+                        .parent_task_id
+                        .as_deref()
+                        .and_then(|p| self.find_task_entry(p))
+                        .map(|t| t.name.as_str());
+                    out.extend(peek_task_lines(task, parent));
+                }
+                None => {
+                    if let Some(ws) = self.workspaces.get(*ws_idx) {
+                        out.extend(self.workspace_peek_lines(ws));
+                    }
+                }
+            },
+            Cursor::Workspace(wi) => {
+                if let Some(ws) = self.workspaces.get(*wi) {
+                    out.extend(self.workspace_peek_lines(ws));
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(PeekLine::Text("Nothing focused.".into()));
+        }
+        out
+    }
+
     // ── Event processing ────────────────────────────────────────────
 
     /// Process all pending terminal events (non-blocking).
@@ -8702,7 +9799,7 @@ impl App {
                                 // Running sort so the green spinner
                                 // doesn't imply live output while the
                                 // stream is dead.
-                                ts.status = SessionStatus::Idle;
+                                ts.set_status(SessionStatus::Idle);
                                 // Gate this tick's pending-write
                                 // delivery too: the stream just died,
                                 // so don't consume a queued prompt
@@ -8804,13 +9901,13 @@ impl App {
                         // Quiet = no wakeups at all in the full idle window → mark idle.
                         let quiet = ts.session.wakeup_times.is_empty();
                         if quiet && ts.status == SessionStatus::Running {
-                            ts.status = SessionStatus::Idle;
+                            ts.set_status(SessionStatus::Idle);
                             visible_dirty = true;
                             if ts.notify_on_idle {
                                 notify_session_idle(&ts.label);
                             }
                         } else if burst && ts.status != SessionStatus::Running {
-                            ts.status = SessionStatus::Running;
+                            ts.set_status(SessionStatus::Running);
                             visible_dirty = true;
                         }
                     }
@@ -9694,11 +10791,13 @@ impl App {
             }
         }
         let ts = TerminalSession {
+            color: None,
             uid: session_uid.clone(),
             label: label.to_string(),
             session_type,
             session,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: None,
             generation: 0,
@@ -10513,6 +11612,8 @@ impl App {
             } else if is_cloud || worktree_path.is_some() {
                 // Auto-provision a workspace so this task gets a sidebar row.
                 let ws = Workspace {
+                    color: None,
+                    pinned: false,
                     id: new_workspace_id(),
                     name: display_name.clone(),
                     is_closed: false,
@@ -10624,7 +11725,10 @@ impl App {
                 .map(|(_, r)| *r)
                 .unwrap_or(4)
         };
-        self.workspaces.sort_by_key(|w| rank_of(&w.id));
+        // Pinned workspaces float to the top; status rank orders each
+        // group. Stable sort keeps ties in their previous order.
+        self.workspaces
+            .sort_by_key(|w| (!w.pinned, rank_of(&w.id)));
 
         // Restore cursor by workspace id.
         if let Some(ref id) = saved_ws_id {
@@ -10676,6 +11780,48 @@ impl App {
         }
     }
 
+    /// A-': copy the focused session's LAST assistant message to the system
+    /// clipboard via OSC 52 (`copy_to_clipboard`), so it works over SSH too.
+    /// Focus resolution reuses `active_session` — a workspace/task row maps
+    /// to its single session when unambiguous, otherwise we ask the user to
+    /// focus one. Every failure path is a status message, never a panic.
+    fn yank_last_assistant_message(&mut self) {
+        let outcome: Result<String, String> = match self.active_session() {
+            None => Err("Yank: focus a session first".to_string()),
+            Some((_, ts)) if ts.session_type == "bash" => {
+                Err("Yank: bash sessions have no transcript".to_string())
+            }
+            Some((ws, ts)) => match ws.worktree_path.as_deref() {
+                None => Err(
+                    "Yank: workspace has no worktree — transcript path unknown"
+                        .to_string(),
+                ),
+                Some(wt) => last_assistant_message_text(ts, wt),
+            },
+        };
+        match outcome {
+            Ok(text) => {
+                let total_chars = text.chars().count();
+                let (payload, truncated) =
+                    truncate_utf8(&text, OSC52_MAX_TEXT_BYTES);
+                copy_to_clipboard(payload);
+                if truncated {
+                    self.set_status_msg(&format!(
+                        "Yanked last assistant message ({} chars — truncated to {}KB for clipboard)",
+                        total_chars,
+                        payload.len() / 1024,
+                    ));
+                } else {
+                    self.set_status_msg(&format!(
+                        "Yanked last assistant message ({} chars)",
+                        total_chars,
+                    ));
+                }
+            }
+            Err(msg) => self.set_status_msg(&msg),
+        }
+    }
+
     // ── Input handling ──────────────────────────────────────────────
 
     /// Handle a crossterm event. Returns true if consumed.
@@ -10688,6 +11834,17 @@ impl App {
         }
 
         self.needs_redraw = true;
+
+        // A-; MRU walk boundary: any OTHER key press ends the walk, so
+        // the next A-; starts fresh from the live deque. This is the
+        // closest a TUI gets to classic alt-tab's "modifier released".
+        if let CrosstermEvent::Key(key) = event {
+            let is_mru_chord = key.modifiers.contains(KeyModifiers::ALT)
+                && key.code == KeyCode::Char(';');
+            if !is_mru_chord && self.mru_walk.is_some() {
+                self.mru_walk = None;
+            }
+        }
 
         // Alt+t toggles between Sessions and Planning view.
         if let CrosstermEvent::Key(key) = event {
@@ -10878,11 +12035,47 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('j') => {
+                        let prev = self.cursor_session_uid();
                         self.navigate(1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     KeyCode::Char('k') => {
+                        let prev = self.cursor_session_uid();
                         self.navigate(-1);
+                        self.note_session_focus_change(prev);
+                        return true;
+                    }
+                    // A-g: cycle through sessions needing a human — pending
+                    // notify_user alerts first, then idle sessions.
+                    KeyCode::Char('g') => {
+                        let prev = self.cursor_session_uid();
+                        self.jump_to_next_attention();
+                        self.note_session_focus_change(prev);
+                        return true;
+                    }
+                    // A-;: MRU quick-switch — jump to the most recent other
+                    // session; repeated presses walk deeper into the ring.
+                    KeyCode::Char(';') => {
+                        self.mru_jump();
+                        return true;
+                    }
+                    // A-p: fuzzy-find palette over sessions + workspaces.
+                    // (Sessions view only — Planning's A-p project picker is
+                    // dispatched in planning.rs before this match is reached.)
+                    KeyCode::Char('p') => {
+                        self.open_session_palette();
+                        return true;
+                    }
+                    // A-i: read-only info peek for the focused row.
+                    KeyCode::Char('i') => {
+                        self.open_task_peek();
+                        return true;
+                    }
+                    // A-': yank the focused session's last assistant message
+                    // to the system clipboard (OSC 52, so it works over SSH).
+                    KeyCode::Char('\'') => {
+                        self.yank_last_assistant_message();
                         return true;
                     }
                     KeyCode::Char('v') => {
@@ -10983,11 +12176,15 @@ impl App {
                     // cursor LEFT / RIGHT between the main sidebar and the
                     // continuous column. No-op when the column isn't shown.
                     KeyCode::Char('h') => {
+                        let prev = self.cursor_session_uid();
                         self.step_column(-1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     KeyCode::Char('l') => {
+                        let prev = self.cursor_session_uid();
                         self.step_column(1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     KeyCode::Char('b') => {
@@ -11362,6 +12559,7 @@ impl App {
                 hidden,
                 notify_on_idle,
                 global_perms,
+                color,
                 seeded_from_snapshot: _,
                 active_field,
             } => handle_session_settings(
@@ -11374,19 +12572,25 @@ impl App {
                     hidden,
                     notify_on_idle,
                     global_perms,
+                    color,
                     active_field,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
-            InputMode::WorkspaceSettings { ws_index, name } => handle_workspace_settings(
-                WorkspaceSettingsMut {
-                    ws_index: *ws_index,
-                    name,
-                },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
-                event,
-            ),
+            InputMode::WorkspaceSettings { ws_index, name, color, pinned, active_field } => {
+                handle_workspace_settings(
+                    WorkspaceSettingsMut {
+                        ws_index: *ws_index,
+                        name,
+                        color,
+                        pinned,
+                        active_field,
+                    },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    event,
+                )
+            }
             InputMode::SaveSnapshot {
                 workspace_id,
                 session_uid,
@@ -11423,14 +12627,18 @@ impl App {
                 InputCtx { repo_urls: &urls, host_ids: &host_ids },
                 event,
             ),
-            InputMode::TaskSettings { task_id, name } => handle_task_settings(
-                TaskSettingsMut {
-                    task_id: task_id.as_str(),
-                    name,
-                },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids },
-                event,
-            ),
+            InputMode::TaskSettings { task_id, name, color, active_field } => {
+                handle_task_settings(
+                    TaskSettingsMut {
+                        task_id: task_id.as_str(),
+                        name,
+                        color,
+                        active_field,
+                    },
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    event,
+                )
+            }
             InputMode::WorkflowLaunchConfirm {
                 ws_id,
                 workflow_name,
@@ -11477,6 +12685,18 @@ impl App {
                     InputCtx { repo_urls: &urls, host_ids: &host_ids },
                     event,
                 )
+            }
+            InputMode::SessionPalette { candidates, query, selected } => {
+                handle_session_palette(
+                    candidates,
+                    query,
+                    selected,
+                    InputCtx { repo_urls: &urls, host_ids: &host_ids },
+                    event,
+                )
+            }
+            InputMode::TaskPeek { scroll, max_scroll, .. } => {
+                handle_task_peek(scroll, *max_scroll, event)
             }
             InputMode::Confirm { action, .. } => {
                 handle_confirm(action, InputCtx { repo_urls: &urls, host_ids: &host_ids }, event)
@@ -11626,6 +12846,7 @@ impl App {
                 hidden,
                 notify_on_idle,
                 global_perms,
+                color,
             } => {
                 // Apply the plain fields in place, and capture the uid +
                 // whether the global-perms grant changed — the grant has
@@ -11642,6 +12863,7 @@ impl App {
                         ts.burst_threshold = burst_threshold;
                         ts.hidden = hidden;
                         ts.notify_on_idle = notify_on_idle;
+                        ts.color = color;
                         if ts.global_perms != global_perms {
                             perms_change = Some((ts.uid.clone(), global_perms));
                         }
@@ -11666,14 +12888,25 @@ impl App {
                     None => self.set_status_msg("Settings saved"),
                 }
             }
-            SubmitAction::SaveWorkspaceName { ws_index, name } => {
-                if !name.is_empty() {
-                    if let Some(ws) = self.workspaces.get_mut(ws_index) {
+            SubmitAction::SaveWorkspaceSettings { ws_index, name, color, pinned } => {
+                let mut pinned_changed = false;
+                if let Some(ws) = self.workspaces.get_mut(ws_index) {
+                    // An emptied name keeps the old one (matches the old
+                    // rename-only behavior); color/pinned always apply.
+                    if !name.is_empty() {
                         ws.name = name;
                     }
-                    self.save_session_manifest();
-                    self.set_status_msg("Workspace renamed");
+                    ws.color = color;
+                    if ws.pinned != pinned {
+                        ws.pinned = pinned;
+                        pinned_changed = true;
+                    }
                 }
+                if pinned_changed {
+                    self.resort_workspaces_for_pin();
+                }
+                self.save_session_manifest();
+                self.set_status_msg("Workspace settings saved");
             }
             SubmitAction::SaveSnapshot {
                 workspace_id,
@@ -11696,7 +12929,18 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, name } => {
+            SubmitAction::SaveTaskName { task_id, name, color } => {
+                // Color rides the local manifest sidecar, not the API row —
+                // apply it regardless of whether the rename half is valid.
+                match color {
+                    Some(c) => {
+                        self.task_colors.insert(task_id.clone(), c);
+                    }
+                    None => {
+                        self.task_colors.remove(&task_id);
+                    }
+                }
+                self.save_session_manifest();
                 if !name.is_empty() {
                     if let Some(task) = self
                         .tasks
@@ -11708,8 +12952,8 @@ impl App {
                     let mut fields = HashMap::new();
                     fields.insert("name".to_string(), serde_json::Value::String(name));
                     self.backend.update_plan_task(task_id, fields);
-                    self.set_status_msg("Task renamed");
                 }
+                self.set_status_msg("Task settings saved");
             }
             SubmitAction::EnterWorkflowLaunchConfirm {
                 ws_id,
@@ -11764,6 +13008,9 @@ impl App {
             }
             SubmitAction::RestoreTombstones { ws_id } => {
                 self.restore_tombstones_for_workspace(&ws_id);
+            }
+            SubmitAction::PaletteJump { target } => {
+                self.apply_palette_jump(target);
             }
         }
     }
@@ -12543,11 +13790,13 @@ impl App {
         };
 
         let ts = TerminalSession {
+            color: None,
             uid: session_uid,
             label: "claude".to_string(),
             session_type: "claude".to_string(),
             session: s,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: cloned_transcript_id.clone(),
             generation: 0,
@@ -12577,6 +13826,8 @@ impl App {
             host_id: active_host.clone(),
         };
         let ws = Workspace {
+            color: None,
+            pinned: false,
             id: workspace_id_pre,
             name: label.to_string(),
             is_closed: false,
@@ -12750,11 +14001,13 @@ impl App {
         };
 
         let ts = TerminalSession {
+            color: None,
             uid: res.session_uid,
             label: "claude".to_string(),
             session_type: "claude".to_string(),
             session,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: None,
             generation: 0,
@@ -12783,6 +14036,8 @@ impl App {
             host_id: host.clone(),
         };
         let ws = Workspace {
+            color: None,
+            pinned: false,
             id: res.workspace_id,
             name: label.to_string(),
             is_closed: false,
@@ -13450,6 +14705,8 @@ impl App {
             // above so the daemon auto-registered it on
             // start_session; carry the same value through here.
             let local_ws = Workspace {
+                color: None,
+                pinned: false,
                 id: workspace_id_pre,
                 name: task_id
                     .as_deref()
@@ -14038,6 +15295,8 @@ impl App {
         }
 
         let ws = Workspace {
+            color: None,
+            pinned: false,
             id: workspace_id_pre,
             name: slug.to_string(),
             is_closed: false,
@@ -14398,6 +15657,8 @@ impl App {
             None => {
                 let main_repo = repo_url.as_deref().and_then(worktree::find_local_repo);
                 let ws = Workspace {
+                    color: None,
+                    pinned: false,
                     id: new_workspace_id(),
                     name,
                     is_closed: false,
@@ -14611,6 +15872,11 @@ impl App {
 
         // Draw input overlay if active (sessions mode only).
         if matches!(self.view_mode, ViewMode::Sessions) {
+            // A-i peek: the draw computes the wrapped content height (the
+            // only place the final wrap width is known) and reports the max
+            // scroll offset; it's written back into the modal state after
+            // the immutable borrow of `input_mode` ends.
+            let mut peek_max: Option<u16> = None;
             match &self.input_mode {
                 InputMode::NewSession {
                     label_text,
@@ -14649,7 +15915,7 @@ impl App {
                         *active_field,
                     );
                 }
-                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, seeded_from_snapshot, active_field, .. } => {
+                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, color, seeded_from_snapshot, active_field, .. } => {
                     self.draw_session_settings(
                         frame,
                         area,
@@ -14659,12 +15925,20 @@ impl App {
                         *hidden,
                         *notify_on_idle,
                         *global_perms,
+                        color.as_deref(),
                         seeded_from_snapshot.as_deref(),
                         *active_field,
                     );
                 }
-                InputMode::WorkspaceSettings { name, .. } => {
-                    self.draw_workspace_settings(frame, area, name);
+                InputMode::WorkspaceSettings { name, color, pinned, active_field, .. } => {
+                    self.draw_workspace_settings(
+                        frame,
+                        area,
+                        name,
+                        color.as_deref(),
+                        *pinned,
+                        *active_field,
+                    );
                 }
                 InputMode::SaveSnapshot {
                     name_text,
@@ -14713,8 +15987,8 @@ impl App {
                         goal,
                     );
                 }
-                InputMode::TaskSettings { name, .. } => {
-                    self.draw_task_settings(frame, area, name);
+                InputMode::TaskSettings { name, color, active_field, .. } => {
+                    self.draw_task_settings(frame, area, name, color.as_deref(), *active_field);
                 }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
@@ -14722,18 +15996,37 @@ impl App {
                 InputMode::PastWorkspacePicker { candidates, selected } => {
                     self.draw_past_workspace_picker(frame, area, candidates, *selected);
                 }
+                InputMode::SessionPalette { candidates, query, selected } => {
+                    self.draw_session_palette(frame, area, candidates, query, *selected);
+                }
+                InputMode::TaskPeek { lines, scroll, .. } => {
+                    peek_max = Some(self.draw_task_peek(frame, area, lines, *scroll));
+                }
                 InputMode::Confirm { prompt, .. } => {
                     self.draw_confirm(frame, area, prompt);
                 }
                 InputMode::Normal => {}
             }
+            if let Some(m) = peek_max {
+                if let InputMode::TaskPeek { scroll, max_scroll, .. } = &mut self.input_mode {
+                    *max_scroll = m;
+                    *scroll = (*scroll).min(m);
+                }
+            }
         }
     }
 
     /// Minimal dialog for renaming a task from the sidebar.
-    fn draw_task_settings(&self, frame: &mut Frame, area: Rect, name: &str) {
+    fn draw_task_settings(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        name: &str,
+        color: Option<&str>,
+        active_field: u8,
+    ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 5u16;
+        let height = 7u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -14742,14 +16035,36 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
-            .title(" Rename task ");
+            .border_style(Style::default().fg(theme::TEXT))
+            .title(" Task Settings ");
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
-        let para = Paragraph::new(format!("Name: {}_", name))
-            .style(Style::default().fg(Color::White));
-        frame.render_widget(para, inner);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("   Name: ", dim),
+                Span::styled(name, white),
+                Span::styled(name_cursor, white),
+            ]),
+            Line::from(""),
+            {
+                let mut spans = vec![Span::styled(
+                    "  Color: ",
+                    if active_field == 1 { white } else { dim },
+                )];
+                spans.extend(color_picker_spans(color, active_field == 1));
+                Line::from(spans)
+            },
+            Line::from(""),
+            Line::from(Span::styled(
+                "Tab next \u{00b7} Enter save \u{00b7} Esc cancel",
+                dim,
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_confirm(&self, frame: &mut Frame, area: Rect, prompt: &str) {
@@ -14763,13 +16078,13 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(theme::ATTN))
             .title(" Confirm ");
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
         let lines = vec![
             Line::from(Span::styled(prompt.to_string(), white)),
             Line::from(""),
@@ -14801,11 +16116,11 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
                 " New Workspace ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
 
@@ -14820,10 +16135,10 @@ impl App {
             .unwrap_or(repo_url);
 
         let cursor = "\u{2588}";
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
         let highlight = Style::default()
-            .fg(Color::White)
+            .fg(theme::TEXT)
             .add_modifier(Modifier::BOLD);
 
         let repo_style = if active_field == 0 { highlight } else { white };
@@ -14933,11 +16248,11 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
                 " Add Session ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
 
@@ -14948,10 +16263,10 @@ impl App {
         let max_name = (width as usize).saturating_sub(8);
         let display_name: String = ws_name.chars().take(max_name).collect();
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
         let highlight = Style::default()
-            .fg(Color::White)
+            .fg(theme::TEXT)
             .add_modifier(Modifier::BOLD);
 
         let mut lines = vec![
@@ -14970,7 +16285,7 @@ impl App {
             let st = if session_type == *opt {
                 if active_field == 0 { highlight } else { white }
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::MUTED)
             };
             lines.push(Line::from(Span::styled(
                 format!("{}{} {}", type_marker, ind, opt),
@@ -15012,6 +16327,7 @@ impl App {
         hidden: bool,
         notify_on_idle: bool,
         global_perms: bool,
+        color: Option<&str>,
         seeded_from_snapshot: Option<&str>,
         active_field: u8,
     ) {
@@ -15019,8 +16335,8 @@ impl App {
         // Seeded-from line is a 2-line block (blank + "Seeded from: <name>")
         // only when the field is set; otherwise the dialog keeps its old
         // size so the unrelated common case doesn't grow. +2 rows for the
-        // global-perms field (blank + line).
-        let height = if seeded_from_snapshot.is_some() { 19u16 } else { 17u16 };
+        // global-perms field (blank + line), +2 for the color picker.
+        let height = if seeded_from_snapshot.is_some() { 21u16 } else { 19u16 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -15029,11 +16345,11 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
                 " Session Settings ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
 
@@ -15041,8 +16357,8 @@ impl App {
         frame.render_widget(block, dialog_area);
 
         let cursor = "\u{2588}";
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
 
         let name_cursor = if active_field == 0 { cursor } else { "" };
         let timeout_cursor = if active_field == 1 { cursor } else { "" };
@@ -15055,9 +16371,9 @@ impl App {
         // Highlight the grant in yellow when on — it's a privileged,
         // cross-session capability, not a routine toggle.
         let perms_style = if active_field == 5 {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme::ATTN)
         } else if global_perms {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)
+            Style::default().fg(theme::ATTN).add_modifier(Modifier::DIM)
         } else {
             dim
         };
@@ -15105,6 +16421,15 @@ impl App {
                     dim,
                 ),
             ]),
+            Line::from(""),
+            {
+                let mut spans = vec![Span::styled(
+                    "          Color: ",
+                    if active_field == 6 { white } else { dim },
+                )];
+                spans.extend(color_picker_spans(color, active_field == 6));
+                Line::from(spans)
+            },
         ];
 
         if let Some(snap) = seeded_from_snapshot {
@@ -15145,20 +16470,20 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
                 " Save Snapshot ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
         let cursor = "\u{2588}";
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
-        let red = Style::default().fg(Color::Red);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let red = Style::default().fg(theme::ERROR);
 
         let name_cursor = if active_field == 0 { cursor } else { "" };
         let desc_cursor = if active_field == 1 { cursor } else { "" };
@@ -15194,9 +16519,17 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_workspace_settings(&self, frame: &mut Frame, area: Rect, name: &str) {
+    fn draw_workspace_settings(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        name: &str,
+        color: Option<&str>,
+        pinned: bool,
+        active_field: u8,
+    ) {
         let width = 55u16.min(area.width.saturating_sub(4));
-        let height = 7u16;
+        let height = 9u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -15205,27 +16538,48 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
-                " Rename Workspace ",
+                " Workspace Settings ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
+        let pinned_marker = if pinned { "[x]" } else { "[ ]" };
+        let pinned_style = if active_field == 2 { white } else { dim };
         let lines = vec![
             Line::from(vec![
-                Span::styled("  Name: ", dim),
+                Span::styled("    Name: ", dim),
                 Span::styled(name, white),
-                Span::styled("\u{2588}", white),
+                Span::styled(name_cursor, white),
+            ]),
+            Line::from(""),
+            {
+                let mut spans = vec![Span::styled(
+                    "   Color: ",
+                    if active_field == 1 { white } else { dim },
+                )];
+                spans.extend(color_picker_spans(color, active_field == 1));
+                Line::from(spans)
+            },
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Pinned: ", dim),
+                Span::styled(pinned_marker, pinned_style),
+                Span::styled(
+                    if active_field == 2 { "  Space to toggle" } else { "" },
+                    dim,
+                ),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "Enter save \u{00b7} Esc cancel  (branch name unchanged)",
+                "Tab next \u{00b7} Enter save \u{00b7} Esc cancel  (branch unchanged)",
                 dim,
             )),
         ];
@@ -15236,15 +16590,56 @@ impl App {
         let has_session = self.active_session().is_some();
 
         let title_style = if has_session {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme::TEXT)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::DIM)
         };
 
-        let block = Block::default()
+        // Border tint telegraphs the ACTIVE session's state peripherally,
+        // mirroring the sidebar indicator's precedence: reconnecting `⟳`
+        // wins, then running, then the idle afterglow window; everything
+        // else (settled/stale idle, exited, no session) stays DIM chrome.
+        let border_color = match self.active_session() {
+            Some((_, ts)) if self.reconnecting_sessions.contains(&ts.uid) => theme::ATTN,
+            Some((_, ts))
+                if ts.status == SessionStatus::Running && !ts.session.exited =>
+            {
+                theme::OK
+            }
+            Some((_, ts))
+                if !ts.session.exited
+                    && idle_age_bucket_at(ts.idle_since, Instant::now())
+                        == IdleAgeBucket::Afterglow =>
+            {
+                theme::AFTERGLOW
+            }
+            _ => theme::DIM,
+        };
+
+        let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(border_color))
             .title(Span::styled(self.active_title(), title_style));
+
+        // Scrollback cue: when the active session's viewport is scrolled up
+        // (not showing the live tail), surface a right-aligned ATTN tag in
+        // the top border. Reading the offset per-frame means it vanishes the
+        // moment the view returns to the tail (any input / Scroll::Bottom).
+        let scrolled_back = self
+            .active_session()
+            .map(|(_, ts)| {
+                crate::terminal_widget::scrollback_offset(&ts.session.term) > 0
+            })
+            .unwrap_or(false);
+        if scrolled_back {
+            block = block.title_top(
+                Line::from(Span::styled(
+                    " \u{25b2} scrollback ",
+                    Style::default().fg(theme::ATTN),
+                ))
+                .right_aligned(),
+            );
+        }
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -15260,7 +16655,7 @@ impl App {
                 if let Some(ref prompt) = task.prompt {
                     lines.push(Line::from(Span::styled(
                         prompt.as_str(),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme::TEXT),
                     )));
                     lines.push(Line::from(""));
                 }
@@ -15268,13 +16663,13 @@ impl App {
             if let Some(ref repo) = ws.repo_url {
                 lines.push(Line::from(Span::styled(
                     format!("Repo: {}", repo),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::DIM),
                 )));
             }
             if let Some(ref vm) = ws.worker_vm {
                 lines.push(Line::from(Span::styled(
                     format!("VM: {}", vm),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::DIM),
                 )));
             }
             if !lines.is_empty() {
@@ -15286,7 +16681,7 @@ impl App {
                 } else {
                     "Press Alt+A to attach"
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::DIM),
             )));
 
             frame.render_widget(Paragraph::new(lines), inner);
@@ -15295,10 +16690,10 @@ impl App {
                 Paragraph::new(
                     "No tasks \u{2014} press Alt+n to start a local session",
                 )
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme::DIM))
             } else {
                 Paragraph::new("Connecting to API...")
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(theme::DIM))
             };
             frame.render_widget(msg, inner);
         }
@@ -15404,10 +16799,10 @@ impl App {
     fn draw_continuous_column(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme::DIM))
             .title(Span::styled(
                 " Continuous ",
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::TEXT),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -15416,6 +16811,8 @@ impl App {
         }
 
         let spinner = self.spinner_frame();
+        // One clock sample for every row's idle-age bucket this frame.
+        let now = Instant::now();
         let rows = self.visual_items_continuous();
         let mut items: Vec<ListItem> = Vec::new();
         for (i, r) in rows.iter().take(inner.height as usize).enumerate() {
@@ -15431,29 +16828,40 @@ impl App {
             } else {
                 Vec::new()
             };
+            // Idle-age bucket — mirrors the main sidebar: tints the
+            // needs-human ● and, when stale, dims the row's label.
+            let idle_bucket = (ts.status == SessionStatus::Idle
+                && !ts.session.exited)
+                .then(|| idle_age_bucket_at(ts.idle_since, now));
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
-                ("\u{27f3}", Style::default().fg(Color::Yellow))
+                ("\u{27f3}", Style::default().fg(theme::ATTN))
             } else if ts.hidden {
                 (" ", Style::default())
             } else {
                 match ts.status {
-                    SessionStatus::Running => (spinner, Style::default().fg(Color::Green)),
+                    SessionStatus::Running => (spinner, Style::default().fg(theme::OK)),
                     // Idle splits three ways: ◉ (cyan) = a pending operator
                     // QUESTION the orchestrator parked (metadata.operator_question);
-                    // ● (white) = the operator must act (fix-ready to review, or an
-                    // explicit human decision — raw planning status `blocked`); ◇
-                    // (dim) = the orchestrator will advance it on its next fire.
-                    // (A fourth state — ○ hollow yellow, dispatch pending — is a
-                    // per-ISSUE sub-line below the row, not a row glyph: the
-                    // operator unblocked an index issue and the orchestrator
-                    // hasn't acked/dispatched it yet.)
+                    // ● = the operator must act (fix-ready to review, or an
+                    // explicit human decision — raw planning status `blocked`),
+                    // age-tinted like the main sidebar's idle dot (afterglow /
+                    // white / dim); ◇ (dim) = the orchestrator will advance it
+                    // on its next fire. (A fourth state — ○ hollow yellow,
+                    // dispatch pending — is a per-ISSUE sub-line below the row,
+                    // not a row glyph: the operator unblocked an index issue and
+                    // the orchestrator hasn't acked/dispatched it yet.)
                     SessionStatus::Idle => {
                         if question.is_some() {
-                            ("\u{25c9}", Style::default().fg(Color::Cyan))
+                            ("\u{25c9}", Style::default().fg(theme::HEADER))
                         } else if self.session_needs_human(ts) {
-                            ("\u{25cf}", Style::default().fg(Color::White))
+                            let color = match idle_bucket {
+                                Some(IdleAgeBucket::Afterglow) => theme::AFTERGLOW,
+                                Some(IdleAgeBucket::Stale) => theme::DIM,
+                                _ => theme::TEXT,
+                            };
+                            ("\u{25cf}", Style::default().fg(color))
                         } else {
-                            ("\u{25c7}", Style::default().fg(Color::DarkGray))
+                            ("\u{25c7}", Style::default().fg(theme::DIM))
                         }
                     }
                 }
@@ -15496,7 +16904,7 @@ impl App {
                 };
                 spans.push(Span::styled(
                     glyph,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::DIM),
                 ));
             }
             // Focus highlight: only when the cursor is actually IN this column
@@ -15507,17 +16915,24 @@ impl App {
                     Cursor::Session(cwi, csi) if *cwi == r.ws_idx && *csi == r.sess_idx
                 );
             let label_style = if is_selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+            } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
+                && !self.session_has_alert(&ts.uid)
+                && !self.reconnecting_sessions.contains(&ts.uid)
+            {
+                // Stale-idle rows fade like the main sidebar's — see the
+                // matching branch in `draw_session_list`.
+                Style::default().fg(theme::DIM)
             } else if r.depth == 0 {
                 // Orchestrators (depth 0) get a slightly brighter label so the
                 // parent/child split reads at a glance.
-                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::MUTED)
             };
             spans.push(Span::styled(label, label_style));
             let item_style = if is_selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -15531,7 +16946,7 @@ impl App {
                     Span::raw(" ".repeat(prefix_cells)),
                     Span::styled(
                         format!("\u{21b3} {}", qtext),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                        Style::default().fg(theme::HEADER).add_modifier(Modifier::DIM),
                     ),
                 ]));
             }
@@ -15552,7 +16967,7 @@ impl App {
                     Span::raw(" ".repeat(prefix_cells)),
                     Span::styled(
                         format!("\u{25cb} {}", itext),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme::ATTN),
                     ),
                 ]));
             }
@@ -15561,7 +16976,7 @@ impl App {
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
                 "  (no continuous tasks)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::DIM),
             ))));
         }
         frame.render_widget(List::new(items), inner);
@@ -15575,10 +16990,10 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme::DIM))
             .title(Span::styled(
                 view_label,
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::TEXT),
             ));
 
         let inner = block.inner(area);
@@ -15589,7 +17004,9 @@ impl App {
         }
 
         let spinner = self.spinner_frame();
-        let dim = Style::default().fg(Color::DarkGray);
+        // One clock sample for every row's idle-age bucket this frame.
+        let now = Instant::now();
+        let dim = Style::default().fg(theme::DIM);
 
         // Help text — two columns. Defined up here so `list_height` can size
         // itself around the help footer (otherwise the help overdraws the
@@ -15606,10 +17023,12 @@ impl App {
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
             ("A-o    stop wf", "A-c  cont-col"),
-            ("A-b    snapshot", ""),
+            ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", "A-9  push"),
             ("PgUp/Dn scroll", "A-0  pull"),
-            ("A-Ent  newline", ""),
+            ("A-Ent  newline", "A-;  recent"),
+            ("A-p    find", "A-i  info"),
+            ("A-'    yank", "A-m  mouse"),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 1);
@@ -15646,34 +17065,45 @@ impl App {
                         .map(|h| format!(" @{}", h.as_str()))
                         .unwrap_or_default();
 
-                    // Reserve room for the tag so the name truncates before it.
+                    // Reserve room for the tags so the name truncates before
+                    // them (the pin glyph 📌 is double-width + a space).
                     let max_name = (inner.width as usize)
                         .saturating_sub(2)
-                        .saturating_sub(host_tag.chars().count());
+                        .saturating_sub(host_tag.chars().count())
+                        .saturating_sub(if ws.pinned { 3 } else { 0 });
                     // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
                     // slice panics when the cut lands inside a multibyte char
                     // (e.g. '≤' in a workspace name). Matches the session/task
                     // name truncation sites below.
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
-                    let mut header_spans = vec![Span::raw(" "), Span::raw(name)];
+                    let mut header_spans = vec![Span::raw(" ")];
+                    if ws.pinned {
+                        header_spans.push(Span::raw("\u{1f4cc} "));
+                    }
+                    header_spans.push(Span::raw(name));
                     if !host_tag.is_empty() {
                         // Magenta keeps it distinct from the Yellow/DarkGray host
                         // headers and Cyan task/workflow headers. The span keeps
                         // its color through selection (the name still highlights).
                         header_spans.push(Span::styled(
                             host_tag,
-                            Style::default().fg(Color::Magenta),
+                            Style::default().fg(theme::REMOTE),
                         ));
                     }
                     let header_line = Line::from(header_spans);
 
+                    // The user accent tints unselected rows; selection keeps
+                    // the White+BOLD highlight so the cursor stays obvious.
+                    let ws_accent = ws.color.as_deref().and_then(theme::user_color);
                     let base_style = if is_selected {
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme::TEXT)
                             .add_modifier(Modifier::BOLD)
+                    } else if let Some(c) = ws_accent {
+                        Style::default().fg(c)
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(theme::MUTED)
                     };
 
                     items.push(ListItem::new(header_line).style(base_style));
@@ -15693,6 +17123,12 @@ impl App {
                         .as_deref()
                         .is_some_and(|id| self.workflow_runs.iter().any(|r| r.run_id == id));
 
+                    // Idle-age bucket — colors the idle dot (afterglow /
+                    // settled / stale) and, when stale, dims the whole row.
+                    let idle_bucket = (ts.status == SessionStatus::Idle
+                        && !ts.session.exited)
+                        .then(|| idle_age_bucket_at(ts.idle_since, now));
+
                     let (indicator, indicator_style) = if self
                         .reconnecting_sessions
                         .contains(&ts.uid)
@@ -15704,16 +17140,24 @@ impl App {
                         // rebinds when connectivity returns. Shown even
                         // for hidden sessions — a stuck stream is worth
                         // surfacing.
-                        ("\u{27f3}", Style::default().fg(Color::Yellow))
+                        ("\u{27f3}", Style::default().fg(theme::ATTN))
                     } else if ts.hidden {
                         (" ", Style::default())
                     } else {
                         match ts.status {
                             SessionStatus::Running => {
-                                (spinner, Style::default().fg(Color::Green))
+                                (spinner, Style::default().fg(theme::OK))
                             }
                             SessionStatus::Idle => {
-                                ("\u{25cf}", Style::default().fg(Color::White))
+                                // Dot color by idle age: warm afterglow for
+                                // "just went idle — probably wants you",
+                                // plain white while settled, dim once stale.
+                                let color = match idle_bucket {
+                                    Some(IdleAgeBucket::Afterglow) => theme::AFTERGLOW,
+                                    Some(IdleAgeBucket::Stale) => theme::DIM,
+                                    _ => theme::TEXT,
+                                };
+                                ("\u{25cf}", Style::default().fg(color))
                             }
                         }
                     };
@@ -15741,9 +17185,9 @@ impl App {
                                 .iter()
                                 .any(|r| r.run_id == run_id && r.active_role.as_deref() == Some(role));
                             let style = if active {
-                                Style::default().fg(Color::Yellow)
+                                Style::default().fg(theme::ATTN)
                             } else {
-                                Style::default().fg(Color::Cyan)
+                                Style::default().fg(theme::HEADER)
                             };
                             Some((format!("[{}] ", role), style))
                         } else {
@@ -15789,7 +17233,7 @@ impl App {
                     if in_active_workflow && self.sidebar_view == SidebarView::Task {
                         spans.push(Span::styled(
                             "\u{2502} ",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme::DIM),
                         ));
                     }
                     if let Some((badge, style)) = wf_badge {
@@ -15798,12 +17242,31 @@ impl App {
                     spans.push(Span::raw(display));
                     let line = Line::from(spans);
 
+                    // Session accent falls back to the workspace accent so a
+                    // colored workspace tints its whole group; selection keeps
+                    // the White+BOLD highlight.
+                    let accent = ts
+                        .color
+                        .as_deref()
+                        .or(ws.color.as_deref())
+                        .and_then(theme::user_color);
                     let base_style = if is_selected {
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme::TEXT)
                             .add_modifier(Modifier::BOLD)
+                    } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
+                        && !self.session_has_alert(&ts.uid)
+                        && !self.reconnecting_sessions.contains(&ts.uid)
+                    {
+                        // Stale-idle rows (idle > 30 min) fade out label and
+                        // all — they're background noise; a pending alert or
+                        // an in-flight reconnect still gets full styling, and
+                        // the selection branch above keeps the cursor legible.
+                        Style::default().fg(theme::DIM)
+                    } else if let Some(c) = accent {
+                        Style::default().fg(c)
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::default().fg(theme::MUTED)
                     };
                     items.push(ListItem::new(line).style(base_style));
                 }
@@ -15825,7 +17288,7 @@ impl App {
                     let run = self.workflow_runs.iter().find(|r| &r.run_id == run_id);
                     let (agg_indicator, agg_style) = match run {
                         Some(r) => aggregate_indicator(r, ws, spinner),
-                        None => ("\u{25cf}", Style::default().fg(Color::DarkGray)),
+                        None => ("\u{25cf}", Style::default().fg(theme::DIM)),
                     };
                     // If any participant of this workflow has a pending alert,
                     // blink the group header too (the participant rows blink
@@ -15854,7 +17317,7 @@ impl App {
                         Span::styled(format!(" {} ", agg_indicator), agg_style),
                         Span::styled(
                             format!("\u{256d}\u{2500} {}{}", name, paused_suffix),
-                            Style::default().fg(Color::Cyan),
+                            Style::default().fg(theme::HEADER),
                         ),
                     ]);
                     items.push(ListItem::new(line));
@@ -15877,12 +17340,19 @@ impl App {
                     // Style lives on the ListItem so selection highlight can
                     // override. Using Span::styled with a fixed color here
                     // would mask the base_style on selection.
+                    let task_accent = self
+                        .task_colors
+                        .get(task_id.as_str())
+                        .map(String::as_str)
+                        .and_then(theme::user_color);
                     let base_style = if is_selected {
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme::TEXT)
                             .add_modifier(Modifier::BOLD)
+                    } else if let Some(c) = task_accent {
+                        Style::default().fg(c)
                     } else {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(theme::HEADER)
                     };
                     let line = Line::from(vec![
                         Span::raw("  "),
@@ -15900,7 +17370,7 @@ impl App {
                     let line = Line::from(vec![Span::styled(
                         format!("  {}", host_id.as_str()),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(theme::DIM)
                             .add_modifier(Modifier::BOLD),
                     )]);
                     items.push(ListItem::new(line));
@@ -15920,7 +17390,7 @@ impl App {
                     let line = Line::from(vec![Span::styled(
                         format!("  continuous ({})", count),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(theme::DIM)
                             .add_modifier(Modifier::BOLD),
                     )]);
                     items.push(ListItem::new(line));
@@ -15972,10 +17442,10 @@ impl App {
     fn draw_activity_feed(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme::DIM))
             .title(Span::styled(
                 " Activity (Alt-, to hide) ",
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::TEXT),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -16003,9 +17473,9 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", ts_str),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::DIM),
                 ),
-                Span::styled(caller_padded, Style::default().fg(Color::Cyan)),
+                Span::styled(caller_padded, Style::default().fg(theme::HEADER)),
                 Span::raw(" → "),
                 Span::raw(entry.summary.clone()),
             ]));
@@ -16040,8 +17510,8 @@ impl App {
             let line = Line::from(Span::styled(
                 text,
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
+                    .fg(theme::TEXT)
+                    .bg(theme::ERROR)
                     .add_modifier(Modifier::BOLD),
             ));
             frame.render_widget(Paragraph::new(line), area);
@@ -16066,9 +17536,9 @@ impl App {
 
         let conn_indicator = if self.connected { "\u{25cf}" } else { "\u{25cb}" };
         let conn_color = if self.connected {
-            Color::Green
+            theme::OK
         } else {
-            Color::Red
+            theme::ERROR
         };
 
         let center = if let Some((ref msg, when)) = self.status_msg {
@@ -16084,44 +17554,114 @@ impl App {
         let mouse_off = !self.mouse_capture_enabled;
         let mouse_indicator = if mouse_off { " [mouse off] " } else { "" };
 
+        // Session-state rollup, e.g. `⠹2 ●1 ⚑1`: running / idle-awaiting /
+        // pending-alert counts across every open workspace (continuous
+        // sessions included, exited sessions excluded). Zero-count clusters
+        // are omitted. The idle dot borrows the afterglow tint when any
+        // session just went idle; the alert flag is steady ATTN (the
+        // sidebar bead does the animating).
+        let mut n_running = 0usize;
+        let mut n_idle = 0usize;
+        let mut n_alert = 0usize;
+        let mut any_afterglow = false;
+        let now = Instant::now();
+        for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
+            for ts in &ws.sessions {
+                if self.session_has_alert(&ts.uid) {
+                    // An alerting session counts ONLY as an alert — it's
+                    // already asking for a human, whatever its status.
+                    n_alert += 1;
+                    continue;
+                }
+                if ts.session.exited {
+                    continue;
+                }
+                match ts.status {
+                    SessionStatus::Running => n_running += 1,
+                    SessionStatus::Idle => {
+                        n_idle += 1;
+                        if idle_age_bucket_at(ts.idle_since, now)
+                            == IdleAgeBucket::Afterglow
+                        {
+                            any_afterglow = true;
+                        }
+                    }
+                }
+            }
+        }
+        let mut rollup: Vec<Span> = Vec::new();
+        if n_running > 0 {
+            rollup.push(Span::styled(
+                format!("{}{} ", self.spinner_frame(), n_running),
+                Style::default().fg(theme::OK),
+            ));
+        }
+        if n_idle > 0 {
+            let idle_color = if any_afterglow {
+                theme::AFTERGLOW
+            } else {
+                theme::TEXT
+            };
+            rollup.push(Span::styled(
+                format!("\u{25cf}{} ", n_idle),
+                Style::default().fg(idle_color),
+            ));
+        }
+        if n_alert > 0 {
+            rollup.push(Span::styled(
+                format!("\u{2691}{} ", n_alert),
+                Style::default().fg(theme::ATTN),
+            ));
+        }
+
+        let left1 = format!(" {} ", conn_indicator);
+        let left2 = "claude-manager ";
         let right = format!(" {}r {}b {}q ", running, blocked, backlog);
 
+        // Width math from the ACTUAL span contents (every glyph used here is
+        // single-cell, so char count == display width) — no hardcoded
+        // left-side constant to drift out of sync.
+        let left_used = (left1.chars().count() + left2.chars().count()) as u16;
         let right_width = right.chars().count() as u16;
-        let center_width = center.len() as u16;
+        let center_width = center.chars().count() as u16;
         let mouse_width = mouse_indicator.chars().count() as u16;
-        let left_used = 18u16; // " ● claude-manager "
-        let pad = area
-            .width
-            .saturating_sub(left_used + right_width + center_width + mouse_width);
+        let rollup_width: u16 = rollup
+            .iter()
+            .map(|s| s.content.chars().count() as u16)
+            .sum();
+        let fixed = left_used + right_width + center_width + mouse_width;
+        // Degrade on narrow terminals: the rollup is the first thing to go
+        // (the rest keeps the pre-rollup behavior of clipping at the edge).
+        let (rollup, rollup_width) = if fixed + rollup_width > area.width {
+            (Vec::new(), 0u16)
+        } else {
+            (rollup, rollup_width)
+        };
+        let pad = area.width.saturating_sub(fixed + rollup_width);
         let pad_left = pad / 2;
         let pad_right = pad - pad_left;
 
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", conn_indicator),
-                Style::default().fg(conn_color),
-            ),
-            Span::styled(
-                "claude-manager ",
-                Style::default().fg(Color::DarkGray),
-            ),
+        let mut spans = vec![
+            Span::styled(left1, Style::default().fg(conn_color)),
+            Span::styled(left2, Style::default().fg(theme::DIM)),
             Span::styled(
                 mouse_indicator,
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 " ".repeat(pad_left as usize),
                 Style::default(),
             ),
-            Span::styled(center, Style::default().fg(Color::Yellow)),
+            Span::styled(center, Style::default().fg(theme::ATTN)),
             Span::styled(
                 " ".repeat(pad_right as usize),
                 Style::default(),
             ),
-            Span::styled(right, Style::default().fg(Color::DarkGray)),
-        ]);
+        ];
+        spans.extend(rollup);
+        spans.push(Span::styled(right, Style::default().fg(theme::DIM)));
 
-        frame.render_widget(Paragraph::new(line), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn active_title(&self) -> String {
@@ -16703,7 +18243,7 @@ impl App {
         for (path, err) in &self.workflow_load_errors {
             lines.push(Line::from(Span::styled(
                 format_workflow_load_error(path, err),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::DIM),
             )));
         }
         if !self.workflow_load_errors.is_empty() {
@@ -16718,14 +18258,14 @@ impl App {
                 .map(|w| w.description.clone())
                 .unwrap_or_default();
             let name_style = if is_active {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme::HEADER)
             };
             let desc_style = if is_active {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme::TEXT)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::DIM)
             };
             let mut spans = vec![
                 Span::raw(cursor),
@@ -16739,13 +18279,13 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "\u{2191}\u{2193} select   Enter: choose   Esc: cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::DIM),
         )));
 
         let block = Block::default()
             .borders(Borders::ALL)
             .title(workflow_picker_title(self.workflow_load_errors.len()))
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(theme::TEXT));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
     }
@@ -16796,7 +18336,7 @@ impl App {
         let end = (offset + body_rows).min(total);
         let below = total.saturating_sub(end);
 
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(theme::DIM);
         let mut lines: Vec<Line> = Vec::new();
 
         if candidates.is_empty() {
@@ -16824,23 +18364,23 @@ impl App {
                     .unwrap_or("");
                 let name_style = if !cand.worktree_exists {
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(theme::DIM)
                         .add_modifier(Modifier::CROSSED_OUT)
                 } else if is_active {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme::ATTN)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(theme::HEADER)
                 };
                 let path_style = if !cand.worktree_exists {
                     Style::default()
-                        .fg(Color::Red)
+                        .fg(theme::ERROR)
                         .add_modifier(Modifier::CROSSED_OUT)
                 } else if is_active {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(theme::TEXT)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme::DIM)
                 };
                 let suffix = if cand.worktree_exists {
                     String::new()
@@ -16858,7 +18398,7 @@ impl App {
                 if !suffix.is_empty() {
                     spans.push(Span::styled(
                         suffix,
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(theme::ERROR),
                     ));
                 }
                 lines.push(Line::from(spans));
@@ -16883,9 +18423,185 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Reopen past workspace ")
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(theme::TEXT));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
+    }
+
+    /// A-p fuzzy-find palette. Chrome mirrors the past-workspace picker:
+    /// centered dialog, one row per match, dim key-hint footer. The query
+    /// line renders on top; matches are the same filtered+ranked view the
+    /// handler indexes, capped at [`PALETTE_MAX_RESULTS`].
+    pub fn draw_session_palette(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        candidates: &[PaletteCandidate],
+        query: &str,
+        selected: usize,
+    ) {
+        let displays: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+        let mut filtered = palette_match_indices(query, &displays);
+        filtered.truncate(PALETTE_MAX_RESULTS);
+
+        let width = area.width.min(80).max(40);
+        // Chrome: 2 border rows + query + blank + rows + blank + footer.
+        let rows = filtered.len().max(1) as u16;
+        let height = (rows + 6).min(area.height.saturating_sub(2).max(8));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let dim = Style::default().fg(theme::DIM);
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("> ", dim),
+            Span::styled(query.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
+        ]));
+        lines.push(Line::from(""));
+        if filtered.is_empty() {
+            lines.push(Line::from(Span::styled("(no matches)", dim)));
+        } else {
+            let sel = selected.min(filtered.len() - 1);
+            for (i, &ci) in filtered.iter().enumerate() {
+                let is_active = i == sel;
+                let marker = if is_active { "\u{25b8} " } else { "  " };
+                let style = if is_active {
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::MUTED)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker.to_string(), style),
+                    Span::styled(candidates[ci].display.clone(), style),
+                ]));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "type to filter   \u{2191}\u{2193}/Tab select   Enter: jump   Esc: close",
+            dim,
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Find session ")
+            .style(Style::default().fg(theme::TEXT));
+        frame.render_widget(Paragraph::new(lines).block(block), dialog);
+    }
+
+    /// A-i read-only info overlay — draw_confirm's chrome scaled up
+    /// (~70% width, ~60% height, centered, cleared underneath). Body
+    /// wraps and scrolls; the key-hint footer stays pinned below it.
+    /// Returns the max scroll offset (wrapped height minus the body
+    /// height) for the caller to write back into `TaskPeek::max_scroll`.
+    pub fn draw_task_peek(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        lines: &[PeekLine],
+        scroll: u16,
+    ) -> u16 {
+        let width = (((area.width as u32) * 7 / 10) as u16)
+            .max(40)
+            .min(area.width.saturating_sub(2).max(1));
+        let height = (((area.height as u32) * 6 / 10) as u16)
+            .max(8)
+            .min(area.height.saturating_sub(2).max(1));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let dialog = Rect { x, y, width, height };
+
+        frame.render_widget(Clear, dialog);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::TEXT))
+            .title(" Info ");
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+
+        let dim = Style::default().fg(theme::DIM);
+        let text = Style::default().fg(theme::TEXT);
+        let rendered: Vec<Line> = lines
+            .iter()
+            .map(|pl| match pl {
+                PeekLine::Title(t) => Line::from(Span::styled(
+                    t.clone(),
+                    Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                )),
+                PeekLine::Field { label, value } => Line::from(vec![
+                    Span::styled(format!("{}: ", label), dim),
+                    Span::styled(value.clone(), text),
+                ]),
+                PeekLine::Status { value, status } => {
+                    let color = match status {
+                        TaskStatus::Running => theme::OK,
+                        TaskStatus::Blocked => theme::ATTN,
+                        TaskStatus::Done => theme::DIM,
+                        TaskStatus::Backlog => theme::MUTED,
+                    };
+                    Line::from(vec![
+                        Span::styled("Status: ", dim),
+                        Span::styled(value.clone(), Style::default().fg(color)),
+                    ])
+                }
+                PeekLine::Text(t) => Line::from(Span::styled(t.clone(), text)),
+                PeekLine::Blank => Line::from(""),
+            })
+            .collect();
+
+        // Body above, pinned footer hint below.
+        let body = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height.saturating_sub(2),
+        };
+
+        // Estimated wrapped height (ceil of char width over body width per
+        // line) → max scroll. Word wrap can occasionally break a line
+        // earlier than the character count predicts, so this is a close
+        // lower bound — good enough for a scroll clamp.
+        let bw = body.width.max(1) as usize;
+        let wrapped: usize = rendered
+            .iter()
+            .map(|l| {
+                let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+                w.max(1).div_ceil(bw)
+            })
+            .sum();
+        let max_scroll = wrapped
+            .saturating_sub(body.height as usize)
+            .min(u16::MAX as usize) as u16;
+
+        frame.render_widget(
+            Paragraph::new(rendered)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((scroll.min(max_scroll), 0)),
+            body,
+        );
+        if inner.height >= 2 {
+            let footer = Rect {
+                x: inner.x,
+                y: inner.y + inner.height - 1,
+                width: inner.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "j/k PgUp/PgDn scroll \u{00b7} Esc close",
+                    dim,
+                ))),
+                footer,
+            );
+        }
+        max_scroll
     }
 
     pub fn draw_snapshot_catalog(
@@ -16923,24 +18639,24 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(title, Style::default().fg(Color::White)));
+            .title(Span::styled(title, Style::default().fg(theme::TEXT)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
-        let cyan = Style::default().fg(Color::Cyan);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
+        let cyan = Style::default().fg(theme::HEADER);
         let yellow = Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::ATTN)
             .add_modifier(Modifier::BOLD);
-        let red = Style::default().fg(Color::Red);
+        let red = Style::default().fg(theme::ERROR);
 
         if snapshots.is_empty() {
             let mut lines = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "No snapshots saved yet.",
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(theme::MUTED),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -16952,7 +18668,7 @@ impl App {
             if let Some(msg) = status_msg {
                 lines.push(Line::from(Span::styled(
                     sanitize_for_display(msg),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme::ERROR),
                 )));
                 lines.push(Line::from(""));
             }
@@ -17011,7 +18727,7 @@ impl App {
         if let Some(msg) = status_msg {
             lines.push(Line::from(Span::styled(
                 sanitize_for_display(msg),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::ERROR),
             )));
         }
         let total = snapshots.len();
@@ -17080,14 +18796,14 @@ impl App {
             .title(Span::styled(
                 format!(" {} ", sanitize_for_display(&snap.name)),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
 
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -17185,7 +18901,7 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Rename ", Style::default().fg(Color::White)));
+            .title(Span::styled(" Rename ", Style::default().fg(theme::TEXT)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
@@ -17208,13 +18924,13 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(" Confirm ", Style::default().fg(Color::White)));
+            .border_style(Style::default().fg(theme::ATTN))
+            .title(Span::styled(" Confirm ", Style::default().fg(theme::TEXT)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
-        let dim = Style::default().fg(Color::DarkGray);
-        let white = Style::default().fg(Color::White);
+        let dim = Style::default().fg(theme::DIM);
+        let white = Style::default().fg(theme::TEXT);
 
         let lines = vec![
             Line::from(Span::styled(
@@ -17260,7 +18976,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             format!("Workspace: {}", ws_name),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme::TEXT),
         )));
         lines.push(Line::from(""));
         for (idx, slot) in slots.iter().enumerate() {
@@ -17280,14 +18996,14 @@ impl App {
             };
             let cursor = if is_active { "▸ " } else { "  " };
             let role_style = if is_active {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme::HEADER)
             };
             let value_style = if is_active {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::MUTED)
             };
             let decorator = if is_active && slot.options.len() > 1 {
                 format!("◂ {} ▸", src_label)
@@ -17305,14 +19021,14 @@ impl App {
         let goal_focused = active_slot == slots.len();
         let goal_cursor = if goal_focused { "▸ " } else { "  " };
         let goal_label_style = if goal_focused {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme::HEADER)
         };
         let goal_value_style = if goal_focused {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme::MUTED)
         };
         let goal_display: String = if goal.is_empty() {
             "(optional — overrides {{ goal }})".into()
@@ -17329,13 +19045,13 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "\u{2191}\u{2193} field   \u{2190}\u{2192} choice   Enter: launch   Esc: cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::DIM),
         )));
 
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(theme::TEXT));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
     }
@@ -17356,7 +19072,7 @@ impl App {
                     "{} • iter {} • status: {:?}",
                     run.workflow_name, run.iteration, run.status
                 ),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::TEXT),
             )));
             lines.push(Line::from(""));
             for h in &run.history {
@@ -17372,17 +19088,17 @@ impl App {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("[{:>3}] {:<10}", h.iteration, h.role),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(theme::HEADER),
                     ),
                     Span::raw("  "),
-                    Span::styled(msg, Style::default().fg(Color::Gray)),
+                    Span::styled(msg, Style::default().fg(theme::MUTED)),
                 ]));
             }
             if let Some(reason) = &run.done_reason {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     format!("done: {}", reason),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(theme::OK),
                 )));
             }
         } else {
@@ -17391,12 +19107,12 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Esc / Enter: close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::DIM),
         )));
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" Workflow history • {} ", run_id))
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(theme::TEXT));
         let paragraph = Paragraph::new(lines).block(block);
         frame.render_widget(paragraph, dialog);
     }
@@ -17558,8 +19274,8 @@ fn aggregate_indicator(
     spinner: &'static str,
 ) -> (&'static str, Style) {
     match run.status {
-        workflow::RunStatus::Done => ("\u{2713}", Style::default().fg(Color::Green)),
-        workflow::RunStatus::Paused => ("\u{25cf}", Style::default().fg(Color::Yellow)),
+        workflow::RunStatus::Done => ("\u{2713}", Style::default().fg(theme::OK)),
+        workflow::RunStatus::Paused => ("\u{25cf}", Style::default().fg(theme::ATTN)),
         _ => {
             // Match the per-session indicator logic: active iff any participant
             // session tagged with this run_id is Running and not exited.
@@ -17569,25 +19285,426 @@ fn aggregate_indicator(
                     && !ts.session.exited
             });
             if any_running {
-                (spinner, Style::default().fg(Color::Green))
+                (spinner, Style::default().fg(theme::OK))
             } else {
-                ("\u{25cf}", Style::default().fg(Color::White))
+                ("\u{25cf}", Style::default().fg(theme::TEXT))
             }
         }
     }
+}
+
+/// Max UTF-8 payload bytes accepted into an OSC 52 write by the A-' yank
+/// path (~100KB of base64 after the 4/3 expansion). Terminal emulators cap
+/// OSC payload sizes around this order of magnitude, and an unbounded
+/// multi-hundred-KB yank would stall the synchronous stdout write.
+const OSC52_MAX_TEXT_BYTES: usize = 75 * 1024;
+
+/// Build the OSC 52 clipboard-set escape sequence (ST-terminated) for
+/// `text`. Pure — the stdout write lives in [`copy_to_clipboard`].
+fn osc52_sequence(text: &str) -> String {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{}\x1b\\", encoded)
+}
+
+/// Truncate `text` to at most `max_bytes` UTF-8 bytes, backing off to the
+/// nearest char boundary so the result is always valid UTF-8. Returns the
+/// (possibly shortened) slice plus whether truncation happened.
+fn truncate_utf8(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
 }
 
 /// Copy text to the system clipboard via the OSC 52 escape sequence.
 /// Supported by most modern terminal emulators (kitty, wezterm, iTerm2, alacritty,
 /// xterm, and tmux with `set -g set-clipboard on`).
 fn copy_to_clipboard(text: &str) {
-    use base64::Engine;
     use std::io::Write;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let seq = format!("\x1b]52;c;{}\x1b\\", encoded);
+    let seq = osc52_sequence(text);
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+/// A-' yank core: read the session's transcript through the engine-specific
+/// [`crate::agent::Agent::read_messages`] reader (the same normalized-message
+/// path that powers MCP `read_session_output` and workflow templating's
+/// `assistant[-1]`) and return the LAST assistant message's text. Errors are
+/// user-facing status strings. A fresh session with no bound transcript
+/// yields an empty message list, which lands in the "no assistant messages"
+/// arm rather than an error.
+fn last_assistant_message_text(
+    ts: &TerminalSession,
+    worktree_path: &Path,
+) -> Result<String, String> {
+    let agent = crate::agent::agent_for(&ts.session_type);
+    let ctx = crate::agent::AgentCtx { ts, worktree_path };
+    let (messages, _cursor) = agent
+        .read_messages(ctx, None, usize::MAX)
+        .map_err(|e| format!("Yank: transcript read failed: {}", e))?;
+    messages
+        .into_iter()
+        .rev()
+        .find(|m| m.role == crate::agent::Role::Assistant)
+        .map(|m| m.content)
+        .ok_or_else(|| "Yank: no assistant messages in transcript yet".to_string())
+}
+
+#[cfg(test)]
+mod idle_attention_tests {
+    use super::*;
+
+    // ── idle_age_bucket: the pure age → display-bucket classifier ──
+
+    #[test]
+    fn unknown_idle_age_is_stale() {
+        // None = "we don't know when it went idle" (e.g. the spell started
+        // before a TUI restart) — must land in the OLDEST bucket, never in
+        // afterglow, so a restart can't light up every idle row.
+        assert_eq!(idle_age_bucket(None), IdleAgeBucket::Stale);
+    }
+
+    #[test]
+    fn bucket_boundaries() {
+        let cases = [
+            (Duration::ZERO, IdleAgeBucket::Afterglow),
+            (IDLE_AFTERGLOW_WINDOW - Duration::from_secs(1), IdleAgeBucket::Afterglow),
+            // Boundary is exclusive on the young side: exactly 2 min = settled.
+            (IDLE_AFTERGLOW_WINDOW, IdleAgeBucket::Settled),
+            (IDLE_STALE_THRESHOLD - Duration::from_secs(1), IdleAgeBucket::Settled),
+            // Exactly 30 min = stale.
+            (IDLE_STALE_THRESHOLD, IdleAgeBucket::Stale),
+            (Duration::from_secs(24 * 3600), IdleAgeBucket::Stale),
+        ];
+        for (age, want) in cases {
+            assert_eq!(
+                idle_age_bucket(Some(age)),
+                want,
+                "idle age {:?} must classify as {:?}",
+                age,
+                want,
+            );
+        }
+    }
+
+    #[test]
+    fn future_idle_since_saturates_to_afterglow() {
+        // A (clock-skew-ish) idle_since in the future saturates to zero age
+        // rather than panicking or wrapping to a huge duration.
+        let now = Instant::now();
+        let future = now + Duration::from_secs(60);
+        assert_eq!(
+            idle_age_bucket_at(Some(future), now),
+            IdleAgeBucket::Afterglow,
+        );
+    }
+
+    // ── next_attention_index: the A-g candidate picker ──
+    // Row tuples are (has_alert, is_idle, hidden) in sidebar visual order.
+
+    const RUNNING: (bool, bool, bool) = (false, false, false);
+    const IDLE: (bool, bool, bool) = (false, true, false);
+    const IDLE_HIDDEN: (bool, bool, bool) = (false, true, true);
+    const ALERT: (bool, bool, bool) = (true, false, false);
+    const ALERT_HIDDEN: (bool, bool, bool) = (true, true, true);
+
+    #[test]
+    fn no_rows_or_no_candidates_yields_none() {
+        assert_eq!(next_attention_index(&[], None), None);
+        // Running rows and hidden alert-less idle rows are not candidates.
+        assert_eq!(
+            next_attention_index(&[RUNNING, IDLE_HIDDEN, RUNNING], Some(0)),
+            None,
+        );
+    }
+
+    #[test]
+    fn alerts_win_over_idles_regardless_of_visual_position() {
+        // Visual order: idle at 0, alert at 2. First jump must go to the
+        // ALERT (priority bucket 1) even though the idle row is higher up.
+        let rows = [IDLE, RUNNING, ALERT];
+        assert_eq!(next_attention_index(&rows, None), Some(2));
+        // Cursor parked on a non-candidate row also lands on the alert.
+        assert_eq!(next_attention_index(&rows, Some(1)), Some(2));
+    }
+
+    #[test]
+    fn cycles_through_priority_ring_and_wraps() {
+        // Candidate ring: alerts in visual order (2), then idles (0, 3).
+        let rows = [IDLE, RUNNING, ALERT, IDLE];
+        assert_eq!(next_attention_index(&rows, Some(2)), Some(0));
+        assert_eq!(next_attention_index(&rows, Some(0)), Some(3));
+        // Wraps back to the head of the ring.
+        assert_eq!(next_attention_index(&rows, Some(3)), Some(2));
+    }
+
+    #[test]
+    fn hidden_is_skipped_unless_alerting() {
+        // A hidden idle session is not a candidate, but an alert overrides
+        // hidden (matching the sidebar indicator override).
+        let rows = [IDLE_HIDDEN, ALERT_HIDDEN, IDLE];
+        assert_eq!(next_attention_index(&rows, None), Some(1));
+        assert_eq!(next_attention_index(&rows, Some(1)), Some(2));
+        // The hidden idle row (0) is never visited: 2 → back to 1.
+        assert_eq!(next_attention_index(&rows, Some(2)), Some(1));
+    }
+
+    #[test]
+    fn single_candidate_self_cycles() {
+        let rows = [RUNNING, IDLE];
+        assert_eq!(next_attention_index(&rows, Some(1)), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod pinned_sort_tests {
+    use super::*;
+
+    fn bare_ws(id: &str, pinned: bool) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
+            color: None,
+            pinned,
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        }
+    }
+
+    #[test]
+    fn resort_floats_pinned_stably_and_preserves_cursor() {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        app.workspaces = vec![
+            bare_ws("a", false),
+            bare_ws("b", true),
+            bare_ws("c", false),
+            bare_ws("d", true),
+        ];
+        // Cursor on "a" — after the pinned float it should follow "a"
+        // to its new index rather than staying on index 0 ("b").
+        app.cursor = Cursor::Workspace(0);
+
+        app.resort_workspaces_for_pin();
+
+        let order: Vec<&str> =
+            app.workspaces.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(
+            order,
+            ["b", "d", "a", "c"],
+            "pinned float to the top; stable order within each group"
+        );
+        assert_eq!(
+            app.cursor,
+            Cursor::Workspace(2),
+            "cursor must follow workspace 'a' across the reorder"
+        );
+    }
+}
+
+#[cfg(test)]
+mod yank_clipboard_tests {
+    //! A-' yank: the OSC 52 encoder, the base64-safe truncation, and the
+    //! last-assistant-message extraction against a fixture transcript.
+
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── osc52_sequence: input → exact escape sequence ──
+
+    #[test]
+    fn osc52_sequence_wraps_base64_payload() {
+        // "hi" → base64 "aGk=", OSC 52 clipboard-set, ST-terminated.
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x1b\\");
+    }
+
+    #[test]
+    fn osc52_sequence_empty_payload() {
+        assert_eq!(osc52_sequence(""), "\x1b]52;c;\x1b\\");
+    }
+
+    // ── truncate_utf8: boundary behavior ──
+
+    #[test]
+    fn truncate_utf8_exact_fit_is_untouched() {
+        assert_eq!(truncate_utf8("abcd", 4), ("abcd", false));
+    }
+
+    #[test]
+    fn truncate_utf8_over_limit_cuts_at_limit() {
+        assert_eq!(truncate_utf8("abcdef", 4), ("abcd", true));
+    }
+
+    #[test]
+    fn truncate_utf8_backs_off_to_char_boundary() {
+        // "é" is 2 bytes: a budget landing mid-char must back off so the
+        // clipboard payload stays valid UTF-8 (never panics on slicing).
+        let s = "a\u{e9}\u{e9}"; // 5 bytes: a=1, é=2, é=2
+        assert_eq!(truncate_utf8(s, 3), ("a\u{e9}", true));
+        assert_eq!(truncate_utf8(s, 2), ("a", true));
+        assert_eq!(truncate_utf8(s, 0), ("", true));
+    }
+
+    // ── last_assistant_message_text against a fixture transcript ──
+
+    /// Minimal claude-type session bound to `sid`. Mirrors the fixture
+    /// pattern of `transcript_rebind_tests::make_test_session` — /bin/true
+    /// exits immediately and the PTY is never read.
+    fn yank_test_session(sid: Option<&str>) -> TerminalSession {
+        let session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .expect("session for test");
+        TerminalSession {
+            color: None,
+            uid: "yank-uid".into(),
+            label: "yank-test".into(),
+            session_type: "claude".into(),
+            session,
+            status: SessionStatus::Idle,
+            idle_since: None,
+            last_write_at: None,
+            transcript_id: sid.map(str::to_string),
+            generation: 0,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            task_id: None,
+            last_delivery: None,
+            notify_on_idle: false,
+            global_perms: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+            seeded_from_snapshot: None,
+            preserved_last_exit: None,
+            host_id: crate::hosts::HostId::local(),
+        }
+    }
+
+    /// Run `f` with HOME pointed at a fresh tempdir (serialized via
+    /// `home_lock`, restored before returning so a failing assertion can't
+    /// poison other tests' HOME).
+    fn with_temp_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _g = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let out = f(tmp.path());
+        unsafe {
+            if let Some(h) = old_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn last_assistant_picks_final_assistant_entry() {
+        let got = with_temp_home(|home| {
+            // Encoded path matches the agent module's rule: '/' and '.' → '-'.
+            let proj = home.join(".claude/projects/-tmp-yankrepo");
+            std::fs::create_dir_all(&proj).unwrap();
+            let lines = concat!(
+                r#"{"type":"user","message":{"role":"user","content":"do the thing"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first answer"}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"again"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"final answer"}]}}"#,
+                "\n",
+            );
+            std::fs::write(proj.join("yank-sid.jsonl"), lines).unwrap();
+
+            let ts = yank_test_session(Some("yank-sid"));
+            last_assistant_message_text(&ts, Path::new("/tmp/yankrepo"))
+        });
+        assert_eq!(
+            got,
+            Ok("final answer".to_string()),
+            "must yank the LAST assistant message, not the first",
+        );
+    }
+
+    #[test]
+    fn last_assistant_errs_when_no_assistant_turns() {
+        let got = with_temp_home(|home| {
+            let proj = home.join(".claude/projects/-tmp-yankrepo");
+            std::fs::create_dir_all(&proj).unwrap();
+            let lines = concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hello?"}}"#,
+                "\n",
+            );
+            std::fs::write(proj.join("user-only.jsonl"), lines).unwrap();
+
+            let ts = yank_test_session(Some("user-only"));
+            last_assistant_message_text(&ts, Path::new("/tmp/yankrepo"))
+        });
+        assert!(
+            got.as_deref()
+                .err()
+                .is_some_and(|e| e.contains("no assistant messages")),
+            "user-only transcript must produce the no-assistant error, got {:?}",
+            got,
+        );
+    }
+
+    #[test]
+    fn last_assistant_errs_when_transcript_unbound() {
+        // Fresh session: no transcript_id yet → the reader returns an empty
+        // message list → same "no assistant messages" status, no panic.
+        let got = with_temp_home(|_home| {
+            let ts = yank_test_session(None);
+            last_assistant_message_text(&ts, Path::new("/tmp/yankrepo"))
+        });
+        assert!(got.is_err());
+    }
 }
 
 #[cfg(test)]
@@ -17849,6 +19966,7 @@ mod stop_workflow_local_cleanup_tests {
 
     fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
         ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -18007,6 +20125,7 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -18055,6 +20174,7 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -18118,6 +20238,7 @@ mod manifest_entry_seeded_from_tests {
         // the round-trip preserves the flag so the toast renders
         // correctly post-restart.
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -18183,6 +20304,7 @@ mod manifest_entry_seeded_from_tests {
             exited_at: 1_700_000_000.0,
         };
         let initial = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -18230,6 +20352,7 @@ mod manifest_entry_seeded_from_tests {
         // the pre-fix `last_exit: None`, the assertion at the end of
         // this test would fail.
         let rebuilt = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -18319,6 +20442,8 @@ mod apply_manifest_diff_tests {
         );
         // Minimal Workspace.
         let ws = Workspace {
+            color: None,
+            pinned: false,
             id: "ws-test".into(),
             name: "test-ws".into(),
             is_closed: false,
@@ -19529,11 +21654,13 @@ mod transcript_rebind_tests {
             crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
                 .expect("session for test");
         TerminalSession {
+            color: None,
             uid: "uid".into(),
             label: "test".into(),
             session_type: "claude".into(),
             session,
             status: SessionStatus::Idle,
+            idle_since: None,
             last_write_at: None,
             transcript_id: transcript_id.map(str::to_string),
             generation,
@@ -19683,11 +21810,13 @@ mod rotation_binding_tests {
         workflow: Option<(&str, &str)>,
     ) -> TerminalSession {
         TerminalSession {
+            color: None,
             uid: "uid".into(),
             label: "test".into(),
             session_type: "claude".into(),
             session: dummy_session(),
             status: SessionStatus::Idle,
+            idle_since: None,
             last_write_at: None,
             transcript_id: sid.map(str::to_string),
             generation: 0,
@@ -19715,6 +21844,8 @@ mod rotation_binding_tests {
 
     fn ws_with(sessions: Vec<TerminalSession>) -> Workspace {
         Workspace {
+            color: None,
+            pinned: false,
             id: "ws-1".into(),
             name: "ws".into(),
             is_closed: false,
@@ -20111,6 +22242,8 @@ mod pending_workflow_events_tests {
 
     fn test_workspace(id: &str, worktree: std::path::PathBuf) -> Workspace {
         Workspace {
+            color: None,
+            pinned: false,
             id: id.to_string(),
             name: id.to_string(),
             is_closed: false,
@@ -20240,6 +22373,8 @@ mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-e2e".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: "ws-e2e".into(),
                 name: "e2e".into(),
                 is_closed: false,
@@ -20680,6 +22815,8 @@ mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-mgr".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: "ws-mgr".into(),
                 name: "mgr".into(),
                 is_closed: false,
@@ -20886,6 +23023,8 @@ mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: "ws-r".into(),
                 name: "r".into(),
                 is_closed: false,
@@ -20981,6 +23120,7 @@ mod pending_workflow_events_tests {
         // Manifest on disk: workspace ws-r with one session pinned to host
         // "manager".
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -21004,6 +23144,8 @@ mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            color: None,
+            pinned: false,
             id: "ws-r".into(),
             name: "r".into(),
             is_closed: false,
@@ -21020,6 +23162,7 @@ mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert(mw.id.clone(), mw);
         let manifest = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: None,
@@ -21127,6 +23270,8 @@ mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: "ws-r".into(),
                 name: "r".into(),
                 is_closed: false,
@@ -21174,6 +23319,7 @@ mod pending_workflow_events_tests {
         // Manifest entry pinned to "manager" with a STALE workflow_run_id
         // (no active runs exist → it's Detached/Done from the TUI's POV).
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -21197,6 +23343,8 @@ mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            color: None,
+            pinned: false,
             id: "ws-r".into(),
             name: "r".into(),
             is_closed: false,
@@ -21213,6 +23361,7 @@ mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-r".to_string(), mw);
         let manifest = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: None,
@@ -21317,6 +23466,8 @@ mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: "ws-r".into(),
                 name: "r".into(),
                 is_closed: false,
@@ -21364,6 +23515,7 @@ mod pending_workflow_events_tests {
 
         // Manifest: [gone, live] — gone FIRST so its failure precedes live.
         let mk = |uid: &str| ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -21387,6 +23539,8 @@ mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            color: None,
+            pinned: false,
             id: "ws-r".into(),
             name: "r".into(),
             is_closed: false,
@@ -21403,6 +23557,7 @@ mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-r".to_string(), mw);
         let manifest = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: None,
@@ -21498,6 +23653,7 @@ mod pending_workflow_events_tests {
         std::fs::create_dir_all(&cm_dir).unwrap();
 
         let mk = |uid: &str| ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -21522,6 +23678,8 @@ mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("ghost"),
         };
         let mw = ManifestWorkspace {
+            color: None,
+            pinned: false,
             id: "ws-g".into(),
             name: "g".into(),
             is_closed: false,
@@ -21538,6 +23696,7 @@ mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-g".to_string(), mw);
         let manifest = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: None,
@@ -21616,6 +23775,7 @@ mod pending_workflow_events_tests {
         let local_sock = cm_dir.join("daemon.sock");
 
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -21639,6 +23799,8 @@ mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            color: None,
+            pinned: false,
             id: "ws-ssh".into(),
             name: "ssh".into(),
             is_closed: false,
@@ -21655,6 +23817,7 @@ mod pending_workflow_events_tests {
         let mut workspaces = HashMap::new();
         workspaces.insert("ws-ssh".to_string(), mw);
         let manifest = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: None,
@@ -21788,6 +23951,8 @@ mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-c".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: "ws-c".into(),
                 name: "c".into(),
                 is_closed: false,
@@ -21923,6 +24088,8 @@ mod pending_workflow_events_tests {
         // plus a queued reattach (with its preserved-on-disk copy) for the
         // live session.
         app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-c".into(),
             name: "c".into(),
             is_closed: true,
@@ -21938,6 +24105,7 @@ mod pending_workflow_events_tests {
             is_pushing: false,
         });
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -22067,6 +24235,8 @@ mod pending_workflow_events_tests {
             None,
         );
         app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-local".into(),
             name: "l".into(),
             is_closed: false,
@@ -22092,6 +24262,8 @@ mod pending_workflow_events_tests {
         );
         remote_sess.host_id = cm_daemon::host_id::HostId::new("manager");
         app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-remote".into(),
             name: "r".into(),
             is_closed: false,
@@ -22261,11 +24433,13 @@ mod remote_reconnect_tests {
             None
         };
         let ts = TerminalSession {
+            color: None,
             uid: uid.into(),
             label: "claude".into(),
             session_type: "claude".into(),
             session,
             status: SessionStatus::Running,
+            idle_since: None,
             last_write_at: None,
             transcript_id: None,
             generation: 0,
@@ -22294,6 +24468,8 @@ mod remote_reconnect_tests {
 
     fn workspace_with(ts: TerminalSession) -> Workspace {
         Workspace {
+            color: None,
+            pinned: false,
             id: "ws-remote".into(),
             name: "remote".into(),
             is_closed: false,
@@ -24459,6 +26635,8 @@ mod worktree_mode_tests {
 
     fn ws(worktree: Option<&str>, main: Option<&str>) -> Workspace {
         Workspace {
+            color: None,
+            pinned: false,
             id: "w".into(),
             name: "w".into(),
             is_closed: false,
@@ -25985,6 +28163,7 @@ mod input_handler_tests {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
             let mut gp = false;
+            let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
                 ws_index: 1,
@@ -25995,6 +28174,7 @@ mod input_handler_tests {
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
                 global_perms: &mut gp,
+                color: &mut color,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -26009,6 +28189,7 @@ mod input_handler_tests {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
             let mut gp = false;
+            let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
                 ws_index: 0,
@@ -26019,6 +28200,7 @@ mod input_handler_tests {
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
                 global_perms: &mut gp,
+                color: &mut color,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -26033,6 +28215,7 @@ mod input_handler_tests {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(3);
             let mut gp = false;
+            let mut color: Option<String> = None;
         hidden = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
@@ -26044,6 +28227,7 @@ mod input_handler_tests {
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
                 global_perms: &mut gp,
+                color: &mut color,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -26058,6 +28242,7 @@ mod input_handler_tests {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
             let mut gp = false;
+            let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
                 ws_index: 4,
@@ -26068,6 +28253,7 @@ mod input_handler_tests {
                 hidden: &mut hidden,
                 notify_on_idle: &mut notify,
                 global_perms: &mut gp,
+                color: &mut color,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -26083,6 +28269,7 @@ mod input_handler_tests {
                 hidden,
                 notify_on_idle,
                 global_perms: _,
+                color: _,
             }) => {
                 assert_eq!(ws_index, 4);
                 assert_eq!(session_index, 9);
@@ -26101,10 +28288,14 @@ mod input_handler_tests {
     #[test]
     fn workspace_settings_char_appends() {
         let mut name = "foo".to_string();
+        let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 0,
                 name: &mut name,
+                color: &mut color,
+                pinned: &mut pinned,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Char('x')),
@@ -26116,10 +28307,14 @@ mod input_handler_tests {
     #[test]
     fn workspace_settings_backspace_pops() {
         let mut name = "abc".to_string();
+        let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 0,
                 name: &mut name,
+                color: &mut color,
+                pinned: &mut pinned,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Backspace),
@@ -26131,30 +28326,45 @@ mod input_handler_tests {
     #[test]
     fn workspace_settings_enter_submits_trimmed_name() {
         let mut name = "  hello  ".to_string();
+        let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 3,
                 name: &mut name,
+                color: &mut color,
+                pinned: &mut pinned,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
         );
         match outcome {
-            InputOutcome::Submit(SubmitAction::SaveWorkspaceName { ws_index, name }) => {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
+                ws_index,
+                name,
+                color,
+                pinned,
+            }) => {
                 assert_eq!(ws_index, 3);
                 assert_eq!(name, "hello");
+                assert_eq!(color, None);
+                assert!(!pinned);
             }
-            other => panic!("expected SaveWorkspaceName, got {:?}", other),
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
         }
     }
 
     #[test]
     fn workspace_settings_esc_cancels() {
         let mut name = "n".to_string();
+        let (mut color, mut pinned, mut active) = (None::<String>, false, 0u8);
         let outcome = handle_workspace_settings(
             WorkspaceSettingsMut {
                 ws_index: 0,
                 name: &mut name,
+                color: &mut color,
+                pinned: &mut pinned,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -26319,6 +28529,8 @@ mod input_handler_tests {
     fn ws_fixture(id: &str, sessions: &[(&str, &str)]) -> Workspace {
         use std::collections::HashMap;
         let mut out = Workspace {
+            color: None,
+            pinned: false,
             id: id.to_string(),
             name: id.to_string(),
             is_closed: false,
@@ -26345,11 +28557,13 @@ mod input_handler_tests {
             )
             .expect("dummy session for fixture");
             out.sessions.push(TerminalSession {
+                color: None,
                 uid: (*uid).into(),
                 label: (*uid).into(),
                 session_type: (*ty).into(),
                 session,
                 status: SessionStatus::Idle,
+                idle_since: None,
                 last_write_at: None,
                 transcript_id: None,
                 generation: 0,
@@ -26955,10 +29169,13 @@ mod input_handler_tests {
     fn task_settings_backspace_pops_name() {
         let task_id = "task-id-1".to_string();
         let mut name = "abc".to_string();
+        let (mut color, mut active) = (None::<String>, 0u8);
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
                 name: &mut name,
+                color: &mut color,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Backspace),
@@ -26971,21 +29188,68 @@ mod input_handler_tests {
     fn task_settings_enter_submits_save_task_name() {
         let task_id = "task-id-1".to_string();
         let mut name = " new name ".to_string();
+        let (mut color, mut active) = (Some("cyan".to_string()), 0u8);
         let outcome = handle_task_settings(
             TaskSettingsMut {
                 task_id: task_id.as_str(),
                 name: &mut name,
+                color: &mut color,
+                active_field: &mut active,
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
         );
         match outcome {
-            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name }) => {
+            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name, color }) => {
                 assert_eq!(task_id, "task-id-1");
                 assert_eq!(name, "new name");
+                assert_eq!(color.as_deref(), Some("cyan"));
             }
             other => panic!("expected SaveTaskName, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn task_settings_space_cycles_color_on_color_field() {
+        let task_id = "task-id-1".to_string();
+        let mut name = "abc".to_string();
+        let (mut color, mut active) = (None::<String>, 1u8);
+        let outcome = handle_task_settings(
+            TaskSettingsMut {
+                task_id: task_id.as_str(),
+                name: &mut name,
+                color: &mut color,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Char(' ')),
+        );
+        assert_consumed(&outcome);
+        // First cycle step lands on the first palette entry; name untouched
+        // (the space must NOT be typed into the name field).
+        assert_eq!(color.as_deref(), Some(theme::USER_COLORS[0].0));
+        assert_eq!(name, "abc");
+    }
+
+    #[test]
+    fn user_color_cycle_roundtrips_through_none() {
+        // Forward through every palette slot and back to None.
+        let mut cur: Option<String> = None;
+        for (name, _) in theme::USER_COLORS {
+            cur = theme::cycle_user_color(cur.as_deref(), true);
+            assert_eq!(cur.as_deref(), Some(*name));
+        }
+        cur = theme::cycle_user_color(cur.as_deref(), true);
+        assert_eq!(cur, None);
+        // One step back from None lands on the last palette entry.
+        cur = theme::cycle_user_color(cur.as_deref(), false);
+        assert_eq!(cur.as_deref(), Some(theme::USER_COLORS[theme::USER_COLORS.len() - 1].0));
+        // Unknown stored names behave like None (palette drift recovery).
+        assert_eq!(
+            theme::cycle_user_color(Some("mauve-nonexistent"), true).as_deref(),
+            Some(theme::USER_COLORS[0].0)
+        );
+        assert_eq!(theme::user_color("mauve-nonexistent"), None);
     }
 
     // ── WorkflowLaunchConfirm ─────────────────────────────────────
@@ -27927,6 +30191,8 @@ mod slice_12e_tests {
             ts.host_id = HostId::new(*host_name);
             ts.status = SessionStatus::Idle;
             let ws = Workspace {
+                color: None,
+                pinned: false,
                 id: format!("ws-{}", i),
                 name: format!("ws-{}", i),
                 is_closed: false,
@@ -27973,6 +30239,8 @@ mod slice_12e_tests {
         let (mut single_app, _tmp2) =
             build_app_with_hosts(&[("local", true)], &guard2);
         single_app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-only".into(),
             name: "ws-only".into(),
             is_closed: false,
@@ -28053,6 +30321,8 @@ mod slice_12e_tests {
                 ts
             };
             Workspace {
+                color: None,
+                pinned: false,
                 id: "ws-0".into(),
                 name: "ws-0".into(),
                 is_closed: false,
@@ -28587,6 +30857,8 @@ mod slice_12e_tests {
         );
         caller_ts.host_id = HostId::local();
         app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-local-caller".into(),
             name: "ws-local-caller".into(),
             is_closed: false,
@@ -28849,6 +31121,8 @@ mod slice_12e_tests {
         );
         caller_ts.host_id = HostId::new("manager");
         app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-mgr-caller".into(),
             name: "ws-mgr-caller".into(),
             is_closed: false,
@@ -29151,6 +31425,7 @@ mod slice_12e_tests {
         // be skipped + preserved).
         let mut workspaces = HashMap::new();
         let local_entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -29174,6 +31449,7 @@ mod slice_12e_tests {
             host_id: HostId::local(),
         };
         let remote_entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -29197,6 +31473,8 @@ mod slice_12e_tests {
             global_perms: false,
         };
         let ws = ManifestWorkspace {
+            color: None,
+            pinned: false,
             id: "ws-acc".into(),
             name: "ws-acc".into(),
             is_closed: false,
@@ -29212,6 +31490,7 @@ mod slice_12e_tests {
         };
         workspaces.insert(ws.id.clone(), ws);
         let manifest = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: Some("status".to_string()),
@@ -29382,6 +31661,8 @@ remote_socket = "/remote/manager.sock"
             workspaces.insert(
                 id.to_string(),
                 ManifestWorkspace {
+                    color: None,
+                    pinned: false,
                     id: id.to_string(),
                     name: id.to_string(),
                     is_closed: false,
@@ -29398,6 +31679,7 @@ remote_socket = "/remote/manager.sock"
             );
         }
         let on_disk = Manifest {
+            task_colors: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             view: Some("task".to_string()),
@@ -29429,6 +31711,8 @@ remote_socket = "/remote/manager.sock"
         // Mimic the clobber trigger: a single fresh workspace lands in live
         // state (as adoption would mint) and a save fires BEFORE restore.
         app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
             id: "ws-fresh-adopted".into(),
             name: "agent: phantom".into(),
             is_closed: false,
@@ -31506,5 +33790,407 @@ mod migrate_tui_local_tests {
              head:\n{}",
             &trimmed[..trimmed.len().min(200)],
         );
+    }
+}
+
+#[cfg(test)]
+mod nav_quickswitch_tests {
+    //! Feature tests for the three Sessions-view navigation additions:
+    //! A-; MRU quick-switch (deque + walk semantics), the A-p fuzzy-find
+    //! palette (pure match/rank + handler), and the A-i peek (pure line
+    //! assembly + scroll clamping). All pure logic / free handlers — no
+    //! App, no PTY.
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode) -> CrosstermEvent {
+        CrosstermEvent::Key(KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    fn key_mod(code: KeyCode, mods: KeyModifiers) -> CrosstermEvent {
+        CrosstermEvent::Key(KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        })
+    }
+
+    fn ctx<'a>() -> InputCtx<'a> {
+        InputCtx { repo_urls: &[], host_ids: &[] }
+    }
+
+    // ── palette_match_indices ─────────────────────────────────────
+
+    #[test]
+    fn palette_empty_query_returns_all_in_order() {
+        let displays = ["alpha", "beta", "gamma"];
+        assert_eq!(palette_match_indices("", &displays), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn palette_prefix_ranks_before_substring() {
+        // "ba" is a prefix of "backend" (idx 2) and a substring of
+        // "alpha-bar" (idx 0) and "rebase" (idx 3); "zzz" matches nothing.
+        let displays = ["alpha-bar", "zzz", "backend", "rebase"];
+        assert_eq!(palette_match_indices("ba", &displays), vec![2, 0, 3]);
+    }
+
+    #[test]
+    fn palette_match_is_case_insensitive() {
+        let displays = ["Fix Login", "deploy", "LOGIN page"];
+        assert_eq!(palette_match_indices("login", &displays), vec![2, 0]);
+    }
+
+    #[test]
+    fn palette_no_match_returns_empty() {
+        let displays = ["one", "two"];
+        assert!(palette_match_indices("xyz", &displays).is_empty());
+    }
+
+    #[test]
+    fn palette_groups_preserve_sidebar_order() {
+        // Two prefix matches keep their relative order; likewise substrings.
+        let displays = ["ab-1", "xab", "ab-2", "yab"];
+        assert_eq!(palette_match_indices("ab", &displays), vec![0, 2, 1, 3]);
+    }
+
+    // ── mru_record ────────────────────────────────────────────────
+
+    #[test]
+    fn mru_record_pushes_front_dedups_and_caps() {
+        let mut mru: VecDeque<String> = VecDeque::new();
+        mru_record(&mut mru, "a", 3);
+        mru_record(&mut mru, "b", 3);
+        mru_record(&mut mru, "c", 3);
+        assert_eq!(mru, ["c", "b", "a"]);
+        // Re-recording an existing uid moves it to the front (no dupes).
+        mru_record(&mut mru, "a", 3);
+        assert_eq!(mru, ["a", "c", "b"]);
+        // Cap evicts the oldest.
+        mru_record(&mut mru, "d", 3);
+        assert_eq!(mru, ["d", "a", "c"]);
+    }
+
+    // ── mru_next_walk_target ──────────────────────────────────────
+
+    fn uids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn walk_first_press_picks_most_recent_other() {
+        // Ring: [current A, then MRU deque B, C]. First press → B.
+        let list = uids(&["A", "B", "C"]);
+        let got = mru_next_walk_target(&list, 0, Some("A"), |_| true);
+        assert_eq!(got, Some(1));
+    }
+
+    #[test]
+    fn walk_advances_deeper_on_repeat_and_wraps_through_start() {
+        let list = uids(&["A", "B", "C"]);
+        // After the first hop (pos 1, focused B), the next press goes
+        // deeper to C — not back to A (classic alt-tab).
+        assert_eq!(mru_next_walk_target(&list, 1, Some("B"), |_| true), Some(2));
+        // And from C the walk wraps back through the start A.
+        assert_eq!(mru_next_walk_target(&list, 2, Some("C"), |_| true), Some(0));
+    }
+
+    #[test]
+    fn walk_skips_unresolvable_uids() {
+        let list = uids(&["A", "dead", "C"]);
+        let got = mru_next_walk_target(&list, 0, Some("A"), |u| u != "dead");
+        assert_eq!(got, Some(2));
+    }
+
+    #[test]
+    fn walk_skips_sentinel_start_slot() {
+        // Walk started on a non-session row: slot 0 is the empty sentinel,
+        // which never resolves — first press lands on the deque head.
+        let list = uids(&["", "B", "C"]);
+        let got = mru_next_walk_target(&list, 0, None, |u| !u.is_empty());
+        assert_eq!(got, Some(1));
+        // Wrapping from the last entry skips the sentinel too.
+        let got = mru_next_walk_target(&list, 2, Some("C"), |u| !u.is_empty());
+        assert_eq!(got, Some(1));
+    }
+
+    #[test]
+    fn walk_none_when_nothing_resolves() {
+        let list = uids(&["A", "B"]);
+        assert_eq!(mru_next_walk_target(&list, 0, Some("A"), |_| false), None);
+        assert_eq!(mru_next_walk_target(&[], 0, None, |_| true), None);
+        // Only the current session in the ring → nowhere to go.
+        let solo = uids(&["A"]);
+        assert_eq!(mru_next_walk_target(&solo, 0, Some("A"), |_| true), None);
+    }
+
+    // ── peek line assembly ────────────────────────────────────────
+
+    fn task_fixture(prompt: Option<&str>, parent: Option<&str>) -> TaskEntry {
+        TaskEntry {
+            task_id: Some("t1".into()),
+            name: "Fix the frobnicator".into(),
+            api_status: TaskStatus::Blocked,
+            repo_url: None,
+            prompt: prompt.map(str::to_string),
+            wip_branch: Some("cm/frob".into()),
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: None,
+            project: Some("claude-manager".into()),
+            parent_task_id: parent.map(str::to_string),
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn peek_task_lines_has_title_status_and_full_prompt() {
+        let task = task_fixture(Some("line one\nline two"), None);
+        let lines = peek_task_lines(&task, None);
+        assert_eq!(lines[0], PeekLine::Title("Fix the frobnicator".into()));
+        assert_eq!(
+            lines[1],
+            PeekLine::Status { value: "blocked".into(), status: TaskStatus::Blocked }
+        );
+        // Full prompt payload, one Text line per prompt line.
+        assert!(lines.contains(&PeekLine::Text("line one".into())));
+        assert!(lines.contains(&PeekLine::Text("line two".into())));
+        // Branch + project fields present.
+        assert!(lines.contains(&PeekLine::Field {
+            label: "Branch".into(),
+            value: "cm/frob".into()
+        }));
+        assert!(lines.contains(&PeekLine::Field {
+            label: "Project".into(),
+            value: "claude-manager".into()
+        }));
+        // No parent → no Parent field.
+        assert!(!lines
+            .iter()
+            .any(|l| matches!(l, PeekLine::Field { label, .. } if label == "Parent")));
+    }
+
+    #[test]
+    fn peek_task_lines_parent_prefers_name_falls_back_to_id() {
+        let task = task_fixture(None, Some("t0"));
+        let with_name = peek_task_lines(&task, Some("Parent task"));
+        assert!(with_name.contains(&PeekLine::Field {
+            label: "Parent".into(),
+            value: "Parent task".into()
+        }));
+        let without = peek_task_lines(&task, None);
+        assert!(without.contains(&PeekLine::Field {
+            label: "Parent".into(),
+            value: "t0".into()
+        }));
+        // Missing prompt renders the placeholder rather than nothing.
+        assert!(without.contains(&PeekLine::Text("(no prompt)".into())));
+    }
+
+    #[test]
+    fn peek_workspace_lines_lists_identity_and_sessions() {
+        let sessions = vec![
+            ("worker".to_string(), "claude".to_string(), "running".to_string()),
+            ("shell".to_string(), "bash".to_string(), "idle".to_string()),
+        ];
+        let lines = peek_workspace_lines(
+            "my-ws",
+            Some("/tmp/wt"),
+            Some("/tmp/main"),
+            Some("git@github.com:a/b.git"),
+            "local",
+            &sessions,
+        );
+        assert_eq!(lines[0], PeekLine::Title("my-ws".into()));
+        assert!(lines.contains(&PeekLine::Field {
+            label: "Worktree".into(),
+            value: "/tmp/wt".into()
+        }));
+        assert!(lines.contains(&PeekLine::Field { label: "Host".into(), value: "local".into() }));
+        assert!(lines.contains(&PeekLine::Text("worker (claude) \u{2014} running".into())));
+        assert!(lines.contains(&PeekLine::Text("shell (bash) \u{2014} idle".into())));
+        // Empty roster shows the placeholder.
+        let empty = peek_workspace_lines("ws", None, None, None, "local", &[]);
+        assert!(empty.contains(&PeekLine::Text("(none)".into())));
+    }
+
+    #[test]
+    fn peek_session_lines_include_provenance_when_present() {
+        let lines = peek_session_lines(
+            "worker",
+            "claude",
+            "uid-1",
+            Some("snap-a"),
+            Some("do the thing"),
+        );
+        assert!(lines.contains(&PeekLine::Field {
+            label: "Session".into(),
+            value: "worker (claude)".into()
+        }));
+        assert!(lines.contains(&PeekLine::Field {
+            label: "Seeded from".into(),
+            value: "snap-a".into()
+        }));
+        assert!(lines.contains(&PeekLine::Field {
+            label: "Last prompt".into(),
+            value: "do the thing".into()
+        }));
+        // Absent provenance → the fields are omitted entirely.
+        let bare = peek_session_lines("worker", "claude", "uid-1", None, None);
+        assert_eq!(bare.len(), 2);
+    }
+
+    // ── handle_session_palette ────────────────────────────────────
+
+    fn palette_candidates() -> Vec<PaletteCandidate> {
+        vec![
+            PaletteCandidate {
+                target: PaletteTarget::Workspace { ws_id: "ws-1".into() },
+                display: "alpha".into(),
+            },
+            PaletteCandidate {
+                target: PaletteTarget::Session { uid: "u-beta".into() },
+                display: "alpha / beta".into(),
+            },
+            PaletteCandidate {
+                target: PaletteTarget::Session { uid: "u-gamma".into() },
+                display: "alpha / gamma".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn palette_typing_edits_query_and_resets_selection() {
+        let cands = palette_candidates();
+        let mut query = String::new();
+        let mut selected = 2usize;
+        // Plain 'g' types into the query (it must NOT move the selection).
+        let o = handle_session_palette(
+            &cands,
+            &mut query,
+            &mut selected,
+            ctx(),
+            &key(KeyCode::Char('g')),
+        );
+        assert!(matches!(o, InputOutcome::Consumed));
+        assert_eq!(query, "g");
+        assert_eq!(selected, 0);
+        // Backspace pops.
+        handle_session_palette(
+            &cands,
+            &mut query,
+            &mut selected,
+            ctx(),
+            &key(KeyCode::Backspace),
+        );
+        assert_eq!(query, "");
+    }
+
+    #[test]
+    fn palette_enter_submits_selected_filtered_row() {
+        let cands = palette_candidates();
+        let mut query = "gamma".to_string();
+        let mut selected = 0usize;
+        let o = handle_session_palette(
+            &cands,
+            &mut query,
+            &mut selected,
+            ctx(),
+            &key(KeyCode::Enter),
+        );
+        match o {
+            InputOutcome::Submit(SubmitAction::PaletteJump {
+                target: PaletteTarget::Session { uid },
+            }) => assert_eq!(uid, "u-gamma"),
+            other => panic!("expected PaletteJump for u-gamma, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn palette_selection_moves_on_down_tab_not_plain_j() {
+        let cands = palette_candidates();
+        let mut query = String::new();
+        let mut selected = 0usize;
+        handle_session_palette(&cands, &mut query, &mut selected, ctx(), &key(KeyCode::Down));
+        assert_eq!(selected, 1);
+        handle_session_palette(&cands, &mut query, &mut selected, ctx(), &key(KeyCode::Tab));
+        assert_eq!(selected, 2);
+        // Wraps.
+        handle_session_palette(&cands, &mut query, &mut selected, ctx(), &key(KeyCode::Down));
+        assert_eq!(selected, 0);
+        // Ctrl-k moves up (wrapping); plain 'j' types instead.
+        handle_session_palette(
+            &cands,
+            &mut query,
+            &mut selected,
+            ctx(),
+            &key_mod(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(selected, 2);
+        assert_eq!(query, "");
+        handle_session_palette(&cands, &mut query, &mut selected, ctx(), &key(KeyCode::Char('j')));
+        assert_eq!(query, "j");
+    }
+
+    #[test]
+    fn palette_esc_and_alt_p_cancel_enter_on_no_match_cancels() {
+        let cands = palette_candidates();
+        let mut query = String::new();
+        let mut selected = 0usize;
+        let o = handle_session_palette(&cands, &mut query, &mut selected, ctx(), &key(KeyCode::Esc));
+        assert!(matches!(o, InputOutcome::Cancel));
+        let o = handle_session_palette(
+            &cands,
+            &mut query,
+            &mut selected,
+            ctx(),
+            &key_mod(KeyCode::Char('p'), KeyModifiers::ALT),
+        );
+        assert!(matches!(o, InputOutcome::Cancel));
+        let mut no_match = "zzzz".to_string();
+        let o = handle_session_palette(
+            &cands,
+            &mut no_match,
+            &mut selected,
+            ctx(),
+            &key(KeyCode::Enter),
+        );
+        assert!(matches!(o, InputOutcome::Cancel));
+    }
+
+    // ── handle_task_peek ──────────────────────────────────────────
+
+    #[test]
+    fn task_peek_scroll_clamps_both_ends() {
+        let mut scroll = 0u16;
+        // Down past the max clamps at max.
+        for _ in 0..5 {
+            handle_task_peek(&mut scroll, 3, &key(KeyCode::Char('j')));
+        }
+        assert_eq!(scroll, 3);
+        handle_task_peek(&mut scroll, 3, &key(KeyCode::PageDown));
+        assert_eq!(scroll, 3);
+        // Up past zero saturates.
+        handle_task_peek(&mut scroll, 3, &key(KeyCode::PageUp));
+        assert_eq!(scroll, 0);
+        handle_task_peek(&mut scroll, 3, &key(KeyCode::Char('k')));
+        assert_eq!(scroll, 0);
+        // PgDn respects the max mid-flight.
+        handle_task_peek(&mut scroll, 25, &key(KeyCode::PageDown));
+        assert_eq!(scroll, 10);
+    }
+
+    #[test]
+    fn task_peek_esc_and_alt_i_close() {
+        let mut scroll = 0u16;
+        let o = handle_task_peek(&mut scroll, 0, &key(KeyCode::Esc));
+        assert!(matches!(o, InputOutcome::Cancel));
+        let o = handle_task_peek(&mut scroll, 0, &key_mod(KeyCode::Char('i'), KeyModifiers::ALT));
+        assert!(matches!(o, InputOutcome::Cancel));
+        let o = handle_task_peek(&mut scroll, 0, &key(KeyCode::Char('q')));
+        assert!(matches!(o, InputOutcome::Cancel));
     }
 }

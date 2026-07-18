@@ -759,6 +759,7 @@ impl DaemonState {
             hide_continuous: false,
             // TUI-only view state; the daemon-owned registry doesn't track it.
             continuous_column_on: false,
+            task_colors: HashMap::new(),
         }
     }
 
@@ -976,6 +977,7 @@ mod tests {
 
     fn entry(uid: &str) -> ManifestEntry {
         ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,

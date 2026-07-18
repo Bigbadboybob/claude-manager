@@ -24,6 +24,7 @@ mod term_shim;
 mod terminal_widget;
 #[cfg(test)]
 mod test_support;
+mod theme;
 mod tls_dialer;
 mod workflow;
 mod workflow_watch;
@@ -379,6 +380,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // pending, which is the overwhelmingly common case.
         app.reap_and_clear_alerts();
         app.tick_alerts();
+        // Idle-age indicator buckets (afterglow/settled/stale): force a
+        // repaint when an idle session crosses a bucket boundary — idle
+        // sessions produce no events of their own. ~1 Hz check, redraw
+        // only on an actual bucket change.
+        app.tick_idle_ages();
 
         // Render at most ~120fps, but only when something changed.
         let now = std::time::Instant::now();

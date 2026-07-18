@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use alacritty_terminal::event::Event as TermEvent;
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -13,6 +13,7 @@ use ratatui::Frame;
 use crate::api::Task;
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
+use crate::theme;
 
 // ── Data Types ──────────────────────────────────────────────
 
@@ -202,6 +203,77 @@ fn visible_row_slug(row: &VisibleRow) -> Option<&str> {
         VisibleRowKind::Subtask { slug } => Some(slug.as_str()),
         _ => None,
     }
+}
+
+/// Case-insensitive substring match over the fields `/` search covers:
+/// title + description.
+fn task_matches_query(task: &PlanTask, query_lower: &str) -> bool {
+    !query_lower.is_empty()
+        && (task.title.to_lowercase().contains(query_lower)
+            || task.description.to_lowercase().contains(query_lower))
+}
+
+/// Wrap-around step through a match list. `current` is the cursor's
+/// position within the list when it already sits on a match; `None`
+/// (cursor elsewhere) enters the list at the first match going forward
+/// and the last going backward. `None` result = empty list.
+fn next_search_index(len: usize, current: Option<usize>, direction: i32) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        Some(cur) => (cur as i32 + direction).rem_euclid(len as i32) as usize,
+        None if direction >= 0 => 0,
+        None => len - 1,
+    })
+}
+
+/// Byte ranges of every case-insensitive occurrence of `needle_lower`
+/// (pre-lowercased, non-empty) in `haystack`. Lowercasing is done per
+/// char with an offset map back to the original string, so multibyte
+/// and case-expanding chars can't produce out-of-bounds or mid-char
+/// ranges — degenerate (empty) ranges are dropped instead.
+fn find_ci_ranges(haystack: &str, needle_lower: &str) -> Vec<(usize, usize)> {
+    if needle_lower.is_empty() {
+        return vec![];
+    }
+    let mut lowered = String::with_capacity(haystack.len());
+    // For each byte of `lowered`, the original byte offset its source
+    // char started at. One extra sentinel entry maps end→end.
+    let mut back: Vec<usize> = Vec::with_capacity(haystack.len() + 1);
+    for (oi, ch) in haystack.char_indices() {
+        for lch in ch.to_lowercase() {
+            let before = lowered.len();
+            lowered.push(lch);
+            for _ in before..lowered.len() {
+                back.push(oi);
+            }
+        }
+    }
+    back.push(haystack.len());
+    let mut ranges = Vec::new();
+    let mut from = 0usize;
+    while let Some(pos) = lowered[from..].find(needle_lower) {
+        let ls = from + pos;
+        let le = ls + needle_lower.len();
+        let os = back[ls];
+        // End maps to the start of the char AFTER the match; when the
+        // match ends mid-expansion this still lands on a boundary of
+        // the original string because `back` repeats the source offset.
+        let oe = if le < back.len() { back[le] } else { haystack.len() };
+        if oe > os {
+            ranges.push((os, oe));
+        }
+        from = le;
+    }
+    ranges
+}
+
+/// One-shot env gate for the grid `[debug]` footer line. Development
+/// aid only: set `CM_PLANNING_DEBUG=1` to get it back.
+fn planning_debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CM_PLANNING_DEBUG").map(|v| v == "1").unwrap_or(false))
 }
 
 #[derive(Clone, Debug)]
@@ -927,6 +999,24 @@ pub struct PlanningView {
     /// only; resets across TUI restarts. Default empty so the user
     /// always opens to a tidy top-level view.
     expanded_tasks: HashSet<String>,
+    /// Committed search query (`/` + Enter). Bare `n`/`N` in normal
+    /// mode step through its matches; matching rows highlight their
+    /// title. `None` = no active search.
+    last_search: Option<String>,
+    /// Task IDs matching `last_search`, in board walk order (columns
+    /// left-to-right, rows top-to-bottom, folded subtasks included).
+    /// A cache: `jump_search` recomputes it from `last_search` on
+    /// every press, so stale entries (deleted tasks, project switch)
+    /// can never send the cursor somewhere wrong — the stored copy
+    /// only feeds the `match i/n` echo and tests.
+    search_matches: Vec<String>,
+    /// Footer echo like `match 2/5: query`, rendered inside the help
+    /// separator line. Set by n/N jumps and search accept.
+    search_status: Option<String>,
+    /// Cursor + fold-state snapshot taken when the `/` prompt opens.
+    /// Esc restores it (incremental search may have moved the cursor
+    /// and auto-unfolded parents); Enter drops it.
+    search_return: Option<(GridCursor, HashSet<String>)>,
 }
 
 impl PlanningView {
@@ -955,6 +1045,10 @@ impl PlanningView {
             workspace_candidates: vec![],
             show_archived: false,
             expanded_tasks: HashSet::new(),
+            last_search: None,
+            search_matches: vec![],
+            search_status: None,
+            search_return: None,
         }
     }
 
@@ -1093,6 +1187,10 @@ impl PlanningView {
 
         self.rebuild_unified_cols();
         self.recompute_conflicts();
+        // Board contents changed wholesale: recompute the search-match
+        // cache so deleted/renamed tasks drop out instead of lingering
+        // as stale IDs (n/N re-resolves position at jump time anyway).
+        self.refresh_search_matches();
         if !self.initialized {
             self.cursor = GridCursor { col: 0, row: 0 };
             self.snap_cursor_to_selectable(1);
@@ -1571,6 +1669,13 @@ impl PlanningView {
     /// Archived filtering still happens at this layer — archived tasks
     /// and their subtrees are skipped when `show_archived` is off.
     fn visible_rows_for_column(&self, pi: usize, ci: usize) -> Vec<VisibleRow> {
+        self.visible_rows_for_column_opts(pi, ci, false)
+    }
+
+    /// `force_expand` treats every parent as unfolded regardless of
+    /// `expanded_tasks` — used by search-match computation so folded
+    /// subtasks still count as matches (the jump auto-unfolds them).
+    fn visible_rows_for_column_opts(&self, pi: usize, ci: usize, force_expand: bool) -> Vec<VisibleRow> {
         let pd = match self.project_data.get(pi) {
             Some(p) => p,
             None => return Vec::new(),
@@ -1644,7 +1749,7 @@ impl PlanningView {
                 let task = match task_by_slug.get(slug.as_str()) { Some(t) => *t, None => continue };
                 let kids = children_of.get(&task.id);
                 let has_children = kids.map_or(false, |v| !v.is_empty());
-                let expanded = self.expanded_tasks.contains(&task.id);
+                let expanded = force_expand || self.expanded_tasks.contains(&task.id);
                 let dcount = desc_memo.get(&task.id).copied().unwrap_or(0);
                 out.push(VisibleRow {
                     kind: VisibleRowKind::Subtask { slug: slug.clone() },
@@ -1685,7 +1790,7 @@ impl PlanningView {
                     let (has_children, expanded, dcount) = match task {
                         Some(t) => (
                             children_of.get(&t.id).map_or(false, |v| !v.is_empty()),
-                            self.expanded_tasks.contains(&t.id),
+                            force_expand || self.expanded_tasks.contains(&t.id),
                             desc_memo.get(&t.id).copied().unwrap_or(0),
                         ),
                         None => (false, false, 0),
@@ -1831,6 +1936,9 @@ impl PlanningView {
                         if !self.show_archived {
                             self.snap_cursor_to_selectable(1);
                         }
+                        // Archived visibility changes which rows can
+                        // match; keep the cached match list honest.
+                        self.refresh_search_matches();
                         return PlanAction::Consumed;
                     }
                     _ => {}
@@ -1933,6 +2041,10 @@ impl PlanningView {
                     }
                     KeyCode::Char('/') => {
                         self.cancel_visual();
+                        // Snapshot cursor + fold state so Esc can fully
+                        // undo whatever incremental search moved/unfolded.
+                        self.search_return = Some((self.cursor.clone(), self.expanded_tasks.clone()));
+                        self.search_status = None;
                         self.input_mode = PlanInputMode::Searching { query: String::new() };
                         return PlanAction::Consumed;
                     }
@@ -1943,6 +2055,17 @@ impl PlanningView {
             match key.code {
                 KeyCode::Char(' ') if key.modifiers.is_empty() => {
                     self.toggle_fold_at_cursor();
+                    return PlanAction::Consumed;
+                }
+                // Bare n/N: step through the stored `/` search matches.
+                // Only bound while a search is active so the keys stay
+                // inert (Ignored) otherwise.
+                KeyCode::Char('n') if key.modifiers.is_empty() && self.last_search.is_some() => {
+                    self.jump_search(1);
+                    return PlanAction::Consumed;
+                }
+                KeyCode::Char('N') if !has_alt && self.last_search.is_some() => {
+                    self.jump_search(-1);
                     return PlanAction::Consumed;
                 }
                 KeyCode::PageDown => {
@@ -2023,10 +2146,35 @@ impl PlanningView {
                 _ => return PlanAction::Consumed,
             };
             match key.code {
-                KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
-                KeyCode::Enter => { self.input_mode = PlanInputMode::Normal; self.apply_search(&query); }
-                KeyCode::Backspace => { query.pop(); self.input_mode = PlanInputMode::Searching { query }; }
-                KeyCode::Char(c) => { query.push(c); self.input_mode = PlanInputMode::Searching { query }; }
+                KeyCode::Esc => {
+                    // Cancel: restore the pre-search cursor + fold state.
+                    // A previously committed search (if any) stays live.
+                    if let Some((cursor, folds)) = self.search_return.take() {
+                        self.cursor = cursor;
+                        self.expanded_tasks = folds;
+                        self.clamp_cursor();
+                        self.ensure_cursor_visible();
+                    }
+                    self.input_mode = PlanInputMode::Normal;
+                }
+                KeyCode::Enter => {
+                    // Accept: keep the cursor where incremental search
+                    // left it, drop the restore snapshot, store the query
+                    // for n/N + highlight.
+                    self.search_return = None;
+                    self.input_mode = PlanInputMode::Normal;
+                    self.commit_search(&query);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.incremental_search(&query);
+                    self.input_mode = PlanInputMode::Searching { query };
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    self.incremental_search(&query);
+                    self.input_mode = PlanInputMode::Searching { query };
+                }
                 _ => {}
             }
         }
@@ -2230,6 +2378,10 @@ impl PlanningView {
                     }
                     self.rebuild_unified_cols();
                     self.clamp_cursor();
+                    // The filter changes which columns exist, so the
+                    // match list (and its ordering) must be rebuilt.
+                    self.refresh_search_matches();
+                    self.search_status = None;
                 }
                 _ => {}
             }
@@ -3169,22 +3321,243 @@ impl PlanningView {
         self.workspace_candidates = candidates;
     }
 
-    fn apply_search(&mut self, query: &str) {
-        if query.is_empty() { return; }
+    // ── Search ──────────────────────────────────────────────
+
+    /// Task IDs matching `query`, in board walk order: unified columns
+    /// left-to-right, rows top-to-bottom within each, with every parent
+    /// treated as unfolded so folded subtasks still participate (the
+    /// jump auto-unfolds their ancestors). Rows the projection hides
+    /// for real (archived without A-V, filtered-out projects) can't
+    /// match. Case-insensitive over title + description.
+    fn compute_search_matches(&self, query: &str) -> Vec<String> {
         let q = query.to_lowercase();
-        for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
-            let rows = self.visible_rows_for_column(pi, ci);
-            for (ri, row) in rows.iter().enumerate() {
+        if q.is_empty() {
+            return vec![];
+        }
+        let mut out = Vec::new();
+        for &(pi, ci) in &self.unified_cols {
+            let rows = self.visible_rows_for_column_opts(pi, ci, true);
+            for row in &rows {
                 let slug = match visible_row_slug(row) { Some(s) => s, None => continue };
                 if let Some(task) = self.project_data[pi].tasks.iter().find(|t| t.slug == slug) {
-                    if task.title.to_lowercase().contains(&q) || task.description.to_lowercase().contains(&q) {
-                        self.cursor.col = gi;
-                        self.cursor.row = ri;
-                        self.ensure_cursor_visible();
-                        return;
+                    if task_matches_query(task, &q) {
+                        out.push(task.id.clone());
                     }
                 }
             }
+        }
+        out
+    }
+
+    /// Recompute `search_matches` from `last_search` over the current
+    /// board. Called at every use site (n/N press) and after board
+    /// mutations (API refresh, project-filter change, archive toggle),
+    /// so stale task IDs from deleted rows or a project switch never
+    /// linger — invalidation is recompute, not clearing, which keeps
+    /// n/N working across refreshes.
+    fn refresh_search_matches(&mut self) {
+        self.search_matches = match &self.last_search {
+            Some(q) => self.compute_search_matches(&q.clone()),
+            None => vec![],
+        };
+    }
+
+    /// Live jump while typing in the `/` prompt: cursor follows the
+    /// first match of the draft query; an empty or unmatched draft
+    /// snaps back to the pre-search position.
+    fn incremental_search(&mut self, query: &str) {
+        let first = self.compute_search_matches(query).into_iter().next();
+        match first {
+            Some(id) => { self.jump_to_task_id(&id); }
+            None => {
+                if let Some((cursor, folds)) = self.search_return.clone() {
+                    self.cursor = cursor;
+                    self.expanded_tasks = folds;
+                    self.clamp_cursor();
+                    self.ensure_cursor_visible();
+                }
+            }
+        }
+    }
+
+    /// Enter in the `/` prompt: persist the query for n/N + highlight.
+    /// An empty query clears any previous search.
+    fn commit_search(&mut self, query: &str) {
+        if query.is_empty() {
+            self.last_search = None;
+            self.search_matches.clear();
+            self.search_status = None;
+            return;
+        }
+        self.last_search = Some(query.to_string());
+        self.refresh_search_matches();
+        let len = self.search_matches.len();
+        if len == 0 {
+            self.search_status = Some(format!("no matches: {}", query));
+            return;
+        }
+        // Incremental search normally already parked the cursor on the
+        // first match; if not (e.g. data shifted mid-prompt), jump now.
+        let pos = match self.cursor_task_id().and_then(|id| self.search_matches.iter().position(|m| *m == id)) {
+            Some(p) => p,
+            None => {
+                let id = self.search_matches[0].clone();
+                self.jump_to_task_id(&id);
+                0
+            }
+        };
+        self.search_status = Some(format!("match {}/{}: {}", pos + 1, len, query));
+    }
+
+    /// Bare n/N: wrap-step through the committed search's matches.
+    fn jump_search(&mut self, direction: i32) {
+        let query = match &self.last_search {
+            Some(q) => q.clone(),
+            None => return,
+        };
+        self.cancel_visual();
+        self.refresh_search_matches();
+        let len = self.search_matches.len();
+        let current = self.cursor_task_id().and_then(|id| self.search_matches.iter().position(|m| *m == id));
+        match next_search_index(len, current, direction) {
+            Some(next) => {
+                let id = self.search_matches[next].clone();
+                if self.jump_to_task_id(&id) {
+                    self.search_status = Some(format!("match {}/{}: {}", next + 1, len, query));
+                }
+            }
+            None => {
+                self.search_status = Some(format!("no matches: {}", query));
+            }
+        }
+    }
+
+    /// ID of the task under the cursor, if the cursor is on a task row.
+    fn cursor_task_id(&self) -> Option<String> {
+        let (task, _) = self.selected_task()?;
+        Some(task.id.clone())
+    }
+
+    /// Move the cursor to a task by ID, auto-unfolding its ancestor
+    /// chain first so folded subtasks become reachable (`Space`'s
+    /// `expanded_tasks` mechanism). Returns false when the task isn't
+    /// on the visible board (deleted, filtered project, hidden
+    /// archived) — the cursor stays put.
+    fn jump_to_task_id(&mut self, task_id: &str) -> bool {
+        // Resolve project + slug + ancestor IDs (cycle-guarded).
+        let mut target: Option<(usize, String)> = None;
+        let mut ancestors: Vec<String> = Vec::new();
+        for (pi, pd) in self.project_data.iter().enumerate() {
+            if let Some(task) = pd.tasks.iter().find(|t| t.id == task_id) {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut cur = task.parent_task_id.clone();
+                while let Some(pid) = cur {
+                    if !seen.insert(pid.clone()) {
+                        break;
+                    }
+                    match pd.tasks.iter().find(|p| p.id == pid) {
+                        Some(parent) => {
+                            ancestors.push(parent.id.clone());
+                            cur = parent.parent_task_id.clone();
+                        }
+                        None => break,
+                    }
+                }
+                target = Some((pi, task.slug.clone()));
+                break;
+            }
+        }
+        let (pi, slug) = match target {
+            Some(t) => t,
+            None => return false,
+        };
+        for id in ancestors {
+            self.expanded_tasks.insert(id);
+        }
+        for (gi, &(p, c)) in self.unified_cols.iter().enumerate() {
+            if p != pi {
+                continue;
+            }
+            let rows = self.visible_rows_for_column(p, c);
+            if let Some(ri) = rows.iter().position(|r| visible_row_slug(r) == Some(slug.as_str())) {
+                if (gi, ri) != (self.cursor.col, self.cursor.row) {
+                    self.detail_scroll = 0;
+                }
+                self.cursor.col = gi;
+                self.cursor.row = ri;
+                self.ensure_cursor_visible();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The query rows should highlight against: the live draft while
+    /// the `/` prompt is open, else the committed search. Lowercased;
+    /// `None` when neither is active.
+    fn active_search_query(&self) -> Option<String> {
+        match &self.input_mode {
+            PlanInputMode::Searching { query } if !query.is_empty() => Some(query.to_lowercase()),
+            _ => self.last_search.as_deref().filter(|q| !q.is_empty()).map(str::to_lowercase),
+        }
+    }
+
+    /// Build the title spans for a (possibly) search-matched row.
+    /// Matching substrings inside the visible title render ATTN+bold;
+    /// a task that matches only via its description (or whose title
+    /// match got truncated away) gets a whole-title ATTN tint so it's
+    /// still discoverable. Non-matches inherit the row style via a
+    /// plain span.
+    fn push_title_spans(
+        &self,
+        spans: &mut Vec<Span<'static>>,
+        title_display: String,
+        task: Option<&PlanTask>,
+        query_lower: Option<&str>,
+    ) {
+        let matched = match (query_lower, task) {
+            (Some(q), Some(t)) => task_matches_query(t, q),
+            _ => false,
+        };
+        if !matched {
+            spans.push(Span::raw(title_display));
+            return;
+        }
+        let q = query_lower.unwrap_or("");
+        let ranges = find_ci_ranges(&title_display, q);
+        if ranges.is_empty() {
+            spans.push(Span::styled(title_display, Style::default().fg(theme::ATTN)));
+            return;
+        }
+        let hl = Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD);
+        let mut pos = 0usize;
+        for (s, e) in ranges {
+            if s > pos {
+                spans.push(Span::raw(title_display[pos..s].to_string()));
+            }
+            spans.push(Span::styled(title_display[s..e].to_string(), hl));
+            pos = e;
+        }
+        if pos < title_display.len() {
+            spans.push(Span::raw(title_display[pos..].to_string()));
+        }
+    }
+
+    /// Footer separator line for grid/linear; carries the search echo
+    /// (`match 2/5: query`) inline when one is pending, so no list row
+    /// is spent on it.
+    fn footer_sep_line(&self, width: usize, dim: Style) -> Line<'static> {
+        match &self.search_status {
+            Some(status) => {
+                let label = truncate_with_ellipsis(&format!(" {} ", status), width.saturating_sub(2));
+                let used = 2 + label.chars().count();
+                Line::from(vec![
+                    Span::styled("\u{2500}\u{2500}", dim),
+                    Span::styled(label, Style::default().fg(theme::ATTN)),
+                    Span::styled("\u{2500}".repeat(width.saturating_sub(used)), dim),
+                ])
+            }
+            None => Line::from(Span::styled("\u{2500}".repeat(width), dim)),
         }
     }
 
@@ -3278,18 +3651,21 @@ impl PlanningView {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(filter_label, Style::default().fg(Color::White)));
+            .border_style(Style::default().fg(theme::DIM))
+            .title(Span::styled(filter_label, Style::default().fg(theme::TEXT)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         if inner.height < 4 || inner.width < 8 { return; }
 
-        let help_h = 4u16;
+        // The `[debug]` row is a dev aid, off by default (reclaims a
+        // list row); CM_PLANNING_DEBUG=1 brings it back.
+        let debug_on = planning_debug_enabled();
+        let help_h = if debug_on { 4u16 } else { 3u16 };
         let grid_height = inner.height.saturating_sub(help_h) as usize;
         let num_cols = self.unified_cols.len().max(1);
         let col_width = inner.width / num_cols as u16;
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(theme::DIM);
 
         // Publish the actual list area height so ensure_cursor_visible
         // scrolls based on the real terminal size, not the stale default.
@@ -3310,7 +3686,7 @@ impl PlanningView {
             if show_headers && self.is_first_col_of_project(gi) {
                 let name_display: String = pd.project.name.chars().take(w as usize).collect();
                 frame.render_widget(
-                    Paragraph::new(Span::styled(name_display, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                    Paragraph::new(Span::styled(name_display, Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD))),
                     Rect::new(x, inner.y, w, 1),
                 );
             }
@@ -3341,7 +3717,7 @@ impl PlanningView {
                 };
                 let sep_x = inner.x + (gi as u16 + 1) * col_width - 1;
                 let ch = if is_project_boundary { '\u{2503}' } else { '\u{2502}' };
-                let color = if is_project_boundary { Color::Cyan } else { Color::DarkGray };
+                let color = if is_project_boundary { theme::HEADER } else { theme::DIM };
                 if sep_x < inner.right() {
                     for y in inner.y..inner.y + grid_height as u16 {
                         if let Some(cell) = buf.cell_mut((sep_x, y)) {
@@ -3356,20 +3732,19 @@ impl PlanningView {
         // Help.
         let help_y = inner.y + inner.height.saturating_sub(help_h);
         let help_area = Rect::new(inner.x, help_y, inner.width, help_h);
-        let sep = Line::from(Span::styled("\u{2500}".repeat(inner.width as usize), dim));
-        let debug_line = Line::from(Span::styled(self.grid_debug_line(), Style::default().fg(Color::Yellow)));
-        frame.render_widget(Paragraph::new(vec![
-            sep,
-            debug_line,
-            Line::from(Span::styled(
-                " A-j/k nav \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear",
-                dim,
-            )),
-            Line::from(Span::styled(
-                " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
-                dim,
-            )),
-        ]), help_area);
+        let mut help_lines = vec![self.footer_sep_line(inner.width as usize, dim)];
+        if debug_on {
+            help_lines.push(Line::from(Span::styled(self.grid_debug_line(), Style::default().fg(theme::ATTN))));
+        }
+        help_lines.push(Line::from(Span::styled(
+            " A-j/k nav \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
+            dim,
+        )));
+        help_lines.push(Line::from(Span::styled(
+            " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+            dim,
+        )));
+        frame.render_widget(Paragraph::new(help_lines), help_area);
     }
 
     fn grid_debug_line(&self) -> String {
@@ -3413,6 +3788,7 @@ impl PlanningView {
     ) -> Vec<ListItem<'a>> {
         let rows = self.visible_rows_for_column(pi, ci);
         let mut items = Vec::new();
+        let search_q = self.active_search_query();
         let start = self.grid_col_scroll.get(col_idx).copied().unwrap_or(0).min(rows.len());
 
         for ri in start..rows.len() {
@@ -3447,14 +3823,14 @@ impl PlanningView {
                         None => "?",
                     };
                     let indicator_style = if is_claude {
-                        Style::default().fg(Color::Magenta)
+                        Style::default().fg(theme::REMOTE)
                     } else {
                         match status {
-                            Some(PlanStatus::Done) => Style::default().fg(Color::Green),
-                            Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
+                            Some(PlanStatus::Done) => Style::default().fg(theme::OK),
+                            Some(PlanStatus::InProgress) => Style::default().fg(theme::ATTN),
                             Some(PlanStatus::Backlog) => Style::default(),
-                            Some(PlanStatus::Draft) => Style::default().fg(Color::DarkGray),
-                            Some(PlanStatus::Archived) => Style::default().fg(Color::DarkGray),
+                            Some(PlanStatus::Draft) => Style::default().fg(theme::DIM),
+                            Some(PlanStatus::Archived) => Style::default().fg(theme::DIM),
                             None => Style::default(),
                         }
                     };
@@ -3483,50 +3859,50 @@ impl PlanningView {
                     if !indent.is_empty() {
                         spans.push(Span::raw(indent.clone()));
                     }
-                    spans.push(Span::styled(fold_glyph.to_string(), Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(fold_glyph.to_string(), Style::default().fg(theme::DIM)));
                     spans.push(Span::styled(format!("{} ", indicator), indicator_style));
                     if is_claude {
-                        spans.push(Span::styled(claude_prefix, Style::default().fg(Color::Magenta)));
+                        spans.push(Span::styled(claude_prefix, Style::default().fg(theme::REMOTE)));
                     }
-                    spans.push(Span::raw(title_display));
+                    self.push_title_spans(&mut spans, title_display, task, search_q.as_deref());
                     if !count_suffix.is_empty() {
-                        spans.push(Span::styled(count_suffix, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(count_suffix, Style::default().fg(theme::DIM)));
                     }
                     let line = Line::from(spans);
                     let conflict = self.is_conflict(project_name, slug);
-                    let base_fg = if is_claude { Color::Magenta } else { Color::Gray };
+                    let base_fg = if is_claude { theme::REMOTE } else { theme::MUTED };
                     let style = if is_selected && in_visual {
-                        Style::default().fg(Color::White).bg(Color::Rgb(50, 50, 80)).add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme::TEXT).bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
                     } else if is_selected {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
                     } else if in_visual {
-                        Style::default().fg(Color::White).bg(Color::Rgb(50, 50, 80))
+                        Style::default().fg(theme::TEXT).bg(theme::SELECT_BG)
                     } else {
                         Style::default().fg(base_fg)
                     };
                     let style = if conflict && is_selected {
-                        style.bg(Color::Red).fg(Color::White)
+                        style.bg(theme::ERROR).fg(theme::TEXT)
                     } else if conflict {
-                        style.bg(Color::Rgb(80, 0, 0))
+                        style.bg(theme::CONFLICT_BG)
                     } else { style };
                     items.push(ListItem::new(line).style(style));
                 }
                 (Some(GridItem::Separator), None) => {
                     let ch = if is_selected { "\u{2501}" } else { "\u{2500}" };
-                    let st = if is_selected { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray) };
+                    let st = if is_selected { Style::default().fg(theme::TEXT) } else { Style::default().fg(theme::DIM) };
                     items.push(ListItem::new(Line::from(Span::styled(ch.repeat(width.saturating_sub(1)), st))));
                 }
                 (Some(GridItem::Empty), None) => {
                     items.push(ListItem::new(Line::from("")));
                 }
                 (Some(GridItem::Header(text)), None) => {
-                    let base_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+                    let base_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
                     let style = if is_selected && in_visual {
-                        base_style.bg(Color::Rgb(50, 50, 80))
+                        base_style.bg(theme::SELECT_BG)
                     } else if is_selected {
-                        base_style.bg(Color::Rgb(40, 40, 50))
+                        base_style.bg(theme::HEADER_SELECT_BG)
                     } else if in_visual {
-                        base_style.bg(Color::Rgb(50, 50, 80))
+                        base_style.bg(theme::SELECT_BG)
                     } else {
                         base_style
                     };
@@ -3553,8 +3929,8 @@ impl PlanningView {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(title, Style::default().fg(Color::White)));
+            .border_style(Style::default().fg(theme::DIM))
+            .title(Span::styled(title, Style::default().fg(theme::TEXT)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 4 || inner.width < 4 { return; }
@@ -3570,15 +3946,17 @@ impl PlanningView {
             ("A-i    header", "A-A    archive done"),
             ("A-s/S  status", "A-V    show arch"),
             ("A-g    grid", "A-t    sessions"),
-            ("A-p    filter", ""),
+            ("A-p    filter", "/      search"),
+            ("n      next match", "N      prev match"),
         ];
         let help_rows = help_entries.len() as u16;
         let list_height = inner.height.saturating_sub(help_rows + 2) as usize;
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(theme::DIM);
         self.grid_rows_visible.set(list_height);
 
         let mut items: Vec<ListItem> = Vec::new();
         let mut flat_idx = 0usize;
+        let search_q = self.active_search_query();
 
         for (gi, &(pi, ci)) in self.unified_cols.iter().enumerate() {
             let pd = &self.project_data[pi];
@@ -3589,7 +3967,7 @@ impl PlanningView {
                     let sep = "\u{2550}".repeat(inner.width.saturating_sub(2) as usize);
                     items.push(ListItem::new(Line::from(vec![
                         Span::styled(" ", dim),
-                        Span::styled(sep, Style::default().fg(Color::Cyan)),
+                        Span::styled(sep, Style::default().fg(theme::HEADER)),
                     ])));
                 }
                 flat_idx += 1;
@@ -3599,7 +3977,7 @@ impl PlanningView {
                 if flat_idx >= self.linear_scroll && items.len() < list_height {
                     items.push(ListItem::new(Line::from(Span::styled(
                         format!(" {}", pd.project.name),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD),
                     ))));
                 }
                 flat_idx += 1;
@@ -3635,12 +4013,12 @@ impl PlanningView {
                             None => "?",
                         };
                         let indicator_style = if is_claude {
-                            Style::default().fg(Color::Magenta)
+                            Style::default().fg(theme::REMOTE)
                         } else {
                             match status {
-                                Some(PlanStatus::Done) => Style::default().fg(Color::Green),
-                                Some(PlanStatus::InProgress) => Style::default().fg(Color::Yellow),
-                                _ => Style::default().fg(Color::DarkGray),
+                                Some(PlanStatus::Done) => Style::default().fg(theme::OK),
+                                Some(PlanStatus::InProgress) => Style::default().fg(theme::ATTN),
+                                _ => Style::default().fg(theme::DIM),
                             }
                         };
                         let claude_prefix = if is_claude { "[C] " } else { "" };
@@ -3651,27 +4029,27 @@ impl PlanningView {
                             Span::styled(format!(" {} ", indicator), indicator_style),
                         ];
                         if is_claude {
-                            spans.push(Span::styled(claude_prefix, Style::default().fg(Color::Magenta)));
+                            spans.push(Span::styled(claude_prefix, Style::default().fg(theme::REMOTE)));
                         }
-                        spans.push(Span::raw(title_display));
+                        self.push_title_spans(&mut spans, title_display, task, search_q.as_deref());
                         let line = Line::from(spans);
                         let conflict = self.is_conflict(&pd.project.name, slug);
-                        let base_fg = if is_claude { Color::Magenta } else { Color::Gray };
+                        let base_fg = if is_claude { theme::REMOTE } else { theme::MUTED };
                         let style = if is_selected {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(base_fg)
                         };
                         let style = if conflict && is_selected {
-                            style.bg(Color::Red).fg(Color::White)
+                            style.bg(theme::ERROR).fg(theme::TEXT)
                         } else if conflict {
-                            style.bg(Color::Rgb(80, 0, 0))
+                            style.bg(theme::CONFLICT_BG)
                         } else { style };
                         items.push(ListItem::new(line).style(style));
                     }
                     GridItem::Separator => {
                         let ch = if is_selected { "\u{2501}" } else { "\u{2500}" };
-                        let st = if is_selected { Style::default().fg(Color::White) } else { dim };
+                        let st = if is_selected { Style::default().fg(theme::TEXT) } else { dim };
                         items.push(ListItem::new(Line::from(Span::styled(
                             format!(" {}", ch.repeat((inner.width as usize).saturating_sub(2))), st,
                         ))));
@@ -3680,9 +4058,9 @@ impl PlanningView {
                         items.push(ListItem::new(Line::from("")));
                     }
                     GridItem::Header(text) => {
-                        let base_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+                        let base_style = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
                         let style = if is_selected {
-                            base_style.bg(Color::Rgb(40, 40, 50))
+                            base_style.bg(theme::HEADER_SELECT_BG)
                         } else {
                             base_style
                         };
@@ -3703,7 +4081,7 @@ impl PlanningView {
 
         let help_y = inner.y + inner.height.saturating_sub(help_rows + 1);
         let help_area = Rect { x: inner.x, y: help_y, width: inner.width, height: help_rows + 1 };
-        let sep = Line::from(Span::styled("\u{2500}".repeat(inner.width as usize), dim));
+        let sep = self.footer_sep_line(inner.width as usize, dim);
         let col = inner.width / 2;
         let mut lines = vec![sep];
         for (left, right) in &help_entries {
@@ -3720,11 +4098,11 @@ impl PlanningView {
         let title = selected.as_ref()
             .map(|(t, _)| format!(" {} ", t.title))
             .unwrap_or_else(|| " No task selected ".to_string());
-        let title_style = if selected.is_some() { Style::default().fg(Color::White) } else { Style::default().fg(Color::DarkGray) };
+        let title_style = if selected.is_some() { Style::default().fg(theme::TEXT) } else { Style::default().fg(theme::DIM) };
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme::DIM))
             .title(Span::styled(title, title_style));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -3732,51 +4110,51 @@ impl PlanningView {
         if let Some((task, project_name)) = selected {
             let mut lines: Vec<Line> = vec![];
             lines.push(Line::from(vec![
-                Span::styled("  Slug: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Slug: ", Style::default().fg(theme::DIM)),
                 Span::styled(
                     format!("{}/{}", project_name, task.slug),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme::TEXT),
                 ),
             ]));
 
             let status_color = match task.status {
-                PlanStatus::Done => Color::Green, PlanStatus::InProgress => Color::Yellow,
-                PlanStatus::Backlog => Color::White, PlanStatus::Draft => Color::DarkGray,
-                PlanStatus::Archived => Color::DarkGray,
+                PlanStatus::Done => theme::OK, PlanStatus::InProgress => theme::ATTN,
+                PlanStatus::Backlog => theme::TEXT, PlanStatus::Draft => theme::DIM,
+                PlanStatus::Archived => theme::DIM,
             };
             let mut meta = vec![
-                Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Status: ", Style::default().fg(theme::DIM)),
                 Span::styled(task.status.label(), Style::default().fg(status_color)),
             ];
             if let Some(d) = task.difficulty {
-                meta.push(Span::styled("    Difficulty: ", Style::default().fg(Color::DarkGray)));
-                meta.push(Span::styled(d.to_string(), Style::default().fg(Color::White)));
+                meta.push(Span::styled("    Difficulty: ", Style::default().fg(theme::DIM)));
+                meta.push(Span::styled(d.to_string(), Style::default().fg(theme::TEXT)));
             }
             lines.push(Line::from(meta));
 
             if !task.depends.is_empty() {
-                let dep_color = if self.is_conflict(project_name, &task.slug) { Color::Red } else { Color::White };
+                let dep_color = if self.is_conflict(project_name, &task.slug) { theme::ERROR } else { theme::TEXT };
                 lines.push(Line::from(vec![
-                    Span::styled("  Depends: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  Depends: ", Style::default().fg(theme::DIM)),
                     Span::styled(task.depends.join(", "), Style::default().fg(dep_color)),
                 ]));
             }
             if let Some(ref created) = task.created {
                 lines.push(Line::from(vec![
-                    Span::styled("  Created: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(created.as_str(), Style::default().fg(Color::White)),
+                    Span::styled("  Created: ", Style::default().fg(theme::DIM)),
+                    Span::styled(created.as_str(), Style::default().fg(theme::TEXT)),
                 ]));
             }
             if task.source == "claude" {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled(" PROPOSED ", Style::default().fg(Color::White).bg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                    Span::styled("  Alt+a to accept, Alt+d to reject", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" PROPOSED ", Style::default().fg(theme::TEXT).bg(theme::REMOTE).add_modifier(Modifier::BOLD)),
+                    Span::styled("  Alt+a to accept, Alt+d to reject", Style::default().fg(theme::DIM)),
                 ]));
             }
             lines.push(Line::from(""));
             let sep_w = inner.width.saturating_sub(4) as usize;
-            lines.push(Line::from(Span::styled(format!("  {}", "\u{2500}".repeat(sep_w)), Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(format!("  {}", "\u{2500}".repeat(sep_w)), Style::default().fg(theme::DIM))));
             lines.push(Line::from(""));
 
             let body = if !task.description.is_empty() {
@@ -3788,12 +4166,12 @@ impl PlanningView {
             };
 
             if body.is_empty() {
-                lines.push(Line::from(Span::styled("  No description. Press Alt+e to edit.", Style::default().fg(Color::DarkGray))));
+                lines.push(Line::from(Span::styled("  No description. Press Alt+e to edit.", Style::default().fg(theme::DIM))));
             } else {
                 for line in body.lines() {
                     let style = if line.starts_with("## ") {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                    } else { Style::default().fg(Color::Gray) };
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    } else { Style::default().fg(theme::MUTED) };
                     lines.push(Line::from(Span::styled(format!("  {}", line), style)));
                 }
             }
@@ -3806,12 +4184,12 @@ impl PlanningView {
         } else if self.projects.is_empty() {
             frame.render_widget(Paragraph::new(vec![
                 Line::from(""),
-                Line::from(Span::styled("  No tasks yet. Press Alt+Shift+p to create a project.", Style::default().fg(Color::DarkGray))),
-                Line::from(Span::styled("  Or press Alt+r to refresh from API.", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  No tasks yet. Press Alt+Shift+p to create a project.", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  Or press Alt+r to refresh from API.", Style::default().fg(theme::DIM))),
             ]), inner);
         } else if self.project_data.iter().all(|pd| pd.tasks.is_empty()) {
             frame.render_widget(Paragraph::new(Span::styled(
-                "  No tasks. Press Alt+n to create one.", Style::default().fg(Color::DarkGray),
+                "  No tasks. Press Alt+n to create one.", Style::default().fg(theme::DIM),
             )), inner);
         }
     }
@@ -3822,8 +4200,8 @@ impl PlanningView {
             .unwrap_or_else(|| " Editor ".to_string());
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(title, Style::default().fg(Color::White)));
+            .border_style(Style::default().fg(theme::DIM))
+            .title(Span::styled(title, Style::default().fg(theme::TEXT)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if let Some(ref editor) = self.editor {
@@ -3835,18 +4213,18 @@ impl PlanningView {
         let (w, h) = (50u16.min(area.width.saturating_sub(4)), 5u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(" Search ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(" Search ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-                Span::styled(query, Style::default().fg(Color::White)),
-                Span::styled("\u{2588}", Style::default().fg(Color::White)),
+                Span::styled("  > ", Style::default().fg(theme::DIM)),
+                Span::styled(query, Style::default().fg(theme::TEXT)),
+                Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Enter search \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("Enter accept \u{00b7} Esc cancel \u{00b7} then n/N next/prev", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 
@@ -3871,10 +4249,10 @@ impl PlanningView {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
                 title_label,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
@@ -3889,27 +4267,27 @@ impl PlanningView {
                 p.to_string()
             };
             lines.push(Line::from(vec![
-                Span::styled("  Parent: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(shown, Style::default().fg(Color::Cyan)),
+                Span::styled("  Parent: ", Style::default().fg(theme::DIM)),
+                Span::styled(shown, Style::default().fg(theme::HEADER)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("  Mode:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled("inherit", Style::default().fg(Color::Gray)),
+                Span::styled("  Mode:   ", Style::default().fg(theme::DIM)),
+                Span::styled("inherit", Style::default().fg(theme::MUTED)),
                 Span::styled(
                     "  (subtask shares parent's worktree on launch)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::DIM),
                 ),
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("  Title:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(title, Style::default().fg(Color::White)),
-            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+            Span::styled("  Title:  ", Style::default().fg(theme::DIM)),
+            Span::styled(title, Style::default().fg(theme::TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Enter create \u{00b7} Esc cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::DIM),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -3919,18 +4297,18 @@ impl PlanningView {
         let (w, h) = (60u16.min(area.width.saturating_sub(4)), 5u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(title, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("  Text: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(text, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled("\u{2588}", Style::default().fg(Color::White)),
+                Span::styled("  Text: ", Style::default().fg(theme::DIM)),
+                Span::styled(text, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+                Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Enter save \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("Enter save \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 
@@ -3938,8 +4316,8 @@ impl PlanningView {
         let (w, h) = (70u16.min(area.width.saturating_sub(4)), 7u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(" New Project ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(" New Project ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
@@ -3949,17 +4327,17 @@ impl PlanningView {
 
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("     Name: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(name, Style::default().fg(Color::White)),
-                Span::styled(name_cursor, Style::default().fg(Color::White)),
+                Span::styled("     Name: ", Style::default().fg(theme::DIM)),
+                Span::styled(name, Style::default().fg(theme::TEXT)),
+                Span::styled(name_cursor, Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Repo URL: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(repo_url, Style::default().fg(Color::White)),
-                Span::styled(url_cursor, Style::default().fg(Color::White)),
+                Span::styled("  Repo URL: ", Style::default().fg(theme::DIM)),
+                Span::styled(repo_url, Style::default().fg(theme::TEXT)),
+                Span::styled(url_cursor, Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Tab switch \u{00b7} Enter create \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("Tab switch \u{00b7} Enter create \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 
@@ -3968,24 +4346,24 @@ impl PlanningView {
         let h = (self.projects.len() as u16 + 5).min(area.height.saturating_sub(4));
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(" Filter Projects ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(" Filter Projects ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
         let mut lines: Vec<Line> = vec![];
-        let all_style = if selected == 0 { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
+        let all_style = if selected == 0 { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::MUTED) };
         let all_ind = if selected == 0 { ">" } else { " " };
         lines.push(Line::from(Span::styled(format!("  {} All projects", all_ind), all_style)));
 
         for (i, project) in self.projects.iter().enumerate() {
             let idx = i + 1;
             let ind = if selected == idx { ">" } else { " " };
-            let st = if selected == idx { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
+            let st = if selected == idx { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::MUTED) };
             lines.push(Line::from(Span::styled(format!("  {} {}", ind, project.name), st)));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("j/k navigate \u{00b7} Enter select \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("j/k navigate \u{00b7} Enter select \u{00b7} Esc cancel", Style::default().fg(theme::DIM))));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -4015,11 +4393,11 @@ impl PlanningView {
         frame.render_widget(Clear, dialog);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White))
+            .border_style(Style::default().fg(theme::TEXT))
             .title(Span::styled(
                 " Launch Into ",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(dialog);
@@ -4031,8 +4409,8 @@ impl PlanningView {
             .collect();
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(vec![
-            Span::styled("  Task: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(display_name, Style::default().fg(Color::White)),
+            Span::styled("  Task: ", Style::default().fg(theme::DIM)),
+            Span::styled(display_name, Style::default().fg(theme::TEXT)),
         ]));
         lines.push(Line::from(""));
         let row = |label: &str, idx: usize| -> Line<'static> {
@@ -4040,10 +4418,10 @@ impl PlanningView {
             let ind = if is_sel { ">" } else { " " };
             let st = if is_sel {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::MUTED)
             };
             Line::from(Span::styled(format!("  {} {}", ind, label), st))
         };
@@ -4059,7 +4437,7 @@ impl PlanningView {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  j/k navigate \u{00b7} Enter select \u{00b7} Esc cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::DIM),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -4071,19 +4449,19 @@ impl PlanningView {
         let (w, h) = (62u16.min(area.width.saturating_sub(4)), 7u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(" Archive Done Tasks ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(" Archive Done Tasks ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
         frame.render_widget(Paragraph::new(vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled(format!("  Archive {} done task{} in ", count, if count == 1 { "" } else { "s" }), Style::default().fg(Color::White)),
-                Span::styled(project_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("?", Style::default().fg(Color::White)),
+                Span::styled(format!("  Archive {} done task{} in ", count, if count == 1 { "" } else { "s" }), Style::default().fg(theme::TEXT)),
+                Span::styled(project_name, Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)),
+                Span::styled("?", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  Enter confirm \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("  Enter confirm \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 
@@ -4095,8 +4473,8 @@ impl PlanningView {
         let (w, h) = (60u16.min(area.width.saturating_sub(4)), 9u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::White))
-            .title(Span::styled(" Launch Task ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
+            .title(Span::styled(" Launch Task ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
         let inner = block.inner(dialog);
         frame.render_widget(block, dialog);
 
@@ -4110,18 +4488,18 @@ impl PlanningView {
         };
         frame.render_widget(Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("    Task: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(display_name, Style::default().fg(Color::White)),
+                Span::styled("    Task: ", Style::default().fg(theme::DIM)),
+                Span::styled(display_name, Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Branch: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(branch_text, Style::default().fg(Color::White)),
-                Span::styled("\u{2588}", Style::default().fg(Color::White)),
-                Span::styled(branch_hint, Style::default().fg(Color::DarkGray)),
+                Span::styled("  Branch: ", Style::default().fg(theme::DIM)),
+                Span::styled(branch_text, Style::default().fg(theme::TEXT)),
+                Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
+                Span::styled(branch_hint, Style::default().fg(theme::DIM)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  Enter launch \u{00b7} Esc cancel", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled("  Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 }
@@ -5476,5 +5854,197 @@ mod tests {
             column_slugs(&view, 0, 0),
             vec!["pa", "a1", "a2", "pb", "b1", "b2"],
         );
+    }
+
+    // ── `/` search: match list + n/N navigation ──────────────────────
+
+    /// Board for the search tests: two columns, a folded subtask, and
+    /// titles/descriptions arranged so a query can hit each field.
+    fn make_search_view() -> PlanningView {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("p", "");
+        let mut alpha = make_task("a", "alpha", None);
+        alpha.title = "Fix Alpha widget".to_string();
+        let mut child = make_task("b", "alpha-child", Some("a"));
+        child.title = "alpha follow-up".to_string();
+        let mut beta = make_task("c", "beta", None);
+        beta.title = "Beta cleanup".to_string();
+        beta.description = "also touches the ALPHA path".to_string();
+        let mut gamma = make_task("d", "gamma", None);
+        gamma.title = "Unrelated".to_string();
+        pd.tasks = vec![alpha, child, beta, gamma];
+        pd.layout.columns = vec![
+            vec![
+                GridItem::Task("alpha".to_string()),
+                GridItem::Task("alpha-child".to_string()),
+            ],
+            vec![
+                GridItem::Task("gamma".to_string()),
+                GridItem::Task("beta".to_string()),
+            ],
+        ];
+        view.project_data.push(pd);
+        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
+        view.rebuild_unified_cols();
+        view
+    }
+
+    #[test]
+    fn search_matches_ordered_by_board_walk_including_folded_subtasks() {
+        let view = make_search_view();
+        // "alpha" hits: alpha (title), alpha-child (title, FOLDED under
+        // alpha), beta (description only). Board order: col 0 top-down
+        // (parent then its subtask), then col 1.
+        assert_eq!(view.compute_search_matches("alpha"), vec!["a", "b", "c"]);
+        // Case-insensitive both ways: query uppercase, field uppercase.
+        assert_eq!(view.compute_search_matches("ALPHA"), vec!["a", "b", "c"]);
+        // No matches → empty; empty query → empty.
+        assert!(view.compute_search_matches("zzz").is_empty());
+        assert!(view.compute_search_matches("").is_empty());
+    }
+
+    #[test]
+    fn search_matches_skip_archived_when_hidden() {
+        let mut view = make_search_view();
+        view.project_data[0].tasks.iter_mut()
+            .find(|t| t.id == "c").unwrap().status = PlanStatus::Archived;
+        assert_eq!(
+            view.compute_search_matches("alpha"),
+            vec!["a", "b"],
+            "hidden archived rows must not match",
+        );
+        view.show_archived = true;
+        assert_eq!(view.compute_search_matches("alpha"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn next_search_index_wraps_both_ways() {
+        // Stepping from a known position wraps at both ends.
+        assert_eq!(next_search_index(3, Some(0), 1), Some(1));
+        assert_eq!(next_search_index(3, Some(2), 1), Some(0));
+        assert_eq!(next_search_index(3, Some(0), -1), Some(2));
+        // Cursor not on a match: n enters at the first, N at the last.
+        assert_eq!(next_search_index(3, None, 1), Some(0));
+        assert_eq!(next_search_index(3, None, -1), Some(2));
+        // Empty list navigates nowhere.
+        assert_eq!(next_search_index(0, Some(1), 1), None);
+        assert_eq!(next_search_index(0, None, -1), None);
+        // Single-element list is a fixed point.
+        assert_eq!(next_search_index(1, Some(0), 1), Some(0));
+    }
+
+    #[test]
+    fn find_ci_ranges_locates_case_insensitive_substrings() {
+        assert_eq!(find_ci_ranges("Fix Alpha widget", "alpha"), vec![(4, 9)]);
+        assert_eq!(find_ci_ranges("aAaA", "aa"), vec![(0, 2), (2, 4)]);
+        assert!(find_ci_ranges("nothing here", "alpha").is_empty());
+        assert!(find_ci_ranges("anything", "").is_empty());
+        // Multibyte haystack: ranges stay on char boundaries.
+        assert_eq!(find_ci_ranges("\u{2264}Alpha", "alpha"), vec![(3, 8)]);
+    }
+
+    #[test]
+    fn bare_n_jumps_to_next_match_and_auto_unfolds_parent() {
+        let mut view = make_search_view();
+        view.last_search = Some("alpha".to_string());
+        view.cursor = GridCursor { col: 0, row: 0 };
+
+        let n_key = CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        ));
+
+        // Cursor sits on match #1 ("a"), so n steps to #2: the folded
+        // subtask "b". Its parent must auto-unfold and the cursor land
+        // on the synthetic subtask row.
+        assert!(matches!(view.handle_event(&n_key), PlanAction::Consumed));
+        assert!(view.expanded_tasks.contains("a"), "parent should auto-unfold");
+        assert_eq!((view.cursor.col, view.cursor.row), (0, 1));
+        match view.cursor_visible_row().expect("row").kind {
+            VisibleRowKind::Subtask { ref slug } => assert_eq!(slug, "alpha-child"),
+            other => panic!("expected Subtask row, got {:?}", other),
+        }
+        assert_eq!(view.search_status.as_deref(), Some("match 2/3: alpha"));
+
+        // n again → beta in column 1; n once more wraps to alpha.
+        assert!(matches!(view.handle_event(&n_key), PlanAction::Consumed));
+        assert_eq!((view.cursor.col, view.cursor.row), (1, 1));
+        assert_eq!(view.search_status.as_deref(), Some("match 3/3: alpha"));
+        assert!(matches!(view.handle_event(&n_key), PlanAction::Consumed));
+        assert_eq!((view.cursor.col, view.cursor.row), (0, 0));
+        assert_eq!(view.search_status.as_deref(), Some("match 1/3: alpha"));
+
+        // Shift+N steps backwards (wraps to beta).
+        let shift_n = CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT,
+        ));
+        assert!(matches!(view.handle_event(&shift_n), PlanAction::Consumed));
+        assert_eq!((view.cursor.col, view.cursor.row), (1, 1));
+        assert_eq!(view.search_status.as_deref(), Some("match 3/3: alpha"));
+    }
+
+    #[test]
+    fn bare_n_without_stored_search_stays_inert() {
+        let mut view = make_search_view();
+        view.cursor = GridCursor { col: 0, row: 0 };
+        let n_key = CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(view.handle_event(&n_key), PlanAction::Ignored));
+        assert_eq!((view.cursor.col, view.cursor.row), (0, 0));
+    }
+
+    #[test]
+    fn incremental_search_moves_live_and_esc_restores() {
+        let mut view = make_search_view();
+        view.cursor = GridCursor { col: 1, row: 0 };
+
+        let key = |code: KeyCode, mods: KeyModifiers| {
+            CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, mods))
+        };
+
+        // Open the prompt (A-/) and type "beta" — the cursor should
+        // track the first match while typing.
+        view.handle_event(&key(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert!(matches!(view.input_mode, PlanInputMode::Searching { .. }));
+        for c in "beta".chars() {
+            view.handle_event(&key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!((view.cursor.col, view.cursor.row), (1, 1), "live jump to Beta cleanup");
+
+        // Esc cancels: cursor restored, no query committed.
+        view.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(view.input_mode, PlanInputMode::Normal));
+        assert_eq!((view.cursor.col, view.cursor.row), (1, 0));
+        assert!(view.last_search.is_none());
+
+        // Same flow but Enter commits: cursor stays on the match and
+        // the query + match list persist for n/N.
+        view.handle_event(&key(KeyCode::Char('/'), KeyModifiers::ALT));
+        for c in "beta".chars() {
+            view.handle_event(&key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        view.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(view.input_mode, PlanInputMode::Normal));
+        assert_eq!((view.cursor.col, view.cursor.row), (1, 1));
+        assert_eq!(view.last_search.as_deref(), Some("beta"));
+        assert_eq!(view.search_matches, vec!["c"]);
+        assert_eq!(view.search_status.as_deref(), Some("match 1/1: beta"));
+    }
+
+    #[test]
+    fn refresh_search_matches_drops_stale_ids_after_reload() {
+        let mut view = make_search_view();
+        view.last_search = Some("alpha".to_string());
+        view.refresh_search_matches();
+        assert_eq!(view.search_matches, vec!["a", "b", "c"]);
+
+        // Simulate a board reload that removed the beta task.
+        view.project_data[0].tasks.retain(|t| t.id != "c");
+        view.project_data[0].layout.columns[1].retain(|i| !matches!(i, GridItem::Task(s) if s == "beta"));
+        view.refresh_search_matches();
+        assert_eq!(view.search_matches, vec!["a", "b"], "stale ID must drop out");
     }
 }

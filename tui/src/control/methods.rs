@@ -1199,6 +1199,8 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             // Register a fresh workspace for this subtask.
             let new_ws_id = crate::app::new_workspace_id();
             let new_ws = Workspace {
+                color: None,
+                pinned: false,
                 id: new_ws_id.clone(),
                 name: leaf_slug.clone(),
                 is_closed: false,
@@ -1228,6 +1230,8 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             let main_repo = in_place_main_repo.expect("validated above");
             let new_ws_id = crate::app::new_workspace_id();
             let new_ws = Workspace {
+                color: None,
+                pinned: false,
                 id: new_ws_id.clone(),
                 name: leaf_slug.clone(),
                 is_closed: false,
@@ -2017,11 +2021,13 @@ mod tests {
 
     fn live_ts(uid: &str, task_id: Option<&str>) -> TerminalSession {
         TerminalSession {
+            color: None,
             uid: uid.into(),
             label: "test".into(),
             session_type: "claude".into(),
             session: dummy_session(),
             status: SessionStatus::Idle,
+            idle_since: None,
             last_write_at: None,
             transcript_id: None,
             generation: 0,
@@ -2049,6 +2055,8 @@ mod tests {
 
     fn workspace_with(sessions: Vec<TerminalSession>, tombstones: Vec<SessionTombstone>) -> Workspace {
         Workspace {
+            color: None,
+            pinned: false,
             id: "ws-1".into(),
             name: "ws".into(),
             is_closed: false,

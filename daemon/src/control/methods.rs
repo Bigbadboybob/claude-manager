@@ -12227,6 +12227,8 @@ mod tests {
         s.workspaces.insert(
             ws_id.into(),
             ManifestWorkspace {
+                color: None,
+                pinned: false,
                 id: ws_id.into(),
                 name: "test-ws".into(),
                 is_closed: false,
@@ -13066,6 +13068,8 @@ mod tests {
             s.workspaces.insert(
                 "ws-cloud".into(),
                 ManifestWorkspace {
+                    color: None,
+                    pinned: false,
                     id: "ws-cloud".into(),
                     name: "cloud-ws".into(),
                     is_closed: false,
@@ -13664,6 +13668,8 @@ mod tests {
             s.workspaces.insert(
                 "ws-envinj".into(),
                 ManifestWorkspace {
+                    color: None,
+                    pinned: false,
                     id: "ws-envinj".into(),
                     name: "test-ws".into(),
                     is_closed: false,
@@ -13833,6 +13839,8 @@ mod tests {
             s.workspaces.insert(
                 "ws-empty-cfg".into(),
                 ManifestWorkspace {
+                    color: None,
+                    pinned: false,
                     id: "ws-empty-cfg".into(),
                     name: "test-ws".into(),
                     is_closed: false,
@@ -13949,6 +13957,8 @@ mod tests {
             s.workspaces.insert(
                 "ws-abs".into(),
                 ManifestWorkspace {
+                    color: None,
+                    pinned: false,
                     id: "ws-abs".into(),
                     name: "test-ws".into(),
                     is_closed: false,
@@ -14410,6 +14420,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    color: None,
                     memory_cap_soft_bytes: None,
                     memory_cap_hard_bytes: None,
                     cgroup_prefix: None,
@@ -14657,6 +14668,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    color: None,
                     memory_cap_soft_bytes: None,
                     memory_cap_hard_bytes: None,
                     cgroup_prefix: None,
@@ -14855,6 +14867,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    color: None,
                     memory_cap_soft_bytes: None,
                     memory_cap_hard_bytes: None,
                     cgroup_prefix: None,
@@ -15917,6 +15930,7 @@ mod tests {
     /// Minimal live plain-session `ManifestEntry` for restore tests.
     fn me(uid: &str, session_type: &str) -> crate::manifest::ManifestEntry {
         crate::manifest::ManifestEntry {
+            color: None,
             uid: uid.into(),
             managed_by_uid: None,
             generation: 0,
@@ -24068,6 +24082,8 @@ mod tests {
             s.workspaces.insert(
                 "ws-child".into(),
                 ManifestWorkspace {
+                    color: None,
+                    pinned: false,
                     id: "ws-child".into(),
                     name: "child".into(),
                     is_closed: false,

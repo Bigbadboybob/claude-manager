@@ -358,6 +358,12 @@ pub struct ManifestEntry {
     pub task_id: Option<String>,
     #[serde(default)]
     pub notify_on_idle: bool,
+    /// User-assigned accent color for this session's sidebar row — a name
+    /// from the TUI's `USER_COLORS` palette (e.g. "red"). Display-only:
+    /// the daemon round-trips it untouched, exactly like `hidden`. `None`
+    /// = inherit the workspace color / default styling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Memory-cap soft limit (bytes) this session was spawned with, when
     /// capped. P0 session durability (S2): persisted in
     /// `daemon-sessions.json` so daemon-side RESTORE can re-apply the
@@ -454,6 +460,16 @@ pub struct ManifestWorkspace {
     /// session at load time.
     #[serde(default = "default_local_host_id")]
     pub host_id: crate::host_id::HostId,
+    /// User-assigned accent color for this workspace — a name from the
+    /// TUI's `USER_COLORS` palette. Sessions without their own `color`
+    /// inherit it in the sidebar. Display-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Pinned workspaces sort to the top of the sidebar, ahead of the
+    /// status-ranked rest (stable within the pinned group). Display and
+    /// ordering only — no daemon behavior keys off it.
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default)]
     pub sessions: Vec<ManifestEntry>,
     /// Recently-closed sessions kept around so `read_session_output` can
@@ -533,6 +549,12 @@ pub struct Manifest {
     /// load as "column off" (today's single-sidebar layout).
     #[serde(default)]
     pub continuous_column_on: bool,
+    /// User-assigned accent colors for planning tasks, keyed by task id.
+    /// Tasks live in the planning API rather than this manifest, so their
+    /// display color rides here as a TUI-side sidecar (same palette names
+    /// as the session/workspace `color` fields).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub task_colors: HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -549,6 +571,34 @@ mod tests {
     }
 
     // --- LastExit serde -----------------------------------------------
+
+    #[test]
+    fn color_pinned_task_colors_default_and_round_trip() {
+        // A pre-feature manifest (no color/pinned/task_colors keys) loads
+        // with inert defaults — the back-compat contract for the fields.
+        let legacy = r#"{"workspaces":{"w1":{"id":"w1","name":"n","sessions":[]}}}"#;
+        let m: Manifest = serde_json::from_str(legacy).unwrap();
+        let w = &m.workspaces["w1"];
+        assert_eq!(w.color, None);
+        assert!(!w.pinned);
+        assert!(m.task_colors.is_empty());
+
+        // Set fields survive a serialize/deserialize cycle, including the
+        // per-session color.
+        let mut m2 = m.clone();
+        {
+            let w = m2.workspaces.get_mut("w1").unwrap();
+            w.color = Some("cyan".into());
+            w.pinned = true;
+        }
+        m2.task_colors.insert("t1".into(), "red".into());
+        let s = serde_json::to_string(&m2).unwrap();
+        let back: Manifest = serde_json::from_str(&s).unwrap();
+        let w = &back.workspaces["w1"];
+        assert_eq!(w.color.as_deref(), Some("cyan"));
+        assert!(w.pinned);
+        assert_eq!(back.task_colors.get("t1").map(String::as_str), Some("red"));
+    }
 
     #[test]
     fn last_exit_round_trips_through_json() {
@@ -833,6 +883,7 @@ mod tests {
     #[test]
     fn t_g3b_explicit_host_id() {
         let entry = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
@@ -938,6 +989,7 @@ mod tests {
 
         // A continuous-tagged entry round-trips the id.
         let tagged = ManifestEntry {
+            color: None,
             memory_cap_soft_bytes: None,
             memory_cap_hard_bytes: None,
             cgroup_prefix: None,
