@@ -1203,8 +1203,11 @@ pub(crate) fn pre_spawn_transcript_path(
 /// cloud backtest worker's tmux. The backtest pipeline runs inside a
 /// ROOT-owned tmux session named `backtest` (see
 /// `worker/backtest_startup.sh`), so the remote command uses `sudo` to
-/// reach root's tmux server and `tmux attach -r` (read-only) so a
-/// watcher can never inject keystrokes into the live run.
+/// reach root's tmux server and `tmux attach -r` (read-only) so the
+/// watcher's input is not forwarded into the live run's pane. (This is
+/// a run-safety convenience, not a security boundary — the attach is
+/// root-over-ssh on a VM the operator already controls with their own
+/// gcloud creds.)
 ///
 /// `ssh -t` forces PTY allocation (tmux won't render otherwise) and the
 /// `TERM=xterm-256color` prefix gives tmux a sane terminal type.
@@ -1262,14 +1265,21 @@ pub(crate) fn backtest_watch_ssh_args(
 /// against a live worker.
 pub(crate) const BACKTEST_WATCH_REMOTE_CMD: &str = "TERM=xterm-256color sudo sh -c 'i=0; while [ $i -lt 60 ]; do tmux has-session -t backtest 2>/dev/null && exec tmux attach -r -t backtest; i=$((i+1)); sleep 2; done; echo \"cm-watch: backtest tmux not present after 120s\"; exit 1'";
 
+/// Pure parse of the `CM_BACKTEST_SSH_IAP` toggle value: `None`
+/// (unset) or an unrecognized value = direct SSH; a recognized truthy
+/// token = tunnel through IAP. Kept separate from the env read so it can
+/// be unit-tested without mutating the process-global environment (which
+/// would race the other unit tests in this binary's parallel threads).
+pub(crate) fn iap_flag_enabled(val: Option<&str>) -> bool {
+    matches!(val.map(str::trim), Some("1" | "true" | "yes" | "on"))
+}
+
 /// Resolve whether the watch attach should tunnel through IAP. Direct
 /// SSH is the default (port 22 already open on the backtest project);
 /// the operator can force IAP — needed if their network blocks outbound
 /// :22 — with `CM_BACKTEST_SSH_IAP=1`.
 pub(crate) fn backtest_watch_use_iap() -> bool {
-    std::env::var("CM_BACKTEST_SSH_IAP")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    iap_flag_enabled(std::env::var("CM_BACKTEST_SSH_IAP").ok().as_deref())
 }
 
 /// migrate-tui-local: free-function form of `App::try_spawn_via_daemon`
@@ -19635,16 +19645,25 @@ mod backtest_watch_tests {
 
     #[test]
     fn use_iap_env_toggle() {
+        // Test the pure parser directly — no process-global env mutation,
+        // so this can't race sibling tests in the same binary's threads.
         // Default (unset) = direct SSH.
-        std::env::remove_var("CM_BACKTEST_SSH_IAP");
-        assert!(!backtest_watch_use_iap());
-        for truthy in ["1", "true", "yes", "on"] {
-            std::env::set_var("CM_BACKTEST_SSH_IAP", truthy);
-            assert!(backtest_watch_use_iap(), "‘{truthy}’ should enable IAP");
+        assert!(!iap_flag_enabled(None));
+        // Recognized truthy tokens enable IAP, including surrounding
+        // whitespace (the env read trims via the same code path).
+        for truthy in ["1", "true", "yes", "on", " 1 ", "on\n", "\tyes"] {
+            assert!(
+                iap_flag_enabled(Some(truthy)),
+                "‘{truthy}’ should enable IAP"
+            );
         }
-        std::env::set_var("CM_BACKTEST_SSH_IAP", "0");
-        assert!(!backtest_watch_use_iap());
-        std::env::remove_var("CM_BACKTEST_SSH_IAP");
+        // Anything else = direct SSH.
+        for falsy in ["0", "false", "no", "off", "", "  ", "maybe", "TRUE"] {
+            assert!(
+                !iap_flag_enabled(Some(falsy)),
+                "‘{falsy}’ should NOT enable IAP"
+            );
+        }
     }
 }
 
