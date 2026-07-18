@@ -23710,8 +23710,16 @@ mod pending_workflow_events_tests {
         .expect("write manifest");
 
         let orig_home = std::env::var_os("HOME");
+        // Pin CM_DAEMON_SOCKET into the temp home too. The HOME override
+        // alone does NOT isolate this test: `default_socket_path()` prefers
+        // $CM_DAEMON_SOCKET, which every cm-TUI-hosted session exports as
+        // the OPERATOR'S live daemon socket — so `restore_sessions()`'s
+        // trailing adopt scan would dial the real daemon and attach (and
+        // 80×24-resize) any real agent-spawned sessions it finds there.
+        let orig_sock = std::env::var_os("CM_DAEMON_SOCKET");
         unsafe {
             std::env::set_var("HOME", &home);
+            std::env::set_var("CM_DAEMON_SOCKET", home.join(".cm/daemon.sock"));
         }
         // App::new synthesizes a local-only pool → "ghost" is unknown.
         let mut app = App::new(crate::config::Config {
@@ -23743,6 +23751,10 @@ mod pending_workflow_events_tests {
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+        match orig_sock {
+            Some(s) => unsafe { std::env::set_var("CM_DAEMON_SOCKET", s) },
+            None => unsafe { std::env::remove_var("CM_DAEMON_SOCKET") },
         }
     }
 
