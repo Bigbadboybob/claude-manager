@@ -1,177 +1,171 @@
-# Fix: frozen remote session (branch `cm/fix-frozen-remote-session`)
+# Proper async subagent wait (branch `cm/proper-cm-subagent-wait`)
 
-## Symptom
+## Goal
 
-A remote (`host=manager`) session freezes: it renders its pre-restart
-scrollback, shows no `⟳` reconnecting indicator, is not marked exited, and is
-dead to input — while local sessions and other remote orchestrators appear
-fine. Onset: a remote `cm-daemon` restart (deploy) or a tunnel respawn.
+Agents that launch or prompt cm sessions should never park in a blocking
+`wait_*` MCP call. Instead, spawning/prompting registers an **async monitor**
+that fires when the watched session goes (semantically) idle, waking the
+caller by delivering a message into its session. This reopens
+`DESIGN_TOOL_ERGONOMICS.md` P1 ("push instead of poll — north star"), which
+was closed as "cm-wait is good enough" — it isn't: cm-wait requires the agent
+to know a script path and burn a background-bash slot, and it can't be made
+automatic.
 
-## Investigation (live evidence, 2026-07-04/05)
+Prereq discovered while designing: PTY message injection (the wake channel)
+is slow and glitchy. Three root causes, each with a fix:
 
-Concrete case: session `ts-18beb58662bcb76d-6` ("BUG-013 negative-cash
-investigate"), a continuous subtask on the `manager` host.
+1. **Mangled prompts while the operator types** — injection races operator
+   keystrokes into the same composer. Fix: the daemon proxies all operator
+   input, so gate injection on an operator-quiet window.
+2. **"Busy" while a background subagent runs** — `idle` is a PTY-output
+   quietness heuristic; spinners keep it noisy forever. Fix: semantic idle
+   from transcript shape (fallback) and Claude Code `Stop` hooks (real fix).
+3. **Slow** — fixed kitty-arming settle delays on every delivery + poll
+   cadence. Fix: cache kitty-armed per session; hook events replace polling.
 
-- **Daemon side is healthy.** `cm-daemon` on cm-manager restarted 00:44 UTC
-  (journal: `restored 8/8 session(s)`). BUG-013 was restored and its agent is
-  alive: `claude --resume 5e8fb07c-…` at its normal idle prompt. The SSH tunnel
-  forwards to the live daemon (a raw probe gets a clean daemon-close).
-- **The freeze is entirely client-side (TUI attach).** On the restart all 7
-  remote attach streams hit transport-EOF and were correctly marked
-  reconnecting + requeued (`cm-tui.log`, incl. BUG-013 twice). Then the reattach
-  went silent — no give-up log, not marked exited on disk.
-- **Smoking gun:** `cm-tui.log` has **133** `path_provider returned None
-  (retrying … 30s)` events across the session, interleaved with
-  `Connection reset by peer` on tunnel sockets. `/run/user/1000/cm-tui/` holds
-  multiple stale `cm-host-manager-*.sock` generations (tunnel respawned several
-  times over the session).
-- The network/tunnel itself is fine: a manually-spawned TUI-style ssh tunnel
-  connects in ~300ms and stays up 60s+. So the tunnel is not being killed by the
-  network — the TUI tears working ones down and respawns (churn), and during each
-  gap `path_provider`/`live_socket_path` return `None`.
+Delivery redesign: **never inject mid-turn.** A cm-installed `Stop` hook can
+return `{"decision":"block","reason":...}` and Claude continues processing
+the reason as its next instruction — so mid-turn deliveries go to a
+per-session inbox consumed at the next turn boundary (atomic, no typing),
+and PTY injection remains only for the already-idle case (safest, and
+further gated by operator-quiet).
 
-## Root cause — re-warm starvation deadlock
+## Slices
 
-Reattach recovery depends on a live tunnel socket path that **only the
-off-thread watch consumers can (re)produce**, and the main-thread reattach drain
-silently gates off — potentially forever — when that path is `None`:
+- **S0 — spike: resolve hook ambiguities empirically.**
+  (a) Does `Stop` fire when the turn ends while a background task is still
+  running? (b) Do hooks passed via `--settings` merge with or replace
+  project-settings hooks? (c) Does `Stop` block+reason actually make Claude
+  continue with the reason as instruction (verify shape + `stop_hook_active`
+  loop guard)? (d) What does the hook receive on stdin / in env (need
+  `CM_TUI_SESSION_ID` for inbox routing)?
 
-1. `App::dispatch_deferred_remote_attaches` (the production drain) **skips every
-   pending session** when `host_pool.live_socket_path(host).is_none()`
-   (`app.rs:6014`).
-2. `live_socket_path` → `ConnectionHandle::socket_path_nonblocking` **never
-   respawns** a dead SSH tunnel (by design — it's the non-blocking main-thread
-   probe; `host_pool.rs:458`).
-3. The **only** code that respawns a dead tunnel is `ConnectionHandle::ensure_alive`
-   (`host_pool.rs:506`), reachable only via `HostPool::for_host`, called only by
-   the off-thread `manifest.watch` / `events.subscribe` / `workflow.watch`
-   consumers — which **back off exponentially to 30s** on repeated failure.
-4. So while the tunnel is between generations (down/respawning — which happens on
-   *every* daemon restart and every tunnel churn), the main-thread drain is gated
-   off and **cannot self-heal**. It waits on a 30s-throttled consumer to bring the
-   tunnel back.
-5. The attach **worker's** path (`try_attach_via_daemon_with_deps` → `for_host` →
-   `ensure_alive`, `app.rs:993`) *can* respawn the tunnel — but it's only reached
-   **after** the gated dispatch decides to dispatch, which it won't while
-   `live_socket_path` is `None`. **Deadlock of responsibility:** the code that can
-   re-warm is downstream of the gate that requires the tunnel already-warm.
+- **S1 — injection safety + semantic idle, no new architecture.**
+  (a) Daemon: track `last_operator_input_at` per session (attach write path
+  only — control-plane `send_input` doesn't count); the agent-kitty-async
+  delivery defers until the operator has been quiet ~10s (bounded, logged).
+  (b) Python monitor: upgrade the idle rule with transcript-shape semantic
+  idle — a session whose transcript ends in a completed assistant turn is
+  `awaiting_input` even if the PTY is noisy (spinner). Fixes false-busy for
+  background-subagent orchestrators.
 
-Net: any remote session that loses its attach stream (every deploy, every tunnel
-churn) can get stuck `reconnecting` indefinitely — frozen to the user. `A-r`
-doesn't help because `nudge_remote_reconnects` only accelerates entries already
-in the pending queue / revives `exited` slots; it can't re-warm the tunnel from
-the main thread either.
+- **S2 — the async monitor + automatic registration.**
+  New MCP tool `monitor_sessions(session_uids, mode, note)` — registers a
+  background watch (MCP-server-resident asyncio task reusing
+  `_monitor_sessions`), returns a monitor id immediately; on fire, delivers
+  a `[cm-monitor]` message into the CALLER's own session via daemon
+  `send_input` (self-target is auth-allowed), gated on caller idle, with
+  delivery verification + one retry. Auto-registration: `start_session`
+  (wait=false) and `send_input` gain `notify_on_done=true` default —
+  spawning IS registering; dedupe one active monitor per (caller, target).
+  Blocking `wait_*` docstrings demoted to advanced primitives.
 
-## Slice plan
-
-- **S1 — decouple reattach dispatch from the `live_socket_path` gate (the fix).**
-  In `dispatch_deferred_remote_attaches`, stop skipping on `live_socket_path ==
-  None`. Dispatch to the attach worker (still throttled per-uid); the worker's
-  `for_host` → `ensure_alive` re-warms the tunnel **off-thread**, so the recovery
-  path itself rebuilds a down/churning tunnel promptly instead of waiting on a
-  30s-backed-off consumer. Distinguish **tunnel-down** failures (host/tunnel not
-  reachable → keep reconnecting, do NOT burn the attempt budget) from
-  **session-gone** failures (daemon says no such uid → burn budget → eventual
-  `exited`). Thread a failure-kind back through `AttachResult`.
-
-- **S2 — robust tunnel liveness (reduce churn + outage windows).** Guard
-  `ensure_alive`'s dead-child teardown with a connect-probe so a still-live tunnel
-  isn't torn down + respawned on a spurious `try_wait`; unlink the host's own
-  stale `cm-host-<host>-*.sock` files on respawn so the runtime dir doesn't
-  accumulate orphans. (Confirm the exact churn trigger during impl.)
-
-- **S3 — detect a dead attach that yields no EOF (half-open / idle write path).**
-  `transport_eof` only latches on a read EOF, so an idle session whose write path
-  is dead never re-triggers reconnect. Add an attach-stream keepalive (or
-  write-side error → synthesize `transport_eof`) so those self-heal. Defense in
-  depth.
-
-- **S4 — `A-r` force-reconnect for ALL stuck remote sessions.** Make
-  `nudge_remote_reconnects` also force a fresh re-attach of remote sessions in the
-  healthy-but-limbo state (bound slot, not reconnecting, not exited) and trigger a
-  re-warm — so the user always has a reliable manual override.
-
-S1 is the high-leverage fix that turns "stuck reconnecting forever" into reliable
-recovery; S2–S4 harden around it.
+- **S3 — hook-based idle + inbox delivery (claude-code engine).**
+  Spawn-time `--settings` injection of a cm Stop hook (per S0 findings).
+  Hook: (1) reports turn-end to the daemon (semantic-idle event → new
+  field surfaced via `resolve_authorized_session`), (2) drains the
+  per-session inbox `~/.cm/inbox/<uid>/` and block+reasons pending
+  messages at the turn boundary. Monitor fire path: target busy → inbox;
+  target idle → gated PTY injection (with post-write re-check to close the
+  went-idle race). Codex sessions stay on S2's gated-PTY-on-idle.
 
 ## Status
 
-- [x] **S1 — DONE.** Removed the `live_socket_path` gate in
-  `dispatch_deferred_remote_attaches` (+ one-dispatch-per-host-per-tick bound so
-  the worker re-warms the tunnel itself). Typed daemon RPC errors
-  (`DaemonRpcError` carrying `ErrorCode`) + a classifier
-  (`attach_failure_is_session_gone`) so the reattach distinguishes daemon-
-  confirmed `NotFound` (SessionGone → give up after the cap → `exited`) from
-  every other failure (TransportDown → retry indefinitely, never tear a live
-  session down). Unified BOTH the production off-thread path
-  (`drain_attach_results`) AND the inline synchronous path
-  (`try_reattach_remote_session` now returns the failure kind;
-  `drain_deferred_remote_reattach` branches on it) so tests validate the real
-  semantics. Files: `client_session.rs`, `attach_worker.rs`, `app.rs`.
-  Tests: 4 classifier unit tests + `transport_down_reattach_never_settles_to_exited`
-  + `reconnect_settles_to_exited_after_session_gone` +
-  `fresh_deferred_reattach_session_gone_retries_then_gives_up_bounded` (both drive
-  a real in-proc daemon that returns `NotFound`). Full TUI suite: 665 pass.
-- [ ] S2
-- [x] **S3 — DONE.** Tunnel-generation watchdog for the half-open freeze (a
-  remote attach stream whose ssh tunnel died WITHOUT a clean EOF — reproduced by
-  `SIGTERM`ing the tunnel; `transport_eof` never latches so the session was never
-  re-queued). `host_pool` now carries a per-host monotonic `generation`
-  (`AtomicU64`), bumped every `ensure_alive` respawn. Each attached remote
-  session records the generation it was dialed under (`attached_tunnel_generation`
-  map, captured at attach time on the worker thread). New per-tick watchdog
-  `requeue_stale_generation_remote_sessions` re-queues any attached remote
-  session whose recorded generation is behind the host's current one — routing
-  through the SAME reconnect path as a transport EOF (shared
-  `requeue_remote_reconnect` helper). A half-open tunnel is converted to a
-  respawned one within ~15s by the existing `ServerAlive` opts, bounding the
-  freeze to seconds. Files: `host_pool.rs`, `attach_worker.rs`, `app.rs`,
-  `main.rs`. Tests: 4 watchdog (`stale`/`current`/`unrecorded-baseline`/`local`)
-  + 2 host_pool generation-bump. Full TUI suite: 670 pass (1 pre-existing
-  load-flake, passes 10/10 in isolation).
+- [x] **S0 spike — DONE (2026-07-18, claude CLI 2.1.214, all findings favorable).**
+  (a) `Stop` FIRES while a background Bash task is still running (hook's
+  pgrep saw the live `sleep`; stdin even carries a `background_tasks`
+  field). (b) `--settings` hooks MERGE with project-settings hooks (both
+  fired, project first). (c) block+reason WORKS: `{"decision":"block",
+  "reason":...}` → Claude continues, treating reason as the next
+  instruction (verified end-to-end: injected "reply BANANA" → final output
+  BANANA); second Stop arrives with `stop_hook_active: true` as the loop
+  guard. (d) Hook inherits the session env including `CM_TUI_SESSION_ID`
+  (verified from a real cm-spawned session), and stdin carries
+  `session_id`, `transcript_path`, `last_assistant_message`,
+  `background_tasks`, `permission_mode`. Spike artifacts in scratchpad.
+- [x] **S1 — DONE.** (a) Daemon: `last_operator_input_at` cell on
+  `DaemonSession` (stamped ONLY by the attach-stream input path via
+  `InputHandle::write_and_stamp_operator`); both agent-prompt delivery
+  threads now call `await_operator_quiet` (4s quiet window, 250ms poll,
+  180s max defer, logged) before writing. Tests: 6
+  (`operator_quiet_tests` in methods.rs). (b) Python:
+  `transcript_turn_complete` in monitor.py (tail-scan for a main-chain
+  assistant `end_turn`, sidechain-aware, claude-code only) wired into
+  `_monitor_sessions`, `wait_for_session_idle`, and `_await_reply` as a
+  debounced (3s) fallback when READY but PTY-busy — completions carry
+  `idle_source: "transcript"`. Tests: 12 (test_semantic_idle.py).
+- [x] **S2 — DONE.** `mcp_server/async_monitor.py`: MCP-server-resident
+  monitor registry; `register_monitor` spawns a background watch
+  (reuses `_monitor_sessions`, retries daemon-restart TransportErrors),
+  formats a `[cm-monitor <id>]` fire message with each worker's final
+  reply, gates on caller-at-prompt, injects via daemon `send_input`
+  (self-target), verifies the marker landed in the caller's transcript,
+  redelivers once, retains the result either way. New tools:
+  `monitor_sessions` / `list_monitors` / `cancel_monitor`.
+  Auto-registration: `send_input` (now async, `notify_on_done=True`
+  default) and `start_session` (wait=false + prompt + non-bash) attach
+  a `monitor` to their result; auto-monitors dedupe per target set.
+  Blocking-wait docstrings demoted. Tests: 8 (test_async_monitor.py).
+  Note: full mcp suite has 3 PRE-EXISTING failures (missing pytest dep,
+  google-libs logging, operator.mark_subtask_done route drift).
+- [x] **S3 — DONE.**
+  - **Hook**: `mcp_server/hooks/cm_stop_hook.py` (stdlib-only,
+    fail-open, loop-safe via consume-before-block). At every turn
+    boundary it (a) self-reports `session.turn_ended` to the daemon
+    (3s timeout) and (b) drains `~/.cm/inbox/<uid>/*.json`, emitting
+    Stop `{"decision":"block","reason":...}` when messages are pending
+    — atomic turn-boundary delivery, zero PTY typing.
+  - **Spawn injection**: `mcp_config::claude_settings_hook_arg` builds
+    the inline `--settings` JSON (Stop hook, 15s timeout, interpreter
+    via the shared venv-aware resolver); injected in BOTH argv
+    composers — daemon `build_args` and the TUI's `claude_args` (which
+    reuses the daemon helper). Fail-open when the script is absent
+    (pre-deploy hosts spawn hook-less).
+  - **Daemon**: `session.turn_ended` RPC (session-caller self-report;
+    self-target Allow, scope-checked otherwise) stamps
+    `last_turn_end_at`; new `last_input_at` stamped by every input
+    path; `resolve_authorized_session` now reports `semantic_idle`
+    (null = no hook data / true = turn-end postdates last input /
+    false = turn pending). Wire-verified e2e against a scratch daemon:
+    null → turn_ended → true → send_input → false, intruder caller
+    unauthorized.
+  - **Python**: monitor/wait loops treat hook-confirmed
+    `semantic_idle` as a debounce-skip on the transcript-shape rule;
+    `async_monitor` delivery now prefers the inbox for mid-turn
+    callers (consumption = delivery), taking the message back for
+    gated PTY injection when the caller reaches its prompt unconsumed
+    (hook-less callers) or the wait cap passes.
+  - **Route table**: `session.turn_ended` added to `DAEMON_METHODS`;
+    also fixed the pre-existing `operator.mark_subtask_done` alignment
+    drift (that suite failure is now green).
+  - Tests: 3 Rust (mcp_config settings-injection) + 6 hook subprocess
+    tests + 2 inbox-delivery tests. Full suites: daemon 947 / TUI 688
+    / accept_loop 5 green; mcp 191 tests with only the 2 pre-existing
+    env failures (missing pytest module; google-libs logging).
 
-  Note: my earlier "S1 verification" `SIGTERM`'d the live tunnel repeatedly and
-  froze the operator's working sessions — that was exercising THIS gap (no-EOF
-  half-open), not S1. S1 handles the daemon-restart case (clean EOF → re-queued →
-  was starved). S3 handles the no-EOF case. Together they cover both triggers.
-- [x] **S4 — DONE.** `A-r` (`nudge_remote_reconnects`) now also **force-reconnects
-  the FOCUSED remote session**, whatever state it's in — closing the
-  attached-but-dead LIMBO gap (not exited, not reconnecting, not queued) that
-  steps 1-2 and even the S3 watchdog can miss (a half-open whose generation
-  hasn't bumped yet). SURGICAL: only the one session the user is looking at is
-  torn down + re-queued (via the shared `requeue_remote_reconnect` helper), so
-  `A-r`-as-refresh never blips other healthy remote panes — that blanket-blip is
-  what left "all remote sessions unresponsive" before. `cursor_session_uid`
-  resolves the focus in both the main and continuous columns. Files: `app.rs`.
-  Tests: 3 (focused-limbo → reconnect / unfocused-healthy → left alone /
-  focused-local → ignored). Full TUI suite: 673 pass (same 1 load-flake).
+## Deploy notes / follow-ups
 
-## Summary — all four slices land the fix
-
-- **S1** (`07e59f3`, on main): re-warm starvation — reattach drive was gated off
-  a non-blocking probe that never respawns the tunnel. Removed the gate; the
-  attach worker re-warms. + typed failure classification (NotFound → give up;
-  else retry forever).
-- **S3** (`1f5a173`, on main): half-open freeze — a tunnel death with no clean
-  EOF. Per-host tunnel-generation counter + per-tick watchdog re-queues attached
-  sessions whose tunnel was replaced.
-- **S4** (this commit): `A-r` manual override — force-reconnect the focused
-  remote session (the limbo case), surgically.
-- **S5** (this work): the CPU fix. A half-open attach socket goes `POLLHUP`;
-  alacritty's EventLoop skips reading an interrupt event (`event_loop.rs:274`)
-  and SPINS at 100% CPU (observed: 11 spinning "PTY reader" threads = ~8 cores,
-  the single biggest CPU consumer on the box). Root: same no-clean-EOF as the
-  freeze. Fix: dup the attach socket fd onto `Session`
-  (`Session::attach_hup_fd`); the per-tick watchdog polls it for
-  `POLLHUP`/`POLLERR` (`attach_socket_hung_up`), and on a hit `request_shutdown`s
-  the spinning EventLoop (stops the spin *now*, not at reattach) + re-queues.
-  Turns "spin forever / ≤15s via generation" into "stop in <1 tick + reconnect
-  immediately." Files: `client_session.rs`, `session.rs`, `app.rs`. Tests: 2
-  (hung-up → requeue+shutdown / healthy → left alone).
-
-- **S2** (deferred): stop tearing down *live* tunnels on a spurious `try_wait`
-  + clean stale `cm-host-*.sock`. Not required for the freeze fix; a churn/
-  cleanliness hardening. Left as a documented follow-up.
-
-Together S1 covers the daemon-restart freeze (clean EOF), S3 the tunnel-death
-freeze (no EOF), S4 the manual override for anything they miss.
+- **cm-manager**: needs BOTH the new daemon binary AND an mcp_server
+  rsync that includes the new `hooks/` dir (hook injection is
+  fail-open until it lands). Existing long-lived orchestrator sessions
+  keep running hook-less (PTY-on-idle delivery path) until their next
+  respawn picks up `--settings`.
+- **predictionTrading twin MCP server**
+  (`scripts/mcp/claude_manager_server.py`) does not yet expose
+  `monitor_sessions`/`list_monitors`/`cancel_monitor` or the
+  `notify_on_done` params — port them if PT-side orchestrators should
+  get async waits (the project_mcp_two_servers rule).
+- **Orchestrator skills** (design-doc-impl-loop, parallel-impl-wave,
+  continuous-task prompts) still describe cm-wait/blocking waits as
+  the monitoring pattern — update them to "spawn/prompt, end turn,
+  wait for the [cm-monitor] wake-up".
+- The TUI-local `send_input` route (laptop: TUI drainer) keeps its
+  existing echo-quiet + hard-deadline gating; the daemon-side
+  typing-quiet gate covers headless/remote and continuous fires. If
+  laptop-side mangling recurs, port `await_operator_quiet` into the
+  TUI drainer as a follow-up.
+- Full-stack live smoke (real claude worker + real monitor fire on the
+  production daemon) needs the rebuilt daemon running — do after
+  merge/restart: spawn a worker via `start_session(prompt=...)`, end
+  turn, confirm the `[cm-monitor ...]` message arrives + `A-y`-style
+  sanity on `~/.cm/inbox/` staying empty.

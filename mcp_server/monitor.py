@@ -12,6 +12,7 @@ dependencies installed.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from mcp_server import control_client
@@ -52,6 +53,81 @@ def _session_status(state: str, idle: bool) -> str:
 # once it has this many rendered messages, and no real session approaches
 # it, so this reads everything.
 _READ_ALL_LIMIT = 100_000_000
+
+# ── Transcript-shape semantic idle ────────────────────────────────────
+#
+# The daemon's `idle` is a PTY-output quietness heuristic (~2s). A
+# session running a BACKGROUND task (subagent, background bash) keeps
+# its PTY noisy forever — spinner + status-line updates — while the
+# main agent is at the prompt, so quietness-idle reports "working"
+# indefinitely (the false-busy bug). The transcript is the semantic
+# signal: spinner noise never touches it, and a claude-code turn is
+# over exactly when the last main-chain message line is an assistant
+# entry whose `stop_reason` is terminal. Verified shape (2026-07-18):
+# a quiet session's tail is `assistant(stop_reason=end_turn)` followed
+# only by non-message lines (`system`, `attachment`, `ai-title`,
+# `mode`, `permission-mode`, `last-prompt`); mid-turn tails end in
+# `assistant(stop_reason=tool_use)` or a `user` tool-result line.
+# Sidechain (subagent) entries carry `isSidechain: true` and must be
+# skipped — a foreground subagent's own end_turn is not the main
+# agent's.
+
+# stop_reasons that mean the assistant's turn is COMPLETE. `tool_use`
+# (and None, mid-stream) mean more work is coming. Conservative: an
+# unknown stop_reason reads as busy, which degrades to the existing
+# PTY heuristic rather than a premature fire.
+_TERMINAL_STOP_REASONS = {"end_turn", "stop_sequence", "refusal"}
+
+# How much transcript tail to scan backwards for the last message line.
+# Message lines are at most a few hundred KB apart in practice.
+_SEMANTIC_TAIL_BYTES = 256 * 1024
+
+# How long the transcript must CONTINUOUSLY read turn-complete before a
+# busy-PTY session is reported idle. Debounces the moment between an
+# end_turn landing and a queued follow-up user message starting the
+# next turn.
+SEMANTIC_IDLE_GRACE_S = 3.0
+
+
+def transcript_turn_complete(engine: str, path: str | None) -> bool:
+    """True iff `path`'s last main-chain message line is a completed
+    assistant turn. claude-code transcripts only — codex encodes turns
+    differently and keeps the PTY heuristic. Sync (file IO): callers
+    offload via asyncio.to_thread. Any read/parse failure returns
+    False (falls back to the PTY heuristic)."""
+    if engine != "claude-code" or not path:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - _SEMANTIC_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            # The first line of a mid-file tail read is usually a
+            # partial line; anything else unparseable is skipped the
+            # same way.
+            continue
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        if etype not in ("assistant", "user"):
+            continue  # system / attachment / ai-title / mode / ...
+        if entry.get("isSidechain"):
+            continue  # a subagent's messages, not the main chain
+        if etype != "assistant":
+            return False  # user line last: a turn is starting/running
+        stop = (entry.get("message") or {}).get("stop_reason")
+        return stop in _TERMINAL_STOP_REASONS
+    return False
 
 
 def _parser_for(engine: str):
@@ -142,6 +218,9 @@ async def _monitor_sessions(
 
     seen: dict[str, bool] = {u: False for u in uids}
     pending_idle_since: dict[str, float | None] = {u: None for u in uids}
+    # Monotonic time each session's transcript FIRST read turn-complete
+    # in an unbroken streak while its PTY stayed busy; None otherwise.
+    semantic_idle_since: dict[str, float | None] = {u: None for u in uids}
     # Last successful (engine, transcript_path, generation) per uid, so we
     # can still read the final reply after a session is evicted on exit.
     last_meta: dict[str, tuple[str, str | None, int]] = {}
@@ -188,10 +267,32 @@ async def _monitor_sessions(
             last_meta[uid] = (engine, tpath, gen)
 
             done = False
+            status_override = None
             if state == "exited":
                 done = True
             elif state == "ready" and idle:
                 done = True
+            elif state == "ready":
+                # PTY busy — but a background task's spinner keeps the
+                # PTY noisy while the agent is at the prompt. Consult
+                # the transcript shape (debounced) so those sessions
+                # still complete. When the daemon ALSO reports
+                # hook-derived `semantic_idle` (the cm Stop hook fired
+                # after the last delivered input), skip the debounce —
+                # the turn boundary is confirmed, not inferred.
+                if await asyncio.to_thread(
+                    transcript_turn_complete, engine, tpath
+                ):
+                    hook_idle = resolved.get("semantic_idle") is True
+                    if semantic_idle_since[uid] is None:
+                        semantic_idle_since[uid] = now
+                    if hook_idle or (
+                        now - semantic_idle_since[uid] >= SEMANTIC_IDLE_GRACE_S
+                    ):
+                        done = True
+                        status_override = "awaiting_input"
+                else:
+                    semantic_idle_since[uid] = None
             elif state == "pending" and idle:
                 if pending_idle_since[uid] is None:
                     pending_idle_since[uid] = now
@@ -201,11 +302,17 @@ async def _monitor_sessions(
                 pending_idle_since[uid] = None
 
             if done:
-                completed.append(await asyncio.to_thread(
+                entry = await asyncio.to_thread(
                     _monitor_completed_entry, uid,
-                    _session_status(state, idle), state, idle,
+                    status_override or _session_status(state, idle),
+                    state, idle,
                     engine, tpath, gen, return_last_message,
-                ))
+                )
+                if status_override is not None:
+                    # Surfaced for callers/debugging: the PTY was busy
+                    # (spinner) but the transcript says the turn ended.
+                    entry["idle_source"] = "transcript"
+                completed.append(entry)
                 remaining.remove(uid)
 
         # mode="any": first poll with any completion wins (completed holds

@@ -655,8 +655,11 @@ fn run_inbound(
                     continue;
                 };
                 // State lock is dropped. Do the actual write +
-                // stamp via the handle's cloned Arcs.
-                if let Err(e) = handle.write_and_stamp(&decoded) {
+                // stamp via the handle's cloned Arcs. The attach
+                // stream is the OPERATOR's input path, so use the
+                // operator-stamping variant — the delivery threads'
+                // typing-quiet gate keys off it.
+                if let Err(e) = handle.write_and_stamp_operator(&decoded) {
                     eprintln!(
                         "cm-daemon: attach stream {} send_input failed: {} (session may have exited)",
                         session_uid, e,

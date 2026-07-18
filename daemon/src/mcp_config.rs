@@ -156,6 +156,40 @@ fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf> {
         .or_else(crate::workflow::spawn::mcp_server_path)
 }
 
+/// Build the inline-JSON value for a claude-code spawn's `--settings`
+/// flag, injecting the cm Stop hook (`mcp_server/hooks/cm_stop_hook.py`
+/// beside the resolved server.py). The hook (a) reports turn-ends to
+/// the daemon (`session.turn_ended` → `semantic_idle`) and (b) drains
+/// the session's monitor inbox at turn boundaries via Stop-hook
+/// block+reason. Returns `None` (spawn proceeds hook-less) when the
+/// script isn't present at the resolved location — e.g. a deployment
+/// that hasn't shipped it yet. Public so the TUI's `claude_args` twin
+/// injects the identical settings.
+pub fn claude_settings_hook_arg(server_path_override: Option<&str>) -> Option<String> {
+    let server = resolve_server_path(server_path_override)?;
+    let hook = server.parent()?.join("hooks").join("cm_stop_hook.py");
+    if !hook.is_file() {
+        return None;
+    }
+    let python = resolve_python_interpreter(&server);
+    // The hook `command` runs via `sh -c`; single-quote both words so
+    // spaces in paths survive. (Paths with single quotes in them are
+    // not a layout cm produces.)
+    let command = format!("'{}' '{}'", python, hook.to_string_lossy());
+    Some(
+        serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [
+                        {"type": "command", "command": command, "timeout": 15}
+                    ]}
+                ]
+            }
+        })
+        .to_string(),
+    )
+}
+
 /// Resolve the Python interpreter that runs `server.py`, in priority order:
 ///
 ///   1. `.venv/bin/python` adjacent to the server (the cm-manager / any
@@ -366,6 +400,16 @@ pub fn build_args(
             args.push("--dangerously-skip-permissions".to_string());
             args.push("--mcp-config".to_string());
             args.push(cfg.to_string_lossy().to_string());
+            // S3 (async-wait branch): inject the cm Stop hook so the
+            // session reports turn-ends to the daemon and drains its
+            // monitor inbox at turn boundaries. `--settings` hooks
+            // MERGE with project/user hooks (verified empirically,
+            // claude CLI 2.1.214). Fail-open: no hook script found →
+            // spawn without it.
+            if let Some(settings) = claude_settings_hook_arg(server_path_override) {
+                args.push("--settings".to_string());
+                args.push(settings);
+            }
             // P0 S3 (resume): continue the prior transcript. Mirrors
             // `tui/src/mcp_config.rs::claude_args` — `--resume <id>`
             // after `--mcp-config`. Claude APPENDS to the same `<id>.jsonl`
@@ -693,6 +737,70 @@ mod tests {
                 None => std::env::remove_var("CM_DAEMON_SOCKET"),
             }
         }
+    }
+
+    #[test]
+    fn claude_settings_hook_arg_injects_stop_hook_when_present() {
+        let root = TempDir::new().unwrap();
+        let srv_dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(srv_dir.join("hooks")).unwrap();
+        let server = srv_dir.join("server.py");
+        std::fs::write(&server, "").unwrap();
+        std::fs::write(srv_dir.join("hooks/cm_stop_hook.py"), "").unwrap();
+
+        let arg = claude_settings_hook_arg(Some(server.to_str().unwrap()))
+            .expect("hook script present → settings emitted");
+        let parsed: serde_json::Value = serde_json::from_str(&arg).unwrap();
+        let entry = &parsed["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(entry["type"], "command");
+        let cmd = entry["command"].as_str().unwrap();
+        assert!(cmd.contains("cm_stop_hook.py"), "command: {cmd}");
+        assert!(
+            entry["timeout"].as_u64().is_some(),
+            "hook must carry an explicit timeout"
+        );
+    }
+
+    #[test]
+    fn claude_settings_hook_arg_missing_script_is_none() {
+        // No hooks/ dir beside server.py — spawn proceeds hook-less
+        // (fail-open for deployments that haven't shipped the script).
+        let root = TempDir::new().unwrap();
+        let srv_dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(&srv_dir).unwrap();
+        let server = srv_dir.join("server.py");
+        std::fs::write(&server, "").unwrap();
+        assert!(
+            claude_settings_hook_arg(Some(server.to_str().unwrap())).is_none()
+        );
+    }
+
+    #[test]
+    fn build_args_claude_includes_settings_hook_when_present() {
+        let root = TempDir::new().unwrap();
+        let srv_dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(srv_dir.join("hooks")).unwrap();
+        let server = srv_dir.join("server.py");
+        std::fs::write(&server, "").unwrap();
+        std::fs::write(srv_dir.join("hooks/cm_stop_hook.py"), "").unwrap();
+
+        let (_prog, args) = build_args(
+            "claude-code",
+            "ts-hooky",
+            None,
+            Some(server.to_str().unwrap()),
+            None,
+        )
+        .expect("build_args");
+        let pos = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings injected when the hook script exists");
+        assert!(
+            args[pos + 1].contains("cm_stop_hook.py"),
+            "settings JSON must reference the hook: {}",
+            args[pos + 1],
+        );
     }
 
     #[test]

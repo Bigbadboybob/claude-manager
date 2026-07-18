@@ -268,6 +268,14 @@ pub fn claude_args(
     args.push("--dangerously-skip-permissions".to_string());
     args.push("--mcp-config".to_string());
     args.push(mcp_config_path.to_string_lossy().to_string());
+    // S3 (async-wait branch): inject the cm Stop hook — identical
+    // settings JSON to the daemon-side `build_args` twin (turn-end
+    // reports + monitor-inbox drain; `--settings` hooks MERGE with
+    // project hooks). Fail-open when the script isn't found.
+    if let Some(settings) = cm_daemon::mcp_config::claude_settings_hook_arg(None) {
+        args.push("--settings".to_string());
+        args.push(settings);
+    }
     if let Some(sid) = resume_session_id {
         args.push("--resume".to_string());
         args.push(sid.to_string());

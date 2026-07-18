@@ -56,7 +56,10 @@ from mcp_server.monitor import (
     _read_all_messages,
     _READ_ALL_LIMIT,
     _session_status,
+    SEMANTIC_IDLE_GRACE_S,
+    transcript_turn_complete,
 )
+from mcp_server import async_monitor
 
 mcp = FastMCP("claude-manager")
 
@@ -684,6 +687,7 @@ async def start_session(
     schema: dict | None = None,
     schema_retries: int = 1,
     isolated: bool = False,
+    notify_on_done: bool = True,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -745,10 +749,18 @@ async def start_session(
             `schema_retries` re-prompts on a miss. The parsed value comes
             back as `result`.
         schema_retries: Max re-prompts on a schema miss. Default 1.
+        notify_on_done: With wait=false and a `prompt`, auto-register an
+            async monitor on the new worker (default true): when it
+            finishes the prompt, a `[cm-monitor ...]` message is
+            delivered into YOUR session with its reply — so END YOUR
+            TURN after spawning; don't poll and don't park in blocking
+            `wait_*` calls. Ignored for bash sessions, when wait=true,
+            or when there's no prompt to wait for.
 
     Returns:
         - wait=false: {"session_uid": "<uid>"} for the freshly-spawned
-          session (unchanged from before).
+          session, plus `monitor` when one was auto-registered (see
+          notify_on_done).
         - wait=true: {session_uid, completed, timed_out, status, state,
           idle, last_message}. `last_message` is the worker's final
           assistant message (null for a bash/transcript-less session, or on
@@ -830,6 +842,21 @@ async def start_session(
         return d
 
     if not wait:
+        spawn_uid = spawn.get("session_uid") if isinstance(spawn, dict) else None
+        if (
+            notify_on_done
+            and spawn_uid
+            and prompt
+            and type != "bash"
+        ):
+            try:
+                spawn["monitor"] = async_monitor.register_monitor(
+                    [spawn_uid], mode="any",
+                    note=f"worker '{label}' finished its initial prompt",
+                    source="auto",
+                )
+            except async_monitor.RegistrationError as e:
+                spawn["monitor"] = {"error": e.code, "message": str(e)}
         return _with_isolation(spawn)
 
     session_uid = spawn.get("session_uid") if isinstance(spawn, dict) else None
@@ -859,14 +886,22 @@ async def start_session(
 
 
 @mcp.tool()
-def send_input(session_uid: str, text: str, submit: bool = True) -> dict:
-    """Deliver a prompt to a session you can see.
+async def send_input(
+    session_uid: str,
+    text: str,
+    submit: bool = True,
+    notify_on_done: bool = True,
+) -> dict:
+    """Deliver a prompt to a session you can see, and (by default) get
+    woken asynchronously when that session finishes the turn.
 
-    If you want the agent's REPLY (the usual case), prefer
-    `send_input_and_wait` — it sends, waits for the turn to finish, and
-    returns the response in one call, without the post-send idle race.
-    Use bare `send_input` for fire-and-forget or when you'll monitor a
-    batch with `wait_for_any_session_idle`.
+    With `notify_on_done=true` (the default) this auto-registers an
+    async monitor on the target: when it next goes idle, a
+    `[cm-monitor ...]` message is delivered into YOUR session with its
+    final reply — so END YOUR TURN after sending; don't poll and don't
+    park in blocking `wait_*` calls. If you need the reply
+    synchronously in this same tool-turn, use `send_input_and_wait`
+    instead.
 
     Args:
         session_uid: Target session's stable UID (from list_sessions).
@@ -875,13 +910,28 @@ def send_input(session_uid: str, text: str, submit: bool = True) -> dict:
             input as a fresh keystroke; the body and Enter are separated
             in time by the TUI drainer to avoid the body being seen as
             a multi-line paste.
+        notify_on_done: Register the self-waking monitor (default
+            true). Set false for pure fire-and-forget (e.g. a nudge you
+            don't care to hear back about, or when you're already
+            watching the session another way).
 
     State your intent and ask the user before calling this tool.
     """
-    return control_client.call(
+    res = await asyncio.to_thread(
+        control_client.call,
         "send_input",
         {"session_uid": session_uid, "text": text, "submit": submit},
     )
+    if notify_on_done and isinstance(res, dict) and "error" not in res:
+        try:
+            res["monitor"] = async_monitor.register_monitor(
+                [session_uid], mode="any",
+                note=f"reply to your send_input to {session_uid}",
+                source="auto",
+            )
+        except async_monitor.RegistrationError as e:
+            res["monitor"] = {"error": e.code, "message": str(e)}
+    return res
 
 
 @mcp.tool()
@@ -1344,9 +1394,12 @@ async def wait_for_session_idle(
     Low-level primitive. For the common cases prefer the front door:
     `start_session(wait=true)` to spawn a worker and get its first reply,
     `send_input_and_wait` to drive an existing session and get the reply,
-    or `wait_for_any_session_idle` to watch a fan-out of workers. Use this
-    bare wait only for a session you did NOT just prompt (no post-send
-    race to close), e.g. polling one you handed off earlier.
+    or `wait_for_any_session_idle` to watch a fan-out of workers. Better
+    still, don't block at all: `start_session`/`send_input` auto-register
+    an async monitor (see `monitor_sessions`) that wakes you when the
+    worker finishes — end your turn and let it fire. Use this bare wait
+    only for a session you did NOT just prompt (no post-send race to
+    close), e.g. polling one you handed off earlier.
 
     "Idle" mirrors the same signal surfaced by `read_session_output`
     and `list_sessions`. An `exited` session is reported as idle (no
@@ -1409,6 +1462,9 @@ async def wait_for_session_idle(
     # Monotonic time the session FIRST went (pending && idle) in an
     # unbroken streak; reset to None on any non-(pending && idle) poll.
     pending_idle_since = None
+    # Streak clock for the transcript-shape semantic-idle fallback
+    # (ready + PTY-busy + transcript says turn complete).
+    semantic_idle_since = None
     while True:
         try:
             resolved = await asyncio.to_thread(
@@ -1447,6 +1503,28 @@ async def wait_for_session_idle(
                 "idle": True, "timed_out": False, "state": state,
                 "status": _session_status(state, idle),
             }
+        # READY but PTY-busy: a background task's spinner keeps the PTY
+        # noisy while the agent is at the prompt (false-busy). Consult
+        # the transcript shape, debounced — see monitor.py. A daemon
+        # hook-confirmed `semantic_idle` skips the debounce.
+        if state == "ready":
+            if await asyncio.to_thread(
+                transcript_turn_complete,
+                resolved.get("engine", "claude-code"),
+                resolved.get("transcript_path"),
+            ):
+                if semantic_idle_since is None:
+                    semantic_idle_since = now
+                if resolved.get("semantic_idle") is True or (
+                    now - semantic_idle_since >= SEMANTIC_IDLE_GRACE_S
+                ):
+                    return {
+                        "idle": True, "timed_out": False, "state": state,
+                        "status": "awaiting_input",
+                        "idle_source": "transcript",
+                    }
+            else:
+                semantic_idle_since = None
         # A `pending` session reports idle=True as soon as its PTY is
         # quiet, but quiet-and-pending is ambiguous: the transcript may
         # just not be bound YET (a freshly-spawned agent the detector
@@ -1641,6 +1719,7 @@ async def _await_reply(
     saw_new_assistant = False
     last_message: dict | None = None
     pending_idle_since: float | None = None
+    semantic_idle_since: float | None = None
     resolved_once = False
 
     def _final_read() -> dict | None:
@@ -1711,6 +1790,28 @@ async def _await_reply(
                     "status": _session_status(state, idle),
                     "state": state, "idle": idle, "last_message": last_message,
                 }
+            # New assistant reply + PTY still noisy: a background
+            # task's spinner can hold `idle` false forever. Fall back
+            # to transcript shape (debounced) — see monitor.py. A
+            # daemon hook-confirmed `semantic_idle` skips the debounce.
+            if saw_new_assistant and state == "ready":
+                if await asyncio.to_thread(
+                    transcript_turn_complete, engine, transcript_path
+                ):
+                    if semantic_idle_since is None:
+                        semantic_idle_since = now
+                    if resolved.get("semantic_idle") is True or (
+                        now - semantic_idle_since >= SEMANTIC_IDLE_GRACE_S
+                    ):
+                        return {
+                            "completed": True, "timed_out": False,
+                            "status": "awaiting_input",
+                            "state": state, "idle": idle,
+                            "last_message": last_message,
+                            "idle_source": "transcript",
+                        }
+                else:
+                    semantic_idle_since = None
         else:
             # Transcript-less fallback == `wait_for_session_idle` semantics.
             if state == "ready" and idle:
@@ -1981,9 +2082,10 @@ async def wait_for_any_session_idle(
 
     Blocking. To monitor a fan-out WITHOUT parking this orchestrator —
     so you stay free to handle the user or other work while workers run —
-    run the `cm-wait` CLI (`mcp_server/wait.py`) under
-    `Bash(run_in_background=true)` instead; it wraps this same core and
-    the harness wakes you when it exits. See the orchestrator skills.
+    use `monitor_sessions` instead: it registers the same watch in the
+    background and delivers a wake-up message into YOUR session when it
+    fires. (Prompting workers via `send_input` / spawning via
+    `start_session` already auto-registers one per worker.)
     """
     return await _monitor_sessions(
         session_uids,
@@ -1993,6 +2095,78 @@ async def wait_for_any_session_idle(
         pending_idle_grace_s=pending_idle_grace_s,
         return_last_message=return_last_message,
     )
+
+
+@mcp.tool()
+async def monitor_sessions(
+    session_uids: list[str],
+    mode: str = "any",
+    note: str = "",
+    timeout_s: float = 1800.0,
+) -> dict:
+    """Watch sessions in the BACKGROUND and get woken when they finish —
+    the non-blocking front door for orchestrators.
+
+    Registers an async monitor and returns immediately. When the watch
+    completes (a watched session finishes its turn / exits — same idle
+    rules as `wait_for_any_session_idle`, including transcript-shape
+    idle for spinner-noisy sessions), a `[cm-monitor <id>]` message
+    carrying each finished worker's final reply is delivered into YOUR
+    OWN session, waking you exactly like a user message. So after
+    registering: END YOUR TURN (or keep doing unrelated work). Don't
+    poll, don't call blocking `wait_*` tools, don't read the worker's
+    output in a loop.
+
+    You rarely need to call this directly — `start_session` (with a
+    prompt) and `send_input` auto-register a monitor per worker unless
+    you pass `notify_on_done=false`. Call it explicitly to watch a
+    fan-out as a single "all done" event (`mode="all"`), to watch
+    sessions you didn't just prompt, or to re-arm after a
+    `cancel_monitor`.
+
+    Args:
+        session_uids: Sessions to watch (UIDs from `list_sessions`).
+        mode: "any" (default) fires when the FIRST watched session
+            finishes; "all" fires once when EVERY one has.
+        note: Short context echoed in the wake-up message (e.g. "wave 2
+            workers") so future-you knows what fired.
+        timeout_s: Watch budget, default 1800 (30 min). On timeout the
+            wake-up message still arrives, flagged timed-out, listing
+            who is still running.
+
+    Returns: {monitor_id, watching, mode, async_note} immediately.
+    The eventual result is ALSO retained and readable via
+    `list_monitors` (e.g. if the wake-up delivery could not be
+    verified).
+
+    Registering a monitor is read-only-plus-a-future-self-message — no
+    pre-approval needed.
+    """
+    try:
+        return async_monitor.register_monitor(
+            session_uids, mode=mode, note=note, timeout_s=timeout_s,
+            source="explicit",
+        )
+    except async_monitor.RegistrationError as e:
+        return {"error": e.code, "message": str(e)}
+
+
+@mcp.tool()
+def list_monitors() -> dict:
+    """List this session's async monitors (active and completed), with
+    each completed monitor's retained result. Read-only.
+
+    Use to check what you're still waiting on, or to pick up a result
+    whose wake-up delivery failed (state="undelivered")."""
+    return async_monitor.list_monitors()
+
+
+@mcp.tool()
+def cancel_monitor(monitor_id: str) -> dict:
+    """Cancel an active async monitor (from `monitor_sessions` /
+    auto-registration). The watch stops and no wake-up message will be
+    delivered. Harmless if it already fired."""
+    return async_monitor.cancel_monitor(monitor_id)
 
 
 @mcp.tool()

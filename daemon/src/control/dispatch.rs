@@ -383,6 +383,13 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_resolve_authorized_session(state, req))
         }
 
+        // S3 (async-wait branch): the cm Stop hook's turn-end
+        // self-report. Session callers are the expected shape
+        // (self-target Allow); auth in the method body.
+        "session.turn_ended" => {
+            DispatchOutcome::Done(dispatch_session_turn_ended(state, req))
+        }
+
         // Sub-2b-1 review #1: TUI pushes the discovered
         // transcript path post-detection so the resolver can
         // transition `pending` → `ready`. Operator-only — the
@@ -1728,6 +1735,23 @@ fn dispatch_send_input(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::send_input(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.turn_ended` — the cm Stop hook's turn-end self-report.
+/// Same caller shape as `dispatch_send_input`; auth (self-or-scope)
+/// runs in the method body.
+fn dispatch_session_turn_ended(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::session_turn_ended(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

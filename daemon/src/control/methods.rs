@@ -2220,6 +2220,11 @@ pub fn resolve_authorized_session(
             "transcript_path": session.transcript_path.clone(),
             "generation": session.generation,
             "idle": idle,
+            // Hook-derived turn-boundary signal (S3): null = no hook
+            // data, true = last turn-end postdates last input (at the
+            // prompt regardless of PTY spinner noise), false = a turn
+            // is pending/running. See DaemonSession::semantic_idle.
+            "semantic_idle": session.semantic_idle(),
         }))
     } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
         // Read-after-exit: the session left the registry but its transcript
@@ -2232,6 +2237,7 @@ pub fn resolve_authorized_session(
             "transcript_path": tomb.transcript_path.clone(),
             "generation": tomb.generation,
             "idle": true,
+            "semantic_idle": true,
         }))
     } else {
         Err((
@@ -2239,6 +2245,54 @@ pub fn resolve_authorized_session(
             format!("session '{}' not in daemon registry", p.session_uid),
         ))
     }
+}
+
+// ============================================================
+// session.turn_ended — the cm Stop hook's self-report (S3)
+// ============================================================
+
+#[derive(Deserialize)]
+struct SessionTurnEndedParams {
+    session_uid: String,
+}
+
+/// A session's agent reports that its turn just finished (fired by the
+/// cm-injected Claude Code `Stop` hook, which inherits
+/// `CM_TUI_SESSION_ID` and calls this against itself). Stamps
+/// `last_turn_end_at`; `resolve_authorized_session` then derives
+/// `semantic_idle` from it. Self-report is the expected shape
+/// (`check_session_caller` short-circuits self to Allow); the standard
+/// scope rule covers the exotic caller-elsewhere cases. Idempotent —
+/// re-stamping is harmless.
+pub fn session_turn_ended(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: SessionTurnEndedParams = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("session.turn_ended params: {}", e),
+            )
+        })?;
+    let state = state_arc.lock().unwrap_or_else(|p2| p2.into_inner());
+    if let Some(cuid) = caller_uid {
+        let decision = crate::control::auth::check_session_caller(
+            &state,
+            cuid,
+            &p.session_uid,
+        );
+        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
+    }
+    let session = state.sessions.get(&p.session_uid).ok_or_else(|| {
+        (
+            ErrorCode::NotFound,
+            format!("session '{}' not in daemon registry", p.session_uid),
+        )
+    })?;
+    session.stamp_turn_end();
+    Ok(json!({ "ok": true }))
 }
 
 /// Sub-2b-1 (review #2): PTY-quiet threshold for daemon-side
@@ -5665,6 +5719,155 @@ const AGENT_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_milli
 /// Mirrors the TUI's separate deferred-Enter write.
 const AGENT_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Typing-quiet gate: how long the OPERATOR must have been quiet on a
+/// session's attach stream before an agent-prompt delivery thread will
+/// write into its PTY. Injecting while a human is mid-keystroke
+/// interleaves the paste with their composer text (the "mangled prompt"
+/// bug); waiting for a short quiet window closes the common case.
+const OPERATOR_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Poll cadence while deferred on the typing-quiet gate.
+const OPERATOR_QUIET_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Upper bound on typing-quiet deferral. An operator typing essentially
+/// continuously for this long is actively driving the session — but the
+/// prompt was still requested and dropping it silently would strand the
+/// caller (a workflow activation, a monitor fire), so after this bound we
+/// deliver anyway and log. In practice the gate clears in seconds.
+const OPERATOR_QUIET_MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Block until the operator has been quiet on `handle`'s session for at
+/// least `quiet_window`, polling every `poll`, giving up (and returning
+/// `false` = "delivering anyway") after `max_defer`. Returns `true` when
+/// the quiet window was achieved. Runs ONLY on detached delivery threads —
+/// never under the state lock.
+fn await_operator_quiet(
+    handle: &crate::session::InputHandle,
+    session_uid: &str,
+    quiet_window: std::time::Duration,
+    poll: std::time::Duration,
+    max_defer: std::time::Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    let mut logged_defer = false;
+    loop {
+        match handle.operator_quiet_for() {
+            // Never typed, or quiet long enough — clear to deliver.
+            None => return true,
+            Some(q) if q >= quiet_window => return true,
+            Some(_) => {}
+        }
+        if start.elapsed() >= max_defer {
+            eprintln!(
+                "cm-daemon: typing-quiet gate for {} exceeded {}s — delivering anyway",
+                session_uid,
+                max_defer.as_secs(),
+            );
+            return false;
+        }
+        if !logged_defer {
+            eprintln!(
+                "cm-daemon: deferring agent prompt for {} — operator is typing \
+                 (waiting for {}s quiet)",
+                session_uid,
+                quiet_window.as_secs(),
+            );
+            logged_defer = true;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+#[cfg(test)]
+mod operator_quiet_tests {
+    use super::await_operator_quiet;
+    use crate::session::InputHandle;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn never_typed_passes_immediately() {
+        let h = InputHandle::test_handle();
+        let start = Instant::now();
+        assert!(await_operator_quiet(
+            &h,
+            "ts-x",
+            Duration::from_secs(4),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        ));
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn already_quiet_passes_immediately() {
+        let h = InputHandle::test_handle();
+        h.stamp_operator_input_at(Instant::now() - Duration::from_secs(60));
+        assert!(await_operator_quiet(
+            &h,
+            "ts-x",
+            Duration::from_secs(4),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn recent_typing_defers_until_quiet_window_elapses() {
+        let h = InputHandle::test_handle();
+        h.stamp_operator_input_at(Instant::now());
+        let start = Instant::now();
+        assert!(await_operator_quiet(
+            &h,
+            "ts-x",
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+        ));
+        // Must have actually waited out the quiet window.
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn continuous_typing_gives_up_at_max_defer() {
+        let h = InputHandle::test_handle();
+        h.stamp_operator_input_at(Instant::now());
+        let start = Instant::now();
+        // Quiet window far larger than max defer — the stamp stays
+        // "recent" for the whole run, so the gate must give up.
+        assert!(!await_operator_quiet(
+            &h,
+            "ts-x",
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+            Duration::from_millis(150),
+        ));
+        assert!(start.elapsed() >= Duration::from_millis(140));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn write_and_stamp_operator_stamps_both_cells() {
+        let h = InputHandle::test_handle();
+        assert!(h.last_activity().is_none());
+        assert!(h.operator_quiet_for().is_none());
+        h.write_and_stamp_operator(b"x").expect("write");
+        assert!(h.last_activity().is_some(), "activity cell stamped");
+        let quiet = h.operator_quiet_for().expect("operator cell stamped");
+        assert!(quiet < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn plain_write_and_stamp_does_not_touch_operator_cell() {
+        let h = InputHandle::test_handle();
+        h.write_and_stamp(b"x").expect("write");
+        assert!(h.last_activity().is_some());
+        assert!(
+            h.operator_quiet_for().is_none(),
+            "agent-delivered input must not count as operator typing",
+        );
+    }
+}
+
 /// Wrap a prompt body in bracketed-paste markers (`\x1b[200~ … \x1b[201~`)
 /// when it spans multiple lines — matches the TUI's
 /// `format_body_for_delivery`. Without this, the agent submits at the first
@@ -5700,6 +5903,13 @@ fn spawn_agent_prompt_delivery(
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
             std::thread::sleep(AGENT_PROMPT_SETTLE);
+            await_operator_quiet(
+                &handle,
+                &session_uid,
+                OPERATOR_QUIET_WINDOW,
+                OPERATOR_QUIET_POLL,
+                OPERATOR_QUIET_MAX_DEFER,
+            );
             let body = prompt.trim_end_matches(['\r', '\n']);
             let payload = agent_paste_payload(body);
             let bracketed = payload.len() != body.len();
@@ -5761,6 +5971,13 @@ fn spawn_persistent_prompt_delivery(
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
         .spawn(move || {
             std::thread::sleep(AGENT_PROMPT_SETTLE);
+            await_operator_quiet(
+                &handle,
+                &session_uid,
+                OPERATOR_QUIET_WINDOW,
+                OPERATOR_QUIET_POLL,
+                OPERATOR_QUIET_MAX_DEFER,
+            );
             if compact {
                 // Auto-compact: `/compact` SUMMARIZES the conversation and
                 // continues on the condensed context — bounding unbounded growth

@@ -981,6 +981,28 @@ pub struct DaemonSession {
     /// would return early because the daemon never observed
     /// the input as activity.
     pub last_activity_at: SharedLastActivity,
+    /// Last time the OPERATOR (a human typing through the attach
+    /// stream) wrote input to this PTY. Distinct from
+    /// `last_activity_at`, which mixes PTY output and every input
+    /// source. Read by the agent-prompt delivery threads to defer
+    /// injection while the operator is actively typing — injecting
+    /// into a composer mid-keystroke interleaves the paste with the
+    /// operator's text (the "mangled prompt" bug). `None` until the
+    /// operator first types; control-plane `send_input` (agent- or
+    /// workflow-driven) never stamps it.
+    pub last_operator_input_at: SharedLastActivity,
+    /// Last time ANY input (operator typing, agent-prompt delivery,
+    /// bash send) was written/accepted for this PTY. Paired with
+    /// `last_turn_end_at` to derive `semantic_idle`: a turn-end
+    /// reported AFTER the last input means the agent is at its
+    /// prompt, whatever the PTY-output heuristic says.
+    pub last_input_at: SharedLastActivity,
+    /// Last time the session's agent reported "my turn ended" via the
+    /// cm Stop hook (`session.turn_ended` self-report). `None` for
+    /// sessions without the hook (bash, codex, pre-hook spawns) —
+    /// `semantic_idle` then reads `null` and callers fall back to the
+    /// PTY/transcript heuristics.
+    pub last_turn_end_at: SharedLastActivity,
     /// `Arc` so the reader thread can hold a clone independently of
     /// the `DaemonSession` instance — the thread pushes bytes into
     /// the fanout, the dispatcher / attach.open consumers subscribe
@@ -1705,6 +1727,13 @@ impl PendingSession {
             // observe generation=0 until a rebind happens.
             generation: 0,
             last_activity_at,
+            // Nothing can stamp operator input / turn-ends before the
+            // session is armed and inserted into the registry, so
+            // these cells are born here rather than threaded through
+            // PendingSession.
+            last_operator_input_at: Arc::new(Mutex::new(None)),
+            last_input_at: Arc::new(Mutex::new(None)),
+            last_turn_end_at: Arc::new(Mutex::new(None)),
             fanout,
             pid,
             pidfd,
@@ -1765,6 +1794,13 @@ impl Drop for PendingSession {
 pub struct InputHandle {
     writer: SessionWriter,
     last_activity_at: SharedLastActivity,
+    last_operator_input_at: SharedLastActivity,
+    last_input_at: SharedLastActivity,
+}
+
+fn stamp_now(cell: &SharedLastActivity) {
+    let mut slot = cell.lock().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(Instant::now());
 }
 
 impl InputHandle {
@@ -1779,13 +1815,8 @@ impl InputHandle {
             w.write_all(bytes)?;
             w.flush()?;
         }
-        {
-            let mut slot = self
-                .last_activity_at
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            *slot = Some(Instant::now());
-        }
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
         Ok(())
     }
 
@@ -1796,11 +1827,61 @@ impl InputHandle {
     /// than ~2.5s later when the thread's first write stamps. (The thread
     /// also stamps on each of its writes; this is the immediate signal.)
     pub fn stamp_activity(&self) {
-        let mut slot = self
-            .last_activity_at
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+    }
+
+    /// [`write_and_stamp`](Self::write_and_stamp) for OPERATOR input
+    /// (the attach stream — a human typing). Additionally stamps
+    /// `last_operator_input_at` so the agent-prompt delivery threads
+    /// can defer injection while the operator is actively typing.
+    pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_and_stamp(bytes)?;
+        stamp_now(&self.last_operator_input_at);
+        Ok(())
+    }
+
+    /// Time since the operator last typed into this PTY through the
+    /// attach stream. `None` = never (no operator interference
+    /// possible). Used by the delivery threads' typing-quiet gate.
+    pub fn operator_quiet_for(&self) -> Option<std::time::Duration> {
+        let slot = self
+            .last_operator_input_at
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        *slot = Some(Instant::now());
+        slot.map(|t| t.elapsed())
+    }
+
+    /// Test hook: pretend the operator typed `ago` before now, so the
+    /// typing-quiet gate can be exercised without an attach stream.
+    #[cfg(test)]
+    pub(crate) fn stamp_operator_input_at(&self, at: Instant) {
+        let mut slot = self
+            .last_operator_input_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = Some(at);
+    }
+
+    /// Test-only handle over an in-memory writer — lets the delivery
+    /// gate and stamping invariants be exercised without a PTY.
+    #[cfg(test)]
+    pub(crate) fn test_handle() -> Self {
+        InputHandle {
+            writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
+            last_activity_at: Arc::new(Mutex::new(None)),
+            last_operator_input_at: Arc::new(Mutex::new(None)),
+            last_input_at: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Test-only read of the activity stamp.
+    #[cfg(test)]
+    pub(crate) fn last_activity(&self) -> Option<Instant> {
+        *self
+            .last_activity_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -1815,7 +1896,38 @@ impl DaemonSession {
         InputHandle {
             writer: Arc::clone(&self.writer),
             last_activity_at: Arc::clone(&self.last_activity_at),
+            last_operator_input_at: Arc::clone(&self.last_operator_input_at),
+            last_input_at: Arc::clone(&self.last_input_at),
         }
+    }
+
+    /// Record the agent's own "my turn ended" report (the cm Stop hook
+    /// → `session.turn_ended`).
+    pub fn stamp_turn_end(&self) {
+        stamp_now(&self.last_turn_end_at);
+    }
+
+    /// Hook-derived idle signal. `None` = no hook data (session never
+    /// reported a turn end — bash/codex/pre-hook spawns): callers fall
+    /// back to PTY/transcript heuristics. `Some(true)` = the last
+    /// reported turn-end postdates the last delivered input, i.e. the
+    /// agent is at its prompt regardless of PTY spinner noise.
+    /// `Some(false)` = input was delivered after the last turn-end (a
+    /// turn is pending/running).
+    pub fn semantic_idle(&self) -> Option<bool> {
+        let turn_end = *self
+            .last_turn_end_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let turn_end = turn_end?;
+        let last_input = *self
+            .last_input_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Some(match last_input {
+            None => true,
+            Some(li) => turn_end >= li,
+        })
     }
 
     /// Convenience: one-shot spawn that combines [`PendingSession::spawn`]

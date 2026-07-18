@@ -99,10 +99,17 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "task.update_tree",
     "resolve_authorized_session",
     "session.set_transcript_path",
+    # The cm Stop hook's turn-end self-report (S3, async-wait branch).
+    # Session-caller self-target; feeds `semantic_idle` in
+    # resolve_authorized_session. No TUI handler — always daemon-routed.
+    "session.turn_ended",
     # PTY resize (TIOCSWINSZ). Operator-only, TUI-called over the daemon
     # socket on (re)attach; no MCP tool routes it. Listed for dispatch-
     # surface alignment only.
     "session.resize",
+    # Operator-only reviewer auto-A-d (cm-notify / Telegram flow). No MCP
+    # tool routes it. Listed for dispatch-surface alignment only.
+    "operator.mark_subtask_done",
     # Operator-only grant of global session permissions (TUI A-e toggle →
     # this RPC). No MCP tool routes it — an agent escalates via
     # start_session(global_perms=true), not this. Listed for dispatch-surface
