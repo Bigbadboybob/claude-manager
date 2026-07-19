@@ -962,24 +962,14 @@ impl App {
             Style::default().fg(theme::DIM)
         };
 
-        // Border tint telegraphs the ACTIVE session's state peripherally,
-        // mirroring the sidebar indicator's precedence: reconnecting `⟳`
-        // wins, then running, then the idle afterglow window; everything
-        // else (settled/stale idle, exited, no session) stays DIM chrome.
+        // Border stays calm DIM chrome except for a genuine alarm: a
+        // reconnecting `⟳` session tints it ATTN. Running/afterglow state
+        // deliberately does NOT tint the window border (owner call,
+        // 2026-07-18 — the persistent green frame around the whole session
+        // window was distracting); the sidebar indicator remains the
+        // per-session state signal.
         let border_color = match self.active_session() {
             Some((_, ts)) if self.reconnecting_sessions.contains(&ts.uid) => theme::ATTN,
-            Some((_, ts))
-                if ts.status == SessionStatus::Running && !ts.session.exited =>
-            {
-                theme::OK
-            }
-            Some((_, ts))
-                if !ts.session.exited
-                    && idle_age_bucket_at(ts.idle_since, Instant::now())
-                        == IdleAgeBucket::Afterglow =>
-            {
-                theme::AFTERGLOW
-            }
             _ => theme::DIM,
         };
 
