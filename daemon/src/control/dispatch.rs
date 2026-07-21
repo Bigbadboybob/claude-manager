@@ -412,6 +412,15 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_set_workflow_context(state, req))
         }
 
+        // `session.revive` — re-spawn one exited session at its same
+        // uid, resumed on its transcript (the on-demand form of the
+        // startup restore path). Operator-only: it can re-grant
+        // `global_perms` from the persisted entry, so a Session caller
+        // could use it as an escalation lever.
+        "session.revive" => {
+            DispatchOutcome::Done(dispatch_session_revive(state, req))
+        }
+
         // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
         // to the planning API. Both Operator and Session callers
         // allowed (any agent can propose; project owner reviews
@@ -1341,6 +1350,29 @@ fn dispatch_set_global_perms(
         return resp;
     }
     match methods::set_global_perms(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.revive` — operator-triggered resurrection of an exited
+/// session at its same uid (see `methods::revive_session`).
+/// Operator-only: the revive re-applies the persisted identity
+/// (including a `global_perms` grant), so a Session caller could
+/// otherwise use it to conjure a privileged sibling.
+fn dispatch_session_revive(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.revive is Operator-callable only — it re-applies the \
+         dead session's persisted identity (incl. global_perms), which \
+         a Session caller could abuse as an escalation lever",
+    ) {
+        return resp;
+    }
+    match methods::revive_session(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

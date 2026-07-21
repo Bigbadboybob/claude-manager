@@ -2650,6 +2650,20 @@ impl App {
                         };
                         return true;
                     }
+                    // A-R (revive dead session) vs A-r (refresh). Terminals
+                    // differ on whether Shift is baked into the char case or
+                    // reported as a modifier — accept both forms (same idiom
+                    // as A-W / A-w above).
+                    KeyCode::Char('R') => {
+                        self.revive_active_session();
+                        return true;
+                    }
+                    KeyCode::Char('r')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.revive_active_session();
+                        return true;
+                    }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
                         // A-r doubles as "reconnect now": accelerate in-flight

@@ -2278,6 +2278,156 @@ impl App {
     }
 
     /// Attach to the active workspace (SSH for cloud, claude for local, bash fallback).
+    /// A-R: revive the focused DEAD session in place, keeping its uid,
+    /// label, task binding, and conversation — the recovery for an
+    /// accidental ctrl-c / crashed agent that previously required a full
+    /// TUI restart (whose manifest restore is the only other path that
+    /// resurrects dead sessions).
+    ///
+    /// Local sessions re-run that startup-restore primitive for ONE slot
+    /// (`spawn_restored_session`): re-attach if the daemon still holds the
+    /// uid live (the TUI merely lost its stream), else re-spawn at the
+    /// SAME uid with the transcript resumed (claude `--resume` / codex
+    /// `resume`; bash respawns fresh). Remote sessions can't spawn
+    /// TUI-side (`guard_local_host_only` — local argv/paths are wrong on
+    /// the remote), so they ask the session's host daemon to
+    /// `session.revive` (same-uid resumed respawn composed daemon-side)
+    /// and then ride the existing deferred-reattach machinery to rebind
+    /// the slot once the spawn lands.
+    pub(super) fn revive_active_session(&mut self) {
+        let (wi, si) = match self.cursor.clone() {
+            Cursor::Session(wi, si) => (wi, si),
+            Cursor::Workspace(wi)
+                if self
+                    .workspaces
+                    .get(wi)
+                    .is_some_and(|w| w.sessions.len() == 1) =>
+            {
+                (wi, 0)
+            }
+            _ => {
+                self.set_status_msg("Focus a session to revive");
+                return;
+            }
+        };
+        let Some(ws) = self.workspaces.get(wi) else { return };
+        let Some(ts) = ws.sessions.get(si) else { return };
+        if !ts.session.exited {
+            self.set_status_msg(
+                "Session is not dead — A-R revives exited sessions",
+            );
+            return;
+        }
+        if ts.workflow_run_id.is_some() {
+            self.set_status_msg(
+                "Workflow participant — the workflow owns its lifecycle (A-u resumes the run)",
+            );
+            return;
+        }
+        if ts.continuous_task_id.is_some() {
+            self.set_status_msg(
+                "Continuous session — the scheduler owns its respawn (supervision / trigger)",
+            );
+            return;
+        }
+        let Some(wt_path) = ws.worktree_path.clone() else {
+            self.set_status_msg("Workspace has no worktree path — can't revive");
+            return;
+        };
+
+        let local = cm_daemon::host_id::HostId::local();
+        if ts.host_id != local {
+            // Remote: daemon-side same-uid revive, then the standard
+            // deferred-reattach flow rebinds the slot.
+            let ws_id = ws.id.clone();
+            let host_id = ts.host_id.clone();
+            let mut entry = ts.to_manifest_entry();
+            entry.last_exit = None;
+            let socket = self
+                .host_pool
+                .for_host(&host_id)
+                .ok()
+                .and_then(|h| h.socket_path());
+            let Some(socket) = socket else {
+                self.set_status_msg(&format!(
+                    "Host `{}` unreachable — can't revive",
+                    host_id.as_str(),
+                ));
+                return;
+            };
+            if let Err(e) = crate::client_session::rpc_session_revive(
+                &socket,
+                crate::daemon_launch::operator_token(),
+                &entry,
+                &ws_id,
+                &wt_path.to_string_lossy(),
+            ) {
+                self.set_status_msg(&format!("Revive failed: {e}"));
+                return;
+            }
+            {
+                let ts = &mut self.workspaces[wi].sessions[si];
+                ts.session.exited = false;
+                ts.set_status(SessionStatus::Idle);
+                ts.preserved_last_exit = None;
+            }
+            self.requeue_remote_reconnect(wi, si, "A-R revive");
+            self.save_session_manifest();
+            self.set_status_msg(&format!(
+                "Session revived on `{}` — reattaching…",
+                host_id.as_str(),
+            ));
+            return;
+        }
+
+        // Local: one-slot rerun of the startup restore.
+        let mut entry = ts.to_manifest_entry();
+        entry.last_exit = None;
+        let (cols, rows) = self.last_term_size;
+        // Live-uid probe decides attach-vs-spawn, exactly like startup
+        // restore. An unreachable daemon yields an empty set → the spawn
+        // path, whose own RPC then surfaces the real error.
+        let live_uids = self
+            .host_pool
+            .for_host(&local)
+            .ok()
+            .and_then(|h| h.socket_path())
+            .and_then(|socket| {
+                crate::client_session::rpc_list_session_uids(
+                    &socket,
+                    crate::daemon_launch::operator_token(),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let spawned = {
+            let ws = &self.workspaces[wi];
+            self.spawn_restored_session(&entry, ws, (cols, rows), &live_uids)
+        };
+        match spawned {
+            Some((mut fresh, outcome)) => {
+                // Same post-swap kick as the workflow respawn path: force
+                // the daemon PTY to the pane size so the pane repaints.
+                fresh.session.resize(cols, rows);
+                self.workspaces[wi].sessions[si] = fresh;
+                self.save_session_manifest();
+                self.set_status_msg(match outcome {
+                    RestoreOutcome::Attached => {
+                        "Session revived — reattached to the still-live daemon session"
+                    }
+                    RestoreOutcome::Spawned => {
+                        "Session revived — respawned with its conversation resumed"
+                    }
+                });
+            }
+            None => {
+                self.set_status_msg(
+                    "Revive failed — could not respawn the session (see stderr log)",
+                );
+            }
+        }
+    }
+
     pub(super) fn attach_active(&mut self) {
         let wi = match self.active_workspace_index() {
             Some(wi) => wi,
@@ -8021,6 +8171,208 @@ mod migrate_tui_local_tests {
              after the type slot (Issue K); post-type slice \
              head:\n{}",
             &trimmed[..trimmed.len().min(200)],
+        );
+    }
+}
+
+#[cfg(test)]
+mod revive_session_tests {
+    //! A-R (`revive_active_session`) behavior pins: the guards that keep
+    //! revive scoped to genuinely-dead, non-workflow sessions, and the
+    //! remote branch's fail-closed handling when the host daemon can't be
+    //! reached. The daemon-side respawn mechanics are pinned in
+    //! `cm-daemon`'s `revive_*` tests; the local spawn path reuses
+    //! `spawn_restored_session`, pinned by the startup-restore suite.
+    use super::*;
+    use std::collections::HashMap;
+
+    fn dummy_ts(uid: &str, exited: bool, host: cm_daemon::host_id::HostId) -> TerminalSession {
+        let mut session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .expect("dummy session");
+        session.exited = exited;
+        TerminalSession {
+            color: None,
+            uid: uid.into(),
+            label: "claude".into(),
+            session_type: "claude".into(),
+            session,
+            status: SessionStatus::Idle,
+            idle_since: None,
+            last_write_at: None,
+            transcript_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            generation: 0,
+            pending_jsonl_files: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            pending_prompt: None,
+            pending_clear: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            task_id: None,
+            last_delivery: None,
+            notify_on_idle: false,
+            global_perms: false,
+            pending_enter: None,
+            created_at: Instant::now(),
+            managed_by_uid: None,
+            seeded_from_snapshot: None,
+            preserved_last_exit: None,
+            host_id: host,
+        }
+    }
+
+    fn app_with_session(ts: TerminalSession) -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
+            id: "ws-revive".into(),
+            name: "revive".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: Some(std::env::temp_dir()),
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
+            sessions: vec![ts],
+            tombstones: Vec::new(),
+            is_pushing: false,
+        });
+        app.cursor = Cursor::Session(0, 0);
+        // Manifest saves no-op (no disk writes) — in-memory asserts only.
+        app.sessions_restored = false;
+        app
+    }
+
+    fn status_text(app: &App) -> String {
+        app.status_msg
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default()
+    }
+
+    /// Revive only applies to a DEAD session: a live one is refused with
+    /// a status hint and the slot is untouched.
+    #[test]
+    fn revive_refuses_non_exited_session() {
+        let ts = dummy_ts("ts-aaaaaaaaaaaaaa01-0", false, cm_daemon::host_id::HostId::local());
+        let mut app = app_with_session(ts);
+        app.revive_active_session();
+        assert!(
+            status_text(&app).contains("not dead"),
+            "live session refused with a hint, got: {}",
+            status_text(&app),
+        );
+        assert_eq!(app.workspaces[0].sessions[0].uid, "ts-aaaaaaaaaaaaaa01-0");
+        assert!(!app.workspaces[0].sessions[0].session.exited);
+    }
+
+    /// Workflow participants are workflow-engine-owned; revive refuses
+    /// them and points at A-u (resume the run) instead.
+    #[test]
+    fn revive_refuses_workflow_participant() {
+        let mut ts =
+            dummy_ts("ts-aaaaaaaaaaaaaa02-0", true, cm_daemon::host_id::HostId::local());
+        ts.workflow_run_id = Some("wf-1".into());
+        let mut app = app_with_session(ts);
+        app.revive_active_session();
+        assert!(
+            status_text(&app).contains("Workflow participant"),
+            "workflow participant refused, got: {}",
+            status_text(&app),
+        );
+        assert!(
+            app.workspaces[0].sessions[0].session.exited,
+            "slot left as-is",
+        );
+    }
+
+    /// Continuous sessions are scheduler-owned; revive refuses them (an
+    /// on-demand revive could double-spawn against supervision).
+    #[test]
+    fn revive_refuses_continuous_session() {
+        let mut ts =
+            dummy_ts("ts-aaaaaaaaaaaaaa04-0", true, cm_daemon::host_id::HostId::local());
+        ts.continuous_task_id = Some("ct-1".into());
+        let mut app = app_with_session(ts);
+        app.revive_active_session();
+        assert!(
+            status_text(&app).contains("Continuous session"),
+            "continuous session refused, got: {}",
+            status_text(&app),
+        );
+        assert!(
+            app.workspaces[0].sessions[0].session.exited,
+            "slot left as-is",
+        );
+    }
+
+    /// Remote branch, fail-closed: when the `session.revive` RPC can't
+    /// reach the host daemon, the slot stays dead and nothing is queued
+    /// for reattach — no half-revived state.
+    #[test]
+    fn revive_remote_rpc_failure_leaves_slot_dead() {
+        let ghost = cm_daemon::host_id::HostId::new("ghost");
+        let ts = dummy_ts("ts-aaaaaaaaaaaaaa03-0", true, ghost.clone());
+        let mut app = app_with_session(ts);
+        // A unix host whose socket doesn't exist: `for_host` resolves a
+        // path, the RPC dial fails immediately (no ssh, no timeout).
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: std::env::temp_dir()
+                            .join("cm-revive-test-nonexistent-local.sock"),
+                    },
+                    default: true,
+                },
+                crate::hosts::HostConfig {
+                    id: ghost,
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: std::env::temp_dir()
+                            .join("cm-revive-test-nonexistent-ghost.sock"),
+                    },
+                    default: false,
+                },
+            ],
+        };
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts).expect("pool"),
+        );
+        app.revive_active_session();
+        assert!(
+            status_text(&app).starts_with("Revive failed"),
+            "RPC failure surfaced, got: {}",
+            status_text(&app),
+        );
+        let ts = &app.workspaces[0].sessions[0];
+        assert!(ts.session.exited, "slot stays dead on RPC failure");
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "nothing queued for reattach on RPC failure",
+        );
+        assert!(
+            !app.reconnecting_sessions.contains(&ts.uid),
+            "not marked reconnecting on RPC failure",
         );
     }
 }

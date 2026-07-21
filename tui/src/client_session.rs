@@ -1456,6 +1456,46 @@ pub fn rpc_set_global_perms(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// `session.revive` RPC (A-R) — ask a host daemon to re-spawn an EXITED
+/// session at its SAME uid, resumed on its transcript (claude `--resume`
+/// / codex `resume`; bash comes back fresh). The TUI passes its own
+/// manifest view of the dead session because the daemon's post-exit
+/// record (workspace entry annotation + read-after-exit tombstone) is
+/// in-memory only — after a daemon restart the caller's view is the only
+/// one left. The daemon composes argv/env on ITS side (same path as its
+/// startup restore), so this works for remote hosts where local paths
+/// would be wrong. Operator-only on the daemon side.
+pub fn rpc_session_revive(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    entry: &cm_daemon::manifest::ManifestEntry,
+    workspace_id: &str,
+    worktree_path: &str,
+) -> anyhow::Result<()> {
+    // TUI-internal "claude" → wire "claude-code" (codex/bash coincide).
+    let wire_session_type = match entry.session_type.as_str() {
+        "claude" => "claude-code",
+        other => other,
+    };
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.revive".into(),
+        params: serde_json::json!({
+            "uid": entry.uid,
+            "workspace_id": workspace_id,
+            "worktree_path": worktree_path,
+            "session_type": wire_session_type,
+            "label": entry.label,
+            "task_id": entry.task_id,
+            "transcript_id": entry.transcript_id,
+            "managed_by_uid": entry.managed_by_uid,
+            "global_perms": entry.global_perms,
+        }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
 /// `task.update_tree` RPC. Sub-2a Finding #1: pushes the TUI's
 /// current task tree to the daemon as a full-replace snapshot.
 /// The daemon caches it in `DaemonState.task_tree` for the
@@ -2128,6 +2168,83 @@ mod tests {
         let returned = rpc_start_session(&config).expect("start_session rpc ok");
         assert_eq!(returned, uid, "daemon must echo the supplied uid verbatim");
         let _ = rpc_kill_session(&socket, "op-test", &uid);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// A-R end-to-end at the wire level: `rpc_session_revive` against a
+    /// real daemon dispatcher re-spawns a dead session ALIVE at its same
+    /// uid and clears the stale `last_exit` on the daemon's workspace
+    /// entry. Seeds the daemon's post-exit shape (workspace entry
+    /// annotated, live registry empty) and drives the same params the TUI
+    /// sends (its own manifest view of the dead session).
+    #[test]
+    fn rpc_session_revive_round_trip_revives_exited_session() {
+        let (socket, working_dir, state, stop, handle) =
+            start_test_daemon("ws-revive");
+        let uid = test_uid();
+        let entry = cm_daemon::manifest::ManifestEntry {
+            color: None,
+            uid: uid.clone(),
+            managed_by_uid: None,
+            generation: 0,
+            label: "revive-me".into(),
+            session_type: "bash".into(),
+            transcript_id: None,
+            hidden: false,
+            idle_timeout_secs: 0,
+            burst_threshold: 0,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            task_id: Some("task-rv".into()),
+            notify_on_idle: false,
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: None,
+            global_perms: false,
+            seeded_from_snapshot: None,
+            last_exit: Some(cm_daemon::manifest::LastExit {
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            }),
+            host_id: cm_daemon::host_id::HostId::local(),
+        };
+        {
+            let mut s = state.lock().unwrap();
+            let ws = s.workspaces.get_mut("ws-revive").expect("seeded ws");
+            ws.sessions.push(entry.clone());
+        }
+
+        rpc_session_revive(
+            &socket,
+            "op-test",
+            &entry,
+            "ws-revive",
+            working_dir.to_str().unwrap(),
+        )
+        .expect("session.revive rpc ok");
+
+        {
+            let mut s = state.lock().unwrap();
+            let revived = s
+                .sessions
+                .get(&uid)
+                .expect("session alive at its same uid after revive");
+            assert_eq!(revived.task_id.as_deref(), Some("task-rv"));
+            let e = s.workspaces["ws-revive"]
+                .sessions
+                .iter()
+                .find(|e| e.uid == uid)
+                .expect("workspace entry kept");
+            assert!(
+                e.last_exit.is_none(),
+                "stale last_exit cleared by the revive",
+            );
+            // Drop the live bash child (DaemonSession Drop SIGKILLs it).
+            s.sessions.clear();
+        }
         stop_test_daemon(&socket, stop, handle);
     }
 

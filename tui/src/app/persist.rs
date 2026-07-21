@@ -1112,7 +1112,7 @@ impl App {
     /// `pending_jsonl_files` for Codex during the rebind window
     /// would otherwise let an unrelated rollout claim the binding
     /// and overwrite the correct transcript_id.
-    fn spawn_restored_session(
+    pub(super) fn spawn_restored_session(
         &self,
         entry: &ManifestEntry,
         ws: &Workspace,

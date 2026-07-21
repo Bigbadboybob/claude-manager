@@ -7442,6 +7442,245 @@ fn restore_one_session(
     Ok(result)
 }
 
+/// Params for `session.revive` — operator-triggered resurrection of one
+/// EXITED session at its same uid (the "I ctrl-c'd my agent by accident"
+/// recovery: the session durability restore machinery, applied on demand
+/// to a single dead session instead of at startup). `uid` is the only
+/// required field; everything else is an optional override the caller
+/// (TUI) supplies from ITS manifest view so revive still works when the
+/// daemon has no record of the exit (both fallback sources — the
+/// workspace-manifest entry and the read-after-exit tombstone — are
+/// in-memory, so a daemon restart between exit and revive loses them).
+/// Resolution per field: explicit param → workspace-manifest entry
+/// (rich: `transcript_id` + mem-cap triple) → tombstone.
+#[derive(Deserialize)]
+struct ReviveSessionParams {
+    uid: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    worktree_path: Option<String>,
+    #[serde(default)]
+    session_type: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    transcript_id: Option<String>,
+    #[serde(default)]
+    managed_by_uid: Option<String>,
+    #[serde(default)]
+    global_perms: Option<bool>,
+}
+
+/// `session.revive` — re-spawn one exited session at its same uid,
+/// resumed on its transcript (claude `--resume <id>` / codex `resume`;
+/// no transcript → fresh spawn, same slot). Refuses live sessions
+/// (Conflict — kill first) and workflow participants (poller-owned).
+/// Spawn mechanics are exactly [`restore_one_session`]'s: argv/env
+/// rebuilt via `compose_restore_params`, mem-cap re-applied when its
+/// cgroup prefix survives, transcript detector armed for codex/fresh.
+pub fn revive_session(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ReviveSessionParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+
+    // Resolve the revive inputs under one brief lock; the spawn itself runs
+    // lock-free inside `restore_one_session` (`start_session` manages its own
+    // locking, and a concurrent same-uid revive race is settled by its
+    // lock-held collision check — the loser gets Conflict, no stranded child).
+    let (ws_id, worktree, entry) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sessions.contains_key(&p.uid) {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "session '{}' is still running — revive applies only to an \
+                     exited session (kill it first to force a restart)",
+                    p.uid
+                ),
+            ));
+        }
+        let ws_entry: Option<(String, crate::manifest::ManifestEntry)> =
+            state.workspaces.iter().find_map(|(id, ws)| {
+                ws.sessions
+                    .iter()
+                    .find(|e| e.uid == p.uid)
+                    .map(|e| (id.clone(), e.clone()))
+            });
+        let tomb = state.exited_tombstone(&p.uid).cloned();
+
+        // Workflow participants are poller-owned — a manual revive would fork
+        // the role's lifecycle out from under the workflow engine (fresh-mode
+        // respawn, on_idle cascades). Resume the workflow instead.
+        if ws_entry
+            .as_ref()
+            .and_then(|(_, e)| e.workflow_run_id.as_deref())
+            .or_else(|| tomb.as_ref().and_then(|t| t.workflow_run_id.as_deref()))
+            .is_some()
+        {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "session '{}' is a workflow participant — the workflow \
+                     engine owns its lifecycle; resume the workflow instead",
+                    p.uid
+                ),
+            ));
+        }
+        // Continuous sessions are scheduler-owned. The STARTUP restore may
+        // resume them only because it runs before the scheduler's first tick
+        // (S5's ordering coordination); an on-demand revive has no such
+        // ordering and could double-spawn against a supervision respawn.
+        if ws_entry
+            .as_ref()
+            .and_then(|(_, e)| e.continuous_task_id.as_deref())
+            .is_some()
+        {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "session '{}' belongs to a continuous task — the scheduler \
+                     owns its respawn (supervision / trigger / resolve_stuck)",
+                    p.uid
+                ),
+            ));
+        }
+
+        let ws_id = p
+            .workspace_id
+            .clone()
+            .or_else(|| ws_entry.as_ref().map(|(id, _)| id.clone()))
+            .or_else(|| tomb.as_ref().map(|t| t.workspace_id.clone()))
+            .ok_or_else(|| {
+                (
+                    ErrorCode::NotFound,
+                    format!(
+                        "no record of session '{}' (daemon restarted since the \
+                         exit?) — pass workspace_id / worktree_path / \
+                         session_type / transcript_id explicitly to revive",
+                        p.uid
+                    ),
+                )
+            })?;
+        let worktree: PathBuf = p
+            .worktree_path
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| {
+                state
+                    .workspaces
+                    .get(&ws_id)
+                    .and_then(|w| w.worktree_path.clone())
+            })
+            .or_else(|| {
+                tomb.as_ref()
+                    .and_then(|t| t.worktree_path.as_deref().map(PathBuf::from))
+            })
+            .ok_or_else(|| {
+                (
+                    ErrorCode::Conflict,
+                    format!(
+                        "workspace '{}' has no worktree path — pass \
+                         worktree_path explicitly to revive session '{}'",
+                        ws_id, p.uid
+                    ),
+                )
+            })?;
+
+        // Start from the daemon's own manifest entry when it has one (it
+        // carries the mem-cap triple + transcript_id), else rebuild a minimal
+        // entry from the tombstone; explicit caller params override either.
+        let mut entry = match ws_entry {
+            Some((_, e)) => e,
+            None => crate::manifest::ManifestEntry {
+                uid: p.uid.clone(),
+                managed_by_uid: None,
+                generation: tomb.as_ref().map(|t| t.generation).unwrap_or(0),
+                label: tomb
+                    .as_ref()
+                    .map(|t| t.label.clone())
+                    .unwrap_or_else(|| p.uid.clone()),
+                session_type: tomb
+                    .as_ref()
+                    .map(|t| t.session_type.clone())
+                    .unwrap_or_else(|| "claude-code".to_string()),
+                transcript_id: None,
+                hidden: false,
+                idle_timeout_secs: 0,
+                burst_threshold: 0,
+                workflow_run_id: None,
+                workflow_role: None,
+                continuous_task_id: None,
+                task_id: tomb.as_ref().and_then(|t| t.task_id.clone()),
+                notify_on_idle: false,
+                color: None,
+                memory_cap_soft_bytes: None,
+                memory_cap_hard_bytes: None,
+                cgroup_prefix: None,
+                global_perms: tomb.as_ref().map(|t| t.global_perms).unwrap_or(false),
+                seeded_from_snapshot: None,
+                last_exit: None,
+                host_id: crate::host_id::HostId::local(),
+            },
+        };
+        // The tombstone snapshots the transcript as a PATH at exit time —
+        // derive the resume key from it when the manifest entry lacks one
+        // (e.g. the detector bound after the last manifest persist).
+        if entry.transcript_id.is_none() {
+            entry.transcript_id = tomb
+                .as_ref()
+                .and_then(|t| t.transcript_path.as_deref())
+                .and_then(crate::session::transcript_id_from_path);
+        }
+        if entry.managed_by_uid.is_none() {
+            entry.managed_by_uid =
+                tomb.as_ref().and_then(|t| t.managed_by_uid.clone());
+        }
+        entry.uid = p.uid.clone();
+        if let Some(st) = p.session_type.clone() {
+            entry.session_type = st;
+        }
+        if let Some(l) = p.label.clone() {
+            entry.label = l;
+        }
+        if p.task_id.is_some() {
+            entry.task_id = p.task_id.clone();
+        }
+        if p.transcript_id.is_some() {
+            entry.transcript_id = p.transcript_id.clone();
+        }
+        if p.managed_by_uid.is_some() {
+            entry.managed_by_uid = p.managed_by_uid.clone();
+        }
+        if let Some(gp) = p.global_perms {
+            entry.global_perms = gp;
+        }
+        entry.last_exit = None;
+        (ws_id, worktree, entry)
+    };
+
+    let result = restore_one_session(state_arc, &ws_id, &worktree, &entry)?;
+
+    // Converge the in-memory bookkeeping: the workspace entry is alive again
+    // (clear the stale last_exit so a later persist doesn't mark the live
+    // session dead) and the read-after-exit tombstone no longer describes
+    // reality (the live registry serves this uid now).
+    {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ws) = state.workspaces.get_mut(&ws_id) {
+            if let Some(e) = ws.sessions.iter_mut().find(|e| e.uid == entry.uid) {
+                e.last_exit = None;
+            }
+        }
+        state.recently_exited.retain(|t| t.session_uid != entry.uid);
+    }
+    Ok(result)
+}
+
 /// Mint a fire_token idempotency key (`ft_<hex>-<hex>`) for a `trigger` call
 /// that didn't supply one. Same `nanos`+counter recipe as
 /// [`new_daemon_minted_session_uid`], distinct prefix. A minted token is fresh
@@ -16229,6 +16468,223 @@ mod tests {
                 "fresh restore sets no transcript_path",
             );
         });
+    }
+
+    // ---- session.revive (on-demand single-session resurrection) -----
+
+    /// The primary revive path: an exited session whose workspace-manifest
+    /// entry is still in daemon memory comes back ALIVE at its same uid,
+    /// carrying its persisted identity; the stale `last_exit` and the
+    /// read-after-exit tombstone are cleared so daemon state converges.
+    #[test]
+    fn revive_respawns_exited_entry_at_same_uid_and_clears_bookkeeping() {
+        let uid = "ts-aaaa000000000001-0";
+        let wt = std::env::temp_dir();
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            let mut e = me(uid, "bash");
+            e.task_id = Some("task-rv".into());
+            e.global_perms = true;
+            e.last_exit = Some(crate::manifest::LastExit {
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            });
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-rv".into();
+            ws.worktree_path = Some(wt.clone());
+            ws.sessions = vec![e];
+            s.workspaces.insert("ws-rv".into(), ws);
+            s.record_exited(crate::state::ExitedTombstone {
+                session_uid: uid.into(),
+                transcript_path: None,
+                generation: 0,
+                session_type: "bash".into(),
+                workspace_id: "ws-rv".into(),
+                task_id: Some("task-rv".into()),
+                managed_by_uid: None,
+                label: "rv".into(),
+                workflow_run_id: None,
+                workflow_role: None,
+                worktree_path: Some(wt.to_string_lossy().into_owned()),
+                global_perms: true,
+                exited_at: 1.0,
+            });
+        }
+
+        revive_session(&state, &json!({ "uid": uid })).expect("revive ok");
+
+        let mut s = state.lock().unwrap();
+        let revived = s.sessions.get(uid).expect("session alive at same uid");
+        assert_eq!(revived.task_id.as_deref(), Some("task-rv"));
+        assert!(revived.global_perms, "persisted global_perms re-applied");
+        let entry = s.workspaces["ws-rv"]
+            .sessions
+            .iter()
+            .find(|e| e.uid == uid)
+            .unwrap();
+        assert!(
+            entry.last_exit.is_none(),
+            "stale last_exit cleared on the workspace entry",
+        );
+        assert!(
+            s.exited_tombstone(uid).is_none(),
+            "read-after-exit tombstone dropped — the live registry serves \
+             this uid now",
+        );
+        s.sessions.clear();
+    }
+
+    /// Revive is for DEAD sessions only: a live uid gets Conflict (kill
+    /// first), and the live child is untouched.
+    #[test]
+    fn revive_refuses_live_session() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let uid = "ts-aaaa000000000002-0";
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            let mut sp = SpawnParams::new(uid, "live", "/bin/sleep");
+            sp.args = vec!["120".into()];
+            sp.workspace_id = "ws-live".into();
+            s.sessions
+                .insert(uid.into(), DaemonSession::spawn(sp).expect("spawn"));
+        }
+        let (code, msg) =
+            revive_session(&state, &json!({ "uid": uid })).unwrap_err();
+        assert!(matches!(code, ErrorCode::Conflict), "got {code:?}: {msg}");
+        assert!(
+            state.lock().unwrap().sessions.contains_key(uid),
+            "live session untouched",
+        );
+        state.lock().unwrap().sessions.clear();
+    }
+
+    /// Workflow participants are poller-owned — revive refuses them (the
+    /// workflow engine's fresh-mode respawn / on_idle cascade would fork).
+    #[test]
+    fn revive_refuses_workflow_participant() {
+        let uid = "ts-aaaa000000000003-0";
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            let mut e = me(uid, "bash");
+            e.workflow_run_id = Some("wf-1".into());
+            e.last_exit = Some(crate::manifest::LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            });
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-wf".into();
+            ws.worktree_path = Some(std::env::temp_dir());
+            ws.sessions = vec![e];
+            s.workspaces.insert("ws-wf".into(), ws);
+        }
+        let (code, msg) =
+            revive_session(&state, &json!({ "uid": uid })).unwrap_err();
+        assert!(matches!(code, ErrorCode::Conflict), "got {code:?}: {msg}");
+        assert!(msg.contains("workflow"), "actionable message: {msg}");
+    }
+
+    /// Continuous sessions are scheduler-owned — an on-demand revive could
+    /// double-spawn against a supervision respawn, so it's refused.
+    #[test]
+    fn revive_refuses_continuous_session() {
+        let uid = "ts-aaaa000000000006-0";
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            let mut e = me(uid, "bash");
+            e.continuous_task_id = Some("ct-1".into());
+            e.last_exit = Some(crate::manifest::LastExit {
+                code: Some(0),
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+            });
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-ct".into();
+            ws.worktree_path = Some(std::env::temp_dir());
+            ws.sessions = vec![e];
+            s.workspaces.insert("ws-ct".into(), ws);
+        }
+        let (code, msg) =
+            revive_session(&state, &json!({ "uid": uid })).unwrap_err();
+        assert!(matches!(code, ErrorCode::Conflict), "got {code:?}: {msg}");
+        assert!(msg.contains("continuous"), "actionable message: {msg}");
+    }
+
+    /// With no workspace-manifest entry (last persist predated the session),
+    /// the read-after-exit tombstone alone resolves the revive.
+    #[test]
+    fn revive_resolves_from_tombstone_when_manifest_lacks_entry() {
+        let uid = "ts-aaaa000000000004-0";
+        let wt = std::env::temp_dir();
+        let state = make_state_arc();
+        state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
+            session_uid: uid.into(),
+            transcript_path: None,
+            generation: 0,
+            session_type: "bash".into(),
+            workspace_id: "ws-tomb".into(),
+            task_id: Some("task-t".into()),
+            managed_by_uid: Some("ts-ffffffffffffffff-0".into()),
+            label: "tombed".into(),
+            workflow_run_id: None,
+            workflow_role: None,
+            worktree_path: Some(wt.to_string_lossy().into_owned()),
+            global_perms: false,
+            exited_at: 1.0,
+        });
+
+        revive_session(&state, &json!({ "uid": uid })).expect("revive ok");
+
+        let mut s = state.lock().unwrap();
+        let revived = s.sessions.get(uid).expect("session alive at same uid");
+        assert_eq!(revived.task_id.as_deref(), Some("task-t"));
+        assert_eq!(
+            revived.managed_by_uid.as_deref(),
+            Some("ts-ffffffffffffffff-0"),
+        );
+        assert_eq!(revived.session_type, "bash");
+        s.sessions.clear();
+    }
+
+    /// The daemon-restarted-since-exit case: no daemon-side record at all,
+    /// but the caller (TUI) supplies its manifest view explicitly and the
+    /// revive still lands. Without any record OR params → NotFound.
+    #[test]
+    fn revive_explicit_params_cover_daemon_amnesia() {
+        let uid = "ts-aaaa000000000005-0";
+        let wt = std::env::temp_dir();
+        let state = make_state_arc();
+
+        let (code, _msg) =
+            revive_session(&state, &json!({ "uid": uid })).unwrap_err();
+        assert!(matches!(code, ErrorCode::NotFound));
+
+        revive_session(
+            &state,
+            &json!({
+                "uid": uid,
+                "workspace_id": "ws-amn",
+                "worktree_path": wt.to_str().unwrap(),
+                "session_type": "bash",
+                "label": "amnesia",
+                "task_id": "task-a",
+            }),
+        )
+        .expect("revive from explicit params ok");
+
+        let mut s = state.lock().unwrap();
+        let revived = s.sessions.get(uid).expect("session alive at same uid");
+        assert_eq!(revived.task_id.as_deref(), Some("task-a"));
+        assert_eq!(revived.workspace_id, "ws-amn");
+        s.sessions.clear();
     }
 
     /// 10d-2c-1 test helper: seed a minimal-but-valid
