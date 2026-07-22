@@ -193,16 +193,28 @@ pub fn write_claude_mcp_config(
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
     let env = build_env(target, session_uid, workflow.as_ref());
-    // Interpreter resolution is shared with the daemon (venv-aware; bare
-    // `python` only as a last resort) — a hardcoded `"python"` here broke
-    // every spawned session's MCP server when the machine's `python` shim
-    // (conda) was removed. See `cm_daemon::mcp_config::resolve_python_interpreter`.
-    let python = cm_daemon::mcp_config::resolve_python_interpreter(&server);
+    // Route through the shared drift-proof launcher (`~/.cm/mcp/
+    // launcher.sh`) — this config is frozen for the life of the agent
+    // process, and a baked interpreter/checkout path here broke every
+    // long-lived session's /mcp reconnect when the machine drifted
+    // (conda removal, deleted dev worktrees). Fail-open to the direct
+    // pair if the launcher can't be written — never block a spawn.
+    // See `cm_daemon::mcp_config::ensure_launcher`.
+    let (command, first_arg) = match cm_daemon::mcp_config::ensure_launcher(&server) {
+        Ok(launcher) => (
+            launcher.to_string_lossy().into_owned(),
+            "server.py".to_string(),
+        ),
+        Err(_) => (
+            cm_daemon::mcp_config::resolve_python_interpreter(&server),
+            server.to_string_lossy().into_owned(),
+        ),
+    };
     let config = json!({
         "mcpServers": {
             "claude-manager": {
-                "command": python,
-                "args": [server.to_string_lossy()],
+                "command": command,
+                "args": [first_arg],
                 "env": env,
             }
         }
@@ -225,15 +237,23 @@ pub fn codex_overrides(
     workflow: Option<&WorkflowMeta>,
 ) -> Vec<String> {
     let server_path = crate::workflow::spawn::mcp_server_path();
-    // Same venv-aware interpreter resolution as the Claude config —
+    // Same launcher indirection as the Claude config — codex freezes
+    // these in argv for the session's lifetime. Direct pair fallback;
     // see `write_claude_mcp_config`.
-    let python = server_path
+    let (python, server) = match server_path
         .as_deref()
-        .map(cm_daemon::mcp_config::resolve_python_interpreter)
-        .unwrap_or_else(|| "python".to_string());
-    let server = server_path
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .map(|s| (s, cm_daemon::mcp_config::ensure_launcher(s)))
+    {
+        Some((_, Ok(launcher))) => (
+            launcher.to_string_lossy().into_owned(),
+            "server.py".to_string(),
+        ),
+        Some((s, Err(_))) => (
+            cm_daemon::mcp_config::resolve_python_interpreter(s),
+            s.to_string_lossy().into_owned(),
+        ),
+        None => ("python".to_string(), String::new()),
+    };
     let env = build_env(target, session_uid, workflow);
     let env_toml = env
         .iter()

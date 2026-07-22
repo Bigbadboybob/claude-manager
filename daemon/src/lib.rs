@@ -388,12 +388,27 @@ pub fn run() -> anyhow::Result<()> {
     // surface here, loudly, instead of as a silent per-participant failure when
     // a manager can't call workflow_done. Non-fatal (the daemon still serves
     // non-workflow sessions); the error names exactly what to fix.
+    let server_override = if initial_state.config.mcp_server_path.trim().is_empty() {
+        None
+    } else {
+        Some(initial_state.config.mcp_server_path.as_str())
+    };
+    // Refresh the drift-proof MCP launcher at every startup, regardless
+    // of workflow definitions: per-session configs point `claude`'s MCP
+    // command at `~/.cm/mcp/launcher.sh`, so this rewrite is what heals
+    // every long-lived session's next /mcp reconnect after machine
+    // drift (removed interpreter, deleted dev worktree, rebuilt venv).
+    if let Some(server) = mcp_config::resolve_server_path(server_override) {
+        match mcp_config::ensure_launcher(&server) {
+            Ok(p) => eprintln!("cm-daemon: refreshed MCP launcher at {}", p.display()),
+            Err(e) => eprintln!(
+                "cm-daemon: \u{26a0}\u{fe0f}  could not refresh MCP launcher: {} — \
+                 spawns fall back to direct interpreter paths",
+                e
+            ),
+        }
+    }
     if !initial_state.base_workflow_definitions.is_empty() {
-        let server_override = if initial_state.config.mcp_server_path.trim().is_empty() {
-            None
-        } else {
-            Some(initial_state.config.mcp_server_path.as_str())
-        };
         match mcp_config::run_mcp_preflight(server_override) {
             Ok(summary) => eprintln!("cm-daemon: MCP preflight OK: {}", summary),
             Err(msg) => eprintln!("cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED\n{}", msg),

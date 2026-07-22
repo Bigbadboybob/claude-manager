@@ -52,6 +52,199 @@ fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
     Some(home.join(".cm/mcp").join(session_uid))
 }
 
+/// Machine-global MCP launcher script. Per-session configs point their
+/// `command` here instead of baking a concrete interpreter + checkout
+/// path — see [`ensure_launcher`].
+fn launcher_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".cm/mcp/launcher.sh"))
+}
+
+/// Sidecar recording the launcher's candidate (python, server) pairs,
+/// most-recently-written first. Kept separate from the script so
+/// [`ensure_launcher`] can merge new resolutions with prior ones
+/// without parsing shell.
+fn launcher_candidates_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".cm/mcp/launcher-candidates.json"))
+}
+
+/// Most candidate pairs the launcher retains. One live checkout plus a
+/// few recent fallbacks is plenty; an unbounded list would accumulate
+/// every dev worktree ever spawned from.
+const LAUNCHER_MAX_CANDIDATES: usize = 4;
+
+/// Write (or refresh) `~/.cm/mcp/launcher.sh` so it launches mcp_server
+/// scripts with the freshest working (python, server) pair, and return
+/// its path.
+///
+/// ## Why per-session configs go through a launcher
+///
+/// A per-session `claude.json` is written ONCE at spawn time and then
+/// frozen for the life of the agent process — `claude` keeps the parsed
+/// config in memory and re-spawns the MCP server from it on every
+/// `/mcp` reconnect. Baking a concrete interpreter + checkout path into
+/// it made long-lived sessions break whenever the machine drifted
+/// underneath them, observed three separate times: bare `python`
+/// vanished (conda shim), bare `python3` lost the `mcp` module (conda
+/// removal), and dev-worktree server paths outlived their worktrees.
+/// Each time, every affected session's reconnect died with `-32000`
+/// until the session itself was respawned.
+///
+/// The launcher breaks that coupling: the frozen config holds only this
+/// script's path (stable forever) and a server-dir-relative script name
+/// (`server.py`, or `hooks/cm_stop_hook.py` for the Stop hook), and the
+/// script re-resolves a WORKING pair at every launch. It is rewritten
+/// at daemon/TUI startup and on every config write, so restarting cm
+/// after machine drift heals every old session's next reconnect with no
+/// per-session surgery.
+///
+/// The freshly resolved pair is prepended to the retained candidate
+/// list (deduped, dead server paths pruned, capped) rather than
+/// replacing it: a dev-worktree TUI legitimately points the head at its
+/// own checkout, and the prior stable pair stays behind it as the
+/// fallback for when that worktree is deleted. Runtime validation picks
+/// the first candidate whose files exist and whose interpreter can
+/// `import mcp` (for `server.py`; other scripts only need a runnable
+/// interpreter).
+///
+/// Fail-open contract: callers fall back to writing the direct
+/// (python, server) pair on `Err`, so a launcher-write failure can
+/// never block a spawn.
+pub fn ensure_launcher(server: &Path) -> std::io::Result<PathBuf> {
+    let launcher = launcher_path().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set")
+    })?;
+    let sidecar = launcher_candidates_path().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set")
+    })?;
+    if let Some(dir) = launcher.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let python = resolve_python_interpreter(server);
+    let head = (python, server.to_string_lossy().into_owned());
+
+    // Merge: head first, then retained pairs that still exist on disk.
+    let mut pairs: Vec<(String, String)> = vec![head.clone()];
+    if let Ok(raw) = fs::read_to_string(&sidecar) {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(&raw) {
+            for it in items {
+                let (Some(py), Some(srv)) = (
+                    it.get("python").and_then(|v| v.as_str()),
+                    it.get("server").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                let pair = (py.to_string(), srv.to_string());
+                // The head is kept unconditionally (it may be an operator-
+                // configured path that doesn't exist on this box — the P-2
+                // remote-config case); retained tails must still exist.
+                if pair != head && Path::new(srv).is_file() {
+                    pairs.push(pair);
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    pairs.retain(|p| seen.insert(p.clone()));
+    pairs.truncate(LAUNCHER_MAX_CANDIDATES);
+
+    let sidecar_json = serde_json::Value::Array(
+        pairs
+            .iter()
+            .map(|(py, srv)| json!({"python": py, "server": srv}))
+            .collect(),
+    );
+    write_if_changed(
+        &sidecar,
+        &format!("{}\n", serde_json::to_string_pretty(&sidecar_json).unwrap_or_default()),
+        0o644,
+    )?;
+    write_if_changed(&launcher, &render_launcher_script(&pairs), 0o755)?;
+    Ok(launcher)
+}
+
+/// Render the launcher script body for a candidate list. Split out so
+/// tests can assert on content without touching HOME.
+fn render_launcher_script(pairs: &[(String, String)]) -> String {
+    let mut s = String::from(
+        "#!/bin/sh\n\
+         # Generated by claude-manager (cm). DO NOT EDIT — rewritten at every\n\
+         # cm-daemon / TUI startup and session spawn.\n\
+         #\n\
+         # Launches an mcp_server script ($1, relative to the mcp_server dir;\n\
+         # default server.py) with the first candidate pair below that still\n\
+         # works. Per-session MCP configs point here instead of freezing an\n\
+         # interpreter + checkout path, so a session's /mcp reconnect survives\n\
+         # deleted worktrees, rebuilt venvs, and interpreter drift.\n\
+         REL=\"${1:-server.py}\"\n\
+         [ \"$#\" -gt 0 ] && shift\n\
+         try() {\n\
+         \tt_py=\"$1\"; t_dir=\"$2\"; shift 2\n\
+         \t[ -f \"$t_dir/$REL\" ] || return 1\n\
+         \tif [ \"$REL\" = \"server.py\" ]; then\n\
+         \t\t\"$t_py\" -c 'import mcp' >/dev/null 2>&1 || return 1\n\
+         \telse\n\
+         \t\t\"$t_py\" -c '' >/dev/null 2>&1 || return 1\n\
+         \tfi\n\
+         \texec \"$t_py\" \"$t_dir/$REL\" \"$@\"\n\
+         }\n\
+         # Ad-hoc override for testing a checkout without rewriting configs.\n\
+         if [ -n \"$CM_MCP_SERVER\" ]; then\n\
+         \ttry \"${CM_MCP_PYTHON:-python3}\" \"$(dirname \"$CM_MCP_SERVER\")\" \"$@\"\n\
+         fi\n",
+    );
+    for (py, srv) in pairs {
+        let dir = Path::new(srv)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| srv.clone());
+        s.push_str(&format!(
+            "try '{}' '{}' \"$@\"\n",
+            sh_squote(py),
+            sh_squote(&dir)
+        ));
+    }
+    s.push_str(
+        "echo \"cm mcp launcher: no working (python, mcp_server) candidate — \
+         restart the cm TUI/daemon to refresh $0\" >&2\nexit 1\n",
+    );
+    s
+}
+
+/// Escape a string for inclusion inside single quotes in sh. cm never
+/// produces paths with single quotes; this is purely defensive.
+fn sh_squote(s: &str) -> String {
+    s.replace('\'', r"'\''")
+}
+
+/// Write `content` to `path` atomically (temp + rename), skipping the
+/// write when the on-disk content already matches — the launcher is
+/// refreshed on every spawn and startup, and churning mtimes for
+/// identical bytes is noise. `mode` is applied to fresh writes.
+fn write_if_changed(path: &Path, content: &str, mode: u32) -> std::io::Result<()> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == content {
+            // Content already right — still enforce the mode so a
+            // hand-chmodded launcher can't stay non-executable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            }
+            return Ok(());
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    }
+    fs::rename(&tmp, path)
+}
+
 /// Workflow participant identity threaded into the MCP server's config `env`
 /// block. Mirrors `tui/src/mcp_config.rs::WorkflowMeta`.
 ///
@@ -148,7 +341,7 @@ fn absolutized_socket_or_raw(p: &Path) -> String {
 /// so could never call `workflow_transition` / `workflow_done`. Threading the
 /// configured path through fixes that; the env/repo resolution stays as the
 /// local-workstation fallback.
-fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf> {
+pub fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf> {
     server_path_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -171,11 +364,23 @@ pub fn claude_settings_hook_arg(server_path_override: Option<&str>) -> Option<St
     if !hook.is_file() {
         return None;
     }
-    let python = resolve_python_interpreter(&server);
-    // The hook `command` runs via `sh -c`; single-quote both words so
+    // The hook `command` runs via `sh -c`; single-quote each word so
     // spaces in paths survive. (Paths with single quotes in them are
-    // not a layout cm produces.)
-    let command = format!("'{}' '{}'", python, hook.to_string_lossy());
+    // not a layout cm produces.) Same launcher indirection as the MCP
+    // config: the `--settings` argv is frozen for the life of the
+    // claude process, so a baked interpreter path here goes stale the
+    // same way — route through the launcher, direct pair as fallback.
+    let command = match ensure_launcher(&server) {
+        Ok(launcher) => format!(
+            "'{}' 'hooks/cm_stop_hook.py'",
+            launcher.to_string_lossy()
+        ),
+        Err(_) => format!(
+            "'{}' '{}'",
+            resolve_python_interpreter(&server),
+            hook.to_string_lossy()
+        ),
+    };
     Some(
         serde_json::json!({
             "hooks": {
@@ -317,12 +522,24 @@ pub fn write_claude_mcp_config(
     fs::create_dir_all(&dir)?;
     let path = dir.join("claude.json");
     let env = build_env(session_uid, workflow);
-    let python = resolve_python_interpreter(&server);
+    // Route through the drift-proof launcher; fall back to the direct
+    // (python, server) pair only if the launcher can't be written —
+    // see `ensure_launcher` (fail-open: never block a spawn).
+    let (command, first_arg) = match ensure_launcher(&server) {
+        Ok(launcher) => (
+            launcher.to_string_lossy().into_owned(),
+            "server.py".to_string(),
+        ),
+        Err(_) => (
+            resolve_python_interpreter(&server),
+            server.to_string_lossy().into_owned(),
+        ),
+    };
     let config = json!({
         "mcpServers": {
             "claude-manager": {
-                "command": python,
-                "args": [server.to_string_lossy()],
+                "command": command,
+                "args": [first_arg],
                 "env": env,
             }
         }
@@ -349,13 +566,21 @@ pub fn codex_overrides(
     server_path_override: Option<&str>,
 ) -> Vec<String> {
     let server_path = resolve_server_path(server_path_override);
-    let python = server_path
-        .as_deref()
-        .map(resolve_python_interpreter)
-        .unwrap_or_else(|| "python".to_string());
-    let server = server_path
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // Same launcher indirection as the Claude config; direct pair as
+    // the fail-open fallback. Codex freezes these in argv for the
+    // session's lifetime, so the stable-command property matters just
+    // as much here.
+    let (python, server) = match server_path.as_deref().map(|s| (s, ensure_launcher(s))) {
+        Some((_, Ok(launcher))) => (
+            launcher.to_string_lossy().into_owned(),
+            "server.py".to_string(),
+        ),
+        Some((s, Err(_))) => (
+            resolve_python_interpreter(s),
+            s.to_string_lossy().into_owned(),
+        ),
+        None => ("python".to_string(), String::new()),
+    };
     let env = build_env(session_uid, workflow);
     let env_toml = env
         .iter()
@@ -869,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_config_uses_adjacent_venv_python_when_present() {
+    fn claude_config_routes_through_launcher_with_adjacent_venv_python() {
         let _g = home_lock();
         let home = TempDir::new().unwrap();
         let _h = HomeGuard::set(home.path());
@@ -892,9 +1117,22 @@ mod tests {
         let cmd = cfg["mcpServers"]["claude-manager"]["command"]
             .as_str()
             .unwrap();
+        // The frozen per-session config must point at the STABLE
+        // launcher, not a concrete interpreter — that's the whole
+        // drift-immunity property.
         assert!(
-            cmd.ends_with("/.venv/bin/python"),
-            "command must be the adjacent venv python, got {cmd}",
+            cmd.ends_with(".cm/mcp/launcher.sh"),
+            "command must be the launcher, got {cmd}",
+        );
+        assert_eq!(
+            cfg["mcpServers"]["claude-manager"]["args"][0], "server.py",
+            "args must carry the server-dir-relative script name",
+        );
+        // The launcher itself must resolve to the adjacent venv python.
+        let launcher = std::fs::read_to_string(cmd).expect("launcher on disk");
+        assert!(
+            launcher.contains(&*venv_bin.join("python").to_string_lossy()),
+            "launcher must carry the adjacent venv python as a candidate:\n{launcher}",
         );
     }
 
@@ -948,6 +1186,154 @@ mod tests {
         // A nonexistent interpreter path still tries to spawn → Io error mapped
         // to Err (not a panic); either the locate or the spawn arm is fine.
         assert!(missing.is_err(), "a bogus server path must yield Err, got {missing:?}");
+    }
+
+    /// ensure_launcher merges the fresh resolution with retained pairs:
+    /// new head first, prior pairs behind it, dead server paths pruned,
+    /// duplicates collapsed.
+    #[test]
+    fn ensure_launcher_retains_prior_pairs_and_prunes_dead_ones() {
+        let _g = home_lock();
+        let home = TempDir::new().unwrap();
+        let _h = HomeGuard::set(home.path());
+
+        let mk_server = |name: &str| {
+            let d = home.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let s = d.join("server.py");
+            std::fs::write(&s, "").unwrap();
+            s
+        };
+        let a = mk_server("checkout-a/mcp_server");
+        let b = mk_server("checkout-b/mcp_server");
+
+        let launcher = ensure_launcher(&a).expect("write with a");
+        ensure_launcher(&b).expect("write with b");
+        let content = std::fs::read_to_string(&launcher).unwrap();
+        let b_dir = b.parent().unwrap().to_string_lossy().into_owned();
+        let a_dir = a.parent().unwrap().to_string_lossy().into_owned();
+        let b_pos = content.find(&b_dir).expect("b present");
+        let a_pos = content.find(&a_dir).expect("a retained as fallback");
+        assert!(
+            b_pos < a_pos,
+            "freshest pair must be the head candidate:\n{content}",
+        );
+
+        // Idempotent re-write: same head, no duplicate lines.
+        ensure_launcher(&b).expect("rewrite with b");
+        let content2 = std::fs::read_to_string(&launcher).unwrap();
+        assert_eq!(
+            content2.matches(&b_dir).count(),
+            1,
+            "no duplicate candidates on rewrite:\n{content2}",
+        );
+
+        // Delete checkout-a (the deleted-worktree case) → pruned on the
+        // next refresh.
+        std::fs::remove_dir_all(home.path().join("checkout-a")).unwrap();
+        ensure_launcher(&b).expect("rewrite after a died");
+        let content3 = std::fs::read_to_string(&launcher).unwrap();
+        assert!(
+            !content3.contains(&a_dir),
+            "dead server paths must be pruned:\n{content3}",
+        );
+    }
+
+    /// The generated script, run under a real `/bin/sh`, must skip a
+    /// candidate whose files are gone AND a candidate whose interpreter
+    /// can't `import mcp`, then exec the first working pair — this is
+    /// the exact conda-removal / deleted-worktree failure the launcher
+    /// exists to survive.
+    #[test]
+    fn launcher_script_runtime_falls_back_past_broken_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().unwrap();
+
+        // Working candidate: a fake "python" that accepts the
+        // `-c 'import mcp'` probe and echoes what it was asked to run.
+        let good_dir = root.path().join("good/mcp_server");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(good_dir.join("server.py"), "").unwrap();
+        let good_py = root.path().join("good/python");
+        std::fs::write(
+            &good_py,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\necho \"LAUNCHED:$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&good_py, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Broken candidate 1: server dir deleted (never created).
+        let dead = ("/usr/bin/env python3".to_string(),
+                    root.path().join("gone/mcp_server/server.py").to_string_lossy().into_owned());
+        // Broken candidate 2: files exist, interpreter fails `import mcp`
+        // (a bare python3 with no mcp module — the conda-removal case).
+        let no_mcp_dir = root.path().join("nomcp/mcp_server");
+        std::fs::create_dir_all(&no_mcp_dir).unwrap();
+        std::fs::write(no_mcp_dir.join("server.py"), "").unwrap();
+        let no_mcp_py = root.path().join("nomcp/python");
+        std::fs::write(&no_mcp_py, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&no_mcp_py, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let pairs = vec![
+            dead,
+            (
+                no_mcp_py.to_string_lossy().into_owned(),
+                no_mcp_dir.join("server.py").to_string_lossy().into_owned(),
+            ),
+            (
+                good_py.to_string_lossy().into_owned(),
+                good_dir.join("server.py").to_string_lossy().into_owned(),
+            ),
+        ];
+        let script = root.path().join("launcher.sh");
+        std::fs::write(&script, render_launcher_script(&pairs)).unwrap();
+
+        let out = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .env_remove("CM_MCP_SERVER")
+            .output()
+            .expect("run launcher");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "launcher must succeed via the good pair; stderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            stdout.contains("LAUNCHED:") && stdout.contains("good/mcp_server/server.py"),
+            "must exec the first WORKING candidate's server.py, got: {stdout}",
+        );
+
+        // Relative-script form (the Stop hook path): `-c ''` gate only,
+        // no `import mcp` requirement.
+        std::fs::write(good_dir.join("hook.py"), "").unwrap();
+        let out2 = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .arg("hook.py")
+            .env_remove("CM_MCP_SERVER")
+            .output()
+            .expect("run launcher with rel script");
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            stdout2.contains("good/mcp_server/hook.py"),
+            "relative script arg must resolve against the candidate dir, got: {stdout2}",
+        );
+
+        // Nothing works → non-zero exit + a pointed stderr message.
+        let none: Vec<(String, String)> = vec![];
+        let empty_script = root.path().join("empty.sh");
+        std::fs::write(&empty_script, render_launcher_script(&none)).unwrap();
+        let out3 = std::process::Command::new("/bin/sh")
+            .arg(&empty_script)
+            .env_remove("CM_MCP_SERVER")
+            .output()
+            .expect("run empty launcher");
+        assert!(!out3.status.success());
+        assert!(
+            String::from_utf8_lossy(&out3.stderr).contains("no working"),
+            "stderr must name the failure",
+        );
     }
 
     #[test]
@@ -1190,16 +1576,22 @@ mod tests {
         let content = std::fs::read_to_string(&cfg).expect("config readable");
         let parsed: serde_json::Value =
             serde_json::from_str(&content).expect("json");
-        let args = &parsed["mcpServers"]["claude-manager"]["args"];
-        assert_eq!(
-            args[0], configured,
-            "claude MCP config must use the configured server path (P-2): {:?}",
-            args,
+        // The config routes through the launcher; the configured path
+        // (which need not exist on this box) must be the launcher's
+        // HEAD candidate — still honored over env/repo resolution (P-2).
+        let cmd = parsed["mcpServers"]["claude-manager"]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.ends_with(".cm/mcp/launcher.sh"), "got {cmd}");
+        let launcher = std::fs::read_to_string(cmd).expect("launcher on disk");
+        assert!(
+            launcher.contains("/opt/cm-daemon/mcp_server"),
+            "launcher must carry the configured server dir (P-2):\n{launcher}",
         );
     }
 
-    /// P-2 (Codex): the inline `-c mcp_servers.claude-manager.args` override
-    /// must also use the configured server path.
+    /// P-2 (Codex): the inline `-c` overrides route through the same
+    /// launcher, which must carry the configured server path.
     #[test]
     fn codex_overrides_prefer_configured_server_path() {
         let _g = home_lock();
@@ -1208,9 +1600,20 @@ mod tests {
         let configured = "/opt/cm-daemon/mcp_server/server.py";
         let args = codex_overrides("ts-cfg", None, Some(configured));
         assert!(
-            args.iter().any(|a| a.contains(&format!("args=[\"{}\"]", configured))),
-            "codex overrides must use the configured server path (P-2): {:?}",
+            args.iter().any(|a| a.contains("launcher.sh")),
+            "codex command override must reference the launcher: {:?}",
             args,
+        );
+        assert!(
+            args.iter().any(|a| a.contains(r#"args=["server.py"]"#)),
+            "codex args override must be the relative script name: {:?}",
+            args,
+        );
+        let launcher = launcher_path().unwrap();
+        let content = std::fs::read_to_string(launcher).expect("launcher on disk");
+        assert!(
+            content.contains("/opt/cm-daemon/mcp_server"),
+            "launcher must carry the configured server dir (P-2):\n{content}",
         );
     }
 

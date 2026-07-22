@@ -111,6 +111,17 @@ fn main() -> anyhow::Result<()> {
     // rebuild+restart workflow.
     daemon_launch::warn_if_daemon_is_stale(&daemon_socket);
 
+    // Refresh the drift-proof MCP launcher (`~/.cm/mcp/launcher.sh`)
+    // at every TUI startup, mirroring the daemon's own startup
+    // refresh. Per-session MCP configs point `claude`/`codex` at the
+    // launcher, so this rewrite is what heals long-lived sessions'
+    // /mcp reconnects after machine drift even when the (already
+    // running) daemon predates the drift. Best-effort: a failure only
+    // means spawns keep using direct interpreter paths.
+    if let Some(server) = workflow::spawn::mcp_server_path() {
+        let _ = cm_daemon::mcp_config::ensure_launcher(&server);
+    }
+
     // Sub-2a Finding (round 3) #1: do NOT push an empty
     // `task.update_tree` at startup. The persistent-host
     // daemon may already hold a non-empty tree from a previous
