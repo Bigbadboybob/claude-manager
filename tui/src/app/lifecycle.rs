@@ -2278,13 +2278,19 @@ impl App {
     }
 
     /// Attach to the active workspace (SSH for cloud, claude for local, bash fallback).
-    /// A-R: revive the focused DEAD session in place, keeping its uid,
+    /// A-R: revive the focused session in place, keeping its uid,
     /// label, task binding, and conversation — the recovery for an
     /// accidental ctrl-c / crashed agent that previously required a full
     /// TUI restart (whose manifest restore is the only other path that
     /// resurrects dead sessions).
     ///
-    /// Local sessions re-run that startup-restore primitive for ONE slot
+    /// A LIVE session is a forced RESTART: the daemon child is killed
+    /// (`kill_live_session_for_restart` — kill RPC + bounded reap wait),
+    /// then the same revive flow runs. The use case is picking up a new
+    /// agent binary / model without losing the conversation: the old
+    /// process predates the update and only a respawn-resumed replaces it.
+    ///
+    /// Local sessions re-run the startup-restore primitive for ONE slot
     /// (`spawn_restored_session`): re-attach if the daemon still holds the
     /// uid live (the TUI merely lost its stream), else re-spawn at the
     /// SAME uid with the transcript resumed (claude `--resume` / codex
@@ -2312,12 +2318,6 @@ impl App {
         };
         let Some(ws) = self.workspaces.get(wi) else { return };
         let Some(ts) = ws.sessions.get(si) else { return };
-        if !ts.session.exited {
-            self.set_status_msg(
-                "Session is not dead — A-R revives exited sessions",
-            );
-            return;
-        }
         if ts.workflow_run_id.is_some() {
             self.set_status_msg(
                 "Workflow participant — the workflow owns its lifecycle (A-u resumes the run)",
@@ -2334,6 +2334,17 @@ impl App {
             self.set_status_msg("Workspace has no worktree path — can't revive");
             return;
         };
+        // A LIVE session is a forced restart: kill the daemon child and
+        // wait for the reaper to clear the uid, then fall through to the
+        // normal dead-session revive below. Without the wait, the local
+        // live-uid probe would re-attach to the dying child and the
+        // remote `session.revive` would return Conflict (still running).
+        let was_live = !ts.session.exited;
+        if was_live && !self.kill_live_session_for_restart(wi, si) {
+            return;
+        }
+        let ws = &self.workspaces[wi];
+        let ts = &ws.sessions[si];
 
         let local = cm_daemon::host_id::HostId::local();
         if ts.host_id != local {
@@ -2374,7 +2385,8 @@ impl App {
             self.requeue_remote_reconnect(wi, si, "A-R revive");
             self.save_session_manifest();
             self.set_status_msg(&format!(
-                "Session revived on `{}` — reattaching…",
+                "Session {} on `{}` — reattaching…",
+                if was_live { "restarted" } else { "revived" },
                 host_id.as_str(),
             ));
             return;
@@ -2411,11 +2423,14 @@ impl App {
                 fresh.session.resize(cols, rows);
                 self.workspaces[wi].sessions[si] = fresh;
                 self.save_session_manifest();
-                self.set_status_msg(match outcome {
-                    RestoreOutcome::Attached => {
+                self.set_status_msg(match (was_live, outcome) {
+                    (true, _) => {
+                        "Session restarted — respawned with its conversation resumed"
+                    }
+                    (false, RestoreOutcome::Attached) => {
                         "Session revived — reattached to the still-live daemon session"
                     }
-                    RestoreOutcome::Spawned => {
+                    (false, RestoreOutcome::Spawned) => {
                         "Session revived — respawned with its conversation resumed"
                     }
                 });
@@ -2426,6 +2441,77 @@ impl App {
                 );
             }
         }
+    }
+
+    /// A-R on a LIVE session — the kill half of a forced restart.
+    /// `kill_session` SIGKILLs via pidfd and returns before the reaper
+    /// runs, so after the RPC we poll the daemon registry until the uid
+    /// is gone (the reaper's on_exit removes it); only then can the
+    /// revive flow treat the session as exited. On success the uid is
+    /// also marked in `restart_suppressed_exit_uids` so the kill's own
+    /// `ManifestDiff::Exited` broadcast — applied only after this
+    /// synchronous flow returns, when the slot already holds the revived
+    /// incarnation — doesn't stamp `preserved_last_exit` on (or prune)
+    /// the new row.
+    ///
+    /// Returns false (with a status message) when the session isn't
+    /// daemon-owned (cloud SSH / backtest-watch views have no daemon
+    /// child to kill), the kill RPC fails, or the uid doesn't clear
+    /// within the bounded wait.
+    fn kill_live_session_for_restart(&mut self, wi: usize, si: usize) -> bool {
+        let (daemon_uid, host_id) = {
+            let Some(ts) =
+                self.workspaces.get(wi).and_then(|w| w.sessions.get(si))
+            else {
+                return false;
+            };
+            let Some(uid) = ts.session.daemon_session_uid.clone() else {
+                self.set_status_msg(
+                    "Not a daemon-owned session — A-R can't force-restart it",
+                );
+                return false;
+            };
+            (uid, ts.host_id.clone())
+        };
+        let socket = self
+            .host_pool
+            .for_host(&host_id)
+            .ok()
+            .and_then(|h| h.socket_path());
+        let Some(socket) = socket else {
+            self.set_status_msg(&format!(
+                "Host `{}` unreachable — can't restart",
+                host_id.as_str(),
+            ));
+            return false;
+        };
+        let token = crate::daemon_launch::operator_token();
+        if let Err(e) = crate::client_session::rpc_kill_session(
+            &socket,
+            token,
+            &daemon_uid,
+        ) {
+            self.set_status_msg(&format!("Restart kill failed: {e}"));
+            return false;
+        }
+        // Bounded reap wait: SIGKILL → reaper on_exit is normally
+        // milliseconds; 2s covers a loaded box. A-R is an explicit
+        // keystroke, so briefly blocking the UI thread is acceptable
+        // (every RPC in this flow is synchronous anyway).
+        for _ in 0..40 {
+            match crate::client_session::rpc_list_session_uids(&socket, token)
+            {
+                Ok(uids) if !uids.contains(&daemon_uid) => {
+                    self.restart_suppressed_exit_uids.insert(daemon_uid);
+                    return true;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+        self.set_status_msg(
+            "Killed the session but it hasn't exited yet — press A-R again",
+        );
+        false
     }
 
     pub(super) fn attach_active(&mut self) {
@@ -8269,16 +8355,18 @@ mod revive_session_tests {
             .unwrap_or_default()
     }
 
-    /// Revive only applies to a DEAD session: a live one is refused with
-    /// a status hint and the slot is untouched.
+    /// A-R on a LIVE session is a forced restart: kill the daemon child,
+    /// then revive. The kill step needs a daemon binding to target — a
+    /// live session without one (this fixture; e.g. a cloud SSH view) is
+    /// refused with a hint and the slot is untouched.
     #[test]
-    fn revive_refuses_non_exited_session() {
+    fn revive_live_session_without_daemon_binding_is_refused() {
         let ts = dummy_ts("ts-aaaaaaaaaaaaaa01-0", false, cm_daemon::host_id::HostId::local());
         let mut app = app_with_session(ts);
         app.revive_active_session();
         assert!(
-            status_text(&app).contains("not dead"),
-            "live session refused with a hint, got: {}",
+            status_text(&app).contains("daemon-owned"),
+            "live non-daemon session refused with a hint, got: {}",
             status_text(&app),
         );
         assert_eq!(app.workspaces[0].sessions[0].uid, "ts-aaaaaaaaaaaaaa01-0");

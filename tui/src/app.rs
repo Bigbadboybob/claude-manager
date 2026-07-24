@@ -441,6 +441,15 @@ pub struct App {
     /// (defensive: covers test-paths that reuse uids; not
     /// required for production correctness).
     pub cap_kill_toasted: std::collections::HashSet<String>,
+    /// A-R force-restart bookkeeping: uids whose next
+    /// `ManifestDiff::Exited` is the restart's own kill. By the time
+    /// that diff is applied, the slot already holds the revived
+    /// incarnation, so the normal exit handling (stamping
+    /// `preserved_last_exit`, pruning agent-spawned rows) would act on
+    /// the wrong session. Inserted by `kill_live_session_for_restart`
+    /// once the reap is confirmed; consumed one-shot in
+    /// `apply_manifest_diff_from_host`.
+    pub(crate) restart_suppressed_exit_uids: std::collections::HashSet<String>,
     /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
     /// local-default when the file is missing (A1 in the Phase 3
     /// plan). No consumer yet — 12b adds the field to manifest
@@ -845,6 +854,7 @@ impl App {
             _dispatch_pending_threads,
             continuous_dispatch_pending: std::collections::HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
+            restart_suppressed_exit_uids: std::collections::HashSet::new(),
             hosts,
             host_pool,
             skipped_manifest_entries: HashMap::new(),

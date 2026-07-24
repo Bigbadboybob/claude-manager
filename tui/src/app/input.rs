@@ -2650,7 +2650,7 @@ impl App {
                         };
                         return true;
                     }
-                    // A-R (revive dead session) vs A-r (refresh). Terminals
+                    // A-R (revive / force-restart session) vs A-r (refresh). Terminals
                     // differ on whether Shift is baked into the char case or
                     // reported as a modifier — accept both forms (same idiom
                     // as A-W / A-w above).

@@ -1784,6 +1784,16 @@ impl App {
         use cm_daemon::manifest::ManifestDiff;
         match diff {
             ManifestDiff::Exited { uid, last_exit } => {
+                // A-R force-restart: this exit is the restart's own
+                // kill. The revive ran synchronously before this diff
+                // could be applied, so the row under this uid is
+                // already the NEW live incarnation — stamping
+                // `preserved_last_exit` or pruning it here would hit
+                // the wrong session. Consume the one-shot marker and
+                // drop the diff.
+                if self.restart_suppressed_exit_uids.remove(&uid) {
+                    return;
+                }
                 let memory_cap_kill = last_exit.memory_cap_kill;
                 let mut found = false;
                 // Workspace index holding the exited session IFF it's an
@@ -2557,6 +2567,53 @@ mod apply_manifest_diff_tests {
             app.needs_redraw,
             "needs_redraw must be set so the next render \
              picks up status indicator changes",
+        );
+    }
+
+    /// A-R force-restart: an `Exited` diff for a uid marked in
+    /// `restart_suppressed_exit_uids` is dropped (the slot already
+    /// holds the revived incarnation) and the marker is consumed —
+    /// the NEXT exit for the same uid applies normally.
+    #[test]
+    fn apply_exited_diff_suppressed_after_forced_restart() {
+        let mut app = build_app_with_session("ts-restart");
+        app.restart_suppressed_exit_uids
+            .insert("ts-restart".into());
+        app.needs_redraw = false;
+
+        let last_exit = LastExit {
+            code: None,
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 1.0,
+        };
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-restart".into(),
+            last_exit: last_exit.clone(),
+        });
+
+        assert!(
+            app.workspaces[0].sessions[0]
+                .preserved_last_exit
+                .is_none(),
+            "suppressed exit diff must not stamp the revived row",
+        );
+        assert!(!app.needs_redraw, "suppressed diff must not redraw");
+        assert!(
+            app.restart_suppressed_exit_uids.is_empty(),
+            "marker is one-shot",
+        );
+
+        // Second exit for the same uid (a genuine later death) applies.
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-restart".into(),
+            last_exit,
+        });
+        assert!(
+            app.workspaces[0].sessions[0]
+                .preserved_last_exit
+                .is_some(),
+            "post-restart exits must apply normally",
         );
     }
 
