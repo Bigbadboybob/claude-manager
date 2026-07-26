@@ -149,11 +149,18 @@ pub fn create_worktree(
             .output();
 
         let origin_ref = format!("origin/{}", start);
-        let attempts: [&[&str]; 3] = [
+        let attempts: [&[&str]; 4] = [
             // Create new branch from origin/<start>.
             &["-b", &branch_name, &origin_ref],
             // Maybe the branch exists locally already, try that.
             &["-b", &branch_name, start],
+            // cm/<slug> already exists (leftover from a prior task with
+            // the same slug whose worktree is gone) — attach to it, same
+            // as the no-start_branch path below. Without this, both -b
+            // attempts fail with "branch already exists" and the <start>
+            // last resort fails too whenever <start> is checked out in
+            // the main repo (main usually is).
+            &[&branch_name],
             // Last resort: just check out <start> directly.
             &[start],
         ];
@@ -954,6 +961,35 @@ mod tests {
             args,
             String::from_utf8_lossy(&status.stderr)
         );
+    }
+
+    /// Regression: launching a task whose `cm/<slug>` branch survives a
+    /// prior run (worktree dir gone, branch left behind) with a
+    /// `start_branch` must attach to that branch instead of failing.
+    /// Pre-fix, the start_branch path had no attach variant: both `-b`
+    /// attempts died on "branch already exists" and the `<start>` last
+    /// resort died on "already checked out" (main is checked out in the
+    /// main repo), surfacing the three-variant error this test pins.
+    #[test]
+    fn create_worktree_start_branch_attaches_to_leftover_slug_branch() {
+        with_home(|_home| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("myrepo");
+            make_git_repo(&repo);
+            // Deterministic default-branch name, left checked out.
+            git(&repo, &["branch", "-M", "main"]);
+            // Leftover branch from a prior task with the same slug.
+            git(&repo, &["branch", "cm/fix-start-session"]);
+
+            let (path, created) =
+                create_worktree(&repo, "fix-start-session", Some("main"))
+                    .expect("must attach to the existing cm/<slug> branch");
+            assert!(created, "fresh worktree dir → created == true");
+            assert_eq!(
+                worktree_current_branch(&path).as_deref(),
+                Some("cm/fix-start-session")
+            );
+        });
     }
 
     #[test]
