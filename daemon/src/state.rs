@@ -406,6 +406,45 @@ pub struct DaemonState {
     /// `Unauthorized` for what would normally be a valid
     /// descendant-task call once the snapshot lands.
     pub task_tree_pushed: bool,
+    /// Daemon-authoritative `child_task → parent_task` edges for
+    /// tasks MINTED BY AN AGENT: `propose_task` from a tasked
+    /// Session caller and `create_subtask` (fix-start-session).
+    ///
+    /// Why `task_tree` alone isn't enough: `task_tree` is a
+    /// replace-not-merge snapshot the TUI pushes from its
+    /// planning-derived view, and that view either doesn't know
+    /// the fresh task yet (the push races the TUI's next planning
+    /// poll) or records it WITHOUT the edge forever:
+    ///   * `propose_task` rows are deliberately TOP-LEVEL in
+    ///     planning (`parent_task_id = null`) — the backlog is the
+    ///     user's triage queue — yet the creating agent must be
+    ///     able to `start_session(task_id=<proposed>)` and then
+    ///     drive/kill the worker it spawned. Pre-fix every such
+    ///     spawn was rejected `unauthorized: task '<id>' is not
+    ///     the caller's task or a descendant` — the "different
+    ///     phantom task each attempt" failure, since each retry
+    ///     proposed a fresh task id.
+    ///   * `create_subtask`'s parent-deleted self-heal creates the
+    ///     planning row top-level (a dangling FK would be
+    ///     rejected), which put the subtask outside its creator's
+    ///     scope the moment the row was minted.
+    ///
+    /// So agent-minted edges live here as an overlay that TUI
+    /// pushes never clear: `task_update_tree` re-applies surviving
+    /// entries after each snapshot replace, and retires an entry
+    /// as soon as the pushed snapshot itself parents the task
+    /// (planning caught up, or the user re-parented it — either
+    /// way the planning-derived edge wins from then on).
+    ///
+    /// Auth-scope note: this widens the creator's descendant scope
+    /// to cover tasks it minted — deliberate, per
+    /// AGENT_ORCHESTRATION.md the descendant check is an
+    /// accidental-misuse guardrail ("keep an honest agent from
+    /// drifting into unrelated work"), and work the agent itself
+    /// created is its own work. Persisted in the daemon manifest
+    /// (`daemon-sessions.json`) so the creator keeps scope over
+    /// its spawned workers across a daemon restart.
+    pub agent_task_edges: HashMap<String, String>,
     /// Sub-2b-3 review-5 #1: per-worktree FIFO spawn queues.
     /// `Arc`-shared so the spawn-main path can clone the
     /// queue out of the state lock and enqueue without
@@ -593,6 +632,7 @@ impl Default for DaemonState {
             task_tree: HashMap::new(),
             task_workspaces: HashMap::new(),
             task_tree_pushed: false,
+            agent_task_edges: HashMap::new(),
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
             tui_sessions: HashMap::new(),
             tui_sessions_pushed: false,
@@ -631,6 +671,17 @@ impl DaemonState {
             .iter()
             .rev()
             .find(|t| t.session_uid == uid)
+    }
+
+    /// Record an agent-minted task edge (see [`Self::agent_task_edges`]):
+    /// the overlay entry plus the immediate `task_tree` edge, so a
+    /// `start_session(task_id=<child>)` issued right after the mint
+    /// passes the descendant walk without waiting for any push.
+    pub fn record_agent_task_edge(&mut self, child_task_id: &str, parent_task_id: &str) {
+        self.agent_task_edges
+            .insert(child_task_id.to_string(), parent_task_id.to_string());
+        self.task_tree
+            .insert(child_task_id.to_string(), Some(parent_task_id.to_string()));
     }
 
     /// Phase 4 §B2: resolve a workflow definition by name through the two-layer
@@ -682,6 +733,14 @@ impl DaemonState {
         })?;
         self.workspaces = manifest.workspaces;
         self.bindings = manifest.bindings;
+        // Agent-minted creator edges (fix-start-session). Empty for the
+        // TUI-written `tui-sessions.json`; carries entries when this loads
+        // a daemon-written manifest. Seed `task_tree` too so the walk
+        // works before any TUI push arrives.
+        for (child, parent) in manifest.agent_task_edges {
+            self.task_tree.insert(child.clone(), Some(parent.clone()));
+            self.agent_task_edges.insert(child, parent);
+        }
         // Headless binding rehydration. The task→workspace `bindings` map is the
         // daemon's restart-survivable resolver for `mcp_start_session(task_id=…)`
         // — the re-spawn-into-an-EXISTING-subtask-worktree path. It is normally
@@ -755,6 +814,10 @@ impl DaemonState {
         Manifest {
             workspaces,
             bindings: self.bindings.clone(),
+            // Kept whole like `bindings` (small, and restart-durable auth
+            // matters: the creator must keep scope over workers it spawned
+            // on agent-minted tasks after a daemon restart).
+            agent_task_edges: self.agent_task_edges.clone(),
             view: None,
             hide_continuous: false,
             // TUI-only view state; the daemon-owned registry doesn't track it.
@@ -1105,6 +1168,9 @@ mod tests {
             },
         );
         state.bindings.insert("task-rt".to_string(), "ws-rt".to_string());
+        // Agent-minted creator edge (fix-start-session) must round-trip
+        // too, so creator scope survives a daemon restart.
+        state.record_agent_task_edge("task-proposed-rt", "task-rt");
         let mut sp = SpawnParams::new("ts-cccc-dddd", "rt", "/bin/sleep");
         sp.args = vec!["120".to_string()];
         sp.workspace_id = "ws-rt".to_string();
@@ -1130,6 +1196,16 @@ mod tests {
             restored.bindings.get("task-rt").map(String::as_str),
             Some("ws-rt"),
             "task→workspace binding survived",
+        );
+        assert_eq!(
+            restored.agent_task_edges.get("task-proposed-rt").map(String::as_str),
+            Some("task-rt"),
+            "agent-minted creator edge survived",
+        );
+        assert_eq!(
+            restored.task_tree.get("task-proposed-rt"),
+            Some(&Some("task-rt".to_string())),
+            "restored edge is immediately visible to the descendant walk",
         );
     }
 

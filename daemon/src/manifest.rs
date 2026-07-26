@@ -534,6 +534,15 @@ pub struct Manifest {
     /// the referenced workspace.
     #[serde(default)]
     pub bindings: HashMap<String, String>,
+    /// `child_task → parent_task` edges for agent-minted tasks
+    /// (`propose_task` from a tasked session, `create_subtask`) — the
+    /// daemon's restart-durable copy of
+    /// [`crate::state::DaemonState::agent_task_edges`]. Only the daemon's
+    /// `daemon-sessions.json` carries entries; the TUI-written
+    /// `tui-sessions.json` never populates it (and `skip_serializing_if`
+    /// keeps that file's shape unchanged).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_task_edges: HashMap<String, String>,
     #[serde(default)]
     pub view: Option<String>,
     /// Continuous-Tasks Phase 1: persisted `A-c` toggle that hides the

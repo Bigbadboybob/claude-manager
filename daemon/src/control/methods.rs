@@ -2747,6 +2747,26 @@ pub fn task_update_tree(
         }
         state.task_tree.insert(entry.task_id, entry.parent_task_id);
     }
+    // Re-apply agent-minted task edges over the fresh snapshot
+    // (fix-start-session; see `DaemonState::agent_task_edges`).
+    // The TUI's planning-derived push either doesn't know an
+    // agent-minted task yet (this push raced the TUI's planning
+    // poll) or records it top-level forever (`propose_task` rows;
+    // `create_subtask`'s parent-deleted self-heal) — and the
+    // replace above just erased the edge the creator's descendant-
+    // scope auth depends on. An edge is retired the moment the
+    // pushed snapshot itself parents the task: planning caught up
+    // with the true parent, or the user re-parented it — either
+    // way the planning-derived edge wins from then on.
+    {
+        let state = &mut *state;
+        state
+            .agent_task_edges
+            .retain(|child, _| !matches!(state.task_tree.get(child), Some(Some(_))));
+        for (child, parent) in &state.agent_task_edges {
+            state.task_tree.insert(child.clone(), Some(parent.clone()));
+        }
+    }
     // Sub-2b-3 review-2 #1: merge-not-replace on
     // `state.workspaces`. The daemon's own `start_session`
     // auto-register branch adds workspace entries with the
@@ -4358,7 +4378,11 @@ struct ProposeTaskParams {
     depends: Option<Vec<String>>,
 }
 
-pub fn propose_task(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+pub fn propose_task(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
     let p: ProposeTaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("propose_task params: {}", e)))?;
     if p.project.trim().is_empty() {
@@ -4417,7 +4441,35 @@ pub fn propose_task(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Meth
         api_url_override,
         api_token_override,
     ) {
-        Ok(task) => Ok(task),
+        Ok(task) => {
+            // fix-start-session: a task an agent just proposed is that
+            // agent's own work — record the daemon-side creator edge so a
+            // follow-up `start_session(task_id=<proposed>)` (and the
+            // send_input / read / kill calls on the worker it spawns)
+            // passes the descendant-scope walk. Planning keeps the row
+            // top-level (the backlog is the user's triage queue); only the
+            // daemon's auth overlay knows the edge — see
+            // `DaemonState::agent_task_edges`. Best-effort by design:
+            // Operator callers, taskless sessions, and unknown uids record
+            // nothing and keep today's propose-only behavior.
+            if let Some(cuid) = caller_uid {
+                let new_task_id = task
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(new_task_id) = new_task_id {
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    let caller_task = state
+                        .lookup_session_any(cuid)
+                        .and_then(|view| view.task_id);
+                    if let Some(parent_task) = caller_task {
+                        state.record_agent_task_edge(&new_task_id, &parent_task);
+                        state.persist_sessions_best_effort();
+                    }
+                }
+            }
+            Ok(task)
+        }
         Err(e) => Err(e.to_method_err()),
     }
 }
@@ -6214,6 +6266,21 @@ pub fn mcp_start_session(
                 // so this fallback resolves the spawn reliably without a TUI.
                 .or_else(|| state.bindings.get(req_task))
                 .cloned()
+                // fix-start-session: an agent-minted task (`propose_task`
+                // by this caller's flow) has NO workspace of its own — no
+                // worktree was ever created for it. Spawning the worker in
+                // the CALLER's workspace is the only sensible resolution
+                // (mirrors the `task_id` == own-task case below). Gated on
+                // the overlay so tasks the daemon did NOT mint — e.g. a
+                // TUI-created branch-mode subtask awaiting its own
+                // worktree — still fail loudly instead of silently
+                // spawning into the wrong tree.
+                .or_else(|| {
+                    state
+                        .agent_task_edges
+                        .contains_key(req_task)
+                        .then(|| caller.workspace_id.clone())
+                })
                 .ok_or((
                     ErrorCode::NotFound,
                     format!(
@@ -7156,10 +7223,22 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
             for (child, parent) in tree_edges {
                 st.task_tree.entry(child).or_insert(Some(parent));
             }
+            // Agent-minted creator edges (fix-start-session): restore the
+            // overlay from the persisted manifest so a creator keeps
+            // descendant scope over tasks it minted (and the workers it
+            // spawned on them) across the restart. `record_agent_task_edge`
+            // also seeds `task_tree`, deliberately overriding the planning-
+            // derived edge above — planning records `propose_task` rows and
+            // parent-deleted subtasks as top-level, which is exactly the
+            // shape the overlay exists to correct.
+            for (child, parent) in &manifest.agent_task_edges {
+                st.record_agent_task_edge(child, parent);
+            }
         }
         eprintln!(
-            "cm-daemon: rehydrated {} task->workspace binding(s), {} task_tree edge(s) on restore",
-            n_bind, n_edge,
+            "cm-daemon: rehydrated {} task->workspace binding(s), {} task_tree edge(s), \
+             {} agent-minted edge(s) on restore",
+            n_bind, n_edge, manifest.agent_task_edges.len(),
         );
     }
 
@@ -11539,15 +11618,27 @@ pub fn create_subtask(
         if let Some(ws) = new_workspace {
             state.workspaces.insert(ws.id.clone(), ws);
         }
-        state
-            .task_tree
-            .insert(new_task_id.clone(), effective_parent_id.clone());
+        // Daemon-side auth edge to the caller's REAL task — deliberately
+        // NOT `effective_parent_id` (fix-start-session). When the parent
+        // planning row was deleted, the API row is created top-level (a
+        // dangling FK would be rejected) but the caller's session still
+        // carries `task_id = parent`, and the subtask must stay inside its
+        // creator's descendant scope or the very next
+        // `start_session(task_id=<subtask>)` bounces with `unauthorized:
+        // task '<id>' is not the caller's task or a descendant`. The
+        // overlay entry also survives the TUI's replace-not-merge
+        // `task.update_tree` pushes, which race this mint window (the
+        // TUI's planning snapshot doesn't know the subtask yet).
+        state.record_agent_task_edge(&new_task_id, &parent_task_id);
         state
             .task_workspaces
             .insert(new_task_id.clone(), workspace_id_for_new.clone());
         state
             .bindings
             .insert(new_task_id.clone(), workspace_id_for_new);
+        // Edges persist with the session registry (daemon manifest), so
+        // creator scope survives a daemon restart.
+        state.persist_sessions_best_effort();
     }
 
     Ok(json!({
@@ -12623,6 +12714,113 @@ mod tests {
             !s.workspaces.contains_key("ws-orphan"),
             "unbound sessionless workspace is still GC'd",
         );
+    }
+
+    /// fix-start-session: agent-minted creator edges
+    /// (`DaemonState::agent_task_edges`) must survive the TUI's
+    /// replace-not-merge `task.update_tree` pushes. Pre-fix, a push
+    /// landing between `propose_task`/`create_subtask` and the
+    /// follow-up `mcp_start_session(task_id=<minted>)` cleared the
+    /// edge and the spawn bounced `unauthorized: task '<id>' is not
+    /// the caller's task or a descendant` — the "different phantom
+    /// task each attempt" failure. An edge is retired only once the
+    /// pushed snapshot itself parents the task.
+    #[test]
+    fn task_update_tree_preserves_agent_task_edges() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut s = state.lock().unwrap();
+            // Proposed task: planning will push it TOP-LEVEL forever.
+            s.record_agent_task_edge("task-proposed", "task-orch");
+            // Subtask whose planning row carries the real FK: planning
+            // eventually pushes the same edge.
+            s.record_agent_task_edge("task-sub", "task-orch");
+        }
+
+        // Push 1: the TUI doesn't know either task yet (planning poll
+        // hasn't caught up). Both edges must survive the replace.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [{"task_id": "task-orch", "parent_task_id": null, "workspace_id": "ws-orch"}],
+                "workspaces": [],
+            }),
+        )
+        .expect("push 1 ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.task_tree.get("task-proposed"),
+                Some(&Some("task-orch".to_string())),
+                "overlay edge must survive a push that doesn't know the task",
+            );
+            assert_eq!(
+                s.task_tree.get("task-sub"),
+                Some(&Some("task-orch".to_string())),
+            );
+        }
+
+        // Push 2: planning caught up. The proposed task arrives
+        // TOP-LEVEL (its permanent planning shape) — the overlay must
+        // keep correcting it. The subtask arrives WITH its FK edge —
+        // the overlay entry is retired; the pushed edge carries it.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [
+                    {"task_id": "task-orch", "parent_task_id": null, "workspace_id": "ws-orch"},
+                    {"task_id": "task-proposed", "parent_task_id": null, "workspace_id": null},
+                    {"task_id": "task-sub", "parent_task_id": "task-orch", "workspace_id": null},
+                ],
+                "workspaces": [],
+            }),
+        )
+        .expect("push 2 ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.task_tree.get("task-proposed"),
+                Some(&Some("task-orch".to_string())),
+                "overlay must keep correcting a top-level planning row",
+            );
+            assert!(
+                s.agent_task_edges.contains_key("task-proposed"),
+                "still-top-level task keeps its overlay entry",
+            );
+            assert_eq!(
+                s.task_tree.get("task-sub"),
+                Some(&Some("task-orch".to_string())),
+            );
+            assert!(
+                !s.agent_task_edges.contains_key("task-sub"),
+                "a pushed FK edge retires the overlay entry",
+            );
+        }
+
+        // Push 3: the user RE-PARENTED the proposed task in planning
+        // (it now has a real parent). The pushed edge wins and retires
+        // the overlay entry — the creator's alias never overrides an
+        // explicit planning parent.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [
+                    {"task_id": "task-other", "parent_task_id": null, "workspace_id": null},
+                    {"task_id": "task-proposed", "parent_task_id": "task-other", "workspace_id": null},
+                ],
+                "workspaces": [],
+            }),
+        )
+        .expect("push 3 ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.task_tree.get("task-proposed"),
+                Some(&Some("task-other".to_string())),
+                "a user re-parent in planning must beat the overlay",
+            );
+            assert!(!s.agent_task_edges.contains_key("task-proposed"));
+        }
     }
 
     #[test]
@@ -24395,13 +24593,24 @@ mod tests {
             .expect("create_subtask must SUCCEED even when the parent row is gone");
             assert_eq!(result["task_id"], "task-child-top");
 
-            // Registered as TOP-LEVEL (no parent) in the headless auth tree.
+            // The PLANNING row is top-level (null FK), but the daemon-side
+            // auth edge still points at the caller's task
+            // (fix-start-session): the subtask must stay inside its
+            // creator's descendant scope or the follow-up
+            // `start_session(task_id=<subtask>)` bounces Unauthorized —
+            // the "different phantom task each attempt" failure.
             {
                 let s = state.lock().unwrap();
                 assert_eq!(
                     s.task_tree.get("task-child-top"),
-                    Some(&None),
-                    "a parentless subtask must register as top-level (None)",
+                    Some(&Some("task-parent".to_string())),
+                    "daemon auth edge must keep the creator's scope even \
+                     when the planning row fell back to top-level",
+                );
+                assert_eq!(
+                    s.agent_task_edges.get("task-child-top"),
+                    Some(&"task-parent".to_string()),
+                    "the edge must be in the push-surviving overlay",
                 );
             }
 
@@ -24427,6 +24636,70 @@ mod tests {
             kill_all_sessions(&state);
             clear_api_env();
         });
+    }
+
+    /// fix-start-session: a TASKED Session caller proposing a task gets a
+    /// creator edge recorded (`agent_task_edges` + `task_tree`), so the
+    /// follow-up `start_session(task_id=<proposed>)` passes the
+    /// descendant walk. An Operator caller (`caller_uid = None`) and an
+    /// unknown caller uid record nothing — propose-only, today's shape.
+    #[test]
+    fn propose_task_records_creator_edge_for_tasked_session_caller() {
+        let state = make_state_arc();
+        // Route the API call through the stub via config overrides (not
+        // env) so this test can't race the env-mutating tests.
+        let stub = spawn_routed_stub(move |method, path, _body| {
+            if method == "POST" && path == "/tasks" {
+                (
+                    200,
+                    r#"{"id":"task-proposed-1","name":"lane d","status":"draft","parent_task_id":null}"#
+                        .to_string(),
+                )
+            } else {
+                (404, r#"{"detail":"unexpected"}"#.to_string())
+            }
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-proposer", "ws-orch", "task-orch");
+
+        let params = json!({
+            "project": "proj",
+            "name": "lane d",
+            "repo_url": "git@x.com:a/b.git",
+        });
+
+        // Operator caller: proposes fine, records NO edge.
+        propose_task(&state, &params, None).expect("operator propose ok");
+        assert!(
+            state.lock().unwrap().agent_task_edges.is_empty(),
+            "operator caller must not record a creator edge",
+        );
+
+        // Unknown session uid: proposes fine, records NO edge.
+        propose_task(&state, &params, Some("ts-nobody")).expect("unknown-caller propose ok");
+        assert!(state.lock().unwrap().agent_task_edges.is_empty());
+
+        // Tasked session caller: creator edge lands in BOTH maps.
+        propose_task(&state, &params, Some("ts-proposer")).expect("tasked propose ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.agent_task_edges.get("task-proposed-1"),
+                Some(&"task-orch".to_string()),
+                "creator edge must land in the push-surviving overlay",
+            );
+            assert_eq!(
+                s.task_tree.get("task-proposed-1"),
+                Some(&Some("task-orch".to_string())),
+                "creator edge must be immediately visible to the descendant walk",
+            );
+        }
+
+        kill_all_sessions(&state);
     }
 
     /// A taskless Session caller (and an Operator caller, which resolves

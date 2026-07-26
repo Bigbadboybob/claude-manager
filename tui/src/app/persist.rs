@@ -107,6 +107,9 @@ impl App {
         let manifest = Manifest {
             workspaces,
             bindings,
+            // Daemon-only field (daemon-sessions.json); the TUI never
+            // mints agent task edges and never writes them here.
+            agent_task_edges: Default::default(),
             view: Some(view.to_string()),
             hide_continuous: self.hide_continuous,
             continuous_column_on: self.continuous_column_on,

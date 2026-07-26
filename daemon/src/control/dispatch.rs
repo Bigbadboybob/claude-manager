@@ -1137,12 +1137,21 @@ fn dispatch_resolve_stuck(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
 /// allowed (the planning queue is intentionally open to all
 /// agents; the project owner accepts/rejects manually). The
 /// method body does its own param validation + HTTP forwarding
-/// via `daemon::planning_client::propose_task`.
+/// via `daemon::planning_client::propose_task`. The Session
+/// caller's uid threads through so a TASKED proposer gets a
+/// creator edge recorded (`DaemonState::agent_task_edges`) —
+/// letting it `start_session` on the task it just minted
+/// (fix-start-session); Operator callers pass `None` and record
+/// nothing.
 fn dispatch_propose_task(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> Response {
-    match methods::propose_task(state, &req.params) {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::propose_task(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -4402,6 +4411,90 @@ mod tests {
             err.message.contains("descendant"),
             "msg should mention descendant-task rule: {}",
             err.message,
+        );
+    }
+
+    /// fix-start-session: the incident shape. An orchestrator
+    /// `propose_task`s a new task (top-level in planning) and then
+    /// `start_session(task_id=<proposed>)`s a worker on it. With the
+    /// creator edge recorded, the spawn passes the descendant walk and —
+    /// since a proposed task has no worktree of its own — lands in the
+    /// CALLER's workspace, bound to the proposed task. Pre-fix this was
+    /// rejected `unauthorized: task '<id>' is not the caller's task or a
+    /// descendant` on every attempt.
+    #[test]
+    fn mcp_start_session_binds_to_agent_proposed_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.insert(
+                "ws-orch".into(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-orch".into(),
+                    worktree_path: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                },
+            );
+            s.task_tree.insert("task-orch".into(), None);
+            // What the daemon records when the orchestrator proposes a
+            // task. Note: NO task_workspaces / bindings entry — a
+            // proposed task has no worktree; resolution must fall back
+            // to the caller's workspace.
+            s.record_agent_task_edge("task-proposed", "task-orch");
+        }
+        let mut sp = crate::session::SpawnParams::new(
+            "ts-orch",
+            "orchestrator",
+            "/bin/sleep",
+        );
+        sp.args = vec!["30".into()];
+        sp.workspace_id = "ws-orch".into();
+        sp.task_id = Some("task-orch".into());
+        let session = crate::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert("ts-orch".into(), session);
+
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "mcp_start_session",
+                serde_json::json!({
+                    "type": "bash",
+                    "label": "lane-d",
+                    "task_id": "task-proposed",
+                }),
+                "ts-orch",
+            ),
+        ).into_response();
+        assert!(
+            resp.ok,
+            "spawn on an agent-proposed task must succeed: {:?}",
+            resp.error,
+        );
+        let new_uid = resp.result.expect("result")["session_uid"]
+            .as_str()
+            .expect("session_uid")
+            .to_string();
+        {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get(&new_uid).expect("worker in registry");
+            assert_eq!(
+                sess.workspace_id, "ws-orch",
+                "a proposed task has no worktree — worker spawns in the \
+                 caller's workspace",
+            );
+            assert_eq!(
+                sess.task_id.as_deref(),
+                Some("task-proposed"),
+                "worker binds to the proposed task",
+            );
+        }
+        let _ = dispatch_request(
+            &state,
+            &operator_request(
+                "kill_session",
+                serde_json::json!({ "session_uid": &new_uid }),
+            ),
         );
     }
 

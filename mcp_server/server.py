@@ -181,6 +181,13 @@ def propose_task(
     The task is created with source='claude' in draft status.
     The project owner will review and accept or reject it in the TUI.
 
+    If YOU have a bound task, the task you propose counts as part of
+    your own scope: you can later `start_session(task_id=<proposed id>)`
+    to run it yourself (with the user's approval) and drive the worker
+    you spawned. Prefer `create_subtask` when the work should live in
+    its own worktree under your task; prefer propose_task when the user
+    should triage it on the planning board first.
+
     `description` and `prompt` serve different purposes — set BOTH:
       - `description`: what the user sees in the planning queue when
         deciding whether to accept the task. Context, motivation,
@@ -717,9 +724,14 @@ async def start_session(
             command line. Required in practice when `wait=true` — there's
             nothing to wait for otherwise.
         task_id: Optional task to bind to. Omitted = your own task (if
-            any) or no task. Cross-task binding is rejected — UNLESS you
-            hold global permissions, in which case you may bind the child
-            to any task.
+            any) or no task. You may bind to your own task, any of its
+            descendants, or a task YOU created via `propose_task` /
+            `create_subtask` (the daemon records a creator edge at mint
+            time, so propose-then-launch works). Any other cross-task
+            binding is rejected — UNLESS you hold global permissions, in
+            which case you may bind the child to any task. A proposed
+            task has no worktree of its own, so its worker spawns in
+            YOUR workspace.
         global_perms: Grant the new session global permissions (it can
             then prompt/read/control ANY session). **Only honored if YOU
             already hold global permissions** (check `ping().global_perms`);

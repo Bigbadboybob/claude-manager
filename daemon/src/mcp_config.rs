@@ -1002,6 +1002,13 @@ mod tests {
 
     #[test]
     fn build_args_claude_includes_settings_hook_when_present() {
+        // build_args writes the per-session config under `~/.cm/mcp/` —
+        // without the lock + HomeGuard every other build_args_* test
+        // takes, a concurrent with_home_and_repo test's HOME flip lands
+        // this write in a mid-teardown tempdir (observed NotFound flake).
+        let _g = home_lock();
+        let home = TempDir::new().unwrap();
+        let _h = HomeGuard::set(home.path());
         let root = TempDir::new().unwrap();
         let srv_dir = root.path().join("mcp_server");
         std::fs::create_dir_all(srv_dir.join("hooks")).unwrap();
