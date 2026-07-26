@@ -896,7 +896,9 @@ async def send_input(
     woken asynchronously when that session finishes the turn.
 
     With `notify_on_done=true` (the default) this auto-registers an
-    async monitor on the target: when it next goes idle, a
+    async monitor on the target: when it finishes the turn this prompt
+    starts (edge-triggered against its transcript at send time, so a
+    still-idle target can't instant-fire its stale previous reply), a
     `[cm-monitor ...]` message is delivered into YOUR session with its
     final reply — so END YOUR TURN after sending; don't poll and don't
     park in blocking `wait_*` calls. If you need the reply
@@ -2103,6 +2105,7 @@ async def monitor_sessions(
     mode: str = "any",
     note: str = "",
     timeout_s: float = 1800.0,
+    edge: bool = True,
 ) -> dict:
     """Watch sessions in the BACKGROUND and get woken when they finish —
     the non-blocking front door for orchestrators.
@@ -2133,11 +2136,21 @@ async def monitor_sessions(
         timeout_s: Watch budget, default 1800 (30 min). On timeout the
             wake-up message still arrives, flagged timed-out, listing
             who is still running.
+        edge: True (default) arms against each session's CURRENT
+            transcript state — the monitor fires only when a watched
+            session completes a NEW turn (or exits) after registration.
+            A session that is already idle does NOT instant-fire its
+            stale last message; it comes back in `already_idle` so you
+            can `read_last_turn` it right now instead. Set false only
+            if you genuinely want "fire immediately if it's already
+            idle" (level-triggered).
 
-    Returns: {monitor_id, watching, mode, async_note} immediately.
-    The eventual result is ALSO retained and readable via
-    `list_monitors` (e.g. if the wake-up delivery could not be
-    verified).
+    Returns: {monitor_id, watching, mode, already_idle, async_note}
+    immediately. A non-empty `already_idle` means those sessions are at
+    their prompt RIGHT NOW — read their output directly; do not re-arm
+    monitors on them hoping for a notification. The eventual result is
+    ALSO retained and readable via `list_monitors` (e.g. if the wake-up
+    delivery could not be verified).
 
     Registering a monitor is read-only-plus-a-future-self-message — no
     pre-approval needed.
@@ -2145,7 +2158,7 @@ async def monitor_sessions(
     try:
         return async_monitor.register_monitor(
             session_uids, mode=mode, note=note, timeout_s=timeout_s,
-            source="explicit",
+            source="explicit", edge=edge,
         )
     except async_monitor.RegistrationError as e:
         return {"error": e.code, "message": str(e)}
@@ -2163,9 +2176,16 @@ def list_monitors() -> dict:
 
 @mcp.tool()
 def cancel_monitor(monitor_id: str) -> dict:
-    """Cancel an active async monitor (from `monitor_sessions` /
-    auto-registration). The watch stops and no wake-up message will be
-    delivered. Harmless if it already fired."""
+    """Cancel an async monitor. Terminal from any state: the watch
+    stops, an in-flight wake-up delivery is aborted, and any pending
+    turn-boundary inbox message is purged — nothing arrives after a
+    cancel. Already-retained results stay readable via `list_monitors`.
+
+    Pass `monitor_id="all"` to cancel EVERY live monitor at once — the
+    one-call off switch when the user asks to stop monitor
+    notifications. (Remember `send_input` / `start_session` auto-register
+    a fresh monitor per prompt; pass `notify_on_done=false` there to
+    keep them off.)"""
     return async_monitor.cancel_monitor(monitor_id)
 
 

@@ -37,6 +37,7 @@ import time
 from mcp_server import control_client
 from mcp_server.monitor import (
     _monitor_sessions,
+    last_completed_turn_fingerprint,
     transcript_turn_complete,
 )
 
@@ -64,6 +65,13 @@ VERIFY_WINDOW_S = 45.0
 
 # Redeliveries after a failed verification (1 = two sends total).
 MAX_REDELIVERIES = 1
+
+# How long a REdelivery waits for the caller to be back at its prompt.
+# A duplicate injected mid-turn (or mid-typing) is worse than no
+# redelivery — the result is retained in list_monitors regardless — so
+# unlike the first attempt this gate does NOT fall through to "deliver
+# anyway" on timeout.
+REDELIVERY_GATE_S = 300.0
 
 # Backstop against runaway registration loops.
 MAX_ACTIVE_MONITORS = 32
@@ -114,6 +122,45 @@ def _prune_finished() -> None:
         _MONITORS.pop(k, None)
 
 
+def _capture_baseline(uid: str) -> tuple[dict | None, bool]:
+    """One resolve of `uid` at ARM time. Returns (baseline-or-None,
+    currently_at_prompt).
+
+    Runs synchronously on the event loop by design: the baseline must
+    be captured BEFORE a just-sent prompt can start its turn (the
+    daemon's PTY delivery gives ~4s of runway; registration follows the
+    send within milliseconds), or a fast worker could complete the new
+    turn before an async capture ran and the edge would never fire. One
+    socket round-trip + one bounded tail read; any failure degrades to
+    a level trigger (None) rather than blocking registration."""
+    try:
+        resolved = control_client.call(
+            "resolve_authorized_session", {"session_uid": uid}
+        )
+    except (control_client.ControlError, control_client.TransportError):
+        return None, False
+    state = resolved.get("state", "pending")
+    idle = bool(resolved.get("idle", False))
+    engine = resolved.get("engine", "claude-code")
+    tpath = resolved.get("transcript_path")
+    if state != "ready" or not tpath:
+        # Starting / transcript-less (bash): nothing to anchor an edge
+        # on — level behavior, which is right for a fresh spawn (its
+        # first completed turn should fire).
+        return None, False
+    if engine == "claude-code":
+        fp = last_completed_turn_fingerprint(engine, tpath)
+        at_prompt = idle or transcript_turn_complete(engine, tpath)
+        if fp is None:
+            return None, at_prompt
+        return {"kind": "turn", "value": fp}, at_prompt
+    try:
+        size = os.path.getsize(tpath)
+    except OSError:
+        return None, idle
+    return {"kind": "size", "value": size}, idle
+
+
 def register_monitor(
     session_uids: list[str],
     *,
@@ -121,8 +168,17 @@ def register_monitor(
     note: str = "",
     timeout_s: float = DEFAULT_TIMEOUT_S,
     source: str = "explicit",
+    edge: bool = True,
 ) -> dict:
     """Start a background watch on `session_uids`; returns immediately.
+
+    `edge=True` (default) arms against the sessions' CURRENT transcript
+    state: the monitor fires only when a watched session completes a
+    NEW turn (or exits) after registration. An already-idle session
+    therefore does not instant-fire its stale last message — it is
+    reported in the returned `already_idle` list instead so the caller
+    can `read_last_turn` it directly. `edge=False` restores the
+    level-triggered behavior (fire on current idleness).
 
     Raises RegistrationError when the environment can't support a
     monitor (no caller identity / no event loop / too many monitors).
@@ -165,6 +221,22 @@ def register_monitor(
             "let some fire first",
         )
 
+    baselines: dict[str, dict] = {}
+    already_idle: list[str] = []
+    if edge:
+        for uid in uids:
+            baseline, at_prompt = _capture_baseline(uid)
+            if baseline is not None:
+                baselines[uid] = baseline
+            if at_prompt:
+                already_idle.append(uid)
+    if source == "auto":
+        # A just-prompted worker is EXPECTED to still be at its prompt
+        # (the PTY delivery has seconds of runway) — reporting it as
+        # already-idle on every send_input would be misleading noise.
+        # The edge baseline is what actually matters, and it's captured.
+        already_idle = []
+
     monitor_id = f"mon-{secrets.token_hex(3)}"
     record = {
         "monitor_id": monitor_id,
@@ -177,6 +249,7 @@ def register_monitor(
         "created_at": time.time(),
         "result": None,
         "delivered": None,
+        "baselines": baselines,
         "task": None,
     }
     _MONITORS[monitor_id] = record
@@ -185,18 +258,29 @@ def register_monitor(
         name=f"cm-monitor-{monitor_id}",
     )
     _prune_finished()
+    async_note = (
+        f"Async monitor {monitor_id} registered. When the watched "
+        f"session{'s finish' if len(uids) > 1 else ' finishes'} the "
+        f"turn, a '[cm-monitor {monitor_id}]' message will be "
+        "delivered into YOUR session and wake you. END YOUR TURN "
+        "instead of polling — do not sit in wait_* calls or "
+        "read_session_output loops."
+    )
+    if already_idle:
+        async_note += (
+            f" NOTE: {', '.join(already_idle)} "
+            f"{'are' if len(already_idle) > 1 else 'is'} ALREADY at the "
+            "prompt — the monitor is edge-triggered and fires only when "
+            "a NEW turn completes, so it will stay quiet until then. If "
+            "you wanted the current output, call read_last_turn instead "
+            "of re-arming monitors."
+        )
     return {
         "monitor_id": monitor_id,
         "watching": uids,
         "mode": mode,
-        "async_note": (
-            f"Async monitor {monitor_id} registered. When the watched "
-            f"session{'s finish' if len(uids) > 1 else ' finishes'} the "
-            f"turn, a '[cm-monitor {monitor_id}]' message will be "
-            "delivered into YOUR session and wake you. END YOUR TURN "
-            "instead of polling — do not sit in wait_* calls or "
-            "read_session_output loops."
-        ),
+        "already_idle": already_idle,
+        "async_note": async_note,
     }
 
 
@@ -220,6 +304,7 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                     record["watching"],
                     mode=record["mode"],
                     timeout_s=remaining,
+                    baselines=record.get("baselines") or None,
                 )
                 break
             except control_client.TransportError as e:
@@ -240,7 +325,11 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                 "list_monitors"
             )
     except asyncio.CancelledError:
-        if record["state"] == "watching":
+        # Cancellation is terminal from ANY in-flight state — a monitor
+        # cancelled mid-delivery ("fired") must not resurrect as
+        # "undelivered" and keep sending. Only the auto-replace path's
+        # "replaced" label survives.
+        if record["state"] != "replaced":
             record["state"] = "cancelled"
         raise
     except Exception as e:  # noqa: BLE001 — background task, never raise
@@ -363,24 +452,33 @@ async def _try_inbox_delivery(record: dict, message: str) -> bool:
     path = _write_inbox(caller, monitor_id, message)
     if path is None:
         return False
-    deadline = time.monotonic() + CALLER_IDLE_MAX_WAIT_S
-    while time.monotonic() < deadline:
-        if not os.path.exists(path):
-            _log(f"{monitor_id}: delivered via Stop-hook inbox")
-            return True
-        at_prompt, _ = await _caller_at_prompt(caller)
-        if at_prompt:
-            # Caller is at its prompt but nothing consumed the message —
-            # no Stop hook fired for it. Take it back; PTY injection is
-            # both available and safe now.
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                return True  # consumed in the race after all
-            except OSError:
-                pass
-            return False
-        await asyncio.sleep(POLL_S)
+    try:
+        deadline = time.monotonic() + CALLER_IDLE_MAX_WAIT_S
+        while time.monotonic() < deadline:
+            if not os.path.exists(path):
+                _log(f"{monitor_id}: delivered via Stop-hook inbox")
+                return True
+            at_prompt, _ = await _caller_at_prompt(caller)
+            if at_prompt:
+                # Caller is at its prompt but nothing consumed the
+                # message — no Stop hook fired for it. Take it back; PTY
+                # injection is both available and safe now.
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    return True  # consumed in the race after all
+                except OSError:
+                    pass
+                return False
+            await asyncio.sleep(POLL_S)
+    except asyncio.CancelledError:
+        # cancel_monitor's purge can race a just-written file — take the
+        # pending message back ourselves so nothing delivers post-cancel.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -390,13 +488,39 @@ async def _try_inbox_delivery(record: dict, message: str) -> bool:
     return False
 
 
+async def _marker_landed(
+    caller: str, marker: str, fallback_tpath: str | None
+) -> bool:
+    """Check the caller's CURRENT transcript for `marker`. Re-resolves
+    the transcript path each call — a caller that was resumed/rotated
+    mid-delivery moves to a new file, and verifying against the
+    arm-time snapshot would miss a copy that demonstrably landed (the
+    spurious-redelivery bug)."""
+    tpath = fallback_tpath
+    try:
+        resolved = await asyncio.to_thread(
+            control_client.call,
+            "resolve_authorized_session",
+            {"session_uid": caller},
+        )
+        tpath = resolved.get("transcript_path") or tpath
+    except (control_client.ControlError, control_client.TransportError):
+        pass
+    if not tpath:
+        return False
+    return await asyncio.to_thread(_transcript_contains_marker, tpath, marker)
+
+
 async def _deliver_to_caller(record: dict, message: str) -> bool:
     """Deliver the fire message into the caller's session.
 
     Mid-turn caller → Stop-hook inbox (atomic turn-boundary delivery,
     zero PTY typing). At-prompt caller (or inbox fallback) → gated PTY
-    injection, verified against the caller's transcript with one
-    redelivery. True = delivered (verified / hook-consumed)."""
+    injection, verified against the caller's live transcript with at
+    most one redelivery — and the redelivery only happens after a fresh
+    marker re-check misses AND the caller is back at its prompt, so a
+    late-landing first copy can't earn a duplicate. True = delivered
+    (verified / hook-consumed)."""
     caller = record["caller"]
     monitor_id = record["monitor_id"]
     marker = f"[cm-monitor {monitor_id}"
@@ -417,8 +541,34 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
                 f"{monitor_id}: caller {caller} busy past the gate window — "
                 "delivering anyway (will queue as a steering message)"
             )
+    last_tpath = (resolved or {}).get("transcript_path")
 
     for attempt in range(1 + MAX_REDELIVERIES):
+        if attempt > 0:
+            # The first copy may have landed late (queued composer
+            # text) or verified against a stale path — re-check before
+            # spamming a duplicate, and only resend into an at-prompt
+            # caller. This gate does NOT deliver-anyway on timeout: an
+            # unverified-but-probably-arrived notification beats a
+            # guaranteed duplicate; the result stays in list_monitors.
+            regate_deadline = time.monotonic() + REDELIVERY_GATE_S
+            cleared = False
+            while time.monotonic() < regate_deadline:
+                if await _marker_landed(caller, marker, last_tpath):
+                    return True
+                at_prompt, resolved = await _caller_at_prompt(caller)
+                if resolved and resolved.get("transcript_path"):
+                    last_tpath = resolved["transcript_path"]
+                if at_prompt:
+                    cleared = True
+                    break
+                await asyncio.sleep(POLL_S)
+            if not cleared:
+                _log(
+                    f"{monitor_id}: redelivery gate never cleared — "
+                    "skipping resend (result retained in list_monitors)"
+                )
+                break
         try:
             await asyncio.to_thread(
                 control_client.call,
@@ -429,16 +579,13 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
             _log(f"{monitor_id}: delivery send failed: {e}")
             await asyncio.sleep(POLL_S)
             continue
-        tpath = (resolved or {}).get("transcript_path")
-        if tpath is None:
+        if last_tpath is None:
             # Nothing to verify against (caller transcript unknown) —
             # trust the successful send.
             return True
         verify_deadline = time.monotonic() + VERIFY_WINDOW_S
         while time.monotonic() < verify_deadline:
-            if await asyncio.to_thread(
-                _transcript_contains_marker, tpath, marker
-            ):
+            if await _marker_landed(caller, marker, last_tpath):
                 return True
             await asyncio.sleep(POLL_S)
         _log(
@@ -448,13 +595,55 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
     return False
 
 
+def _purge_inbox(caller: str, monitor_id: str) -> None:
+    """Remove any not-yet-consumed inbox files this monitor wrote, so a
+    cancelled monitor can't ghost-deliver at the caller's next turn
+    boundary."""
+    inbox = os.path.join(INBOX_ROOT, caller)
+    try:
+        names = os.listdir(inbox)
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(f"-{monitor_id}.json"):
+            try:
+                os.remove(os.path.join(inbox, name))
+            except OSError:
+                pass
+
+
+# States with anything left to do. Everything else ("delivered",
+# "undelivered", "replaced", "cancelled", "error") is inert: the task is
+# finished and only the retained result remains.
+_LIVE_STATES = ("watching", "fired")
+
+
+def _cancel_record(m: dict) -> None:
+    """Terminal cancel from ANY state: stop the watch task (also aborts
+    an in-flight delivery — a "fired" monitor can pend in the caller-
+    idle gate for many minutes) and purge pending inbox messages.
+    Retained results stay readable via list_monitors."""
+    task = m.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+    if m["state"] in _LIVE_STATES:
+        m["state"] = "cancelled"
+    _purge_inbox(m["caller"], m["monitor_id"])
+
+
 def cancel_monitor(monitor_id: str) -> dict:
+    if monitor_id in ("all", "*"):
+        live = [m for m in _MONITORS.values() if m["state"] in _LIVE_STATES]
+        for m in live:
+            _cancel_record(m)
+        return {
+            "cancelled": [m["monitor_id"] for m in live],
+            "count": len(live),
+        }
     m = _MONITORS.get(monitor_id)
     if m is None:
         return {"error": "not_found", "monitor_id": monitor_id}
-    if m["state"] == "watching" and m["task"] is not None:
-        m["task"].cancel()
-        m["state"] = "cancelled"
+    _cancel_record(m)
     return {"monitor_id": monitor_id, "state": m["state"]}
 
 

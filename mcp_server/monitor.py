@@ -12,7 +12,9 @@ dependencies installed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import time
 
 from mcp_server import control_client
@@ -130,6 +132,73 @@ def transcript_turn_complete(engine: str, path: str | None) -> bool:
     return False
 
 
+def last_completed_turn_fingerprint(engine: str, path: str | None) -> str | None:
+    """Identity of the last COMPLETED main-chain assistant turn in
+    `path`, or None when there isn't one (no transcript, unreadable, a
+    non-claude engine, or no terminal assistant entry in the tail
+    window).
+
+    This is the edge-trigger baseline for async monitors: a monitor
+    armed while the watched session is already at its prompt fires only
+    once this identity CHANGES — i.e. a NEW turn completed after
+    arming — instead of instant-firing on the stale last message.
+
+    Unlike `transcript_turn_complete` this skips over trailing user /
+    tool-result lines: mid-turn, it identifies the PREVIOUS completed
+    turn, which is exactly the right baseline (the in-flight turn's
+    completion changes it). Sync (file IO): callers offload via
+    asyncio.to_thread where it matters."""
+    if engine != "claude-code" or not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - _SEMANTIC_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        if entry.get("isSidechain"):
+            continue
+        stop = (entry.get("message") or {}).get("stop_reason")
+        if stop in _TERMINAL_STOP_REASONS:
+            uid = entry.get("uuid")
+            if uid:
+                return str(uid)
+            return hashlib.sha1(line.encode("utf-8")).hexdigest()
+    return None
+
+
+def _edge_passed(baseline: dict, engine: str, tpath: str | None) -> bool:
+    """True when the watched session has produced NEW completed work
+    since `baseline` was captured at arm time. "turn" baselines compare
+    the last-completed-turn fingerprint (claude-code); "size" baselines
+    (codex — no turn parse) accept any transcript growth. Unknown
+    baseline kinds fail open (level behavior)."""
+    kind = baseline.get("kind")
+    if kind == "turn":
+        fp = last_completed_turn_fingerprint(engine, tpath)
+        return fp is not None and fp != baseline.get("value")
+    if kind == "size":
+        if not tpath:
+            return False
+        try:
+            return os.path.getsize(tpath) > int(baseline.get("value", 0))
+        except OSError:
+            return False
+    return True
+
+
 def _parser_for(engine: str):
     return transcripts_codex if engine == "codex" else transcripts_claude
 
@@ -187,8 +256,17 @@ async def _monitor_sessions(
     poll_interval_s: float = 2.0,
     pending_idle_grace_s: float = 8.0,
     return_last_message: bool = True,
+    baselines: dict[str, dict] | None = None,
 ) -> dict:
     """Watch `session_uids` until the stop condition is met or `timeout_s`.
+
+    `baselines` (uid -> baseline captured at arm time, see
+    `_edge_passed`) makes the watch EDGE-triggered for those uids: an
+    idle observation only completes once the session has produced a new
+    completed turn (or grown its transcript) past the baseline. Exits
+    and evictions always complete regardless. Absent/None baselines
+    keep the level-triggered behavior the blocking `wait_*` tools want
+    (already-idle returns immediately).
 
     A session "completes" by the same rule as `wait_for_session_idle`:
     it finishes its turn (ready + quiet -> `awaiting_input`), or it
@@ -300,6 +378,17 @@ async def _monitor_sessions(
                     done = True
             else:
                 pending_idle_since[uid] = None
+
+            if done and state != "exited" and baselines:
+                b = baselines.get(uid)
+                if b is not None and not await asyncio.to_thread(
+                    _edge_passed, b, engine, tpath
+                ):
+                    # Idle, but idle on the SAME turn that existed when
+                    # the watch was armed — not a completion, keep
+                    # waiting for the next edge.
+                    done = False
+                    status_override = None
 
             if done:
                 entry = await asyncio.to_thread(
