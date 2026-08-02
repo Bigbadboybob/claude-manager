@@ -8,4 +8,7 @@ uv.lock
 tui/target/
 # Workspace build dir created by the root Cargo.toml (slice 2 of the
 # persistent-host-daemon design doc moved tui to a workspace member).
-/target/
+# No trailing slash: target is a symlink to the shared build dir
+# (~/.cm/shared-target, see .cargo/config.toml), and `/target/` only
+# matches real directories.
+/target
