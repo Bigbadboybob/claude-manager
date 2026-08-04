@@ -401,7 +401,9 @@ pub fn claude_settings_hook_arg(server_path_override: Option<&str>) -> Option<St
 ///      venv-based deployment layout — `/opt/cm-daemon/mcp_server/.venv/`).
 ///   2. `.venv/bin/python` at the repo root, i.e. the server dir's PARENT
 ///      (the local-workstation layout — `<repo>/.venv` + `<repo>/mcp_server/`).
-///   3. Bare `python3` when it resolves on PATH, else bare `python`.
+///   3. The PRIMARY checkout's venv when the server lives in a linked git
+///      worktree that has no venv of its own (see `primary_checkout_venv`).
+///   4. Bare `python3` when it resolves on PATH, else bare `python`.
 ///
 /// Why this exists: the MCP config used a hardcoded `command: "python"`, but
 /// cm-manager has NO `python` on PATH (only `python3` + the venv) — so the
@@ -429,11 +431,66 @@ pub fn resolve_python_interpreter(server: &std::path::Path) -> String {
             return venv.to_string_lossy().into_owned();
         }
     }
+    if let Some(python) = primary_checkout_venv(server) {
+        return python;
+    }
     if path_has_python3() {
         "python3".to_string()
     } else {
         "python".to_string()
     }
+}
+
+/// `<primary checkout>/mcp_server/.venv/bin/python` when `server` lives in a
+/// LINKED GIT WORKTREE that has no venv of its own.
+///
+/// This tier exists because the bare-interpreter fallback below is a
+/// machine-state guess, and pairing it with a perfectly valid server path
+/// produces a silently broken spawn. A fresh cm worktree has no `.venv` —
+/// nothing creates one — so any daemon whose `mcp_server_path` resolved into a
+/// worktree fell straight through tiers 1-2 to bare `python3`. On a host where
+/// the mcp deps live only in the checkout's venv (the normal local layout,
+/// since conda was removed) that interpreter cannot `import mcp`, so:
+/// preflight failed, EVERY spawned session got an MCP server that would not
+/// start, and — because `claude_settings_hook_arg` runs the cm Stop hook
+/// through the same interpreter — `session.turn_ended` never reached the
+/// daemon. Those sessions kept `transcript_id: null` forever, so the TUI never
+/// marked them ready: a live, working agent that is invisible in the sidebar,
+/// with the only signal a preflight warning in the daemon log. Observed
+/// 2026-08-03 with the daemon started from a worktree by `cm-redeploy`.
+///
+/// Worktrees share their primary checkout's git common dir, which is where a
+/// built venv reliably lives, so borrowing it is both cheap and correct: the
+/// server.py being run still comes from the worktree, only the interpreter is
+/// borrowed. Returns `None` outside a git tree, or when the primary checkout
+/// has no venv either — the bare fallback still applies there.
+fn primary_checkout_venv(server: &std::path::Path) -> Option<String> {
+    let server_dir = server.parent()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(server_dir)
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let common_dir = std::str::from_utf8(&out.stdout).ok()?.trim().to_string();
+    if common_dir.is_empty() {
+        return None;
+    }
+    // `<primary>/.git` → `<primary>`.
+    let primary = std::path::Path::new(&common_dir).parent()?;
+    // Same two layouts tiers 1-2 accept, rooted at the primary checkout.
+    for rel in ["mcp_server/.venv/bin/python", ".venv/bin/python"] {
+        let venv = primary.join(rel);
+        if venv.is_file() {
+            return Some(venv.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 /// Does `python3` resolve on this process's PATH?
@@ -1032,6 +1089,81 @@ mod tests {
             args[pos + 1].contains("cm_stop_hook.py"),
             "settings JSON must reference the hook: {}",
             args[pos + 1],
+        );
+    }
+
+    /// The 2026-08-03 invisible-session bug. A daemon whose `mcp_server_path`
+    /// resolved into a LINKED GIT WORKTREE fell through tiers 1-2 (a fresh cm
+    /// worktree has no `.venv` — nothing builds one) to bare `python3`, which
+    /// on this layout cannot `import mcp`. Preflight failed, every spawned
+    /// session got a dead MCP server AND a dead Stop hook, so
+    /// `session.turn_ended` never landed, `transcript_id` stayed null, and the
+    /// TUI never marked the session ready — a live agent invisible in the
+    /// sidebar. The primary checkout's venv must be borrowed instead.
+    #[test]
+    fn resolve_python_borrows_primary_checkout_venv_for_a_worktree() {
+        let root = TempDir::new().unwrap();
+        let primary = root.path().join("primary");
+        let worktrees = root.path().join("worktrees");
+        std::fs::create_dir_all(primary.join("mcp_server")).unwrap();
+        std::fs::create_dir_all(&worktrees).unwrap();
+
+        // A real git repo with one commit, so `git worktree add` works.
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main"], &primary);
+        git(&["config", "user.email", "t@t"], &primary);
+        git(&["config", "user.name", "t"], &primary);
+        std::fs::write(primary.join("mcp_server/server.py"), "").unwrap();
+        git(&["add", "-A"], &primary);
+        git(&["commit", "-qm", "seed"], &primary);
+
+        // The primary checkout has the built venv; the worktree does not.
+        let primary_venv_bin = primary.join("mcp_server/.venv/bin");
+        std::fs::create_dir_all(&primary_venv_bin).unwrap();
+        let primary_py = primary_venv_bin.join("python");
+        std::fs::write(&primary_py, "").unwrap();
+
+        let wt = worktrees.join("feature");
+        let out = git(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "main"],
+            &primary,
+        );
+        if !out.status.success() {
+            eprintln!("skipping: git worktree add unavailable here");
+            return;
+        }
+
+        let wt_server = wt.join("mcp_server/server.py");
+        assert!(wt_server.is_file(), "worktree must carry server.py");
+        assert!(
+            !wt.join("mcp_server/.venv/bin/python").exists(),
+            "precondition: the worktree has no venv of its own",
+        );
+
+        let resolved = resolve_python_interpreter(&wt_server);
+        assert_eq!(
+            resolved,
+            primary_py.to_string_lossy(),
+            "a venv-less worktree must borrow the primary checkout's \
+             interpreter, not fall through to a bare name that cannot \
+             import mcp",
+        );
+
+        // The worktree's OWN venv still wins once it exists (tier 1).
+        let wt_venv_bin = wt.join("mcp_server/.venv/bin");
+        std::fs::create_dir_all(&wt_venv_bin).unwrap();
+        let wt_py = wt_venv_bin.join("python");
+        std::fs::write(&wt_py, "").unwrap();
+        assert_eq!(
+            resolve_python_interpreter(&wt_server),
+            wt_py.to_string_lossy(),
+            "an adjacent venv must still beat the borrowed one",
         );
     }
 
