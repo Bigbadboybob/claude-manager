@@ -364,6 +364,10 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_register_agent_subtask(state, req))
         }
 
+        // fix-loud-preflight: post-restart health probe. Operator-only —
+        // it reports host-environment diagnosis, not per-session state.
+        "daemon.health" => DispatchOutcome::Done(dispatch_daemon_health(state, req)),
+
         // 10d-1: TUI-pushed session snapshot so the daemon
         // can recognize TUI-minted sessions for the future
         // workflow-method auth (10d-2). Operator-only — same
@@ -1430,6 +1434,25 @@ fn dispatch_register_agent_subtask(
         return resp;
     }
     match methods::register_agent_subtask(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `daemon.health` — can this daemon spawn working sessions, and what did
+/// it restore (fix-loud-preflight)? Operator-only.
+fn dispatch_daemon_health(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "daemon.health is Operator-callable only — it reports host \
+         environment diagnosis, not per-session state",
+    ) {
+        return resp;
+    }
+    match methods::daemon_health(state) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

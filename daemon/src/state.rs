@@ -445,6 +445,16 @@ pub struct DaemonState {
     /// (`daemon-sessions.json`) so the creator keeps scope over
     /// its spawned workers across a daemon restart.
     pub agent_task_edges: HashMap<String, String>,
+    /// Startup MCP preflight result: `Ok(summary)` or `Err(diagnosis)`
+    /// (fix-loud-preflight). `None` only before startup has run it.
+    ///
+    /// Retained so the health of this daemon's spawns is a QUESTION YOU CAN
+    /// ASK over the socket rather than a line you have to find in a log. A
+    /// failed preflight means every session this daemon spawns gets a dead
+    /// MCP server and a dead cm Stop hook — it runs, but never reports a
+    /// turn-end, so it never appears ready. Not persisted: it describes this
+    /// process's environment and is recomputed at every startup.
+    pub mcp_preflight: Option<Result<String, String>>,
     /// Sub-2b-3 review-5 #1: per-worktree FIFO spawn queues.
     /// `Arc`-shared so the spawn-main path can clone the
     /// queue out of the state lock and enqueue without
@@ -633,6 +643,7 @@ impl Default for DaemonState {
             task_workspaces: HashMap::new(),
             task_tree_pushed: false,
             agent_task_edges: HashMap::new(),
+            mcp_preflight: None,
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
             tui_sessions: HashMap::new(),
             tui_sessions_pushed: false,

@@ -2254,6 +2254,18 @@ pub fn resolve_authorized_session(
 #[derive(Deserialize)]
 struct SessionTurnEndedParams {
     session_uid: String,
+    /// The transcript file Claude Code handed the Stop hook for THIS turn
+    /// (fix-stale-resume). Optional: older hooks omit it.
+    ///
+    /// This is the only exact, live signal for "which conversation is this
+    /// session actually in". The id recorded at spawn goes stale the moment
+    /// the conversation rotates (`/clear`, `/compact`, a fork, a resume that
+    /// mints a new id), and a stale id is what makes a restart resume the
+    /// WRONG conversation — silently, since `--resume <id>` on a dead id
+    /// just starts something else. Re-stamping it every turn means the
+    /// recorded resume key is never more than one turn out of date.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 /// A session's agent reports that its turn just finished (fired by the
@@ -2276,7 +2288,7 @@ pub fn session_turn_ended(
                 format!("session.turn_ended params: {}", e),
             )
         })?;
-    let state = state_arc.lock().unwrap_or_else(|p2| p2.into_inner());
+    let mut state = state_arc.lock().unwrap_or_else(|p2| p2.into_inner());
     if let Some(cuid) = caller_uid {
         let decision = crate::control::auth::check_session_caller(
             &state,
@@ -2292,6 +2304,44 @@ pub fn session_turn_ended(
         )
     })?;
     session.stamp_turn_end();
+    // fix-stale-resume: refresh the recorded resume key from the hook's
+    // report. Unlike `session.set_transcript_path` (Operator-only, because
+    // the TUI is authoritative for path conventions) this is a SELF-report
+    // on an already-self-scoped method, so it is contained two ways:
+    // `check_session_caller` above bounds WHOSE session can be stamped, and
+    // the directory check below bounds WHICH file may be claimed. Without
+    // that second check a session could name another session's transcript
+    // and turn its own `read_session_output` into a cross-session read.
+    let reported = p
+        .transcript_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(reported) = reported {
+        let own_dir = state
+            .workspaces
+            .get(&session.workspace_id)
+            .and_then(|ws| ws.worktree_path.as_deref())
+            .and_then(crate::transcript_detect::claude_transcript_dir_for);
+        let contained = own_dir
+            .as_deref()
+            .zip(std::path::Path::new(reported).parent())
+            .is_some_and(|(dir, parent)| dir == parent);
+        let changed = contained
+            && session.transcript_path.as_deref() != Some(reported);
+        if changed {
+            let reported = reported.to_string();
+            if let Some(session) = state.sessions.get_mut(&p.session_uid) {
+                // Mirror `set_transcript_path`: a real rotation bumps the
+                // generation so an agent's read cursor is invalidated.
+                session.generation = session.generation.saturating_add(1);
+                session.transcript_path = Some(reported);
+            }
+            // Persist so a restart resumes the conversation the session is
+            // in RIGHT NOW, not the one it started in.
+            state.persist_sessions_best_effort();
+        }
+    }
     Ok(json!({ "ok": true }))
 }
 
@@ -2926,6 +2976,54 @@ pub fn register_agent_subtask(
     state.bindings.insert(p.task_id.clone(), p.workspace_id);
     state.persist_sessions_best_effort();
     Ok(json!({ "ok": true }))
+}
+
+// ============================================================
+// daemon.health (fix-loud-preflight)
+// ============================================================
+//
+// One question, answerable over the socket: "is this daemon able to spawn
+// working sessions, and what did it restore?"
+//
+// It exists because the 2026-08-03 incident was invisible for ~45 minutes.
+// The daemon came up, bound its socket, served RPCs, and spawned sessions
+// that ran real work — while its MCP preflight had failed, so every one of
+// those sessions had a dead MCP server and a dead cm Stop hook and never
+// reported ready. Every signal needed to catch that existed; all of it was
+// in a log file. `cm-redeploy` now asks this after restarting and refuses to
+// call the deploy good when `mcp_ok` is false.
+//
+// Deliberately NOT folded into `ping`: a Session-caller `ping` is the MCP
+// smoke test, and operator `ping` is Unauthorized on purpose (TUI-dispatcher
+// parity, pinned by a test). This is Operator-only.
+
+pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let (mcp_ok, mcp_detail) = match &state.mcp_preflight {
+        Some(Ok(summary)) => (true, summary.clone()),
+        Some(Err(msg)) => (false, msg.clone()),
+        // Startup always runs it, so `None` means a state built by some
+        // other path (tests). Report it as not-ok rather than inventing a
+        // pass — a health check that guesses is worse than none.
+        None => (false, "preflight has not run".to_string()),
+    };
+    let total = state.sessions.len();
+    // A session with no transcript has never reported a turn-end, which is
+    // exactly the shape the incident produced. Surfacing the split makes
+    // "restored 19, none of them ready" legible at a glance.
+    let with_transcript = state
+        .sessions
+        .values()
+        .filter(|s| s.transcript_path.is_some())
+        .count();
+    Ok(json!({
+        "ok": true,
+        "mcp_ok": mcp_ok,
+        "mcp_detail": mcp_detail,
+        "sessions": total,
+        "sessions_with_transcript": with_transcript,
+        "workspaces": state.workspaces.len(),
+    }))
 }
 
 // ============================================================
@@ -6951,6 +7049,30 @@ fn compose_daemon_spawn_params(
         } else {
             Some(path)
         }
+    };
+    // fix-stale-resume: never hand claude a `--resume <id>` whose transcript
+    // is not on disk. `--resume` on an unknown id does NOT fail loudly — the
+    // agent just comes up on something else — so a phantom id restores a
+    // session that silently lost its history. Dropping the flag makes it a
+    // visible fresh start instead. Only claude is checked: codex resume
+    // writes a NEW rollout file and is rebound by the detector, so its id
+    // has no such file to look for.
+    let resume_session_id = match (resume_session_id, engine) {
+        (Some(id), "claude-code") => {
+            let exists = crate::transcript_detect::claude_transcript_path(working_dir, id)
+                .is_some_and(|p| p.is_file());
+            if !exists {
+                eprintln!(
+                    "cm-daemon: session {}: recorded transcript '{}' is gone from {} — \
+                     spawning FRESH instead of resuming a phantom conversation",
+                    uid,
+                    id,
+                    working_dir.display(),
+                );
+            }
+            exists.then_some(id)
+        }
+        (other, _) => other,
     };
     let (program, argv_tail) = crate::mcp_config::build_args(
         engine,
@@ -13021,6 +13143,89 @@ mod tests {
         ));
     }
 
+    /// fix-stale-resume: the Stop hook's per-turn `transcript_path` report is
+    /// what keeps the recorded resume key current. Without it the key is
+    /// frozen at spawn, so a conversation that rotates (/clear, /compact, a
+    /// fork) leaves the daemon pointing at a dead id — and `--resume <dead>`
+    /// does not fail, it just restores the wrong history.
+    #[test]
+    fn turn_ended_refreshes_the_recorded_transcript() {
+        let dir = TempDir::new().unwrap();
+        let wt = dir.path().to_path_buf();
+        let state = state_with_workspace("ws-t", &dir);
+        let uid = fresh_test_uid();
+        {
+            let mut s = state.lock().unwrap();
+            let mut sp = crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "ws-t".to_string();
+            sp.session_type = "claude-code".to_string();
+            let mut sess = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            sess.transcript_path = Some("/old/stale.jsonl".to_string());
+            s.sessions.insert(uid.clone(), sess);
+        }
+        // The hook may only claim a file in its OWN worktree's transcript
+        // dir; anything else would turn a self-report into a cross-session
+        // read via `read_session_output`.
+        let own_dir = crate::transcript_detect::claude_transcript_dir_for(&wt)
+            .expect("transcript dir");
+        let fresh = own_dir.join("new-conversation.jsonl");
+
+        session_turn_ended(
+            &state,
+            &json!({
+                "session_uid": uid,
+                "transcript_path": fresh.to_string_lossy(),
+            }),
+            None,
+        )
+        .expect("turn_ended ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.sessions.get(&uid).and_then(|x| x.transcript_path.clone()),
+                Some(fresh.to_string_lossy().into_owned()),
+                "a rotation must re-stamp the resume key",
+            );
+        }
+
+        // A path outside the session's own transcript dir is refused.
+        session_turn_ended(
+            &state,
+            &json!({
+                "session_uid": uid,
+                "transcript_path": "/somewhere/else/other-session.jsonl",
+            }),
+            None,
+        )
+        .expect("turn_ended ok");
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.sessions.get(&uid).and_then(|x| x.transcript_path.clone()),
+            Some(fresh.to_string_lossy().into_owned()),
+            "a session must not be able to claim a transcript outside its own worktree",
+        );
+    }
+
+    /// fix-loud-preflight: a `None` preflight reports NOT ok. A health check
+    /// that assumes the best is worse than no health check — the whole point
+    /// is that `cm-redeploy` refuses to call a deploy good on this answer.
+    #[test]
+    fn daemon_health_does_not_assume_a_pass() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let unrun = daemon_health(&state).expect("health ok");
+        assert_eq!(unrun["mcp_ok"], json!(false));
+
+        state.lock().unwrap().mcp_preflight = Some(Err("no venv".into()));
+        let failed = daemon_health(&state).expect("health ok");
+        assert_eq!(failed["mcp_ok"], json!(false));
+        assert!(failed["mcp_detail"].as_str().unwrap().contains("no venv"));
+
+        state.lock().unwrap().mcp_preflight = Some(Ok("41 tools".into()));
+        let passed = daemon_health(&state).expect("health ok");
+        assert_eq!(passed["mcp_ok"], json!(true));
+    }
+
     #[test]
     fn missing_workspace_returns_not_found() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
@@ -16811,6 +17016,14 @@ mod tests {
             let mut e = me("ts-eeeeeeeeeeeeeeee-0", "claude-code");
             let tid = "11111111-2222-3333-4444-555555555555";
             e.transcript_id = Some(tid.into());
+            // The transcript must EXIST for the resume flag to survive
+            // (fix-stale-resume): a `--resume` at a file that is gone does
+            // not fail, it silently restores a different conversation, so
+            // the compose step now drops it. Materialize the fixture's file.
+            let tpath = crate::transcript_detect::claude_transcript_path(&wt, tid)
+                .expect("transcript path");
+            std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+            std::fs::write(&tpath, b"{}\n").unwrap();
             let params =
                 compose_restore_params(&state, "ws-x", &wt, &e).expect("compose ok");
             let argv: Vec<String> = params["argv"]
@@ -16832,6 +17045,38 @@ mod tests {
                 tp.ends_with(&format!("{tid}.jsonl")),
                 "transcript_path points at the resumed file: {}",
                 tp,
+            );
+        });
+    }
+
+    /// fix-stale-resume: a recorded `transcript_id` whose file is GONE must
+    /// not be resumed. `claude --resume <unknown-id>` does not error — it
+    /// comes up on something else — so a phantom id produces a session that
+    /// silently lost its history and looks fine. Dropping the flag makes it
+    /// an obvious fresh start instead.
+    #[test]
+    fn compose_restore_params_drops_resume_when_transcript_is_gone() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("rwt-gone");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            let mut e = me("ts-aaaaaaaaaaaaaaaa-0", "claude-code");
+            // Recorded, but never materialized on disk — the shape a
+            // rotated/cleaned-up conversation leaves behind.
+            e.transcript_id = Some("99999999-8888-7777-6666-555555555555".into());
+            let params =
+                compose_restore_params(&state, "ws-gone", &wt, &e).expect("compose ok");
+            let argv: Vec<String> = params["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                !argv.iter().any(|a| a == "--resume"),
+                "a phantom transcript must not be resumed: {:?}",
+                argv,
             );
         });
     }

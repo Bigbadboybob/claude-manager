@@ -159,6 +159,13 @@ pub fn claude_transcript_path(
     Some(dir.join(format!("{}.jsonl", transcript_id)))
 }
 
+/// Public view of [`claude_transcript_dir`] — the directory Claude Code
+/// writes this worktree's transcripts into. Used by `session.turn_ended` to
+/// bound which file a session may claim as its own (fix-stale-resume).
+pub fn claude_transcript_dir_for(worktree_path: &Path) -> Option<PathBuf> {
+    claude_transcript_dir(worktree_path)
+}
+
 fn claude_transcript_dir(worktree_path: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let path_str = worktree_path.to_str()?;

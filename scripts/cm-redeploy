@@ -244,6 +244,88 @@ fi
 echo "new daemon PID: $NEW_DAEMON_PID"
 echo "log:            $DAEMON_LOG"
 
+# ---------------------------------------------------------------------------
+# Smoke test. "The process is alive" is NOT the same as "the daemon can spawn
+# working sessions" — on 2026-08-03 a daemon came up healthy-looking with a
+# failed MCP preflight, and every session it spawned ran real work while
+# staying invisible in the TUI for ~45 minutes. The only signal was a warning
+# in this log. So ask the daemon directly and fail loudly.
+# ---------------------------------------------------------------------------
+step "smoke test"
+SOCKET="$HOME/.cm/daemon.sock"
+HEALTH=$(python3 - "$SOCKET" <<'PY' 2>/dev/null || true
+import json, os, socket, struct, sys, time
+sock = sys.argv[1]
+deadline = time.time() + 15
+last = ""
+while time.time() < deadline:
+    try:
+        body = json.dumps({"id": os.urandom(8).hex(),
+                           "caller": {"token_id": "cm-redeploy"},
+                           "method": "daemon.health", "params": {}}).encode()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect(sock)
+        try:
+            s.sendall(struct.pack(">I", len(body)) + body)
+            raw = b""
+            while len(raw) < 4:
+                chunk = s.recv(4 - len(raw))
+                if not chunk:
+                    raise OSError("eof")
+                raw += chunk
+            (n,) = struct.unpack(">I", raw)
+            buf = b""
+            while len(buf) < n:
+                chunk = s.recv(n - len(buf))
+                if not chunk:
+                    raise OSError("eof")
+                buf += chunk
+        finally:
+            s.close()
+        resp = json.loads(buf.decode())
+        if resp.get("ok"):
+            print(json.dumps(resp.get("result") or {}))
+            sys.exit(0)
+        # A structured error means the daemon IS up and answering — retrying
+        # a definitive "unknown_method" for 15s just delays the report.
+        print(json.dumps({"unreachable": str(resp.get("error"))}))
+        sys.exit(0)
+    except Exception as e:  # socket not up yet — this is the retryable case
+        last = str(e)
+    time.sleep(0.5)
+print(json.dumps({"unreachable": last}))
+PY
+)
+
+if [ -z "$HEALTH" ]; then
+    echo "WARNING: could not run the smoke test (no python3?). Check by hand:" >&2
+    echo "         tail -30 $DAEMON_LOG" >&2
+elif echo "$HEALTH" | grep -q '"unreachable"'; then
+    echo "ERROR: daemon is running but did not answer daemon.health." >&2
+    echo "       $HEALTH" >&2
+    echo "       If this daemon predates daemon.health that's expected; otherwise" >&2
+    echo "       check: tail -30 $DAEMON_LOG" >&2
+    exit 1
+else
+    MCP_OK=$(echo "$HEALTH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mcp_ok"))' 2>/dev/null || echo "?")
+    echo "sessions restored: $(echo "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"{d.get(\"sessions\")} ({d.get(\"sessions_with_transcript\")} with a transcript)")' 2>/dev/null || echo '?')"
+    if [ "$MCP_OK" = "True" ]; then
+        echo "MCP preflight:     OK"
+    else
+        echo >&2
+        echo "ERROR: MCP PREFLIGHT FAILED on the new daemon." >&2
+        echo "       Every session it spawns will have a dead MCP server and a dead cm" >&2
+        echo "       Stop hook: they will run, but never appear ready in the TUI." >&2
+        echo "       Do not trust this deploy. Diagnosis:" >&2
+        echo "$HEALTH" | python3 -c 'import json,sys; print("       "+str(json.load(sys.stdin).get("mcp_detail","")).replace(chr(10),chr(10)+"       "))' >&2 2>/dev/null || true
+        echo >&2
+        echo "       Common cause: this script was run from a git WORKTREE, so the" >&2
+        echo "       daemon inherited a checkout with no mcp_server/.venv." >&2
+        exit 1
+    fi
+fi
+
 step "ready"
 cat <<EOF
 Daemon restarted on the new binary. To bring the TUI back up, run from

@@ -53,14 +53,27 @@ def _session_uid() -> str:
     return os.environ.get("CM_TUI_SESSION_ID", "").strip()
 
 
-def _report_turn_ended(uid: str) -> None:
-    """Best-effort `session.turn_ended` self-report."""
+def _report_turn_ended(uid: str, transcript_path: str | None = None) -> None:
+    """Best-effort `session.turn_ended` self-report.
+
+    `transcript_path` is the file Claude Code names in this hook's stdin
+    payload — the only exact, live answer to "which conversation is this
+    session in". The daemon re-stamps it as the session's resume key, so a
+    restart resumes the CURRENT conversation instead of whatever id was
+    recorded at spawn (which goes stale on /clear, /compact, or a fork, and
+    then silently resumes the wrong history). The daemon bounds the claim to
+    this session's own transcript directory; sending it is safe and
+    best-effort like everything else here.
+    """
     try:
         from mcp_server import control_client
 
+        params = {"session_uid": uid}
+        if transcript_path:
+            params["transcript_path"] = transcript_path
         control_client.call(
             "session.turn_ended",
-            {"session_uid": uid},
+            params,
             timeout=TURN_ENDED_TIMEOUT_S,
         )
     except Exception:  # noqa: BLE001 — fail open, always
@@ -105,19 +118,30 @@ def _drain_inbox(uid: str) -> list[str]:
 
 def main() -> int:
     try:
-        # Consume stdin fully (Claude Code pipes the hook input JSON;
-        # its content isn't needed for the uid — env is authoritative —
-        # but an unread pipe can raise BrokenPipeError on the writer).
+        # Consume stdin fully (an unread pipe can raise BrokenPipeError on
+        # the writer). The uid still comes from the env, which is
+        # authoritative, but the payload carries `transcript_path` — the
+        # live resume key we forward below. Malformed or absent JSON just
+        # means no path; the turn-end report goes out either way.
+        transcript_path = None
         try:
-            sys.stdin.read()
+            raw = sys.stdin.read()
         except OSError:
+            raw = ""
+        try:
+            payload = json.loads(raw) if raw.strip() else None
+            if isinstance(payload, dict):
+                value = payload.get("transcript_path")
+                if isinstance(value, str) and value.strip():
+                    transcript_path = value.strip()
+        except ValueError:
             pass
 
         uid = _session_uid()
         if not uid:
             return 0  # not a cm session — nothing to do
 
-        _report_turn_ended(uid)
+        _report_turn_ended(uid, transcript_path)
 
         messages = _drain_inbox(uid)
         if messages:

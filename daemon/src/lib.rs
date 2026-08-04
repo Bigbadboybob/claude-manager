@@ -408,10 +408,31 @@ pub fn run() -> anyhow::Result<()> {
             ),
         }
     }
-    if !initial_state.base_workflow_definitions.is_empty() {
-        match mcp_config::run_mcp_preflight(server_override) {
-            Ok(summary) => eprintln!("cm-daemon: MCP preflight OK: {}", summary),
-            Err(msg) => eprintln!("cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED\n{}", msg),
+    // Runs UNCONDITIONALLY (fix-loud-preflight). It used to be gated on
+    // "this daemon has workflow definitions", which framed a broken MCP
+    // server as a workflow-only problem. It isn't: the same interpreter runs
+    // the cm Stop hook that every claude session reports `session.turn_ended`
+    // through, so a failed preflight means EVERY spawned session stays
+    // `transcript_id: null` and never gets marked ready — live agents doing
+    // real work, invisible in the sidebar. Observed 2026-08-03, where the
+    // only signal was this warning in a log nobody was reading.
+    //
+    // The result is also RETAINED on the state so it can be asked for over
+    // the socket (operator `ping`) instead of having to be found by grepping
+    // a log — that is what makes a redeploy verifiable.
+    match mcp_config::run_mcp_preflight(server_override) {
+        Ok(summary) => {
+            eprintln!("cm-daemon: MCP preflight OK: {}", summary);
+            initial_state.mcp_preflight = Some(Ok(summary));
+        }
+        Err(msg) => {
+            eprintln!(
+                "cm-daemon: \u{26a0}\u{fe0f}  MCP PREFLIGHT FAILED — every session spawned by \
+                 this daemon will have a dead MCP server AND a dead cm Stop hook, so sessions \
+                 will run but never appear ready in the TUI.\n{}",
+                msg
+            );
+            initial_state.mcp_preflight = Some(Err(msg));
         }
     }
     // The path the TUI dials for a dedicated attach connection.
