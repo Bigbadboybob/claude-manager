@@ -1272,9 +1272,9 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             session_id: None,
             blocked_at: None,
             is_cloud: false,
-            workspace_id: Some(workspace_id_for_new),
+            workspace_id: Some(workspace_id_for_new.clone()),
             project: project_for_local.clone(),
-            parent_task_id: Some(parent_task_id),
+            parent_task_id: Some(parent_task_id.clone()),
             worktree_mode: crate::app::parse_worktree_mode(&p.worktree_mode),
             metadata: None,
         });
@@ -1293,6 +1293,43 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     // Post-fix: edge is live the moment `create_subtask`
     // returns. Mirrors the launch_* paths which call this at
     // the tail for the same reason.
+    //
+    // fix-launch-mcmp: that push is FIRE-AND-FORGET (a channel send to
+    // `PushWorker`), so "the moment `create_subtask` returns" was never
+    // true for the tightest caller — `mcp_start_session(isolated=true)`
+    // calls `create_subtask` here and `mcp_start_session` on the DAEMON
+    // socket microseconds later, beating the push and bouncing with
+    // `unauthorized: task '<id>' is not the caller's task or a
+    // descendant`. The synchronous registration below seeds the same
+    // state the daemon's own `create_subtask` seeds inline (auth edge +
+    // task→workspace binding + worktree path), so the spawn resolves both
+    // its scope and its working directory. It is recorded as an
+    // `agent_task_edges` overlay entry, which survives the replace-not-
+    // merge pushes and daemon restarts — the async push alone would be
+    // undone by the next reconcile that doesn't know the parent link yet.
+    let subtask_host = app
+        .workspaces
+        .iter()
+        .find(|w| w.id == workspace_id_for_new)
+        .map(|w| w.host_id.clone())
+        .unwrap_or_else(cm_daemon::host_id::HostId::local);
+    if let Err(e) = app.register_agent_subtask_with_daemon(
+        &subtask_host,
+        &new_task_id,
+        &parent_task_id,
+        &workspace_id_for_new,
+        Some(worktree_path.as_path()),
+    ) {
+        // Non-fatal: the API row and the worktree both exist, so failing
+        // the call would strand them. The agent is back to racing the
+        // async push (today's behavior), which is worse than the fix but
+        // better than a spurious error on a subtask that was created.
+        eprintln!(
+            "cm-tui: create_subtask: synchronous daemon registration for task {} failed: {} \
+             (falling back to the async task-tree push)",
+            new_task_id, e,
+        );
+    }
     app.push_task_tree_to_daemon();
     Ok(json!({
         "task_id": new_task_id,

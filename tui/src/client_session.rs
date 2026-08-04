@@ -1688,6 +1688,36 @@ pub fn rpc_workflow_update_definitions(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// Tell the daemon SYNCHRONOUSLY about a subtask `create_subtask` just
+/// minted (fix-launch-mcmp). The regular task-tree push goes through
+/// `PushWorker`, which is fire-and-forget — an agent that calls
+/// `create_subtask` and then immediately spawns into the subtask (what
+/// `mcp_start_session(isolated=true)` does within a single MCP tool call)
+/// beats the push to the daemon and gets `unauthorized: task '<id>' is not
+/// the caller's task or a descendant`. This call is on the create path, so
+/// the edge is live before `create_subtask` returns to the agent.
+pub fn rpc_register_agent_subtask(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    task_id: &str,
+    parent_task_id: &str,
+    workspace_id: &str,
+    worktree_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "task.register_agent_subtask".into(),
+        params: serde_json::json!({
+            "task_id": task_id,
+            "parent_task_id": parent_task_id,
+            "workspace_id": workspace_id,
+            "worktree_path": worktree_path.map(|p| p.display().to_string()),
+        }),
+    };
+    rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
 pub fn rpc_task_update_tree(
     daemon_socket: &Path,
     operator_token_id: &str,
@@ -2323,6 +2353,45 @@ mod tests {
             assert_eq!(
                 s.task_tree.get("task-grandchild"),
                 Some(&Some("task-child".to_string()))
+            );
+        }
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// fix-launch-mcmp: the create-path registration has to be reachable
+    /// over the wire as an Operator and land the auth edge in one round
+    /// trip — that synchronous landing is the entire point (the async
+    /// `PushWorker` path is what `start_session(isolated=true)` was
+    /// outrunning). Covers dispatch routing + the operator gate + the
+    /// state writes together; the unit tests in `daemon::control::methods`
+    /// cover the push-survival and inherit-mode semantics.
+    #[test]
+    fn rpc_register_agent_subtask_lands_in_daemon_state() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-register-subtask");
+        rpc_register_agent_subtask(
+            &socket,
+            "op-register",
+            "task-sub",
+            "task-orch",
+            "ws-sub",
+            Some(Path::new("/tmp/wt-sub")),
+        )
+        .expect("register ok");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(
+                s.task_tree.get("task-sub"),
+                Some(&Some("task-orch".to_string())),
+                "descendant walk must resolve with no task.update_tree push",
+            );
+            assert!(s.agent_task_edges.contains_key("task-sub"));
+            assert_eq!(s.bindings.get("task-sub"), Some(&"ws-sub".to_string()));
+            assert_eq!(
+                s.workspaces
+                    .get("ws-sub")
+                    .and_then(|w| w.worktree_path.clone()),
+                Some(std::path::PathBuf::from("/tmp/wt-sub")),
             );
         }
         stop_test_daemon(&socket, stop, handle);

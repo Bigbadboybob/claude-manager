@@ -356,6 +356,14 @@ pub fn dispatch_request(
         // rewrite the tree.
         "task.update_tree" => DispatchOutcome::Done(dispatch_task_update_tree(state, req)),
 
+        // fix-launch-mcmp: the TUI's SYNCHRONOUS "I just minted this
+        // subtask" registration, closing the window where the async
+        // task-tree push hasn't landed yet. Operator-only — same
+        // rationale as task.update_tree.
+        "task.register_agent_subtask" => {
+            DispatchOutcome::Done(dispatch_register_agent_subtask(state, req))
+        }
+
         // 10d-1: TUI-pushed session snapshot so the daemon
         // can recognize TUI-minted sessions for the future
         // workflow-method auth (10d-2). Operator-only — same
@@ -1401,6 +1409,27 @@ fn dispatch_task_update_tree(
         return resp;
     }
     match methods::task_update_tree(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `task.register_agent_subtask` — the TUI's synchronous
+/// registration of a subtask it just minted (fix-launch-mcmp).
+/// Operator-only: a Session caller able to name its own parent
+/// edge would be granting itself descendant scope over any task.
+fn dispatch_register_agent_subtask(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "task.register_agent_subtask is Operator-callable only — a Session \
+         caller registering its own parent edge could escape its auth scope",
+    ) {
+        return resp;
+    }
+    match methods::register_agent_subtask(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

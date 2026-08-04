@@ -2848,6 +2848,87 @@ pub fn task_update_tree(
 }
 
 // ============================================================
+// task.register_agent_subtask (fix-launch-mcmp)
+// ============================================================
+//
+// The TUI-served `create_subtask` mints a subtask and then relies on
+// `push_task_tree_to_daemon` to teach the daemon about it. That push is
+// FIRE-AND-FORGET (a channel send to `PushWorker`), so it loses a race it
+// cannot win: `mcp_start_session(isolated=true)` calls `create_subtask` on
+// the TUI socket and — in the same MCP tool call, microseconds later —
+// `mcp_start_session` on the DAEMON socket. The daemon has never heard of
+// the subtask yet, so the spawn bounces with `unauthorized: task '<id>' is
+// not the caller's task or a descendant`, and the operator sees "the
+// session launcher is broken" (it isn't — retrying seconds later works).
+//
+// This method is the TUI's synchronous counterpart to the registration
+// block the daemon's OWN `create_subtask` does inline: it seeds the same
+// four pieces of state, so the very next `start_session` resolves both the
+// descendant walk AND the spawn's working directory. Recording the
+// `agent_task_edges` overlay (rather than only a `task_tree` edge) is what
+// makes it durable: the overlay is re-applied after every replace-not-merge
+// `task.update_tree` push, persists in `daemon-sessions.json`, and
+// rehydrates on daemon restart — so a reconcile that lands before planning
+// knows the parent link can't silently un-authorize the creator.
+//
+// Operator-only, exactly like `task.update_tree`: a Session caller that
+// could register arbitrary parent edges would be handing itself auth scope
+// over tasks it doesn't own.
+
+#[derive(Deserialize)]
+struct RegisterAgentSubtaskParams {
+    task_id: String,
+    parent_task_id: String,
+    workspace_id: String,
+    /// Worktree the subtask's sessions spawn into. Upserted onto
+    /// `state.workspaces[workspace_id]` with the same merge-not-replace
+    /// semantics `task.update_tree` uses, so a subtask that reuses its
+    /// parent's workspace (`worktree_mode="inherit"`) can omit it and
+    /// leave the existing entry alone.
+    #[serde(default)]
+    worktree_path: Option<String>,
+}
+
+pub fn register_agent_subtask(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: RegisterAgentSubtaskParams =
+        serde_json::from_value(params.clone()).map_err(|e| {
+            (
+                ErrorCode::InvalidParams,
+                format!("task.register_agent_subtask params: {}", e),
+            )
+        })?;
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(path) = p.worktree_path {
+        let entry = state
+            .workspaces
+            .entry(p.workspace_id.clone())
+            .or_insert_with(|| crate::manifest::ManifestWorkspace {
+                id: p.workspace_id.clone(),
+                worktree_path: None,
+                ..Default::default()
+            });
+        entry.worktree_path = Some(std::path::PathBuf::from(path));
+    }
+    // `record_agent_task_edge` seeds BOTH the durable overlay and the
+    // immediate `task_tree` edge the descendant walk reads.
+    state.record_agent_task_edge(&p.task_id, &p.parent_task_id);
+    state
+        .task_workspaces
+        .insert(p.task_id.clone(), p.workspace_id.clone());
+    // `bindings` is the durable half of the pair: `task.update_tree`
+    // CLEARS `task_workspaces` on every push (full replace from a TUI
+    // snapshot that may not know this subtask yet) but never touches
+    // `bindings`, which is also what keeps the workspace itself off that
+    // handler's GC list until the subtask's first session spawns.
+    state.bindings.insert(p.task_id.clone(), p.workspace_id);
+    state.persist_sessions_best_effort();
+    Ok(json!({ "ok": true }))
+}
+
+// ============================================================
 // tui.update_sessions_snapshot (10d-1)
 // ============================================================
 //
@@ -12821,6 +12902,123 @@ mod tests {
             );
             assert!(!s.agent_task_edges.contains_key("task-proposed"));
         }
+    }
+
+    /// fix-launch-mcmp: `task.register_agent_subtask` is what the TUI's
+    /// `create_subtask` calls SYNCHRONOUSLY, in place of trusting the
+    /// fire-and-forget `PushWorker` snapshot to land first. The contract is
+    /// that the very next `mcp_start_session(task_id=<subtask>)` — issued
+    /// microseconds later by `start_session(isolated=true)`, before any push
+    /// could plausibly arrive — resolves BOTH halves of the spawn: the
+    /// descendant walk (`task_tree`) and the working directory
+    /// (`task_workspaces`/`bindings` → `workspaces[..].worktree_path`).
+    #[test]
+    fn register_agent_subtask_authorizes_an_immediate_spawn() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        register_agent_subtask(
+            &state,
+            &json!({
+                "task_id": "task-sub",
+                "parent_task_id": "task-orch",
+                "workspace_id": "ws-sub",
+                "worktree_path": "/tmp/wt-sub",
+            }),
+        )
+        .expect("register ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                crate::control::auth::task_is_self_or_descendant_of(
+                    &s.task_tree,
+                    "task-sub",
+                    "task-orch",
+                ),
+                "the creator must be authorized for its subtask with no push at all",
+            );
+            assert_eq!(s.task_workspaces.get("task-sub"), Some(&"ws-sub".to_string()));
+            assert_eq!(s.bindings.get("task-sub"), Some(&"ws-sub".to_string()));
+            assert_eq!(
+                s.workspaces
+                    .get("ws-sub")
+                    .and_then(|w| w.worktree_path.clone()),
+                Some(std::path::PathBuf::from("/tmp/wt-sub")),
+                "the spawn's working_dir must resolve without waiting for a push",
+            );
+        }
+
+        // The push that eventually lands does NOT know the subtask yet
+        // (planning's poll hasn't caught up). It must not un-authorize the
+        // spawn, and its workspace GC must not reap the subtask's worktree.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [{"task_id": "task-orch", "parent_task_id": null, "workspace_id": "ws-orch"}],
+                "workspaces": [{"workspace_id": "ws-orch", "worktree_path": "/tmp/wt-orch"}],
+            }),
+        )
+        .expect("push ok");
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                crate::control::auth::task_is_self_or_descendant_of(
+                    &s.task_tree,
+                    "task-sub",
+                    "task-orch",
+                ),
+                "the overlay entry must survive the replace-not-merge push",
+            );
+            // `task_workspaces` is cleared by every push; `bindings` is the
+            // durable half `mcp_start_session` falls back to.
+            assert_eq!(s.bindings.get("task-sub"), Some(&"ws-sub".to_string()));
+            assert_eq!(
+                s.workspaces
+                    .get("ws-sub")
+                    .and_then(|w| w.worktree_path.clone()),
+                Some(std::path::PathBuf::from("/tmp/wt-sub")),
+                "a bound workspace is off the push handler's GC list",
+            );
+        }
+    }
+
+    /// `worktree_mode="inherit"` reuses the PARENT's workspace, so the TUI
+    /// sends no `worktree_path` — registering the auth edge must not blank
+    /// out the path the parent's workspace already carries.
+    #[test]
+    fn register_agent_subtask_without_worktree_path_preserves_existing() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.insert(
+                "ws-parent".to_string(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-parent".to_string(),
+                    worktree_path: Some(std::path::PathBuf::from("/tmp/wt-parent")),
+                    ..Default::default()
+                },
+            );
+        }
+        register_agent_subtask(
+            &state,
+            &json!({
+                "task_id": "task-sub",
+                "parent_task_id": "task-orch",
+                "workspace_id": "ws-parent",
+            }),
+        )
+        .expect("register ok");
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.workspaces
+                .get("ws-parent")
+                .and_then(|w| w.worktree_path.clone()),
+            Some(std::path::PathBuf::from("/tmp/wt-parent")),
+            "an omitted worktree_path must leave the inherited workspace intact",
+        );
+        assert!(crate::control::auth::task_is_self_or_descendant_of(
+            &s.task_tree,
+            "task-sub",
+            "task-orch",
+        ));
     }
 
     #[test]

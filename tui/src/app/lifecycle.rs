@@ -1605,6 +1605,49 @@ impl App {
         self.push_worker.push_task_tree(tasks, workspaces, hosts);
     }
 
+    /// Register a just-minted subtask with its host daemon SYNCHRONOUSLY
+    /// (fix-launch-mcmp). `push_task_tree_to_daemon` above hands the
+    /// snapshot to `PushWorker` and returns immediately, which is right for
+    /// the steady-state pushes it was built for and WRONG for a mint the
+    /// caller is about to act on: `mcp_start_session(isolated=true)` calls
+    /// `create_subtask` on the TUI socket and `mcp_start_session` on the
+    /// daemon socket inside one MCP tool call, so the spawn reaches the
+    /// daemon before the push does and bounces with `unauthorized: task
+    /// '<id>' is not the caller's task or a descendant`.
+    ///
+    /// Blocking here is safe: the control-socket handler that calls this
+    /// already blocks on the planning API's `create_task` and on `git
+    /// worktree add`, both orders of magnitude slower than a unix-socket
+    /// round trip, and `rpc_round_trip` bounds the read/write anyway.
+    pub(crate) fn register_agent_subtask_with_daemon(
+        &self,
+        host_id: &cm_daemon::host_id::HostId,
+        task_id: &str,
+        parent_task_id: &str,
+        workspace_id: &str,
+        worktree_path: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        let daemon_socket = self
+            .host_pool
+            .for_host(host_id)
+            .map_err(|e| {
+                format!("host_pool.for_host({}) unavailable: {}", host_id.as_str(), e)
+            })?
+            .socket_path()
+            .ok_or_else(|| {
+                format!("host_pool.for_host({}) has no live socket path", host_id.as_str())
+            })?;
+        crate::client_session::rpc_register_agent_subtask(
+            &daemon_socket,
+            crate::daemon_launch::operator_token(),
+            task_id,
+            parent_task_id,
+            workspace_id,
+            worktree_path,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// Bulk session removal that preserves the tombstone invariant.
     /// Walks `ws.sessions`, tombstones each entry where `should_drop`
     /// returns true, marks the PTY exited, and removes it. Use this
