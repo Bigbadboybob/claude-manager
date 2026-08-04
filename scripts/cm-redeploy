@@ -33,8 +33,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-DAEMON_BINARY="$REPO_ROOT/target/release/cm-daemon"
-TUI_BINARY="$REPO_ROOT/target/release/claude-manager-tui"
+# Ask cargo where the build actually lands rather than assuming
+# "$REPO_ROOT/target". Builds go to a shared target-dir now
+# (.cargo/config.toml → ~/.cm/shared-target) so agent worktrees stop
+# duplicating artifacts; only the main checkout has a `target` symlink, so
+# the old assumption made this script unusable from any worktree. Reading
+# it from `cargo metadata` picks up .cargo/config.toml and
+# CARGO_TARGET_DIR alike; the fallback keeps a cargo-less environment
+# working the way it always did.
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
+    || true)
+[ -n "$TARGET_DIR" ] || TARGET_DIR="$REPO_ROOT/target"
+
+DAEMON_BINARY="$TARGET_DIR/release/cm-daemon"
+TUI_BINARY="$TARGET_DIR/release/claude-manager-tui"
 DAEMON_LOG="$HOME/.cm/daemon.log"
 
 # Remote daemon host (the always-on cm-manager VM). Deploying there is
@@ -113,8 +126,28 @@ DAEMON_BIN_MTIME=$(stat -c %Y "$DAEMON_BINARY")
 DAEMON_BIN_HUMAN=$(date -d "@$DAEMON_BIN_MTIME" '+%Y-%m-%d %H:%M:%S')
 
 step "current daemon state"
-DAEMON_PID=$(pgrep -f "/target/release/cm-daemon$" | head -1 || true)
+# Path-agnostic on purpose. These used to anchor on "/target/release/…",
+# which silently stopped matching when the build moved to a shared
+# target-dir: the TUI launches the daemon from
+# ~/.cm/shared-target/release/cm-daemon, and the "-" before "target" kills
+# the match. The failure mode was nasty — no daemon found, so the
+# freshness check and kill-list preview were both skipped, the TUI was
+# killed anyway (its pattern still matched), and the "fresh" daemon then
+# died on bind because the stale one still owned the socket. Net: TUI
+# dead, stale daemon still serving, no code reloaded.
+DAEMON_PID=$(pgrep -f "release/cm-daemon$" | head -1 || true)
 if [ -z "$DAEMON_PID" ]; then
+    # Nothing matched — but is the socket actually free? If something is
+    # still listening we'd kill the TUI and then fail on bind, which is
+    # exactly the damage described above. Bail while it's still cheap.
+    if [ -S "$HOME/.cm/daemon.sock" ] && command -v ss >/dev/null 2>&1 \
+        && ss -lx 2>/dev/null | grep -q "$HOME/.cm/daemon.sock"; then
+        echo "ERROR: no cm-daemon process matched, but $HOME/.cm/daemon.sock is still" >&2
+        echo "       being listened on. Something owns that socket under a name this" >&2
+        echo "       script doesn't recognize. Refusing to kill the TUI and fail on bind." >&2
+        echo "       Find it with: ss -lxp | grep daemon.sock" >&2
+        exit 1
+    fi
     echo "no running cm-daemon found; will start fresh"
     DAEMON_START_EPOCH=0
 else
@@ -133,7 +166,7 @@ else
     echo "binary newer by:   ${AGE_SECS}s"
 fi
 
-TUI_PID=$(pgrep -f "/target/release/claude-manager-tui$" | head -1 || true)
+TUI_PID=$(pgrep -f "release/claude-manager-tui$" | head -1 || true)
 if [ -n "$TUI_PID" ]; then
     TUI_START_HUMAN=$(ps -p "$TUI_PID" -o lstart= | xargs)
     echo "TUI PID:           $TUI_PID  (started $TUI_START_HUMAN)"
