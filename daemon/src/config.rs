@@ -175,6 +175,28 @@ pub struct SchedulerConfig {
     /// per-task `max_runtime_secs` (the watchdog).
     #[serde(default)]
     pub persistent_max_stall_secs: Option<u32>,
+    /// Consumer-wedge watchdog (2026-08-03 incident): a Consumer task whose
+    /// active run is still `Running` while its live session's transcript ends
+    /// in a COMPLETED turn (or a delivered-but-unanswered prompt) and has been
+    /// quiet for this many SECONDS is wedged — the agent finished (or died)
+    /// without `report_done`, and the run-active due-gate would otherwise skip
+    /// every future fire forever. The scheduler auto-closes such a run
+    /// (`Running → Failed`, a `"wedge_closed"` runs.jsonl line, an operator
+    /// alert) so the due-gate refires naturally — bounded by
+    /// [`SchedulerConfig::wedge_close_limit`]. Must comfortably exceed the
+    /// longest legitimate "turn ended, waiting for a monitor wake" gap (a
+    /// worker the orchestrator parked on can run ~25 min). `0` = OFF.
+    /// Default `3600` (1 h — the incident wedge lasted 3.5 DAYS).
+    #[serde(default = "default_scheduler_wedge_grace_secs")]
+    pub consumer_wedge_grace_secs: u64,
+    /// Consecutive wedge auto-closes (no intervening clean completion) after
+    /// which the scheduler STOPS closing and escalates instead — a repeatedly
+    /// wedging consumer means something systemic, and every auto-close+refire
+    /// claims (and acks) real queue items into a broken orchestrator. The
+    /// counter is `ContinuousTask::consecutive_wedge_closes`, reset by
+    /// `report_done` / a clean exit / an operator `force_done`. Default `3`.
+    #[serde(default = "default_scheduler_wedge_close_limit")]
+    pub wedge_close_limit: u32,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -210,6 +232,21 @@ fn default_scheduler_investigator_runtime_secs() -> u32 {
     600
 }
 
+fn default_scheduler_wedge_grace_secs() -> u64 {
+    // 1 hour of post-turn silence before a Running consumer run is judged
+    // wedged. Longest legitimate silent gap is a monitor-parked worker
+    // (~25 min budget) + delivery slack; 1 h leaves >2× headroom while
+    // detecting in 1 h what the 2026-08-03 incident left invisible for 3.5 d.
+    3600
+}
+
+fn default_scheduler_wedge_close_limit() -> u32 {
+    // Three consecutive auto-closes, then escalate: enough to self-heal a
+    // flaky missed report_done, few enough that a systemically-broken
+    // consumer doesn't burn its queue via close→refire churn.
+    3
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -220,6 +257,8 @@ impl Default for SchedulerConfig {
             max_investigations: default_scheduler_max_investigations(),
             default_investigator_runtime_secs: default_scheduler_investigator_runtime_secs(),
             persistent_max_stall_secs: None,
+            consumer_wedge_grace_secs: default_scheduler_wedge_grace_secs(),
+            wedge_close_limit: default_scheduler_wedge_close_limit(),
         }
     }
 }
@@ -290,6 +329,17 @@ pub struct DaemonConfig {
     /// `#[serde(default)]` so a `daemon.toml` predating it still loads.
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    /// Operator push-alert command (see `crate::notify::notify_operator`).
+    /// When set, daemon escalations (auth expiry, wedged consumer runs, stuck
+    /// escalations, circuit-breaker pauses, persistent stalls) exec this with
+    /// the alert message as the single argument and `CM_NOTIFY_TAG` in the
+    /// env — on cm-manager, `/home/lucas/.cm/bin/cm-notify` (the Telegram
+    /// script). Use an ABSOLUTE path: the systemd unit's PATH is minimal.
+    /// `None`/empty (default) = alerts land on stderr (journal) only. Born
+    /// from the 2026-08-03 auth-expiry incident, where every failure was
+    /// logged and nothing was pushed.
+    #[serde(default)]
+    pub notify_command: Option<String>,
 }
 
 impl DaemonConfig {
@@ -321,6 +371,7 @@ impl Default for DaemonConfig {
             allow_clone: false,
             repos: Vec::new(),
             scheduler: SchedulerConfig::default(),
+            notify_command: None,
         }
     }
 }
@@ -611,6 +662,7 @@ mode = "ssh-trust"
                 url: "https://github.com/u/claude-manager.git".into(),
             }],
             scheduler: SchedulerConfig::default(),
+            notify_command: None,
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =

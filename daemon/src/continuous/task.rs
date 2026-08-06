@@ -252,6 +252,14 @@ pub struct ContinuousTask {
     /// auto-escalates (last_run → Stuck) instead of spawning another.
     #[serde(default)]
     pub investigation_count: u32,
+    /// Consumer-wedge watchdog: consecutive runs the scheduler auto-closed
+    /// because the session's turn ended without `report_done`
+    /// (`scheduler::auth_wedge_pass`). At `[scheduler] wedge_close_limit` the
+    /// scheduler escalates instead of closing (a chronic wedger burns queue
+    /// items on every close→refire). Reset to `0` by `report_done`, a clean
+    /// session exit, and an operator `continuous.force_done`.
+    #[serde(default)]
+    pub consecutive_wedge_closes: u32,
     /// Phase 3b (stuck-story watchdog): the session_uid of the live investigator
     /// the watchdog spawned for the current stuck run, if any. `Some(_)` means
     /// an investigation is in flight (the watchdog does nothing while it is
@@ -333,6 +341,7 @@ impl ContinuousTask {
             mem_cap_bytes: None,
             consecutive_failures: 0,
             investigation_count: 0,
+            consecutive_wedge_closes: 0,
             investigator_uid: None,
             investigator_started_at: None,
             downstream: Vec::new(),

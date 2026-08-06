@@ -171,6 +171,24 @@ Never disable the old job until the new task has fired a real cycle successfully
 
 ---
 
+## 8b. Push alerts + the auth/wedge watchdog (2026-08-03 incident)
+
+Backstory: cm-manager's `~/.claude/.credentials.json` got truncated at 04:18; the momentum-detective and scraper-creation consumer runs wedged `Running` for **3.5 days** with every failure surfaced (journal + runs.jsonl) and nothing pushed. Two daemon guards now exist, plus a push channel:
+
+- **Push channel** — set in `~/.cm/daemon.toml` (top level, absolute path; the systemd PATH is minimal):
+
+  ```toml
+  notify_command = "/home/lucas/.cm/bin/cm-notify"
+  ```
+
+  Unset (the default) = alerts land on stderr/journal only. The command gets the message as its one argument and the source as `CM_NOTIFY_TAG`. It now fires on: auth expiry, consumer wedges, `escalate_stuck`, the consecutive-failure circuit breaker, and persistent stalls.
+
+- **Auth-expiry detection** (always on, claude-engine tasks) — the scheduler tail-reads the active run's transcript and matches the synthetic `authentication_failed` record ("Login expired · Please run /login"). One push per task per 6 h while it persists (`runs.jsonl` event `auth_expired`). The run is **deliberately left `Running`**: the run-active gate is what stops further fires from claiming+acking queue batches into a dead session. Recovery: `/login` on the daemon host, then `continuous.force_done {task_id, seq}` (the alert names both). Note the Stop hook does NOT run on auth-error turns, which is why this reads transcripts instead.
+- **Credentials preflight** (always on when any claude continuous task is enabled) — `~/.claude/.credentials.json` existing but truncated/unparseable/token-less alerts within ~60 s of the file breaking, before any session proves it. A missing file is fine (keychain/API-key setups).
+- **Consumer-wedge watchdog** (`[scheduler] consumer_wedge_grace_secs`, default 3600, `0` = off) — a Consumer run still `Running` whose live session's transcript ends in a *completed turn* (or a delivered prompt with no response) and has been quiet past the grace = the agent finished without `report_done`. The scheduler auto-closes it (`Running → Failed`, event `wedge_closed`, push) so the due-gate refires — up to `[scheduler] wedge_close_limit` (default 3) consecutive times; past that it escalates once (`wedge_escalated`, run left `Running` to stop close→refire from burning queue items) and waits for you. `report_done` / a clean exit / `force_done` reset the streak. Long-running cycles are safe: a mid-turn transcript (e.g. a blocking `wait_for_session_idle`) is never judged wedged, and the 1 h grace clears monitor-wake gaps (workers run ≤25 min).
+
+---
+
 ## Continuous-column glyph legend
 
 What each session row (and sub-line) in the TUI's Continuous column (`A-c`) means:

@@ -94,6 +94,25 @@ const CONSUMER_REFIRE_SPACING_SECS: u64 = 60;
 /// log per queue per TTL, not four per second.
 const QUEUE_DEPTH_CACHE_TTL_SECS: u64 = 30;
 
+/// How often (seconds) the auth/wedge pass re-reads a given task's transcript
+/// tail. The pass runs every tick (250 ms) but tail reads are file I/O +
+/// JSON parsing; per-task throttling keeps the steady-state cost at one small
+/// read per task per interval. Detection latency is dominated by the wedge
+/// grace / alert cooldowns, so 30 s adds nothing observable.
+const TAIL_PROBE_INTERVAL_SECS: u64 = 30;
+
+/// Auth-expiry alert cooldown (seconds) — per task. A persistent PERIODIC
+/// task keeps re-firing into an auth-dead session (its due-gate has no
+/// run-active block), minting a fresh 401 record each period; a
+/// record-identity latch would therefore re-alert every period. Cooldown
+/// instead: one push per task per window while the condition persists, and a
+/// healthy turn clears the latch so a NEW episode alerts immediately.
+const AUTH_REALERT_SECS: u64 = 6 * 3600;
+
+/// How often (seconds) the credentials preflight re-checks
+/// `~/.claude/.credentials.json`.
+const CREDS_CHECK_INTERVAL_SECS: u64 = 60;
+
 /// Post-compact settle spacing (seconds). A compact-only fire delivers
 /// `/compact`, whose summarization turn is async and can outlast a few
 /// minutes; a prompt pasted into the PTY mid-summarization is DROPPED by the
@@ -156,6 +175,22 @@ pub struct ContinuousScheduler {
     /// due-check between API polls ([`QUEUE_DEPTH_CACHE_TTL_SECS`]). In-memory
     /// only — a restart just re-polls.
     queue_depths: Mutex<HashMap<String, (u64, u64)>>,
+    /// Auth/wedge transcript-probe throttle: `task_id -> last probe ts`
+    /// ([`TAIL_PROBE_INTERVAL_SECS`]). In-memory only.
+    probe_at: Mutex<HashMap<String, u64>>,
+    /// Auth-expiry alert cooldown latch: `task_id -> last alert ts`
+    /// ([`AUTH_REALERT_SECS`]); cleared when the task's transcript shows a
+    /// healthy (non-auth-error) tail again. In-memory only — a restart
+    /// re-alerts a still-dead session once, which is the desired behavior.
+    auth_alerts: Mutex<HashMap<String, u64>>,
+    /// Wedge-escalation one-shot latch: `task_id -> run seq already escalated`
+    /// (past the wedge-close limit the run is deliberately LEFT `Running`, so
+    /// without this the pass would re-escalate the same run every probe).
+    wedge_escalations: Mutex<HashMap<String, u64>>,
+    /// Credentials-preflight throttle + cooldown: `(last check ts, last alert
+    /// ts)`. The alert half is a per-[`AUTH_REALERT_SECS`] cooldown, cleared
+    /// when the file is healthy again.
+    creds_state: Mutex<(u64, u64)>,
     /// Test-only: canned per-queue depths so scheduler tests drive the Consumer
     /// due-check without an HTTP server. `Some(map)` short-circuits
     /// `consumer_depth_snapshot` entirely (missing queues read as depth 0).
@@ -199,6 +234,10 @@ impl ContinuousScheduler {
             panic_record: Arc::new(Mutex::new(None)),
             stall_alerts: Mutex::new(HashMap::new()),
             queue_depths: Mutex::new(HashMap::new()),
+            probe_at: Mutex::new(HashMap::new()),
+            auth_alerts: Mutex::new(HashMap::new()),
+            wedge_escalations: Mutex::new(HashMap::new()),
+            creds_state: Mutex::new((0, 0)),
             #[cfg(test)]
             depth_override: Mutex::new(None),
             #[cfg(test)]
@@ -348,6 +387,20 @@ impl ContinuousScheduler {
         // transcript growth within the stall budget is wedged. Surfaces only
         // (no auto-act); off unless `persistent_max_stall_secs` is configured.
         self.persistent_stall_pass(&tasks, now);
+
+        // (c.3b) AUTH-EXPIRY + CONSUMER-WEDGE — transcript-tail ground truth
+        // for the two failure shapes the 2026-08-03 incident proved invisible:
+        // an auth-dead session (every fire guaranteed dead → push-alert, run
+        // deliberately left Running) and a Consumer run whose session ended
+        // its turn without report_done (auto-close so the due-gate refires,
+        // bounded by the wedge-close limit). A closed run is picked up by the
+        // NEXT tick's disk load — this tick's `tasks` snapshot predates it.
+        self.auth_wedge_pass(&tasks, now);
+
+        // (c.3c) CREDENTIALS PREFLIGHT — a truncated/invalid
+        // ~/.claude/.credentials.json makes every claude fire dead before any
+        // transcript says so; push-alert as soon as the file itself is broken.
+        self.credentials_preflight(&tasks, now);
 
         // (c.4) CONSUMER DEPTH SNAPSHOT (Phase 4) — poll the planning API's
         // queue stats for the queues of eligible Consumer tasks, throttled by
@@ -643,10 +696,14 @@ impl ContinuousScheduler {
     /// transcript mtime is past `last_fired_at` and this misses it — a safe
     /// direction (a miss, not a false alarm).
     fn persistent_stall_pass(&self, tasks: &[ContinuousTask], now: u64) {
-        let Some(budget) = ({
+        let (budget, notify_cmd) = {
             let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            s.config.scheduler.persistent_max_stall_secs
-        }) else {
+            (
+                s.config.scheduler.persistent_max_stall_secs,
+                s.config.notify_command.clone(),
+            )
+        };
+        let Some(budget) = budget else {
             return; // OFF (opt-in)
         };
         if budget == 0 {
@@ -705,12 +762,16 @@ impl ContinuousScheduler {
             }
 
             let stalled_secs = now.saturating_sub(tk.last_fired_at);
-            eprintln!(
-                "cm-daemon: continuous task {} STALLED — fired {}s ago (session {}) but \
-                 its transcript has not grown since; the orchestrator may be parked at \
-                 an interactive modal. Surfacing only; recovery is the operator's call \
-                 (kill the session → supervisor respawns + re-fires).",
-                tk.task_id, stalled_secs, uid,
+            crate::notify::notify_operator(
+                notify_cmd.as_deref(),
+                "persistent-stall",
+                &format!(
+                    "continuous task {} STALLED — fired {}s ago (session {}) but \
+                     its transcript has not grown since; the orchestrator may be parked at \
+                     an interactive modal. Surfacing only; recovery is the operator's call \
+                     (kill the session → supervisor respawns + re-fires).",
+                    tk.task_id, stalled_secs, uid,
+                ),
             );
             if let Err(e) = ContinuousRunLog::append(&RunLogLine {
                 seq: tk.last_run.as_ref().map(|r| r.seq).unwrap_or(tk.run_count as u64),
@@ -736,6 +797,391 @@ impl ContinuousScheduler {
                 );
             }
         }
+    }
+
+    /// (c.3b) Auth-expiry + consumer-wedge detection over transcript tails.
+    /// Both detectors ride ONE throttled tail probe per task
+    /// ([`TAIL_PROBE_INTERVAL_SECS`]) of the ACTIVE run's session transcript.
+    ///
+    /// Why not the Stop hook: an auth-error turn never runs Stop hooks
+    /// (verified in the 2026-08-03 incident transcript — healthy turns log a
+    /// `stop_hook_summary`, auth turns don't), so `session.turn_ended` is
+    /// blind exactly when it matters. Why not `persistent_stall_pass`: the
+    /// fire's own prompt delivery + the synthetic 401 record grow the
+    /// transcript PAST `last_fired_at`, so the mtime-vs-fire stall signal
+    /// reads "healthy" on an auth-dead session.
+    ///
+    /// Per task with a `Running` run on a LIVE claude session:
+    ///
+    ///   1. **Auth expiry** (any schedule / run mode): the newest assistant
+    ///      record is a synthetic `authentication_failed` message → runlog
+    ///      `"auth_expired"` + operator push alert (per-task
+    ///      [`AUTH_REALERT_SECS`] cooldown; healthy tail clears it). The run
+    ///      is deliberately LEFT `Running`: every subsequent fire is
+    ///      guaranteed dead, and for a Consumer the run-active due-gate is
+    ///      the only thing preventing fires from claiming+acking queue items
+    ///      into a dead session. Recovery is the operator's `/login` +
+    ///      `continuous.force_done` (the alert says exactly that).
+    ///   2. **Consumer wedge** (Consumer schedule, both run modes): the tail
+    ///      shows a COMPLETED turn (or a delivered-but-unanswered prompt) and
+    ///      NOTHING has happened for `[scheduler] consumer_wedge_grace_secs`
+    ///      — the agent finished without `report_done` and the due-gate would
+    ///      skip every future fire forever (the 3.5-day incident shape).
+    ///      Under `[scheduler] wedge_close_limit` consecutive closes:
+    ///      auto-close (`Running → Failed` + runlog `"wedge_closed"` + alert);
+    ///      the due-gate then refires naturally next tick. At the limit:
+    ///      escalate once per run (runlog `"wedge_escalated"` + alert) and
+    ///      leave the run `Running` so a chronically-broken consumer stops
+    ///      burning queue items on close→refire churn.
+    ///
+    /// A `MidTurn` tail (newest record is a healthy assistant record, e.g. a
+    /// long blocking tool call) is never touched. LOCK DISCIPLINE: brief
+    /// probes only; `task::modify` / notify spawns run lock-free.
+    fn auth_wedge_pass(&self, tasks: &[ContinuousTask], now: u64) {
+        use crate::continuous::probe::{self, TailShape};
+
+        let (grace, wedge_limit, notify_cmd) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                s.config.scheduler.consumer_wedge_grace_secs,
+                s.config.scheduler.wedge_close_limit,
+                s.config.notify_command.clone(),
+            )
+        };
+
+        for tk in tasks {
+            // Claude-only: the tail shapes (turn_duration records, the
+            // authentication_failed marker) are claude-code transcript vocab.
+            if tk.engine != task::Engine::Claude || !tk.enabled || tk.paused {
+                continue;
+            }
+            let Some(run) = tk.last_run.as_ref() else {
+                continue;
+            };
+            if run.status != RunStatus::Running {
+                continue;
+            }
+            let Some(uid) = run.session_uid.as_deref() else {
+                continue;
+            };
+            // A DEAD session's run is handle_session_exit / reconcile_orphans
+            // territory.
+            if self.session_is_dead(uid) {
+                continue;
+            }
+            // Per-task probe throttle.
+            {
+                let mut probes = self.probe_at.lock().unwrap_or_else(|p| p.into_inner());
+                let last = probes.get(&tk.task_id).copied().unwrap_or(0);
+                if now.saturating_sub(last) < TAIL_PROBE_INTERVAL_SECS {
+                    continue;
+                }
+                probes.insert(tk.task_id.clone(), now);
+            }
+            // No transcript bound yet / unreadable → can't judge, skip.
+            let Some(path) = self.session_transcript_path(uid) else {
+                continue;
+            };
+            let Some(mtime) = mtime_unix(&path) else {
+                continue;
+            };
+            let Some(tail) = probe::probe_transcript_tail(&path) else {
+                continue;
+            };
+
+            // --- 1. auth expiry (any schedule) ---
+            if let Some(banner) = tail.auth_error.as_deref() {
+                self.surface_auth_expiry(tk, run.seq, uid, banner, notify_cmd.as_deref(), now);
+                // NEVER fall through to the wedge close: the blocked due-gate
+                // is protecting queue items from dead fires.
+                continue;
+            }
+            self.auth_alerts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&tk.task_id);
+
+            // --- 2. consumer wedge ---
+            if grace == 0 || !matches!(tk.schedule, Schedule::Consumer { .. }) {
+                continue;
+            }
+            // Quiet window: nothing since the newest of (transcript growth,
+            // fire delivery, run start). `last_fired_at` guards the paste-
+            // in-flight window right after a fire whose prompt hasn't landed
+            // in the transcript yet.
+            let quiet_since = mtime.max(run.started_at).max(tk.last_fired_at);
+            if now.saturating_sub(quiet_since) < grace {
+                continue;
+            }
+            match tail.shape {
+                TailShape::MidTurn => continue, // long tool call — healthy
+                TailShape::TurnComplete | TailShape::AwaitingResponse => {}
+            }
+            let quiet_secs = now.saturating_sub(quiet_since);
+            if tk.consecutive_wedge_closes >= wedge_limit {
+                self.escalate_wedged_run(
+                    tk,
+                    run.seq,
+                    uid,
+                    quiet_secs,
+                    wedge_limit,
+                    notify_cmd.as_deref(),
+                    now,
+                );
+            } else {
+                self.close_wedged_run(tk, run.seq, uid, quiet_secs, wedge_limit, notify_cmd.as_deref(), now);
+            }
+        }
+    }
+
+    /// Auth-expiry surfacing: runlog `"auth_expired"` + push alert, at most
+    /// once per [`AUTH_REALERT_SECS`] per task while the condition persists.
+    fn surface_auth_expiry(
+        &self,
+        tk: &ContinuousTask,
+        seq: u64,
+        uid: &str,
+        banner: &str,
+        notify_cmd: Option<&str>,
+        now: u64,
+    ) {
+        {
+            let mut latch = self.auth_alerts.lock().unwrap_or_else(|p| p.into_inner());
+            let last = latch.get(&tk.task_id).copied().unwrap_or(0);
+            if now.saturating_sub(last) < AUTH_REALERT_SECS {
+                return;
+            }
+            latch.insert(tk.task_id.clone(), now);
+        }
+        crate::notify::notify_operator(
+            notify_cmd,
+            "auth-expired",
+            &format!(
+                "claude auth EXPIRED: continuous task '{}' (session {}) ended its turn \
+                 with \"{}\". Every scheduled fire is dead until /login is re-run on the \
+                 daemon host. Run seq {} is left Running to block further fires; after \
+                 re-login, close it with continuous.force_done(task_id=\"{}\", seq={}).",
+                tk.task_id, uid, banner, seq, tk.task_id, seq,
+            ),
+        );
+        if let Err(e) = ContinuousRunLog::append(&RunLogLine {
+            seq,
+            ts: now as f64,
+            task_id: tk.task_id.clone(),
+            event: "auth_expired".to_string(),
+            fire_token: tk.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: Some(uid.to_string()),
+            run_mode: None,
+            trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
+            status: Some("running".to_string()),
+            detail: Some(banner.to_string().into()),
+        }) {
+            eprintln!(
+                "cm-daemon: failed to append \"auth_expired\" audit line for {}: {}",
+                tk.task_id, e,
+            );
+        }
+    }
+
+    /// Wedge auto-close: `Running → Failed` (guarded on seq/uid/status so a
+    /// concurrent `report_done` / new fire wins), bump the consecutive-close
+    /// counter, audit + alert. The due-gate refires naturally next tick.
+    fn close_wedged_run(
+        &self,
+        tk: &ContinuousTask,
+        seq: u64,
+        uid: &str,
+        quiet_secs: u64,
+        wedge_limit: u32,
+        notify_cmd: Option<&str>,
+        now: u64,
+    ) {
+        let mut closed = false;
+        let mut closes = tk.consecutive_wedge_closes;
+        let _ = task::modify(&tk.task_id, |t| {
+            if let Some(run) = t.last_run.as_mut() {
+                if run.seq == seq
+                    && run.status == RunStatus::Running
+                    && run.session_uid.as_deref() == Some(uid)
+                {
+                    run.status = RunStatus::Failed;
+                    run.finished_at = Some(now);
+                    t.consecutive_wedge_closes = t.consecutive_wedge_closes.saturating_add(1);
+                    closes = t.consecutive_wedge_closes;
+                    closed = true;
+                }
+            }
+        });
+        if !closed {
+            return; // raced with report_done / a newer fire — nothing wedged
+        }
+        crate::notify::notify_operator(
+            notify_cmd,
+            "consumer-wedge",
+            &format!(
+                "continuous task '{}' run seq {} WEDGED: session {} ended its turn \
+                 without report_done and produced nothing for {}s. Auto-closed \
+                 (Running → Failed); the due-gate will refire. (consecutive close \
+                 {}/{} — at the limit the scheduler escalates instead)",
+                tk.task_id, seq, uid, quiet_secs, closes, wedge_limit,
+            ),
+        );
+        if let Err(e) = ContinuousRunLog::append(&RunLogLine {
+            seq,
+            ts: now as f64,
+            task_id: tk.task_id.clone(),
+            event: "wedge_closed".to_string(),
+            fire_token: tk.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: Some(uid.to_string()),
+            run_mode: None,
+            trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
+            status: Some("failed".to_string()),
+            detail: Some(
+                format!(
+                    "turn ended without report_done; quiet {}s (grace elapsed); \
+                     consecutive close {}/{}",
+                    quiet_secs, closes, wedge_limit,
+                )
+                .into(),
+            ),
+        }) {
+            eprintln!(
+                "cm-daemon: failed to append \"wedge_closed\" audit line for {}: {}",
+                tk.task_id, e,
+            );
+        }
+    }
+
+    /// Wedge escalation (close limit exhausted): one-shot per run seq. The run
+    /// is LEFT `Running` — with a chronically-wedging consumer, every further
+    /// close→refire claims and acks real queue items into a broken
+    /// orchestrator, so blocking fires is the protective choice.
+    fn escalate_wedged_run(
+        &self,
+        tk: &ContinuousTask,
+        seq: u64,
+        uid: &str,
+        quiet_secs: u64,
+        wedge_limit: u32,
+        notify_cmd: Option<&str>,
+        now: u64,
+    ) {
+        {
+            let mut latch = self
+                .wedge_escalations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if latch.get(&tk.task_id) == Some(&seq) {
+                return; // this run already escalated
+            }
+            latch.insert(tk.task_id.clone(), seq);
+        }
+        crate::notify::notify_operator(
+            notify_cmd,
+            "consumer-wedge",
+            &format!(
+                "continuous task '{}' run seq {} WEDGED AGAIN (turn ended without \
+                 report_done, quiet {}s) and the auto-close limit ({}) is exhausted — \
+                 {} consecutive runs wedged. Leaving the run Running so fires stay \
+                 blocked (each refire would burn queue items). Investigate the \
+                 orchestrator (session {}); once fixed, recover with \
+                 continuous.force_done(task_id=\"{}\", seq={}).",
+                tk.task_id,
+                seq,
+                quiet_secs,
+                wedge_limit,
+                tk.consecutive_wedge_closes,
+                uid,
+                tk.task_id,
+                seq,
+            ),
+        );
+        if let Err(e) = ContinuousRunLog::append(&RunLogLine {
+            seq,
+            ts: now as f64,
+            task_id: tk.task_id.clone(),
+            event: "wedge_escalated".to_string(),
+            fire_token: tk.last_run.as_ref().map(|r| r.fire_token.clone()),
+            session_uid: Some(uid.to_string()),
+            run_mode: None,
+            trigger_source: Some(SCHEDULER_CALLER_TOKEN.to_string()),
+            status: Some("running".to_string()),
+            detail: Some(
+                format!(
+                    "wedge-close limit {} exhausted after {} consecutive wedged runs; \
+                     run left Running to block fires",
+                    wedge_limit, tk.consecutive_wedge_closes,
+                )
+                .into(),
+            ),
+        }) {
+            eprintln!(
+                "cm-daemon: failed to append \"wedge_escalated\" audit line for {}: {}",
+                tk.task_id, e,
+            );
+        }
+    }
+
+    /// (c.3c) Credentials preflight: when any enabled claude-engine continuous
+    /// task exists, structurally validate `~/.claude/.credentials.json` every
+    /// [`CREDS_CHECK_INTERVAL_SECS`]. A file that EXISTS but is truncated /
+    /// unparseable / token-less (the 2026-08-03 incident began exactly there —
+    /// 243 bytes of a ~500-byte file) means every subsequent claude fire is
+    /// dead; push-alert without waiting for a session to prove it. Missing
+    /// file = healthy (keychain / API-key setups). Alert cooldown
+    /// [`AUTH_REALERT_SECS`]; a healthy re-check clears it. Returns whether an
+    /// alert fired this call (tests observe it; the tick ignores it).
+    fn credentials_preflight(&self, tasks: &[ContinuousTask], now: u64) -> bool {
+        if !tasks
+            .iter()
+            .any(|t| t.enabled && !t.paused && t.engine == task::Engine::Claude)
+        {
+            return false;
+        }
+        {
+            let mut st = self.creds_state.lock().unwrap_or_else(|p| p.into_inner());
+            if now.saturating_sub(st.0) < CREDS_CHECK_INTERVAL_SECS {
+                return false;
+            }
+            st.0 = now;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return false;
+        };
+        let path = std::path::PathBuf::from(home).join(".claude/.credentials.json");
+        let problem = crate::continuous::probe::credentials_file_problem(&path);
+        {
+            let mut st = self.creds_state.lock().unwrap_or_else(|p| p.into_inner());
+            match problem.as_deref() {
+                None => {
+                    st.1 = 0; // healthy — re-arm the alert
+                    return false;
+                }
+                Some(_) => {
+                    if now.saturating_sub(st.1) < AUTH_REALERT_SECS {
+                        return false;
+                    }
+                    st.1 = now;
+                }
+            }
+        }
+        let reason = problem.unwrap_or_default();
+        let notify_cmd = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.config.notify_command.clone()
+        };
+        crate::notify::notify_operator(
+            notify_cmd.as_deref(),
+            "auth-expired",
+            &format!(
+                "claude credentials file {} is INVALID ({}) — every continuous \
+                 claude fire on this host will fail with auth errors until \
+                 /login is re-run.",
+                path.display(),
+                reason,
+            ),
+        );
+        true
     }
 
     /// Phase (a): orphan any task whose `in_flight` spawn-window guard outlived
@@ -901,10 +1347,18 @@ impl ContinuousScheduler {
             }
         });
         if let Some((seq, fails)) = auto_paused {
-            eprintln!(
-                "cm-daemon: continuous task {} AUTO-PAUSED (circuit breaker) after {} \
-                 consecutive fire failures",
-                task_id, fails,
+            let notify_cmd = {
+                let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                s.config.notify_command.clone()
+            };
+            crate::notify::notify_operator(
+                notify_cmd.as_deref(),
+                "circuit-breaker",
+                &format!(
+                    "continuous task {} AUTO-PAUSED (circuit breaker) after {} \
+                     consecutive fire failures — un-pause it after fixing the cause",
+                    task_id, fails,
+                ),
             );
             if let Err(e) = ContinuousRunLog::append(&RunLogLine {
                 seq,
@@ -2321,6 +2775,329 @@ mod tests {
             sched.start().expect("first start");
             sched.start().expect("second start is a no-op");
             sched.shutdown();
+        });
+    }
+
+    // ----- (c.3b) auth-expiry + consumer-wedge pass -----
+
+    // Transcript fixture lines — the shapes `continuous::probe` classifies
+    // (mirrors of the real 2026-08-03 incident records).
+    const T_USER: &str = r#"{"type":"user","message":{"role":"user","content":"go"}}"#;
+    const T_ASSISTANT: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done."}]}}"#;
+    const T_TOOL_USE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
+    const T_TURN_END: &str = r#"{"type":"system","subtype":"turn_duration","durationMs":10}"#;
+    const T_AUTH_401: &str = r#"{"type":"assistant","error":"authentication_failed","isApiErrorMessage":true,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Login expired · Please run /login"}]}}"#;
+
+    /// Live session + transcript with the given lines; binds the transcript to
+    /// the session and returns the file's real mtime (unix secs) — test `now`
+    /// values are derived from it, mirroring the stall-pass test.
+    fn bind_transcript(
+        state: &Arc<Mutex<DaemonState>>,
+        uid: &str,
+        name: &str,
+        lines: &[&str],
+    ) -> u64 {
+        insert_live_session(state, uid);
+        let home = std::env::var("HOME").expect("HOME");
+        let path = std::path::Path::new(&home).join(name);
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write transcript");
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(uid)
+            .unwrap()
+            .transcript_path = Some(path.to_string_lossy().into_owned());
+        mtime_unix(&path).expect("mtime")
+    }
+
+    /// A Consumer task (given run mode) with a `Running` run pinned to `uid`,
+    /// with run start / last fire stamped at `at`.
+    fn running_consumer(
+        id: &str,
+        uid: &str,
+        run_mode: RunMode,
+        seq: u64,
+        at: u64,
+    ) -> ContinuousTask {
+        let mut t = consumer_task(id, "q", 3600, 1);
+        t.run_mode = run_mode;
+        t.current_session_uid = Some(uid.into());
+        t.last_fired_at = at;
+        t.run_count = seq as u32;
+        t.last_run = Some(RunRecord {
+            seq,
+            fire_token: format!("ft-{}-{}", id, seq),
+            started_at: at,
+            finished_at: None,
+            session_uid: Some(uid.into()),
+            status: RunStatus::Running,
+            trigger_source: "operator".into(),
+        });
+        t
+    }
+
+    /// The incident shape: a persistent Consumer whose session ended its turn
+    /// with the synthetic 401 record. The pass surfaces `auth_expired` ONCE
+    /// per cooldown window (re-alerting after it elapses) and deliberately
+    /// leaves the run Running — the blocked due-gate is what keeps future
+    /// fires from claiming+acking queue items into a dead session.
+    #[test]
+    fn auth_wedge_pass_surfaces_auth_expiry_and_leaves_run_running() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let uid = "ts-auth-dead-0";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "auth.jsonl",
+                &[T_USER, T_AUTH_401, T_TURN_END],
+            );
+            // Quiet WAY past the wedge grace: proves auth wins over the close.
+            let now = mtime + 10_000;
+            let t = running_consumer("authdead", uid, RunMode::Persistent, 5, mtime);
+            task::save(&t).expect("save");
+
+            sched.auth_wedge_pass(&task::load_all(), now);
+
+            let runs = std::fs::read_to_string(task::runs_log_path("authdead")).unwrap();
+            assert_eq!(runs.matches("\"auth_expired\"").count(), 1, "{}", runs);
+            assert!(runs.contains("Login expired"), "banner in detail: {}", runs);
+            let reloaded = task::load_one("authdead").unwrap();
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "auth-dead run stays Running (due-gate protects the queue)",
+            );
+            assert_eq!(reloaded.consecutive_wedge_closes, 0, "not a wedge close");
+
+            // Within the cooldown (past the probe throttle): no re-alert.
+            sched.auth_wedge_pass(&task::load_all(), now + TAIL_PROBE_INTERVAL_SECS + 1);
+            let runs2 = std::fs::read_to_string(task::runs_log_path("authdead")).unwrap();
+            assert_eq!(runs2.matches("\"auth_expired\"").count(), 1, "{}", runs2);
+
+            // Past the cooldown: one re-alert (the condition persists).
+            sched.auth_wedge_pass(&task::load_all(), now + AUTH_REALERT_SECS + 1);
+            let runs3 = std::fs::read_to_string(task::runs_log_path("authdead")).unwrap();
+            assert_eq!(runs3.matches("\"auth_expired\"").count(), 2, "{}", runs3);
+        });
+    }
+
+    /// The 3.5-day wedge shape: a Consumer run still `Running` while its live
+    /// session's transcript ends in a COMPLETED healthy turn and nothing has
+    /// happened past the grace. Auto-closed `Running → Failed` (due-gate
+    /// unblocked), counter bumped, `"wedge_closed"` audited.
+    #[test]
+    fn auth_wedge_pass_closes_wedged_consumer_run() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let grace = {
+                let s = state.lock().unwrap();
+                s.config.scheduler.consumer_wedge_grace_secs
+            };
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let uid = "ts-wedged-0";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "wedge.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let now = mtime + grace + 1;
+            let t = running_consumer("wedged", uid, RunMode::Persistent, 7, mtime);
+            task::save(&t).expect("save");
+
+            sched.auth_wedge_pass(&task::load_all(), now);
+
+            let reloaded = task::load_one("wedged").unwrap();
+            let lr = reloaded.last_run.as_ref().unwrap();
+            assert_eq!(lr.status, RunStatus::Failed, "wedged run auto-closed");
+            assert_eq!(lr.finished_at, Some(now));
+            assert_eq!(reloaded.consecutive_wedge_closes, 1);
+            let runs = std::fs::read_to_string(task::runs_log_path("wedged")).unwrap();
+            assert_eq!(runs.matches("\"wedge_closed\"").count(), 1, "{}", runs);
+            // The due-gate is unblocked again.
+            assert!(!run_active_blocks_fire(&reloaded), "consumer can refire");
+        });
+    }
+
+    /// Within the grace, mid-turn tails (long tool call), and non-Consumer
+    /// schedules are never closed.
+    #[test]
+    fn auth_wedge_pass_skips_healthy_and_non_consumer_shapes() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let grace = {
+                let s = state.lock().unwrap();
+                s.config.scheduler.consumer_wedge_grace_secs
+            };
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+
+            // (a) turn-complete but WITHIN the grace.
+            let m1 = bind_transcript(
+                &state,
+                "ts-w-recent",
+                "recent.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            task::save(&running_consumer("recent", "ts-w-recent", RunMode::Persistent, 1, m1))
+                .unwrap();
+            // (b) MID-TURN (trailing tool_use) long past the grace.
+            let m2 = bind_transcript(
+                &state,
+                "ts-w-midturn",
+                "midturn.jsonl",
+                &[T_USER, T_TOOL_USE],
+            );
+            task::save(&running_consumer(
+                "midturn",
+                "ts-w-midturn",
+                RunMode::Fresh,
+                1,
+                m2,
+            ))
+            .unwrap();
+            // (c) PERIODIC persistent (non-Consumer), turn-complete + stale —
+            // a Running run here is normal persistent bookkeeping, never a
+            // wedge.
+            let m3 = bind_transcript(
+                &state,
+                "ts-w-periodic",
+                "periodic.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let mut periodic = periodic_task("periodic", 3600, 0);
+            periodic.run_mode = RunMode::Persistent;
+            periodic.current_session_uid = Some("ts-w-periodic".into());
+            periodic.last_fired_at = m3;
+            periodic.last_run = Some(RunRecord {
+                seq: 1,
+                fire_token: "ft-p".into(),
+                started_at: m3,
+                finished_at: None,
+                session_uid: Some("ts-w-periodic".into()),
+                status: RunStatus::Running,
+                trigger_source: "operator".into(),
+            });
+            task::save(&periodic).unwrap();
+
+            // One pass, stale for everyone by mtime — but (a)'s quiet window
+            // is refreshed via last_fired_at (a fire just delivered, its
+            // paste not yet in the transcript), exercising the grace guard.
+            let now = m1.max(m2).max(m3) + grace + 1;
+            let _ = task::modify("recent", |t| t.last_fired_at = now - 10);
+            sched.auth_wedge_pass(&task::load_all(), now);
+
+            for id in ["recent", "midturn", "periodic"] {
+                let t = task::load_one(id).unwrap();
+                assert_eq!(
+                    t.last_run.as_ref().unwrap().status,
+                    RunStatus::Running,
+                    "{} must not be closed",
+                    id,
+                );
+                assert_eq!(t.consecutive_wedge_closes, 0, "{}", id);
+                let runs = std::fs::read_to_string(task::runs_log_path(id)).unwrap_or_default();
+                assert!(
+                    !runs.contains("wedge_closed"),
+                    "{} must not wedge-close: {}",
+                    id,
+                    runs,
+                );
+            }
+        });
+    }
+
+    /// At the close limit the pass escalates ONCE per run (audit + alert),
+    /// leaving the run Running so a chronically-wedging consumer stops
+    /// burning queue items via close→refire churn.
+    #[test]
+    fn auth_wedge_pass_escalates_at_close_limit() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let (grace, limit) = {
+                let s = state.lock().unwrap();
+                (
+                    s.config.scheduler.consumer_wedge_grace_secs,
+                    s.config.scheduler.wedge_close_limit,
+                )
+            };
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let uid = "ts-chronic-0";
+            let mtime = bind_transcript(
+                &state,
+                uid,
+                "chronic.jsonl",
+                &[T_USER, T_ASSISTANT, T_TURN_END],
+            );
+            let now = mtime + grace + 1;
+            let mut t = running_consumer("chronic", uid, RunMode::Persistent, 9, mtime);
+            t.consecutive_wedge_closes = limit; // streak already exhausted
+            task::save(&t).expect("save");
+
+            sched.auth_wedge_pass(&task::load_all(), now);
+
+            let reloaded = task::load_one("chronic").unwrap();
+            assert_eq!(
+                reloaded.last_run.as_ref().unwrap().status,
+                RunStatus::Running,
+                "escalated run is deliberately left Running",
+            );
+            let runs = std::fs::read_to_string(task::runs_log_path("chronic")).unwrap();
+            assert_eq!(runs.matches("\"wedge_escalated\"").count(), 1, "{}", runs);
+
+            // Idempotent for the same run seq.
+            sched.auth_wedge_pass(&task::load_all(), now + TAIL_PROBE_INTERVAL_SECS + 1);
+            let runs2 = std::fs::read_to_string(task::runs_log_path("chronic")).unwrap();
+            assert_eq!(runs2.matches("\"wedge_escalated\"").count(), 1, "{}", runs2);
+        });
+    }
+
+    // ----- (c.3c) credentials preflight -----
+
+    /// Exists-but-broken credentials alert once per episode (cooldown), gated
+    /// on having an enabled claude continuous task; a healthy file (or a
+    /// missing one) never alerts and re-arms the latch.
+    #[test]
+    fn credentials_preflight_alerts_once_per_bad_episode() {
+        let _tmp = with_temp_home(|| {
+            let state = Arc::new(Mutex::new(DaemonState::default()));
+            let sched = Arc::new(ContinuousScheduler::new(Arc::clone(&state)));
+            let home = std::env::var("HOME").unwrap();
+            let dir = std::path::Path::new(&home).join(".claude");
+            std::fs::create_dir_all(&dir).unwrap();
+            let creds = dir.join(".credentials.json");
+            let tasks = vec![periodic_task("ct", 60, 0)]; // enabled claude task
+            let mut now = 100_000u64;
+
+            // Missing file: healthy.
+            assert!(!sched.credentials_preflight(&tasks, now));
+
+            // Truncated file: one alert...
+            now += CREDS_CHECK_INTERVAL_SECS + 1;
+            std::fs::write(&creds, r#"{"claudeAiOauth":{"accessToken":"sk-an"#).unwrap();
+            assert!(sched.credentials_preflight(&tasks, now));
+            // ...throttled within the check interval...
+            assert!(!sched.credentials_preflight(&tasks, now + 1));
+            // ...and cooldown-latched past it.
+            now += CREDS_CHECK_INTERVAL_SECS + 1;
+            assert!(!sched.credentials_preflight(&tasks, now));
+
+            // Healthy again: no alert, latch re-armed.
+            now += CREDS_CHECK_INTERVAL_SECS + 1;
+            std::fs::write(&creds, r#"{"claudeAiOauth":{"accessToken":"sk-ant-ok"}}"#)
+                .unwrap();
+            assert!(!sched.credentials_preflight(&tasks, now));
+
+            // Broken AGAIN (new episode): immediate re-alert, no 6h wait.
+            now += CREDS_CHECK_INTERVAL_SECS + 1;
+            std::fs::write(&creds, b"").unwrap();
+            assert!(sched.credentials_preflight(&tasks, now));
+
+            // No claude tasks → never alerts even with a broken file.
+            now += CREDS_CHECK_INTERVAL_SECS + 1;
+            assert!(!sched.credentials_preflight(&[], now));
         });
     }
 }

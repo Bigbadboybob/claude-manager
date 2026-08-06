@@ -22,6 +22,7 @@
 //! fields are defined here but inert.
 
 pub mod dispatch_pending;
+pub mod probe;
 pub mod queue;
 pub mod runlog;
 pub mod scheduler;

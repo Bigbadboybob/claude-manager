@@ -61,6 +61,7 @@ pub mod control;
 pub mod host_id;
 pub mod manifest;
 pub mod mcp_config;
+pub mod notify;
 pub mod path;
 pub mod planning_client;
 pub mod reaper;

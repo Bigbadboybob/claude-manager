@@ -7800,6 +7800,7 @@ mod tests {
                 allow_clone: false,
                 repos: Vec::new(),
                 scheduler: Default::default(),
+                notify_command: None,
             };
         }
         let resp = dispatch_request(
@@ -7858,6 +7859,7 @@ mod tests {
             allow_clone: false,
             repos: Vec::new(),
             scheduler: Default::default(),
+            notify_command: None,
         };
     }
 

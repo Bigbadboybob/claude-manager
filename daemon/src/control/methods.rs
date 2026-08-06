@@ -1221,6 +1221,12 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
                 {
                     run.status = terminal_status;
                     run.finished_at = Some(crate::continuous::task::now_unix());
+                    // A CLEAN exit ends any consumer-wedge streak (the
+                    // scheduler's close limit counts consecutive wedges);
+                    // a Failed exit is not a clean completion — leave it.
+                    if terminal_status == crate::continuous::task::RunStatus::Done {
+                        t.consecutive_wedge_closes = 0;
+                    }
                 }
             }
         });
@@ -8993,10 +8999,11 @@ pub fn queue_stats(
 // both `resolve_stuck`'s escalate action and the scheduler watchdog's
 // cap-reached auto-escalate.
 //
-// NOTIFY-THE-USER for v1 is the durable failure-surfacing trio
-// (DESIGN §11), NOT an active desktop push: there is no daemon-side
-// `notify_user` RPC (it is TUI-only, routed to ~/.cm/tui.sock). See
-// `escalate_stuck` for the trio.
+// NOTIFY-THE-USER is the durable failure-surfacing trio (DESIGN §11)
+// PLUS, since the 2026-08-03 auth-expiry incident, an operator push via
+// the configured `notify_command` (`crate::notify::notify_operator`) on
+// escalations. There is still no daemon-side `notify_user` RPC (it is
+// TUI-only, routed to ~/.cm/tui.sock). See `escalate_stuck` for the trio.
 // ===================================================================
 
 #[derive(Deserialize, Default)]
@@ -9077,6 +9084,9 @@ pub fn report_done(
             {
                 run.status = crate::continuous::task::RunStatus::Done;
                 run.finished_at = Some(now);
+                // A clean completion ends any wedge streak — the scheduler's
+                // consumer-wedge close limit counts CONSECUTIVE wedges only.
+                t.consecutive_wedge_closes = 0;
                 marked = true;
             }
         }
@@ -9183,6 +9193,9 @@ pub fn continuous_force_done(
             {
                 run.status = crate::continuous::task::RunStatus::Done;
                 run.finished_at = Some(now);
+                // Operator intervention resets the scheduler's consumer-wedge
+                // streak (same as a clean report_done).
+                t.consecutive_wedge_closes = 0;
                 marked = true;
             }
         }
@@ -9447,10 +9460,11 @@ pub fn resolve_stuck(
 ///
 /// NOTIFY-THE-USER: this trio (Stuck status in state.json → continuous.list red
 /// glyph; the `ManifestDiff::Exited` broadcast the kill emits → manifest.watch,
-/// the session carries `continuous_task_id`; the runs.jsonl escalated line) IS
-/// the daemon's "notify" for v1. There is NO daemon-side `notify_user` RPC (it
-/// is TUI-only). An ACTIVE push (desktop notification) would be a NEW daemon
-/// channel and is out of scope.
+/// the session carries `continuous_task_id`; the runs.jsonl escalated line) is
+/// what the operator FINDS; step 4's `notify_command` push is what tells them
+/// to look (added after the 2026-08-03 incident, where fully-surfaced failures
+/// went unnoticed for 3.5 days). There is still NO daemon-side `notify_user`
+/// RPC (it is TUI-only).
 ///
 /// LOCK DISCIPLINE: takes NO DaemonState lock itself — `kill_session` (and the
 /// reaper's on_exit) re-lock internally, so a caller (the scheduler tick) MUST
@@ -9508,6 +9522,23 @@ pub fn escalate_stuck(
             task.task_id, e
         );
     }
+
+    // 4. Push alert. The durable-surfacing trio above is what the operator
+    // FINDS; this is what tells them to look (2026-08-03: a fully-surfaced
+    // failure went unnoticed for 3.5 days because nothing pushed).
+    let notify_cmd = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        s.config.notify_command.clone()
+    };
+    crate::notify::notify_operator(
+        notify_cmd.as_deref(),
+        "stuck-escalated",
+        &format!(
+            "continuous task '{}' run seq {} ESCALATED to Stuck ({}) — the session was \
+             killed; the run needs a human before the task fires again.",
+            task.task_id, seq, reason,
+        ),
+    );
 
     Ok(())
 }
@@ -14537,6 +14568,7 @@ mod tests {
                 allow_clone: false,
                 repos: Vec::new(),
                 scheduler: Default::default(),
+                notify_command: None,
             };
             Arc::new(Mutex::new(s))
         };
@@ -23329,7 +23361,11 @@ mod tests {
             let wt = home.join("wt");
             std::fs::create_dir_all(&wt).unwrap();
             let uid = fresh_test_uid();
-            let task = fresh_task_running("ct-rd", &wt, &uid);
+            let mut task = fresh_task_running("ct-rd", &wt, &uid);
+            // A prior wedge streak: a clean completion must reset it (the
+            // scheduler's consumer-wedge close limit counts CONSECUTIVE
+            // wedges only).
+            task.consecutive_wedge_closes = 2;
             crate::continuous::task::save(&task).expect("save");
 
             let state = Arc::new(Mutex::new(DaemonState::new()));
@@ -23344,6 +23380,10 @@ mod tests {
             let last = reloaded.last_run.expect("last_run");
             assert_eq!(last.status, crate::continuous::task::RunStatus::Done);
             assert!(last.finished_at.is_some(), "finished_at set");
+            assert_eq!(
+                reloaded.consecutive_wedge_closes, 0,
+                "clean completion resets the wedge streak",
+            );
 
             kill_all_sessions(&state);
         });
