@@ -872,6 +872,12 @@ struct StartSessionParams {
     /// daemon's `mcp_start_session`.
     #[serde(default)]
     global_perms: bool,
+    /// ux-1a/1b: opt back into CO-TENANCY when the named `task_id` has
+    /// no bound workspace. The default mints the task its own branch
+    /// worktree; this spawns the worker in the CALLER's checkout
+    /// instead. Mirrors the daemon's `mcp_start_session`.
+    #[serde(default)]
+    allow_shared_workspace: bool,
 }
 
 /// ux-5c (TUI twin of the daemon's `task_autodelivery_prompt`):
@@ -957,15 +963,31 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     // caller's own task or no task: use caller's workspace. For a
     // descendant task: that task's workspace (which may differ in
     // branch-mode subtasks).
-    let target_wi = match task_id_for_new.as_deref() {
+    //
+    // ux-1a/1b: a descendant task with NO bound workspace used to be a
+    // flat `NotFound` here while the daemon route quietly co-tenanted the
+    // worker in the caller's checkout — two routes, two different answers
+    // to the same question. Both now MINT the task its own branch
+    // worktree (shared implementation in
+    // `cm_daemon::worktree::mint_task_worktree`, so the branch name and
+    // cut point can't drift), with `allow_shared_workspace=true` as the
+    // explicit opt-in to co-tenancy.
+    let (target_wi, shared_with_caller) = match task_id_for_new.as_deref() {
         Some(tid) if Some(tid) != caller.task_id.as_deref() => {
-            // Descendant task — find its workspace.
-            workspace_index_for_task(app, tid).ok_or((
-                ErrorCode::NotFound,
-                format!("task {} has no bound workspace", tid),
-            ))?
+            match resolve_target_workspace(
+                workspace_index_for_task(app, tid),
+                caller_wi,
+                p.allow_shared_workspace,
+            ) {
+                TargetWorkspace::Existing(wi) => (wi, false),
+                TargetWorkspace::Shared(wi) => (wi, true),
+                TargetWorkspace::Mint => (
+                    mint_workspace_for_task(app, tid, caller_wi, caller.task_id.as_deref())?,
+                    false,
+                ),
+            }
         }
-        _ => caller_wi,
+        _ => (caller_wi, false),
     };
 
     // ux-5c: caller prompt wins; a blank/absent one falls back to the
@@ -1020,13 +1042,234 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         "session_uid": new_uid,
         "prompt_source": prompt_source,
     });
-    if let Some(wt) = worktree_path {
-        resp["worktree_path"] = Value::String(wt);
+    if let Some(wt) = worktree_path.as_deref() {
+        resp["worktree_path"] = Value::String(wt.to_string());
     }
-    if let Some(tid) = task_id_for_response {
-        resp["task_id"] = Value::String(tid);
+    if let Some(tid) = task_id_for_response.as_deref() {
+        resp["task_id"] = Value::String(tid.to_string());
+    }
+    // ux-1a/1b co-tenancy guard (daemon twin: same three fields). The
+    // opt-in is honored but never silent — the response names the shared
+    // checkout and every other live session already in it.
+    if shared_with_caller {
+        let co_tenants: Vec<Value> = app.workspaces[target_wi]
+            .sessions
+            .iter()
+            .filter(|s| s.uid != new_uid)
+            .map(|s| json!({ "session_uid": s.uid, "label": s.label }))
+            .collect();
+        resp["shared_workspace"] = Value::Bool(true);
+        resp["warning"] = Value::String(format!(
+            "task '{}' has no worktree of its own; allow_shared_workspace=true spawned \
+             this worker as a CO-TENANT in {} — {} other live session(s) are working in \
+             that same checkout. Branch switches, resets and uncommitted edits it makes \
+             land in THEIR tree too. Drop the flag to have the TUI mint the task its own \
+             worktree instead.",
+            task_id_for_response.as_deref().unwrap_or("?"),
+            worktree_path.as_deref().unwrap_or("<no worktree>"),
+            co_tenants.len(),
+        ));
+        resp["workspace_shared_with"] = Value::Array(co_tenants);
     }
     Ok(resp)
+}
+
+/// ux-1a/1b: where a `start_session` bound to a task OTHER than the
+/// caller's own should put the child.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetWorkspace {
+    /// The task already has a workspace; spawn there.
+    Existing(usize),
+    /// `allow_shared_workspace=true` on a workspace-less task: spawn as a
+    /// co-tenant of the caller's checkout (the pre-ux-1a behavior).
+    Shared(usize),
+    /// Workspace-less task, no opt-in: mint it a worktree of its own.
+    Mint,
+}
+
+/// The spawn-placement policy, isolated from every side effect so it can
+/// be read (and tested) as a policy rather than inferred from a spawn.
+/// Daemon twin: the `match (bound_workspace_id, descendant_task_target)`
+/// block in `mcp_start_session`.
+fn resolve_target_workspace(
+    bound_wi: Option<usize>,
+    caller_wi: usize,
+    allow_shared_workspace: bool,
+) -> TargetWorkspace {
+    match bound_wi {
+        Some(wi) => TargetWorkspace::Existing(wi),
+        None if allow_shared_workspace => TargetWorkspace::Shared(caller_wi),
+        None => TargetWorkspace::Mint,
+    }
+}
+
+/// ux-1a (TUI twin of the daemon's `mint_task_workspace`): give a
+/// workspace-less task its OWN checkout, register it as a workspace, bind
+/// the task to it, and return the new workspace's index.
+///
+/// The git half is `cm_daemon::worktree::mint_task_worktree` — the same
+/// call the daemon route makes — so both routes produce the identical
+/// branch name (`cm-sub/<slug>-<task-id-prefix>`) cut from the identical
+/// place (the project's trunk). What differs is only where each route
+/// reads the task's repo from: the daemon GETs the planning row, the TUI
+/// already holds it in `app.tasks`.
+///
+/// Every refusal names `allow_shared_workspace=true`, so an agent that
+/// can't be minted a worktree learns the escape hatch in the same
+/// sentence.
+fn mint_workspace_for_task(
+    app: &mut App,
+    task_id: &str,
+    caller_wi: usize,
+    caller_task_id: Option<&str>,
+) -> Result<usize, (ErrorCode, String)> {
+    const OVERRIDE_HINT: &str =
+        "; pass allow_shared_workspace=true to spawn the worker as a co-tenant in your \
+         own checkout instead";
+
+    let task = app
+        .tasks
+        .iter()
+        .find(|t| t.task_id.as_deref() == Some(task_id))
+        .cloned()
+        .ok_or((
+            ErrorCode::NotFound,
+            format!(
+                "task {} has no bound workspace and is not in the TUI's task list, so \
+                 there is nothing to mint a worktree from{}",
+                task_id, OVERRIDE_HINT
+            ),
+        ))?;
+    let caller_repo_url = app.workspaces[caller_wi].repo_url.clone();
+    let repo_url = task
+        .repo_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| caller_repo_url.clone())
+        .ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "task {} has neither a workspace nor a repo_url, so there is nothing to \
+                 cut a worktree from{}",
+                task_id, OVERRIDE_HINT
+            ),
+        ))?;
+    // Prefer the caller's own main repo, but only when the task names the
+    // SAME repo — otherwise a caller in repo A would drag a task in repo
+    // B into A's checkout. Falling back to the on-disk lookup mirrors the
+    // daemon's `resolve_repo` fast path.
+    let caller_repo_matches = caller_repo_url.as_deref() == Some(repo_url.as_str());
+    let main_repo = app.workspaces[caller_wi]
+        .main_repo_path
+        .clone()
+        .filter(|_| caller_repo_matches)
+        .or_else(|| cm_daemon::worktree::find_local_repo(&repo_url))
+        .ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "task {} has no workspace and repo '{}' isn't checked out on this \
+                 machine, so a worktree can't be minted for it{}",
+                task_id, repo_url, OVERRIDE_HINT
+            ),
+        ))?;
+
+    // The cut. `mint_task_worktree` resolves the project's trunk to a
+    // concrete sha FIRST, so an unresolvable main errors here with
+    // nothing on disk and nothing registered.
+    let minted = cm_daemon::worktree::mint_task_worktree(&main_repo, task_id, &task.name)
+        .map_err(|e| {
+            (
+                ErrorCode::Conflict,
+                format!(
+                    "task {} has no workspace and one could not be minted: {}{}",
+                    task_id, e, OVERRIDE_HINT
+                ),
+            )
+        })?;
+
+    let new_ws_id = crate::app::new_workspace_id();
+    app.workspaces.push(Workspace {
+        color: None,
+        pinned: false,
+        id: new_ws_id.clone(),
+        name: cm_daemon::worktree::slugify(&task.name),
+        is_closed: false,
+        is_cloud: false,
+        repo_url: Some(repo_url),
+        worktree_path: Some(minted.worktree_path.clone()),
+        main_repo_path: Some(main_repo),
+        worker_vm: None,
+        worker_zone: None,
+        host_id: app.workspaces[caller_wi].host_id.clone(),
+        sessions: vec![],
+        tombstones: vec![],
+        is_pushing: false,
+    });
+    let target_wi = app.workspaces.len() - 1;
+
+    // Bind the task locally so the NEXT spawn on it resolves through
+    // `workspace_index_for_task` and reuses this checkout instead of
+    // minting a second one.
+    if let Some(entry) = app
+        .tasks
+        .iter_mut()
+        .find(|t| t.task_id.as_deref() == Some(task_id))
+    {
+        entry.workspace_id = Some(new_ws_id.clone());
+        entry.wip_branch = Some(minted.branch.clone());
+        entry.worktree_mode = crate::app::parse_worktree_mode("branch");
+    }
+    app.save_session_manifest();
+
+    // Teach the daemon about the binding SYNCHRONOUSLY — same reason
+    // `create_subtask` does (see the fix-launch-mcmp note there): the
+    // async `push_task_tree_to_daemon` below loses the race against a
+    // daemon-socket call made microseconds later in the same MCP tool
+    // invocation. A taskless (global-perms) caller has no parent edge to
+    // record, so it relies on the async push alone.
+    let host = app.workspaces[target_wi].host_id.clone();
+    if let Some(parent_task_id) = caller_task_id {
+        if let Err(e) = app.register_agent_subtask_with_daemon(
+            &host,
+            task_id,
+            parent_task_id,
+            &new_ws_id,
+            Some(minted.worktree_path.as_path()),
+        ) {
+            // Non-fatal: the worktree exists and the TUI has the binding,
+            // so failing the spawn would strand a checkout. The caller is
+            // back to racing the async push — today's behavior.
+            eprintln!(
+                "cm-tui: start_session: synchronous daemon registration for minted task \
+                 {} failed: {} (falling back to the async task-tree push)",
+                task_id, e,
+            );
+        }
+    }
+    app.push_task_tree_to_daemon();
+
+    // Best-effort: record the branch on the planning row so a manifest
+    // loss can recover the binding via `recover_worktree_path`. A failure
+    // costs recovery metadata, not the spawn.
+    if let Ok(api_client) = api_client_or_err() {
+        let fields: std::collections::HashMap<String, Value> = [
+            ("wip_branch".to_string(), json!(minted.branch)),
+            ("worktree_mode".to_string(), json!("branch")),
+        ]
+        .into_iter()
+        .collect();
+        if let Err(e) = api_client.update_task(task_id, &fields) {
+            eprintln!(
+                "cm-tui: start_session minted worktree {} for task {} but could not \
+                 record wip_branch on the planning row ({}); the spawn continues",
+                minted.worktree_path.display(),
+                task_id,
+                e,
+            );
+        }
+    }
+
+    Ok(target_wi)
 }
 
 /// Look up the workspace index for a task by its FK (`workspace_id`).
@@ -2992,5 +3235,212 @@ mod tests {
     fn autodelivery_unknown_task_is_a_miss() {
         let tasks = vec![task_with_parent("A", None, "a")];
         assert_eq!(task_autodelivery_prompt(&tasks, "nope"), None);
+    }
+
+    // ───── ux-1a/1b: workspace-less task spawn policy (mint) ─────
+
+    /// The placement policy, stated once. A bound task spawns in its own
+    /// workspace; a workspace-less one MINTS by default and only shares
+    /// the caller's checkout on the explicit opt-in. Pre-ux-1a the
+    /// workspace-less case was a flat `NotFound` here while the daemon
+    /// route silently co-tenanted — the divergence this arm removes.
+    #[test]
+    fn target_workspace_policy_mints_unless_sharing_is_opted_into() {
+        assert_eq!(
+            resolve_target_workspace(Some(3), 0, false),
+            TargetWorkspace::Existing(3),
+        );
+        // The opt-in never overrides a real binding — there's nothing to
+        // share when the task has its own worktree.
+        assert_eq!(
+            resolve_target_workspace(Some(3), 0, true),
+            TargetWorkspace::Existing(3),
+        );
+        assert_eq!(resolve_target_workspace(None, 0, false), TargetWorkspace::Mint);
+        assert_eq!(
+            resolve_target_workspace(None, 7, true),
+            TargetWorkspace::Shared(7),
+        );
+    }
+
+    /// `App::new` reads `~/.cm/` and spawns daemon-watch threads, and the
+    /// mint itself resolves `~/.cm/worktrees` through `$HOME` — so the
+    /// tests below run inside a closure that holds the home lock and the
+    /// isolated HOME for their WHOLE body, the way `events.rs`'s
+    /// app-backed tests do. (Taking the lock in the test AND the fixture
+    /// would self-deadlock: it's a plain, non-reentrant mutex.) The
+    /// tempdir is leaked so the already-spawned consumer threads keep a
+    /// valid HOME after the swap back.
+    fn with_app_and_repo<F: FnOnce(&mut App, &std::path::Path)>(repo_name: &str, f: F) {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let orig_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+
+        let repo = tmp.path().join("code/projects").join(repo_name);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("README.md"), "x").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "-M", "main"]);
+
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces.push(Workspace {
+            color: None,
+            pinned: false,
+            id: "ws-caller".into(),
+            name: "caller".into(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: Some(repo_name.to_string()),
+            worktree_path: Some(repo.clone()),
+            main_repo_path: Some(repo.clone()),
+            worker_vm: None,
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        });
+
+        f(&mut app, &repo);
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        } else {
+            unsafe { std::env::remove_var("HOME") };
+        }
+        std::mem::forget(tmp);
+    }
+
+    /// TUI twin of the daemon's mint: a workspace-less task gets its OWN
+    /// checkout, cut from the project's main and OUTSIDE the caller's
+    /// worktree — the placement that would have prevented the ux note's
+    /// incident. Pre-fix this route answered `NotFound` instead.
+    #[test]
+    fn mint_gives_a_workspace_less_task_its_own_worktree() {
+        with_app_and_repo("tuimintrepo", |app, repo| {
+            let mut task =
+                task_with_parent("task-orphan", Some("task-parent"), "Fix the parser");
+            task.repo_url = Some("tuimintrepo".into());
+            app.tasks.push(task);
+
+            let wi = mint_workspace_for_task(app, "task-orphan", 0, Some("task-parent"))
+                .expect("mint");
+
+            assert_ne!(wi, 0, "the minted workspace is a NEW one, not the caller's");
+            let minted = app.workspaces[wi]
+                .worktree_path
+                .clone()
+                .expect("worktree path");
+            assert_ne!(
+                minted, repo,
+                "the worker must not land in the caller's checkout",
+            );
+            assert!(minted.exists());
+            assert_eq!(
+                cm_daemon::worktree::worktree_current_branch(&minted).as_deref(),
+                Some("cm-sub/fix-the-parser-taskorp"),
+            );
+            assert_eq!(app.workspaces[wi].main_repo_path.as_deref(), Some(repo));
+
+            // The task is now bound, so the NEXT spawn resolves through
+            // the ordinary lookup and reuses this checkout instead of
+            // minting a second one.
+            assert_eq!(workspace_index_for_task(app, "task-orphan"), Some(wi));
+            assert_eq!(
+                resolve_target_workspace(
+                    workspace_index_for_task(app, "task-orphan"),
+                    0,
+                    false,
+                ),
+                TargetWorkspace::Existing(wi),
+            );
+            let entry = app
+                .tasks
+                .iter()
+                .find(|t| t.task_id.as_deref() == Some("task-orphan"))
+                .unwrap();
+            assert_eq!(
+                entry.wip_branch.as_deref(),
+                Some("cm-sub/fix-the-parser-taskorp"),
+            );
+        });
+    }
+
+    /// A mint that can't resolve the project's main refuses cleanly: an
+    /// error naming the override, and NO workspace left registered
+    /// pointing at a checkout that was never created.
+    #[test]
+    fn mint_failure_leaves_no_half_made_workspace() {
+        with_app_and_repo("tuimintrepo2", |app, repo| {
+            // No `main`, no `master` — nothing to cut from.
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["branch", "-M", "trunkless"])
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success());
+            let mut task =
+                task_with_parent("task-orphan", Some("task-parent"), "Fix the parser");
+            task.repo_url = Some("tuimintrepo2".into());
+            app.tasks.push(task);
+            let before = app.workspaces.len();
+
+            let err = mint_workspace_for_task(app, "task-orphan", 0, Some("task-parent"))
+                .expect_err("an unmintable task must refuse");
+
+            assert_eq!(err.0, ErrorCode::Conflict);
+            assert!(
+                err.1.contains("cannot resolve the project's main branch"),
+                "error names the real cause: {}",
+                err.1,
+            );
+            assert!(
+                err.1.contains("allow_shared_workspace=true"),
+                "every refusal names the escape hatch: {}",
+                err.1,
+            );
+            assert_eq!(app.workspaces.len(), before, "no workspace was registered");
+            assert_eq!(workspace_index_for_task(app, "task-orphan"), None);
+        });
+    }
+
+    /// A task the TUI has never heard of can't be minted for — but the
+    /// refusal says so, and names the override, instead of the bare
+    /// "has no bound workspace" the pre-fix arm returned.
+    #[test]
+    fn mint_refuses_unknown_task_with_the_override_hint() {
+        with_app_and_repo("tuimintrepo3", |app, _repo| {
+            let err = mint_workspace_for_task(app, "task-ghost", 0, Some("task-parent"))
+                .expect_err("unknown task");
+
+            assert_eq!(err.0, ErrorCode::NotFound);
+            assert!(err.1.contains("allow_shared_workspace=true"), "{}", err.1);
+        });
     }
 }

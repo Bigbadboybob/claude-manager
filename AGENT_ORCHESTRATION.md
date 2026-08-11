@@ -90,6 +90,21 @@ The `cm-sub/` prefix is followed by **exactly one path component** (no further s
 
 For `inherit` mode, the child has no worktree of its own; its sessions spawn in the parent's worktree directory. Two agents stepping on each other's edits is the user's concern, by design (matches the doc-level convention).
 
+### Workspace-less tasks: `start_session` mints (ux-1a)
+
+A task can be spawn-authorized while having no workspace at all. The canonical case is `propose_task`: the row lands in the planning backlog, the daemon records a creator edge so the proposer may launch it, but nothing has ever created a checkout for it. `create_subtask` in `branch` mode before its worktree registration lands is the other.
+
+`start_session(task_id=<that task>)` **mints one**. The daemon reads the task's planning row for its `repo_url`, resolves that repo on the host (the caller's own `main_repo_path` when it's the same repo, else `resolve_repo`), and cuts a fresh branch worktree from the project's trunk:
+
+- Branch: `cm-sub/<name-slug>-<first 7 chars of the task id>`. The suffix is **derived from the task id, not random** (unlike `create_subtask`'s), so re-minting the same task is idempotent — it finds the directory already there and hands back the original checkout rather than scattering a second one. The `cm-sub/` prefix means `recover_worktree_path` and the TUI's reconcile recovery map it back for free.
+- Cut point: `main`, `origin/main`, `master`, `origin/master` in that order, all resolved locally first; only a total miss spends a `git fetch`. Local-first for the same reason `create_subtask(base=…)` is local-first — the operator's own commits are usually the point.
+- The workspace is registered and bound (`task_workspaces` + `bindings`) only **after** the checkout exists on disk, so a failed mint leaves nothing half-made. The next `start_session` on the task resolves through the ordinary binding and joins that same checkout.
+- The task row gets `wip_branch` + `worktree_mode="branch"` recorded, best-effort — a PATCH failure costs recovery metadata, not the spawn.
+
+Before this, the daemon route silently fell back to the **caller's** workspace whenever it had minted the task itself, and the TUI route answered a flat `NotFound` — two routes, two answers. The daemon's fallback caused a live incident: three `propose_task` workers spawned into the proposer's own worktree, followed their "branch off main" instructions by rewriting HEAD under a live session, and left uncommitted edits behind.
+
+**`allow_shared_workspace=true`** opts back into that co-tenancy, for when a worker is genuinely meant to work in the caller's tree (or when minting isn't possible and the caller accepts the risk). It is honored but never silent: the response carries `shared_workspace: true`, a `warning` naming the shared checkout, and `workspace_shared_with` listing the other live sessions in it. When a mint is impossible and the flag was *not* passed, the spawn is **refused** rather than silently placed — and every such refusal names the flag as the way through.
+
 ### Session manifest fields (additions)
 
 `~/.cm/tui-sessions.json` entries gain:
@@ -495,12 +510,17 @@ list_sessions(task_id?, include_exited=false)
    #   across the auth boundary. Same field in list_sessions_grouped, and
    #   worth reading there too: the grouping key is workspace_id, and two
    #   workspaces can point at one checkout.
-start_session(task_id?, type: "claude-code"|"codex", label, prompt?)
-   -> {session_uid, worktree_path, task_id?, prompt_source}
+start_session(task_id?, type: "claude-code"|"codex", label, prompt?,
+              allow_shared_workspace=false)
+   -> {session_uid, worktree_path, task_id?, prompt_source,
+       shared_workspace?, warning?, workspace_shared_with?}
    # task_id omitted = "spawn in caller's workspace, no task binding"
    #   (the only valid form for a taskless caller).
    # task_id provided = bind the new session to that task; only allowed
    #   if the caller has authority over it (own task or descendant).
+   # A named task with NO workspace gets one MINTED: see
+   #   "Workspace-less tasks" below. allow_shared_workspace=true opts
+   #   back into spawning the worker in the CALLER's checkout.
    # worktree_path = the checkout the child actually landed in. Worth
    #   reading even when you passed no task_id: binding to a branch-mode
    #   subtask spawns the child in ITS worktree, not the caller's.

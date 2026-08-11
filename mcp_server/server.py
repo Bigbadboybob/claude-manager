@@ -777,6 +777,7 @@ async def start_session(
     isolated: bool = False,
     notify_on_done: bool = True,
     notify_until: str = "turn_end",
+    allow_shared_workspace: bool = False,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -828,9 +829,28 @@ async def start_session(
             `create_subtask` (the daemon records a creator edge at mint
             time, so propose-then-launch works). Any other cross-task
             binding is rejected — UNLESS you hold global permissions, in
-            which case you may bind the child to any task. A proposed
-            task has no worktree of its own, so its worker spawns in
-            YOUR workspace.
+            which case you may bind the child to any task.
+            **A task with no worktree of its own gets one minted**: a
+            fresh `cm-sub/<slug>-<id>` branch cut from the project's
+            main, in its own checkout, which the worker runs in and
+            every later spawn on that task reuses. So propose-then-launch
+            hands the worker a clean tree instead of dropping it into
+            YOURS. Read `worktree_path` in the response to see where it
+            landed. If the worktree can't be minted (no planning row, no
+            repo on this host, no resolvable main) the spawn is REFUSED
+            rather than silently placed — the error names
+            `allow_shared_workspace` as the way through.
+        allow_shared_workspace: Opt back into co-tenancy. When `task_id`
+            names a task with no worktree, spawn the worker in YOUR
+            checkout instead of minting it one. Use it when the worker
+            is genuinely meant to work on your tree (or when minting
+            isn't possible and you accept the risk) — and know what you
+            are accepting: anything it does to the working tree, branch
+            switches and `git reset` especially, happens in the tree
+            YOUR session and any siblings are live in. The response then
+            carries `shared_workspace: true`, a `warning`, and
+            `workspace_shared_with` listing the other sessions in that
+            checkout. Ignored when the task already has a workspace.
         global_perms: Grant the new session global permissions (it can
             then prompt/read/control ANY session). **Only honored if YOU
             already hold global permissions** (check `ping().global_perms`);
@@ -888,6 +908,12 @@ async def start_session(
           - `prompt_source` — "caller" (your `prompt`), "task" (the
             bound task's stored prompt, auto-delivered because you
             passed none), or "none" (spawned promptless).
+          - `shared_workspace` / `warning` / `workspace_shared_with` —
+            present ONLY when `allow_shared_workspace=true` actually put
+            the worker in your own checkout. `workspace_shared_with` is
+            `[{session_uid, label}]` for the other live sessions there.
+            Treat these as a pre-flight collision warning: if you didn't
+            mean to share a tree, kill the worker before it edits.
 
         - wait=false: {"session_uid": "<uid>"} for the freshly-spawned
           session, plus `monitor` when one was auto-registered (see
@@ -945,6 +971,11 @@ async def start_session(
         params["task_id"] = task_id
     if global_perms:
         params["global_perms"] = True
+    # ux-1b: only send the co-tenancy opt-in when it was actually asked
+    # for, so an older server (which would reject the unknown field) still
+    # serves the default mint path.
+    if allow_shared_workspace:
+        params["allow_shared_workspace"] = True
     # Sub-2c review-2: single-decision binding (restoring the
     # round-8 #2 fix). `resolve_socket_route()` is called ONCE
     # to get both the chosen path AND the route-chose-daemon
@@ -999,9 +1030,19 @@ async def start_session(
         """Carry the spawn call's descriptive fields onto a result dict
         built elsewhere (the wait path's `_await_reply` result), so
         `wait=true` callers see the same `worktree_path` / `task_id` /
-        `prompt_source` that `wait=false` callers get."""
+        `prompt_source` that `wait=false` callers get — plus the ux-1b
+        co-tenancy guard fields, which a `wait=true` caller needs at least
+        as much (it's about to read a reply from a worker sharing its
+        tree)."""
         if isinstance(d, dict) and isinstance(spawn, dict):
-            for key in ("worktree_path", "task_id", "prompt_source"):
+            for key in (
+                "worktree_path",
+                "task_id",
+                "prompt_source",
+                "shared_workspace",
+                "warning",
+                "workspace_shared_with",
+            ):
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]
         return d

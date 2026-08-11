@@ -321,6 +321,118 @@ pub fn resolve_base_commit(main_repo: &Path, base: &str) -> anyhow::Result<Strin
     anyhow::bail!("base '{}' does not resolve to a commit", base)
 }
 
+/// Trunk refs `resolve_project_main` tries, in order. Local first
+/// (matching `resolve_base_commit`'s local-first rule: the operator's own
+/// commits are usually the point), then the remote-tracking mirror.
+const PROJECT_MAIN_CANDIDATES: [&str; 2] = ["main", "master"];
+
+/// The commit a workspace-less task's minted worktree is cut from: the
+/// project's trunk. Returns `(ref_used, sha)`.
+///
+/// Resolution order is `main`, `origin/main`, `master`, `origin/master`,
+/// all `rev-parse`-local; only if every one misses does it fall through
+/// to [`resolve_base_commit`]`(main_repo, "main")`, which spends one
+/// `git fetch`. That ordering means the common case (a repo with a local
+/// trunk) costs no network at all, and a `master`-trunk repo resolves
+/// without the caller having to say so.
+///
+/// Errors when nothing resolves — the caller surfaces that as a clean
+/// refusal, having created nothing.
+pub fn resolve_project_main(main_repo: &Path) -> anyhow::Result<(String, String)> {
+    for cand in PROJECT_MAIN_CANDIDATES {
+        if let Some(sha) = rev_parse_commit(main_repo, cand) {
+            return Ok((cand.to_string(), sha));
+        }
+        let remote = format!("origin/{}", cand);
+        if let Some(sha) = rev_parse_commit(main_repo, &remote) {
+            return Ok((remote, sha));
+        }
+    }
+    // Nothing local. One fetch, through the same resolver `create_subtask`
+    // uses for an explicit `base`.
+    if let Ok(sha) = resolve_base_commit(main_repo, "main") {
+        return Ok(("main".to_string(), sha));
+    }
+    anyhow::bail!(
+        "cannot resolve the project's main branch in {} (tried main, origin/main, \
+         master, origin/master, and a fetch of origin main)",
+        main_repo.display()
+    )
+}
+
+/// Branch name for a task's minted worktree:
+/// `cm-sub/<name-slug>-<7 chars of the task id>`.
+///
+/// The suffix is DERIVED FROM THE TASK ID rather than random (which is
+/// what `create_subtask` does), so minting is idempotent: a second mint
+/// for the same task computes the same branch, `create_subtask_worktree`
+/// finds the directory already there, and the task gets its original
+/// checkout back instead of a second one. That matters because the
+/// task→workspace binding lives in daemon state, which a restart can
+/// outlive the worktree of.
+///
+/// The `cm-sub/` prefix is deliberate reuse: `recover_worktree_path` and
+/// the TUI's reconcile recovery both already map that prefix back to a
+/// worktree directory, so a minted checkout survives a manifest loss for
+/// free.
+pub fn task_worktree_branch(task_id: &str, task_name: &str) -> String {
+    let mut slug = slugify(task_name);
+    if slug.is_empty() {
+        slug = "task".to_string();
+    }
+    let short: String = task_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(7)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let short = if short.is_empty() {
+        "nosuffix".to_string()
+    } else {
+        short
+    };
+    format!("cm-sub/{}-{}", slug, short)
+}
+
+/// A worktree minted for a task that had none.
+#[derive(Debug)]
+pub struct MintedTaskWorktree {
+    pub branch: String,
+    pub worktree_path: PathBuf,
+    /// The trunk ref the cut came from (`main`, `origin/master`, …).
+    pub base_ref: String,
+    /// The commit the checkout actually sits on. Equals the trunk tip for
+    /// a fresh mint; for a RE-mint that found the directory already there
+    /// (same task ⇒ same branch) it's wherever that checkout has since
+    /// moved to, which is the honest answer to "what am I working on top
+    /// of".
+    pub base_sha: String,
+}
+
+/// Mint the checkout a workspace-less task's first session runs in: a
+/// fresh branch cut from the project's trunk, in its own worktree.
+///
+/// This is the shared implementation behind BOTH `start_session` routes
+/// (the daemon's `mcp_start_session` and the TUI's twin) so the two can't
+/// drift on branch naming or cut point. It reuses `create_subtask`'s
+/// machinery wholesale — [`resolve_project_main`] feeds a concrete sha to
+/// [`create_subtask_worktree`] via [`SubtaskStart::Base`], so an
+/// unresolvable trunk fails with the "does not resolve to a commit"
+/// message BEFORE any git state is touched and the caller is never left
+/// registering a workspace for a checkout that doesn't exist.
+pub fn mint_task_worktree(
+    main_repo: &Path,
+    task_id: &str,
+    task_name: &str,
+) -> anyhow::Result<MintedTaskWorktree> {
+    let (base_ref, trunk_sha) = resolve_project_main(main_repo)?;
+    let branch = task_worktree_branch(task_id, task_name);
+    let worktree_path = create_subtask_worktree(main_repo, &branch, SubtaskStart::Base(&trunk_sha))?;
+    setup_worktree(main_repo, &worktree_path);
+    let base_sha = worktree_head_sha(&worktree_path).unwrap_or(trunk_sha);
+    Ok(MintedTaskWorktree { branch, worktree_path, base_ref, base_sha })
+}
+
 /// Create a worktree for a subtask. Differs from `create_worktree` in:
 ///   - branch name is fully specified by the caller (e.g.
 ///     `cm-sub/<slug-chain>-<short_id>` per AGENT_ORCHESTRATION.md), not
@@ -1244,6 +1356,13 @@ mod tests {
             "clone failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // `git clone` copies no identity, so the commit below would fall
+        // back to the machine's GLOBAL git config — which the HOME-swapping
+        // tests in this module (they share `env_lock`, this one doesn't)
+        // can yank out from under it mid-run. Pin it locally like
+        // `make_git_repo` does.
+        git(&clone, &["config", "user.email", "t@t"]);
+        git(&clone, &["config", "user.name", "t"]);
 
         // A local-only commit on a branch that is NOT checked out — git
         // refuses to fetch into a checked-out branch, so this is exactly
@@ -1364,6 +1483,114 @@ mod tests {
 
             assert_eq!(worktree_head_sha(&wt).as_deref(), Some(second.as_str()));
             assert!(wt.join("two.txt").exists());
+        });
+    }
+
+    // === ux-1a: minting a worktree for a workspace-less task ===
+
+    /// The mint cuts from the project's trunk, NOT from whatever the
+    /// caller happens to be sitting on — that's the whole point of the
+    /// policy (the ux note's incident was a worker "branching off main"
+    /// inside the proposer's WIP checkout). `repo_with_history` leaves
+    /// `main` at `second`, so that's the commit the mint must land on.
+    #[test]
+    fn mint_task_worktree_cuts_from_project_main() {
+        with_home(|_home| {
+            let (_tmp, repo, first, second) = repo_with_history();
+            // Move the main repo OFF main, to prove the cut follows the
+            // trunk rather than the current checkout.
+            git(&repo, &["checkout", "-q", "-b", "sidetrack", &first]);
+
+            let minted = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing")
+                .expect("mint");
+
+            assert_eq!(minted.base_ref, "main");
+            assert_eq!(minted.base_sha, second);
+            assert_eq!(worktree_head_sha(&minted.worktree_path).as_deref(), Some(second.as_str()));
+            assert_eq!(
+                worktree_current_branch(&minted.worktree_path).as_deref(),
+                Some(minted.branch.as_str()),
+            );
+            assert!(minted.worktree_path.exists());
+        });
+    }
+
+    /// The branch (and therefore the directory) is derived from the TASK
+    /// ID, so a second mint for the same task returns the same checkout
+    /// instead of a second one. This is what keeps a daemon restart —
+    /// which can outlive the task→workspace binding — from scattering
+    /// duplicate worktrees.
+    #[test]
+    fn mint_task_worktree_is_idempotent_per_task() {
+        with_home(|_home| {
+            let (_tmp, repo, _first, _second) = repo_with_history();
+
+            let a = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing").unwrap();
+            let b = mint_task_worktree(&repo, "abc12345-dead-beef", "Fix the thing").unwrap();
+
+            assert_eq!(a.branch, b.branch);
+            assert_eq!(a.worktree_path, b.worktree_path);
+            // A DIFFERENT task with the same name gets its own checkout.
+            let c = mint_task_worktree(&repo, "99999999-dead-beef", "Fix the thing").unwrap();
+            assert_ne!(a.worktree_path, c.worktree_path);
+        });
+    }
+
+    /// The branch name follows the `cm-sub/` convention so
+    /// `recover_worktree_path` (and the TUI's reconcile recovery, which
+    /// keys off the same prefix) can map a minted checkout back to its
+    /// task after a manifest loss.
+    #[test]
+    fn task_worktree_branch_is_recoverable() {
+        with_home(|home| {
+            let branch = task_worktree_branch("abc12345-dead-beef", "Fix the thing!");
+            assert_eq!(branch, "cm-sub/fix-the-thing-abc1234");
+
+            let dir = home.join(".cm/worktrees").join(branch.replace('/', "-"));
+            std::fs::create_dir_all(&dir).unwrap();
+            assert_eq!(recover_worktree_path("r", &branch), Some(dir));
+
+            // A task whose name slugifies to nothing still yields a
+            // usable branch rather than a bare `cm-sub/-<id>`.
+            assert_eq!(task_worktree_branch("abc1234", "!!!"), "cm-sub/task-abc1234");
+        });
+    }
+
+    /// A repo whose trunk is `master` resolves without the caller having
+    /// to say so — and a repo with NO trunk at all fails cleanly, having
+    /// created nothing. That second half is the invariant the mint
+    /// callers depend on: they register a workspace only after this
+    /// returns Ok.
+    #[test]
+    fn resolve_project_main_handles_master_and_refuses_when_absent() {
+        with_home(|home| {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("masterrepo");
+            make_git_repo(&repo);
+            git(&repo, &["branch", "-M", "master"]);
+            let head = commit_file(&repo, "one.txt", "1");
+            assert_eq!(
+                resolve_project_main(&repo).unwrap(),
+                ("master".to_string(), head)
+            );
+
+            // Rename the trunk to something the resolver doesn't know and
+            // there is no main to fall back to.
+            git(&repo, &["branch", "-M", "trunkless"]);
+            let err = resolve_project_main(&repo).expect_err("no main/master").to_string();
+            assert!(
+                err.contains("cannot resolve the project's main branch"),
+                "unexpected error: {}",
+                err
+            );
+            let err = mint_task_worktree(&repo, "abc1234", "no trunk")
+                .expect_err("mint must refuse")
+                .to_string();
+            assert!(err.contains("cannot resolve the project's main branch"), "{}", err);
+            assert!(
+                !home.join(".cm/worktrees/cm-sub-no-trunk-abc1234").exists(),
+                "a refused mint must leave no half-made worktree behind",
+            );
         });
     }
 

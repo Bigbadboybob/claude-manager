@@ -382,6 +382,95 @@ class IsolatedSpawnTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIn("bound task", res["message"])
 
 
+# ── ux-1a/1b: workspace-less task spawn policy ─────────────────────────
+
+
+class AllowSharedWorkspaceTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
+    """The co-tenancy opt-in and the guard fields it comes back with.
+
+    The placement DECISION is the server's (see the daemon's
+    `mcp_start_session` / its TUI twin); what the tool layer owes is to
+    forward the flag only when asked, and to surface the guard the server
+    returns — including on the `wait=true` path, where the fields are
+    assembled from a different dict.
+    """
+
+    async def test_flag_is_omitted_by_default(self):
+        # An older server would reject an unknown field, so the default
+        # (mint) path must not send one.
+        seen = {}
+
+        def _call(method, params, *a, **k):
+            seen.update(params)
+            return {"session_uid": "ts-0", "worktree_path": "/wt/minted"}
+
+        control_client.call = _call
+        res = await start_session("claude-code", "w", task_id="task-orphan")
+        self.assertNotIn("allow_shared_workspace", seen)
+        self.assertEqual(res["worktree_path"], "/wt/minted")
+
+    async def test_flag_is_forwarded_when_asked_for(self):
+        seen = {}
+
+        def _call(method, params, *a, **k):
+            seen.update(params)
+            return {
+                "session_uid": "ts-0",
+                "worktree_path": "/wt/caller",
+                "shared_workspace": True,
+                "warning": "spawned as a CO-TENANT in /wt/caller",
+                "workspace_shared_with": [
+                    {"session_uid": "ts-caller", "label": "orchestrator"},
+                ],
+            }
+
+        control_client.call = _call
+        res = await start_session(
+            "claude-code", "w", task_id="task-orphan",
+            allow_shared_workspace=True,
+        )
+        self.assertIs(seen["allow_shared_workspace"], True)
+        # The guard reaches the agent intact — it's the whole point.
+        self.assertIs(res["shared_workspace"], True)
+        self.assertIn("CO-TENANT", res["warning"])
+        self.assertEqual(
+            res["workspace_shared_with"][0]["session_uid"], "ts-caller",
+        )
+
+    async def test_wait_path_carries_the_guard_fields(self):
+        # `_with_spawn_fields` builds the wait=true result from a
+        # different dict; a caller about to read a reply from a worker
+        # sharing its tree needs the warning at least as much.
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        _write_lines(path, [_user_line("go"), _assistant_line("done")])
+
+        def _call(method, params, *a, **k):
+            if method == "mcp_start_session":
+                return {
+                    "session_uid": "ts-0",
+                    "worktree_path": "/wt/caller",
+                    "prompt_source": "caller",
+                    "shared_workspace": True,
+                    "warning": "spawned as a CO-TENANT in /wt/caller",
+                    "workspace_shared_with": [
+                        {"session_uid": "ts-caller", "label": "orchestrator"},
+                    ],
+                }
+            return _ready(True, path)
+
+        control_client.call = _call
+        res = await start_session(
+            "claude-code", "w", prompt="go", task_id="task-orphan",
+            allow_shared_workspace=True, wait=True, poll_interval_s=0.02,
+        )
+        self.assertEqual(res["last_message"]["content"], "done")
+        self.assertIs(res["shared_workspace"], True)
+        self.assertIn("CO-TENANT", res["warning"])
+        self.assertEqual(res["worktree_path"], "/wt/caller")
+
+
 # ── P1: transcript-less read advisory ──────────────────────────────────
 
 

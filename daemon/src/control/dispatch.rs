@@ -4594,11 +4594,18 @@ mod tests {
     /// fix-start-session: the incident shape. An orchestrator
     /// `propose_task`s a new task (top-level in planning) and then
     /// `start_session(task_id=<proposed>)`s a worker on it. With the
-    /// creator edge recorded, the spawn passes the descendant walk and —
-    /// since a proposed task has no worktree of its own — lands in the
-    /// CALLER's workspace, bound to the proposed task. Pre-fix this was
-    /// rejected `unauthorized: task '<id>' is not the caller's task or a
+    /// creator edge recorded, the spawn passes the descendant walk — and
+    /// binds the worker to the proposed task. Pre-fix this was rejected
+    /// `unauthorized: task '<id>' is not the caller's task or a
     /// descendant` on every attempt.
+    ///
+    /// ux-1a changed where that worker LANDS: a workspace-less task now
+    /// gets its own minted worktree, and `allow_shared_workspace=true` is
+    /// the opt-in to the old co-tenant placement. This fixture has no git
+    /// repo and no planning API, so it asserts the auth half both ways:
+    /// without the flag the call fails on the MINT (not on auth), and
+    /// with it the worker lands in the caller's workspace exactly as
+    /// before.
     #[test]
     fn mcp_start_session_binds_to_agent_proposed_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -4631,6 +4638,37 @@ mod tests {
         let session = crate::session::DaemonSession::spawn(sp).unwrap();
         state.lock().unwrap().sessions.insert("ts-orch".into(), session);
 
+        // ux-1a: without the opt-in, the daemon tries to MINT the task a
+        // worktree. There's no repo or planning API in this fixture so
+        // that fails — but the failure is about the mint, which is proof
+        // the descendant walk let the caller through (the pre-fix bug
+        // failed here with `unauthorized ... descendant`).
+        let refused = dispatch_request(
+            &state,
+            &session_request(
+                "mcp_start_session",
+                serde_json::json!({
+                    "type": "bash",
+                    "label": "lane-d",
+                    "task_id": "task-proposed",
+                }),
+                "ts-orch",
+            ),
+        ).into_response();
+        assert!(!refused.ok, "a workspace-less task is no longer silently co-tenanted");
+        let err = refused.error.expect("error body");
+        assert_ne!(err.code, ErrorCode::Unauthorized, "auth passed: {}", err.message);
+        assert!(
+            !err.message.contains("descendant"),
+            "the creator edge must still authorize the spawn: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("allow_shared_workspace=true"),
+            "the refusal must name the override: {}",
+            err.message,
+        );
+
         let resp = dispatch_request(
             &state,
             &session_request(
@@ -4639,6 +4677,7 @@ mod tests {
                     "type": "bash",
                     "label": "lane-d",
                     "task_id": "task-proposed",
+                    "allow_shared_workspace": true,
                 }),
                 "ts-orch",
             ),
@@ -4657,7 +4696,7 @@ mod tests {
             let sess = s.sessions.get(&new_uid).expect("worker in registry");
             assert_eq!(
                 sess.workspace_id, "ws-orch",
-                "a proposed task has no worktree — worker spawns in the \
+                "with allow_shared_workspace the worker still spawns in the \
                  caller's workspace",
             );
             assert_eq!(
