@@ -23,11 +23,11 @@ from mcp_server.transcripts import codex as transcripts_codex
 from mcp_server.transcripts.types import Role
 
 
-def _session_status(state: str, idle: bool) -> str:
-    """Collapse the daemon's (state, idle) pair into ONE unambiguous
-    word. Agents routinely misread the raw signal because "idle" means
-    three different things depending on `state`; this is the legible
-    summary they should branch on:
+def _session_status(state: str, idle: bool, reported_done: bool = False) -> str:
+    """Collapse the daemon's (state, idle, reported_done) triple into ONE
+    unambiguous word. Agents routinely misread the raw signal because
+    "idle" means three different things depending on `state`; this is the
+    legible summary they should branch on:
 
       - "starting"        spawned but transcript not bound yet — the
                           agent is still coming up, OR it's a
@@ -38,14 +38,33 @@ def _session_status(state: str, idle: bool) -> str:
                           (mid-turn).
       - "awaiting_input"  transcript bound, PTY quiet — the agent
                           finished its turn and is back at the prompt,
-                          waiting on you.
+                          waiting on you. NOT a claim that it finished
+                          its WORK; see "reported".
+      - "reported"        the agent called `report_done` and has not been
+                          given new work since — it says it is finished.
       - "exited"          process gone.
+
+    UX item 4a: `awaiting_input` used to carry three unrelated meanings —
+    a worker delivering its final verdict, a worker whose background
+    fan-out is still running, and a worker paused mid-task all looked
+    identical, so orchestrators pattern-matched the prose for "VERDICT:"
+    to tell them apart. `reported` is the agent's own answer, and it
+    outranks the PTY-derived words: a session that has declared itself
+    done reads "reported" whether or not it is still flushing its final
+    message (`idle` still tells you whether the turn has ended).
+
+    `exited` still wins over everything — a dead session's own opinion of
+    its state stopped being actionable when the process went away, and
+    "did it report before it died" is a separate field (see
+    `_monitor_completed_entry`).
 
     `state` and `idle` are still returned alongside `status` everywhere,
     so callers that want the raw signal keep it.
     """
     if state == "exited":
         return "exited"
+    if reported_done:
+        return "reported"
     if state == "pending":
         return "starting"
     return "awaiting_input" if idle else "working"
@@ -179,6 +198,54 @@ def last_completed_turn_fingerprint(engine: str, path: str | None) -> str | None
     return None
 
 
+def baseline_for(engine: str, tpath: str | None) -> dict | None:
+    """A baseline pinned to the session's CURRENT completed work, or None
+    when there is nothing to anchor on (no transcript, unreadable, no
+    completed turn yet) — in which case the watch degrades to level
+    behavior for that session.
+
+    Two uses, same shape: `async_monitor._capture_baseline` arms a fresh
+    monitor with it, and `_monitor_sessions` RE-arms with it every time a
+    `until="final"` watch skips an interim turn end. Sync (file IO):
+    callers offload via asyncio.to_thread where it matters."""
+    if engine == "claude-code":
+        fp = last_completed_turn_fingerprint(engine, tpath)
+        return {"kind": "turn", "value": fp} if fp is not None else None
+    if not tpath:
+        return None
+    try:
+        return {"kind": "size", "value": os.path.getsize(tpath)}
+    except OSError:
+        return None
+
+
+def report_anchor_for(resolved: dict) -> float | None:
+    """The `report_done` timestamp a watch should treat as ALREADY SEEN,
+    or None when the session has not reported.
+
+    The done-report equivalent of an edge baseline: a `until="final"`
+    watch armed on a session that reported ten minutes ago must not fire
+    on that stale report, and comparing timestamps is exact — the daemon
+    clears the flag on any new input, so a fresh report always carries a
+    later stamp. Sessions reporting without a timestamp (a daemon older
+    than this field) anchor at 0.0, which reads as "seen"."""
+    if not resolved.get("reported_done"):
+        return None
+    try:
+        return float(resolved.get("reported_done_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _report_is_new(resolved: dict, anchor: float | None) -> bool:
+    """True when `resolved` carries a done report the watch has not
+    already accounted for at arm time."""
+    current = report_anchor_for(resolved)
+    if current is None:
+        return False
+    return anchor is None or current != anchor
+
+
 def _edge_passed(baseline: dict, engine: str, tpath: str | None) -> bool:
     """True when the watched session has produced NEW completed work
     since `baseline` was captured at arm time. "turn" baselines compare
@@ -219,13 +286,29 @@ def _last_assistant(messages) -> dict | None:
     return None
 
 
-# Exit-provenance keys the daemon puts on an exited session's
-# `resolve_authorized_session` / `list_sessions(include_exited)` payload
-# (daemon tombstone, UX item 3b). Copied onto the completed entry so a
-# consumer can tell "the agent finished and stopped" apart from "someone
-# killed it mid-turn" — the difference between a final report and a
-# truncated fragment. See `async_monitor._format_fire_message`.
-_EXIT_PROVENANCE_KEYS = ("killed", "killed_by", "exited_at")
+# Outcome keys the daemon puts on a session's
+# `resolve_authorized_session` / `list_sessions(include_exited)` payload.
+# Copied onto the completed entry so a consumer can tell "the agent
+# finished and stopped" apart from "someone killed it mid-turn" — the
+# difference between a final report and a truncated fragment. See
+# `async_monitor._format_fire_message`.
+#
+#   killed / killed_by / exited_at   how it ended (UX item 3b; the
+#       daemon tombstone. `killed_by` is a who-or-what — a session uid,
+#       "operator", "memory-cap", or a uid annotated with the sweep that
+#       killed it — rendered verbatim, never parsed).
+#   reported_done / reported_done_at / report_reason
+#       whether it said it was FINISHED (UX item 4a). Present on live
+#       rows and carried onto the tombstone, so "exited after reporting
+#       done" is distinguishable from "exited mid-task".
+_EXIT_PROVENANCE_KEYS = (
+    "killed",
+    "killed_by",
+    "exited_at",
+    "reported_done",
+    "reported_done_at",
+    "report_reason",
+)
 
 
 def _monitor_completed_entry(
@@ -272,11 +355,13 @@ async def _monitor_sessions(
     session_uids: list[str],
     *,
     mode: str = "any",
+    until: str = "turn_end",
     timeout_s: float = 1800.0,
     poll_interval_s: float = 2.0,
     pending_idle_grace_s: float = 8.0,
     return_last_message: bool = True,
     baselines: dict[str, dict] | None = None,
+    report_anchors: dict[str, float] | None = None,
 ) -> dict:
     """Watch `session_uids` until the stop condition is met or `timeout_s`.
 
@@ -293,6 +378,24 @@ async def _monitor_sessions(
     `exited`; a transcript-less pending+quiet session reports after
     `pending_idle_grace_s`. A bad/unauthorized uid is reported once with
     status="error" so a typo can't block the whole monitor.
+
+    `until` selects WHAT counts as finished for each session:
+
+    until="turn_end" (default): the rule above — the next completed turn.
+    until="final": a turn ending is not enough. The session completes
+        only when it EXITS or when its agent has called `report_done`
+        (`reported_done` on the daemon payload, cleared by any new input
+        — see `DaemonSession::reported_done`). Every interim turn end
+        RE-ARMS the watch against the turn that just finished, so the
+        same idle state can't be re-examined every poll and the skipped
+        turns are counted onto the eventual entry as `interim_turn_ends`.
+        This is the mode for "wake me when the worker is DONE, not each
+        time it pauses" — the fan-out case where a worker ends its
+        launch turn with background subagents still running, and an
+        orchestrator reading that as completion is a live incident.
+        Note a session that can't report (bash, or any agent that never
+        calls the tool) completes only on exit, so pair final mode with
+        a `timeout_s` you're willing to wait.
 
     mode="any" (default): return as soon as >=1 session completes. The
         `completed` batch may hold more than one if several finished in
@@ -313,6 +416,19 @@ async def _monitor_sessions(
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
     grace = max(1.0, min(pending_idle_grace_s, 60.0))
+
+    final_mode = until == "final"
+    # Re-arm bookkeeping lives here rather than on the caller's record so a
+    # blocking caller gets the same behavior; `baselines` is mutated in
+    # place for uids the final watch skips past.
+    if final_mode and baselines is None:
+        baselines = {}
+    # uid -> the done report already present when the watch armed (see
+    # `report_anchor_for`). Absent uids have no anchor, so ANY report on
+    # them fires — the level-triggered reading, which is what a caller
+    # that passed no baselines asked for.
+    report_anchors = report_anchors or {}
+    interim_turn_ends: dict[str, int] = {u: 0 for u in uids}
 
     seen: dict[str, bool] = {u: False for u in uids}
     pending_idle_since: dict[str, float | None] = {u: None for u in uids}
@@ -399,21 +515,68 @@ async def _monitor_sessions(
             else:
                 pending_idle_since[uid] = None
 
+            # Edge gate: an idle observation on the SAME turn that existed
+            # when the watch was armed is not a completion.
+            edge_ok = True
             if done and state != "exited" and baselines:
                 b = baselines.get(uid)
                 if b is not None and not await asyncio.to_thread(
                     _edge_passed, b, engine, tpath
                 ):
-                    # Idle, but idle on the SAME turn that existed when
-                    # the watch was armed — not a completion, keep
-                    # waiting for the next edge.
+                    edge_ok = False
+
+            reported = bool(resolved.get("reported_done"))
+            if final_mode and state != "exited":
+                if _report_is_new(resolved, report_anchors.get(uid)):
+                    # The report IS the edge. Deciding this off the
+                    # transcript instead would be fragile in exactly the
+                    # case that matters: this watch RE-ARMS its baseline
+                    # past every interim turn, so a report arriving with
+                    # no further transcript movement would sit behind a
+                    # baseline the agent can never pass.
+                    edge_ok = True
+                elif done and edge_ok:
+                    # A turn ended and the agent has NOT said it is
+                    # finished. Re-arm past it and keep watching — this
+                    # is the whole point of final mode. The re-arm also
+                    # stops the same idle state from being re-tested (and
+                    # its transcript re-read) on every poll.
+                    new_baseline = await asyncio.to_thread(
+                        baseline_for, engine, tpath
+                    )
+                    # Count only turns we can actually pin. A
+                    # transcript-less session — bash, or an agent still
+                    # coming up — has no turn boundary to re-arm against,
+                    # and incrementing per poll would make the count a
+                    # poll counter.
+                    if (
+                        new_baseline is not None
+                        and new_baseline != baselines.get(uid)
+                    ):
+                        baselines[uid] = new_baseline
+                        interim_turn_ends[uid] += 1
                     done = False
-                    status_override = None
+
+            if not edge_ok:
+                # Idle on the pre-arm turn: not a completion, keep waiting
+                # for the next edge.
+                done = False
+            if not done:
+                status_override = None
 
             if done:
+                # `status_override` only exists to force "awaiting_input"
+                # when the PTY looks busy but the transcript says the turn
+                # ended — a strictly weaker claim than the agent's own
+                # done report, so `reported` wins over it.
+                status_word = (
+                    _session_status(state, idle, True)
+                    if reported
+                    else status_override or _session_status(state, idle)
+                )
                 entry = await asyncio.to_thread(
                     _monitor_completed_entry, uid,
-                    status_override or _session_status(state, idle),
+                    status_word,
                     state, idle,
                     engine, tpath, gen, return_last_message,
                     resolved,
@@ -422,6 +585,8 @@ async def _monitor_sessions(
                     # Surfaced for callers/debugging: the PTY was busy
                     # (spinner) but the transcript says the turn ended.
                     entry["idle_source"] = "transcript"
+                if interim_turn_ends[uid]:
+                    entry["interim_turn_ends"] = interim_turn_ends[uid]
                 completed.append(entry)
                 remaining.remove(uid)
 

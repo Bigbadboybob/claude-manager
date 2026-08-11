@@ -729,6 +729,34 @@ class FireMessageFormatTests(unittest.TestCase):
         self.assertNotIn("killed", text)
         self.assertNotIn("no explicit done-report", text)
 
+    def test_timeout_with_no_completers_announces_nobody_finished(self):
+        # Observed live (mon-7a1643): timed_out with an EMPTY completed
+        # list. Every trailer below is written about completers, so the
+        # generic one used to fire over zero of them — telling the
+        # orchestrator that "the completed worker(s) are now awaiting
+        # input" when nothing had finished at all.
+        text = async_monitor._format_fire_message(
+            dict(self.RECORD),
+            {"completed": [], "still_running": ["ts-b"], "timed_out": True},
+        )
+        self.assertIn("TIMED OUT", text)
+        self.assertIn("Still running: ts-b", text)
+        self.assertIn("NOTHING finished inside the watch budget", text)
+        self.assertNotIn("awaiting input", text)
+        self.assertNotIn("EXITED", text)
+        # The recovery cue: those sessions are live but unwatched now.
+        self.assertIn("NO LONGER WATCHED", text)
+        self.assertIn("monitor_sessions", text)
+
+    def test_timeout_with_nothing_left_at_all_says_so(self):
+        text = async_monitor._format_fire_message(
+            dict(self.RECORD),
+            {"completed": [], "still_running": [], "timed_out": True},
+        )
+        self.assertIn("no session is still being watched", text)
+        self.assertNotIn("awaiting input", text)
+        self.assertNotIn("NO LONGER WATCHED", text)
+
 
 if __name__ == "__main__":
     unittest.main()

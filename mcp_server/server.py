@@ -597,7 +597,9 @@ def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
     sessions = control_client.call("list_sessions", params)
     for s in sessions:
         s["status"] = _session_status(
-            s.get("state", "pending"), bool(s.get("idle", False))
+            s.get("state", "pending"),
+            bool(s.get("idle", False)),
+            bool(s.get("reported_done", False)),
         )
         for k in _SESSION_NOISE_FIELDS:
             s.pop(k, None)
@@ -639,13 +641,22 @@ def list_sessions(
         Exited rows (include_exited=true) additionally carry HOW they
         ended: exited_at (unix seconds), killed (true when the exit
         followed a kill request rather than the agent stopping on its
-        own), and killed_by (the session uid that called `kill_session`,
-        or "operator"). Use them before reading a dead session's tail —
-        a killed session's last message is wherever the SIGKILL cut it
-        off, not a conclusion.
-        status ∈ {"starting", "working", "awaiting_input", "exited"} —
-            the legible summary of (state, idle); branch on this instead
-            of decoding the pair yourself. See the status legend on
+        own), and killed_by (who or what asked — a session uid,
+        "operator", "memory-cap" for a session the memory cap OOM-killed,
+        or a uid annotated with the sweep that killed it). Use them
+        before reading a dead session's tail — a killed session's last
+        message is wherever the SIGKILL cut it off, not a conclusion.
+        reported_done / reported_done_at / report_reason: whether the
+            agent called `report_done` — its own "my work is finished"
+            signal — and what it said. Present on live rows AND on exited
+            ones, so "finished, then exited" is distinguishable from
+            "stopped mid-task".
+        status ∈ {"starting", "working", "awaiting_input", "reported",
+            "exited"} — the legible summary; branch on this instead of
+            decoding (state, idle) yourself. "reported" means the agent
+            declared itself done and has had no new input since — it is
+            the one status that means completion. "awaiting_input" means
+            only that it stopped talking. See the status legend on
             `wait_for_session_idle`.
         managed_by_uid: the session that spawned this one (None if
             operator-spawned) — the parent link for orchestration.
@@ -765,6 +776,7 @@ async def start_session(
     schema_retries: int = 1,
     isolated: bool = False,
     notify_on_done: bool = True,
+    notify_until: str = "turn_end",
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -857,6 +869,13 @@ async def start_session(
             `prompt_source == "task"`) counts, so a task launch wakes
             you too. Ignored for bash sessions, when wait=true, or when
             the worker was spawned with no prompt at all.
+        notify_until: What the auto-monitor waits for — "turn_end"
+            (default: the worker finishing this prompt) or "final" (only
+            an exit or the worker's own `report_done`, with interim turn
+            ends silently re-arming the watch). Use "final" for a worker
+            you expect to run a multi-turn job on its own and want to
+            hear from ONCE, when it is genuinely finished. See
+            `monitor_sessions`.
 
     Returns:
         Every spawn returns, alongside the shape below:
@@ -1000,8 +1019,12 @@ async def start_session(
         ):
             try:
                 spawn["monitor"] = async_monitor.register_monitor(
-                    [spawn_uid], mode="any",
-                    note=f"worker '{label}' finished its initial prompt",
+                    [spawn_uid], mode="any", until=notify_until,
+                    note=(
+                        f"worker '{label}' reported done"
+                        if notify_until in ("final", "task_done")
+                        else f"worker '{label}' finished its initial prompt"
+                    ),
                     source="auto",
                 )
             except async_monitor.RegistrationError as e:
@@ -1040,6 +1063,7 @@ async def send_input(
     text: str,
     submit: bool = True,
     notify_on_done: bool = True,
+    notify_until: str = "turn_end",
 ) -> dict:
     """Deliver a prompt to a session you can see, and (by default) get
     woken asynchronously when that session finishes the turn.
@@ -1065,6 +1089,11 @@ async def send_input(
             true). Set false for pure fire-and-forget (e.g. a nudge you
             don't care to hear back about, or when you're already
             watching the session another way).
+        notify_until: What that monitor waits for — "turn_end" (default:
+            the reply to THIS prompt) or "final" (only an exit or the
+            target's own `report_done`, with interim turn ends re-arming
+            the watch). Use "final" when the prompt kicks off work that
+            will span several turns. See `monitor_sessions`.
 
     State your intent and ask the user before calling this tool.
     """
@@ -1076,8 +1105,12 @@ async def send_input(
     if notify_on_done and isinstance(res, dict) and "error" not in res:
         try:
             res["monitor"] = async_monitor.register_monitor(
-                [session_uid], mode="any",
-                note=f"reply to your send_input to {session_uid}",
+                [session_uid], mode="any", until=notify_until,
+                note=(
+                    f"{session_uid} reported done"
+                    if notify_until in ("final", "task_done")
+                    else f"reply to your send_input to {session_uid}"
+                ),
                 source="auto",
             )
         except async_monitor.RegistrationError as e:
@@ -1144,6 +1177,29 @@ _NO_TRANSCRIPT_NOTE = (
 )
 
 
+# Outcome fields the daemon puts on a `resolve_authorized_session` reply:
+# how the session ended (3b) and whether its agent said it was finished
+# (4a). Copied verbatim onto the read tools' results so a reader never has
+# to call `list_sessions(include_exited=True)` just to learn that the tail
+# it is looking at is a SIGKILL fragment rather than a conclusion.
+_OUTCOME_FIELDS = (
+    "killed",
+    "killed_by",
+    "exited_at",
+    "reported_done",
+    "reported_done_at",
+    "report_reason",
+)
+
+
+def _with_outcome(out: dict, resolved: dict) -> dict:
+    """Carry the resolve payload's outcome fields onto a read result."""
+    for key in _OUTCOME_FIELDS:
+        if resolved.get(key) is not None:
+            out[key] = resolved[key]
+    return out
+
+
 @mcp.tool()
 def read_session_output(
     session_uid: str,
@@ -1177,11 +1233,18 @@ def read_session_output(
         - messages: list of {role, content, ts}
         - cursor: opaque, pass back on next call
         - state: "ready" | "pending" | "exited"
-        - status: "starting"|"working"|"awaiting_input"|"exited" — the
-          legible summary of (state, idle)
+        - status: "starting"|"working"|"awaiting_input"|"reported"|
+          "exited" — the legible summary; "reported" means the agent
+          called `report_done`.
         - When state="pending", messages is empty and you can poll again.
         - note: present only when no transcript is bound (messages empty).
           Explains the bash-session read dead-end and what to do instead.
+        - Outcome fields, present when the daemon knows them:
+          reported_done / reported_done_at / report_reason (the agent's
+          own "I'm finished" signal) and, for a session that has ended,
+          killed / killed_by / exited_at. Read them before trusting the
+          tail: a killed session's last message is wherever the SIGKILL
+          landed, not a conclusion.
     """
     try:
         resolved = control_client.call(
@@ -1196,6 +1259,7 @@ def read_session_output(
     transcript_path = resolved.get("transcript_path")
     generation = int(resolved.get("generation", 0))
     idle = bool(resolved.get("idle", False))
+    reported = bool(resolved.get("reported_done", False))
 
     if state == "pending" or transcript_path is None:
         out = {
@@ -1204,11 +1268,11 @@ def read_session_output(
             "generation": generation,
             "state": state,
             "idle": idle,
-            "status": _session_status(state, idle),
+            "status": _session_status(state, idle, reported),
         }
         if transcript_path is None:
             out["note"] = _NO_TRANSCRIPT_NOTE
-        return out
+        return _with_outcome(out, resolved)
 
     parser = _parser_for(engine)
     messages, cursor = parser.read_messages(
@@ -1217,14 +1281,14 @@ def read_session_output(
         since_cursor,
         max_messages,
     )
-    return {
+    return _with_outcome({
         "messages": [m.to_dict() for m in messages],
         "cursor": cursor,
         "generation": generation,
         "state": state,
         "idle": idle,
-        "status": _session_status(state, idle),
-    }
+        "status": _session_status(state, idle, reported),
+    }, resolved)
 
 
 @mcp.tool()
@@ -1251,11 +1315,20 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
           message, or null if the agent hasn't produced one yet.
         - messages: the last `context_messages` rendered messages
           (oldest-first), for context around the final turn.
-        - status: "starting"|"working"|"awaiting_input"|"exited".
+        - status: "starting"|"working"|"awaiting_input"|"reported"|
+          "exited". "reported" is the only one that means the agent
+          considers the work DONE; "awaiting_input" just means it
+          stopped talking.
         - cursor: end cursor — pass to `read_session_output(since_cursor=)`
           if you later want to resume forward reads from here.
         - note: present only when no transcript is bound (last_assistant is
           null). Explains the bash-session read dead-end and what to do.
+        - Outcome fields, present when the daemon knows them:
+          reported_done / reported_done_at / report_reason — the agent's
+          own done signal and its one-line reason — and, once the session
+          has ended, killed / killed_by / exited_at. The pair answers the
+          question this tool is usually asked in service of: is the text
+          below a conclusion, or wherever the process happened to stop?
     """
     try:
         resolved = control_client.call(
@@ -1270,10 +1343,12 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
     transcript_path = resolved.get("transcript_path")
     generation = int(resolved.get("generation", 0))
     idle = bool(resolved.get("idle", False))
-    status = _session_status(state, idle)
+    status = _session_status(
+        state, idle, bool(resolved.get("reported_done", False))
+    )
 
     if transcript_path is None:
-        return {
+        return _with_outcome({
             "last_assistant": None,
             "messages": [],
             "status": status,
@@ -1282,12 +1357,12 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
             "generation": generation,
             "cursor": None,
             "note": _NO_TRANSCRIPT_NOTE,
-        }
+        }, resolved)
 
     n = max(0, min(context_messages, 100))
     messages, cursor = _read_all_messages(engine, transcript_path, generation)
     tail = messages[-n:] if n else []
-    return {
+    return _with_outcome({
         "last_assistant": _last_assistant(messages),
         "messages": [m.to_dict() for m in tail],
         "status": status,
@@ -1295,7 +1370,7 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
         "idle": idle,
         "generation": generation,
         "cursor": cursor,
-    }
+    }, resolved)
 
 
 @mcp.tool()
@@ -1652,18 +1727,21 @@ async def wait_for_session_idle(
         resolved_once = True
         state = resolved.get("state", "pending")
         idle = bool(resolved.get("idle", False))
+        # The agent's own done signal, so this wait's `status` agrees with
+        # what `list_sessions` says about the same session.
+        reported = bool(resolved.get("reported_done", False))
         now = time.monotonic()
         if state == "exited":
             return {
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle),
+                "status": _session_status(state, idle, reported),
             }
         # A READY session (transcript bound) that's quiet is unambiguously
         # done with its turn — return immediately.
         if state == "ready" and idle:
             return {
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle),
+                "status": _session_status(state, idle, reported),
             }
         # READY but PTY-busy: a background task's spinner keeps the PTY
         # noisy while the agent is at the prompt (false-busy). Consult
@@ -1682,7 +1760,7 @@ async def wait_for_session_idle(
                 ):
                     return {
                         "idle": True, "timed_out": False, "state": state,
-                        "status": "awaiting_input",
+                        "status": "reported" if reported else "awaiting_input",
                         "idle_source": "transcript",
                     }
             else:
@@ -1705,14 +1783,14 @@ async def wait_for_session_idle(
             elif now - pending_idle_since >= grace:
                 return {
                 "idle": True, "timed_out": False, "state": state,
-                "status": _session_status(state, idle),
+                "status": _session_status(state, idle, reported),
             }
         else:
             pending_idle_since = None
         if now >= deadline:
             return {
                 "idle": False, "timed_out": True, "state": state,
-                "status": _session_status(state, idle),
+                "status": _session_status(state, idle, reported),
             }
         await asyncio.sleep(interval)
 
@@ -1915,6 +1993,9 @@ async def _await_reply(
         resolved_once = True
         state = resolved.get("state", "pending")
         idle = bool(resolved.get("idle", False))
+        # Same as the wait loop above: the agent's own done signal, so the
+        # `status` this returns agrees with what a listing would say.
+        reported = bool(resolved.get("reported_done", False))
         # A fresh session's transcript may bind only AFTER polling begins —
         # pick it up the moment it appears.
         if transcript_path is None and resolved.get("transcript_path"):
@@ -1949,7 +2030,7 @@ async def _await_reply(
             if saw_new_assistant and state == "ready" and idle:
                 return {
                     "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle),
+                    "status": _session_status(state, idle, reported),
                     "state": state, "idle": idle, "last_message": last_message,
                 }
             # New assistant reply + PTY still noisy: a background
@@ -1967,7 +2048,9 @@ async def _await_reply(
                     ):
                         return {
                             "completed": True, "timed_out": False,
-                            "status": "awaiting_input",
+                            "status": (
+                                "reported" if reported else "awaiting_input"
+                            ),
                             "state": state, "idle": idle,
                             "last_message": last_message,
                             "idle_source": "transcript",
@@ -1979,7 +2062,7 @@ async def _await_reply(
             if state == "ready" and idle:
                 return {
                     "completed": True, "timed_out": False,
-                    "status": _session_status(state, idle),
+                    "status": _session_status(state, idle, reported),
                     "state": state, "idle": idle, "last_message": None,
                     "note": _NO_TRANSCRIPT_NOTE,
                 }
@@ -1989,7 +2072,7 @@ async def _await_reply(
                 elif now - pending_idle_since >= grace:
                     return {
                         "completed": True, "timed_out": False,
-                        "status": _session_status(state, idle),
+                        "status": _session_status(state, idle, reported),
                         "state": state, "idle": idle, "last_message": None,
                         "note": _NO_TRANSCRIPT_NOTE,
                     }
@@ -1999,7 +2082,7 @@ async def _await_reply(
         if now >= deadline:
             return {
                 "completed": False, "timed_out": True,
-                "status": _session_status(state, idle),
+                "status": _session_status(state, idle, reported),
                 "state": state, "idle": idle, "last_message": last_message,
             }
         await asyncio.sleep(interval)
@@ -2270,6 +2353,7 @@ async def wait_for_any_session_idle(
 async def monitor_sessions(
     session_uids: list[str],
     mode: str = "any",
+    until: str = "turn_end",
     note: str = "",
     timeout_s: float = 1800.0,
     edge: bool = True,
@@ -2296,19 +2380,40 @@ async def monitor_sessions(
         (background work may still be running);
       - an idle-but-alive session is flagged as possibly an interim
         turn — the agent stopped talking, which is not the same as
-        reporting done.
+        reporting done;
+      - a session that called `report_done` reads `- <uid> (reported)`
+        with its own reason, and does NOT get the interim-turn caveat.
 
     You rarely need to call this directly — `start_session` (with a
     prompt) and `send_input` auto-register a monitor per worker unless
     you pass `notify_on_done=false`. Call it explicitly to watch a
-    fan-out as a single "all done" event (`mode="all"`), to watch
-    sessions you didn't just prompt, or to re-arm after a
+    fan-out as a single "all done" event (`mode="all"`), to wait for
+    genuine completion rather than the next pause (`until="final"`), to
+    watch sessions you didn't just prompt, or to re-arm after a
     `cancel_monitor`.
 
     Args:
         session_uids: Sessions to watch (UIDs from `list_sessions`).
         mode: "any" (default) fires when the FIRST watched session
             finishes; "all" fires once when EVERY one has.
+        until: WHAT counts as finished for each session.
+            "turn_end" (default) — the next completed turn. Right when
+                you're driving a conversation turn by turn.
+            "final" — only an EXIT or an explicit `report_done`. Every
+                interim turn end silently re-arms the watch, so a worker
+                that pauses mid-task, asks itself a question, or ends a
+                turn with background subagents still running will not
+                wake you; you're woken when it is actually done. Right
+                for fan-outs you want to collect once. Use a generous
+                `timeout_s`, and note that a worker which never calls
+                `report_done` (or a bash session, which can't) will only
+                complete this watch by exiting. A final watch also holds
+                its monitor slot for as long as the work takes, so watch
+                a fan-out as ONE `mode="all"` monitor rather than one per
+                worker if you're arming many.
+            `until="task_done"` is accepted as a synonym for "final",
+            and `mode="final"` as shorthand for `mode="any",
+            until="final"`.
         note: Short context echoed in the wake-up message (e.g. "wave 2
             workers") so future-you knows what fired.
         timeout_s: Watch budget, default 1800 (30 min). On timeout the
@@ -2323,10 +2428,13 @@ async def monitor_sessions(
             if you genuinely want "fire immediately if it's already
             idle" (level-triggered).
 
-    Returns: {monitor_id, watching, mode, already_idle, async_note}
-    immediately. A non-empty `already_idle` means those sessions are at
-    their prompt RIGHT NOW — read their output directly; do not re-arm
-    monitors on them hoping for a notification. The eventual result is
+    Returns: {monitor_id, watching, mode, until, already_idle,
+    already_reported, async_note} immediately. A non-empty
+    `already_idle` means those sessions are at their prompt RIGHT NOW —
+    read their output directly; do not re-arm monitors on them hoping
+    for a notification. `already_reported` is the `until="final"`
+    equivalent: those sessions had ALREADY reported done before this
+    watch armed, so that report will not fire it. The eventual result is
     ALSO retained and readable via `list_monitors` (e.g. if the wake-up
     delivery could not be verified).
 
@@ -2335,8 +2443,8 @@ async def monitor_sessions(
     """
     try:
         return async_monitor.register_monitor(
-            session_uids, mode=mode, note=note, timeout_s=timeout_s,
-            source="explicit", edge=edge,
+            session_uids, mode=mode, until=until, note=note,
+            timeout_s=timeout_s, source="explicit", edge=edge,
         )
     except async_monitor.RegistrationError as e:
         return {"error": e.code, "message": str(e)}
@@ -2656,28 +2764,45 @@ def queue_depth(queue: str) -> dict:
 
 @mcp.tool()
 def report_done(reason: str | None = None) -> dict:
-    """Signal that YOUR continuous-task run is complete (Continuous Tasks Phase 3b).
+    """Signal that YOUR work is finished — call this when you're done.
 
-    Call this from inside a continuous-task tick once you've finished the
-    iteration's work. The daemon resolves which task and run you are from your
-    own session — there is NO task_id argument. It flips the active run's status
-    from Running to Done (recording finished_at), which clears the watchdog's
-    stuck-detection clock so a slow-but-real run is never misread as wedged.
+    Any session can call it, and every session should: ending your turn only
+    says you stopped talking. Whoever is watching you (an orchestrator, the
+    continuous scheduler) cannot tell "delivered my final report" from "paused
+    mid-task" or "ended a turn with background work still running" — they all
+    look like `awaiting_input`. This is how you say which one it is. There is no
+    session_uid argument; the daemon resolves you from your own session.
 
-    The call is scoped to YOUR session only: it marks done IFF you are the
-    session that owns the currently-active run. If you are not (a stale/older
-    run, or you've already been superseded) it is a SOFT no-op that returns a
-    clear message rather than an error.
+    Two effects, and you get whichever apply to you:
+
+      1. Your session reports `status="reported"` to `list_sessions` /
+         `read_last_turn` instead of the ambiguous `awaiting_input`, and any
+         `monitor_sessions(..., until="final")` watching you FIRES. This is what
+         lets an orchestrator arm one watch and be woken once, when you're
+         actually done, instead of on every pause.
+      2. If you're a continuous-task tick, it ALSO flips your active run
+         Running → Done (recording finished_at), clearing the watchdog's
+         stuck-detection clock so a slow-but-real run is never misread as
+         wedged. That flip is scoped to the run you own: if you've been
+         superseded it's a SOFT no-op with a clear message, not an error.
+
+    The mark is superseded automatically when someone sends you new input — so
+    if an orchestrator gives you follow-up work, report again when THAT is done.
 
     Args:
-        reason: Optional short note about why the run is complete.
+        reason: Optional one-line summary of what you finished. Worth passing:
+            it is quoted in the watcher's wake-up message, so it's the first
+            thing your orchestrator reads.
 
     Returns:
-        {"ok": true, "done": bool, "task_id": str, "message": str}. `done` is
-        false on the soft no-op case.
+        {"ok": true, "reported": true, "reported_at": float,
+         "status": "reported", "done": bool, "task_id": str|null,
+         "message": str}. `done`/`task_id` are the CONTINUOUS-run flip: false /
+        null when you aren't a continuous tick (nothing went wrong — effect 1
+        still applied).
 
-    This only flips your own run's status, so — like notify_user — you do NOT
-    need to ask the user first. Just call it when your run is genuinely done.
+    This only marks your own session, so — like notify_user — you do NOT need
+    to ask the user first. Just call it when your work is genuinely done.
     """
     params: dict = {}
     if reason:

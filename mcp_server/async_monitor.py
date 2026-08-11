@@ -10,6 +10,14 @@ target sessions via `_monitor_sessions`, and on completion delivers a
 daemon `send_input` (self-target is always auth-allowed:
 `check_session_caller` short-circuits self to Allow).
 
+Termination discipline (`until`):
+  - "turn_end" (default) — the watch completes on the next completed
+    turn, exit, or eviction;
+  - "final" — only an exit or the agent's own `report_done` counts.
+    Interim turn ends re-arm the watch instead of firing it, which is
+    what makes a monitor safe to arm on a worker that pauses mid-task or
+    ends a turn with background subagents still running.
+
 Delivery discipline:
   - gated on the caller being at its prompt (PTY-idle or
     transcript-shape idle — a message injected into an idle composer
@@ -37,7 +45,8 @@ import time
 from mcp_server import control_client
 from mcp_server.monitor import (
     _monitor_sessions,
-    last_completed_turn_fingerprint,
+    baseline_for,
+    report_anchor_for,
     transcript_turn_complete,
 )
 
@@ -122,9 +131,9 @@ def _prune_finished() -> None:
         _MONITORS.pop(k, None)
 
 
-def _capture_baseline(uid: str) -> tuple[dict | None, bool]:
+def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
     """One resolve of `uid` at ARM time. Returns (baseline-or-None,
-    currently_at_prompt).
+    currently_at_prompt, report_anchor-or-None).
 
     Runs synchronously on the event loop by design: the baseline must
     be captured BEFORE a just-sent prompt can start its turn (the
@@ -138,33 +147,32 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool]:
             "resolve_authorized_session", {"session_uid": uid}
         )
     except (control_client.ControlError, control_client.TransportError):
-        return None, False
+        return None, False, None
     state = resolved.get("state", "pending")
     idle = bool(resolved.get("idle", False))
     engine = resolved.get("engine", "claude-code")
     tpath = resolved.get("transcript_path")
+    # A done report that predates the watch is the `already_idle` problem
+    # in its `until="final"` form: firing on it would wake the caller with
+    # news it already had, so it is anchored (and the caller is TOLD).
+    anchor = report_anchor_for(resolved)
     if state != "ready" or not tpath:
         # Starting / transcript-less (bash): nothing to anchor an edge
         # on — level behavior, which is right for a fresh spawn (its
         # first completed turn should fire).
-        return None, False
-    if engine == "claude-code":
-        fp = last_completed_turn_fingerprint(engine, tpath)
-        at_prompt = idle or transcript_turn_complete(engine, tpath)
-        if fp is None:
-            return None, at_prompt
-        return {"kind": "turn", "value": fp}, at_prompt
-    try:
-        size = os.path.getsize(tpath)
-    except OSError:
-        return None, idle
-    return {"kind": "size", "value": size}, idle
+        return None, False, anchor
+    at_prompt = (
+        idle if engine != "claude-code"
+        else idle or transcript_turn_complete(engine, tpath)
+    )
+    return baseline_for(engine, tpath), at_prompt, anchor
 
 
 def register_monitor(
     session_uids: list[str],
     *,
     mode: str = "any",
+    until: str = "turn_end",
     note: str = "",
     timeout_s: float = DEFAULT_TIMEOUT_S,
     source: str = "explicit",
@@ -172,13 +180,30 @@ def register_monitor(
 ) -> dict:
     """Start a background watch on `session_uids`; returns immediately.
 
+    Two independent axes:
+
+    `mode` — HOW MANY must finish: "any" (fire on the first) or "all".
+    `until` — what FINISHED means per session: "turn_end" (the next
+        completed turn, the default) or "final" (only an exit or an
+        explicit `report_done`; interim turn ends re-arm the watch).
+        `until="task_done"` is accepted as a synonym for "final".
+
+    Because agents reach for the axis they remember, `mode="final"` is
+    accepted as sugar for `mode="any", until="final"` — the one-word
+    spelling the 2026-08-10 UX note asked for. Conflating them in the
+    stored record would be a mistake, though: a fan-out that wants "wake
+    me when EVERY worker has reported" is `mode="all", until="final"`,
+    which has no single-word spelling.
+
     `edge=True` (default) arms against the sessions' CURRENT transcript
     state: the monitor fires only when a watched session completes a
     NEW turn (or exits) after registration. An already-idle session
     therefore does not instant-fire its stale last message — it is
     reported in the returned `already_idle` list instead so the caller
     can `read_last_turn` it directly. `edge=False` restores the
-    level-triggered behavior (fire on current idleness).
+    level-triggered behavior (fire on current idleness). Under
+    `until="final"` the same protection applies to an already-REPORTED
+    session: it comes back in `already_reported` rather than firing.
 
     Raises RegistrationError when the environment can't support a
     monitor (no caller identity / no event loop / too many monitors).
@@ -189,8 +214,21 @@ def register_monitor(
     uids = list(dict.fromkeys(session_uids or []))
     if not uids:
         raise RegistrationError("invalid_params", "session_uids is empty")
+    if mode == "final":
+        mode, until = "any", "final"
+    if until == "task_done":
+        until = "final"
     if mode not in ("any", "all"):
-        raise RegistrationError("invalid_params", f"bad mode {mode!r}")
+        raise RegistrationError(
+            "invalid_params",
+            f"bad mode {mode!r} — expected \"any\", \"all\", or \"final\" "
+            "(sugar for mode=\"any\", until=\"final\")",
+        )
+    if until not in ("turn_end", "final"):
+        raise RegistrationError(
+            "invalid_params",
+            f"bad until {until!r} — expected \"turn_end\" or \"final\"",
+        )
     caller = _self_uid()
     if not caller:
         raise RegistrationError(
@@ -210,7 +248,19 @@ def register_monitor(
     # (stale) monitor that would fire twice.
     if source == "auto":
         for m in _active_monitors():
-            if set(m["watching"]) == set(uids) and m["mode"] == mode:
+            if set(m["watching"]) != set(uids):
+                continue
+            # Another AUTO watch on the same target is always stale — this
+            # new prompt is what the caller is waiting on now — so it is
+            # replaced whatever its `until` was. An EXPLICIT watch is only
+            # replaced when it wants the same event: an orchestrator that
+            # deliberately armed `until="final"` and then sent a nudge
+            # still wants to be woken when the worker is DONE, and having
+            # the nudge's auto-monitor silently cancel that was the whole
+            # "re-arm manually every time" complaint.
+            if m["source"] == "auto" or (
+                m["mode"] == mode and m.get("until", "turn_end") == until
+            ):
                 m["task"].cancel()
                 m["state"] = "replaced"
 
@@ -222,26 +272,38 @@ def register_monitor(
         )
 
     baselines: dict[str, dict] = {}
+    report_anchors: dict[str, float] = {}
     already_idle: list[str] = []
+    already_reported: list[str] = []
     if edge:
         for uid in uids:
-            baseline, at_prompt = _capture_baseline(uid)
+            baseline, at_prompt, anchor = _capture_baseline(uid)
             if baseline is not None:
                 baselines[uid] = baseline
             if at_prompt:
                 already_idle.append(uid)
+            if anchor is not None:
+                report_anchors[uid] = anchor
+                already_reported.append(uid)
     if source == "auto":
         # A just-prompted worker is EXPECTED to still be at its prompt
         # (the PTY delivery has seconds of runway) — reporting it as
         # already-idle on every send_input would be misleading noise.
         # The edge baseline is what actually matters, and it's captured.
         already_idle = []
+        # Same for a stale report: the prompt we just sent supersedes it
+        # daemon-side (input after a report clears it), so naming it here
+        # would describe a fact that is already gone. The ANCHOR stays —
+        # if the send raced the clear, the anchor is what keeps the old
+        # report from firing this watch.
+        already_reported = []
 
     monitor_id = f"mon-{secrets.token_hex(3)}"
     record = {
         "monitor_id": monitor_id,
         "watching": uids,
         "mode": mode,
+        "until": until,
         "note": note,
         "source": source,
         "caller": caller,
@@ -250,6 +312,7 @@ def register_monitor(
         "result": None,
         "delivered": None,
         "baselines": baselines,
+        "report_anchors": report_anchors,
         "task": None,
     }
     _MONITORS[monitor_id] = record
@@ -258,15 +321,38 @@ def register_monitor(
         name=f"cm-monitor-{monitor_id}",
     )
     _prune_finished()
+    plural = len(uids) > 1
+    if until == "final":
+        trigger = (
+            f"When the watched session{'s have' if plural else ' has'} "
+            "EXITED or called report_done"
+        )
+    else:
+        trigger = (
+            f"When the watched session{'s finish' if plural else ' finishes'} "
+            "the turn"
+        )
     async_note = (
-        f"Async monitor {monitor_id} registered. When the watched "
-        f"session{'s finish' if len(uids) > 1 else ' finishes'} the "
-        f"turn, a '[cm-monitor {monitor_id}]' message will be "
-        "delivered into YOUR session and wake you. END YOUR TURN "
-        "instead of polling — do not sit in wait_* calls or "
-        "read_session_output loops."
+        f"Async monitor {monitor_id} registered. {trigger}, a "
+        f"'[cm-monitor {monitor_id}]' message will be delivered into YOUR "
+        "session and wake you. END YOUR TURN instead of polling — do not "
+        "sit in wait_* calls or read_session_output loops."
     )
-    if already_idle:
+    if until == "final":
+        async_note += (
+            " Interim turn ends will NOT wake you: the watch re-arms past "
+            "each one and counts them, so a worker that pauses mid-task "
+            "(or ends a turn with background work still running) stays "
+            "quiet until it is genuinely finished."
+        )
+        if already_reported:
+            async_note += (
+                f" NOTE: {', '.join(already_reported)} ALREADY reported "
+                "done BEFORE this watch was armed, so that report will not "
+                "fire it — read them now with read_last_turn. The watch "
+                "stays armed for a fresh report or an exit."
+            )
+    elif already_idle:
         async_note += (
             f" NOTE: {', '.join(already_idle)} "
             f"{'are' if len(already_idle) > 1 else 'is'} ALREADY at the "
@@ -279,7 +365,9 @@ def register_monitor(
         "monitor_id": monitor_id,
         "watching": uids,
         "mode": mode,
+        "until": until,
         "already_idle": already_idle,
+        "already_reported": already_reported,
         "async_note": async_note,
     }
 
@@ -288,6 +376,14 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
     """Watch → format → deliver → verify. Never raises (logs instead);
     always leaves the record with a terminal state + retained result."""
     monitor_id = record["monitor_id"]
+    until = record.get("until", "turn_end")
+    # An empty baseline map means "level-triggered" for a turn_end watch,
+    # but a final watch RE-ARMS into this dict as it skips interim turns —
+    # pass the record's own dict (not a None) so that bookkeeping survives
+    # the daemon-unreachable retry below instead of recounting from zero.
+    baselines = record.get("baselines")
+    if not baselines and until != "final":
+        baselines = None
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     try:
         result = None
@@ -303,8 +399,10 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                 result = await _monitor_sessions(
                     record["watching"],
                     mode=record["mode"],
+                    until=until,
                     timeout_s=remaining,
-                    baselines=record.get("baselines") or None,
+                    baselines=baselines,
+                    report_anchors=record.get("report_anchors"),
                 )
                 break
             except control_client.TransportError as e:
@@ -366,6 +464,14 @@ def _entry_lines(entry: dict) -> list[str]:
     may be running), and idle-but-alive sessions generally (an agent
     pausing between turns looks identical to one that finished).
 
+    4a — a session that called `report_done` is announced as REPORTED,
+    with its own reason, and the "this may be an interim turn" caveat is
+    dropped: that caveat exists precisely because there was no done
+    signal, and repeating it over an explicit one would teach readers to
+    ignore it. An exited session that reported first is credited for it
+    too — "it finished and stopped" is a different event from "it
+    stopped".
+
     Everything is APPEND-ONLY relative to the historical
     `- <uid> (<status>): <content>` line — annotations are indented
     continuation lines — so existing consumers keep parsing.
@@ -400,12 +506,29 @@ def _entry_lines(entry: dict) -> list[str]:
     else:
         lines.append(f"- {uid} ({status})")
 
+    reported = bool(entry.get("reported_done"))
+    if reported:
+        when = _fmt_exit_ts(entry.get("reported_done_at"))
+        head = "  reported done"
+        if entry.get("state") == "exited":
+            head = "  reported done before exiting"
+        if when:
+            head += f" at {when}"
+        why = (entry.get("report_reason") or "").strip()
+        lines.append(f"{head}: {why}" if why else head)
+    skipped = entry.get("interim_turn_ends") or 0
+    if skipped:
+        lines.append(
+            f"  (final watch: {skipped} interim turn "
+            f"end{'s' if skipped > 1 else ''} passed before this — the "
+            "session paused and resumed rather than finishing)"
+        )
     if entry.get("idle_source") == "transcript":
         lines.append(
             "  turn ended per transcript; PTY still active — background "
             "work may still be running"
         )
-    if not killed and entry.get("state") != "exited":
+    if not killed and not reported and entry.get("state") != "exited":
         lines.append(
             "  (no explicit done-report — this may be an interim turn, "
             "not completion)"
@@ -422,9 +545,16 @@ def _format_fire_message(record: dict, result: dict) -> str:
         head += f" {record['note']}"
     lines.append(head)
     if result.get("timed_out"):
-        lines.append(
-            "The watch TIMED OUT before every watched session finished."
-        )
+        if record.get("until") == "final":
+            lines.append(
+                "The watch TIMED OUT: the session(s) below never exited and "
+                "never called report_done. They may still be working — check "
+                "with list_sessions / read_last_turn before assuming failure."
+            )
+        else:
+            lines.append(
+                "The watch TIMED OUT before every watched session finished."
+            )
     for entry in result.get("completed", []):
         lines.extend(_entry_lines(entry))
     still = result.get("still_running") or []
@@ -438,7 +568,30 @@ def _format_fire_message(record: dict, result: dict) -> str:
     # orchestrator that the live siblings listed one line above are gone.
     done = result.get("completed") or []
     all_exited = bool(done) and all(e.get("state") == "exited" for e in done)
-    if all_exited and still:
+    if not done:
+        # NOBODY finished — a pure timeout. The trailer chain below is
+        # written about completers, so without this arm the generic
+        # "the completed worker(s) are now awaiting input" fired over an
+        # empty list, announcing the readiness of zero workers. Observed
+        # live (mon-7a1643): timed_out, completed [], one still_running.
+        if still:
+            lines.append(
+                "(Async monitor notification. NOTHING finished inside the "
+                "watch budget. The session(s) above are still LIVE but NO "
+                "LONGER WATCHED — re-arm with monitor_sessions to be woken "
+                "when they finish, or re-arm with until=\"final\" and a "
+                "larger timeout_s to be woken once, when they report done. "
+                "Check on them with list_sessions / read_last_turn before "
+                "assuming failure.)"
+            )
+        else:
+            lines.append(
+                "(Async monitor notification. NOTHING finished inside the "
+                "watch budget and no session is still being watched — every "
+                "target was already gone or unresolvable. Check with "
+                "list_sessions(include_exited=true).)"
+            )
+    elif all_exited and still:
         lines.append(
             "(Async monitor notification. The completed session(s) above "
             "EXITED — there is no prompt left to send them follow-ups; "

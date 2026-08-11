@@ -87,6 +87,19 @@ pub struct ExitedTombstone {
     /// the `kill_session` handler) — `killed` can still be true there,
     /// derived from the exit probe's operator-kill flag.
     pub killed_by: Option<String>,
+    /// When the agent called `report_done` before this exit (unix
+    /// seconds), or `None` when it never did.
+    ///
+    /// UX item 4a: "exited" alone doesn't say whether the agent finished
+    /// its work or the process just went away. A session that reported
+    /// done and THEN exited left a real conclusion behind; one that
+    /// exited without reporting may have been cut off mid-task. The
+    /// monitor fire message says which (see
+    /// `mcp_server/async_monitor.py::_entry_lines`).
+    pub reported_done_at: Option<f64>,
+    /// The `report_done` reason carried onto the tombstone, so a
+    /// read-after-exit caller still sees the agent's own summary.
+    pub report_reason: Option<String>,
 }
 
 /// Bound on [`DaemonState::kill_requests`]. A request is normally
@@ -1118,6 +1131,8 @@ mod tests {
             exited_at: 0.0,
             killed: false,
             killed_by: None,
+            reported_done_at: None,
+            report_reason: None,
         }
     }
 

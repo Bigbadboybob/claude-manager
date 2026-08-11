@@ -462,8 +462,9 @@ All session-targeting tools take a **`session_uid`** (the stable TUI-assigned UI
 
 ```
 list_sessions(task_id?, include_exited=false)
-   -> [{session_uid, label, type, state, idle, managed_by_uid,
-        task_id, workspace_id, worktree_path, workspace_shared_with?}]
+   -> [{session_uid, label, type, state, idle, status, reported_done,
+        managed_by_uid, task_id, workspace_id, worktree_path,
+        workspace_shared_with?}]
    # state in {"ready", "pending", "exited"}.
    # When include_exited=false (default), only live ws.sessions entries are
    # returned and "exited" never appears. When true, the workspace's
@@ -476,6 +477,15 @@ list_sessions(task_id?, include_exited=false)
    #   longer a workspace-less, checkout-less row.
    # Exited rows additionally carry how they ended: exited_at, killed,
    #   killed_by (see kill_session).
+   # `reported_done` / `reported_done_at` / `report_reason` = the agent's
+   #   own done signal (see report_done). Present on live rows and
+   #   carried onto the tombstone, so "finished, then exited" is
+   #   distinguishable from "stopped mid-task".
+   # `status` collapses (state, idle, reported_done) into one word:
+   #   starting | working | awaiting_input | reported | exited.
+   #   "reported" is the only one that means COMPLETION — awaiting_input
+   #   means only that the agent stopped talking, which it also does
+   #   mid-task and between fan-out waves.
    # `workspace_shared_with` = [{session_uid, label}] for the OTHER LIVE
    #   sessions running in the same worktree_path — the "who else is
    #   editing this checkout?" answer. Present only when the checkout is
@@ -513,7 +523,12 @@ start_session(task_id?, type: "claude-code"|"codex", label, prompt?)
 send_input(session_uid, text, submit=true)
    -> {ok}
 read_session_output(session_uid, since_cursor?, max_messages=20)
-   -> {messages: [...], cursor, generation, state, idle}
+   -> {messages: [...], cursor, generation, state, idle, status}
+   # Also carries the outcome fields the resolver knows — reported_done /
+   #   reported_done_at / report_reason, and killed / killed_by /
+   #   exited_at once the session has ended. Read them before trusting
+   #   the text: they answer "is this a conclusion, or wherever the
+   #   process happened to stop?". Same on read_last_turn.
    # generation echoes the resolver's value; state surfaces "pending"/"exited"
    # so the caller can decide to poll or move on. Cursors include the
    # generation they were issued under; on mismatch, the parser silently
@@ -521,11 +536,20 @@ read_session_output(session_uid, since_cursor?, max_messages=20)
    # carries the new generation.
 kill_session(session_uid) -> {ok}
    # Provenance is recorded: the exit tombstone gets killed=true and
-   #   killed_by (the calling session's uid, or "operator" for the
-   #   operator routes — the TUI's A-w, resolve_stuck, the continuous
-   #   scheduler's watchdog). killed can be true with killed_by null for
-   #   kill paths that don't go through this handler (mark_subtask_done's
-   #   session sweep). Downstream readers use it so a killed
+   #   killed_by — a who-OR-WHAT, rendered verbatim and never parsed:
+   #     <session uid>                    an agent's kill_session
+   #     "operator"                       the operator routes (the TUI's
+   #                                      A-w, resolve_stuck, the
+   #                                      continuous scheduler watchdog)
+   #     "memory-cap"                     the memory cap's cgroup/OOM
+   #                                      SIGKILL, which reached the
+   #                                      tombstone as a plain exit
+   #                                      before 4a and so had its
+   #                                      truncated tail read as a report
+   #     "<uid> (mark_subtask_done)"      the session sweep run when a
+   #                                      subtask is marked done
+   #   killed can still be true with killed_by null for any kill path
+   #   that records no request. Downstream readers use it so a killed
    #   session's truncated transcript tail is never presented as its
    #   final report: exited list_sessions rows carry the fields, and the
    #   async monitors' fire message reads "killed by <who> at <ts>" with
@@ -534,6 +558,52 @@ kill_session(session_uid) -> {ok}
    #   it errors `not_found` with "session '<uid>' already exited at
    #   <ts>" (plus the killer when known) instead of a message that
    #   reads like a bad uid.
+```
+
+```
+report_done(reason?) -> {ok, reported, reported_at, status, done, task_id}
+   # The caller's own "my work is finished" signal — no session_uid arg;
+   #   the daemon resolves the caller from its own session. Two effects,
+   #   applied per the caller's identity:
+   #     1. Session-scoped (every Session caller): stamps the mark behind
+   #        status="reported" and fires any until="final" monitor
+   #        watching it. Superseded automatically by new input, so a
+   #        worker handed follow-up work reports again when THAT is done.
+   #     2. Continuous-run (a continuous-task tick only): also flips the
+   #        active run Running -> Done. `done` / `task_id` describe THAT
+   #        flip and are false / null for everyone else.
+   # Widened rather than split into a second RPC: the two effects are one
+   #   fact — "the agent is finished" — with two consumers, and two verbs
+   #   would fail silently on a wrong guess (the continuous one used to
+   #   answer Unauthorized to plain workers; a plain one called from a
+   #   tick would leave the run Running until the wedge watchdog closed
+   #   it). Wire-compatible: `done` / `task_id` / `message` keep their
+   #   meanings and the new fields are additive.
+
+monitor_sessions(session_uids, mode="any", until="turn_end", note?,
+                 timeout_s=1800, edge=true)
+   -> {monitor_id, watching, mode, until, already_idle, already_reported,
+       async_note}
+   # Two independent axes. `mode` = how many must finish (any | all).
+   #   `until` = what finished MEANS per session:
+   #     "turn_end"  the next completed turn (the default).
+   #     "final"     only an exit or an explicit report_done. Interim
+   #                 turn ends RE-ARM the watch against the turn that
+   #                 just ended and are counted onto the eventual entry
+   #                 as interim_turn_ends. This is the fix for a worker
+   #                 that ends its launch turn with background subagents
+   #                 still running: one watch, one wake-up, when it is
+   #                 genuinely done.
+   #   mode="final" is accepted as sugar for mode="any", until="final",
+   #   and until="task_done" as a synonym for "final".
+   # `already_reported` is the final-mode twin of `already_idle`: those
+   #   sessions had reported BEFORE the watch armed, so that (anchored)
+   #   report will not fire it — read them directly instead.
+   # A session that never calls report_done — including any bash
+   #   session, which cannot — completes a final watch only by exiting,
+   #   so pair it with a timeout_s you are willing to wait.
+   # start_session / send_input take notify_until with the same values
+   #   for the monitor they auto-register.
 ```
 
 `type: "bash"` is **not** offered in `start_session`. Bash sessions remain user-only — they have no transcript and no `Agent` impl.

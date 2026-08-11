@@ -116,6 +116,24 @@ pub struct PtyByteFanout {
 /// to compute the wire-level `idle` field.
 pub type SharedLastActivity = Arc<Mutex<Option<Instant>>>;
 
+/// One agent's `report_done` call: the session-scoped "my work is
+/// finished" marker behind `status="reported"` and `mode="final"`
+/// monitors (UX item 4a).
+///
+/// Two clocks on purpose. `at_unix` is what goes on the wire (an agent
+/// reading `list_sessions` wants a timestamp it can compare to other
+/// timestamps); `at_instant` is what [`DaemonSession::reported_done`]
+/// compares against `last_input_at` to decide whether the report is
+/// still current — `Instant` is monotonic, so a wall-clock step can't
+/// resurrect a superseded report.
+#[derive(Clone, Debug)]
+pub struct ReportedDone {
+    pub at_unix: f64,
+    pub at_instant: Instant,
+    /// The agent's own one-line summary, verbatim from `report_done`.
+    pub reason: Option<String>,
+}
+
 struct FanoutInner {
     buffer: VecDeque<u8>,
     capacity: usize,
@@ -1003,6 +1021,18 @@ pub struct DaemonSession {
     /// `semantic_idle` then reads `null` and callers fall back to the
     /// PTY/transcript heuristics.
     pub last_turn_end_at: SharedLastActivity,
+    /// The agent's own "my work is finished" marker (`report_done`).
+    /// UX item 4a: a turn ending tells you the agent stopped TALKING,
+    /// not that it is done — `awaiting_input` covers a final report, a
+    /// worker whose background fan-out is still running, and a worker
+    /// pausing mid-task alike. This is the explicit signal, and it is
+    /// what `mode="final"` monitors terminate on.
+    ///
+    /// Interior-mutable (like the activity cells) because it is stamped
+    /// from the `report_done` handler while other readers hold only a
+    /// `&DaemonSession`. `None` until the agent reports. Read it through
+    /// [`Self::reported_done`], which also applies the superseded rule.
+    pub done_report: Arc<Mutex<Option<ReportedDone>>>,
     /// `Arc` so the reader thread can hold a clone independently of
     /// the `DaemonSession` instance — the thread pushes bytes into
     /// the fanout, the dispatcher / attach.open consumers subscribe
@@ -1736,6 +1766,7 @@ impl PendingSession {
             last_operator_input_at: Arc::new(Mutex::new(None)),
             last_input_at: Arc::new(Mutex::new(None)),
             last_turn_end_at: Arc::new(Mutex::new(None)),
+            done_report: Arc::new(Mutex::new(None)),
             fanout,
             pid,
             pidfd,
@@ -1907,6 +1938,51 @@ impl DaemonSession {
     /// → `session.turn_ended`).
     pub fn stamp_turn_end(&self) {
         stamp_now(&self.last_turn_end_at);
+    }
+
+    /// Record the agent's own "my work is finished" report
+    /// (`report_done`). Re-reporting overwrites — the latest reason
+    /// wins, and re-stamping after a follow-up prompt is exactly how a
+    /// worker signals it is done again.
+    pub fn stamp_reported_done(&self, reason: Option<String>) -> ReportedDone {
+        let record = ReportedDone {
+            at_unix: crate::control::methods::now_unix_f64(),
+            at_instant: Instant::now(),
+            reason,
+        };
+        let mut slot = self
+            .done_report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *slot = Some(record.clone());
+        record
+    }
+
+    /// The agent's CURRENT done report, or `None` when it never
+    /// reported — or when the report has been superseded.
+    ///
+    /// Superseding is the whole reason this is a method rather than a
+    /// field read: input delivered after a report means the session was
+    /// given new work, so it is no longer done. Deriving that from
+    /// `last_input_at` (which every input path already stamps — operator
+    /// typing, agent prompt delivery, bash sends) rather than clearing
+    /// the flag at each of those call sites means a new input path
+    /// cannot forget to invalidate the report. Same comparison
+    /// [`Self::semantic_idle`] makes for turn ends.
+    pub fn reported_done(&self) -> Option<ReportedDone> {
+        let record = self
+            .done_report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()?;
+        let last_input = *self
+            .last_input_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match last_input {
+            Some(li) if li > record.at_instant => None,
+            _ => Some(record),
+        }
     }
 
     /// Hook-derived idle signal. `None` = no hook data (session never

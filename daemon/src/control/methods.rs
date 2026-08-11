@@ -1137,6 +1137,20 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // "killed by X" instead of presenting the truncated last transcript
     // fragment as if it were the agent's final report.
     let kill_request = state.take_kill_request(uid);
+    // Built ONCE, before the tombstone, because both need it: the tombstone
+    // reads `memory_cap_kill` to attribute a cap kill (below), and the manifest
+    // entry / `ManifestDiff::Exited` broadcast carry the whole record.
+    let last_exit_opt = state
+        .sessions
+        .get(uid)
+        .map(|sess| sess.last_exit.build_last_exit(exited_at));
+    // A cgroup/OOM cap kill is a kill — the child was SIGKILLed by the memory
+    // watcher, mid-turn, exactly like an operator kill. Pre-fix it carried
+    // neither `killed` nor `killed_by`, so it rendered as a natural exit and
+    // the monitor quoted whatever the transcript happened to end on as if it
+    // were the agent's final report (the last open item from the 2026-08-10
+    // UX note's provenance family).
+    let memory_cap_kill = last_exit_opt.as_ref().is_some_and(|le| le.memory_cap_kill);
     let tombstone = state.sessions.get(uid).map(|sess| {
         let worktree_path = state
             .workspaces
@@ -1144,11 +1158,18 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             .and_then(|w| w.worktree_path.as_ref())
             .map(|p| p.to_string_lossy().into_owned());
         // `operator_kill_requested` is the broader signal: it is also set by
-        // kill paths that don't route through `kill_session` (mark_subtask_done's
-        // session sweep), which record no attribution. So `killed` can be true
-        // with `killed_by` unknown.
-        let killed =
-            kill_request.is_some() || sess.last_exit.operator_kill_requested();
+        // kill paths that don't route through `kill_session`, which may record
+        // no attribution. So `killed` can be true with `killed_by` unknown.
+        let killed = kill_request.is_some()
+            || memory_cap_kill
+            || sess.last_exit.operator_kill_requested();
+        // Explicit request wins the attribution: an operator A-w on a session
+        // that was ALSO breaching its cap is still an operator kill.
+        let killed_by = kill_request
+            .as_ref()
+            .map(|k| k.killed_by.clone())
+            .or_else(|| memory_cap_kill.then(|| MEMORY_CAP_KILLER.to_string()));
+        let report = sess.reported_done();
         crate::state::ExitedTombstone {
             session_uid: uid.to_string(),
             transcript_path: sess.transcript_path.clone(),
@@ -1164,7 +1185,9 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             global_perms: sess.global_perms,
             exited_at,
             killed,
-            killed_by: kill_request.as_ref().map(|k| k.killed_by.clone()),
+            killed_by,
+            reported_done_at: report.as_ref().map(|r| r.at_unix),
+            report_reason: report.and_then(|r| r.reason),
         }
     });
     // Continuous Tasks Phase 3b completion signal (b): capture this session's
@@ -1175,13 +1198,7 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
         .sessions
         .get(uid)
         .and_then(|s| s.continuous_task_id.clone());
-    let (workspace_id_opt, last_exit_opt) = match state.sessions.get(uid) {
-        Some(sess) => {
-            let le = sess.last_exit.build_last_exit(exited_at);
-            (Some(sess.workspace_id.clone()), Some(le))
-        }
-        None => (None, None),
-    };
+    let workspace_id_opt = state.sessions.get(uid).map(|s| s.workspace_id.clone());
     // Classify the continuous-run outcome from the exit BEFORE `last_exit_opt`
     // is consumed by the broadcast below. A memory-cap (OOM) kill or a non-zero
     // exit code is a genuine FAILURE — supervision and the consecutive-failure
@@ -1692,6 +1709,13 @@ pub fn kill_session(
 /// scheduler's watchdog. Agent kills record the caller's session uid.
 pub(crate) const OPERATOR_KILLER: &str = "operator";
 
+/// Attribution for a session the memory cap killed (cgroup OOM / the
+/// watcher's SIGKILL). Nobody asked for this one, so there is no uid to
+/// name — but it is emphatically not a natural exit, and a reader
+/// (human or agent) needs to know the transcript was cut off rather
+/// than concluded. See `DESIGN_MEMORY_CAP.md`.
+pub(crate) const MEMORY_CAP_KILLER: &str = "memory-cap";
+
 /// Render a unix timestamp as `YYYY-MM-DDTHH:MM:SSZ`. The daemon has no
 /// date crate (see `daemon/Cargo.toml`), and the alternative — echoing a
 /// raw epoch float into an agent-facing error — is exactly the kind of
@@ -2062,12 +2086,19 @@ pub fn list_sessions(
         // `read_session_output` (which resolves via
         // resolve_authorized_session) agree.
         let (state_str, idle) = compute_session_state_and_idle(session);
+        // UX item 4a: the agent's own done signal, so a listing caller can
+        // tell "delivered its final report" from "idle mid-workflow" without
+        // reading the transcript and pattern-matching for a verdict line.
+        let report = session.reported_done();
         sessions.push(json!({
             "session_uid": uid,
             "label": session.title,
             "type": session.session_type,
             "state": state_str,
             "idle": idle,
+            "reported_done": report.is_some(),
+            "reported_done_at": report.as_ref().map(|r| r.at_unix),
+            "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
             "managed_by_uid": session.managed_by_uid,
             // Global-permissions grant — surfaced so an agent (and
             // the grouped MCP view) can tell which sessions are
@@ -2227,6 +2258,10 @@ pub fn list_sessions(
                 "exited_at": tomb.exited_at,
                 "killed": tomb.killed,
                 "killed_by": tomb.killed_by,
+                // UX item 4a: and whether it finished before ending.
+                "reported_done": tomb.reported_done_at.is_some(),
+                "reported_done_at": tomb.reported_done_at,
+                "report_reason": tomb.report_reason,
             }));
         }
     }
@@ -2345,6 +2380,10 @@ pub fn resolve_authorized_session(
         // so the Python `read_session_output` tool's cursor
         // (`v1:<generation>:<offset>`) resets when the underlying
         // transcript file rotates (e.g. `/clear`, codex resume).
+        // UX item 4a: the agent's own done signal. `reported_done` is the
+        // termination predicate for `mode="final"` monitors — an interim turn
+        // end leaves it false, so the monitor re-arms instead of firing.
+        let report = session.reported_done();
         Ok(json!({
             "state": state_str,
             "engine": engine_str(&session.session_type),
@@ -2356,6 +2395,9 @@ pub fn resolve_authorized_session(
             // prompt regardless of PTY spinner noise), false = a turn
             // is pending/running. See DaemonSession::semantic_idle.
             "semantic_idle": session.semantic_idle(),
+            "reported_done": report.is_some(),
+            "reported_done_at": report.as_ref().map(|r| r.at_unix),
+            "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
         }))
     } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
         // Read-after-exit: the session left the registry but its transcript
@@ -2377,6 +2419,11 @@ pub fn resolve_authorized_session(
             "exited_at": tomb.exited_at,
             "killed": tomb.killed,
             "killed_by": tomb.killed_by.clone(),
+            // UX item 4a: did it finish, or just stop? A tombstoned report
+            // separates "exited after reporting done" from "exited mid-task".
+            "reported_done": tomb.reported_done_at.is_some(),
+            "reported_done_at": tomb.reported_done_at,
+            "report_reason": tomb.report_reason.clone(),
         }))
     } else {
         Err((
@@ -4871,7 +4918,7 @@ pub struct WorkflowDoneParams {
     pub role: String,
 }
 
-fn now_unix_f64() -> f64 {
+pub(crate) fn now_unix_f64() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9333,16 +9380,39 @@ struct ReportDoneParams {
     reason: Option<String>,
 }
 
-/// `report_done(reason?)` — Session-callable completion signal for a
-/// continuous-task agent (DESIGN_CONTINUOUS_TASKS.md §11). The daemon resolves
-/// WHICH task/run the caller is from its own session tag (no `task_id` on the
-/// wire), then flips the active run `Running → Done` IFF the caller owns it.
+/// `report_done(reason?)` — the caller's own "my work is finished" signal.
 ///
-/// Auth + resolution: Operator callers are rejected (a continuous tick is always
-/// a Session). The task is resolved from the CALLER session's
-/// `continuous_task_id` read DIRECTLY off `state.sessions` — NOT
-/// `lookup_session_any`, whose `SessionViewAny` drops the field. A caller with
-/// no `continuous_task_id` is Unauthorized.
+/// TWO effects, and every Session caller gets the first:
+///
+/// 1. **Session-scoped (UX item 4a).** Stamps `reported_done` on the CALLER's
+///    session. `list_sessions` / `resolve_authorized_session` then report
+///    `status="reported"` instead of the ambiguous `awaiting_input`, and
+///    `mode="final"` monitors terminate on it. This is the fix for
+///    "awaiting_input conflates a final report with an interim pause": before
+///    it, an orchestrator had to pattern-match the worker's prose for a
+///    "VERDICT:" line — a convention doing a status field's job.
+/// 2. **Continuous-run (DESIGN_CONTINUOUS_TASKS.md §11).** When the caller is a
+///    continuous-task tick, ALSO flips the active run `Running → Done`
+///    (recording `finished_at`), clearing the watchdog's stuck clock.
+///
+/// ## Why widen this instead of adding `session.report_done`
+///
+/// The two effects are one fact — "the agent is finished" — observed by two
+/// consumers. A second RPC would mean two verbs an agent must choose between,
+/// with a silent failure mode on a wrong guess (call the continuous one from a
+/// plain worker and you got `Unauthorized`; call the plain one from a tick and
+/// the run stays `Running` until the wedge watchdog closes it). Widening keeps
+/// one verb: report when you're done, and the daemon applies whichever effects
+/// your session's identity earns. Wire-compatible for continuous callers —
+/// `done` / `task_id` / `message` keep their exact meanings, and the new
+/// `reported` / `reported_at` / `status` fields are additive. The only behavior
+/// change is on a path that used to be a hard error.
+///
+/// Auth: Operator callers are still rejected — an Operator frame has no session
+/// identity to stamp and no continuous run to own. The continuous task is
+/// resolved from the CALLER session's `continuous_task_id` read DIRECTLY off
+/// `state.sessions` (NOT `lookup_session_any`, whose `SessionViewAny` drops the
+/// field); a caller without one simply gets effect 1.
 ///
 /// The mark is DOUBLE-guarded: it fires only when
 /// `last_run.session_uid == caller_uid` AND `last_run.status == Running`. Any
@@ -9370,27 +9440,45 @@ pub fn report_done(
         }
     };
 
-    // Resolve the task from the caller session's continuous_task_id (read the
-    // DaemonSession field directly; SessionViewAny omits it). Brief lock, dropped
-    // before the disk modify.
-    let ct_id = {
+    // Effect 1 — stamp the session-scoped marker, and resolve the caller's
+    // continuous tag while we hold the lock (read the DaemonSession field
+    // directly; SessionViewAny omits it). Brief lock, dropped before the disk
+    // modify below.
+    let (reported, ct_id) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .sessions
-            .get(&caller_uid)
-            .and_then(|s| s.continuous_task_id.clone())
+        let session = state.sessions.get(&caller_uid).ok_or_else(|| {
+            (
+                ErrorCode::NotFound,
+                format!(
+                    "report_done: caller session '{}' is not in the daemon registry, \
+                     so there is nothing to mark done",
+                    caller_uid
+                ),
+            )
+        })?;
+        (
+            session.stamp_reported_done(p.reason.clone()),
+            session.continuous_task_id.clone(),
+        )
     };
+
+    // Effect 2 — the continuous-run flip, for callers that are a tick.
     let ct_id = match ct_id {
         Some(id) => id,
         None => {
-            return Err((
-                ErrorCode::Unauthorized,
-                format!(
-                    "report_done: caller session '{}' is not a continuous-task tick \
-                     (no continuous_task_id)",
-                    caller_uid
-                ),
-            ));
+            return Ok(json!({
+                "ok": true,
+                "reported": true,
+                "reported_at": reported.at_unix,
+                "status": "reported",
+                // No continuous run to close — `done` keeps its established
+                // meaning (the RUN flipped) rather than being overloaded.
+                "done": false,
+                "task_id": Value::Null,
+                "message": "marked done: your session now reports status=\"reported\" \
+                            to list_sessions / read_last_turn, and any mode=\"final\" \
+                            monitor watching you will fire",
+            }));
         }
     };
 
@@ -9449,13 +9537,20 @@ pub fn report_done(
         }
     }
 
+    // The session-scoped mark lands either way: even when the continuous flip
+    // is a no-op (a superseded run), the AGENT is done and its status should
+    // say so.
     let message = if marked {
         "run marked done"
     } else {
-        "no-op: caller is not the active run's session, or the run is no longer Running"
+        "run flip was a no-op: caller is not the active run's session, or the run is \
+         no longer Running (your session is still marked reported)"
     };
     Ok(json!({
         "ok": true,
+        "reported": true,
+        "reported_at": reported.at_unix,
+        "status": "reported",
         "done": marked,
         "task_id": ct_id,
         "message": message,
@@ -12867,11 +12962,50 @@ fn wait_for_task_sessions_gone(
 /// workspace, refuses to destroy a dirty branch worktree (unless `force`),
 /// closes its sessions, removes its worktree, then flips the task to `done`.
 /// Does NO auth — the two entry points below own that.
+/// SIGKILL every live session bound to `task_id`, attributing the kills to
+/// `killer` (a caller uid, or `"operator"`).
+///
+/// UX item 3b, sweep arm: this path kills without going through the
+/// `kill_session` RPC, so pre-fix its victims tombstoned as
+/// `killed: true, killed_by: null` — "something killed it, no idea what",
+/// which is what an orchestrator saw in the monitor's death notice for a
+/// worker whose own task it had just marked done. Recording the request
+/// turns that into an explanation. The attribution names the SWEEP as well
+/// as its requester, because a bare uid would read as a deliberate
+/// `kill_session` — a different, more alarming event than tidy-up on task
+/// completion.
+///
+/// Runs under one lock hold, like `kill_session`: the reaper's exit
+/// callback must take the same lock to build the tombstone, so every
+/// attribution is in place before any of them can be consumed, however
+/// fast the children die.
+fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let targets: Vec<String> = state
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.task_id.as_deref() == Some(task_id))
+        .map(|(uid, _)| uid.clone())
+        .collect();
+    let swept_at = now_unix_f64();
+    let killer = format!("{} (mark_subtask_done)", killer);
+    for uid in targets {
+        if let Some(sess) = state.sessions.get_mut(&uid) {
+            sess.last_exit.mark_operator_kill_requested();
+            let _ = sess.kill();
+        }
+        state.record_kill_request(&uid, &killer, swept_at);
+    }
+}
+
 fn teardown_subtask_done(
     state_arc: &Arc<Mutex<DaemonState>>,
     task_id: &str,
     close_worktree: bool,
     force: bool,
+    // Attribution for the session sweep below: the calling agent's uid on the
+    // Session route, `"operator"` on the operator route.
+    killer: &str,
 ) -> MethodResult {
     // Rebuild the params struct so the teardown body below stays verbatim from
     // the original single-function implementation.
@@ -12959,21 +13093,7 @@ fn teardown_subtask_done(
     // regardless of worktree_mode / close_worktree (the daemon previously only
     // closed them inside the branch-mode + close_worktree path, stranding live
     // sessions on inherit / in-place / close_worktree=false done subtasks).
-    {
-        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let targets: Vec<String> = state
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.task_id.as_deref() == Some(p.task_id.as_str()))
-            .map(|(uid, _)| uid.clone())
-            .collect();
-        for uid in targets {
-            if let Some(sess) = state.sessions.get_mut(&uid) {
-                sess.last_exit.mark_operator_kill_requested();
-                let _ = sess.kill();
-            }
-        }
-    }
+    sweep_task_sessions(state_arc, &p.task_id, killer);
     wait_for_task_sessions_gone(state_arc, &p.task_id, std::time::Duration::from_secs(2));
 
     // Phase 1/2 — cleanup BEFORE the API flip. Only branch mode owns a
@@ -13075,7 +13195,8 @@ pub fn mark_subtask_done(
         }
     }
 
-    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force)
+    let killer = caller_uid.unwrap_or(OPERATOR_KILLER).to_string();
+    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force, &killer)
 }
 
 /// Operator-scoped counterpart to [`mark_subtask_done`]: tears down and marks
@@ -13096,7 +13217,13 @@ pub fn operator_mark_subtask_done(
             format!("operator.mark_subtask_done params: {}", e),
         )
     })?;
-    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force)
+    teardown_subtask_done(
+        state_arc,
+        &p.task_id,
+        p.close_worktree,
+        p.force,
+        OPERATOR_KILLER,
+    )
 }
 
 #[cfg(test)]
@@ -17778,6 +17905,8 @@ mod tests {
                 exited_at: 1.0,
                 killed: false,
                 killed_by: None,
+                reported_done_at: None,
+                report_reason: None,
             });
         }
 
@@ -17908,6 +18037,8 @@ mod tests {
             exited_at: 1.0,
             killed: false,
             killed_by: None,
+            reported_done_at: None,
+            report_reason: None,
         });
 
         revive_session(&state, &json!({ "uid": uid })).expect("revive ok");
@@ -24335,17 +24466,21 @@ mod tests {
         });
     }
 
-    /// `report_done` rejects an Operator caller and a Session caller that is not
-    /// a continuous-task tick (no continuous_task_id).
+    /// `report_done` rejects an Operator caller (no session identity to
+    /// mark, no run to own). A Session caller WITHOUT a
+    /// `continuous_task_id` used to be rejected here too — UX item 4a
+    /// widened that path into the session-scoped mark, so it now
+    /// succeeds with `done: false` (no run was closed) and touches no
+    /// continuous state.
     #[test]
-    fn report_done_rejects_operator_and_untagged_caller() {
+    fn report_done_rejects_operator_but_marks_an_untagged_session() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         // Operator caller: Unauthorized (a continuous tick is always a Session).
         let err = report_done(&state, &Caller::operator("op"), &json!({}))
             .expect_err("operator rejected");
         assert_eq!(err.0, ErrorCode::Unauthorized);
 
-        // Session caller with NO continuous_task_id: Unauthorized.
+        // Session caller with NO continuous_task_id: marked, not rejected.
         let uid = fresh_test_uid();
         {
             let mut sp = crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
@@ -24354,9 +24489,11 @@ mod tests {
             let ds = crate::session::DaemonSession::spawn(sp).expect("spawn");
             state.lock().unwrap().sessions.insert(uid.clone(), ds);
         }
-        let err = report_done(&state, &Caller::session(uid.clone()), &json!({}))
-            .expect_err("untagged rejected");
-        assert_eq!(err.0, ErrorCode::Unauthorized);
+        let resp = report_done(&state, &Caller::session(uid.clone()), &json!({}))
+            .expect("an untagged session may still mark itself done");
+        assert_eq!(resp["reported"], json!(true));
+        assert_eq!(resp["done"], json!(false), "no continuous run was closed");
+        assert!(resp["task_id"].is_null());
         kill_all_sessions(&state);
     }
 
@@ -26402,6 +26539,259 @@ mod tests {
         let me = mark_subtask_done(&state, &json!({"task_id": "unrelated"}), Some("ts-orch"))
             .expect_err("mark must reject a non-descendant target");
         assert_eq!(me.0, ErrorCode::Unauthorized);
+        kill_all_sessions(&state);
+    }
+    // ===========================================================
+    // UX item 4a — the worker done-signal.
+    //
+    // `report_done` used to be continuous-task-only: any other agent
+    // calling it got `Unauthorized`, so "I am finished" had no wire
+    // representation at all and orchestrators inferred it by grepping
+    // the worker's prose for a verdict line. These pin the widened
+    // shape: every Session caller gets the session-scoped mark, the
+    // continuous flip stays exactly as it was, and the mark is
+    // superseded by new work.
+    // ===========================================================
+
+    /// A plain (non-continuous) worker can mark itself done, and the
+    /// mark is visible on BOTH read surfaces a watcher uses:
+    /// `resolve_authorized_session` (what the monitors poll) and
+    /// `list_sessions` (what an orchestrator eyeballs).
+    #[test]
+    fn report_done_marks_a_plain_session_and_surfaces_on_both_reads() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-plainrep", "ws-rep");
+
+        let res = report_done(
+            &state,
+            &Caller::session("ts-plainrep"),
+            &json!({ "reason": "migration merged" }),
+        )
+        .expect("a plain session may report done");
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["reported"], true);
+        assert_eq!(res["status"], "reported");
+        // The CONTINUOUS-run flip is what `done` has always meant; a
+        // plain caller closed no run, and saying otherwise would make
+        // the field meaningless for the callers that read it.
+        assert_eq!(res["done"], false);
+        assert!(res["task_id"].is_null());
+        assert!(res["reported_at"].as_f64().unwrap_or(0.0) > 0.0);
+
+        let resolved = resolve_authorized_session(
+            &state,
+            &json!({ "session_uid": "ts-plainrep" }),
+            None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved["reported_done"], true);
+        assert_eq!(resolved["report_reason"], "migration merged");
+
+        let rows = list_sessions(&state, &json!({}), None).expect("list");
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["session_uid"] == "ts-plainrep")
+            .expect("row present");
+        assert_eq!(row["reported_done"], true);
+        assert_eq!(row["report_reason"], "migration merged");
+
+        kill_all_sessions(&state);
+    }
+
+    /// New input supersedes the report: an orchestrator that hands a
+    /// finished worker follow-up work must not keep reading "reported"
+    /// (and a `mode="final"` monitor re-armed on it must not
+    /// instant-fire). Derived from `last_input_at` rather than cleared
+    /// per call site, so no future input path can forget to do it.
+    #[test]
+    fn report_done_is_superseded_by_new_input() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-superseded", "ws-rep");
+        report_done(
+            &state,
+            &Caller::session("ts-superseded"),
+            &json!({ "reason": "first pass done" }),
+        )
+        .expect("report");
+
+        {
+            let s = state.lock().unwrap();
+            let sess = s.sessions.get("ts-superseded").unwrap();
+            assert!(sess.reported_done().is_some(), "reported before input");
+            // Same stamp the agent-prompt delivery path makes.
+            sess.input_handle().stamp_activity();
+            assert!(
+                sess.reported_done().is_none(),
+                "a follow-up prompt means the worker is working again",
+            );
+        }
+
+        let resolved = resolve_authorized_session(
+            &state,
+            &json!({ "session_uid": "ts-superseded" }),
+            None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved["reported_done"], false);
+        assert!(resolved["report_reason"].is_null());
+
+        // Reporting again after the new work is the expected shape.
+        report_done(&state, &Caller::session("ts-superseded"), &json!({}))
+            .expect("re-report");
+        let s = state.lock().unwrap();
+        assert!(s.sessions.get("ts-superseded").unwrap().reported_done().is_some());
+        drop(s);
+        kill_all_sessions(&state);
+    }
+
+    /// An Operator frame has no session to mark and no run to own, and
+    /// a uid the registry doesn't hold has nothing to stamp. Both stay
+    /// errors — the widening only opened the *Session-with-no-
+    /// continuous-tag* path.
+    #[test]
+    fn report_done_still_rejects_operator_and_unknown_callers() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let op = report_done(
+            &state,
+            &Caller::Operator(crate::control::protocol::CallerOperator {
+                token_id: "t".into(),
+            }),
+            &json!({}),
+        )
+        .expect_err("operator has no session identity");
+        assert_eq!(op.0, ErrorCode::Unauthorized);
+
+        let ghost = report_done(&state, &Caller::session("ts-ghost"), &json!({}))
+            .expect_err("no such session");
+        assert_eq!(ghost.0, ErrorCode::NotFound);
+        assert!(
+            ghost.1.contains("nothing to mark done"),
+            "message must explain the miss: {}",
+            ghost.1,
+        );
+    }
+
+    /// A worker that reported and THEN exited left a real conclusion
+    /// behind. The tombstone carries that, so a read-after-exit caller
+    /// (and the monitor fire message) can tell it apart from a session
+    /// that just stopped.
+    #[test]
+    fn report_done_rides_the_exit_tombstone() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-repexit", "ws-rep");
+        report_done(
+            &state,
+            &Caller::session("ts-repexit"),
+            &json!({ "reason": "all four fixes landed" }),
+        )
+        .expect("report");
+
+        kill_session(&state, &json!({ "session_uid": "ts-repexit" }), None)
+            .expect("kill");
+        poll_until_session_removed(&state, "ts-repexit");
+
+        let s = state.lock().unwrap();
+        let tomb = s.exited_tombstone("ts-repexit").expect("tombstone");
+        assert!(tomb.reported_done_at.is_some());
+        assert_eq!(tomb.report_reason.as_deref(), Some("all four fixes landed"));
+        drop(s);
+
+        let resolved = resolve_authorized_session(
+            &state,
+            &json!({ "session_uid": "ts-repexit" }),
+            None,
+        )
+        .expect("read-after-exit resolve");
+        assert_eq!(resolved["state"], "exited");
+        assert_eq!(resolved["reported_done"], true);
+        assert_eq!(resolved["report_reason"], "all four fixes landed");
+    }
+
+    /// UX item 3b, memory-cap arm: a cgroup/OOM cap kill is a KILL. It
+    /// reached the tombstone as a plain exit before this, so a monitor
+    /// rendered the victim's truncated transcript tail as if it were the
+    /// agent's final report — the same misread the operator/agent kill
+    /// paths were already fixed for.
+    #[test]
+    fn memory_cap_kill_is_attributed_on_the_exit_tombstone() {
+        let tmp = TempDir::new().unwrap();
+        let kills_dir = tmp.path().to_path_buf();
+        let uid = "ts-capkill";
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+
+        // Self-SIGKILL so the kernel exit is a signal (code=None), the
+        // shape `is_cap_kill` joins with the kill-log record.
+        let mut p = crate::session::SpawnParams::new(uid, "capkill", "/bin/sh");
+        p.args = vec!["-c".into(), "sleep 0.2; kill -9 $$".into()];
+        p.workspace_id = "ws-cap".into();
+        p.kills_dir = Some(kills_dir.clone());
+        let pending = crate::session::PendingSession::spawn(p).expect("spawn");
+
+        // The memory watcher's record, written past the spawn baseline.
+        let log_path = kills_dir.join(format!("{}.jsonl", uid));
+        let record = format!(
+            "{{\"ts\":1700000000,\"session_uid\":\"{}\",\"pid\":1,\"comm\":\"sh\",\
+             \"argc\":3,\"argv_sha256_prefix\":\"deadbeef\",\"rss_kb\":1024,\
+             \"soft_cap_bytes\":1,\"hard_cap_bytes\":2,\"kill_status\":\"killed_by_us\"}}\n",
+            uid
+        );
+        std::fs::write(&log_path, record).expect("write kill log");
+
+        let state_for_cleanup = Arc::clone(&state);
+        let uid_for_cleanup = uid.to_string();
+        let on_exit: Box<dyn FnOnce(&DaemonExitStatus) + Send + 'static> =
+            Box::new(move |_status| {
+                let mut s = state_for_cleanup.lock().unwrap_or_else(|p| p.into_inner());
+                handle_session_exit(&mut s, &uid_for_cleanup);
+            });
+        let session = pending.arm_reaper(Some(on_exit)).expect("arm_reaper");
+        state.lock().unwrap().sessions.insert(uid.to_string(), session);
+
+        poll_until_session_removed(&state, uid);
+
+        let s = state.lock().unwrap();
+        let tomb = s.exited_tombstone(uid).expect("tombstone");
+        assert!(tomb.killed, "an OOM kill is a kill, not a natural exit");
+        assert_eq!(tomb.killed_by.as_deref(), Some(MEMORY_CAP_KILLER));
+    }
+
+    /// UX item 3b, sweep arm: `mark_subtask_done` SIGKILLs the task's
+    /// sessions without going through `kill_session`, so its victims
+    /// used to tombstone as `killed_by: null` — an unexplained death in
+    /// the orchestrator's wake-up message.
+    #[test]
+    fn subtask_done_sweep_attributes_its_kills() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-sweep-a", "ws-sweep");
+        insert_session(&state, "ts-sweep-b", "ws-sweep");
+        insert_session(&state, "ts-other", "ws-sweep");
+        {
+            let mut s = state.lock().unwrap();
+            for uid in ["ts-sweep-a", "ts-sweep-b"] {
+                s.sessions.get_mut(uid).unwrap().task_id = Some("task-swept".into());
+            }
+            s.sessions.get_mut("ts-other").unwrap().task_id = Some("task-other".into());
+        }
+
+        sweep_task_sessions(&state, "task-swept", "ts-boss");
+        poll_until_session_removed(&state, "ts-sweep-a");
+        poll_until_session_removed(&state, "ts-sweep-b");
+
+        let s = state.lock().unwrap();
+        for uid in ["ts-sweep-a", "ts-sweep-b"] {
+            let tomb = s.exited_tombstone(uid).expect("tombstone");
+            assert!(tomb.killed);
+            assert_eq!(
+                tomb.killed_by.as_deref(),
+                Some("ts-boss (mark_subtask_done)"),
+                "the sweep must name both its requester and itself",
+            );
+        }
+        // A session on a DIFFERENT task is untouched.
+        assert!(s.sessions.contains_key("ts-other"));
+        drop(s);
         kill_all_sessions(&state);
     }
 }
