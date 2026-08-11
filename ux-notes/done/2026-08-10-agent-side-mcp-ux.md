@@ -63,3 +63,15 @@ Process: 4 implementation agents in isolated worktrees (branches `worktree-wf_6d
 Remaining advisories (recorded, not fixed): `FETCH_HEAD` can be substituted by a concurrent fetch in the same main repo (narrow race, base still validated); the improved `TargetNotInRegistry` miss message reveals `exited_at`/killer for tombstoned uids to any session caller (refuted as a regression by majority — requires knowing the uid; prior message already confirmed absence); cgroup/OOM kills read as natural exits (folded into task `8c0ab1a3`).
 
 Activation: daemon changes need a daemon restart (cm-manager: redeploy binary + `mcp_server/`; auto-delivery needs `api_url`/`api_token` in `daemon.toml`), MCP-server changes on next MCP spawn, TUI changes on next TUI build. predictionTrading's MCP copy is retired (its launcher execs this repo's `server.py`) — no mirroring needed.
+
+### 2026-08-11 — follow-up: the two filed tasks are implemented
+
+Both task-filed rows closed the same day by managed subtask workers (branches cut from `origin/main` @ ace338d, reviewed by the triage orchestrator):
+
+| # | Item | Disposition | Where |
+|---|------|-------------|-------|
+| 1a/1b | workspace-less spawn policy | implemented (mint + `allow_shared_workspace` opt-back) | `5df4590` — planning task `eb043d87` closed |
+| 3a | `until="final"` re-arming monitors | implemented (`mode`/`until` axes, report-anchor `already_reported`) | `d58492e` — planning task `8c0ab1a3` closed |
+| 4a | worker done-signal | implemented (`report_done` widened, `status="reported"`, tombstone carry) | `d58492e` |
+
+Fold-ins that rode along: memory-cap kills labeled `killed_by="memory-cap"`; kill provenance in `read_last_turn`/`read_session_output`; `mark_subtask_done` sweep attribution; empty-batch timeout fires no longer claim workers await input. With this, every item in the original note is implemented or consciously declined (4b only).
