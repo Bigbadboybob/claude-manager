@@ -5917,12 +5917,34 @@ pub fn workflow_reject_finding(
 // sub-2a's `task_is_self_or_descendant_of`. Taskless caller +
 // explicit task_id → Unauthorized. Operator callers also
 // allowed (uniform with other methods).
+//
+// **Return shape** (ux-1c / ux-5c) — a superset of the
+// operator `start_session` return, which stays
+// `{session_uid, cgroup_path?}`:
+//   {
+//     "session_uid":   "<uid>",
+//     "cgroup_path":   "<path>",      // only when capped
+//     "worktree_path": "<abs path>",  // ALWAYS — where the child landed
+//     "task_id":       "<id>",        // only when the child is task-bound
+//     "prompt_source": "caller" | "task" | "none",
+//   }
+// `worktree_path` matters because a `task_id` naming a branch-mode
+// subtask spawns the child in a DIFFERENT worktree than the caller's;
+// pre-ux-1c the caller had no way to learn that path from the response.
 
 #[derive(Deserialize)]
 struct McpStartSessionParams {
     #[serde(rename = "type")]
     type_: String,
     label: String,
+    /// Initial prompt for the child. ux-5c: when this is absent or
+    /// blank AND the spawn is task-bound AND the child is an agent
+    /// (`claude-code` / `codex`, never `bash` — whose "prompt" is a
+    /// command line the shell would EXECUTE), the daemon looks up that
+    /// task's stored `description`/`prompt` and delivers THAT instead
+    /// (`prompt_source: "task"` in the response) — so an orchestrator
+    /// can launch a backlog task without re-typing its prompt. The
+    /// lookup is best-effort: any failure spawns promptless.
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -6544,6 +6566,55 @@ pub fn mcp_start_session(
         )
     };
 
+    // ux-5c: resolve the task binding BEFORE the spawn so the
+    // auto-delivery lookup and the response can both use it.
+    // (`start_session` gets the same value via `full_params`.)
+    let task_id_for_spawn = p.task_id.clone().or(caller_task_id);
+
+    // ux-5c: effective prompt + its provenance.
+    //
+    //   - caller passed a non-blank `prompt`  → deliver it   ("caller")
+    //   - blank/absent prompt + a bound task  → deliver the task's
+    //     stored prompt, composed the way the operator launch path
+    //     composes it (`tui/src/planning.rs::compose_launch_prompt`)
+    //                                          ("task")
+    //   - anything else / lookup failed       → spawn promptless
+    //                                          ("none")
+    //
+    // The task lookup is a planning-API round trip, so it runs HERE —
+    // before the per-worktree spawn slot is claimed — rather than
+    // holding that slot across a network call. It is strictly
+    // best-effort: any failure (no API creds, 404, transport, empty
+    // prompt) degrades to a promptless spawn. Auto-delivery must
+    // NEVER be able to fail a spawn that would otherwise succeed.
+    //
+    // **Agents only.** A bash session's "prompt" is a COMMAND LINE the
+    // shell executes; typing a task's English prompt into one would run
+    // it as a command. A promptless bash spawn stays promptless.
+    let caller_prompt: Option<String> = p
+        .prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    // **Explicit `task_id` only.** The child INHERITS the caller's task
+    // binding when none is passed (grouping), but that must not trigger
+    // delivery: a promptless spawn without `task_id` is the documented
+    // "spawn now, drive with send_input later" pattern, and handing the
+    // child the CALLER's own task prompt would re-execute the parent's
+    // task. Auto-delivery is for the propose-then-launch flow, where
+    // the caller names the task it wants run.
+    let autodelivery_eligible = matches!(p.type_.as_str(), "claude-code" | "codex");
+    let (effective_prompt, prompt_source): (Option<String>, &'static str) = match caller_prompt {
+        Some(text) => (Some(text), "caller"),
+        None => match p.task_id.as_deref().filter(|_| autodelivery_eligible) {
+            Some(tid) => match task_autodelivery_prompt(state_arc, tid) {
+                Some(text) => (Some(text), "task"),
+                None => (None, "none"),
+            },
+            None => (None, "none"),
+        },
+    };
+
     // Sub-2b-3 review-7: per-worktree slot wraps
     // {pre-snapshot + spawn + detect}, not just {detect}.
     //
@@ -6713,7 +6784,6 @@ pub fn mcp_start_session(
     // the existing `start_session` method to keep the spawn
     // pipeline in one place (validation, two-phase spawn,
     // reaper, registry insert).
-    let task_id_for_spawn = p.task_id.clone().or(caller_task_id);
     let mut full_params = serde_json::Map::new();
     full_params.insert("uid".into(), Value::String(session_uid.clone()));
     full_params.insert("workspace_id".into(), Value::String(caller_workspace_id));
@@ -6736,8 +6806,8 @@ pub fn mcp_start_session(
     if let Some(cuid) = caller_uid {
         full_params.insert("managed_by_uid".into(), Value::String(cuid.to_string()));
     }
-    if let Some(tid) = task_id_for_spawn {
-        full_params.insert("task_id".into(), Value::String(tid));
+    if let Some(tid) = task_id_for_spawn.as_deref() {
+        full_params.insert("task_id".into(), Value::String(tid.to_string()));
     }
     // Propagate the (guard-approved) global-perms grant to the
     // child. The escalation guard above already verified the caller
@@ -6783,7 +6853,13 @@ pub fn mcp_start_session(
     //     is the daemon-side stand-in for the TUI's mode-aware
     //     `PendingWrite::wait_for_quiet` drainer, which isn't
     //     relocated daemon-side.
-    if let Some(prompt) = p.prompt.as_deref() {
+    //
+    // ux-5c: `effective_prompt` is either the caller's own prompt or
+    // the bound task's stored prompt (see the resolution block above).
+    // Both go through this identical delivery path — an auto-delivered
+    // task prompt is indistinguishable, from the child's side, from one
+    // the caller typed.
+    if let Some(prompt) = effective_prompt.as_deref() {
         if !prompt.is_empty() {
             let handle_opt = {
                 let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -6922,7 +6998,119 @@ pub fn mcp_start_session(
         }
     }
 
-    Ok(start_result)
+    // ux-1c / ux-5c: enrich the agent-facing return.
+    //
+    // Pre-fix the caller got `{"session_uid": ...}` and had to guess
+    // where the child actually landed — a `start_session(task_id=…)`
+    // into a branch-mode subtask spawns in a DIFFERENT worktree than
+    // the caller's, and the agent had no way to learn that path short
+    // of asking the child. `worktree_path` is always present (the
+    // spawn cannot succeed without one); `task_id` appears only when
+    // the child is bound to a task; `prompt_source` says which prompt
+    // (if any) the child was handed.
+    //
+    // Strictly additive: the operator-facing `start_session` return
+    // (`session_uid` + optional `cgroup_path`) is untouched — this
+    // decorates only the value `mcp_start_session` hands back.
+    let mut response = start_result;
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "worktree_path".into(),
+            Value::String(working_dir.to_string_lossy().into_owned()),
+        );
+        if let Some(tid) = task_id_for_spawn {
+            obj.insert("task_id".into(), Value::String(tid));
+        }
+        obj.insert("prompt_source".into(), Value::String(prompt_source.to_string()));
+    }
+    Ok(response)
+}
+
+/// ux-5c: best-effort lookup of a task's stored prompt for
+/// auto-delivery by `mcp_start_session` when the caller supplied none.
+///
+/// Returns `None` — meaning "spawn promptless, exactly as before" — for
+/// every failure mode: no planning-API creds configured, the row is
+/// missing, the API is unreachable, or the task carries neither a
+/// `prompt` nor a `description`. A spawn must never fail because this
+/// convenience lookup did.
+fn task_autodelivery_prompt(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+) -> Option<String> {
+    let (api_url_cfg, api_token_cfg) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (st.config.api_url.clone(), st.config.api_token.clone())
+    };
+    let creds = match PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "mcp_start_session: no planning-API creds for task-prompt \
+                 auto-delivery ({:?}); spawning promptless",
+                e,
+            );
+            return None;
+        }
+    };
+    let row = match api_get_task(&creds, task_id) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "mcp_start_session: task '{}' prompt lookup failed ({:?}); \
+                 spawning promptless",
+                task_id, e,
+            );
+            return None;
+        }
+    };
+    let field = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    compose_task_launch_prompt(field("description"), field("prompt"))
+}
+
+/// Daemon-side twin of `tui/src/planning.rs::compose_launch_prompt`,
+/// with one deliberate difference: it returns `Option<String>` instead
+/// of falling back to the title.
+///
+/// The operator launch path always has SOMETHING to deliver (the user
+/// pressed launch), so a bare-title fallback is better than nothing
+/// there. The auto-delivery path is the opposite: a task with neither a
+/// prompt nor a description has nothing worth saying, and shoving its
+/// title at a fresh agent would be noise. `None` means "spawn
+/// promptless", which is exactly the pre-ux-5c behavior.
+///
+/// Precedence otherwise matches the operator path:
+///   - both present  → `"{description}\n\n---\n\n{prompt}"`
+///   - only prompt   → prompt verbatim
+///   - only descr.   → description verbatim
+///
+/// The result is capped at `MAX_SEND_INPUT_BYTES` (the same cap the
+/// caller-supplied `prompt` is validated against up-front) — an
+/// over-long task prompt is truncated at a char boundary with a visible
+/// marker rather than rejected, since rejecting would fail a spawn the
+/// caller never asked to carry a prompt at all.
+fn compose_task_launch_prompt(description: &str, prompt: &str) -> Option<String> {
+    let description = description.trim();
+    let prompt = prompt.trim();
+    let composed = if !description.is_empty() && !prompt.is_empty() {
+        format!("{}\n\n---\n\n{}", description, prompt)
+    } else if !prompt.is_empty() {
+        prompt.to_string()
+    } else if !description.is_empty() {
+        description.to_string()
+    } else {
+        return None;
+    };
+    if composed.len() <= MAX_SEND_INPUT_BYTES {
+        return Some(composed);
+    }
+    const MARKER: &str = "\n\n[cm: task prompt truncated at the send_input cap]";
+    let budget = MAX_SEND_INPUT_BYTES.saturating_sub(MARKER.len());
+    let mut cut = budget.min(composed.len());
+    while cut > 0 && !composed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(format!("{}{}", &composed[..cut], MARKER))
 }
 
 // ============================================================
@@ -19050,6 +19238,323 @@ mod tests {
             // No child was spawned — only the caller remains.
             assert_eq!(state.lock().unwrap().sessions.len(), 1);
         });
+    }
+
+    // ─────────── ux-1c / ux-5c: mcp_start_session return shape ───────────
+
+    /// Seed `ws-1` with a real on-disk worktree plus a live caller
+    /// session in it, and return the worktree path. `task` binds the
+    /// caller to a task (so the spawn inherits the binding); `None`
+    /// leaves it taskless.
+    fn seed_mcp_spawn_fixture(
+        state: &Arc<Mutex<DaemonState>>,
+        caller_uid: &str,
+        task: Option<&str>,
+    ) -> std::path::PathBuf {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-1".to_string();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-1".to_string(), ws);
+        }
+        let mut sp = crate::session::SpawnParams::new(caller_uid, "caller", "/bin/sleep");
+        sp.args = vec!["120".to_string()];
+        sp.workspace_id = "ws-1".to_string();
+        sp.task_id = task.map(str::to_string);
+        let sess = crate::session::PendingSession::spawn(sp)
+            .expect("spawn caller")
+            .arm_reaper(None)
+            .expect("arm");
+        state.lock().unwrap().sessions.insert(caller_uid.to_string(), sess);
+        wt
+    }
+
+    /// ux-1c: every `mcp_start_session` success carries
+    /// `worktree_path` (where the child actually landed) and, when the
+    /// child is task-bound, `task_id`. Pre-fix the agent got only
+    /// `session_uid` and had no way to learn either.
+    ///
+    /// ux-5c corollary asserted here: a caller-supplied prompt reports
+    /// `prompt_source: "caller"` and costs NO planning-API round trip
+    /// (the stub records zero requests).
+    #[test]
+    fn mcp_start_session_returns_worktree_task_and_caller_prompt_source() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let wt = seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            // A stub the handler must NOT call: the caller passed a prompt.
+            let stub = spawn_routed_stub(|_m, _p, _b| (500, "{}".to_string()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "bash", "label": "child", "prompt": "do it" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+
+            assert!(resp["session_uid"].as_str().is_some(), "uid still returned");
+            assert_eq!(
+                resp["worktree_path"].as_str(),
+                Some(wt.to_string_lossy().as_ref()),
+                "ux-1c: the child's worktree must come back on the response",
+            );
+            assert_eq!(
+                resp["task_id"].as_str(),
+                Some("task-1"),
+                "ux-1c: the inherited task binding must come back too",
+            );
+            assert_eq!(resp["prompt_source"], json!("caller"));
+            assert!(
+                stub.requests.lock().unwrap().is_empty(),
+                "a caller-supplied prompt must short-circuit the task lookup",
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// ux-1c: a taskless spawn still reports `worktree_path`, omits
+    /// `task_id` entirely, and reports `prompt_source: "none"` — there
+    /// is no task to auto-deliver from and no prompt was passed.
+    #[test]
+    fn mcp_start_session_taskless_promptless_reports_none() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let wt = seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "bash", "label": "child" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+
+            assert_eq!(
+                resp["worktree_path"].as_str(),
+                Some(wt.to_string_lossy().as_ref()),
+            );
+            assert!(
+                resp.get("task_id").is_none(),
+                "no binding ⇒ no task_id key, not a null: {}",
+                resp,
+            );
+            assert_eq!(resp["prompt_source"], json!("none"));
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// ux-5c: prompt omitted + a bound task ⇒ the daemon fetches that
+    /// task's row and delivers its stored description+prompt, reporting
+    /// `prompt_source: "task"`. This is what makes
+    /// `start_session(task_id=<backlog task>)` a complete launch.
+    ///
+    /// Uses `codex` (an agent type) because auto-delivery is
+    /// deliberately agent-only — see the bash test below.
+    #[test]
+    fn mcp_start_session_auto_delivers_bound_task_prompt() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-1") => (
+                    200,
+                    r#"{"id":"task-1","name":"Fix the thing",
+                        "description":"background","prompt":"instructions"}"#
+                        .to_string(),
+                ),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "child", "task_id": "task-1" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+
+            assert_eq!(resp["prompt_source"], json!("task"));
+            assert_eq!(resp["task_id"].as_str(), Some("task-1"));
+            let reqs = stub.requests.lock().unwrap();
+            assert!(
+                reqs.iter().any(|r| r.method == "GET" && r.path == "/tasks/task-1"),
+                "the bound task's row must be fetched: {:?}",
+                reqs,
+            );
+            drop(reqs);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// ux-5c scope guard: auto-delivery requires an EXPLICIT `task_id`
+    /// param. A child spawned without one still INHERITS the caller's
+    /// binding (grouping), but that binding must not trigger delivery —
+    /// a promptless spawn is the "spawn now, drive with send_input
+    /// later" pattern, and delivering would re-run the CALLER's own
+    /// task prompt in the child. No planning-API call may be made.
+    #[test]
+    fn mcp_start_session_inherited_binding_never_auto_delivers() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let stub = spawn_routed_stub(|_m, _p, _b| {
+                (500, r#"{"detail":"must not be called"}"#.to_string())
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "child" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+
+            assert_eq!(resp["prompt_source"], json!("none"));
+            // The inherited binding itself is preserved on the child.
+            assert_eq!(resp["task_id"].as_str(), Some("task-1"));
+            let reqs = stub.requests.lock().unwrap();
+            assert!(
+                reqs.is_empty(),
+                "inherited binding must not trigger a task lookup: {:?}",
+                reqs,
+            );
+            drop(reqs);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// ux-5c scope guard: a `bash` session's "prompt" is a COMMAND LINE
+    /// the shell executes. Auto-delivering a task's English prompt into
+    /// one would run it as a command, so a promptless bash spawn stays
+    /// promptless — and doesn't even make the lookup call.
+    #[test]
+    fn mcp_start_session_bash_never_auto_delivers_task_prompt() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let stub = spawn_routed_stub(|_m, _p, _b| {
+                (200, r#"{"id":"task-1","prompt":"rm -rf everything"}"#.to_string())
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "bash", "label": "shell", "task_id": "task-1" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+
+            assert_eq!(resp["prompt_source"], json!("none"));
+            assert!(
+                stub.requests.lock().unwrap().is_empty(),
+                "a bash spawn must not even look the task prompt up",
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// ux-5c fail-soft: an unreachable / erroring planning API must
+    /// NEVER fail the spawn. The session comes up promptless with
+    /// `prompt_source: "none"` — exactly the pre-ux-5c behavior.
+    #[test]
+    fn mcp_start_session_auto_delivery_failure_still_spawns() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let stub = spawn_routed_stub(|_m, _p, _b| (500, r#"{"detail":"boom"}"#.to_string()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "child" }),
+                Some("ts-caller"),
+            )
+            .expect("a failed task lookup must not fail the spawn");
+            set_spawn_program_override_for_test(None);
+
+            assert_eq!(resp["prompt_source"], json!("none"));
+            assert!(resp["session_uid"].as_str().is_some());
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// ux-5c composition rules: description+prompt are joined the way
+    /// the operator launch path joins them, either alone passes
+    /// through verbatim, and a task with neither yields `None` (⇒
+    /// promptless spawn) rather than the bare title.
+    #[test]
+    fn compose_task_launch_prompt_precedence() {
+        assert_eq!(
+            compose_task_launch_prompt("why", "how").as_deref(),
+            Some("why\n\n---\n\nhow"),
+        );
+        assert_eq!(compose_task_launch_prompt("", "how").as_deref(), Some("how"));
+        assert_eq!(compose_task_launch_prompt("why", "  ").as_deref(), Some("why"));
+        assert_eq!(compose_task_launch_prompt("  \n ", "\t"), None);
+        assert_eq!(compose_task_launch_prompt("", ""), None);
+    }
+
+    /// ux-5c: an over-long task prompt is TRUNCATED, not rejected —
+    /// rejecting would fail a spawn whose caller never asked to carry a
+    /// prompt at all. The result stays within the `send_input` cap and
+    /// says so.
+    #[test]
+    fn compose_task_launch_prompt_truncates_over_cap() {
+        let huge = "x".repeat(MAX_SEND_INPUT_BYTES + 10_000);
+        let out = compose_task_launch_prompt("", &huge).expect("still composes");
+        assert!(
+            out.len() <= MAX_SEND_INPUT_BYTES,
+            "truncated body must fit the send_input cap, got {}",
+            out.len(),
+        );
+        assert!(out.ends_with("truncated at the send_input cap]"), "marker present");
     }
 
     /// F1 round-5: half-tagged updates are rejected. Caller-bug

@@ -723,6 +723,23 @@ async def start_session(
             activation flow uses). For a bash session this is just a
             command line. Required in practice when `wait=true` — there's
             nothing to wait for otherwise.
+            **Omit it to launch a planning task as written**: when
+            `prompt` is empty/absent AND you named a task EXPLICITLY
+            (the `task_id` arg, or the one `isolated=true` mints), the
+            server looks up that task's stored description + prompt and
+            delivers THAT to the worker — the same text the operator's
+            launch key would have sent. A binding merely INHERITED from
+            your own session does not trigger this: a promptless spawn
+            without `task_id` stays promptless (the "spawn now, drive
+            with send_input later" pattern). So `start_session(type=...,
+            label=..., task_id=<backlog task>)` is a complete launch;
+            you don't have to fetch the task and re-type its prompt.
+            The response's `prompt_source` tells you what happened
+            ("caller" / "task" / "none"). The lookup is best-effort: a
+            task with no stored prompt, or an unreachable planning API,
+            just spawns the worker promptless — it never fails the
+            spawn. Agents only: a `bash` session's prompt is a command
+            line the shell would EXECUTE, so bash never auto-delivers.
         task_id: Optional task to bind to. Omitted = your own task (if
             any) or no task. You may bind to your own task, any of its
             descendants, or a task YOU created via `propose_task` /
@@ -761,15 +778,28 @@ async def start_session(
             `schema_retries` re-prompts on a miss. The parsed value comes
             back as `result`.
         schema_retries: Max re-prompts on a schema miss. Default 1.
-        notify_on_done: With wait=false and a `prompt`, auto-register an
-            async monitor on the new worker (default true): when it
+        notify_on_done: With wait=false and a prompt to run, auto-register
+            an async monitor on the new worker (default true): when it
             finishes the prompt, a `[cm-monitor ...]` message is
             delivered into YOUR session with its reply — so END YOUR
             TURN after spawning; don't poll and don't park in blocking
-            `wait_*` calls. Ignored for bash sessions, when wait=true,
-            or when there's no prompt to wait for.
+            `wait_*` calls. An auto-delivered task prompt (see `prompt`,
+            `prompt_source == "task"`) counts, so a task launch wakes
+            you too. Ignored for bash sessions, when wait=true, or when
+            the worker was spawned with no prompt at all.
 
     Returns:
+        Every spawn returns, alongside the shape below:
+          - `worktree_path` — the checkout the new session actually
+            landed in. Worth reading even when you didn't pass
+            `task_id`: binding to a branch-mode subtask spawns the
+            worker in ITS worktree, not yours.
+          - `task_id` — the task the new session is bound to, when it is
+            bound to one.
+          - `prompt_source` — "caller" (your `prompt`), "task" (the
+            bound task's stored prompt, auto-delivered because you
+            passed none), or "none" (spawned promptless).
+
         - wait=false: {"session_uid": "<uid>"} for the freshly-spawned
           session, plus `monitor` when one was auto-registered (see
           notify_on_done).
@@ -780,8 +810,8 @@ async def start_session(
           can fall back to polling a slow worker that outran `timeout_s`.
           With `schema`, also `result` (parsed value or null) and
           `schema_error` (null on success, else the reason).
-        - isolated=true: the dict ALSO carries `task_id` (the branched
-          subtask) and `worktree_path` (its checkout), whatever `wait` is.
+        - isolated=true: `task_id` / `worktree_path` name the branched
+          subtask and its fresh checkout, whatever `wait` is.
 
     State your intent in plain language and ask the user to confirm
     before calling this tool. The user expects to be in the loop on
@@ -845,12 +875,46 @@ async def start_session(
         control_client.call, method, params, socket_path=route.path
     )
 
+    # ux-5c: the server tells us which prompt (if any) the child was
+    # actually handed — "caller" (the `prompt` arg), "task" (the task's
+    # own stored prompt, auto-delivered because we passed none while
+    # naming a task_id), or "none". When present it is AUTHORITATIVE:
+    # the server treats a whitespace-only `prompt` as absent, so keying
+    # off our raw argument would register a done-monitor against a
+    # worker that was never handed anything (it can never fire, and the
+    # orchestrator parks on it). Older servers omit the field; only
+    # then fall back to what we sent, with the same blank-normalization.
+    prompt_source = spawn.get("prompt_source") if isinstance(spawn, dict) else None
+    if prompt_source is not None:
+        delivered_a_prompt = prompt_source in ("caller", "task")
+    else:
+        delivered_a_prompt = bool(prompt and prompt.strip())
+
     def _with_isolation(d: dict) -> dict:
         """Tag the subtask task_id / worktree_path onto a result so the
-        caller can later merge the branch and `mark_subtask_done`."""
+        caller can later merge the branch and `mark_subtask_done`.
+
+        ux-1c: the server now returns `worktree_path` (always) and
+        `task_id` (when bound) on EVERY spawn, not just isolated ones —
+        so this only has to fill in the isolated-specific values, and
+        must not clobber a real server-supplied path with a None.
+        """
         if isolated and isinstance(d, dict):
-            d["task_id"] = isolated_task_id
-            d["worktree_path"] = isolated_worktree
+            if isolated_task_id:
+                d["task_id"] = isolated_task_id
+            if isolated_worktree:
+                d["worktree_path"] = isolated_worktree
+        return d
+
+    def _with_spawn_fields(d: dict) -> dict:
+        """Carry the spawn call's descriptive fields onto a result dict
+        built elsewhere (the wait path's `_await_reply` result), so
+        `wait=true` callers see the same `worktree_path` / `task_id` /
+        `prompt_source` that `wait=false` callers get."""
+        if isinstance(d, dict) and isinstance(spawn, dict):
+            for key in ("worktree_path", "task_id", "prompt_source"):
+                if spawn.get(key) is not None and d.get(key) is None:
+                    d[key] = spawn[key]
         return d
 
     if not wait:
@@ -858,7 +922,10 @@ async def start_session(
         if (
             notify_on_done
             and spawn_uid
-            and prompt
+            # ux-5c: an auto-delivered task prompt is a turn the worker
+            # will run and finish, so it deserves the same wake-me-up
+            # monitor a caller-supplied prompt gets.
+            and delivered_a_prompt
             and type != "bash"
         ):
             try:
@@ -894,7 +961,7 @@ async def start_session(
             session_uid, res, schema, schema_retries,
             deadline=deadline, interval=interval, grace=grace,
         )
-    return _with_isolation(res)
+    return _with_isolation(_with_spawn_fields(res))
 
 
 @mcp.tool()

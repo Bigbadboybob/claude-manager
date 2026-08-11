@@ -823,6 +823,10 @@ struct StartSessionParams {
     #[serde(rename = "type")]
     type_: String,
     label: String,
+    /// Initial prompt for the child. ux-5c: absent/blank + a bound task
+    /// ⇒ the task's own stored prompt is delivered instead
+    /// (`prompt_source: "task"`). Mirrors the daemon's
+    /// `mcp_start_session`.
     #[serde(default)]
     prompt: Option<String>,
     /// Grant the spawned child global perms. Honored only when the
@@ -830,6 +834,35 @@ struct StartSessionParams {
     /// daemon's `mcp_start_session`.
     #[serde(default)]
     global_perms: bool,
+}
+
+/// ux-5c (TUI twin of the daemon's `task_autodelivery_prompt`):
+/// best-effort lookup of a bound task's stored prompt, for an
+/// `mcp start_session` that carried no prompt of its own.
+///
+/// The TUI already holds the planning rows in `app.tasks` (kept fresh
+/// by the planning refresh), so this is a memory lookup rather than the
+/// daemon's API round trip. `None` ⇒ spawn promptless, exactly as
+/// before ux-5c.
+///
+/// `TaskEntry` carries the task's `prompt` and display `name` but not
+/// its `description` (that lives only in the planning-board rows), so
+/// the composition here degenerates to "prompt verbatim". The daemon
+/// path — which reads the full API row — is the one that folds in the
+/// description. Both refuse to fall back to the bare title: a task with
+/// no stored prompt has nothing worth auto-delivering.
+fn task_autodelivery_prompt(
+    tasks: &[crate::app::TaskEntry],
+    task_id: &str,
+) -> Option<String> {
+    let task = tasks
+        .iter()
+        .find(|t| t.task_id.as_deref() == Some(task_id))?;
+    let stored = task.prompt.as_deref().unwrap_or("");
+    if stored.trim().is_empty() {
+        return None;
+    }
+    Some(crate::planning::compose_launch_prompt("", stored, &task.name))
 }
 
 pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
@@ -897,17 +930,65 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         _ => caller_wi,
     };
 
+    // ux-5c: caller prompt wins; a blank/absent one falls back to the
+    // bound task's stored prompt. Mirrors the daemon's
+    // `mcp_start_session` resolution (agent-facing route only — the
+    // operator's own spawn paths are untouched). Agents only: a bash
+    // session's "prompt" is a command line the shell would EXECUTE.
+    let caller_prompt: Option<String> = p
+        .prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    // Explicit `task_id` only (mirrors the daemon): an inherited
+    // binding must not trigger delivery, or a promptless "spawn now,
+    // drive later" child would re-run the caller's own task prompt.
+    let autodelivery_eligible = matches!(p.type_.as_str(), "claude-code" | "codex");
+    let (effective_prompt, prompt_source): (Option<String>, &'static str) = match caller_prompt {
+        Some(text) => (Some(text), "caller"),
+        None => match p.task_id.as_deref().filter(|_| autodelivery_eligible) {
+            Some(tid) => match task_autodelivery_prompt(&app.tasks, tid) {
+                Some(text) => (Some(text), "task"),
+                None => (None, "none"),
+            },
+            None => (None, "none"),
+        },
+    };
+
+    // ux-1c: snapshot the target worktree BEFORE the spawn borrows
+    // `app` mutably, so the response can tell the caller where the
+    // child actually landed (a descendant task's branch-mode worktree
+    // is NOT the caller's).
+    let worktree_path: Option<String> = app.workspaces[target_wi]
+        .worktree_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let task_id_for_response = task_id_for_new.clone();
+
     let new_uid = app.spawn_managed_session(
         target_wi,
         caller_uid,
         &p.type_,
         &p.label,
         task_id_for_new,
-        p.prompt.as_deref(),
+        effective_prompt.as_deref(),
         p.global_perms,
     )
     .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
-    Ok(json!({"session_uid": new_uid}))
+    // ux-1c / ux-5c: same enriched shape the daemon's
+    // `mcp_start_session` returns, so the Python tool can read one set
+    // of fields regardless of which socket served the call.
+    let mut resp = json!({
+        "session_uid": new_uid,
+        "prompt_source": prompt_source,
+    });
+    if let Some(wt) = worktree_path {
+        resp["worktree_path"] = Value::String(wt);
+    }
+    if let Some(tid) = task_id_for_response {
+        resp["task_id"] = Value::String(tid);
+    }
+    Ok(resp)
 }
 
 /// Look up the workspace index for a task by its FK (`workspace_id`).
@@ -2753,5 +2834,43 @@ mod tests {
         // benign no-op handled by the on-disk fallback path (the run
         // is no longer in `app.workflow_runs`).
         assert!(!matches!(RunStatus::Detached, RunStatus::Done));
+    }
+
+    // -- ux-5c: task-prompt auto-delivery lookup (TUI socket route) --
+
+    /// The bound task's stored prompt is what gets auto-delivered when
+    /// an agent calls `start_session` with no prompt of its own.
+    #[test]
+    fn autodelivery_returns_the_tasks_stored_prompt() {
+        let mut t = task_with_parent("A", None, "Fix the thing");
+        t.prompt = Some("go fix it".into());
+        let tasks = vec![t];
+        assert_eq!(
+            task_autodelivery_prompt(&tasks, "A").as_deref(),
+            Some("go fix it"),
+        );
+    }
+
+    /// A task with no stored prompt (or only whitespace) yields None —
+    /// the spawn stays promptless rather than handing the worker its
+    /// bare title, which would be noise, not instructions.
+    #[test]
+    fn autodelivery_refuses_title_only_tasks() {
+        let mut blank = task_with_parent("A", None, "Fix the thing");
+        blank.prompt = None;
+        let mut ws_only = task_with_parent("B", None, "Other thing");
+        ws_only.prompt = Some("  \n\t ".into());
+        let tasks = vec![blank, ws_only];
+        assert_eq!(task_autodelivery_prompt(&tasks, "A"), None);
+        assert_eq!(task_autodelivery_prompt(&tasks, "B"), None);
+    }
+
+    /// An unknown task id is a miss, not a panic — the spawn proceeds
+    /// promptless. (Happens when the planning refresh hasn't yet pulled
+    /// a just-created row into `app.tasks`.)
+    #[test]
+    fn autodelivery_unknown_task_is_a_miss() {
+        let tasks = vec![task_with_parent("A", None, "a")];
+        assert_eq!(task_autodelivery_prompt(&tasks, "nope"), None);
     }
 }
