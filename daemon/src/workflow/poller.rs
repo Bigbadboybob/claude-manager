@@ -1499,8 +1499,13 @@ pub fn resolve_role_session_context(
             .session_type
             .clone()
             .unwrap_or_else(|| "claude-code".to_string());
-        // `TuiSessionSnapshot` doesn't carry workspace_id; derive
-        // via task_id binding.
+        // Derive via the task_id binding. `TuiSessionSnapshot` did
+        // gain a `workspace_id` field (5d, for `list_sessions`
+        // grouping), but the daemon-side binding stays authoritative
+        // here: it's the same map `state.workspaces` worktree lookups
+        // key off, and switching this resolver to the pushed field
+        // would change which workspace a workflow role spawns into.
+        // Left as a deliberate non-change.
         let workspace_id = ts
             .task_id
             .as_deref()
@@ -1898,6 +1903,8 @@ mod tests {
                     workflow_run_id: Some("r1".to_string()),
                     workflow_role: Some("worker".to_string()),
                     global_perms: false,
+                    workspace_id: None,
+                    worktree_path: None,
                 },
             );
             s.tui_sessions_pushed = true;

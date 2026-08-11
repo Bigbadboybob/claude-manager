@@ -43,6 +43,12 @@ pub struct TuiSessionRow {
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
     pub global_perms: bool,
+    /// 5d: workspace this session lives in + that workspace's checkout,
+    /// so the daemon's `list_sessions` can report the same
+    /// `workspace_id` / `worktree_path` for TUI-owned rows that it
+    /// already reports for daemon-owned ones.
+    pub workspace_id: Option<String>,
+    pub worktree_path: Option<String>,
 }
 
 enum PushCommand {
@@ -333,6 +339,8 @@ fn push_tui_sessions(
             workflow_run_id: s.workflow_run_id.as_deref(),
             workflow_role: s.workflow_role.as_deref(),
             global_perms: s.global_perms,
+            workspace_id: s.workspace_id.as_deref(),
+            worktree_path: s.worktree_path.as_deref(),
         })
         .collect();
     match crate::client_session::rpc_tui_update_sessions_snapshot(

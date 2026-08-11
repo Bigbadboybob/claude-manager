@@ -649,6 +649,21 @@ pub struct TuiSessionSnapshot {
     /// field) loading as `false`.
     #[serde(default)]
     pub global_perms: bool,
+    /// Workspace this TUI-minted session lives in (5d). Pushed so the
+    /// daemon's unified `list_sessions` can report the same
+    /// `workspace_id` grouping key for TUI-owned rows that it already
+    /// reports for daemon-owned ones — and so it can join the
+    /// workspace's `worktree_path` out of `state.workspaces` (which the
+    /// TUI's `task.update_tree` push already populates).
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// Checkout the session runs in, carried directly on the row (5d).
+    /// Belt-and-braces next to the `workspace_id` join: a workspace the
+    /// TUI hasn't pushed to `state.workspaces` yet (or one GC'd out of
+    /// it) would otherwise leave the row pathless, and "which sessions
+    /// share my checkout?" is exactly what agents use this for.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
 }
 
 /// 10d-1: unified session view used by future workflow-

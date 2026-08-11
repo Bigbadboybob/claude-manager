@@ -1490,6 +1490,13 @@ impl App {
         // Bucket each remaining session by its pinned `host_id` so each
         // daemon only hears about sessions it actually owns (12e-r8 F2).
         for w in &self.workspaces {
+            // 5d: carry the workspace identity + checkout on every row.
+            // The daemon's `list_sessions` previously reported
+            // `workspace_id: null` and no `worktree_path` at all for
+            // TUI-owned sessions, so an agent could not see that a
+            // TUI-launched sibling shares its worktree.
+            let worktree_path =
+                w.worktree_path.as_ref().map(|p| p.display().to_string());
             for ts in &w.sessions {
                 if ts.session.daemon_session_uid.is_some() {
                     continue;
@@ -1504,6 +1511,8 @@ impl App {
                         workflow_run_id: ts.workflow_run_id.clone(),
                         workflow_role: ts.workflow_role.clone(),
                         global_perms: ts.global_perms,
+                        workspace_id: Some(w.id.clone()),
+                        worktree_path: worktree_path.clone(),
                     });
                 }
             }

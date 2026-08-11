@@ -541,10 +541,56 @@ def ping() -> dict:
 _SESSION_NOISE_FIELDS = ("cols", "rows")
 
 
+def _annotate_shared_worktrees(sessions: list[dict]) -> None:
+    """Stamp `workspace_shared_with` on every LIVE row that shares its
+    `worktree_path` with another live row.
+
+    The hint answers "who else is editing this checkout right now?" —
+    the question an agent has to answer before it edits a file, and one
+    it previously could not answer at all (it had to eyeball paths and
+    guess). Value is a list of `{"session_uid", "label"}` for the OTHER
+    live sessions on the same path; the key is omitted when a session
+    has its checkout to itself, so the common case stays quiet.
+
+    Scope safety: computed STRICTLY from `sessions` — the rows the host
+    already filtered down to what this caller may see. Both host
+    implementations authorize per row before emitting it (the daemon's
+    `list_sessions` runs every row through `should_include`, which walks
+    the caller's task tree / workspace via `check_session_caller`; the
+    TUI twin runs `caller_authorized_for` per row). So this can only
+    ever name a session the caller could already list. Never re-query
+    the host for a wider set to build this — that would leak session
+    uids and labels across auth boundaries.
+
+    Exited rows (present only under `include_exited`) neither receive
+    the hint nor count as sharers: a closed session isn't touching the
+    checkout anymore.
+    """
+    by_path: dict[str, list[dict]] = {}
+    for s in sessions:
+        if s.get("state") == "exited":
+            continue
+        path = s.get("worktree_path")
+        uid = s.get("session_uid")
+        if not path or not uid:
+            continue
+        by_path.setdefault(path, []).append(s)
+    for peers in by_path.values():
+        if len(peers) < 2:
+            continue
+        for s in peers:
+            s["workspace_shared_with"] = [
+                {"session_uid": o.get("session_uid"), "label": o.get("label")}
+                for o in peers
+                if o.get("session_uid") != s.get("session_uid")
+            ]
+
+
 def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
     """Shared implementation behind `list_sessions` and
     `list_sessions_grouped`: call the host, enrich each entry with the
-    legible `status` word, and drop terminal-geometry noise."""
+    legible `status` word and the `workspace_shared_with` hint, and drop
+    terminal-geometry noise."""
     params: dict = {"include_exited": include_exited}
     if task_id:
         params["task_id"] = task_id
@@ -555,6 +601,7 @@ def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
         )
         for k in _SESSION_NOISE_FIELDS:
             s.pop(k, None)
+    _annotate_shared_worktrees(sessions)
     return sessions
 
 
@@ -586,7 +633,8 @@ def list_sessions(
     back-compat.) Each dict:
         {session_uid, label, type, state, idle, status, managed_by_uid,
          task_id, workspace_id, workflow_run_id, workflow_role,
-         global_perms, continuous_task_id, worktree_path}
+         global_perms, continuous_task_id, worktree_path,
+         workspace_shared_with?}
         state ∈ {"ready", "pending", "exited"}.
         Exited rows (include_exited=true) additionally carry HOW they
         ended: exited_at (unix seconds), killed (true when the exit
@@ -605,6 +653,14 @@ def list_sessions(
         global_perms: true if THIS session is a privileged orchestrator.
         continuous_task_id: set if this session belongs to a continuous task.
         worktree_path: the checkout the session runs in.
+        workspace_shared_with: PRESENT ONLY when another live session is
+            running in the same `worktree_path` — a list of
+            `{session_uid, label}` for those others. Absent means the
+            session has that checkout to itself. Treat its presence as
+            "concurrent edits are possible here": coordinate before you
+            edit shared files (or `send_input` to the other session)
+            rather than assuming the working tree is yours. Exited
+            sessions never appear in it and never receive it.
     (Terminal geometry — `cols`/`rows` — is intentionally omitted; it's
     noise for orchestration.)
     """
@@ -647,6 +703,13 @@ def list_sessions_grouped(
     Sessions with no workspace_id (e.g. some host-owned snapshots) land
     under a `workspace_id: null` group; taskless sessions under a
     `task_id: null` task within their workspace.
+
+    The per-session dicts carry `workspace_shared_with` on the same terms
+    as `list_sessions` (see there). It is worth reading even though the
+    output is already grouped: the grouping key is `workspace_id`, and
+    two DIFFERENT workspaces can point at the same checkout (an in-place
+    launch, or a workspace re-created around an existing worktree), so a
+    shared checkout does not always show up as a shared group.
     """
     sessions = _list_sessions_raw(task_id, include_exited)
 

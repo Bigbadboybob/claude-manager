@@ -1552,6 +1552,8 @@ pub fn rpc_tui_update_sessions_snapshot(
                 "workflow_run_id": s.workflow_run_id,
                 "workflow_role": s.workflow_role,
                 "global_perms": s.global_perms,
+                "workspace_id": s.workspace_id,
+                "worktree_path": s.worktree_path,
             })
         })
         .collect();
@@ -1578,6 +1580,13 @@ pub struct TuiSessionSnapshotPush<'a> {
     pub workflow_run_id: Option<&'a str>,
     pub workflow_role: Option<&'a str>,
     pub global_perms: bool,
+    /// 5d: the workspace this session lives in, and that workspace's
+    /// checkout. The daemon's `list_sessions` projects both onto
+    /// TUI-owned rows so a shared-worktree hint can be computed for
+    /// them (previously `workspace_id` was hard-coded null and
+    /// `worktree_path` was absent entirely).
+    pub workspace_id: Option<&'a str>,
+    pub worktree_path: Option<&'a str>,
 }
 
 /// 10d-2c-2-1: push the full workflow-definitions map to the
@@ -2501,6 +2510,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-b",
@@ -2511,6 +2522,8 @@ mod tests {
                 workflow_run_id: Some("wf-1"),
                 workflow_role: Some("worker"),
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-snap", &first)
@@ -2541,6 +2554,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-c",
@@ -2551,6 +2566,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-snap", &second)
@@ -2659,6 +2676,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             }],
         );
         assert!(
@@ -2718,6 +2737,8 @@ mod tests {
                 workflow_run_id: Some("wf-r"),
                 workflow_role: Some("worker"),
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-restored-2",
@@ -2728,6 +2749,8 @@ mod tests {
                 workflow_run_id: Some("wf-r"),
                 workflow_role: Some("reviewer"),
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-restored-3",
@@ -2738,6 +2761,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-restore", &restored)
@@ -2833,6 +2858,8 @@ mod tests {
             workflow_run_id: None,
             workflow_role: None,
             global_perms: false,
+            workspace_id: None,
+            worktree_path: None,
         }];
         rpc_tui_update_sessions_snapshot(&socket, "op-filter", &filtered)
             .expect("filtered push ok");
@@ -2846,6 +2873,57 @@ mod tests {
              keeps the maps non-overlapping by construction)",
         );
         drop(s);
+        stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// 5d: the snapshot push carries the session's workspace + that
+    /// workspace's checkout, so the daemon's `list_sessions` can report
+    /// `workspace_id` / `worktree_path` for TUI-owned rows (previously
+    /// hard-coded null / absent, which hid shared-worktree siblings from
+    /// every agent that listed them).
+    #[test]
+    fn push_carries_workspace_id_and_worktree_path() {
+        let (socket, _working_dir, state, stop, handle) =
+            start_test_daemon("ws-wt");
+        let rows = vec![
+            TuiSessionSnapshotPush {
+                uid: "ses-wt",
+                task_id: Some("task-wt"),
+                label: Some("wt"),
+                session_type: Some("claude-code"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+                global_perms: false,
+                workspace_id: Some("ws-wt-1"),
+                worktree_path: Some("/tmp/wt-1"),
+            },
+            // A workspace with no checkout yet (cloud / anchor) still
+            // pushes cleanly — both fields are Option end-to-end.
+            TuiSessionSnapshotPush {
+                uid: "ses-nowt",
+                task_id: None,
+                label: Some("nowt"),
+                session_type: Some("bash"),
+                hidden: false,
+                workflow_run_id: None,
+                workflow_role: None,
+                global_perms: false,
+                workspace_id: Some("ws-wt-2"),
+                worktree_path: None,
+            },
+        ];
+        rpc_tui_update_sessions_snapshot(&socket, "op-wt", &rows)
+            .expect("push ok");
+        {
+            let s = state.lock().unwrap();
+            let a = s.tui_sessions.get("ses-wt").expect("row landed");
+            assert_eq!(a.workspace_id.as_deref(), Some("ws-wt-1"));
+            assert_eq!(a.worktree_path.as_deref(), Some("/tmp/wt-1"));
+            let b = s.tui_sessions.get("ses-nowt").expect("row landed");
+            assert_eq!(b.workspace_id.as_deref(), Some("ws-wt-2"));
+            assert_eq!(b.worktree_path, None);
+        }
         stop_test_daemon(&socket, stop, handle);
     }
 
@@ -2880,6 +2958,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-b",
@@ -2890,6 +2970,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-live", &live)
@@ -2936,6 +3018,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-b",
@@ -2946,6 +3030,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-tui1-live", &first)
@@ -2972,6 +3058,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
             TuiSessionSnapshotPush {
                 uid: "ses-c",
@@ -2982,6 +3070,8 @@ mod tests {
                 workflow_run_id: None,
                 workflow_role: None,
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         ];
         rpc_tui_update_sessions_snapshot(&socket, "op-tui2-restore", &second)

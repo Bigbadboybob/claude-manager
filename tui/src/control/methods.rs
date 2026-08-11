@@ -617,6 +617,10 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             // workspace→task and flag privileged sessions.
             "task_id": ts.task_id,
             "workspace_id": ws.id,
+            // Parity with the daemon's rows: the MCP layer derives the
+            // workspace_shared_with hint from this field, so omitting it
+            // silently disables the hint on the TUI-socket path.
+            "worktree_path": ws.worktree_path.as_ref().map(|p| p.display().to_string()),
             "workflow_run_id": ts.workflow_run_id,
             "workflow_role": ts.workflow_role,
             "global_perms": ts.global_perms,

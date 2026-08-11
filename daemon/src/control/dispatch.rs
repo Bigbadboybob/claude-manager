@@ -3194,6 +3194,131 @@ mod tests {
         assert_eq!(s2["rows"].as_u64(), Some(50));
     }
 
+    /// 5d: TUI-owned rows carry `workspace_id` + `worktree_path` so an
+    /// agent can tell that a TUI-launched sibling shares its checkout.
+    /// Pre-5d these rows reported `workspace_id: null` and omitted
+    /// `worktree_path` entirely — a daemon-spawned agent listing its
+    /// siblings saw a pathless row and could not answer "who else is
+    /// editing my worktree?".
+    ///
+    /// Two sources are pinned: the join out of `state.workspaces`
+    /// (populated by the TUI's `task.update_tree` push — the same join
+    /// daemon-owned rows use) and the fallback to the path carried on
+    /// the snapshot row itself, for a workspace the daemon hasn't been
+    /// told about yet.
+    #[test]
+    fn list_sessions_tui_owned_rows_carry_workspace_and_worktree() {
+        let state = make_state();
+        {
+            let mut s = state.lock().unwrap();
+            s.workspaces.insert(
+                "ws-known".into(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-known".into(),
+                    worktree_path: Some(std::path::PathBuf::from("/tmp/wt-known")),
+                    ..Default::default()
+                },
+            );
+            s.tui_sessions.insert(
+                "ts-joined".into(),
+                crate::state::TuiSessionSnapshot {
+                    uid: "ts-joined".into(),
+                    task_id: None,
+                    label: Some("joined".into()),
+                    session_type: Some("claude-code".into()),
+                    hidden: false,
+                    workflow_run_id: None,
+                    workflow_role: None,
+                    global_perms: false,
+                    workspace_id: Some("ws-known".into()),
+                    // Deliberately stale on the row — the
+                    // `state.workspaces` join must win.
+                    worktree_path: Some("/tmp/wt-stale".into()),
+                },
+            );
+            s.tui_sessions.insert(
+                "ts-unregistered".into(),
+                crate::state::TuiSessionSnapshot {
+                    uid: "ts-unregistered".into(),
+                    task_id: None,
+                    label: Some("unregistered".into()),
+                    session_type: Some("bash".into()),
+                    hidden: false,
+                    workflow_run_id: None,
+                    workflow_role: None,
+                    global_perms: false,
+                    workspace_id: Some("ws-unknown".into()),
+                    worktree_path: Some("/tmp/wt-fallback".into()),
+                },
+            );
+            s.tui_sessions_pushed = true;
+        }
+        let resp = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        )
+        .into_response();
+        assert!(resp.ok, "operator must succeed: {:?}", resp.error);
+        let sessions = resp.result.expect("result body");
+        let arr = sessions.as_array().expect("array");
+        let row = |uid: &str| -> serde_json::Value {
+            arr.iter()
+                .find(|s| s["session_uid"] == uid)
+                .unwrap_or_else(|| panic!("{} listed", uid))
+                .clone()
+        };
+        let joined = row("ts-joined");
+        assert_eq!(joined["workspace_id"], "ws-known");
+        assert_eq!(
+            joined["worktree_path"], "/tmp/wt-known",
+            "state.workspaces join wins over the row's own path",
+        );
+        let unregistered = row("ts-unregistered");
+        assert_eq!(unregistered["workspace_id"], "ws-unknown");
+        assert_eq!(
+            unregistered["worktree_path"], "/tmp/wt-fallback",
+            "row-carried path is the fallback when the workspace \
+             isn't in state.workspaces",
+        );
+    }
+
+    /// 5d back-compat: a pre-5d TUI pushes a snapshot with neither
+    /// `workspace_id` nor `worktree_path`. `#[serde(default)]` must land
+    /// them as null rather than rejecting the push, and the row must
+    /// still list (same shape as before, just pathless).
+    #[test]
+    fn list_sessions_tui_owned_row_without_workspace_fields_still_lists() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "tui.update_sessions_snapshot",
+                serde_json::json!({
+                    "sessions": [{
+                        "uid": "ts-legacy",
+                        "label": "legacy",
+                        "type": "claude-code",
+                    }],
+                }),
+            ),
+        )
+        .into_response();
+        assert!(resp.ok, "legacy push must be accepted: {:?}", resp.error);
+        let resp = dispatch_request(
+            &state,
+            &operator_request("list_sessions", serde_json::Value::Null),
+        )
+        .into_response();
+        let sessions = resp.result.expect("result body");
+        let arr = sessions.as_array().expect("array");
+        let row = arr
+            .iter()
+            .find(|s| s["session_uid"] == "ts-legacy")
+            .expect("legacy row listed");
+        assert!(row["workspace_id"].is_null());
+        assert!(row["worktree_path"].is_null());
+    }
+
     /// Sub-2a: `task_id` filter is honored. A session whose
     /// `task_id` is not the filter (nor a descendant in the
     /// task tree) is excluded. `include_exited` stays a no-op
@@ -8385,6 +8510,8 @@ mod tests {
                 workflow_run_id: Some(run_id.to_string()),
                 workflow_role: Some(role.to_string()),
                 global_perms: false,
+                workspace_id: None,
+                worktree_path: None,
             },
         );
     }

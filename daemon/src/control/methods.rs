@@ -2138,6 +2138,21 @@ pub fn list_sessions(
         if !should_include(uid, snap.task_id.as_deref()) {
             continue;
         }
+        // 5d: worktree_path for TUI-owned rows. Prefer the same join the
+        // daemon-owned loop does (`state.workspaces[ws].worktree_path`,
+        // kept current by the TUI's `task.update_tree` push) and fall
+        // back to the path the session row carries itself, so a
+        // workspace that hasn't reached `state.workspaces` yet (or was
+        // GC'd out of it) still reports a checkout. Without this an
+        // agent could not tell that a TUI-launched sibling shares its
+        // worktree — the "who else is editing my checkout?" question.
+        let worktree_path = snap
+            .workspace_id
+            .as_deref()
+            .and_then(|ws| state.workspaces.get(ws))
+            .and_then(|w| w.worktree_path.as_ref())
+            .map(|p| p.display().to_string())
+            .or_else(|| snap.worktree_path.clone());
         sessions.push(json!({
             "session_uid": uid,
             "label": snap.label.clone().unwrap_or_default(),
@@ -2147,13 +2162,15 @@ pub fn list_sessions(
             "managed_by_uid": Value::Null,
             // Task / workflow context from the TUI snapshot so the
             // grouped MCP view can place TUI-owned sessions under
-            // their task. `workspace_id` isn't carried in the
-            // snapshot (TUI-owned), so it's null here.
+            // their task. `workspace_id` / `worktree_path` ride the
+            // snapshot too (5d) — pre-5d pushes omit them and
+            // `#[serde(default)]` lands them as null, same as before.
             "task_id": snap.task_id,
-            "workspace_id": Value::Null,
+            "workspace_id": snap.workspace_id,
             "workflow_run_id": snap.workflow_run_id,
             "workflow_role": snap.workflow_role,
             "global_perms": snap.global_perms,
+            "worktree_path": worktree_path,
         }));
     }
     // Recently-exited sessions, included only when the caller opts in
@@ -18588,6 +18605,8 @@ mod tests {
                         workflow_run_id: Some("wf_different".into()),
                         workflow_role: Some("worker".into()),
                         global_perms: false,
+                        workspace_id: None,
+                        worktree_path: None,
                     },
                 );
             }
@@ -18863,6 +18882,8 @@ mod tests {
                         workflow_run_id: Some("wf_other_run".into()),
                         workflow_role: Some("manager".into()),
                         global_perms: false,
+                        workspace_id: None,
+                        worktree_path: None,
                     },
                 );
             }
