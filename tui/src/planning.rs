@@ -332,6 +332,68 @@ struct ProjectData {
 #[derive(Clone, Copy, PartialEq)]
 enum NewProjectField { Name, RepoUrl }
 
+/// Agent engine chosen in the planning launch dialogs (`A-l` / `A-f`).
+/// Claude is the default; `←/→` cycles. Only the two agent engines are
+/// offered — a planning launch always delivers the task prompt to an
+/// agent, so `bash` (the third session type elsewhere in the TUI) has
+/// no meaning here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LaunchEngine {
+    Claude,
+    Codex,
+}
+
+impl LaunchEngine {
+    /// Internal TUI session-type vocabulary (`"claude"` / `"codex"`) —
+    /// what `try_spawn_via_daemon` and `TerminalSession::session_type`
+    /// expect. NOT the public MCP wire form (`"claude-code"`).
+    pub fn as_session_type(self) -> &'static str {
+        match self {
+            LaunchEngine::Claude => "claude",
+            LaunchEngine::Codex => "codex",
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            LaunchEngine::Claude => LaunchEngine::Codex,
+            LaunchEngine::Codex => LaunchEngine::Claude,
+        }
+    }
+}
+
+impl Default for LaunchEngine {
+    fn default() -> Self {
+        LaunchEngine::Claude
+    }
+}
+
+/// The `Engine: [claude]  codex` row shared by both launch dialogs.
+/// Selected option is bracketed + bold so it reads at a glance in the
+/// same style as the other in-place cyclers (A-e color pickers).
+fn engine_line(engine: LaunchEngine) -> Line<'static> {
+    let dim = Style::default().fg(theme::DIM);
+    let mut spans = vec![Span::styled("  Engine: ", dim)];
+    for (i, opt) in [LaunchEngine::Claude, LaunchEngine::Codex].iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ", dim));
+        }
+        let is_sel = *opt == engine;
+        let label = if is_sel {
+            format!("[{}]", opt.as_session_type())
+        } else {
+            format!(" {} ", opt.as_session_type())
+        };
+        let style = if is_sel {
+            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::MUTED)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
 enum PlanInputMode {
     Normal,
     Editing,
@@ -354,8 +416,11 @@ enum PlanInputMode {
     ProjectPicker { selected: usize },
     /// Before LaunchConfirm: pick either "new workspace" or an existing one.
     /// Selected is an index into [NewWorkspace, ...workspace_candidates].
-    WorkspacePicker { project_idx: usize, task_idx: usize, selected: usize },
-    LaunchConfirm { project_idx: usize, task_idx: usize, branch_text: String },
+    /// `engine` is the agent to spawn (←/→ cycles); it rides through to
+    /// LaunchConfirm when "New workspace" is picked, so the choice is made
+    /// once regardless of which of the two launch routes is taken.
+    WorkspacePicker { project_idx: usize, task_idx: usize, selected: usize, engine: LaunchEngine },
+    LaunchConfirm { project_idx: usize, task_idx: usize, branch_text: String, engine: LaunchEngine },
 }
 
 /// An open workspace the planning view can offer as a launch target.
@@ -448,6 +513,9 @@ pub enum PlanAction {
         /// `true` when the branch field held the `.` sentinel: launch
         /// in-place in the main repo (no worktree, no branch).
         in_place: bool,
+        /// Agent to spawn into the new worktree (launch-dialog choice,
+        /// Claude by default).
+        engine: LaunchEngine,
     },
     /// Bind a task to an existing workspace and spawn a session there
     /// (no new worktree, no branch input).
@@ -468,6 +536,9 @@ pub enum PlanAction {
         /// the stub at the call site lands with the correct
         /// parent edge on first push.
         parent_task_id: Option<String>,
+        /// Agent to spawn into the existing workspace (picker
+        /// choice, Claude by default).
+        engine: LaunchEngine,
     },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
@@ -2478,12 +2549,13 @@ impl PlanningView {
     }
 
     fn handle_workspace_picker_event(&mut self, event: &CrosstermEvent) -> PlanAction {
-        let (project_idx, task_idx, mut selected) = match self.input_mode {
+        let (project_idx, task_idx, mut selected, mut engine) = match self.input_mode {
             PlanInputMode::WorkspacePicker {
                 project_idx,
                 task_idx,
                 selected,
-            } => (project_idx, task_idx, selected),
+                engine,
+            } => (project_idx, task_idx, selected, engine),
             _ => return PlanAction::Consumed,
         };
         let num_candidates = self.candidates_for(project_idx, task_idx).len();
@@ -2502,6 +2574,7 @@ impl PlanningView {
                         project_idx,
                         task_idx,
                         selected,
+                        engine,
                     };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -2510,11 +2583,24 @@ impl PlanningView {
                         project_idx,
                         task_idx,
                         selected,
+                        engine,
+                    };
+                }
+                // Engine picker: only two options, so either arrow
+                // toggles. j/k stay reserved for the workspace list.
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    engine = engine.cycle();
+                    self.input_mode = PlanInputMode::WorkspacePicker {
+                        project_idx,
+                        task_idx,
+                        selected,
+                        engine,
                     };
                 }
                 KeyCode::Enter => {
                     if selected == 0 {
-                        // Fall through to branch-input dialog (current flow).
+                        // Fall through to branch-input dialog (current flow),
+                        // carrying the engine picked here.
                         let branch_text = self.project_data[project_idx].tasks[task_idx]
                             .branch
                             .clone()
@@ -2523,6 +2609,7 @@ impl PlanningView {
                             project_idx,
                             task_idx,
                             branch_text,
+                            engine,
                         };
                     } else {
                         // Bind task to the selected existing workspace.
@@ -2555,6 +2642,7 @@ impl PlanningView {
                                     // initializes the local stub with
                                     // the correct edge.
                                     parent_task_id: task.parent_task_id.clone(),
+                                    engine,
                                 };
                             }
                         }
@@ -2568,9 +2656,9 @@ impl PlanningView {
 
     fn handle_launch_confirm_event(&mut self, event: &CrosstermEvent) -> PlanAction {
         if let CrosstermEvent::Key(key) = event {
-            let (project_idx, task_idx, mut branch_text) = match &self.input_mode {
-                PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text } => {
-                    (*project_idx, *task_idx, branch_text.clone())
+            let (project_idx, task_idx, mut branch_text, mut engine) = match &self.input_mode {
+                PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => {
+                    (*project_idx, *task_idx, branch_text.clone(), *engine)
                 }
                 _ => return PlanAction::Consumed,
             };
@@ -2610,17 +2698,24 @@ impl PlanningView {
                                 // Sub-2a Finding #2: see LaunchTaskIntoWorkspace.
                                 parent_task_id,
                                 in_place,
+                                engine,
                             };
                         }
                     }
                 }
+                // Branch is a free-text field, so the engine toggle can't
+                // use letters — arrows (unused by this dialog) and Tab do it.
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    engine = engine.cycle();
+                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
+                }
                 KeyCode::Backspace => {
                     branch_text.pop();
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text };
+                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
                 }
                 KeyCode::Char(c) => {
                     branch_text.push(c);
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text };
+                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
                 }
                 _ => {}
             }
@@ -3398,6 +3493,9 @@ impl PlanningView {
                 project_idx: pi,
                 task_idx: ti,
                 selected: 0,
+                // Fresh default per launch — the engine choice is
+                // deliberately not sticky.
+                engine: LaunchEngine::default(),
             };
         }
         PlanAction::Consumed
@@ -3723,8 +3821,8 @@ impl PlanningView {
             PlanInputMode::BulkArchiveConfirm { project_idx, count } => self.draw_bulk_archive_confirm(frame, area, *project_idx, *count),
             PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
-            PlanInputMode::WorkspacePicker { project_idx, task_idx, selected } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected),
-            PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text } => self.draw_launch_confirm(frame, area, *project_idx, *task_idx, branch_text),
+            PlanInputMode::WorkspacePicker { project_idx, task_idx, selected, engine } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected, *engine),
+            PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => self.draw_launch_confirm(frame, area, *project_idx, *task_idx, branch_text, *engine),
             _ => {}
         }
     }
@@ -4462,6 +4560,7 @@ impl PlanningView {
         project_idx: usize,
         task_idx: usize,
         selected: usize,
+        engine: LaunchEngine,
     ) {
         let task_name = self
             .project_data
@@ -4470,7 +4569,8 @@ impl PlanningView {
             .map(|t| t.title.as_str())
             .unwrap_or("?");
         let candidates = self.candidates_for(project_idx, task_idx);
-        let rows = 5 + candidates.len() as u16 + 2;
+        // +2 for the engine row and its blank separator.
+        let rows = 5 + candidates.len() as u16 + 2 + 2;
         let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
         let dialog = Rect::new(
             (area.width - w) / 2,
@@ -4523,8 +4623,10 @@ impl PlanningView {
             lines.push(row(&label, i + 1));
         }
         lines.push(Line::from(""));
+        lines.push(engine_line(engine));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  j/k navigate \u{00b7} Enter select \u{00b7} Esc cancel",
+            "  j/k navigate \u{00b7} \u{2190}/\u{2192} engine \u{00b7} Enter select \u{00b7} Esc cancel",
             Style::default().fg(theme::DIM),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
@@ -4553,12 +4655,13 @@ impl PlanningView {
         ]), inner);
     }
 
-    fn draw_launch_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, task_idx: usize, branch_text: &str) {
+    fn draw_launch_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, task_idx: usize, branch_text: &str, engine: LaunchEngine) {
         let task_name = self.project_data.get(project_idx)
             .and_then(|pd| pd.tasks.get(task_idx))
             .map(|t| t.title.as_str())
             .unwrap_or("?");
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 9u16);
+        // +2 rows for the engine line and its blank separator.
+        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 11u16);
         let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
         frame.render_widget(Clear, dialog);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
@@ -4587,7 +4690,9 @@ impl PlanningView {
                 Span::styled(branch_hint, Style::default().fg(theme::DIM)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("  Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
+            engine_line(engine),
+            Line::from(""),
+            Line::from(Span::styled("  \u{2190}/\u{2192} engine \u{00b7} Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 }
@@ -5157,6 +5262,7 @@ mod tests {
             project_idx: 0,
             task_idx: 0,
             branch_text: String::new(),
+            engine: LaunchEngine::Claude,
         };
         let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let action = view.handle_event(&enter);
@@ -5215,6 +5321,7 @@ mod tests {
             project_idx: 0,
             task_idx: 0,
             branch_text: String::new(),
+            engine: LaunchEngine::Claude,
         };
         let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let action = view.handle_event(&enter);
@@ -5277,6 +5384,7 @@ mod tests {
             project_idx: 0,
             task_idx: 0,
             branch_text: ".".to_string(),
+            engine: LaunchEngine::Claude,
         };
         match view.handle_event(&enter) {
             PlanAction::LaunchTask { in_place, branch, .. } => {
@@ -5292,12 +5400,179 @@ mod tests {
             project_idx: 0,
             task_idx: 0,
             branch_text: String::new(),
+            engine: LaunchEngine::Claude,
         };
         match view.handle_event(&enter) {
             PlanAction::LaunchTask { in_place, .. } => {
                 assert!(!in_place, "empty branch is not in-place");
             }
             other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    // ── Launch engine picker (claude | codex) ────────────────
+
+    /// Build a one-task planning view for the launch-dialog tests.
+    #[cfg(test)]
+    fn view_with_one_task() -> PlanningView {
+        let mut view = PlanningView::new();
+        let mut pd = make_project("repo", "git@example.com:org/repo.git");
+        pd.tasks.push(PlanTask {
+            id: "top-id".to_string(),
+            slug: "toplevel".to_string(),
+            title: "Top".to_string(),
+            status: PlanStatus::Backlog,
+            difficulty: None,
+            depends: vec![],
+            branch: None,
+            created: None,
+            description: String::new(),
+            prompt: String::new(),
+            source: "user".to_string(),
+            is_cloud: false,
+            repo_url: "git@example.com:org/repo.git".to_string(),
+            parent_task_id: None,
+            kind: "oneshot".to_string(),
+            worker_vm: None,
+            vm_project: None,
+            vm_zone: None,
+            run_key: None,
+            bt_label: None,
+        });
+        view.project_data.push(pd);
+        view.projects = view
+            .project_data
+            .iter()
+            .map(|pd| pd.project.clone())
+            .collect();
+        view
+    }
+
+    /// Default is Claude, and ←/→ toggles to Codex. The chosen engine
+    /// rides out on the `LaunchTask` action — the launch site spawns
+    /// that session_type instead of the old hardcoded "claude".
+    #[test]
+    fn launch_confirm_engine_defaults_claude_and_arrow_toggles() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
+
+        // Untouched → claude.
+        let mut view = view_with_one_task();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: String::new(),
+            engine: LaunchEngine::default(),
+        };
+        match view.handle_event(&key(KeyCode::Enter)) {
+            PlanAction::LaunchTask { engine, .. } => {
+                assert_eq!(engine, LaunchEngine::Claude, "default engine is claude");
+                assert_eq!(engine.as_session_type(), "claude");
+            }
+            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        // One → (or ←) → codex.
+        for toggle in [KeyCode::Right, KeyCode::Left, KeyCode::Tab] {
+            let mut view = view_with_one_task();
+            view.input_mode = PlanInputMode::LaunchConfirm {
+                project_idx: 0,
+                task_idx: 0,
+                branch_text: String::new(),
+                engine: LaunchEngine::default(),
+            };
+            view.handle_event(&key(toggle));
+            match view.handle_event(&key(KeyCode::Enter)) {
+                PlanAction::LaunchTask { engine, .. } => {
+                    assert_eq!(engine, LaunchEngine::Codex, "{:?} must select codex", toggle);
+                    assert_eq!(engine.as_session_type(), "codex");
+                }
+                other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
+            }
+        }
+    }
+
+    /// The engine toggle must not steal characters from the branch
+    /// field — it's a free-text input, so `h`/`l`/`j`/`k` are branch
+    /// name characters, not navigation.
+    #[test]
+    fn launch_confirm_letters_still_edit_branch_text() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: char| {
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+        };
+        let mut view = view_with_one_task();
+        view.input_mode = PlanInputMode::LaunchConfirm {
+            project_idx: 0,
+            task_idx: 0,
+            branch_text: String::new(),
+            engine: LaunchEngine::default(),
+        };
+        for c in "hjkl".chars() {
+            view.handle_event(&key(c));
+        }
+        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match view.handle_event(&enter) {
+            PlanAction::LaunchTask { branch, engine, .. } => {
+                assert_eq!(branch.as_deref(), Some("hjkl"));
+                assert_eq!(engine, LaunchEngine::Claude, "letters must not cycle engine");
+            }
+            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// The picker's engine choice survives the hop into the branch
+    /// dialog ("New workspace" route) — the operator picks once.
+    #[test]
+    fn workspace_picker_engine_rides_into_launch_confirm() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        let mut view = view_with_one_task();
+        view.input_mode = PlanInputMode::WorkspacePicker {
+            project_idx: 0,
+            task_idx: 0,
+            selected: 0,
+            engine: LaunchEngine::default(),
+        };
+        view.handle_event(&key(KeyCode::Right));
+        view.handle_event(&key(KeyCode::Enter));
+        match view.input_mode {
+            PlanInputMode::LaunchConfirm { engine, .. } => {
+                assert_eq!(engine, LaunchEngine::Codex, "engine carries into LaunchConfirm");
+            }
+            _ => panic!("expected LaunchConfirm after selecting 'New workspace'"),
+        }
+    }
+
+    /// The existing-workspace route honors the picker's engine too, so
+    /// both launch paths can start a codex worker.
+    #[test]
+    fn workspace_picker_engine_rides_into_existing_workspace_launch() {
+        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        let mut view = view_with_one_task();
+        view.set_workspace_candidates(vec![WorkspaceCandidate {
+            workspace_id: "ws-1".to_string(),
+            name: "repo-toplevel".to_string(),
+            repo_url: Some("https://example.com/org/repo.git".to_string()),
+        }]);
+        view.input_mode = PlanInputMode::WorkspacePicker {
+            project_idx: 0,
+            task_idx: 0,
+            // 0 is "New workspace"; 1 is the candidate above.
+            selected: 1,
+            engine: LaunchEngine::default(),
+        };
+        view.handle_event(&key(KeyCode::Right));
+        match view.handle_event(&key(KeyCode::Enter)) {
+            PlanAction::LaunchTaskIntoWorkspace { engine, workspace_id, .. } => {
+                assert_eq!(workspace_id, "ws-1");
+                assert_eq!(engine, LaunchEngine::Codex);
+            }
+            other => panic!(
+                "expected LaunchTaskIntoWorkspace, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -6173,3 +6448,4 @@ mod tests {
         assert_eq!(view.search_matches, vec!["a", "b"], "stale ID must drop out");
     }
 }
+

@@ -115,6 +115,15 @@ Planning view:
 - `A-e` edit, `A-n` new, `A-N` new subtask of focused task (persists `parent_task_id` on the API row; same input form as `A-n` with the parent name shown for confirmation; worktree mode defaults to `inherit`), `A-a` accept (claim claude-proposed task), `A-i` insert header (bold-text section label), `A-A` bulk-archive done tasks in current project (with confirm), `A-V` toggle archived task visibility, `A-s/S` cycle status, `A-f` launch (cloud), `A-g` grid/linear toggle, `Space` toggle subtask fold on focused parent
 - `A-w` — **watch a cloud backtest** (only on a `kind=backtest` task): spawns a local, READ-ONLY terminal view of the worker VM's tmux (the pipeline runs in a root-owned tmux named `backtest`), rendered like any other session and switched to in the Sessions view. Runs `gcloud compute ssh <worker_vm> --project <metadata.vm.project> --zone <metadata.vm.zone> -- -t "TERM=xterm-256color sudo sh -c '…wait for the backtest session then exec tmux attach -r -t backtest…'"` — the `-r` makes the attach read-only so watching can never disturb the run. It waits (bounded ~120s) for the session because `worker_vm`/`ttyd_url` are stamped at VM-CREATE time, before the in-VM startup has created the tmux — so hitting `A-w` the instant a VM appears would otherwise race the session and get an immediate "no sessions" exit. **The VM's project comes from `metadata.vm.project`, NOT the CM default project** (backtest VMs run in `prediction-market-scalper`). Direct SSH by default (the backtest project's firewall already allows tcp:22); set `CM_BACKTEST_SSH_IAP=1` to route through `--tunnel-through-iap` if your network blocks outbound port 22. On a non-backtest task, or a backtest not yet dispatched (no `worker_vm`), `A-w` shows a status-line hint instead of spawning; if the VM is already gone the ssh fails and the session exits cleanly.
 
+The `A-f` launch dialogs (the "Launch Into" workspace picker and the
+"Launch Task" branch prompt) carry an **Engine** field — `claude`
+(default) or `codex` — cycled with `←`/`→`/`Tab`. The choice is picked
+once in the workspace picker and rides into the branch dialog, so both
+launch routes (new worktree / existing workspace) spawn the chosen
+agent. It resets to `claude` on every launch (not sticky). The
+equivalent for agent-driven launches is `start_session(type="codex")`,
+which the MCP already supported.
+
 The grid renders subtasks as an indented tree under each parent in
 the parent's column. Subtasks are hidden from their own raw column
 position when their parent is in the same project — `cursor.row`

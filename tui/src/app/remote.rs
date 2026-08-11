@@ -1735,7 +1735,9 @@ mod remote_reconnect_tests {
         ws.sessions.clear();
         app.workspaces.push(ws);
 
-        app.launch_into_workspace("ws-mgr", "task-1", "Title", "https://repo", "proj", "do x", None);
+        app.launch_into_workspace(
+            "ws-mgr", "task-1", "Title", "https://repo", "proj", "do x", None, "claude",
+        );
 
         let (msg, _) = app.status_msg.clone().expect("a status message was set");
         assert!(

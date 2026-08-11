@@ -3796,6 +3796,11 @@ impl App {
         // sentinel: run in the main repo in-place (no worktree, no
         // `cm/<slug>` branch).
         in_place: bool,
+        // Agent engine picked in the launch dialog — internal
+        // session-type vocabulary ("claude" | "codex"). Defaults to
+        // "claude" in the UI; never "bash" (a planning launch always
+        // delivers the task prompt to an agent).
+        engine: &str,
     ) {
         // Planning A-l creates a local worktree + spawns a session into it, so
         // the host is local (the global active_host is retired —
@@ -3854,13 +3859,20 @@ impl App {
         // state.tui_sessions.
         let session_uid = new_session_uid();
         let workspace_id_pre = new_workspace_id();
-        let pending = Self::list_jsonl_files(&worktree_path);
+        // Transcript-detection baseline is engine-specific: Claude writes
+        // ~/.claude/projects/<encoded>/*.jsonl, Codex ~/.codex/sessions/…
+        // Taking the wrong one leaves the session without a transcript id.
+        let pending = if engine == "codex" {
+            Self::list_codex_sessions(&worktree_path)
+        } else {
+            Self::list_jsonl_files(&worktree_path)
+        };
 
         let new_sess = match self.try_spawn_via_daemon(
             &session_uid,
             &workspace_id_pre,
             &worktree_path,
-            "claude",
+            engine,
             slug,
             None,
             cols,
@@ -3879,9 +3891,10 @@ impl App {
                 return;
             }
             None => {
-                self.set_status_msg(
-                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
-                );
+                self.set_status_msg(&format!(
+                    "Internal: try_spawn_via_daemon returned None for daemon-eligible '{}'",
+                    engine,
+                ));
                 return;
             }
         };
@@ -3900,7 +3913,7 @@ impl App {
         let mut ts = make_simple_session_with_uid(
             session_uid,
             slug,
-            "claude",
+            engine,
             new_sess,
             Some(pending),
         );
@@ -4021,8 +4034,9 @@ impl App {
             .collect()
     }
 
-    /// Spawn a new Claude session in an existing workspace and bind the
-    /// given task to it. No new worktree — the workspace already has one.
+    /// Spawn a new agent session (`engine`: claude | codex) in an existing
+    /// workspace and bind the given task to it. No new worktree — the
+    /// workspace already has one.
     pub(super) fn launch_into_workspace(
         &mut self,
         workspace_id: &str,
@@ -4034,6 +4048,9 @@ impl App {
         // Sub-2a Finding #2: parent edge from the planning row.
         // See `launch_from_plan` for the full backstory.
         parent_task_id: Option<&str>,
+        // Agent engine picked in the workspace picker — internal
+        // session-type vocabulary ("claude" | "codex").
+        engine: &str,
     ) {
         // Planning A-l into an existing workspace → use THAT workspace's host
         // (not the global active_host — the old read mistagged a session when
@@ -4068,13 +4085,18 @@ impl App {
         // this, a session launched into an existing workspace can't call
         // any orchestration tool.
         let session_uid = new_session_uid();
-        let pending = Self::list_jsonl_files(&worktree_path);
+        // Engine-specific transcript baseline — see `launch_from_plan`.
+        let pending = if engine == "codex" {
+            Self::list_codex_sessions(&worktree_path)
+        } else {
+            Self::list_jsonl_files(&worktree_path)
+        };
         let workspace_id_owned = workspace_id.to_string();
         let new_sess = match self.try_spawn_via_daemon(
             &session_uid,
             &workspace_id_owned,
             &worktree_path,
-            "claude",
+            engine,
             task_title,
             None,
             cols,
@@ -4093,16 +4115,17 @@ impl App {
                 return;
             }
             None => {
-                self.set_status_msg(
-                    "Internal: try_spawn_via_daemon returned None for daemon-eligible 'claude'",
-                );
+                self.set_status_msg(&format!(
+                    "Internal: try_spawn_via_daemon returned None for daemon-eligible '{}'",
+                    engine,
+                ));
                 return;
             }
         };
         let mut ts = make_simple_session_with_uid(
             session_uid,
             task_title,
-            "claude",
+            engine,
             new_sess,
             Some(pending),
         );

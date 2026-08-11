@@ -2428,6 +2428,7 @@ impl App {
                     task_id,
                     parent_task_id,
                     in_place,
+                    engine,
                 } => {
                     self.launch_from_plan(
                         &project,
@@ -2438,6 +2439,7 @@ impl App {
                         &task_id,
                         parent_task_id.as_deref(),
                         in_place,
+                        engine.as_session_type(),
                     );
                     return true;
                 }
@@ -2449,6 +2451,7 @@ impl App {
                     project,
                     prompt,
                     parent_task_id,
+                    engine,
                 } => {
                     self.launch_into_workspace(
                         &workspace_id,
@@ -2458,6 +2461,7 @@ impl App {
                         &project,
                         &prompt,
                         parent_task_id.as_deref(),
+                        engine.as_session_type(),
                     );
                     return true;
                 }
