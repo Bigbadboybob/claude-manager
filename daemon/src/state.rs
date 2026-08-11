@@ -71,6 +71,43 @@ pub struct ExitedTombstone {
     /// caller, never the tombstone).
     pub global_perms: bool,
     pub exited_at: f64,
+    /// `true` when this exit followed an explicit kill request (the
+    /// `kill_session` RPC, or a daemon-internal kill that goes through
+    /// the same handler) rather than the agent finishing on its own.
+    ///
+    /// Recorded so consumers never present a killed session's last
+    /// transcript fragment as if it were the agent's final report — see
+    /// `mcp_server/async_monitor.py::_format_fire_message`.
+    pub killed: bool,
+    /// Who asked for the kill: the CALLER session's uid when an agent
+    /// called `kill_session`, `"operator"` on the operator route (the
+    /// TUI's A-w, `resolve_stuck`, the scheduler's watchdog). `None`
+    /// when `killed` is false, or when the kill came in through a path
+    /// that didn't record provenance (a bare `session.kill()` outside
+    /// the `kill_session` handler) — `killed` can still be true there,
+    /// derived from the exit probe's operator-kill flag.
+    pub killed_by: Option<String>,
+}
+
+/// Bound on [`DaemonState::kill_requests`]. A request is normally
+/// consumed within milliseconds (the reaper's `handle_session_exit`
+/// takes it while building the tombstone), so anything still resident
+/// past this bound is a leak — a kill whose session never reached the
+/// reaper callback.
+pub const KILL_REQUEST_CAP: usize = 256;
+
+/// Provenance of an in-flight kill: WHO asked for a session to die,
+/// stamped at `kill_session` time. The exit tombstone is built later
+/// (asynchronously, on the reaper's `on_exit` callback), by which point
+/// the requester is long gone from the call stack — this ledger carries
+/// the attribution across that gap.
+#[derive(Clone, Debug)]
+pub struct KillRequest {
+    /// Caller session uid, or `"operator"` for the operator route.
+    pub killed_by: String,
+    /// Unix seconds when the kill was requested. Used only for the
+    /// bounded-eviction order.
+    pub requested_at: f64,
 }
 
 /// Sub-2b-3 review-5 #1: per-worktree FIFO sequence queue.
@@ -327,6 +364,13 @@ pub struct DaemonState {
     /// [`RECENTLY_EXITED_CAP`]. Front = oldest. Recorded via
     /// [`DaemonState::record_exited`].
     pub recently_exited: VecDeque<ExitedTombstone>,
+    /// Pending kill attributions, keyed by target session uid. Written
+    /// by the `kill_session` handler under the state lock BEFORE the
+    /// SIGKILL's exit can be observed; consumed by `handle_session_exit`
+    /// (which holds the same lock) when it builds the
+    /// [`ExitedTombstone`]. Bounded by [`KILL_REQUEST_CAP`]. See
+    /// [`DaemonState::record_kill_request`].
+    pub kill_requests: HashMap<String, KillRequest>,
     /// Snapshot of the persisted manifest's workspaces, keyed by
     /// stable workspace id. Loaded at daemon startup via
     /// [`load_manifest_from_disk`](Self::load_manifest_from_disk).
@@ -634,6 +678,7 @@ impl Default for DaemonState {
         Self {
             sessions: HashMap::new(),
             recently_exited: VecDeque::new(),
+            kill_requests: HashMap::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
             daemon_sessions_path: None,
@@ -674,6 +719,46 @@ impl DaemonState {
         while self.recently_exited.len() > RECENTLY_EXITED_CAP {
             self.recently_exited.pop_front();
         }
+    }
+
+    /// Stamp who requested a session's kill, so the tombstone built later
+    /// (on the reaper's exit callback) can attribute the exit. A repeat
+    /// request for the same uid overwrites — the most recent requester is
+    /// the one whose SIGKILL is in flight.
+    ///
+    /// Bounded: past [`KILL_REQUEST_CAP`] the oldest half is dropped by
+    /// `requested_at`. Entries are normally removed by
+    /// [`Self::take_kill_request`] milliseconds later, so eviction only
+    /// ever touches leaked rows (a kill whose exit was never observed).
+    pub fn record_kill_request(&mut self, uid: &str, killed_by: &str, requested_at: f64) {
+        if self.kill_requests.len() >= KILL_REQUEST_CAP
+            && !self.kill_requests.contains_key(uid)
+        {
+            let mut by_age: Vec<(String, f64)> = self
+                .kill_requests
+                .iter()
+                .map(|(u, r)| (u.clone(), r.requested_at))
+                .collect();
+            // Newest first, then drop everything past the halfway mark.
+            by_age.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (stale, _) in by_age.into_iter().skip(KILL_REQUEST_CAP / 2) {
+                self.kill_requests.remove(&stale);
+            }
+        }
+        self.kill_requests.insert(
+            uid.to_string(),
+            KillRequest {
+                killed_by: killed_by.to_string(),
+                requested_at,
+            },
+        );
+    }
+
+    /// Consume a pending kill attribution for `uid` (see
+    /// [`Self::record_kill_request`]). Removing rather than reading keeps
+    /// the ledger from accumulating rows for sessions that already exited.
+    pub fn take_kill_request(&mut self, uid: &str) -> Option<KillRequest> {
+        self.kill_requests.remove(uid)
     }
 
     /// Look up a recently-exited session's tombstone by uid.
@@ -1016,7 +1101,45 @@ mod tests {
             worktree_path: None,
             global_perms: false,
             exited_at: 0.0,
+            killed: false,
+            killed_by: None,
         }
+    }
+
+    /// The kill ledger carries "who asked" from the `kill_session` handler
+    /// to the reaper callback that builds the tombstone, and `take_` is a
+    /// consume (a second read finds nothing).
+    #[test]
+    fn kill_request_round_trips_and_is_consumed_once() {
+        let mut s = DaemonState::default();
+        s.record_kill_request("ts-a", "ts-caller", 100.0);
+        let taken = s.take_kill_request("ts-a").expect("attribution recorded");
+        assert_eq!(taken.killed_by, "ts-caller");
+        assert_eq!(taken.requested_at, 100.0);
+        assert!(s.take_kill_request("ts-a").is_none(), "consumed once");
+        // Most recent requester wins for a repeat request.
+        s.record_kill_request("ts-b", "ts-first", 1.0);
+        s.record_kill_request("ts-b", "operator", 2.0);
+        assert_eq!(s.take_kill_request("ts-b").unwrap().killed_by, "operator");
+    }
+
+    /// Leaked rows (a kill whose exit was never observed) can't grow the
+    /// ledger without bound; the newest entry always survives the prune.
+    #[test]
+    fn kill_requests_are_bounded_and_keep_the_newest() {
+        let mut s = DaemonState::default();
+        for i in 0..(KILL_REQUEST_CAP + 10) {
+            s.record_kill_request(&format!("ts-{i:04}"), "operator", i as f64);
+        }
+        assert!(
+            s.kill_requests.len() <= KILL_REQUEST_CAP,
+            "ledger bounded, got {}",
+            s.kill_requests.len()
+        );
+        assert!(
+            s.take_kill_request(&format!("ts-{:04}", KILL_REQUEST_CAP + 9)).is_some(),
+            "newest request retained",
+        );
     }
 
     #[test]

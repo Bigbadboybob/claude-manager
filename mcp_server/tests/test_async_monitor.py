@@ -623,5 +623,112 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(fp("claude-code", self.path), "u-123")
 
 
+class FireMessageFormatTests(unittest.TestCase):
+    """UX 3b/3c: the wake-up text must say HOW a session finished. A
+    killed session must never have its transcript tail rendered in the
+    `- <uid> (<status>): <content>` slot, where it reads as a final
+    report; interim-looking fires must be flagged as interim."""
+
+    RECORD = {"monitor_id": "m-1", "note": ""}
+
+    def _format(self, entry: dict, still: list[str] | None = None) -> str:
+        return async_monitor._format_fire_message(
+            dict(self.RECORD),
+            {"completed": [entry], "still_running": still or []},
+        )
+
+    def test_killed_entry_labels_killer_and_fragment(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "exited", "state": "exited",
+            "idle": True, "killed": True, "killed_by": "ts-boss",
+            "exited_at": 1_700_000_000.0,
+            "last_message": {"content": "I was in the middle of"},
+        })
+        self.assertIn(
+            "- ts-w (killed by ts-boss at 2023-11-14T22:13:20Z)", text
+        )
+        self.assertIn(
+            "last transcript fragment before kill: I was in the middle of",
+            text,
+        )
+        # The fragment must NOT sit in the "final reply" slot.
+        self.assertNotIn("- ts-w (exited): I was in the middle of", text)
+
+    def test_killed_without_killer_or_timestamp_still_says_killed(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "exited", "state": "exited",
+            "idle": True, "killed": True, "last_message": None,
+        })
+        self.assertIn("- ts-w (killed)", text)
+
+    def test_transcript_idle_flags_live_pty(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "awaiting_input",
+            "state": "ready", "idle": False, "idle_source": "transcript",
+            "last_message": {"content": "done-ish"},
+        })
+        self.assertIn("- ts-w (awaiting_input): done-ish", text)
+        self.assertIn("PTY still active", text)
+
+    def test_idle_but_alive_flags_possible_interim_turn(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "awaiting_input",
+            "state": "ready", "idle": True,
+            "last_message": {"content": "here's a thought"},
+        })
+        self.assertIn("no explicit done-report", text)
+
+    def test_all_exited_batch_does_not_claim_workers_await_input(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "exited", "state": "exited",
+            "idle": True, "killed": True, "killed_by": "operator",
+            "last_message": None,
+        })
+        self.assertIn("have EXITED", text)
+        self.assertNotIn("are now awaiting input", text)
+
+    def test_live_completer_keeps_the_orchestration_trailer(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "awaiting_input",
+            "state": "ready", "idle": True, "last_message": None,
+        })
+        self.assertIn("awaiting input", text)
+
+    def test_exited_completer_never_declares_live_siblings_gone(self):
+        # mode="any" returns on the FIRST completion. When that completer
+        # is a corpse but other watched sessions are still running, the
+        # trailer must not tell the orchestrator everything has EXITED —
+        # it would abandon workers listed as running one line above.
+        text = self._format({
+            "session_uid": "ts-a", "status": "exited", "state": "exited",
+            "idle": True, "killed": True, "killed_by": "operator",
+            "last_message": None,
+        }, still=["ts-b", "ts-c"])
+        self.assertIn("Still running: ts-b, ts-c", text)
+        self.assertNotIn("watched session(s) have EXITED", text)
+        self.assertNotIn("start a fresh session", text)
+        # …and it must not claim the corpse is awaiting input either.
+        self.assertNotIn("are now awaiting input", text)
+        self.assertIn("NO LONGER WATCHED", text)
+
+    def test_live_completer_with_siblings_keeps_orchestration_trailer(self):
+        text = self._format({
+            "session_uid": "ts-a", "status": "awaiting_input",
+            "state": "ready", "idle": True, "last_message": None,
+        }, still=["ts-b"])
+        self.assertIn("Still running: ts-b", text)
+        self.assertIn("are now awaiting input", text)
+        self.assertNotIn("EXITED", text)
+
+    def test_plain_exit_is_not_flagged_interim_or_killed(self):
+        text = self._format({
+            "session_uid": "ts-w", "status": "exited", "state": "exited",
+            "idle": True, "last_message": {"content": "all finished"},
+        })
+        self.assertIn("- ts-w (exited): all finished", text)
+        self.assertNotIn("killed", text)
+        self.assertNotIn("no explicit done-report", text)
+
+
 if __name__ == "__main__":
     unittest.main()

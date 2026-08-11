@@ -1130,12 +1130,25 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // contract). Resolve the worktree from the workspace (the session itself
     // doesn't carry it). Built here, recorded after the existing last_exit /
     // broadcast steps so it lands under the same lock as the remove.
+    // Kill provenance (UX item 3b): who asked for this session to die, stamped
+    // by `kill_session` under this same lock before the SIGKILL. Consumed here
+    // so the tombstone — and every reader downstream of it (list_sessions,
+    // resolve_authorized_session, the MCP monitors' fire messages) — can say
+    // "killed by X" instead of presenting the truncated last transcript
+    // fragment as if it were the agent's final report.
+    let kill_request = state.take_kill_request(uid);
     let tombstone = state.sessions.get(uid).map(|sess| {
         let worktree_path = state
             .workspaces
             .get(&sess.workspace_id)
             .and_then(|w| w.worktree_path.as_ref())
             .map(|p| p.to_string_lossy().into_owned());
+        // `operator_kill_requested` is the broader signal: it is also set by
+        // kill paths that don't route through `kill_session` (mark_subtask_done's
+        // session sweep), which record no attribution. So `killed` can be true
+        // with `killed_by` unknown.
+        let killed =
+            kill_request.is_some() || sess.last_exit.operator_kill_requested();
         crate::state::ExitedTombstone {
             session_uid: uid.to_string(),
             transcript_path: sess.transcript_path.clone(),
@@ -1150,6 +1163,8 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             worktree_path,
             global_perms: sess.global_perms,
             exited_at,
+            killed,
+            killed_by: kill_request.as_ref().map(|k| k.killed_by.clone()),
         }
     });
     // Continuous Tasks Phase 3b completion signal (b): capture this session's
@@ -1306,9 +1321,10 @@ fn is_valid_session_type(session_type: &str) -> bool {
 /// session. The migration moves every spawn site to the daemon
 /// (workflow respawn, manifest restore, A-l resume, etc.), so
 /// no production session is "TUI-owned" anymore — the branch is
-/// unreachable. The `state` parameter is kept (Option) to
-/// preserve the call shape; callers may pass `None` if they
-/// don't have state at hand.
+/// unreachable. The `state` parameter is kept (Option) and is now
+/// read again for the UX item 5b tombstone lookup on
+/// `TargetNotInRegistry`; callers may still pass `None` if they
+/// don't have state at hand (they just get the generic message).
 fn return_auth_error_if_denied_with_state(
     decision: crate::control::auth::AuthDecision,
     caller_uid: &str,
@@ -1316,7 +1332,6 @@ fn return_auth_error_if_denied_with_state(
     state: Option<&DaemonState>,
 ) -> MethodResult {
     use crate::control::auth::AuthDecision;
-    let _ = state;
     match decision {
         AuthDecision::Allow => Ok(Value::Null),
         AuthDecision::CallerNotInRegistry => Err((
@@ -1326,9 +1341,21 @@ fn return_auth_error_if_denied_with_state(
                 caller_uid
             ),
         )),
+        // UX item 5b (session-caller path): a session-caller's
+        // `kill_session` / `send_input` against an already-gone target
+        // fails HERE, in auth, before the handler's own registry lookup —
+        // `check_session_caller` only walks live sessions. Same fix as the
+        // operator path: when the read-after-exit tombstone is still around
+        // say what actually happened instead of "not in the daemon
+        // registry" (which reads as "bad uid"). Auth semantics are
+        // untouched — this is the message only, on a decision already made.
         AuthDecision::TargetNotInRegistry => Err((
             ErrorCode::NotFound,
-            format!("target session '{}' not in the daemon registry", target_uid),
+            state
+                .and_then(|s| already_exited_message(s, target_uid))
+                .unwrap_or_else(|| {
+                    format!("target session '{}' not in the daemon registry", target_uid)
+                }),
         )),
         AuthDecision::OutOfScope => Err((
             ErrorCode::Unauthorized,
@@ -1621,28 +1648,105 @@ pub fn kill_session(
     // diff, and finally removes from `state.sessions`. Now
     // operator-kill and cap-kill share the same exit-diff path —
     // the UI sees a `ManifestDiff::Exited` frame for both.
-    let session = match state.sessions.get_mut(&p.session_uid) {
-        Some(s) => s,
-        None => {
-            return Err((
-                ErrorCode::NotFound,
-                format!("session '{}' not in daemon registry", p.session_uid),
-            ));
-        }
-    };
-    // Slice 10d watcher-fix #4: mark the operator-kill flag on
-    // the session's `LastExitProbe` BEFORE the SIGKILL goes
-    // out. The probe's flag is read at End-frame snapshot time
-    // and joined with `kill_status` + signal in `is_cap_kill`
-    // so a transient `protected`/`no_pids` record past baseline
-    // doesn't render as a cap kill on a user-initiated A-w.
-    session.last_exit.mark_operator_kill_requested();
-    // SIGKILL via pidfd. Errors are best-effort: ESRCH means the
-    // child already exited (race with the watcher / natural
-    // exit) — reaper will still see the exit and fire on_exit.
-    let _ = session.kill();
+    {
+        let session = match state.sessions.get_mut(&p.session_uid) {
+            Some(s) => s,
+            None => {
+                // UX item 5b: "not in daemon registry" reads as "bad uid" and
+                // sends the caller hunting for a typo. When we still hold the
+                // read-after-exit tombstone we KNOW what happened — the
+                // session already exited (often the caller's own earlier
+                // kill, or a natural exit that raced this call). Say so, and
+                // keep the `not_found` CODE for wire compat.
+                let msg = already_exited_message(&state, &p.session_uid).unwrap_or_else(
+                    || format!("session '{}' not in daemon registry", p.session_uid),
+                );
+                return Err((ErrorCode::NotFound, msg));
+            }
+        };
+        // Slice 10d watcher-fix #4: mark the operator-kill flag on
+        // the session's `LastExitProbe` BEFORE the SIGKILL goes
+        // out. The probe's flag is read at End-frame snapshot time
+        // and joined with `kill_status` + signal in `is_cap_kill`
+        // so a transient `protected`/`no_pids` record past baseline
+        // doesn't render as a cap kill on a user-initiated A-w.
+        session.last_exit.mark_operator_kill_requested();
+        // SIGKILL via pidfd. Errors are best-effort: ESRCH means the
+        // child already exited (race with the watcher / natural
+        // exit) — reaper will still see the exit and fire on_exit.
+        let _ = session.kill();
+    }
+    // UX item 3b: stamp WHO asked, for `handle_session_exit` to fold into the
+    // exit tombstone. Recorded under the same lock the reaper's exit callback
+    // must take, so the attribution is always in place before the tombstone is
+    // built — however fast the child dies. `caller_uid == None` is the operator
+    // route (TUI A-w, `resolve_stuck`, the continuous scheduler's watchdog).
+    let killer = caller_uid.unwrap_or(OPERATOR_KILLER).to_string();
+    state.record_kill_request(&p.session_uid, &killer, now_unix_f64());
 
     Ok(json!({ "ok": true }))
+}
+
+/// Attribution recorded for a kill that came in on the OPERATOR route
+/// (no caller session): the TUI's A-w, `resolve_stuck`, the continuous
+/// scheduler's watchdog. Agent kills record the caller's session uid.
+pub(crate) const OPERATOR_KILLER: &str = "operator";
+
+/// Render a unix timestamp as `YYYY-MM-DDTHH:MM:SSZ`. The daemon has no
+/// date crate (see `daemon/Cargo.toml`), and the alternative — echoing a
+/// raw epoch float into an agent-facing error — is exactly the kind of
+/// unreadable diagnostic these UX items exist to remove.
+///
+/// Civil-from-days per Howard Hinnant's algorithm; valid for any date in
+/// the proleptic Gregorian calendar.
+///
+/// `pub` so the TUI's control-method twin renders its own
+/// already-exited message identically (see
+/// `tui/src/control/methods.rs::kill_session`).
+pub fn fmt_unix_utc(ts: f64) -> String {
+    let secs = ts.floor() as i64;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if mth <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, mth, d, h, m, s
+    )
+}
+
+/// UX item 5b: the "you're too late" message for a uid the live registry
+/// no longer holds but whose read-after-exit tombstone is still around.
+/// `None` when there's no tombstone (a genuinely unknown uid — the caller
+/// really does have a typo, and the generic message is correct).
+///
+/// Folds in the kill attribution when we have it, so a second kill against
+/// an already-killed session names the first killer rather than looking
+/// like an unexplained disappearance.
+pub(crate) fn already_exited_message(state: &DaemonState, uid: &str) -> Option<String> {
+    let tomb = state.exited_tombstone(uid)?;
+    let mut msg = format!(
+        "session '{}' already exited at {}",
+        uid,
+        fmt_unix_utc(tomb.exited_at)
+    );
+    if tomb.killed {
+        match tomb.killed_by.as_deref() {
+            Some(by) => msg.push_str(&format!(" (killed by {})", by)),
+            None => msg.push_str(" (killed)"),
+        }
+    }
+    Some(msg)
 }
 
 // ============================================================
@@ -2102,6 +2206,10 @@ pub fn list_sessions(
                 "workflow_run_id": tomb.workflow_run_id,
                 "workflow_role": tomb.workflow_role,
                 "worktree_path": tomb.worktree_path,
+                // UX item 3b: how it ended, not just that it ended.
+                "exited_at": tomb.exited_at,
+                "killed": tomb.killed,
+                "killed_by": tomb.killed_by,
             }));
         }
     }
@@ -2237,6 +2345,11 @@ pub fn resolve_authorized_session(
         // file is still on disk. Report state="exited" + the final transcript
         // path/generation so `read_session_output` serves the last output. An
         // exited session has no live PTY, so it is trivially idle.
+        //
+        // UX item 3b: `killed` / `killed_by` / `exited_at` ride along so a
+        // reader can tell "the agent finished and stopped" apart from "someone
+        // killed it mid-turn" — the MCP monitors label the transcript tail
+        // accordingly instead of presenting it as a final report.
         Ok(json!({
             "state": "exited",
             "engine": engine_str(&tomb.session_type),
@@ -2244,6 +2357,9 @@ pub fn resolve_authorized_session(
             "generation": tomb.generation,
             "idle": true,
             "semantic_idle": true,
+            "exited_at": tomb.exited_at,
+            "killed": tomb.killed,
+            "killed_by": tomb.killed_by.clone(),
         }))
     } else {
         Err((
@@ -16879,6 +16995,154 @@ mod tests {
         kill_all_sessions(&state);
     }
 
+    /// UX item 3b: an AGENT kill attributes the exit to the caller
+    /// session, and the attribution survives the async gap between the
+    /// handler and the reaper callback that builds the tombstone. Without
+    /// this the monitor fire message renders a killed worker's truncated
+    /// transcript tail as if it were the worker's final report.
+    #[test]
+    fn kill_session_by_agent_records_caller_on_the_exit_tombstone() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-killer", "ws-shared");
+        insert_session(&state, "ts-target", "ws-shared");
+        kill_session(
+            &state,
+            &json!({ "session_uid": "ts-target" }),
+            Some("ts-killer"),
+        )
+        .expect("must allow");
+        poll_until_session_removed(&state, "ts-target");
+
+        let s = state.lock().unwrap();
+        let tomb = s.exited_tombstone("ts-target").expect("tombstone recorded");
+        assert!(tomb.killed, "exit attributed as a kill");
+        assert_eq!(tomb.killed_by.as_deref(), Some("ts-killer"));
+        assert!(
+            !s.kill_requests.contains_key("ts-target"),
+            "ledger entry consumed when the tombstone was built",
+        );
+        drop(s);
+        kill_all_sessions(&state);
+    }
+
+    /// Same for the OPERATOR route (TUI A-w, resolve_stuck, the
+    /// continuous watchdog): `killed_by == "operator"`. And UX item 5b —
+    /// a SECOND kill against the now-gone uid says what actually happened
+    /// instead of "not in daemon registry" (which reads as a typo).
+    #[test]
+    fn kill_session_operator_route_attributes_and_second_kill_reports_already_exited() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-op-victim", "ws-shared");
+        kill_session(&state, &json!({ "session_uid": "ts-op-victim" }), None)
+            .expect("operator kill ok");
+        poll_until_session_removed(&state, "ts-op-victim");
+        {
+            let s = state.lock().unwrap();
+            let tomb = s.exited_tombstone("ts-op-victim").expect("tombstone");
+            assert!(tomb.killed);
+            assert_eq!(tomb.killed_by.as_deref(), Some(OPERATOR_KILLER));
+        }
+
+        let err = kill_session(&state, &json!({ "session_uid": "ts-op-victim" }), None)
+            .expect_err("already gone");
+        assert_eq!(err.0, ErrorCode::NotFound, "code kept for wire compat");
+        assert!(
+            err.1.contains("already exited at") && err.1.contains("killed by operator"),
+            "message must explain the miss: {}",
+            err.1,
+        );
+        kill_all_sessions(&state);
+    }
+
+    /// UX item 5b, session-caller path: the miss happens in AUTH
+    /// (`check_session_caller` only walks live sessions), so the fix has
+    /// to land at the decision-mapping site too. A genuinely unknown uid
+    /// still gets the generic message — there, "not in the registry" IS
+    /// the truth.
+    #[test]
+    fn kill_session_by_agent_on_exited_target_reports_already_exited() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-agent", "ws-shared");
+        insert_session(&state, "ts-gone", "ws-shared");
+        kill_session(&state, &json!({ "session_uid": "ts-gone" }), Some("ts-agent"))
+            .expect("first kill ok");
+        poll_until_session_removed(&state, "ts-gone");
+
+        let err = kill_session(
+            &state,
+            &json!({ "session_uid": "ts-gone" }),
+            Some("ts-agent"),
+        )
+        .expect_err("already gone");
+        assert_eq!(err.0, ErrorCode::NotFound);
+        assert!(
+            err.1.contains("already exited at") && err.1.contains("killed by ts-agent"),
+            "message must explain the miss: {}",
+            err.1,
+        );
+
+        let unknown = kill_session(
+            &state,
+            &json!({ "session_uid": "ts-never-existed" }),
+            Some("ts-agent"),
+        )
+        .expect_err("unknown uid");
+        assert_eq!(unknown.0, ErrorCode::NotFound);
+        assert!(
+            unknown.1.contains("not in the daemon registry"),
+            "no tombstone → generic message: {}",
+            unknown.1,
+        );
+        kill_all_sessions(&state);
+    }
+
+    /// The exit-provenance fields ride the read-after-exit surfaces the
+    /// MCP monitors actually read: `resolve_authorized_session` (the
+    /// monitor's per-poll resolve) and `list_sessions(include_exited)`.
+    #[test]
+    fn exited_surfaces_report_kill_provenance() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        insert_session(&state, "ts-surfaced", "ws-shared");
+        kill_session(&state, &json!({ "session_uid": "ts-surfaced" }), None)
+            .expect("kill ok");
+        poll_until_session_removed(&state, "ts-surfaced");
+
+        let resolved = resolve_authorized_session(
+            &state,
+            &json!({ "session_uid": "ts-surfaced" }),
+            None,
+        )
+        .expect("resolve exited");
+        assert_eq!(resolved["state"], "exited");
+        assert_eq!(resolved["killed"], true);
+        assert_eq!(resolved["killed_by"], "operator");
+        assert!(resolved["exited_at"].as_f64().unwrap_or(0.0) > 0.0);
+
+        let listed = list_sessions(&state, &json!({ "include_exited": true }), None)
+            .expect("list ok");
+        let row = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["session_uid"] == "ts-surfaced")
+            .expect("exited row present");
+        assert_eq!(row["state"], "exited");
+        assert_eq!(row["killed"], true);
+        assert_eq!(row["killed_by"], "operator");
+        kill_all_sessions(&state);
+    }
+
+    /// The UTC renderer behind the "already exited at <ts>" message —
+    /// the daemon has no date crate, so this is hand-rolled and worth a
+    /// pin (leap year + a known epoch).
+    #[test]
+    fn fmt_unix_utc_renders_iso_zulu() {
+        assert_eq!(fmt_unix_utc(0.0), "1970-01-01T00:00:00Z");
+        assert_eq!(fmt_unix_utc(1_700_000_000.0), "2023-11-14T22:13:20Z");
+        // 2024-02-29T12:00:00Z — leap day.
+        assert_eq!(fmt_unix_utc(1_709_208_000.0), "2024-02-29T12:00:00Z");
+    }
+
     /// Race-style: two threads call `kill_session` on the SAME
     /// target. Post-10e-a-r1-F2 the registry is mutated by the
     /// reaper-cleanup callback (asynchronously), not by
@@ -17495,6 +17759,8 @@ mod tests {
                 worktree_path: Some(wt.to_string_lossy().into_owned()),
                 global_perms: true,
                 exited_at: 1.0,
+                killed: false,
+                killed_by: None,
             });
         }
 
@@ -17623,6 +17889,8 @@ mod tests {
             worktree_path: Some(wt.to_string_lossy().into_owned()),
             global_perms: false,
             exited_at: 1.0,
+            killed: false,
+            killed_by: None,
         });
 
         revive_session(&state, &json!({ "uid": uid })).expect("revive ok");

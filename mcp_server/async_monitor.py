@@ -338,6 +338,81 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
         _log(f"{monitor_id}: monitor loop crashed: {e!r}")
 
 
+def _fmt_exit_ts(value) -> str | None:
+    """Render a unix timestamp the way the daemon does
+    (`YYYY-MM-DDTHH:MM:SSZ`), or None when there's nothing usable."""
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _entry_lines(entry: dict) -> list[str]:
+    """Render ONE completed session as fire-message lines.
+
+    Two UX rules live here:
+
+    3b — a KILLED session is announced as killed. Its transcript tail is
+    whatever it happened to be saying when the SIGKILL landed, so it is
+    printed on its own explicitly-labelled line, never in the
+    `- <uid> (<status>): <content>` slot where a reader (or a parsing
+    orchestrator) would take it for the worker's final report.
+
+    3c — a fire is flagged when it is not a confirmed completion:
+    transcript-derived idle (the PTY is still live, so background work
+    may be running), and idle-but-alive sessions generally (an agent
+    pausing between turns looks identical to one that finished).
+
+    Everything is APPEND-ONLY relative to the historical
+    `- <uid> (<status>): <content>` line — annotations are indented
+    continuation lines — so existing consumers keep parsing.
+    """
+    uid = entry.get("session_uid", "?")
+    status = entry.get("status", "?")
+    lm = entry.get("last_message") or {}
+    content = (lm.get("content") or "").strip()
+    if len(content) > _LAST_MESSAGE_CHARS:
+        content = (
+            content[:_LAST_MESSAGE_CHARS]
+            + f"… [truncated — read_last_turn('{uid}') for the rest]"
+        )
+
+    lines: list[str] = []
+    killed = bool(entry.get("killed"))
+    if killed:
+        killer = entry.get("killed_by")
+        when = _fmt_exit_ts(entry.get("exited_at"))
+        head = f"- {uid} (killed"
+        if killer:
+            head += f" by {killer}"
+        if when:
+            head += f" at {when}"
+        lines.append(head + ")")
+        if content:
+            lines.append(
+                f"  last transcript fragment before kill: {content}"
+            )
+    elif content:
+        lines.append(f"- {uid} ({status}): {content}")
+    else:
+        lines.append(f"- {uid} ({status})")
+
+    if entry.get("idle_source") == "transcript":
+        lines.append(
+            "  turn ended per transcript; PTY still active — background "
+            "work may still be running"
+        )
+    if not killed and entry.get("state") != "exited":
+        lines.append(
+            "  (no explicit done-report — this may be an interim turn, "
+            "not completion)"
+        )
+    return lines
+
+
 def _format_fire_message(record: dict, result: dict) -> str:
     """The text injected into the caller's session. Starts with the
     marker (also used for delivery verification)."""
@@ -351,28 +426,39 @@ def _format_fire_message(record: dict, result: dict) -> str:
             "The watch TIMED OUT before every watched session finished."
         )
     for entry in result.get("completed", []):
-        uid = entry.get("session_uid", "?")
-        status = entry.get("status", "?")
-        lm = entry.get("last_message") or {}
-        content = (lm.get("content") or "").strip()
-        if len(content) > _LAST_MESSAGE_CHARS:
-            content = (
-                content[:_LAST_MESSAGE_CHARS]
-                + f"… [truncated — read_last_turn('{uid}') for the rest]"
-            )
-        if content:
-            lines.append(f"- {uid} ({status}): {content}")
-        else:
-            lines.append(f"- {uid} ({status})")
+        lines.extend(_entry_lines(entry))
     still = result.get("still_running") or []
     if still:
         lines.append(f"Still running: {', '.join(still)}")
-    lines.append(
-        "(Async monitor notification. The completed worker(s) are now "
-        "awaiting input — continue orchestrating: read full output with "
-        "read_last_turn, send follow-ups with send_input, or finish up. "
-        "Prompting a worker again auto-registers a fresh monitor.)"
-    )
+    # Only claim the workers are at their prompt when at least one
+    # actually is: a batch of exited/killed sessions has nothing to send
+    # a follow-up to, and saying otherwise sends the orchestrator
+    # prompting a corpse. `still_running` is part of that judgement — a
+    # mode="any" fire whose first completer exited must NOT tell the
+    # orchestrator that the live siblings listed one line above are gone.
+    done = result.get("completed") or []
+    all_exited = bool(done) and all(e.get("state") == "exited" for e in done)
+    if all_exited and still:
+        lines.append(
+            "(Async monitor notification. The completed session(s) above "
+            "EXITED — there is no prompt left to send them follow-ups; "
+            "read what they left with read_last_turn. The still-running "
+            "session(s) are live but NO LONGER WATCHED — re-arm with "
+            "monitor_sessions to be woken when they finish.)"
+        )
+    elif all_exited:
+        lines.append(
+            "(Async monitor notification. The watched session(s) have "
+            "EXITED — there is no prompt left to send follow-ups to. Read "
+            "what they left with read_last_turn, or start a fresh session.)"
+        )
+    else:
+        lines.append(
+            "(Async monitor notification. The completed worker(s) are now "
+            "awaiting input — continue orchestrating: read full output with "
+            "read_last_turn, send follow-ups with send_input, or finish up. "
+            "Prompting a worker again auto-registers a fresh monitor.)"
+        )
     return "\n".join(lines)
 
 

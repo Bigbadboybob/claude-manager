@@ -588,6 +588,13 @@ def list_sessions(
          task_id, workspace_id, workflow_run_id, workflow_role,
          global_perms, continuous_task_id, worktree_path}
         state ∈ {"ready", "pending", "exited"}.
+        Exited rows (include_exited=true) additionally carry HOW they
+        ended: exited_at (unix seconds), killed (true when the exit
+        followed a kill request rather than the agent stopping on its
+        own), and killed_by (the session uid that called `kill_session`,
+        or "operator"). Use them before reading a dead session's tail —
+        a killed session's last message is wherever the SIGKILL cut it
+        off, not a conclusion.
         status ∈ {"starting", "working", "awaiting_input", "exited"} —
             the legible summary of (state, idle); branch on this instead
             of decoding the pair yourself. See the status legend on
@@ -1042,6 +1049,17 @@ def kill_session(session_uid: str) -> dict:
     """Close a session you can see. The PTY is torn down and a tombstone
     is recorded so `read_session_output` still works for the closed
     session's transcript.
+
+    The tombstone also records WHO killed it (you), so anything that
+    later reports on that session — `list_sessions(include_exited=true)`,
+    a monitor's wake-up message — says "killed by <your uid>" instead of
+    quoting the half-finished transcript tail as if it were the agent's
+    final report.
+
+    Errors: killing a session that is already gone returns `not_found`
+    with a message naming when it exited ("session '<uid>' already
+    exited at <ts>") rather than implying a bad uid. That is a no-op,
+    not a failure — the session you wanted closed is closed.
 
     Ask the user before calling. Killing a session is destructive —
     pending work in that agent stops.
@@ -2158,6 +2176,13 @@ async def wait_for_any_session_idle(
           status="error" and an `error` code, so a typo can't block the
           call forever. last_message is null for transcript-less sessions
           / when return_last_message is false.
+          An entry for an EXITED session also carries exited_at, killed
+          and killed_by when the daemon still holds its tombstone: when
+          killed is true, last_message is the fragment the transcript
+          happened to end on when the kill landed — NOT a final report.
+          `idle_source: "transcript"` means the turn boundary came from
+          the transcript while the PTY stayed busy, so background work
+          may still be running.
         - still_running: UIDs not yet finished — pass back to keep waiting.
         - timed_out: true if the deadline passed with nothing finished.
 
@@ -2198,6 +2223,17 @@ async def monitor_sessions(
     registering: END YOUR TURN (or keep doing unrelated work). Don't
     poll, don't call blocking `wait_*` tools, don't read the worker's
     output in a loop.
+
+    The wake-up message says HOW each session finished, so you don't
+    mistake an interruption for a conclusion:
+      - a killed session reads `- <uid> (killed by <who> at <ts>)`, and
+        any transcript text is labelled "last transcript fragment before
+        kill" instead of being quoted as its reply;
+      - a fire off transcript-shape idle notes the PTY is still active
+        (background work may still be running);
+      - an idle-but-alive session is flagged as possibly an interim
+        turn — the agent stopped talking, which is not the same as
+        reporting done.
 
     You rarely need to call this directly — `start_session` (with a
     prompt) and `send_input` auto-register a monitor per worker unless

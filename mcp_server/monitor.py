@@ -219,6 +219,15 @@ def _last_assistant(messages) -> dict | None:
     return None
 
 
+# Exit-provenance keys the daemon puts on an exited session's
+# `resolve_authorized_session` / `list_sessions(include_exited)` payload
+# (daemon tombstone, UX item 3b). Copied onto the completed entry so a
+# consumer can tell "the agent finished and stopped" apart from "someone
+# killed it mid-turn" — the difference between a final report and a
+# truncated fragment. See `async_monitor._format_fire_message`.
+_EXIT_PROVENANCE_KEYS = ("killed", "killed_by", "exited_at")
+
+
 def _monitor_completed_entry(
     uid: str,
     status: str,
@@ -228,10 +237,17 @@ def _monitor_completed_entry(
     transcript_path: str | None,
     generation: int,
     include_message: bool,
+    exit_meta: dict | None = None,
 ) -> dict:
     """Build a monitor completed-entry, reading the final assistant
     message off disk when asked. Sync (does file IO) — callers offload it
-    via asyncio.to_thread."""
+    via asyncio.to_thread.
+
+    `exit_meta` is the daemon's resolve payload for the session (or None
+    when it could no longer be resolved); its exit-provenance keys —
+    `killed` / `killed_by` / `exited_at` — are carried onto the entry when
+    present so the fire message can label a killed session as killed
+    instead of presenting its last transcript line as a final report."""
     last_message = None
     if include_message and transcript_path is not None:
         try:
@@ -239,13 +255,17 @@ def _monitor_completed_entry(
             last_message = _last_assistant(msgs)
         except OSError:
             last_message = None
-    return {
+    entry = {
         "session_uid": uid,
         "status": status,
         "state": state,
         "idle": idle,
         "last_message": last_message,
     }
+    for key in _EXIT_PROVENANCE_KEYS:
+        if exit_meta and exit_meta.get(key) is not None:
+            entry[key] = exit_meta[key]
+    return entry
 
 
 async def _monitor_sessions(
@@ -396,6 +416,7 @@ async def _monitor_sessions(
                     status_override or _session_status(state, idle),
                     state, idle,
                     engine, tpath, gen, return_last_message,
+                    resolved,
                 )
                 if status_override is not None:
                     # Surfaced for callers/debugging: the PTY was busy

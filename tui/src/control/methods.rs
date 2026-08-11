@@ -767,13 +767,47 @@ struct KillParams {
     session_uid: String,
 }
 
+/// UX item 5b: what to say when a target uid isn't a live session.
+/// `"not found"` alone reads as "bad uid" and sends the caller hunting
+/// for a typo, when the far likelier truth — one the TUI can prove,
+/// because it keeps a [`SessionTombstone`] per closed session — is that
+/// the session already exited. (The TUI records no kill attribution, so
+/// this says only WHEN it went; the daemon's twin also says who killed
+/// it.) The wire CODE stays `NotFound` either way.
+fn missing_session_message(workspaces: &[Workspace], uid: &str) -> String {
+    match find_tombstone(workspaces, uid) {
+        Some((wi, ti)) => format!(
+            "session '{}' already exited at {}",
+            uid,
+            cm_daemon::control::methods::fmt_unix_utc(
+                workspaces[wi].tombstones[ti].exited_at,
+            ),
+        ),
+        None => format!("session '{}' not found", uid),
+    }
+}
+
 pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
     let p: KillParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
     // Mutation — caller must be live, not tombstoned.
     let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
-    let (wi, si) = find_live_session(&app.workspaces, &p.session_uid)
-        .ok_or((ErrorCode::NotFound, "session_uid not found".into()))?;
+    // UX item 5b (TUI twin of the daemon's kill path): a bare
+    // "session_uid not found" reads as "bad uid" and sends the caller
+    // hunting for a typo, when the far likelier truth — one the TUI can
+    // prove, because it keeps a `SessionTombstone` per closed session —
+    // is that the session already exited. Same `NotFound` code, better
+    // sentence. (The TUI records no kill attribution, so this says only
+    // WHEN it went; the daemon's twin also says who killed it.)
+    let (wi, si) = match find_live_session(&app.workspaces, &p.session_uid) {
+        Some(loc) => loc,
+        None => {
+            return Err((
+                ErrorCode::NotFound,
+                missing_session_message(&app.workspaces, &p.session_uid),
+            ));
+        }
+    };
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
     if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
         return Err((
@@ -2444,6 +2478,28 @@ mod tests {
         let listed_type = public_session_type("claude"); // what list_sessions returns
         // Mirror start_session's accepted-types check:
         assert!(matches!(listed_type, "claude-code" | "codex"));
+    }
+
+    /// UX item 5b (TUI twin): killing a uid that already exited must say
+    /// so — "not found" alone reads as a typo. A uid with no tombstone
+    /// keeps the generic message, because there "not found" IS the truth.
+    #[test]
+    fn missing_session_message_distinguishes_exited_from_unknown() {
+        let mut tomb = make_tombstone("dead-uid");
+        tomb.exited_at = 1_700_000_000.0;
+        let workspaces = vec![workspace_with(vec![], vec![tomb])];
+
+        let exited = missing_session_message(&workspaces, "dead-uid");
+        assert!(
+            exited.contains("already exited at") && exited.contains("2023-11-14T22:13:20Z"),
+            "must name when it went: {exited}",
+        );
+
+        let unknown = missing_session_message(&workspaces, "never-existed");
+        assert!(
+            unknown.contains("not found") && !unknown.contains("already exited"),
+            "no tombstone → generic message: {unknown}",
+        );
     }
 
     #[test]

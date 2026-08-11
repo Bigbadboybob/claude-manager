@@ -245,6 +245,45 @@ class WaitForAnyTests(_SocketStubMixin, unittest.IsolatedAsyncioTestCase):
             res, {"completed": [], "still_running": [], "timed_out": False}
         )
 
+    async def test_exited_entry_carries_kill_provenance(self):
+        # UX 3b: the daemon puts killed / killed_by / exited_at on an
+        # exited session's resolve payload (from its tombstone). The
+        # completed entry must carry them through — that is what lets the
+        # fire message say "killed by X" instead of quoting the transcript
+        # tail as a final report.
+        def _call(method, params, *a, **k):
+            return {
+                "state": "exited", "idle": True, "engine": "claude-code",
+                "transcript_path": None, "generation": 0,
+                "semantic_idle": True,
+                "exited_at": 1_700_000_000.0,
+                "killed": True, "killed_by": "ts-orchestrator",
+            }
+
+        control_client.call = _call
+        res = await wait_for_any_session_idle(
+            ["ts-dead"], poll_interval_s=0.02, return_last_message=False
+        )
+        entry = res["completed"][0]
+        self.assertEqual(entry["status"], "exited")
+        self.assertTrue(entry["killed"])
+        self.assertEqual(entry["killed_by"], "ts-orchestrator")
+        self.assertEqual(entry["exited_at"], 1_700_000_000.0)
+
+    async def test_live_entry_has_no_kill_provenance_keys(self):
+        # A live session's resolve has no provenance keys; the entry must
+        # not sprout null ones (consumers branch on presence).
+        def _call(method, params, *a, **k):
+            return _ready(True, None)
+
+        control_client.call = _call
+        res = await wait_for_any_session_idle(
+            ["ts-live"], poll_interval_s=0.02, return_last_message=False
+        )
+        entry = res["completed"][0]
+        for key in ("killed", "killed_by", "exited_at"):
+            self.assertNotIn(key, entry)
+
 
 def _seq_stub(per_uid):
     """control_client.call replacement scripting resolve responses per uid;
