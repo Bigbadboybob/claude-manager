@@ -194,6 +194,17 @@ impl PtyModeTracker {
         enter_bytes_for_mode(self.term_mode())
     }
 
+    /// True once the inner program has enabled either of the modes a
+    /// kitty-TUI agent (claude-code / codex) turns on at startup —
+    /// kitty key disambiguation or bracketed paste. This is the
+    /// observable "the composer is up and reading input" signal the
+    /// fresh-spawn delivery path waits for instead of a fixed sleep
+    /// that a slow cold start outruns.
+    pub fn composer_ready(&self) -> bool {
+        let m = self.term_mode();
+        m.contains(TermMode::DISAMBIGUATE_ESC_CODES) || m.contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Whether the inner program currently has bracketed paste enabled.
     pub fn bracketed_paste(&self) -> bool {
         self.term_mode().contains(TermMode::BRACKETED_PASTE)
@@ -296,6 +307,26 @@ mod tests {
             !t.quiet_for(Duration::from_secs(2), Instant::now()),
             "replay must stamp a recent wakeup — not falsely quiet on first read"
         );
+    }
+
+    /// `composer_ready` is the fresh-spawn delivery gate: false on a raw
+    /// PTY (nothing enabled yet — the slow-cold-start window where a paste
+    /// + Enter would land in the void), true the moment EITHER startup
+    /// mode appears, in either order.
+    #[test]
+    fn composer_ready_flips_on_either_startup_mode() {
+        let base = Instant::now();
+
+        let mut t = PtyModeTracker::new();
+        assert!(!t.composer_ready(), "raw PTY: composer not ready");
+        t.feed(b"codex booting...\r\n", base);
+        assert!(!t.composer_ready(), "plain output alone must not arm it");
+        t.feed(b"\x1b[?2004h", base + Duration::from_millis(50));
+        assert!(t.composer_ready(), "bracketed paste alone suffices");
+
+        let mut t2 = PtyModeTracker::new();
+        t2.feed(b"\x1b[>1u", base);
+        assert!(t2.composer_ready(), "kitty disambiguation alone suffices");
     }
 
     /// `\x1b[?2004h` enables bracketed paste; `\x1b[>1u` pushes the kitty

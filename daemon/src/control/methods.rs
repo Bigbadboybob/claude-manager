@@ -1478,7 +1478,7 @@ pub fn send_input(
     // invariant in one place so future input paths can't skip
     // it. Also read the session_type so we can pick the right
     // SUBMIT encoding below (see the agent/bash branch).
-    let (handle, is_agent) = {
+    let (handle, fanout, is_agent) = {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Session-caller auth: under the same lock that does
         // the target lookup. Operator callers (`caller_uid:
@@ -1512,7 +1512,7 @@ pub fn send_input(
         }
         // claude-code / codex run a kitty-keyboard TUI; bash is a raw shell.
         let is_agent = session.session_type != "bash";
-        (session.input_handle(), is_agent)
+        (session.input_handle(), session.fanout.clone(), is_agent)
     };
 
     // SUBMIT encoding depends on the target's input mode:
@@ -1532,7 +1532,7 @@ pub fn send_input(
         // Input was delivered NOW — flip idle false synchronously even though
         // the PTY write is deferred to the delivery thread (which stamps too).
         handle.stamp_activity();
-        spawn_agent_prompt_delivery(handle, p.session_uid.clone(), p.text);
+        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false);
         Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
     } else {
         let mut payload = p.text.into_bytes();
@@ -6156,13 +6156,35 @@ struct McpStartSessionParams {
 /// kitty arm. (Verified: a bare `\n` submits neither agent's composer.)
 const AGENT_KITTY_ENTER: &[u8] = b"\x1b[13u";
 
-/// Wait after spawn before writing the prompt body, so the agent finishes
-/// enabling its kitty + bracketed-paste modes (codex enabled them ~1.3-1.8s
-/// post-startup in codex-tui.log; claude-code is similar). Held a bit above
-/// that for margin; this is the most likely value to need tuning if the
-/// prompt still doesn't submit on a slow cold-start — the delivery log line
-/// below reports the actual elapsed time to guide it.
+/// LIVE-target bound on the mode-await loop (send_input to an already-
+/// running agent): its startup escapes usually predate the fanout ring, so
+/// modes can't be observed — wait at most this long (the old fixed settle),
+/// then fall back to the assume-kitty encoding that is correct for every
+/// live agent.
 const AGENT_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// FRESH-SPAWN bound on the mode-await loop. A freshly spawned agent's
+/// startup escapes flow through the delivery thread's fanout subscription
+/// from t=0 (the replay seed covers any race), so the tracker OBSERVES the
+/// moment the composer is ready instead of guessing with a fixed sleep —
+/// the fixed 2.5s settle lost that race on slow cold starts and the body +
+/// kitty-Enter landed before the composer existed, leaving the prompt (and
+/// a literal `^[[13u`) sitting in the composer unsubmitted. The common
+/// case proceeds the moment the modes appear (~1-2s); this bound only
+/// caps pathological cold starts.
+const AGENT_MODE_WAIT_FRESH: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Poll cadence for the mode-await loop.
+const AGENT_MODE_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Small settle after the modes appear: the composer just initialized;
+/// give its first render loop a beat before pasting into it.
+const AGENT_POST_MODE_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Post-Enter verification window: a successful submit makes the agent
+/// redraw immediately (input echo + spinner). A PTY still quiet this long
+/// after the Enter means the submit didn't take — re-send Enter once.
+const AGENT_SUBMIT_VERIFY: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Gap between the body and the trailing Enter, so the agent consumes the
 /// paste and treats the Enter as a distinct keystroke (not paste tail).
@@ -6336,23 +6358,91 @@ fn agent_paste_payload(body: &str) -> Vec<u8> {
     }
 }
 
-/// Deliver a `start_session` prompt to a kitty-TUI agent (codex or
-/// claude-code) on a detached thread: settle, write the bracketed body,
-/// gap, write the kitty Enter. Async so `mcp_start_session` returns
-/// promptly (stays under the Python MCP 30s call timeout). The daemon
-/// can't read the agent's live terminal mode (no `Term`), so this assumes
-/// the modes codex/claude-code always enable; see the constants above.
-/// Write failures are logged, not fatal — the session is already
+/// Deliver a prompt to a kitty-TUI agent (codex or claude-code) on a
+/// detached thread: mode-await, write the body, gap, write Enter, verify.
+/// Async so callers return promptly (stays under the Python MCP 30s call
+/// timeout). Write failures are logged, not fatal — the session is already
 /// registered and the caller has its uid.
+///
+/// `fresh_spawn=true` (start_session prompt / continuous fresh-spawn
+/// fire): a tracker attached to the session's fanout sees the agent's
+/// startup escapes (the replay seed covers any race with this thread's
+/// start), so the delivery WAITS until the composer observably enabled
+/// its kitty/bracketed-paste modes — a fixed sleep lost that race on slow
+/// cold starts and the Enter landed before the composer existed. Body
+/// framing and the Enter encoding then come from the OBSERVED mode.
+///
+/// `fresh_spawn=false` (send_input to a live agent): the target's startup
+/// escapes usually predate the fanout ring, so the mode-await is bounded
+/// at the old settle and, when nothing was observed, the encoding falls
+/// back to assume-kitty — correct for every live agent (bash never comes
+/// here).
+///
+/// Either way, a post-Enter verification re-sends Enter once if the PTY
+/// stayed quiet (a real submit echoes + redraws immediately).
 fn spawn_agent_prompt_delivery(
     handle: crate::session::InputHandle,
+    fanout: std::sync::Arc<crate::session::PtyByteFanout>,
     session_uid: String,
     prompt: String,
+    fresh_spawn: bool,
 ) {
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
-            std::thread::sleep(AGENT_PROMPT_SETTLE);
+            use std::sync::mpsc::RecvTimeoutError;
+            use std::time::Instant;
+            // Own the fanout subscription for the life of THIS delivery
+            // rather than `spawn_for_fanout`'s background feeder: that
+            // feeder holds its receiver until the session exits, so a
+            // chatty orchestrator's repeated `send_input`s would strand
+            // one thread per call. Dropping `rx` when this thread ends
+            // lets the fanout's next push reap the slot.
+            let rx = fanout.subscribe();
+            let mut tracker =
+                crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
+            // Drain PTY bytes into the tracker for `dur`, so both the
+            // observed mode AND the wakeup stamps quiet-detection reads
+            // are current. Returns early only on producer death.
+            let mut drain_for = |tracker: &mut crate::workflow::pty_tracker::PtyModeTracker,
+                                 dur: std::time::Duration| {
+                let until = Instant::now() + dur;
+                loop {
+                    let now = Instant::now();
+                    if now >= until {
+                        return true;
+                    }
+                    match rx.recv_timeout(until - now) {
+                        Ok(chunk) => tracker.feed(&chunk, Instant::now()),
+                        Err(RecvTimeoutError::Timeout) => return true,
+                        Err(RecvTimeoutError::Disconnected) => return false,
+                    }
+                }
+            };
+            let wait = if fresh_spawn {
+                AGENT_MODE_WAIT_FRESH
+            } else {
+                AGENT_PROMPT_SETTLE
+            };
+            let started = Instant::now();
+            let deadline = started + wait;
+            let mut observed = false;
+            loop {
+                if tracker.composer_ready() {
+                    observed = true;
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                if !drain_for(&mut tracker, AGENT_MODE_POLL) {
+                    break; // producer gone (child exited)
+                }
+            }
+            let mode_wait_ms = started.elapsed().as_millis();
+            if observed {
+                drain_for(&mut tracker, AGENT_POST_MODE_SETTLE);
+            }
             await_operator_quiet(
                 &handle,
                 &session_uid,
@@ -6361,7 +6451,14 @@ fn spawn_agent_prompt_delivery(
                 OPERATOR_QUIET_MAX_DEFER,
             );
             let body = prompt.trim_end_matches(['\r', '\n']);
-            let payload = agent_paste_payload(body);
+            let payload = if observed {
+                crate::workflow::pty_tracker::format_body_for_delivery(
+                    body,
+                    tracker.term_mode(),
+                )
+            } else {
+                agent_paste_payload(body)
+            };
             let bracketed = payload.len() != body.len();
             if let Err(e) = handle.write_and_stamp(&payload) {
                 eprintln!(
@@ -6370,28 +6467,61 @@ fn spawn_agent_prompt_delivery(
                 );
                 return;
             }
-            std::thread::sleep(AGENT_ENTER_GAP);
-            if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
+            drain_for(&mut tracker, AGENT_ENTER_GAP);
+            // Re-read the mode at Enter time — it can complete during the
+            // gap (e.g. bracketed paste observed first, kitty a beat later).
+            let enter: &'static [u8] = if observed {
+                tracker.enter_bytes()
+            } else {
+                AGENT_KITTY_ENTER
+            };
+            if let Err(e) = handle.write_and_stamp(enter) {
                 eprintln!(
                     "cm-daemon: agent prompt Enter write failed for {}: {}",
                     session_uid, e
                 );
                 return;
             }
-            // Positive delivery log (the failure mode this fix targets is
+            // Verify: a successful submit echoes + redraws immediately, so a
+            // PTY still quiet a full verification window after the Enter
+            // means the submit didn't take (mode flipped inside the gap,
+            // byte swallowed mid-redraw, ...). Re-send Enter once with a
+            // freshly-read mode.
+            drain_for(&mut tracker, AGENT_SUBMIT_VERIFY);
+            let quiet = tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now());
+            let mut retried = false;
+            if quiet {
+                let enter2: &'static [u8] = if tracker.composer_ready() {
+                    tracker.enter_bytes()
+                } else {
+                    AGENT_KITTY_ENTER
+                };
+                retried = true;
+                if let Err(e) = handle.write_and_stamp(enter2) {
+                    eprintln!(
+                        "cm-daemon: agent prompt Enter retry write failed for {}: {}",
+                        session_uid, e
+                    );
+                    return;
+                }
+            }
+            // Positive delivery log (the failure mode this path exists for is
             // "writes succeed but the agent never submits" — invisible
-            // without this line). If the session stays `pending` after this
-            // logs, the bytes landed but the timing/encoding assumption was
-            // wrong (tune AGENT_PROMPT_SETTLE / the kitty sequence), rather
-            // than a write error or a missing delivery.
+            // without this line). `mode_observed=false` on a fresh spawn
+            // means the agent never enabled its modes inside the wait bound —
+            // the strongest lead if a prompt still fails to submit.
             eprintln!(
-                "cm-daemon: agent prompt delivered for {}: settle={}ms gap={}ms \
-                 body={}B bracketed={} + kitty-Enter(CSI 13 u)",
+                "cm-daemon: agent prompt delivered for {}: fresh={} \
+                 mode_observed={} mode_wait={}ms body={}B bracketed={} \
+                 enter={} retried={}",
                 session_uid,
-                AGENT_PROMPT_SETTLE.as_millis(),
-                AGENT_ENTER_GAP.as_millis(),
+                fresh_spawn,
+                observed,
+                mode_wait_ms,
                 body.len(),
                 bracketed,
+                if enter == AGENT_KITTY_ENTER { "kitty(CSI 13 u)" } else { "raw-CR" },
+                retried,
             );
         });
 }
@@ -7408,10 +7538,10 @@ pub fn mcp_start_session(
                             s.session_type.as_str(),
                             "codex" | "claude-code"
                         );
-                        (s.input_handle(), is_tui_agent)
+                        (s.input_handle(), s.fanout.clone(), is_tui_agent)
                     })
             };
-            let Some((handle, is_tui_agent)) = handle_opt else {
+            let Some((handle, fanout, is_tui_agent)) = handle_opt else {
                 // Session disappeared between spawn and prompt
                 // delivery — exceptional but possible (fast-
                 // exit reaper removed the registry entry).
@@ -7443,8 +7573,10 @@ pub fn mcp_start_session(
                 // runs the turn.
                 spawn_agent_prompt_delivery(
                     handle,
+                    fanout,
                     session_uid.clone(),
                     prompt.to_string(),
+                    true,
                 );
             } else {
                 // claude-code / bash: body + newline, synchronous, with
@@ -9561,10 +9693,19 @@ pub fn trigger(
             // caller has its uid.
             let handle_opt = {
                 let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                state.sessions.get(&session_uid).map(|s| s.input_handle())
+                state
+                    .sessions
+                    .get(&session_uid)
+                    .map(|s| (s.input_handle(), s.fanout.clone()))
             };
-            if let Some(handle) = handle_opt {
-                spawn_agent_prompt_delivery(handle, session_uid.clone(), resolved_prompt.clone());
+            if let Some((handle, fanout)) = handle_opt {
+                spawn_agent_prompt_delivery(
+                    handle,
+                    fanout,
+                    session_uid.clone(),
+                    resolved_prompt.clone(),
+                    true,
+                );
             }
         }
     }
@@ -10667,10 +10808,13 @@ pub(crate) fn spawn_investigator(
     let prompt = investigator_prompt(task, seq, snapshot_dir);
     let handle_opt = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        state.sessions.get(&uid).map(|s| s.input_handle())
+        state
+        .sessions
+        .get(&uid)
+        .map(|s| (s.input_handle(), s.fanout.clone()))
     };
-    if let Some(handle) = handle_opt {
-        spawn_agent_prompt_delivery(handle, uid.clone(), prompt);
+    if let Some((handle, fanout)) = handle_opt {
+        spawn_agent_prompt_delivery(handle, fanout, uid.clone(), prompt, true);
     }
 
     // Record the investigation: bind investigator_uid + its spawn time (the
