@@ -6583,10 +6583,19 @@ fn deliver_agent_body(
     // submit didn't take (mode flipped inside the gap, byte swallowed
     // mid-redraw, ...). Re-send Enter once with a freshly-read mode.
     let mut retries = 0usize;
+    // Whether the agent was ever seen REACTING to an Enter. Every attempt
+    // — including the last retry — is followed by a verification window,
+    // so this is a real outcome rather than "we wrote the bytes". Read it
+    // as a strong hint, not proof: it infers submission from the agent
+    // redrawing, so an agent that submits and then emits nothing for
+    // AGENT_SUBMIT_VERIFY would read as a miss. claude-code and codex
+    // both paint a spinner immediately, so that case is theoretical.
+    let mut submitted = false;
     loop {
         drain_for(&mut tracker, &mut bytes_seen, AGENT_SUBMIT_VERIFY);
         if !tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now()) {
-            break; // the agent reacted — the submit took
+            submitted = true; // the agent reacted — the submit took
+            break;
         }
         if retries >= AGENT_SUBMIT_RETRIES {
             break;
@@ -6621,7 +6630,7 @@ fn deliver_agent_body(
     eprintln!(
         "cm-daemon: agent {} delivered for {}: fresh={} mode_observed={} \
          mode_wait={}ms render_wait={}ms paint={}B body={}B bracketed={} \
-         enter={} enter_retries={}",
+         enter={} enter_retries={} submitted={}",
         what,
         session_uid,
         fresh_spawn,
@@ -6633,7 +6642,23 @@ fn deliver_agent_body(
         bracketed,
         if enter == AGENT_KITTY_ENTER { "kitty(CSI 13 u)" } else { "raw-CR" },
         retries,
+        submitted,
     );
+    // A delivery that exhausted its Enter attempts with the PTY never
+    // reacting is the failure this whole path exists to prevent, and it
+    // is otherwise invisible: the writes all succeeded, the session just
+    // sits there with the body in its composer. Say so on its own line
+    // so it is greppable in the daemon log / journal.
+    if !submitted {
+        eprintln!(
+            "cm-daemon: WARNING agent {} for {} may NOT have submitted — the PTY \
+             stayed quiet through {} Enter attempt(s); the body is likely sitting \
+             in the composer unsent",
+            what,
+            session_uid,
+            retries + 1,
+        );
+    }
     true
 }
 
