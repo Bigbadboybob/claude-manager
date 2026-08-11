@@ -6390,159 +6390,192 @@ fn spawn_agent_prompt_delivery(
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
-            use std::sync::mpsc::RecvTimeoutError;
-            use std::time::Instant;
-            // Own the fanout subscription for the life of THIS delivery
-            // rather than `spawn_for_fanout`'s background feeder: that
-            // feeder holds its receiver until the session exits, so a
-            // chatty orchestrator's repeated `send_input`s would strand
-            // one thread per call. Dropping `rx` when this thread ends
-            // lets the fanout's next push reap the slot.
-            let rx = fanout.subscribe();
-            let mut tracker =
-                crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
-            // Drain PTY bytes into the tracker for `dur`, so both the
-            // observed mode AND the wakeup stamps quiet-detection reads
-            // are current. Returns early only on producer death.
-            let mut drain_for = |tracker: &mut crate::workflow::pty_tracker::PtyModeTracker,
-                                 dur: std::time::Duration| {
-                let until = Instant::now() + dur;
-                loop {
-                    let now = Instant::now();
-                    if now >= until {
-                        return true;
-                    }
-                    match rx.recv_timeout(until - now) {
-                        Ok(chunk) => tracker.feed(&chunk, Instant::now()),
-                        Err(RecvTimeoutError::Timeout) => return true,
-                        Err(RecvTimeoutError::Disconnected) => return false,
-                    }
-                }
-            };
-            let wait = if fresh_spawn {
-                AGENT_MODE_WAIT_FRESH
-            } else {
-                AGENT_PROMPT_SETTLE
-            };
-            let started = Instant::now();
-            let deadline = started + wait;
-            let mut observed = false;
-            loop {
-                if tracker.composer_ready() {
-                    observed = true;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                if !drain_for(&mut tracker, AGENT_MODE_POLL) {
-                    break; // producer gone (child exited)
-                }
-            }
-            let mode_wait_ms = started.elapsed().as_millis();
-            if observed {
-                drain_for(&mut tracker, AGENT_POST_MODE_SETTLE);
-            }
-            await_operator_quiet(
-                &handle,
-                &session_uid,
-                OPERATOR_QUIET_WINDOW,
-                OPERATOR_QUIET_POLL,
-                OPERATOR_QUIET_MAX_DEFER,
-            );
-            let body = prompt.trim_end_matches(['\r', '\n']);
-            let payload = if observed {
-                crate::workflow::pty_tracker::format_body_for_delivery(
-                    body,
-                    tracker.term_mode(),
-                )
-            } else {
-                agent_paste_payload(body)
-            };
-            let bracketed = payload.len() != body.len();
-            if let Err(e) = handle.write_and_stamp(&payload) {
-                eprintln!(
-                    "cm-daemon: agent prompt body write failed for {}: {}",
-                    session_uid, e
-                );
-                return;
-            }
-            drain_for(&mut tracker, AGENT_ENTER_GAP);
-            // Re-read the mode at Enter time — it can complete during the
-            // gap (e.g. bracketed paste observed first, kitty a beat later).
-            let enter: &'static [u8] = if observed {
-                tracker.enter_bytes()
-            } else {
-                AGENT_KITTY_ENTER
-            };
-            if let Err(e) = handle.write_and_stamp(enter) {
-                eprintln!(
-                    "cm-daemon: agent prompt Enter write failed for {}: {}",
-                    session_uid, e
-                );
-                return;
-            }
-            // Verify: a successful submit echoes + redraws immediately, so a
-            // PTY still quiet a full verification window after the Enter
-            // means the submit didn't take (mode flipped inside the gap,
-            // byte swallowed mid-redraw, ...). Re-send Enter once with a
-            // freshly-read mode.
-            drain_for(&mut tracker, AGENT_SUBMIT_VERIFY);
-            let quiet = tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now());
-            let mut retried = false;
-            if quiet {
-                let enter2: &'static [u8] = if tracker.composer_ready() {
-                    tracker.enter_bytes()
-                } else {
-                    AGENT_KITTY_ENTER
-                };
-                retried = true;
-                if let Err(e) = handle.write_and_stamp(enter2) {
-                    eprintln!(
-                        "cm-daemon: agent prompt Enter retry write failed for {}: {}",
-                        session_uid, e
-                    );
-                    return;
-                }
-            }
-            // Positive delivery log (the failure mode this path exists for is
-            // "writes succeed but the agent never submits" — invisible
-            // without this line). `mode_observed=false` on a fresh spawn
-            // means the agent never enabled its modes inside the wait bound —
-            // the strongest lead if a prompt still fails to submit.
-            eprintln!(
-                "cm-daemon: agent prompt delivered for {}: fresh={} \
-                 mode_observed={} mode_wait={}ms body={}B bracketed={} \
-                 enter={} retried={}",
-                session_uid,
-                fresh_spawn,
-                observed,
-                mode_wait_ms,
-                body.len(),
-                bracketed,
-                if enter == AGENT_KITTY_ENTER { "kitty(CSI 13 u)" } else { "raw-CR" },
-                retried,
-            );
+            deliver_agent_body(&handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
         });
 }
 
-/// Deliver a PERSISTENT continuous-task fire's prompt to an EXISTING live
-/// session (no respawn — prior context preserved), optionally preceded by a
-/// `/clear` auto-compaction. Detached thread, same kitty-TUI mechanics as
-/// [`spawn_agent_prompt_delivery`]: settle, then (when `compact`) `/clear` body →
-/// gap → kitty-Enter → settle, then the bracketed prompt body → gap → kitty-Enter.
+/// Deliver one body + Enter to a kitty-TUI agent's PTY, synchronously, on
+/// whatever thread calls it (both spawners call it from their detached
+/// delivery thread). Returns false when a write failed — logged, never
+/// fatal: the session is already registered / the fire already counted.
 ///
-/// The `/clear` reuses the SAME hardcoded kitty-Enter + raw single-line body as
-/// the prompt delivery, NOT `fresh_reset::send_clear_body` + a `PtyModeTracker`:
-/// a tracker attached at fire time has NOT observed the agent's startup
-/// kitty/bracketed-paste escapes (those fire once at process start, not per
-/// fire), so `term_mode()` would report the default raw-`\r` mode and `/clear`
-/// would not submit on a kitty TUI — the exact failure `spawn_agent_prompt_delivery`
-/// was written to avoid. The compaction keeps the SAME session/PTY/uid (only the
-/// agent's internal transcript sid rotates); `current_session_uid` is unchanged.
+/// `fresh_spawn=true` (start_session prompt, continuous fresh-spawn fire):
+/// this subscription sees the agent's startup escapes, so the delivery
+/// WAITS until the composer observably enabled its kitty/bracketed-paste
+/// modes. A fixed sleep lost that race on slow cold starts: the body and
+/// Enter landed before the composer existed and the prompt sat unsubmitted
+/// next to a literal `^[[13u`.
+///
+/// `fresh_spawn=false` (send_input / a continuous fire into a LIVE
+/// session): the composer is already up, so the wait is bounded at the
+/// old settle. In practice the fanout ring still carries the target's
+/// mode state and it resolves on the first poll (~150ms measured against
+/// live claude-code and codex), which both makes delivery snappier than
+/// the old blind 2.5s sleep and means the ENCODING is observed rather
+/// than assumed. When the ring has scrolled past every mode escape,
+/// nothing is observed and the encoding falls back to assume-kitty —
+/// correct for any live agent (bash never comes here). Reading the mode
+/// from a byte window is safe in either direction: a window that holds a
+/// disable without its enable reads as "off" and takes the fallback.
+///
+/// Either way a post-Enter verification re-sends Enter once if the PTY
+/// stayed quiet: a real submit echoes + redraws immediately, so this
+/// cannot double-fire on success, and it recovers the dropped-submit case
+/// (which on the `/compact` path used to leave the command sitting in the
+/// composer for the next fire's prompt to be appended to).
+fn deliver_agent_body(
+    handle: &crate::session::InputHandle,
+    fanout: &std::sync::Arc<crate::session::PtyByteFanout>,
+    session_uid: &str,
+    body_text: &str,
+    fresh_spawn: bool,
+    what: &str,
+) -> bool {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+    // Own the fanout subscription for the life of THIS delivery rather
+    // than `spawn_for_fanout`'s background feeder: that feeder holds its
+    // receiver until the session exits, so a chatty orchestrator's
+    // repeated `send_input`s would strand one thread per call. Dropping
+    // `rx` on return lets the fanout's next push reap the slot.
+    let rx = fanout.subscribe();
+    let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
+    // Drain PTY bytes into the tracker for `dur`, so both the observed
+    // mode AND the wakeup stamps quiet-detection reads are current.
+    // Returns false only on producer death (child exited).
+    let drain_for = |tracker: &mut crate::workflow::pty_tracker::PtyModeTracker,
+                     dur: std::time::Duration| {
+        let until = Instant::now() + dur;
+        loop {
+            let now = Instant::now();
+            if now >= until {
+                return true;
+            }
+            match rx.recv_timeout(until - now) {
+                Ok(chunk) => tracker.feed(&chunk, Instant::now()),
+                Err(RecvTimeoutError::Timeout) => return true,
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    };
+    let wait = if fresh_spawn {
+        AGENT_MODE_WAIT_FRESH
+    } else {
+        AGENT_PROMPT_SETTLE
+    };
+    let started = Instant::now();
+    let deadline = started + wait;
+    let mut observed = false;
+    loop {
+        if tracker.composer_ready() {
+            observed = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if !drain_for(&mut tracker, AGENT_MODE_POLL) {
+            break; // producer gone (child exited)
+        }
+    }
+    let mode_wait_ms = started.elapsed().as_millis();
+    if observed {
+        drain_for(&mut tracker, AGENT_POST_MODE_SETTLE);
+    }
+    await_operator_quiet(
+        handle,
+        session_uid,
+        OPERATOR_QUIET_WINDOW,
+        OPERATOR_QUIET_POLL,
+        OPERATOR_QUIET_MAX_DEFER,
+    );
+    let body = body_text.trim_end_matches(['\r', '\n']);
+    let payload = if observed {
+        crate::workflow::pty_tracker::format_body_for_delivery(body, tracker.term_mode())
+    } else {
+        agent_paste_payload(body)
+    };
+    let bracketed = payload.len() != body.len();
+    if let Err(e) = handle.write_and_stamp(&payload) {
+        eprintln!(
+            "cm-daemon: agent {} body write failed for {}: {}",
+            what, session_uid, e
+        );
+        return false;
+    }
+    drain_for(&mut tracker, AGENT_ENTER_GAP);
+    // Re-read the mode at Enter time — it can complete during the gap
+    // (e.g. bracketed paste observed first, kitty a beat later).
+    let enter: &'static [u8] = if observed {
+        tracker.enter_bytes()
+    } else {
+        AGENT_KITTY_ENTER
+    };
+    if let Err(e) = handle.write_and_stamp(enter) {
+        eprintln!(
+            "cm-daemon: agent {} Enter write failed for {}: {}",
+            what, session_uid, e
+        );
+        return false;
+    }
+    // Verify: a PTY still quiet a full window after the Enter means the
+    // submit didn't take (mode flipped inside the gap, byte swallowed
+    // mid-redraw, ...). Re-send Enter once with a freshly-read mode.
+    drain_for(&mut tracker, AGENT_SUBMIT_VERIFY);
+    let mut retried = false;
+    if tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now()) {
+        let enter2: &'static [u8] = if tracker.composer_ready() {
+            tracker.enter_bytes()
+        } else {
+            AGENT_KITTY_ENTER
+        };
+        retried = true;
+        if let Err(e) = handle.write_and_stamp(enter2) {
+            eprintln!(
+                "cm-daemon: agent {} Enter retry write failed for {}: {}",
+                what, session_uid, e
+            );
+            return false;
+        }
+    }
+    // Positive delivery log (the failure mode this path exists for is
+    // "writes succeed but the agent never submits" — invisible without
+    // this line). `mode_observed=false` on a fresh spawn means the agent
+    // never enabled its modes inside the wait bound: the strongest lead
+    // if a prompt still fails to submit.
+    eprintln!(
+        "cm-daemon: agent {} delivered for {}: fresh={} mode_observed={} \
+         mode_wait={}ms body={}B bracketed={} enter={} retried={}",
+        what,
+        session_uid,
+        fresh_spawn,
+        observed,
+        mode_wait_ms,
+        body.len(),
+        bracketed,
+        if enter == AGENT_KITTY_ENTER { "kitty(CSI 13 u)" } else { "raw-CR" },
+        retried,
+    );
+    true
+}
+
+/// Deliver a PERSISTENT continuous-task fire's prompt to an EXISTING live
+/// session (no respawn — prior context preserved), or the periodic
+/// auto-`/compact` in its place. Detached thread over
+/// [`deliver_agent_body`] with `fresh_spawn=false` — the composer is
+/// already up, so there is no startup race to wait out, but the fire
+/// still gets that core's observed-mode encoding and its post-Enter
+/// verification. The verification matters most HERE: a `/compact` whose
+/// Enter is dropped leaves the command sitting in the composer, and the
+/// next fire's prompt is then appended to it (`/compact<prompt>`), which
+/// is the "compact fire silently skipped a cycle" shape.
+///
+/// The compaction keeps the SAME session/PTY/uid (only the agent's
+/// internal transcript sid rotates); `current_session_uid` is unchanged.
 /// Write failures are logged, not fatal (the fire already counted).
 fn spawn_persistent_prompt_delivery(
     handle: crate::session::InputHandle,
+    fanout: std::sync::Arc<crate::session::PtyByteFanout>,
     session_uid: String,
     prompt: String,
     compact: bool,
@@ -6550,79 +6583,46 @@ fn spawn_persistent_prompt_delivery(
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
         .spawn(move || {
-            std::thread::sleep(AGENT_PROMPT_SETTLE);
-            await_operator_quiet(
-                &handle,
-                &session_uid,
-                OPERATOR_QUIET_WINDOW,
-                OPERATOR_QUIET_POLL,
-                OPERATOR_QUIET_MAX_DEFER,
-            );
             if compact {
                 // Auto-compact: `/compact` SUMMARIZES the conversation and
-                // continues on the condensed context — bounding unbounded growth
-                // across fires/restarts while preserving working continuity (the
-                // agent's on-disk memory is independent of it). Single-line slash
-                // command, raw body, no bracketed paste.
+                // continues on the condensed context — bounding unbounded
+                // growth across fires/restarts while preserving working
+                // continuity (the agent's on-disk memory is independent of
+                // it). Single-line slash command, so no bracketed paste.
                 //
-                // Unlike `/clear` (an instant reset), `/compact` runs an async
-                // summarization TURN that is NOT finished when the command
-                // returns. So deliver `/compact` ALONE this fire and let it run —
-                // it completes long before the next scheduled fire. The prompt is
-                // deliberately NOT delivered now (it would land mid-summarization
-                // and get mangled); it resumes on the NEXT fire, on the freshly-
-                // summarized context. One compaction thus "costs" a single fire's
-                // prompt, which at the `compact_every` cadence is negligible.
-                if let Err(e) = handle.write_and_stamp(b"/compact") {
+                // Unlike `/clear` (an instant reset), `/compact` runs an
+                // async summarization TURN that is NOT finished when the
+                // command returns. So deliver `/compact` ALONE this fire and
+                // let it run — it completes long before the next scheduled
+                // fire. The prompt is deliberately NOT delivered now (it
+                // would land mid-summarization and get mangled); it resumes
+                // on the NEXT fire, on the freshly-summarized context. One
+                // compaction thus "costs" a single fire's prompt, which at
+                // the `compact_every` cadence is negligible.
+                if deliver_agent_body(
+                    &handle,
+                    &fanout,
+                    &session_uid,
+                    "/compact",
+                    false,
+                    "persistent /compact",
+                ) {
                     eprintln!(
-                        "cm-daemon: persistent /compact body write failed for {}: {}",
-                        session_uid, e
+                        "cm-daemon: persistent auto-compact delivered for {} \
+                         (prompt resumes next fire)",
+                        session_uid
                     );
-                    return;
                 }
-                std::thread::sleep(AGENT_ENTER_GAP);
-                if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
-                    eprintln!(
-                        "cm-daemon: persistent /compact Enter write failed for {}: {}",
-                        session_uid, e
-                    );
-                    return;
-                }
-                eprintln!(
-                    "cm-daemon: persistent auto-compact /compact delivered for {} \
-                     (prompt resumes next fire)",
-                    session_uid
-                );
-                // Compact-only fire — the prompt resumes on the next scheduled
-                // fire, on the summarized context. Do NOT fall through to the
-                // prompt body below.
+                // Compact-only fire — do NOT fall through to the prompt.
                 return;
             }
-            let body = prompt.trim_end_matches(['\r', '\n']);
-            let payload = agent_paste_payload(body);
-            let bracketed = payload.len() != body.len();
-            if let Err(e) = handle.write_and_stamp(&payload) {
-                eprintln!(
-                    "cm-daemon: persistent prompt body write failed for {}: {}",
-                    session_uid, e
-                );
-                return;
-            }
-            std::thread::sleep(AGENT_ENTER_GAP);
-            if let Err(e) = handle.write_and_stamp(AGENT_KITTY_ENTER) {
-                eprintln!(
-                    "cm-daemon: persistent prompt Enter write failed for {}: {}",
-                    session_uid, e
-                );
-                return;
-            }
-            eprintln!(
-                "cm-daemon: persistent prompt delivered for {}: compact={} \
-                 body={}B bracketed={} + kitty-Enter(CSI 13 u)",
-                session_uid,
-                compact,
-                body.len(),
-                bracketed,
+            deliver_agent_body(
+                &handle,
+                &fanout,
+                &session_uid,
+                &prompt,
+                false,
+                "persistent prompt",
             );
         });
 }
@@ -9437,7 +9437,14 @@ pub fn trigger(
     //   `Some((uid, Some(handle)))` = live, deliver to handle (production);
     //   `Some((uid, None))`         = live per the delivery test spy (no real PTY);
     //   `None`                      = not persistent, or dead/unset → FRESH spawn.
-    let persistent_target: Option<(String, Option<crate::session::InputHandle>)> =
+    #[allow(clippy::type_complexity)]
+    let persistent_target: Option<(
+        String,
+        Option<(
+            crate::session::InputHandle,
+            std::sync::Arc<crate::session::PtyByteFanout>,
+        )>,
+    )> =
         if is_persistent {
             task.current_session_uid.as_deref().and_then(|uid| {
                 #[cfg(test)]
@@ -9449,9 +9456,10 @@ pub fn trigger(
                     // Dead-session predicate: registry-absent OR the reaper has
                     // populated kernel exit (kernel_set flips before on_exit
                     // removes the registry entry — no liveness gap).
-                    Some(s) if !s.last_exit.kernel_set() => {
-                        Some((uid.to_string(), Some(s.input_handle())))
-                    }
+                    Some(s) if !s.last_exit.kernel_set() => Some((
+                        uid.to_string(),
+                        Some((s.input_handle(), s.fanout.clone())),
+                    )),
                     _ => None,
                 }
             })
@@ -9616,7 +9624,8 @@ pub fn trigger(
             }
             if let Some(handle) = handle_opt {
                 spawn_persistent_prompt_delivery(
-                    handle,
+                    handle.0,
+                    handle.1,
                     live_uid.clone(),
                     resolved_prompt.clone(),
                     compact,
