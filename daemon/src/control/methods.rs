@@ -6177,14 +6177,41 @@ const AGENT_MODE_WAIT_FRESH: std::time::Duration = std::time::Duration::from_sec
 /// Poll cadence for the mode-await loop.
 const AGENT_MODE_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Small settle after the modes appear: the composer just initialized;
-/// give its first render loop a beat before pasting into it.
-const AGENT_POST_MODE_SETTLE: std::time::Duration = std::time::Duration::from_millis(600);
+/// Quiet window that ends the composer's paint burst. Mirrors the TUI's
+/// proven `require_quiet` for its own pending-prompt drainer.
+const AGENT_RENDER_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Bytes of output that count as "the composer actually painted".
+///
+/// This is the load-bearing half of the readiness test. A mode escape is
+/// emitted EARLY in startup — before the JS UI mounts — and the PTY then
+/// goes SILENT while the runtime loads, so "modes on + quiet" fires into
+/// a program that cannot yet read input, and the paste is dropped. That
+/// is the shape that failed on a loaded cm-manager (modes at ~8s, paste
+/// lost) and it reproduces locally under CPU load. A rendered composer is
+/// thousands of bytes of box-drawing and status line, so requiring a
+/// paint of at least this much AFTER the modes — and only then a quiet
+/// window — distinguishes "still loading" from "ready".
+const AGENT_PAINT_MIN_BYTES: usize = 500;
+
+/// Bound on the paint-and-settle wait for a FRESH spawn. Past this the
+/// body is written regardless (the old behavior); the delivery log
+/// reports the paint bytes seen so a miss is diagnosable.
+const AGENT_RENDER_SETTLE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Post-Enter verification window: a successful submit makes the agent
 /// redraw immediately (input echo + spinner). A PTY still quiet this long
-/// after the Enter means the submit didn't take — re-send Enter once.
+/// after the Enter means the submit didn't take — re-send Enter.
 const AGENT_SUBMIT_VERIFY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How many extra Enters a quiet PTY earns. Each is a no-op against an
+/// empty composer (a real submit ends the loop by producing output), so
+/// the only cost of retrying is latency on an already-failed delivery.
+/// The second retry flips the encoding: claude-code enables the kitty
+/// protocol on some hosts and not others (cm-manager's does NOT — it
+/// takes raw CR), so if the observed encoding was wrong, the other one
+/// is right.
+const AGENT_SUBMIT_RETRIES: usize = 2;
 
 /// Gap between the body and the trailing Enter, so the agent consumes the
 /// paste and treats the Enter as a distinct keystroke (not paste tail).
@@ -6443,7 +6470,9 @@ fn deliver_agent_body(
     // Drain PTY bytes into the tracker for `dur`, so both the observed
     // mode AND the wakeup stamps quiet-detection reads are current.
     // Returns false only on producer death (child exited).
+    let mut bytes_seen: usize = 0;
     let drain_for = |tracker: &mut crate::workflow::pty_tracker::PtyModeTracker,
+                     bytes_seen: &mut usize,
                      dur: std::time::Duration| {
         let until = Instant::now() + dur;
         loop {
@@ -6452,7 +6481,10 @@ fn deliver_agent_body(
                 return true;
             }
             match rx.recv_timeout(until - now) {
-                Ok(chunk) => tracker.feed(&chunk, Instant::now()),
+                Ok(chunk) => {
+                    *bytes_seen += chunk.len();
+                    tracker.feed(&chunk, Instant::now());
+                }
                 Err(RecvTimeoutError::Timeout) => return true,
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
@@ -6474,13 +6506,42 @@ fn deliver_agent_body(
         if Instant::now() >= deadline {
             break;
         }
-        if !drain_for(&mut tracker, AGENT_MODE_POLL) {
+        if !drain_for(&mut tracker, &mut bytes_seen, AGENT_MODE_POLL) {
             break; // producer gone (child exited)
         }
     }
     let mode_wait_ms = started.elapsed().as_millis();
+    // Modes on != composer ready. The agent paints its UI right after
+    // enabling them, and a paste landing mid-render is dropped, so wait
+    // for the PTY to go quiet before writing. Bounded, and skipped
+    // entirely when no mode was observed (nothing to settle after).
+    let mut render_wait_ms = 0u128;
+    let mut paint_bytes = 0usize;
     if observed {
-        drain_for(&mut tracker, AGENT_POST_MODE_SETTLE);
+        let settle_started = Instant::now();
+        // A fresh spawn has a whole UI to mount; a live target painted
+        // long ago and only needs its current burst (if any) to finish.
+        let settle_deadline = settle_started
+            + if fresh_spawn {
+                AGENT_RENDER_SETTLE_MAX
+            } else {
+                AGENT_RENDER_QUIET * 2
+            };
+        let paint_floor = bytes_seen + AGENT_PAINT_MIN_BYTES;
+        loop {
+            let painted = !fresh_spawn || bytes_seen >= paint_floor;
+            if painted && tracker.quiet_for(AGENT_RENDER_QUIET, Instant::now()) {
+                break;
+            }
+            if Instant::now() >= settle_deadline {
+                break;
+            }
+            if !drain_for(&mut tracker, &mut bytes_seen, AGENT_MODE_POLL) {
+                break; // producer gone (child exited)
+            }
+        }
+        paint_bytes = bytes_seen.saturating_sub(paint_floor - AGENT_PAINT_MIN_BYTES);
+        render_wait_ms = settle_started.elapsed().as_millis();
     }
     await_operator_quiet(
         handle,
@@ -6503,7 +6564,7 @@ fn deliver_agent_body(
         );
         return false;
     }
-    drain_for(&mut tracker, AGENT_ENTER_GAP);
+    drain_for(&mut tracker, &mut bytes_seen, AGENT_ENTER_GAP);
     // Re-read the mode at Enter time — it can complete during the gap
     // (e.g. bracketed paste observed first, kitty a beat later).
     let enter: &'static [u8] = if observed {
@@ -6521,16 +6582,30 @@ fn deliver_agent_body(
     // Verify: a PTY still quiet a full window after the Enter means the
     // submit didn't take (mode flipped inside the gap, byte swallowed
     // mid-redraw, ...). Re-send Enter once with a freshly-read mode.
-    drain_for(&mut tracker, AGENT_SUBMIT_VERIFY);
-    let mut retried = false;
-    if tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now()) {
-        let enter2: &'static [u8] = if tracker.composer_ready() {
-            tracker.enter_bytes()
+    let mut retries = 0usize;
+    loop {
+        drain_for(&mut tracker, &mut bytes_seen, AGENT_SUBMIT_VERIFY);
+        if !tracker.quiet_for(AGENT_SUBMIT_VERIFY, Instant::now()) {
+            break; // the agent reacted — the submit took
+        }
+        if retries >= AGENT_SUBMIT_RETRIES {
+            break;
+        }
+        // Flip the encoding on the LAST attempt: whichever of kitty /
+        // raw-CR we have been sending is evidently not this agent's
+        // Enter, so try the other one before giving up.
+        let last = retries + 1 == AGENT_SUBMIT_RETRIES;
+        let enter_retry: &'static [u8] = if last {
+            if enter == AGENT_KITTY_ENTER {
+                b"\r"
+            } else {
+                AGENT_KITTY_ENTER
+            }
         } else {
-            AGENT_KITTY_ENTER
+            enter
         };
-        retried = true;
-        if let Err(e) = handle.write_and_stamp(enter2) {
+        retries += 1;
+        if let Err(e) = handle.write_and_stamp(enter_retry) {
             eprintln!(
                 "cm-daemon: agent {} Enter retry write failed for {}: {}",
                 what, session_uid, e
@@ -6545,16 +6620,19 @@ fn deliver_agent_body(
     // if a prompt still fails to submit.
     eprintln!(
         "cm-daemon: agent {} delivered for {}: fresh={} mode_observed={} \
-         mode_wait={}ms body={}B bracketed={} enter={} retried={}",
+         mode_wait={}ms render_wait={}ms paint={}B body={}B bracketed={} \
+         enter={} enter_retries={}",
         what,
         session_uid,
         fresh_spawn,
         observed,
         mode_wait_ms,
+        render_wait_ms,
+        paint_bytes,
         body.len(),
         bracketed,
         if enter == AGENT_KITTY_ENTER { "kitty(CSI 13 u)" } else { "raw-CR" },
-        retried,
+        retries,
     );
     true
 }
