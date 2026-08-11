@@ -34,3 +34,32 @@ Everything lands in awaiting_input: a worker that just delivered its verdict-fir
 ## What's working well (keep)
 
 read_last_turn as the tail-first default is exactly right and I use it constantly; the async monitor wake-up pattern (register → end turn → get woken) fits the agent execution model perfectly and beats any polling API; start_session wait=true as a one-call spawn-and-collect; verdict-first report convention + read_last_turn compose into a clean orchestration loop; per-worker auto-monitors on start_session mean zero-ceremony fan-outs when things go right.
+
+---
+
+## Triage log
+
+### 2026-08-11 — cm/ux-notes-triage
+
+| # | Item | Disposition | Where / why |
+|---|------|-------------|-------------|
+| 1a | workspace-less task: mint a worktree | task-filed | planning task `eb043d87` (with 1b — mint-vs-refuse is one policy decision; mint preferred) |
+| 1b | …or refuse loudly with override | task-filed | same task `eb043d87` |
+| 1c | `start_session` returns `worktree_path` | implemented | daemon `mcp_start_session` return decoration + TUI twin + server.py passthrough (incl. `wait=true` via `_with_spawn_fields`); `task_id` when bound |
+| 2a | `create_subtask(base=<committish>)` | implemented | `CreateSubtaskParams` + TUI twin + tool signature; `worktree.rs::resolve_base_commit` (local rev-parse → one fetch → `origin/<ref>`/`FETCH_HEAD`); resolved in the pre-POST precondition block so a typo is `invalid_params` with zero side effects; branch-mode only. Review hardening: `is_single_revision()` gate — the raw ref reached `git fetch` as a REFSPEC, so `+src:dst` could force-overwrite local branches (confirmed HIGH, fixed + victim-branch regression test) |
+| 2b | return `base_sha` | implemented | both return sites, all worktree modes (`worktree_head_sha`) |
+| 3a | `mode="final"` / re-arming monitors | task-filed | planning task `8c0ab1a3` (with 4a — needs the done signal as its termination predicate) |
+| 3b | label kill-triggered firings | implemented | tombstone `killed`/`killed_by`/`exited_at` via bounded `kill_requests` ledger; fire message `killed by <who> at <ts>` with transcript labeled "fragment before kill", never as a final report |
+| 3c | flag interim turns in wake-ups | implemented | `idle_source=="transcript"` → "PTY still active" line; idle-but-alive → "may be an interim turn". Review fix: mixed batches (exited completer + live siblings) no longer emit the all-EXITED trailer |
+| 4a | `status="reported"` done signal | task-filed | task `8c0ab1a3` (fold-ins: cgroup-kill provenance, `read_last_turn` kill labels, sweep attribution) |
+| 4b | detect permission-prompt-blocked | declined | needs a PTY-content classification layer that doesn't exist; poor value/cost today — revisit if it keeps biting |
+| 5a | `create_subtask` returns `launched: false` | implemented | both return sites + docstring ("nothing is running until start_session") |
+| 5b | `kill_session` "already exited at <ts>" | implemented | tombstone lookup on both miss paths (+ killer when known); TUI twin via manifest tombstones; `not_found` code kept for compat |
+| 5c | empty prompt auto-delivers task prompt | implemented | EXPLICIT `task_id` (or `isolated=true`) only — inherited bindings stay promptless (spawn-then-drive pattern); agent types only, never bash (its "prompt" would execute); best-effort, never fails the spawn; `prompt_source` in return; auto-monitor counts auto-delivered prompts |
+| 5d | `workspace_shared_with` hint | implemented | computed MCP-side strictly from caller-authorized rows; TUI-owned rows now push `workspace_id`/`worktree_path` (serde-defaulted), TUI twin emits `worktree_path` too |
+
+Process: 4 implementation agents in isolated worktrees (branches `worktree-wf_6d72c26a-d5d-1..4`, kept as safety copies), merged conflict-free; 6-lens adversarial review — 22 findings → 13 verified by 3-refuter majority → 2 confirmed (both fixed: the fetch-refspec injection, the mixed-batch trailer) + 3 low advisories fixed at triage (inherited-binding auto-delivery, `delivered_a_prompt` whitespace mismatch, skew-warning wording). Verified: `cargo build --workspace` clean; 104 daemon + 24 TUI + 62 mcp_server tests pass.
+
+Remaining advisories (recorded, not fixed): `FETCH_HEAD` can be substituted by a concurrent fetch in the same main repo (narrow race, base still validated); the improved `TargetNotInRegistry` miss message reveals `exited_at`/killer for tombstoned uids to any session caller (refuted as a regression by majority — requires knowing the uid; prior message already confirmed absence); cgroup/OOM kills read as natural exits (folded into task `8c0ab1a3`).
+
+Activation: daemon changes need a daemon restart (cm-manager: redeploy binary + `mcp_server/`; auto-delivery needs `api_url`/`api_token` in `daemon.toml`), MCP-server changes on next MCP spawn, TUI changes on next TUI build. predictionTrading's MCP copy is retired (its launcher execs this repo's `server.py`) — no mirroring needed.

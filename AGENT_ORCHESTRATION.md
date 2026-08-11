@@ -462,7 +462,8 @@ All session-targeting tools take a **`session_uid`** (the stable TUI-assigned UI
 
 ```
 list_sessions(task_id?, include_exited=false)
-   -> [{session_uid, label, type, state, idle, managed_by_uid}]
+   -> [{session_uid, label, type, state, idle, managed_by_uid,
+        task_id, workspace_id, worktree_path, workspace_shared_with?}]
    # state in {"ready", "pending", "exited"}.
    # When include_exited=false (default), only live ws.sessions entries are
    # returned and "exited" never appears. When true, the workspace's
@@ -470,12 +471,45 @@ list_sessions(task_id?, include_exited=false)
    # The `exited` state remains reachable via read_session_output even
    # when the caller hasn't passed include_exited — read_session_output
    # always consults tombstones during resolve.
+   # `workspace_id` / `worktree_path` ride TUI-owned rows too — the TUI's
+   #   session-snapshot push carries both, so a TUI-launched sibling is no
+   #   longer a workspace-less, checkout-less row.
+   # Exited rows additionally carry how they ended: exited_at, killed,
+   #   killed_by (see kill_session).
+   # `workspace_shared_with` = [{session_uid, label}] for the OTHER LIVE
+   #   sessions running in the same worktree_path — the "who else is
+   #   editing this checkout?" answer. Present only when the checkout is
+   #   shared; exited rows neither receive it nor count as sharers. It is
+   #   computed MCP-side from the rows the host already authorized for
+   #   this caller — never from a wider re-query, which would leak uids
+   #   across the auth boundary. Same field in list_sessions_grouped, and
+   #   worth reading there too: the grouping key is workspace_id, and two
+   #   workspaces can point at one checkout.
 start_session(task_id?, type: "claude-code"|"codex", label, prompt?)
-   -> {session_uid}
+   -> {session_uid, worktree_path, task_id?, prompt_source}
    # task_id omitted = "spawn in caller's workspace, no task binding"
    #   (the only valid form for a taskless caller).
    # task_id provided = bind the new session to that task; only allowed
    #   if the caller has authority over it (own task or descendant).
+   # worktree_path = the checkout the child actually landed in. Worth
+   #   reading even when you passed no task_id: binding to a branch-mode
+   #   subtask spawns the child in ITS worktree, not the caller's.
+   # task_id in the RESPONSE = the task the child ended up bound to
+   #   (absent when it isn't bound to one).
+   # prompt_source in {"caller", "task", "none"}: an empty/absent prompt
+   #   on a spawn that names a task EXPLICITLY (the task_id arg, or the
+   #   task isolated=true mints) auto-delivers that task's stored
+   #   description+prompt — the same text the operator's launch key
+   #   sends — so start_session(task_id=<backlog task>) is a complete
+   #   launch. A merely INHERITED binding never triggers it: a
+   #   promptless spawn without task_id stays promptless (the classic
+   #   spawn-now-drive-later pattern). Best-effort: no stored prompt, or
+   #   an unreachable planning API, degrades to a promptless spawn and
+   #   never fails the spawn.
+   #   Agent session types only: a bash "prompt" is a command line the
+   #   shell would EXECUTE, so bash never auto-delivers. The
+   #   auto-registered done-monitor treats an auto-delivered task prompt
+   #   exactly like a caller-supplied one.
 send_input(session_uid, text, submit=true)
    -> {ok}
 read_session_output(session_uid, since_cursor?, max_messages=20)
@@ -486,6 +520,20 @@ read_session_output(session_uid, since_cursor?, max_messages=20)
    # restarts from the beginning of the new transcript and the response
    # carries the new generation.
 kill_session(session_uid) -> {ok}
+   # Provenance is recorded: the exit tombstone gets killed=true and
+   #   killed_by (the calling session's uid, or "operator" for the
+   #   operator routes — the TUI's A-w, resolve_stuck, the continuous
+   #   scheduler's watchdog). killed can be true with killed_by null for
+   #   kill paths that don't go through this handler (mark_subtask_done's
+   #   session sweep). Downstream readers use it so a killed
+   #   session's truncated transcript tail is never presented as its
+   #   final report: exited list_sessions rows carry the fields, and the
+   #   async monitors' fire message reads "killed by <who> at <ts>" with
+   #   any transcript text labelled a fragment.
+   # Killing a session that is already gone is a no-op, not a mystery:
+   #   it errors `not_found` with "session '<uid>' already exited at
+   #   <ts>" (plus the killer when known) instead of a message that
+   #   reads like a bad uid.
 ```
 
 `type: "bash"` is **not** offered in `start_session`. Bash sessions remain user-only — they have no transcript and no `Agent` impl.
@@ -519,8 +567,27 @@ list_workflows(task_id?) -> [{run_id, name, active_role, ...}]
 ## Phase 5 — Subtask MCP tools + worktree branching
 
 ```
-create_subtask(name, prompt, worktree_mode="inherit"|"branch", project?)
-   -> {task_id, worktree_path}
+create_subtask(name, prompt, worktree_mode="inherit"|"branch", project?, base?)
+   -> {task_id, worktree_path, base_sha, launched: false}
+   # base = explicit committish the new branch is cut from, REPLACING the
+   #   parent-wip-branch default — use it to fork off clean upstream
+   #   instead of inheriting the parent's in-progress work. Anything git
+   #   resolves: sha, tag, local branch ("main"), remote-tracking ref
+   #   ("origin/main"); resolved locally first, with one
+   #   `git fetch origin <base>` if it doesn't resolve yet.
+   #   worktree_mode="branch" ONLY — inherit / in-place cut no branch, so
+   #   passing it there is invalid_params ("base only valid with
+   #   worktree_mode=branch"). An unresolvable base is invalid_params
+   #   ("base '<x>' does not resolve to a commit") raised BEFORE the task
+   #   row is created, so a typo'd ref can't leave a half-made subtask to
+   #   roll back.
+   # base_sha = the commit the new checkout actually sits on (the
+   #   resolved base or the parent branch's tip in branch mode, the
+   #   shared checkout's HEAD otherwise; null when the path isn't
+   #   readable as a git checkout).
+   # launched is ALWAYS false: create_subtask mints a task and (in
+   #   branch mode) a worktree, then stops. Nothing runs until
+   #   start_session(task_id=<task_id>).
 list_subtasks(task_id?) -> [{task_id, name, status, worktree_mode, ...}]
 mark_subtask_done(task_id, close_worktree=true)
    -> {ok}
@@ -620,7 +687,7 @@ Implementation runs unattended between checkpoints. The agent should still stop 
 
 ## Open questions / risks
 
-1. **Two MCP server copies.** Per memory: planning tools must currently be added to both `mcp_server/server.py` and the predictionTrading copy. This whole expansion would need to land in both, or we resolve the duplication first. Worth resolving first.
+1. ~~**Two MCP server copies.**~~ *Resolved.* The predictionTrading copy (`scripts/mcp/claude_manager_server.py`) is retired — that repo's `scripts/mcp/claude-manager.sh` now execs this repo's `server.py` through the generated `~/.cm/mcp/launcher.sh`, which tracks the active claude-manager checkout/venv. Tool changes land in `mcp_server/server.py` only.
 2. **Concurrent edits in `inherit` mode.** Two sibling sessions in the same worktree both running `cargo build` will fight. Document this as a user concern; don't solve in v1.
 3. **Activity feed in the activation prompt context.** When an agent resumes after a transition, the activity feed records the transition — but the agent doesn't see it. Is that OK? Probably yes; the feed is for the user, not the agents.
 4. **Worktree cleanup races.** If a subtask agent is mid-write when the user kills the parent, child sessions may be killed mid-edit. Existing worktree-close logic already handles this; reuse it.
