@@ -1020,6 +1020,11 @@ struct CreateSubtaskParams {
     worktree_mode: String,
     #[serde(default)]
     project: Option<String>,
+    /// Explicit committish the new worktree branch is cut from
+    /// (`worktree_mode="branch"` only). Replaces the parent-wip-branch
+    /// resolution when present; absent keeps the parent-branch default.
+    #[serde(default)]
+    base: Option<String>,
 }
 
 fn default_subtask_worktree_mode() -> String {
@@ -1036,6 +1041,25 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
                 "worktree_mode must be 'inherit', 'branch', or 'in-place', got '{}'",
                 p.worktree_mode
             ),
+        ));
+    }
+    // `base` names the commit the new worktree BRANCH is cut from, so it
+    // only means anything when there is a cut. Inherit reuses the
+    // parent's worktree and in-place runs in the main checkout — neither
+    // creates a branch, so honoring `base` there is impossible and
+    // ignoring it would silently hand back a subtask on a base the
+    // caller didn't ask for. Reject instead. (Daemon twin: same check,
+    // same message.)
+    let base: Option<String> = p
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if base.is_some() && p.worktree_mode != "branch" {
+        return Err((
+            ErrorCode::InvalidParams,
+            "base only valid with worktree_mode=branch".into(),
         ));
     }
     let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
@@ -1148,6 +1172,18 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     } else {
         None
     };
+    // An explicit `base` is a precondition like any other: resolve it to a
+    // concrete commit HERE, before the API create, so a typo'd ref fails
+    // as invalid_params instead of minting a `running` row that then has
+    // to be rolled back. The cut below reuses the resolved sha. (Daemon
+    // twin does the same at the same point in its Step 1.)
+    let resolved_base: Option<String> = match (base.as_deref(), branch_main_repo.as_deref()) {
+        (Some(b), Some(main_repo)) => Some(
+            cm_daemon::worktree::resolve_base_commit(main_repo, b)
+                .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+        ),
+        _ => None,
+    };
     // Resolve the parent's actual branch UPFRONT. Tasks launched into
     // existing workspaces commonly have `wip_branch: None` because
     // the system never had reason to set it; the source of truth in
@@ -1163,13 +1199,16 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
     // Inherit-mode treats None as soft: the new task's wip_branch
     // inherits the resolution if available, so future grandchildren
     // can branch from it.
+    //
+    // An explicit `base` replaces this resolution outright, so it also
+    // lifts the branch-mode requirement: the caller named the cut point.
     let parent_branch_resolved: Option<String> = parent.wip_branch.clone().or_else(|| {
         app.workspaces[parent_wi]
             .worktree_path
             .as_deref()
             .and_then(cm_daemon::worktree::worktree_current_branch)
     });
-    if p.worktree_mode == "branch" && parent_branch_resolved.is_none() {
+    if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
         return Err((
             ErrorCode::Conflict,
             "cannot determine parent's base branch (no wip_branch and worktree HEAD is detached or unreadable)".into(),
@@ -1245,9 +1284,19 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
         }
         "branch" => {
             let main_repo = branch_main_repo.expect("validated above");
-            let parent_branch = parent_branch_resolved
+            // Explicit `base` (already resolved to a sha above) replaces
+            // the parent-branch resolution as the cut point — and is the
+            // only thing that makes an unresolvable parent branch
+            // survive the check above.
+            let start_ref = resolved_base
                 .clone()
+                .or_else(|| parent_branch_resolved.clone())
                 .expect("validated above");
+            let start = if resolved_base.is_some() {
+                cm_daemon::worktree::SubtaskStart::Base(&start_ref)
+            } else {
+                cm_daemon::worktree::SubtaskStart::ParentBranch(&start_ref)
+            };
             // Branch name was computed upfront and sent in the
             // create_task body — no post-create PATCH needed.
             let branch_name = branch_name_for_new
@@ -1256,7 +1305,7 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
             let worktree_path = match cm_daemon::worktree::create_subtask_worktree(
                 &main_repo,
                 &branch_name,
-                &parent_branch,
+                start,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1412,9 +1461,20 @@ pub fn create_subtask(app: &mut App, caller_uid: &str, params: &Value) -> Method
         );
     }
     app.push_task_tree_to_daemon();
+    // The commit the subtask's checkout actually sits on. In branch mode
+    // that's the resolved `base` (or the parent branch's tip); in
+    // inherit / in-place it's the shared checkout's current HEAD — either
+    // way it answers "what am I working on top of" without a follow-up
+    // shell call. `null` when the path isn't readable as a git checkout.
+    let base_sha = cm_daemon::worktree::worktree_head_sha(&worktree_path);
     Ok(json!({
         "task_id": new_task_id,
         "worktree_path": worktree_path.to_string_lossy(),
+        "base_sha": base_sha,
+        // create_subtask mints a task + (maybe) a worktree and stops.
+        // Stated explicitly so an agent doesn't assume a worker is
+        // already running on it — nothing runs until start_session.
+        "launched": false,
     }))
 }
 

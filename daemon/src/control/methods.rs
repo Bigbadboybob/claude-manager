@@ -11680,6 +11680,11 @@ struct CreateSubtaskParams {
     worktree_mode: String,
     #[serde(default)]
     project: Option<String>,
+    /// Explicit committish the new worktree branch is cut from
+    /// (`worktree_mode="branch"` only). Replaces the parent-wip-branch
+    /// resolution when present; absent keeps the parent-branch default.
+    #[serde(default)]
+    base: Option<String>,
 }
 
 fn default_subtask_worktree_mode() -> String {
@@ -11693,7 +11698,11 @@ fn default_subtask_worktree_mode() -> String {
 /// `slug="<chain>-<short>"`, branch mode → a `cm-sub/<chain>-<short>`
 /// worktree, with `wip_branch` baked into the API row per mode.
 ///
-/// Returns `{"task_id": <new id>, "worktree_path": <string>}`.
+/// Returns `{"task_id": <new id>, "worktree_path": <string>,
+/// "base_sha": <sha|null>, "launched": false}`. `base_sha` is the commit
+/// the subtask's checkout sits on; `launched` is always `false` because
+/// create_subtask never spawns a session (the caller must
+/// `start_session` on the returned task).
 pub fn create_subtask(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -11709,6 +11718,24 @@ pub fn create_subtask(
                 "worktree_mode must be 'inherit', 'branch', or 'in-place', got '{}'",
                 p.worktree_mode
             ),
+        ));
+    }
+    // `base` names the commit the new worktree BRANCH is cut from, so it
+    // only means anything when there is a cut. Inherit reuses the
+    // parent's worktree and in-place runs in the main checkout — neither
+    // creates a branch, so honoring `base` there is impossible and
+    // ignoring it would silently hand back a subtask on a base the
+    // caller didn't ask for. Reject instead.
+    let base: Option<String> = p
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if base.is_some() && p.worktree_mode != "branch" {
+        return Err((
+            ErrorCode::InvalidParams,
+            "base only valid with worktree_mode=branch".into(),
         ));
     }
     // Reject an empty-after-normalization slug before any API/git work.
@@ -11903,15 +11930,27 @@ pub fn create_subtask(
     } else {
         None
     };
+    // An explicit `base` is a precondition like any other: resolve it to a
+    // concrete commit HERE, before the POST, so a typo'd ref fails as
+    // invalid_params instead of minting a `running` row that then has to
+    // be rolled back. The cut below reuses the resolved sha.
+    let resolved_base: Option<String> = match (base.as_deref(), branch_main_repo.as_deref()) {
+        (Some(b), Some(main_repo)) => Some(
+            crate::worktree::resolve_base_commit(main_repo, b)
+                .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+        ),
+        _ => None,
+    };
 
     // Parent's base branch: wip_branch, else the worktree's actual HEAD.
-    // Branch mode REQUIRES this (never falls back to "main").
+    // Branch mode REQUIRES this (never falls back to "main") — UNLESS an
+    // explicit `base` was passed, which replaces this resolution outright.
     let parent_branch_resolved: Option<String> = parent_wip_branch.clone().or_else(|| {
         parent_worktree_path
             .as_deref()
             .and_then(crate::worktree::worktree_current_branch)
     });
-    if p.worktree_mode == "branch" && parent_branch_resolved.is_none() {
+    if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
         return Err((
             ErrorCode::Conflict,
             "cannot determine parent's base branch (no wip_branch and worktree HEAD is \
@@ -11971,14 +12010,26 @@ pub fn create_subtask(
             }
             "branch" => {
                 let main_repo = branch_main_repo.expect("validated above");
-                let parent_branch = parent_branch_resolved.clone().expect("validated above");
+                // Explicit `base` (already resolved to a sha above)
+                // replaces the parent-branch resolution as the cut point
+                // — and is the only thing that makes an unresolvable
+                // parent branch survive the check above.
+                let start_ref = resolved_base
+                    .clone()
+                    .or_else(|| parent_branch_resolved.clone())
+                    .expect("validated above");
+                let start = if resolved_base.is_some() {
+                    crate::worktree::SubtaskStart::Base(&start_ref)
+                } else {
+                    crate::worktree::SubtaskStart::ParentBranch(&start_ref)
+                };
                 let branch_name = branch_name_for_new
                     .clone()
                     .expect("branch_name_for_new is Some in branch mode");
                 let wt = match crate::worktree::create_subtask_worktree(
                     &main_repo,
                     &branch_name,
-                    &parent_branch,
+                    start,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -12063,9 +12114,21 @@ pub fn create_subtask(
         state.persist_sessions_best_effort();
     }
 
+    // The commit the subtask's checkout actually sits on. In branch mode
+    // that's the resolved `base` (or the parent branch's tip); in
+    // inherit / in-place it's the shared checkout's current HEAD — either
+    // way it answers "what am I working on top of" without a follow-up
+    // shell call. `null` when the path isn't readable as a git checkout.
+    let base_sha = crate::worktree::worktree_head_sha(&worktree_path);
+
     Ok(json!({
         "task_id": new_task_id,
         "worktree_path": worktree_path.to_string_lossy(),
+        "base_sha": base_sha,
+        // create_subtask mints a task + (maybe) a worktree and stops.
+        // Stated explicitly so an agent doesn't assume a worker is
+        // already running on it — nothing runs until start_session.
+        "launched": false,
     }))
 }
 
@@ -13138,6 +13201,48 @@ mod tests {
         );
     }
 
+    /// `base` names the commit a NEW subtask branch is cut from, so it is
+    /// meaningful only in branch mode. With inherit / in-place there is no
+    /// branch to cut, and silently ignoring the argument would hand the
+    /// caller a subtask sitting on a base it never asked for — so it's an
+    /// invalid_params error, raised BEFORE any caller/API/git work (the
+    /// caller here is unresolvable and we still get the base message, not
+    /// the unauthorized one).
+    #[test]
+    fn create_subtask_base_is_rejected_outside_branch_mode() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        for mode in ["inherit", "in-place"] {
+            let err = create_subtask(
+                &state,
+                &json!({"name": "sub", "worktree_mode": mode, "base": "origin/main"}),
+                None,
+            )
+            .expect_err("base outside branch mode must fail");
+            assert_eq!(err.0, ErrorCode::InvalidParams, "mode {}: {:?}", mode, err);
+            assert_eq!(err.1, "base only valid with worktree_mode=branch");
+        }
+
+        // Control 1: branch mode accepts `base` — it gets past the
+        // param gate and dies on the (absent) caller instead.
+        let err = create_subtask(
+            &state,
+            &json!({"name": "sub", "worktree_mode": "branch", "base": "origin/main"}),
+            None,
+        )
+        .expect_err("no caller");
+        assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+
+        // Control 2: an empty/whitespace `base` is "not supplied", not a
+        // ref — MCP clients that always send the key must not be broken.
+        let err = create_subtask(
+            &state,
+            &json!({"name": "sub", "worktree_mode": "inherit", "base": "   "}),
+            None,
+        )
+        .expect_err("no caller");
+        assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+    }
+
     /// fix-start-session: agent-minted creator edges
     /// (`DaemonState::agent_task_edges`) must survive the TUI's
     /// replace-not-merge `task.update_tree` pushes. Pre-fix, a push
@@ -13595,6 +13700,24 @@ mod tests {
             args,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// `git -C <dir> rev-parse <rev>`, asserting it resolves. Used by the
+    /// `create_subtask` tests to pin the commit a subtask was cut from.
+    fn git_sha(dir: &std::path::Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git rev-parse {} failed: {}",
+            rev,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// Set HOME to a tempdir and create a real git repo (one commit, so
@@ -25348,6 +25471,11 @@ mod tests {
                 "branch-mode worktree must exist on disk: {}",
                 wt
             );
+            // create_subtask mints state and stops — no session is spawned.
+            assert_eq!(result["launched"], json!(false));
+            // With no explicit `base`, the cut follows the parent branch's
+            // tip, and that commit is reported back.
+            assert_eq!(result["base_sha"], json!(git_sha(&repo, "HEAD")));
 
             {
                 let s = state.lock().unwrap();
@@ -25398,6 +25526,115 @@ mod tests {
                 wip
             );
             drop(reqs);
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// Branch-mode `create_subtask(base=<committish>)`: the new worktree
+    /// branch is cut from the NAMED commit, not the parent branch's tip
+    /// — the "fork this subtask off clean upstream instead of my WIP"
+    /// case. The returned `base_sha` is that commit, and the parent's
+    /// later work is provably absent from the checkout.
+    #[test]
+    fn create_subtask_base_cuts_from_named_commit_not_parent_tip() {
+        with_home_and_repo("baserepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            // Commit A (from the helper) is the base we'll ask for;
+            // commit B is the parent's WIP tip that must NOT come along.
+            let base_sha = git_sha(&repo, "HEAD");
+            std::fs::write(repo.join("parent-wip.txt"), "wip").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "parent wip"]);
+            let tip_sha = git_sha(&repo, "HEAD");
+            assert_ne!(base_sha, tip_sha);
+
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some(name.to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-parent" {
+                    (
+                        200,
+                        format!(
+                            r#"{{"id":"task-parent","name":"Parent Task","repo_url":"{}","project":"proj","status":"running","worktree_mode":"inherit","wip_branch":null,"parent_task_id":null}}"#,
+                            name_owned
+                        ),
+                    )
+                } else if method == "POST" && path == "/tasks" {
+                    (
+                        200,
+                        r#"{"id":"task-child-base","name":"based","status":"running","worktree_mode":"branch","parent_task_id":"task-parent"}"#
+                            .to_string(),
+                    )
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let result = create_subtask(
+                &state,
+                &json!({"name": "based", "worktree_mode": "branch", "base": base_sha}),
+                Some("ts-orch"),
+            )
+            .expect("create_subtask ok");
+
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert_eq!(
+                result["base_sha"], json!(base_sha),
+                "base_sha must report the commit we cut from"
+            );
+            assert_eq!(git_sha(&wt, "HEAD"), base_sha);
+            assert!(
+                !wt.join("parent-wip.txt").exists(),
+                "the parent's later commit must not be in a base-cut subtask",
+            );
+            assert_eq!(result["launched"], json!(false));
+
+            // An unresolvable base fails with the documented message, as
+            // invalid_params, BEFORE the task row is POSTed — so there's
+            // no orphan `running` row to roll back.
+            let posts_before = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count();
+            let err = create_subtask(
+                &state,
+                &json!({"name": "bad-base", "worktree_mode": "branch", "base": "no-such-ref"}),
+                Some("ts-orch"),
+            )
+            .expect_err("unresolvable base must fail");
+            assert_eq!(err.0, ErrorCode::InvalidParams, "{:?}", err);
+            assert!(
+                err.1.contains("base 'no-such-ref' does not resolve to a commit"),
+                "unexpected error: {:?}",
+                err
+            );
+            assert_eq!(
+                stub.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method == "POST")
+                    .count(),
+                posts_before,
+                "a bad base must not create (then roll back) a task row",
+            );
 
             kill_all_sessions(&state);
             clear_api_env();

@@ -2274,8 +2274,11 @@ def create_subtask(
     prompt: str = "",
     worktree_mode: str = "inherit",
     project: str | None = None,
+    base: str | None = None,
 ) -> dict:
-    """Create a subtask under your current task.
+    """Create a subtask under your current task. Creates the task (and,
+    in branch mode, its worktree) and STOPS — nothing is running until
+    you `start_session` on it.
 
     The new task gets `parent_task_id` set to your task. You must have
     a bound task (workflow- or planning-launched session). Taskless
@@ -2285,16 +2288,34 @@ def create_subtask(
         name: Display name for the subtask. Slugified for the branch
             name (alphanumerics + dash, max 40 chars).
         prompt: Optional initial prompt for the subtask's worker.
+            Recorded on the task row (that's where the planning view
+            reads it from); since this call spawns nothing, pass the
+            prompt to `start_session` too if you want it delivered.
         worktree_mode: "inherit" (default) — same worktree as parent;
             sessions spawn in the parent's worktree directory.
             "branch" — new worktree branched off the parent's
             wip_branch with name `cm-sub/<slug-chain>-<short_id>`.
             "in-place" — spawn directly in the parent's MAIN repo
             checkout: no new worktree, no new branch.
+        base: Optional committish the new branch is cut from, REPLACING
+            the default parent-wip-branch base. Anything git resolves:
+            a sha, a tag, a local branch ("main"), or a remote-tracking
+            ref ("origin/main") — resolved locally first, with one
+            `git fetch origin <base>` if it doesn't resolve yet. Use it
+            to fork a subtask off clean upstream instead of inheriting
+            the parent's in-progress work. `worktree_mode="branch"`
+            ONLY: passing it with "inherit"/"in-place" is an error
+            (those modes create no branch, so there is nothing to cut).
+            Unresolvable bases fail with
+            `base '<x>' does not resolve to a commit`.
         project: Optional explicit project; defaults to the parent's
             project.
 
-    Returns: {"task_id": "<uuid>", "worktree_path": "<absolute path>"}.
+    Returns: {"task_id": "<uuid>", "worktree_path": "<absolute path>",
+    "base_sha": "<commit sha the checkout sits on, or null>",
+    "launched": false}. `launched` is always false — this tool never
+    spawns a session; call `start_session(task_id=<task_id>, prompt=...)`
+    next to actually put an agent on it.
 
     State your intent and ask the user before calling. Subtasks are a
     real fork — branch mode creates real git state.
@@ -2307,7 +2328,23 @@ def create_subtask(
         params["prompt"] = prompt
     if project:
         params["project"] = project
-    return control_client.call("create_subtask", params)
+    if base:
+        params["base"] = base
+    result = control_client.call("create_subtask", params)
+    # Version skew: a daemon predating `base` deserializes params
+    # leniently, so it would ignore the argument and cut from the
+    # parent's branch WITHOUT saying so. `base_sha` ships in the same
+    # change, so its absence is the tell — surface it rather than let
+    # the caller believe it forked from where it asked.
+    if base and isinstance(result, dict) and "base_sha" not in result:
+        result["warning"] = (
+            f"the cm host serving create_subtask predates the `base` parameter "
+            f"and IGNORED base={base!r} — the subtask was cut from the parent's "
+            "branch instead. Rebuild/restart the serving host (create_subtask is "
+            "TUI-routed on workstation setups, daemon-routed headless) or check "
+            "the branch by hand before relying on the base."
+        )
+    return result
 
 
 @mcp.tool()

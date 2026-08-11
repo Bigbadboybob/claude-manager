@@ -195,6 +195,132 @@ pub fn create_worktree(
     Ok((worktree_path, true))
 }
 
+/// Where a subtask worktree's new branch is cut from.
+///
+/// Two shapes because the resolution rules genuinely differ:
+///   - `ParentBranch` is a BRANCH NAME the system derived itself (the
+///     parent task's `wip_branch` / worktree HEAD). It gets the
+///     local-then-`origin/<name>` dance below, because the parent branch
+///     may live only on the remote in a fresh clone.
+///   - `Base` is a caller-supplied committish (`create_subtask(base=…)`):
+///     a sha, tag, `main`, `origin/main`, … It is `rev-parse`-verified to
+///     a concrete commit FIRST (see `resolve_base_commit`), so an
+///     unresolvable base fails with a precise message instead of a raw
+///     `git worktree add` stderr, and there is no `origin/<x>` guessing
+///     on top of what the caller literally asked for.
+pub enum SubtaskStart<'a> {
+    /// The parent task's branch — local ref first, then `origin/<ref>`.
+    ParentBranch(&'a str),
+    /// An explicit committish supplied by the caller.
+    Base(&'a str),
+}
+
+/// `git rev-parse --verify --quiet <rev>^{commit}` inside `repo`.
+/// `None` when the rev doesn't resolve (or doesn't peel to a commit).
+fn rev_parse_commit(repo: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{}^{{commit}}", rev))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// The commit a worktree's HEAD points at. `None` when the path isn't a
+/// git checkout or HEAD is unborn. Used by `create_subtask` to report
+/// `base_sha` — the exact commit the subtask's checkout sits on.
+pub fn worktree_head_sha(worktree_path: &Path) -> Option<String> {
+    rev_parse_commit(worktree_path, "HEAD")
+}
+
+/// Is `base` shaped like a SINGLE revision, as opposed to a git option,
+/// refspec, or glob?
+///
+/// This matters because `resolve_base_commit` hands the caller's string
+/// to `git fetch origin <base>`, where the argument is a REFSPEC, not a
+/// rev: `<src>:<dst>` (or `+<src>:<dst>`) makes git WRITE `<dst>` in the
+/// operator's main repo, so an unvalidated `base` of
+/// `+refs/heads/main:refs/heads/some-branch` would create or
+/// force-overwrite local branches there — and the `FETCH_HEAD` fallback
+/// would then resolve, so `create_subtask` would report success and the
+/// clobber would never surface. `create_subtask`'s `base` is a
+/// precondition check with zero side effects, so refspec syntax has to
+/// die before it reaches git's argv.
+///
+/// No legitimate committish needs any of the rejected characters: shas,
+/// tags, `main`, `origin/main`, `HEAD~2`, `main^{commit}` and `HEAD@{1}`
+/// all pass.
+fn is_single_revision(base: &str) -> bool {
+    // `-` is an option marker, `+` the refspec force marker; `:`
+    // separates a refspec's src from its dst; `?`/`*`/`[` are refspec
+    // globs; `\` and whitespace/control bytes are never valid in a ref
+    // name (git check-ref-format rejects them).
+    !base.starts_with('-')
+        && !base.starts_with('+')
+        && !base.chars().any(|c| {
+            matches!(c, ':' | '?' | '*' | '[' | '\\') || c.is_whitespace() || c.is_control()
+        })
+}
+
+/// Resolve a caller-supplied `base` committish to a concrete commit sha
+/// inside `main_repo`. Accepts anything git accepts — a full or short
+/// sha, a tag, a local branch (`main`), or a remote-tracking ref
+/// (`origin/main`) — as long as it's a single revision and not refspec
+/// or option syntax (see `is_single_revision`).
+///
+/// Order:
+///   1. Local `rev-parse --verify` — covers shas, tags, local branches,
+///      and already-fetched `origin/<branch>` refs. Local-first for the
+///      same reason `create_subtask_worktree` prefers local refs: the
+///      operator's local commits are usually the point.
+///   2. If that misses, `git fetch origin <base>` once, then retry the
+///      literal ref, then `origin/<base>`, then `FETCH_HEAD` — the last
+///      only when THAT fetch succeeded, so a stale FETCH_HEAD left by an
+///      unrelated earlier fetch can never silently become the base.
+///
+/// Errors with `base '<x>' does not resolve to a commit` when nothing
+/// resolves; callers surface that message verbatim.
+pub fn resolve_base_commit(main_repo: &Path, base: &str) -> anyhow::Result<String> {
+    let base = base.trim();
+    if base.is_empty() || !is_single_revision(base) {
+        anyhow::bail!("base '{}' does not resolve to a commit", base);
+    }
+
+    if let Some(sha) = rev_parse_commit(main_repo, base) {
+        return Ok(sha);
+    }
+
+    let fetched = Command::new("git")
+        .arg("-C")
+        .arg(main_repo)
+        .args(["fetch", "origin", base])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let mut candidates = vec![base.to_string(), format!("origin/{}", base)];
+    if fetched {
+        candidates.push("FETCH_HEAD".to_string());
+    }
+    for cand in candidates {
+        if let Some(sha) = rev_parse_commit(main_repo, &cand) {
+            return Ok(sha);
+        }
+    }
+
+    anyhow::bail!("base '{}' does not resolve to a commit", base)
+}
+
 /// Create a worktree for a subtask. Differs from `create_worktree` in:
 ///   - branch name is fully specified by the caller (e.g.
 ///     `cm-sub/<slug-chain>-<short_id>` per AGENT_ORCHESTRATION.md), not
@@ -202,14 +328,15 @@ pub fn create_worktree(
 ///     ref-prefix collision that hierarchical names hit.
 ///   - dir name under `~/.cm/worktrees/` is derived from the branch
 ///     name with `/` mapped to `-` so it's a valid path component.
-///   - `start_branch` is the parent's wip_branch; the new branch is
-///     created off it (with origin fetch as the first attempt).
+///   - the new branch is cut from `start`: either the parent's
+///     wip_branch (local ref first, origin fetch second) or an explicit
+///     caller-supplied committish. See `SubtaskStart`.
 ///
 /// Returns the path to the new worktree directory.
 pub fn create_subtask_worktree(
     main_repo: &Path,
     branch_name: &str,
-    start_branch: &str,
+    start: SubtaskStart<'_>,
 ) -> anyhow::Result<PathBuf> {
     let base = worktree_base();
     std::fs::create_dir_all(&base)?;
@@ -222,6 +349,35 @@ pub fn create_subtask_worktree(
     if worktree_path.exists() {
         return Ok(worktree_path);
     }
+
+    // Explicit base: resolve to a sha up front so an unresolvable ref
+    // fails with the precise "base '<x>' does not resolve to a commit"
+    // message BEFORE any git state is touched, and so the cut is
+    // pinned to exactly one commit (no `origin/<base>` second-guessing
+    // of what the caller literally asked for).
+    let start_branch = match start {
+        SubtaskStart::ParentBranch(b) => b,
+        SubtaskStart::Base(b) => {
+            let sha = resolve_base_commit(main_repo, b)?;
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(main_repo)
+                .args(["worktree", "add"])
+                .arg(&worktree_path)
+                .args(["-b", branch_name, &sha])
+                .output()?;
+            if out.status.success() {
+                return Ok(worktree_path);
+            }
+            anyhow::bail!(
+                "git worktree add failed for subtask branch {} at base {} ({}): {}",
+                branch_name,
+                b,
+                sha,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    };
 
     // Order matters: try the LOCAL ref first, then origin/<start>.
     //
@@ -989,6 +1145,225 @@ mod tests {
                 worktree_current_branch(&path).as_deref(),
                 Some("cm/fix-start-session")
             );
+        });
+    }
+
+    // === create_subtask(base=…): explicit cut point ===
+
+    /// Add a commit on top of whatever is checked out and return its sha.
+    fn commit_file(repo: &Path, name: &str, body: &str) -> String {
+        std::fs::write(repo.join(name), body).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", name]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A two-commit repo on `main`, with `v1` tagging the first commit and
+    /// a synthetic `refs/remotes/origin/main` also at the first commit
+    /// (written directly so the test needs no network / real remote).
+    /// Returns `(tempdir_guard, repo_path, first_sha, second_sha)` — the
+    /// guard must stay alive for the repo to exist.
+    fn repo_with_history() -> (tempfile::TempDir, PathBuf, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("myrepo");
+        make_git_repo(&repo);
+        git(&repo, &["branch", "-M", "main"]);
+        let first = commit_file(&repo, "one.txt", "1");
+        git(&repo, &["tag", "v1"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &first]);
+        let second = commit_file(&repo, "two.txt", "2");
+        (tmp, repo, first, second)
+    }
+
+    /// `base` must accept every shape git accepts: full sha, short sha,
+    /// tag, local branch, remote-tracking ref. Each resolves to the
+    /// concrete commit the subtask will be cut from.
+    #[test]
+    fn resolve_base_commit_accepts_sha_tag_branch_and_remote_ref() {
+        let (_tmp, repo, first, second) = repo_with_history();
+
+        assert_eq!(resolve_base_commit(&repo, &first).unwrap(), first);
+        assert_eq!(resolve_base_commit(&repo, &first[..8]).unwrap(), first);
+        assert_eq!(resolve_base_commit(&repo, "v1").unwrap(), first);
+        assert_eq!(resolve_base_commit(&repo, "origin/main").unwrap(), first);
+        assert_eq!(resolve_base_commit(&repo, "main").unwrap(), second);
+        // Surrounding whitespace is a paste artifact, not a different ref.
+        assert_eq!(resolve_base_commit(&repo, "  main  ").unwrap(), second);
+    }
+
+    /// A base that resolves nowhere must fail with the actionable
+    /// message the MCP tool documents — not a raw git stderr. The
+    /// `-`-prefixed case would otherwise be parsed by git as an option.
+    #[test]
+    fn resolve_base_commit_rejects_unresolvable_ref() {
+        let (_tmp, repo, _first, _second) = repo_with_history();
+
+        for bad in ["no-such-ref-anywhere", "--force", ""] {
+            let err = resolve_base_commit(&repo, bad)
+                .expect_err("must not resolve")
+                .to_string();
+            assert!(
+                err.contains("does not resolve to a commit"),
+                "unexpected error for base {:?}: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    /// `base` lands in the REFSPEC argument of `git fetch origin <base>`,
+    /// so `<src>:<dst>` / `+<src>:<dst>` would make git create or
+    /// force-overwrite `<dst>` in the operator's main repo — and because
+    /// that fetch succeeds, the `FETCH_HEAD` fallback then resolved and
+    /// `create_subtask` reported success, hiding the clobber. Refspec /
+    /// glob syntax must be rejected before git's argv, leaving the repo's
+    /// refs untouched.
+    #[test]
+    fn resolve_base_commit_rejects_refspec_and_never_writes_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        make_git_repo(&upstream);
+        git(&upstream, &["branch", "-M", "main"]);
+        commit_file(&upstream, "up.txt", "u");
+
+        let clone = tmp.path().join("clone");
+        let out = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&upstream)
+            .arg(&clone)
+            .output()
+            .expect("spawn git clone");
+        assert!(
+            out.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // A local-only commit on a branch that is NOT checked out — git
+        // refuses to fetch into a checked-out branch, so this is exactly
+        // the ref a forced refspec could destroy.
+        git(&clone, &["checkout", "-q", "-b", "victim"]);
+        let victim = commit_file(&clone, "local-only.txt", "precious");
+        git(&clone, &["checkout", "-q", "main"]);
+
+        for bad in [
+            "+refs/heads/main:refs/heads/victim",
+            "refs/heads/main:refs/heads/brand-new",
+            "+refs/heads/*:refs/heads/pwn/*",
+            "+main",
+            "main victim",
+        ] {
+            let err = resolve_base_commit(&clone, bad)
+                .expect_err("refspec syntax must not resolve")
+                .to_string();
+            assert!(
+                err.contains("does not resolve to a commit"),
+                "unexpected error for base {:?}: {}",
+                bad,
+                err
+            );
+            assert_eq!(
+                rev_parse_commit(&clone, "victim").as_deref(),
+                Some(victim.as_str()),
+                "base {:?} moved an existing local branch",
+                bad
+            );
+            for forged in ["brand-new", "pwn/main"] {
+                assert!(
+                    rev_parse_commit(&clone, forged).is_none(),
+                    "base {:?} created local branch {}",
+                    bad,
+                    forged
+                );
+            }
+        }
+
+        // Positive control: the fetch fallback really is live in this
+        // fixture, so the rejections above are the validator's doing and
+        // not a broken remote. `later` exists only on the upstream.
+        git(&upstream, &["checkout", "-q", "-b", "later"]);
+        let later = commit_file(&upstream, "later.txt", "l");
+        assert_eq!(resolve_base_commit(&clone, "later").unwrap(), later);
+    }
+
+    /// `SubtaskStart::Base` cuts the subtask branch from the named
+    /// commit, NOT from the parent branch's tip — the whole point of the
+    /// knob (fork off clean upstream instead of inheriting WIP).
+    #[test]
+    fn create_subtask_worktree_base_cuts_from_explicit_commit() {
+        with_home(|_home| {
+            let (_tmp, repo, first, second) = repo_with_history();
+
+            let wt = create_subtask_worktree(
+                &repo,
+                "cm-sub/base-test-abc1234",
+                SubtaskStart::Base(&first),
+            )
+            .expect("cut from the explicit base");
+
+            assert_eq!(
+                worktree_current_branch(&wt).as_deref(),
+                Some("cm-sub/base-test-abc1234")
+            );
+            // item 2b: the reported base_sha is the commit asked for.
+            assert_eq!(worktree_head_sha(&wt).as_deref(), Some(first.as_str()));
+            assert_ne!(worktree_head_sha(&wt).as_deref(), Some(second.as_str()));
+            // The second commit's file must NOT be present — proof the
+            // cut really happened at `first`.
+            assert!(wt.join("one.txt").exists());
+            assert!(!wt.join("two.txt").exists());
+        });
+    }
+
+    /// An unresolvable base fails BEFORE any worktree is produced, so the
+    /// caller's rollback path (delete the API row) isn't racing a
+    /// half-built checkout.
+    #[test]
+    fn create_subtask_worktree_base_unresolvable_leaves_no_worktree() {
+        with_home(|home| {
+            let (_tmp, repo, _first, _second) = repo_with_history();
+
+            let err = create_subtask_worktree(
+                &repo,
+                "cm-sub/base-missing-abc1234",
+                SubtaskStart::Base("nope-not-a-ref"),
+            )
+            .expect_err("must fail")
+            .to_string();
+
+            assert!(
+                err.contains("does not resolve to a commit"),
+                "unexpected error: {}",
+                err
+            );
+            assert!(!home
+                .join(".cm/worktrees/cm-sub-base-missing-abc1234")
+                .exists());
+        });
+    }
+
+    /// Default (no `base`) behavior is untouched by the `SubtaskStart`
+    /// refactor: the cut still follows the parent's branch tip.
+    #[test]
+    fn create_subtask_worktree_parent_branch_cuts_from_branch_tip() {
+        with_home(|_home| {
+            let (_tmp, repo, _first, second) = repo_with_history();
+
+            let wt = create_subtask_worktree(
+                &repo,
+                "cm-sub/parent-test-abc1234",
+                SubtaskStart::ParentBranch("main"),
+            )
+            .expect("cut from the parent branch");
+
+            assert_eq!(worktree_head_sha(&wt).as_deref(), Some(second.as_str()));
+            assert!(wt.join("two.txt").exists());
         });
     }
 
