@@ -1875,12 +1875,11 @@ impl App {
                     let target = uid.clone();
                     self.tombstone_and_remove(wi, |ts| ts.uid == target);
                     self.clamp_cursor();
-                    // P1 (Feature 3): auto-reap the workspace of a finished
-                    // agent-spawned / detective worker once its row is pruned,
-                    // if nothing live remains and its task is Done/gone — stops
-                    // the empty-workspace pile-up (~10/day) without waiting for
-                    // a manual A-W.
-                    self.maybe_reap_spent_workspace(wi);
+                    // Workspace cleanup is NOT a per-site call anymore: the
+                    // `reap_spent_workspaces` sweep at the `reconcile_tasks`
+                    // tail (~5s cadence) soft-closes this workspace once its
+                    // task reads terminal — same cleanup, one hoisted site
+                    // covering every session-end path instead of this one.
                 }
                 // R5: untracked uid — `found` stays false; silent
                 // no-op. The diff referenced a session the TUI
@@ -2357,6 +2356,16 @@ impl App {
                     && matches!(t.status.as_str(), "running" | "blocked")
             })
         });
+
+        // Soft-close spent workspaces — the single, hoisted cleanup site
+        // (see `reap_spent_workspaces`). Runs HERE, and only here, because
+        // this is the one moment `self.tasks` is guaranteed fresh: the
+        // upsert above just applied API statuses and the retain just
+        // dropped Done tasks, so the sweep's task-liveness gates can't act
+        // on stale data (which is also why there's no timer-driven sweep —
+        // before the first TasksUpdated, an empty `self.tasks` would make
+        // every gate pass vacuously).
+        self.reap_spent_workspaces();
 
         // Sort workspaces by effective status (via their first bound task if
         // any). No bound task → put last.

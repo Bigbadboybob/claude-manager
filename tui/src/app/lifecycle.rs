@@ -3458,57 +3458,137 @@ impl App {
         self.tombstone_and_remove(wi, |ts| {
             ts.task_id.as_deref() == Some(target.as_str())
         });
-        // P1 (Feature 3): reap the workspace if that was its last live work.
-        // Without this the workspace is hidden only until `reconcile_tasks`
-        // drops the now-Done task, after which `is_past_workspace` no longer
-        // matches (no bound task) and the empty workspace reappears as an
-        // unbound header — the leftover the operator has to A-W by hand.
-        self.maybe_reap_spent_workspace(wi);
+        // Spent-workspace cleanup is no longer a per-site call here: the
+        // task was just marked Done locally, so `is_past_workspace` hides
+        // the row immediately, and the `reconcile_tasks` that drops the Done
+        // task runs `reap_spent_workspaces` in the same pass — the sweep
+        // soft-closes the workspace before the gap between "task dropped"
+        // and "workspace unbound" can ever render.
         self.cursor = Cursor::Workspace(wi);
         self.clamp_cursor();
         self.set_status_msg("Marked done");
     }
 
-    /// P1 (Feature 3): soft-close a "spent" workspace so it stops lingering
-    /// after its last subtask finishes. A workspace is spent when it is a
-    /// local (non-cloud), not-already-closed workspace that has **no live
-    /// sessions**, **no active (non-Done) bound task**, and **at least one
-    /// tombstone** (i.e. it was actually used — this excludes a freshly
-    /// created empty slot waiting for its first session). Soft-close means
-    /// `is_closed = true` (same as `close_active_workspace` / A-W), which
-    /// keeps it hidden via `is_past_workspace`'s `is_closed` branch even after
-    /// its Done task is reconciled away. Deliberately NOT a hard delete: the
+    /// P1 (Feature 3), hoisted: soft-close every "spent" workspace so none
+    /// lingers after its work finishes. Originally this ran as per-site
+    /// `maybe_reap_spent_workspace(wi)` calls at two specific teardown sites
+    /// (A-d `mark_active_done`, the manifest `Exited`-diff prune) — every
+    /// other way a session could end (daemon-side kills seen only as attach
+    /// EOF, exits missed while the TUI was down or the tunnel disconnected,
+    /// a task flipping terminal AFTER its sessions were already gone, an
+    /// adoption whose deferred attach never bound a session) leaked a stray
+    /// sidebar row the operator had to close by hand. Now the cleanup is one
+    /// condition-driven sweep at the `reconcile_tasks` tail (~5s cadence),
+    /// which is the moment fresh task statuses have just landed — so the
+    /// task-liveness gates below are never evaluated against stale data.
+    ///
+    /// Soft-close means `is_closed = true` (same as `close_active_workspace`
+    /// / A-W, which remains the manual override), keeping the workspace
+    /// hidden via `is_past_workspace`'s `is_closed` branch even after its
+    /// Done task is reconciled away. Deliberately NOT a hard delete: the
     /// tombstones (post-done `read_session_output`) and the git worktree are
-    /// preserved — only A-x (`delete_active`) force-removes those. Idempotent
-    /// and cheap; safe to call from any teardown site.
-    pub(super) fn maybe_reap_spent_workspace(&mut self, wi: usize) {
-        let reap = self
-            .workspaces
-            .get(wi)
-            .is_some_and(|ws| Self::workspace_is_spent(ws, &self.tasks));
-        if reap {
-            if let Some(ws) = self.workspaces.get_mut(wi) {
-                ws.is_closed = true;
+    /// preserved — only A-x (`delete_active`) force-removes those.
+    /// Idempotent and cheap; persists the manifest only when something
+    /// actually flipped.
+    pub(super) fn reap_spent_workspaces(&mut self) {
+        // Attach-pending exemption: a workspace whose session(s) are merely
+        // unreachable — queued for deferred remote reattach, in-flight on
+        // the attach worker, or preserved as raw manifest entries for an
+        // offline host — LOOKS sessionless but isn't spent. Closing one
+        // would also clear its sessions from the next manifest save (closed
+        // workspaces restore with sessions dropped), turning a down tunnel
+        // into data loss. Owned strings so the borrow ends before the
+        // mutation loop below.
+        let mut attach_pending: std::collections::HashSet<String> =
+            self.skipped_manifest_entries.keys().cloned().collect();
+        attach_pending.extend(
+            self.pending_remote_reattach
+                .iter()
+                .map(|p| p.ws_id().to_string()),
+        );
+        attach_pending
+            .extend(self.attaching.values().map(|p| p.ws_id().to_string()));
+
+        // Focus exemption: never sweep the workspace the operator has the
+        // cursor on. An A-O reopen of a spent workspace parks the cursor
+        // there while the operator decides what to do (restore tombstones,
+        // A-s a fresh session) — without this the next reconcile tick could
+        // re-close it out from under them. Costs at most one lingering row,
+        // which is reaped as soon as they navigate away.
+        let cursor_wi = match &self.cursor {
+            Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
+            Cursor::Task { ws_idx, .. } => *ws_idx,
+        };
+
+        let mut changed = false;
+        for wi in 0..self.workspaces.len() {
+            if wi == cursor_wi {
+                continue;
             }
+            let ws = &self.workspaces[wi];
+            if attach_pending.contains(ws.id.as_str()) {
+                continue;
+            }
+            if Self::workspace_is_spent(ws, &self.tasks) {
+                self.workspaces[wi].is_closed = true;
+                changed = true;
+            }
+        }
+        if changed {
             self.save_session_manifest();
+            self.clamp_cursor();
+            self.needs_redraw = true;
         }
     }
 
-    /// Pure predicate behind [`Self::maybe_reap_spent_workspace`]: true when
-    /// `ws` is a local workspace that has finished its work and should be
-    /// hidden. Split out so the decision is side-effect-free and unit-testable
-    /// (the mutation + manifest write live in the caller). Spent ⟺ local
-    /// (non-cloud), not already closed, **no live sessions**, **at least one
-    /// tombstone** (it was used — excludes a freshly-created empty slot), and
-    /// **no bound task that isn't Done** (another active task keeps it open).
+    /// Pure predicate behind [`Self::reap_spent_workspaces`]: true when `ws`
+    /// has finished its work and should be hidden. Split out so the decision
+    /// is side-effect-free and unit-testable (the mutation + manifest write
+    /// live in the caller). Spent ⟺ non-cloud, not already closed, **no
+    /// sessions** (a live OR ghost row keeps it open — ghosts are user-owned,
+    /// and a dead session under a live task is the leaked-session condition
+    /// the operator wants visible), **evidence it was used** (see below), and
+    /// **no still-active task** (neither bound by `workspace_id` nor
+    /// referenced by a tombstone's `task_id`).
     fn workspace_is_spent(ws: &Workspace, tasks: &[TaskEntry]) -> bool {
-        !ws.is_cloud
-            && !ws.is_closed
-            && ws.sessions.is_empty()
-            && !ws.tombstones.is_empty()
-            && !tasks.iter().any(|t| {
-                t.workspace_id.as_deref() == Some(&ws.id)
-                    && !matches!(t.api_status, TaskStatus::Done)
+        if ws.is_cloud || ws.is_closed || !ws.sessions.is_empty() {
+            return false;
+        }
+        // "It was used" evidence, which excludes a freshly-created empty
+        // slot waiting for its first session (A-n, reconcile
+        // auto-provision): a tombstone, OR the workspace is an
+        // adoption-minted marker (`resolve_adopt_workspace` names them
+        // "agent: <label>"). A marker whose deferred attach never bound a
+        // session has neither sessions nor tombstones and used to linger as
+        // a stray header forever. The prefix is minted only by adoption;
+        // renaming a marker via A-e therefore claims it and restores the
+        // tombstone requirement.
+        if ws.tombstones.is_empty() && !ws.name.starts_with("agent: ") {
+            return false;
+        }
+        // Task-liveness gate, two edges. A task bound to this workspace via
+        // `workspace_id` that isn't Done keeps it open (the pre-hoist rule).
+        // So does a non-Done task referenced by any tombstone's `task_id` —
+        // this covers markers whose TaskEntry never bound to the synthetic
+        // workspace id (e.g. a remote worktree path local recovery can't
+        // match): their dead session under a still-running task must stay
+        // visible, not be swept as litter. `self.tasks` only retains
+        // non-terminal tasks (reconcile drops Done ones), so "absent" reads
+        // as terminal here.
+        if tasks.iter().any(|t| {
+            t.workspace_id.as_deref() == Some(&ws.id)
+                && !matches!(t.api_status, TaskStatus::Done)
+        }) {
+            return false;
+        }
+        !ws.tombstones
+            .iter()
+            .filter_map(|tomb| tomb.task_id.as_deref())
+            .any(|tid| {
+                tasks.iter().any(|t| {
+                    t.task_id.as_deref() == Some(tid)
+                        && !matches!(t.api_status, TaskStatus::Done)
+                })
             })
     }
 
@@ -8538,6 +8618,263 @@ mod revive_session_tests {
         assert!(
             !app.reconnecting_sessions.contains(&ts.uid),
             "not marked reconnecting on RPC failure",
+        );
+    }
+}
+
+#[cfg(test)]
+mod spent_workspace_tests {
+    //! Pins for the hoisted spent-workspace cleanup: `workspace_is_spent`
+    //! (the pure decision) and `reap_spent_workspaces` (the sweep at the
+    //! `reconcile_tasks` tail that replaced the per-site
+    //! `maybe_reap_spent_workspace` calls). The load-bearing regressions:
+    //! an adoption-minted marker whose deferred attach never bound a
+    //! session ("agent: …", zero sessions, zero tombstones) must be
+    //! reaped, while a fresh user slot, a leaked-session row, a
+    //! still-active task, and an attach-pending remote workspace must
+    //! all survive the sweep.
+    use super::*;
+    use std::collections::HashMap;
+
+    fn ws(name: &str) -> Workspace {
+        Workspace {
+            color: None,
+            pinned: false,
+            id: format!("ws-{}", name.replace(' ', "-")),
+            name: name.to_string(),
+            is_closed: false,
+            is_cloud: false,
+            repo_url: None,
+            worktree_path: None,
+            main_repo_path: None,
+            worker_vm: None,
+            worker_zone: None,
+            host_id: cm_daemon::host_id::HostId::local(),
+            sessions: vec![],
+            tombstones: vec![],
+            is_pushing: false,
+        }
+    }
+
+    fn tomb(task_id: Option<&str>) -> SessionTombstone {
+        SessionTombstone {
+            uid: "ts-dead-0".into(),
+            managed_by_uid: Some("ts-orch-0".into()),
+            label: "worker".into(),
+            session_type: "claude".into(),
+            task_id: task_id.map(str::to_string),
+            last_transcript_id: None,
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        }
+    }
+
+    fn task(task_id: &str, ws_id: Option<&str>, status: TaskStatus) -> TaskEntry {
+        TaskEntry {
+            task_id: Some(task_id.to_string()),
+            name: task_id.to_string(),
+            api_status: status,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            workspace_id: ws_id.map(str::to_string),
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        }
+    }
+
+    /// The pre-hoist core case: a used (tombstoned), unbound workspace
+    /// with nothing running is spent.
+    #[test]
+    fn tombstoned_unbound_workspace_is_spent() {
+        let mut w = ws("done-work");
+        w.tombstones.push(tomb(Some("t-done")));
+        assert!(App::workspace_is_spent(&w, &[]));
+    }
+
+    /// Screenshot regression (OPT-4295 / OPT-4305): an adoption-minted
+    /// marker whose deferred attach never bound a session has NEITHER
+    /// sessions NOR tombstones — the "agent: " name (minted only by
+    /// `resolve_adopt_workspace`) is the used-evidence that lets the
+    /// sweep reap it instead of it lingering as a stray header.
+    #[test]
+    fn never_bound_agent_marker_is_spent() {
+        let w = ws("agent: OPT-4295 Raleigh News &amp; Observer");
+        assert!(w.sessions.is_empty() && w.tombstones.is_empty());
+        assert!(App::workspace_is_spent(&w, &[]));
+    }
+
+    /// A fresh empty slot (A-n, reconcile auto-provision) has no
+    /// used-evidence — never reaped while it waits for its first session.
+    #[test]
+    fn fresh_user_slot_is_not_spent() {
+        assert!(!App::workspace_is_spent(&ws("my-new-workspace"), &[]));
+    }
+
+    /// Renaming a marker via A-e claims it: without the "agent: " prefix
+    /// the tombstone requirement is back in force.
+    #[test]
+    fn renamed_marker_regains_tombstone_requirement() {
+        assert!(!App::workspace_is_spent(&ws("keep this one"), &[]));
+    }
+
+    /// A bound task that isn't Done keeps the workspace open — the
+    /// stray-but-live condition the operator wants visible.
+    #[test]
+    fn bound_active_task_keeps_workspace_open() {
+        let mut w = ws("agent: BUG-999 fix");
+        w.tombstones.push(tomb(Some("t-999")));
+        for status in [TaskStatus::Running, TaskStatus::Blocked] {
+            let tasks = vec![task("t-999", Some(&w.id), status)];
+            assert!(!App::workspace_is_spent(&w, &tasks));
+        }
+        let tasks = vec![task("t-999", Some(&w.id), TaskStatus::Done)];
+        assert!(App::workspace_is_spent(&w, &tasks));
+    }
+
+    /// New gate added with the hoist: a still-active task referenced only
+    /// by a tombstone's `task_id` (its TaskEntry never bound to the
+    /// synthetic workspace id — e.g. a remote worktree path local
+    /// recovery can't match) also keeps the workspace open. A dead
+    /// session under a running task is a leaked session, not litter.
+    #[test]
+    fn tombstone_task_still_active_keeps_workspace_open() {
+        let mut w = ws("agent: SCRAPER-042 fix");
+        w.tombstones.push(tomb(Some("t-042")));
+        let tasks = vec![task("t-042", None, TaskStatus::Running)];
+        assert!(!App::workspace_is_spent(&w, &tasks));
+        // Task gone from the retained set (reconcile drops terminal
+        // tasks) → reads as terminal → spent.
+        assert!(App::workspace_is_spent(&w, &[]));
+    }
+
+    /// Cloud and already-closed workspaces are never the sweep's business.
+    #[test]
+    fn cloud_and_closed_workspaces_never_spent() {
+        let mut cloud = ws("agent: cloudy");
+        cloud.is_cloud = true;
+        assert!(!App::workspace_is_spent(&cloud, &[]));
+        let mut closed = ws("agent: shut");
+        closed.is_closed = true;
+        assert!(!App::workspace_is_spent(&closed, &[]));
+    }
+
+    /// Any session row — live or ghost — keeps the workspace open;
+    /// ghosts are user-owned (A-w) and a live row may be a leak the
+    /// operator is watching.
+    #[test]
+    fn session_row_keeps_workspace_open() {
+        let session = crate::session::Session::new(
+            "/bin/true",
+            &[],
+            80,
+            24,
+            None,
+            HashMap::new(),
+            None,
+        )
+        .expect("test PTY");
+        let ts = crate::app::model::make_simple_session_with_uid(
+            "ts-ghost-0".into(),
+            "ghost",
+            "claude",
+            session,
+            None,
+        );
+        let mut w = ws("agent: leaked");
+        w.sessions.push(ts);
+        assert!(!App::workspace_is_spent(&w, &[]));
+    }
+
+    /// Sweep-level: spent workspaces flip `is_closed`, while workspaces
+    /// with an attach still pending/in-flight (deferred remote reattach,
+    /// attach-worker dispatch, offline-host preserved entries) are
+    /// exempt — their sessions are unreachable, not gone.
+    #[test]
+    fn sweep_closes_spent_but_spares_attach_pending() {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // Manifest saves no-op (sessions_restored=false) — in-memory
+        // asserts only, same convention as revive_session_tests.
+        app.workspaces.push(ws("agent: reap-me"));
+        app.workspaces.push(ws("agent: offline-host"));
+        app.workspaces.push(ws("agent: reattach-queued"));
+        app.workspaces.push(ws("fresh-user-slot"));
+
+        let offline_id = app.workspaces[1].id.clone();
+        app.skipped_manifest_entries
+            .insert(offline_id, Vec::new());
+        let queued_id = app.workspaces[2].id.clone();
+        let entry: cm_daemon::manifest::ManifestEntry =
+            serde_json::from_value(serde_json::json!({
+                "label": "w",
+                "session_type": "claude",
+                "transcript_id": null,
+            }))
+            .expect("minimal manifest entry");
+        app.pending_remote_reattach
+            .push(crate::app::remote::PendingRemoteReattach::new(
+                queued_id, entry,
+            ));
+        // Park the cursor on the fresh slot so the focus exemption
+        // (pinned separately below) doesn't shield workspaces[0].
+        app.cursor = Cursor::Workspace(3);
+
+        app.reap_spent_workspaces();
+
+        assert!(
+            app.workspaces[0].is_closed,
+            "spent marker must be soft-closed by the sweep",
+        );
+        assert!(
+            !app.workspaces[1].is_closed,
+            "offline-host preserved workspace must survive the sweep",
+        );
+        assert!(
+            !app.workspaces[2].is_closed,
+            "reattach-queued workspace must survive the sweep",
+        );
+        assert!(
+            !app.workspaces[3].is_closed,
+            "fresh user slot must survive the sweep",
+        );
+    }
+
+    /// Focus exemption: the workspace under the cursor is never swept —
+    /// an A-O reopen parks the cursor on the reopened workspace, and the
+    /// next reconcile tick must not close it out from under the operator.
+    #[test]
+    fn sweep_spares_workspace_under_cursor() {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.workspaces.push(ws("agent: focused-marker"));
+        app.workspaces.push(ws("agent: background-marker"));
+        app.cursor = Cursor::Workspace(0);
+
+        app.reap_spent_workspaces();
+        assert!(
+            !app.workspaces[0].is_closed,
+            "cursor-focused workspace must survive the sweep",
+        );
+        assert!(
+            app.workspaces[1].is_closed,
+            "non-focused spent marker still reaped",
         );
     }
 }

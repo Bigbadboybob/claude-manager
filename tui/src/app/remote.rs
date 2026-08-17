@@ -45,6 +45,13 @@ impl PendingRemoteReattach {
             last_attempt_at: None,
         }
     }
+
+    /// Target workspace of this deferred reattach. The spent-workspace sweep
+    /// uses it to exempt workspaces whose sessions are merely unreachable —
+    /// pending here — from being reaped as sessionless.
+    pub(super) fn ws_id(&self) -> &str {
+        &self.ws_id
+    }
 }
 
 /// Remote auto-reconnect: retry a dead attach at most this often. The main
