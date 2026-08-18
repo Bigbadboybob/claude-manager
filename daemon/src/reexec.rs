@@ -81,8 +81,14 @@
 //!   the daemon started with `CM_REEXEC=1`.
 //! - **The full close-every-unlisted-inherited-fd audit** on the
 //!   rehydrate side; escrow closes exactly what it owns.
-//! - **TLS listeners.** The exec side writes `tls_listener_fd: None`;
-//!   don't point the dev flag at a `[tls]`-configured daemon.
+//! - **TLS listeners.** The exec side writes `tls_listener_fd: None`.
+//!   Since phase 4g (audit gap 8) [`perform_reexec`] REFUSES on a
+//!   `[tls]`-configured daemon — before the preflight, nothing
+//!   happened — instead of relying on this doc's old "don't point the
+//!   dev flag at a TLS daemon" advisory (a swap there would drop every
+//!   TLS client, and a fresh TLS re-bind failure in `run()` exits
+//!   BEFORE `complete_handoff`, the crash-class outcome with escrow
+//!   unresolved).
 //!
 //! Phase 4b (R11) closed three 4a gaps in this module: the manifest
 //! carries the FULL session record (schema v2 — identity, bindings,
@@ -205,6 +211,34 @@ pub fn perform_reexec(
     target: &Path,
     skip_preflight: bool,
 ) -> anyhow::Error {
+    // ---- Step (a0): refuse under [tls] (phase 4g, audit gap 8). ----
+    // TLS listener handoff is unimplemented: the exec side writes
+    // `tls_listener_fd: None`, and `run()` re-binds the TLS listener
+    // FRESH at startup with a loud-fatal error path that sits BEFORE
+    // `complete_handoff` — so on a `[tls]`-configured daemon a swap
+    // drops every TLS client, and a re-bind failure exits the new
+    // image with the escrow unresolved: children orphaned by PTY
+    // teardown, the crash-class outcome. Refuse up front — before the
+    // pin, the preflight, and every point of side effect — while
+    // NOTHING has happened. (Pre-4g the module doc's "don't point the
+    // dev flag at a TLS daemon" was the only guard.)
+    {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(tls) = &st.config.tls {
+            return anyhow::anyhow!(
+                "re-exec REFUSED: this daemon carries a [tls] listener \
+                 config (listen_addr {}), and TLS listener handoff is \
+                 unimplemented — a re-exec'd daemon would drop every TLS \
+                 client and could die at the fresh TLS re-bind BEFORE \
+                 complete_handoff resolves the escrow (children orphaned: \
+                 the crash-class outcome). Use drain + legacy restart on \
+                 TLS-configured daemons until TLS handoff (R13) lands. \
+                 Nothing has happened.",
+                tls.listen_addr,
+            );
+        }
+    }
+
     // ---- Step (a): pin the executables (R7). ----
     // The target fd IS the binary that will be exec'd — everything
     // downstream goes through the fd, never the pathname, so the
@@ -1693,7 +1727,11 @@ pub enum HandoffOutcome {
     /// The rehydrate transaction committed: sessions are in the
     /// registry, swap-dead records are reaped + tombstoned (4b),
     /// escrow is released. `run()` SKIPS legacy `restore_sessions`
-    /// (R13).
+    /// (R13) but runs its NON-SPAWNING half
+    /// (`control::methods::rehydrate_derived_state` — phase 4g, audit
+    /// gap 2) so bindings / task-tree edges / the agent_task_edges
+    /// overlay / daemon-registered workspace rows come back from
+    /// `daemon-sessions.json` without spawning anything.
     Adopted {
         adopted: usize,
         /// Records whose child exited during the swap — reaped and
@@ -2037,6 +2075,52 @@ fn swap_exit_tombstone(
     }
 }
 
+/// The continuous run-close flip for a record whose child exited
+/// during the swap — DESIGN_SEAMLESS_RESTART phase 4g (audit gap 7).
+///
+/// A live continuous tick's exit reaches
+/// `control::methods::handle_session_exit`, which flips the task's
+/// ACTIVE run `Running → Done/Failed`; the swap-dead path records its
+/// tombstone directly (above), bypassing that callback — pre-4g the
+/// run stayed `Running` until the scheduler's `reconcile_orphans`
+/// misclassified the outcome `Orphaned`, and
+/// `consecutive_wedge_closes` was never reset. Apply the SAME flip
+/// here, through the shared
+/// [`crate::control::methods::close_continuous_run_for_exit`] (whose
+/// docs carry the double-guard and lock-safety arguments; its
+/// per-task flock IO is safe under the commit's pre-serving state-lock
+/// hold for the same reason it is under the reaper's).
+///
+/// Terminal-status classification mirrors `handle_session_exit`'s:
+/// a non-zero exit code is a genuine FAILURE; a clean exit (code 0)
+/// or a bare signal (code None) finishes the run `Done` — matching
+/// the live path's treatment of signal kills, and honest for the swap
+/// window, where a memory-cap kill cannot be attributed anyway (the
+/// old image's kill-log baseline died with it; see
+/// [`swap_exit_tombstone`]'s `memory_cap_kill: false`).
+fn swap_dead_continuous_close(
+    rec: &SessionRecord,
+    status: &crate::session::DaemonExitStatus,
+) {
+    let Some(ct_id) = rec.continuous_task_id.as_deref() else {
+        return;
+    };
+    let terminal = if matches!(status.code, Some(c) if c != 0) {
+        crate::continuous::task::RunStatus::Failed
+    } else {
+        crate::continuous::task::RunStatus::Done
+    };
+    eprintln!(
+        "cm-daemon: handoff session '{}' was continuous task '{}''s tick — \
+         closing its run {:?} (exited during the swap; exit code {:?}, \
+         signal {:?})",
+        rec.uid, ct_id, terminal, status.code, status.signal,
+    );
+    crate::control::methods::close_continuous_run_for_exit(
+        ct_id, &rec.uid, terminal,
+    );
+}
+
 /// The escrow/commit-gate transaction (design step 6, R5/R6; phase
 /// 4b restructured it into validate → build-all → reap-dead →
 /// commit).
@@ -2081,8 +2165,10 @@ fn swap_exit_tombstone(
 /// blocks on this lock, so every insert is visible before any exit
 /// callback can run): tombstone the reaped dead records (mirroring
 /// `handle_session_exit`'s provenance shape — an exit during the
-/// swap, not a kill), then arm ([`AdoptedSessionBuild::arm`]) and
-/// insert each survivor. Kill-on-drop begins at arm — that is the
+/// swap, not a kill — including its continuous run-close flip for
+/// dead records carrying a `continuous_task_id`; phase 4g, audit gap
+/// 7, see [`swap_dead_continuous_close`]), then arm
+/// ([`AdoptedSessionBuild::arm`]) and insert each survivor. Kill-on-drop begins at arm — that is the
 /// commit. A thread-spawn failure mid-arm still disarms the
 /// already-inserted sessions inside the same lock hold (drain +
 /// `mem::forget` — never Drop, which SIGKILLs) and returns `Err`
@@ -2316,6 +2402,11 @@ fn rehydrate_transaction(
             }
         }
         st.record_exited(swap_exit_tombstone(rec, worktree_path, exited_at));
+        // Phase 4g (audit gap 7): a swap-dead CONTINUOUS tick gets the
+        // same run-close flip `handle_session_exit` gives a live exit,
+        // instead of leaving its run `Running` for `reconcile_orphans`
+        // to misclassify `Orphaned`.
+        swap_dead_continuous_close(rec, &status);
         eprintln!(
             "cm-daemon: handoff session '{}' tombstoned (exited during the \
              re-exec swap; exit code {:?}, signal {:?}, reaped — no zombie)",
@@ -3224,6 +3315,262 @@ mod tests {
             err.to_string().contains("missing at read-back"),
             "diagnosis names the missing file: {}",
             err
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4g (audit gap 8): refuse re-exec under [tls]
+    // ---------------------------------------------------------------
+
+    /// A `[tls]`-configured daemon must REFUSE `perform_reexec` up
+    /// front — before the pin, the preflight, and every side effect —
+    /// naming the unimplemented TLS handoff. Pre-4g the only guard was
+    /// the module doc's advisory; a swap would drop every TLS client,
+    /// and a TLS re-bind failure in the new image is startup-fatal
+    /// BEFORE `complete_handoff` (crash-class, escrow unresolved).
+    #[test]
+    fn perform_reexec_refuses_tls_configured_daemon() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.tls = Some(crate::config::TlsConfig {
+            cert_path: "/nonexistent/cert.pem".into(),
+            key_path: "/nonexistent/key.pem".into(),
+            listen_addr: "127.0.0.1:18443".into(),
+        });
+
+        // The target path deliberately does NOT exist: if the TLS
+        // guard weren't first, the call would fail at the executable
+        // pin with a different message — the assertion below proves
+        // the refusal is the TLS one, i.e. nothing before it ran.
+        let err = perform_reexec(
+            &state,
+            Path::new("/nonexistent/cm-daemon-target"),
+            true,
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("re-exec REFUSED") && msg.contains("[tls]"),
+            "refusal must name the [tls] limitation: {}",
+            msg
+        );
+        assert!(
+            msg.contains("TLS listener handoff is unimplemented"),
+            "refusal must say WHY: {}",
+            msg
+        );
+        assert!(
+            msg.contains("127.0.0.1:18443"),
+            "refusal names the configured listener: {}",
+            msg
+        );
+
+        // Daemon state untouched: no drain latched, no restart in
+        // flight, registry empty — the refusal happened before the
+        // quiesce barrier ever began.
+        let st = state.lock().unwrap();
+        assert!(!st.draining, "refusal must not leave the daemon draining");
+        assert!(!st.restarting, "refusal must not latch `restarting`");
+        assert!(st.sessions.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4g (audit gap 7): swap-dead continuous run-close flip
+    // ---------------------------------------------------------------
+
+    /// Build a continuous task on disk with an ACTIVE run bound to
+    /// `session_uid`, so the flip under test has real state to close.
+    fn save_running_continuous(task_id: &str, session_uid: &str) {
+        use crate::continuous::task::{
+            self, ContinuousTask, Engine, RunMode, RunRecord, RunStatus,
+            Schedule,
+        };
+        let mut t = ContinuousTask::new(
+            task_id.into(),
+            "gap7".into(),
+            "ws-gap7".into(),
+            "/tmp/gap7-wt".into(),
+            Engine::Claude,
+            RunMode::Fresh,
+            Schedule::OnDemand,
+            "go".into(),
+        );
+        t.consecutive_wedge_closes = 3;
+        t.last_run = Some(RunRecord {
+            seq: 7,
+            fire_token: "ft-gap7".into(),
+            started_at: 1,
+            finished_at: None,
+            session_uid: Some(session_uid.into()),
+            status: RunStatus::Running,
+            trigger_source: "test".into(),
+        });
+        task::save(&t).expect("save continuous task");
+    }
+
+    /// A crafted swap-dead record for the gap-7 tests.
+    fn continuous_dead_record(uid: &str, ct_id: Option<&str>) -> SessionRecord {
+        SessionRecord {
+            uid: uid.into(),
+            generation: 1,
+            transcript_id: None,
+            transcript_path: None,
+            session_type: "claude-code".into(),
+            title: "gap7 tick".into(),
+            workspace_id: "ws-gap7".into(),
+            task_id: None,
+            managed_by_uid: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: ct_id.map(str::to_string),
+            global_perms: false,
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            last_activity_age_s: None,
+            last_input_age_s: None,
+            last_operator_input_age_s: None,
+            last_turn_end_age_s: None,
+            done_report: None,
+            child_pid: 4242,
+            child_start_time: 1,
+            pty_master_fd: 50,
+            pidfd: 51,
+            cgroup_prefix: None,
+            watcher_checkpoint: None,
+        }
+    }
+
+    /// The gap-7 regression: a continuous tick whose child exited
+    /// during the swap gets the SAME run-close flip a live exit gets
+    /// from `handle_session_exit` — clean exit → `Done` (+ wedge-streak
+    /// reset), non-zero exit → `Failed` (streak preserved) — instead of
+    /// leaving the run `Running` for the scheduler's
+    /// `reconcile_orphans` to misclassify `Orphaned`.
+    #[test]
+    fn swap_dead_continuous_close_flips_running_run() {
+        use crate::continuous::task::{self, RunStatus};
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+
+        // Clean exit (code 0) → Done, finished_at stamped, wedge
+        // streak reset.
+        save_running_continuous("ct-gap7-done", "ts-gap7-dead");
+        let rec = continuous_dead_record("ts-gap7-dead", Some("ct-gap7-done"));
+        swap_dead_continuous_close(
+            &rec,
+            &crate::session::DaemonExitStatus {
+                code: Some(0),
+                signal: None,
+            },
+        );
+        let t = task::load_one("ct-gap7-done").expect("task on disk");
+        let run = t.last_run.expect("run present");
+        assert_eq!(run.status, RunStatus::Done, "clean swap exit closes Done");
+        assert!(run.finished_at.is_some(), "finished_at stamped");
+        assert_eq!(
+            t.consecutive_wedge_closes, 0,
+            "a Done close ends the wedge streak (was 3)"
+        );
+
+        // Non-zero exit → Failed; the wedge streak is NOT a clean
+        // completion's to reset.
+        save_running_continuous("ct-gap7-fail", "ts-gap7-dead");
+        swap_dead_continuous_close(
+            &continuous_dead_record("ts-gap7-dead", Some("ct-gap7-fail")),
+            &crate::session::DaemonExitStatus {
+                code: Some(2),
+                signal: None,
+            },
+        );
+        let t = task::load_one("ct-gap7-fail").expect("task on disk");
+        assert_eq!(
+            t.last_run.as_ref().unwrap().status,
+            RunStatus::Failed,
+            "non-zero swap exit is a genuine failure"
+        );
+        assert_eq!(
+            t.consecutive_wedge_closes, 3,
+            "Failed close preserves the wedge streak"
+        );
+
+        // Bare signal (code None) → Done, matching handle_session_exit's
+        // treatment of signal kills (and honest for the swap window,
+        // where a cap kill can't be attributed).
+        save_running_continuous("ct-gap7-sig", "ts-gap7-dead");
+        swap_dead_continuous_close(
+            &continuous_dead_record("ts-gap7-dead", Some("ct-gap7-sig")),
+            &crate::session::DaemonExitStatus {
+                code: None,
+                signal: Some(9),
+            },
+        );
+        assert_eq!(
+            task::load_one("ct-gap7-sig")
+                .unwrap()
+                .last_run
+                .unwrap()
+                .status,
+            RunStatus::Done,
+            "bare-signal swap exit mirrors the live path's Done"
+        );
+    }
+
+    /// The flip's guards hold on the swap-dead path too: a record with
+    /// no `continuous_task_id` is a no-op; a run bound to a DIFFERENT
+    /// session uid is untouched (the double guard — never close another
+    /// tick's run); a run that already left `Running` (e.g. the
+    /// watchdog escalated it `Stuck` pre-swap) is preserved.
+    #[test]
+    fn swap_dead_continuous_close_respects_guards() {
+        use crate::continuous::task::{self, RunStatus};
+        let _g = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = set_home(dir.path());
+        let status = crate::session::DaemonExitStatus {
+            code: Some(0),
+            signal: None,
+        };
+
+        // No continuous tag → nothing written anywhere (no task dir
+        // appears).
+        swap_dead_continuous_close(
+            &continuous_dead_record("ts-gap7-plain", None),
+            &status,
+        );
+        assert!(
+            !crate::continuous::task::tasks_dir().exists(),
+            "an untagged record must not touch continuous state"
+        );
+
+        // Uid mismatch → run untouched.
+        save_running_continuous("ct-gap7-other", "ts-gap7-OTHER");
+        swap_dead_continuous_close(
+            &continuous_dead_record("ts-gap7-dead", Some("ct-gap7-other")),
+            &status,
+        );
+        let t = task::load_one("ct-gap7-other").expect("task on disk");
+        assert_eq!(
+            t.last_run.as_ref().unwrap().status,
+            RunStatus::Running,
+            "another session's run must never be closed"
+        );
+
+        // Already-escalated run (Stuck) → preserved.
+        save_running_continuous("ct-gap7-stuck", "ts-gap7-dead");
+        let _ = task::modify("ct-gap7-stuck", |t| {
+            t.last_run.as_mut().unwrap().status = RunStatus::Stuck;
+        });
+        swap_dead_continuous_close(
+            &continuous_dead_record("ts-gap7-dead", Some("ct-gap7-stuck")),
+            &status,
+        );
+        assert_eq!(
+            task::load_one("ct-gap7-stuck")
+                .unwrap()
+                .last_run
+                .unwrap()
+                .status,
+            RunStatus::Stuck,
+            "a pre-swap Stuck escalation must survive the flip"
         );
     }
 }

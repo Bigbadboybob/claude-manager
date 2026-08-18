@@ -1252,35 +1252,13 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
         state.record_exited(tomb);
     }
     // Continuous Tasks Phase 3b completion signal (b): a continuous-task session
-    // exiting CLEANLY clears its ACTIVE run (DESIGN_CONTINUOUS_TASKS.md §11). The
-    // DOUBLE guard (session_uid match + status==Running) keeps every kill path
-    // benign: operator kill → Done (fine); watchdog escalate sets Stuck FIRST so
-    // the kill's exit sees status!=Running → Stuck preserved; resolve_stuck
-    // restart re-fires a NEW last_run (new uid) so the killed uid mismatches →
-    // no-op; the investigator's own exit (its uid != last_run.session_uid) is a
-    // no-op too. `task::modify` is per-task flock disk IO with ZERO DaemonState
-    // re-entrancy, so it is safe under this reaper-held lock. Best-effort: a
-    // failed persist only leaves the run Running (the watchdog/orphan reconciler
-    // is the backstop), so log nothing louder than the swallow.
+    // exiting CLEANLY clears its ACTIVE run. Guards, kill-path analysis, and the
+    // lock-safety argument live on [`close_continuous_run_for_exit`] — shared
+    // with the re-exec swap-dead tombstone path since phase 4g (audit gap 7).
     if let (Some(ct_id), Some(terminal_status)) =
         (continuous_task_id, continuous_terminal_status)
     {
-        let _ = crate::continuous::task::modify(&ct_id, |t| {
-            if let Some(run) = t.last_run.as_mut() {
-                if run.session_uid.as_deref() == Some(uid)
-                    && matches!(run.status, crate::continuous::task::RunStatus::Running)
-                {
-                    run.status = terminal_status;
-                    run.finished_at = Some(crate::continuous::task::now_unix());
-                    // A CLEAN exit ends any consumer-wedge streak (the
-                    // scheduler's close limit counts consecutive wedges);
-                    // a Failed exit is not a clean completion — leave it.
-                    if terminal_status == crate::continuous::task::RunStatus::Done {
-                        t.consecutive_wedge_closes = 0;
-                    }
-                }
-            }
-        });
+        close_continuous_run_for_exit(&ct_id, uid, terminal_status);
     }
     state.sessions.remove(uid);
     // P0 session durability (S1): persist the registry now that the
@@ -1289,6 +1267,52 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
     // the staleness window. Best-effort; runs under the reaper/kill
     // lock that guards the remove above.
     state.persist_sessions_best_effort();
+}
+
+/// The continuous run-close flip (Continuous Tasks Phase 3b completion
+/// signal (b), DESIGN_CONTINUOUS_TASKS.md §11), shared between the two
+/// paths that observe a continuous session's terminal state:
+///
+///   * [`handle_session_exit`] — a live session's reaper callback;
+///   * `reexec::rehydrate_transaction`'s swap-dead tombstone commit
+///     (DESIGN_SEAMLESS_RESTART phase 4g, audit gap 7) — a tick that
+///     exited DURING the re-exec swap bypasses the reaper entirely, so
+///     pre-4g its run stayed `Running` until the scheduler's
+///     `reconcile_orphans` misclassified the outcome `Orphaned` and
+///     `consecutive_wedge_closes` was never reset.
+///
+/// The DOUBLE guard (session_uid match + status==Running) keeps every
+/// other path benign: operator kill → Done (fine); watchdog escalate
+/// sets Stuck FIRST so the kill's exit sees status!=Running → Stuck
+/// preserved; resolve_stuck restart re-fires a NEW last_run (new uid)
+/// so the old uid mismatches → no-op; an investigator's own exit (its
+/// uid != last_run.session_uid) is a no-op too. A CLEAN completion
+/// (`Done`) also ends any consumer-wedge streak; a `Failed` exit is
+/// not a clean completion — the streak is left alone.
+///
+/// `task::modify` is per-task flock disk IO with ZERO DaemonState
+/// re-entrancy, so it is safe under the reaper-held state lock (and
+/// under the rehydrate commit's pre-serving lock hold). Best-effort: a
+/// failed persist only leaves the run Running (the watchdog/orphan
+/// reconciler is the backstop), so log nothing louder than the swallow.
+pub(crate) fn close_continuous_run_for_exit(
+    continuous_task_id: &str,
+    session_uid: &str,
+    terminal_status: crate::continuous::task::RunStatus,
+) {
+    let _ = crate::continuous::task::modify(continuous_task_id, |t| {
+        if let Some(run) = t.last_run.as_mut() {
+            if run.session_uid.as_deref() == Some(session_uid)
+                && matches!(run.status, crate::continuous::task::RunStatus::Running)
+            {
+                run.status = terminal_status;
+                run.finished_at = Some(crate::continuous::task::now_unix());
+                if terminal_status == crate::continuous::task::RunStatus::Done {
+                    t.consecutive_wedge_closes = 0;
+                }
+            }
+        }
+    });
 }
 
 /// Sanity-check for a TUI-supplied session uid. Slice 10c-e-3b-fix:
@@ -8676,6 +8700,172 @@ fn resolve_continuous_cap(
 // P0 session durability — S2 (restore). DESIGN_SESSION_DURABILITY.md.
 // ===================================================================
 
+/// The NON-SPAWNING half of [`restore_sessions`]: rebuild the derived
+/// state that `daemon-sessions.json` (+ the planning API) carries,
+/// without touching any session process. DESIGN_SEAMLESS_RESTART
+/// phase 4g (audit gap 2). Called from BOTH startup shapes:
+///
+///   * legacy [`restore_sessions`] (fresh boot / re-exec terminal
+///     fallback), which follows it with the re-spawning half;
+///   * `run()`'s re-exec **Adopted** arm, after
+///     `reexec::complete_handoff` commits. The children are alive and
+///     adopted there, so the spawn half must NOT run (R13 — `--resume`
+///     duplicates) — but skipping this half too was audit gap 2: the
+///     swapped daemon came back with empty `bindings` /
+///     `agent_task_edges` / daemon-registered `workspaces` (most
+///     acutely headless, where no TUI push papers over it), so
+///     `start_session(task_id=…)` into an existing subtask worktree
+///     failed NotFound "no bound workspace" and creators lost
+///     descendant scope over agent-minted tasks — the phantom-task
+///     `unauthorized: task '<id>' is not the caller's task or a
+///     descendant` class this project already fixed once (see
+///     `DaemonState::agent_task_edges`).
+///
+/// What it rebuilds, and why each map matters after a restart/swap:
+///   * **daemon-registered workspaces** (crucially `worktree_path`):
+///     `state.workspaces` is otherwise seeded only from the TUI's
+///     `tui-sessions.json`, so headless/daemon-spawned workspaces —
+///     the resolve target for spawning into an existing checkout, and
+///     the `worktree_path` source for tombstones and `list_sessions`
+///     rows — would be gone. `entry().or_insert` merge: anything the
+///     running daemon already registered wins.
+///   * **`bindings`** (task -> workspace): the restart-survivable
+///     resolver for `mcp_start_session(task_id=…)`; empty =>
+///     "no bound workspace". Two persisted sources, both merged:
+///     the manifest's explicit `bindings` map (recorded truth —
+///     `build_daemon_manifest` keeps it whole, covering a task minted
+///     by `create_subtask` whose worker never spawned), then a
+///     derivation from the persisted sessions' task ids (the
+///     empty-persisted-bindings self-heal `load_manifest_from_disk`
+///     also applies). Explicit wins over derived; live wins over both
+///     (`or_insert` throughout).
+///   * **`task_tree` edges from the planning API**: the basis of ALL
+///     descendant-scope auth; empty => every orchestrator->subtask op
+///     (`mark_subtask_done`, `set_subtask_status`, `update_task`,
+///     `trigger`) fails the descendant gate for pre-restart subtasks.
+///     Best-effort exactly as restore always treated it — the daemon
+///     holds the creds, and an offline/slow API (bounded by the
+///     planning client's 10s global timeout) is silently skipped: it
+///     must never fail startup, and on the Adopted path it must never
+///     fail the handoff.
+///   * **the `agent_task_edges` overlay** (fix-start-session):
+///     re-applied via `record_agent_task_edge`, which also seeds
+///     `task_tree` — deliberately overriding the planning-derived edge
+///     above, because planning records `propose_task` rows and
+///     parent-deleted subtasks as top-level, which is exactly the
+///     shape the overlay exists to correct.
+///
+/// Returns the parsed manifest so [`restore_sessions`] can feed its
+/// spawn half from the same read; `None` when there is nothing to
+/// rehydrate (no `daemon_sessions_path`, absent file, or a parse
+/// failure — logged, never fatal).
+pub fn rehydrate_derived_state(
+    state_arc: &Arc<Mutex<DaemonState>>,
+) -> Option<crate::manifest::Manifest> {
+    let path = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.daemon_sessions_path.clone()
+    }?;
+    let manifest = match crate::state::read_daemon_sessions(&path) {
+        Ok(Some(m)) => m,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: could not read durable session registry {} ({}); \
+                 starting with no restored sessions",
+                path.display(),
+                e,
+            );
+            return None;
+        }
+    };
+
+    let derived_bindings: Vec<(String, String)> = manifest
+        .workspaces
+        .iter()
+        .flat_map(|(ws_id, ws)| {
+            ws.sessions
+                .iter()
+                .filter_map(move |s| s.task_id.clone().map(|t| (t, ws_id.clone())))
+        })
+        .collect();
+    let (api_url, api_token) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (st.config.api_url.clone(), st.config.api_token.clone())
+    };
+    // No DaemonState lock held across this (potentially slow) HTTP call.
+    let tree_edges: Vec<(String, String)> =
+        PlanningApiCreds::from_config(&api_url, &api_token)
+            .ok()
+            .and_then(|creds| api_list_tasks(&creds).ok())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let id = row.get("id").and_then(|v| v.as_str())?.to_string();
+                        let parent =
+                            row.get("parent_task_id").and_then(|v| v.as_str())?.to_string();
+                        Some((id, parent))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    let (n_bind, n_edge) = (derived_bindings.len(), tree_edges.len());
+    let n_ws;
+    {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        // Daemon-registered workspace rows (gap 2): re-enter the
+        // persisted entries — worktree paths included — that only
+        // `daemon-sessions.json` carries. `or_insert` so live state
+        // (TUI-loaded rows, spawn-time auto-registers) always wins.
+        n_ws = manifest
+            .workspaces
+            .iter()
+            .filter(|(ws_id, _)| !st.workspaces.contains_key(*ws_id))
+            .count();
+        for (ws_id, ws) in &manifest.workspaces {
+            st.workspaces
+                .entry(ws_id.clone())
+                .or_insert_with(|| ws.clone());
+        }
+        // Explicit persisted bindings first (recorded truth), then the
+        // sessions-derived reconstruction — same precedence
+        // `load_manifest_from_disk` applies.
+        for (task_id, ws_id) in &manifest.bindings {
+            st.bindings
+                .entry(task_id.clone())
+                .or_insert_with(|| ws_id.clone());
+        }
+        for (task_id, ws_id) in derived_bindings {
+            st.bindings.entry(task_id).or_insert(ws_id);
+        }
+        for (child, parent) in tree_edges {
+            st.task_tree.entry(child).or_insert(Some(parent));
+        }
+        // Agent-minted creator edges (fix-start-session): restore the
+        // overlay from the persisted manifest so a creator keeps
+        // descendant scope over tasks it minted (and the workers it
+        // spawned on them) across the restart. `record_agent_task_edge`
+        // also seeds `task_tree`, deliberately overriding the planning-
+        // derived edge above — planning records `propose_task` rows and
+        // parent-deleted subtasks as top-level, which is exactly the
+        // shape the overlay exists to correct.
+        for (child, parent) in &manifest.agent_task_edges {
+            st.record_agent_task_edge(child, parent);
+        }
+    }
+    eprintln!(
+        "cm-daemon: rehydrated {} persisted + {} derived task->workspace \
+         binding(s), {} task_tree edge(s), {} agent-minted edge(s), {} \
+         workspace registration(s) on restore",
+        manifest.bindings.len(),
+        n_bind,
+        n_edge,
+        manifest.agent_task_edges.len(),
+        n_ws,
+    );
+    Some(manifest)
+}
+
 /// At daemon startup, re-spawn the sessions the daemon was running before it
 /// stopped, reading the durable registry S1 persisted to
 /// `daemon-sessions.json`. This is the half that makes a `systemctl restart
@@ -8699,98 +8889,24 @@ fn resolve_continuous_cap(
 /// and skipped; one bad entry can't wedge the daemon. Runs before the control
 /// listener accepts (caller ordering in `lib.rs::run`) so a reconnecting TUI
 /// can't reattach mid-spawn.
+///
+/// DESIGN_SEAMLESS_RESTART phase 4g (audit gap 2): the NON-SPAWNING half of
+/// this function lives in [`rehydrate_derived_state`], which the re-exec
+/// Adopted path also calls — see its docs.
 pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
+    // The NON-SPAWNING half (shared with the re-exec Adopted path — see
+    // `rehydrate_derived_state`): read the durable registry and rebuild the
+    // derived maps. `None` means nothing to restore (no path / absent file /
+    // parse failure, all logged there).
+    let Some(manifest) = rehydrate_derived_state(state_arc) else {
+        return;
+    };
+    // Re-read the path for the progress log below (it is `Some` — the
+    // rehydrate returned a manifest read from it).
     let path = {
         let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        st.daemon_sessions_path.clone()
+        st.daemon_sessions_path.clone().unwrap_or_default()
     };
-    let Some(path) = path else { return };
-    let manifest = match crate::state::read_daemon_sessions(&path) {
-        Ok(Some(m)) => m,
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!(
-                "cm-daemon: could not read durable session registry {} ({}); \
-                 starting with no restored sessions",
-                path.display(),
-                e,
-            );
-            return;
-        }
-    };
-
-    // Headless binding + task-tree rehydration. A headless daemon has no TUI
-    // `task.update_tree` push, so after a restart both maps would start EMPTY —
-    // and each silently breaks a whole class of ops:
-    //   * `bindings` (task -> workspace) is the restart-survivable resolver for
-    //     `mcp_start_session(task_id=…)`; empty => "no bound workspace".
-    //   * `task_tree` (task -> parent) is the basis of ALL descendant-scope auth;
-    //     empty => every orchestrator->subtask op (`mark_subtask_done`,
-    //     `set_subtask_status`, `update_task`, `trigger`) fails the descendant
-    //     gate for pre-restart subtasks.
-    // Rebuild both here (before the empty-targets early-return below, so a task
-    // whose sessions all exited still gets its binding + auth edges). Bindings
-    // derive from the restored manifest (disk-only, always available);
-    // `task_tree` is best-effort from the planning API (the daemon holds the
-    // creds — a headless restart with the API briefly down just leaves it to
-    // the next `create_subtask`). `or_insert` so an explicit later value wins.
-    {
-        let derived_bindings: Vec<(String, String)> = manifest
-            .workspaces
-            .iter()
-            .flat_map(|(ws_id, ws)| {
-                ws.sessions
-                    .iter()
-                    .filter_map(move |s| s.task_id.clone().map(|t| (t, ws_id.clone())))
-            })
-            .collect();
-        let (api_url, api_token) = {
-            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            (st.config.api_url.clone(), st.config.api_token.clone())
-        };
-        // No DaemonState lock held across this (potentially slow) HTTP call.
-        let tree_edges: Vec<(String, String)> =
-            PlanningApiCreds::from_config(&api_url, &api_token)
-                .ok()
-                .and_then(|creds| api_list_tasks(&creds).ok())
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|row| {
-                            let id = row.get("id").and_then(|v| v.as_str())?.to_string();
-                            let parent =
-                                row.get("parent_task_id").and_then(|v| v.as_str())?.to_string();
-                            Some((id, parent))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-        let (n_bind, n_edge) = (derived_bindings.len(), tree_edges.len());
-        {
-            let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            for (task_id, ws_id) in derived_bindings {
-                st.bindings.entry(task_id).or_insert(ws_id);
-            }
-            for (child, parent) in tree_edges {
-                st.task_tree.entry(child).or_insert(Some(parent));
-            }
-            // Agent-minted creator edges (fix-start-session): restore the
-            // overlay from the persisted manifest so a creator keeps
-            // descendant scope over tasks it minted (and the workers it
-            // spawned on them) across the restart. `record_agent_task_edge`
-            // also seeds `task_tree`, deliberately overriding the planning-
-            // derived edge above — planning records `propose_task` rows and
-            // parent-deleted subtasks as top-level, which is exactly the
-            // shape the overlay exists to correct.
-            for (child, parent) in &manifest.agent_task_edges {
-                st.record_agent_task_edge(child, parent);
-            }
-        }
-        eprintln!(
-            "cm-daemon: rehydrated {} task->workspace binding(s), {} task_tree edge(s), \
-             {} agent-minted edge(s) on restore",
-            n_bind, n_edge, manifest.agent_task_edges.len(),
-        );
-    }
 
     // Collect (workspace_id, worktree, entry) for every in-scope session.
     let mut targets: Vec<(String, std::path::PathBuf, crate::manifest::ManifestEntry)> =
@@ -18869,6 +18985,142 @@ mod tests {
         drop(s);
         // Drop the restored bash child (its Drop SIGKILLs it).
         state.lock().unwrap().sessions.clear();
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 4g (audit gap 2):
+    /// [`rehydrate_derived_state`] — the non-spawning half of restore,
+    /// shared with `run()`'s re-exec **Adopted** arm — rebuilds every
+    /// derived map from a crafted `daemon-sessions.json` WITHOUT
+    /// spawning anything. This is the post-Adopted-handoff
+    /// post-condition at the unit level: a daemon-registered workspace
+    /// binding and an `agent_task_edges` edge persisted pre-swap answer
+    /// correctly afterwards.
+    ///
+    /// The `agent_task_edges` half is the phantom-task regression this
+    /// prevents: pre-4g an Adopted swap dropped the creator edge (only
+    /// legacy restore re-applied it), so the creator's next
+    /// `start_session(task_id=<minted>)` bounced `unauthorized: task
+    /// '<id>' is not the caller's task or a descendant` — the exact
+    /// class fixed once already (see `DaemonState::agent_task_edges`);
+    /// the descendant predicate is asserted directly below.
+    ///
+    /// Best-effort planning API is pinned too: `config.api_url` is
+    /// empty here, so the task-tree fetch is skipped — an offline API
+    /// must fail neither startup nor the handoff.
+    #[test]
+    fn rehydrate_derived_state_rebuilds_derived_maps_without_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon-sessions.json");
+
+        // Crafted persisted registry: one daemon-registered workspace
+        // (worktree path + a session bound to a task), one explicit
+        // binding with no live session behind it (the
+        // create_subtask-minted shape), one agent-minted creator edge,
+        // and a workspace id that collides with a LIVE row.
+        let mut ws = crate::manifest::ManifestWorkspace::default();
+        ws.id = "ws-g2".into();
+        ws.worktree_path = Some(std::path::PathBuf::from("/g2/worktree"));
+        let mut sess = me("ts-aaaaaaaaaaaaaaaa-2", "bash");
+        sess.task_id = Some("task-sub".into());
+        ws.sessions = vec![sess];
+        let mut stale = crate::manifest::ManifestWorkspace::default();
+        stale.id = "ws-live".into();
+        stale.worktree_path = Some(std::path::PathBuf::from("/stale/persisted"));
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest.workspaces.insert("ws-g2".into(), ws);
+        manifest.workspaces.insert("ws-live".into(), stale);
+        manifest
+            .bindings
+            .insert("task-explicit".into(), "ws-g2".into());
+        manifest
+            .agent_task_edges
+            .insert("task-minted".into(), "task-parent".into());
+        std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let state = make_state_arc();
+        {
+            let mut st = state.lock().unwrap();
+            st.daemon_sessions_path = Some(path.clone());
+            // A live registration that must WIN the or_insert merge.
+            st.workspaces.insert(
+                "ws-live".into(),
+                crate::manifest::ManifestWorkspace {
+                    id: "ws-live".into(),
+                    worktree_path: Some(std::path::PathBuf::from("/live/wins")),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let returned = rehydrate_derived_state(&state)
+            .expect("manifest parsed and returned for the spawn half");
+        assert_eq!(returned.workspaces.len(), 2);
+
+        let st = state.lock().unwrap();
+        // Non-spawning: nothing entered the live registry.
+        assert!(st.sessions.is_empty(), "rehydrate must not spawn");
+        // Workspace registration (the gap-2 loss): the daemon-registered
+        // row is back, worktree path included…
+        assert_eq!(
+            st.workspaces
+                .get("ws-g2")
+                .and_then(|w| w.worktree_path.as_deref()),
+            Some(std::path::Path::new("/g2/worktree")),
+            "daemon-registered workspace re-entered state.workspaces",
+        );
+        // …and live state won the collision.
+        assert_eq!(
+            st.workspaces
+                .get("ws-live")
+                .and_then(|w| w.worktree_path.as_deref()),
+            Some(std::path::Path::new("/live/wins")),
+            "or_insert merge: the live registration wins",
+        );
+        // Bindings: derived from the persisted session AND the explicit
+        // persisted map.
+        assert_eq!(
+            st.bindings.get("task-sub").map(String::as_str),
+            Some("ws-g2"),
+            "session-derived binding rebuilt",
+        );
+        assert_eq!(
+            st.bindings.get("task-explicit").map(String::as_str),
+            Some("ws-g2"),
+            "explicit persisted binding rebuilt (minted-but-never-spawned shape)",
+        );
+        // The agent-minted creator edge is back in BOTH maps…
+        assert_eq!(
+            st.agent_task_edges.get("task-minted").map(String::as_str),
+            Some("task-parent"),
+            "agent_task_edges overlay rebuilt",
+        );
+        // …and the descendant predicate — the one whose failure IS the
+        // phantom-task `unauthorized` — answers correctly again.
+        assert!(
+            crate::control::auth::task_is_self_or_descendant_of(
+                &st.task_tree,
+                "task-minted",
+                "task-parent",
+            ),
+            "creator scope over the minted task restored (phantom-task class)",
+        );
+    }
+
+    /// [`rehydrate_derived_state`] no-op shapes: no configured path and
+    /// an absent file both return `None` (nothing to rehydrate, nothing
+    /// mutated) — the same early-outs restore has always had.
+    #[test]
+    fn rehydrate_derived_state_noops_without_a_registry() {
+        let state = make_state_arc();
+        assert!(rehydrate_derived_state(&state).is_none(), "no path");
+        let dir = tempfile::tempdir().unwrap();
+        state.lock().unwrap().daemon_sessions_path =
+            Some(dir.path().join("absent.json"));
+        assert!(rehydrate_derived_state(&state).is_none(), "absent file");
+        let st = state.lock().unwrap();
+        assert!(st.workspaces.is_empty());
+        assert!(st.bindings.is_empty());
+        assert!(st.agent_task_edges.is_empty());
     }
 
     /// S5: a SUPERVISED-PERSISTENT continuous session IS restored (resumed at

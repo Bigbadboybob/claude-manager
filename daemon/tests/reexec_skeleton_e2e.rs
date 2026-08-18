@@ -1460,6 +1460,25 @@ fn proc_state(pid: i32) -> Option<String> {
 /// swap. Post-swap: an exited tombstone for B (killed=false — the
 /// daemon never signaled it; provenance is a swap exit, not a
 /// kill), and NO zombie (the pid fully reaped via waitid(P_PIDFD)).
+///
+/// Phase 4g additions (audit gaps 2 + 4), on the same swap:
+///
+/// Session C is killed via `kill_session` BEFORE the swap, so its
+/// tombstone — `killed: true, killed_by: "operator"` — exists only in
+/// `recently_exited` when the exec fires. Post-swap it must still be
+/// served by `list_sessions(include_exited)` with provenance intact:
+/// the checked persistence pass wrote it to the 4c sidecar
+/// (`daemon-tombstones.json`) and the new image seeds from it at
+/// startup (gap 4's read side — pre-4g the row vanished, degrading
+/// read-after-exit to a bad-uid-shaped NotFound).
+///
+/// And the Adopted arm must run restore's NON-SPAWNING half (gap 2):
+/// the daemon log carries the rehydrate line — A's task binding
+/// derived from the swap-written `daemon-sessions.json`, and the
+/// daemon-registered workspace re-entering `state.workspaces` — the
+/// state whose absence made post-swap `start_session(task_id=…)`
+/// fail NotFound and creators lose scope over agent-minted tasks
+/// (the phantom-task `unauthorized` class).
 #[test]
 fn reexec_full_record_and_dead_record_tombstone() {
     let bin = env!("CARGO_BIN_EXE_cm-daemon");
@@ -1610,6 +1629,79 @@ fn reexec_full_record_and_dead_record_tombstone() {
         sb.daemon_pid, a_pid, a_start, b_pid, b_start
     );
 
+    // ---- Session C: killed PRE-swap (phase 4g, audit gap 4). ----
+    // Its tombstone — operator kill provenance included — lands in
+    // `recently_exited` before the swap, rides the 4c sidecar
+    // (`daemon-tombstones.json`, written by the checked persistence
+    // pass), and must be visible via `list_sessions(include_exited)`
+    // AFTER the swap. Pre-4g every pre-swap tombstone died with the
+    // old image.
+    let uid_c = "ts-e2ed-3";
+    let start = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "start_session",
+            serde_json::json!({
+                "uid": uid_c,
+                "workspace_id": "ws-reexec-e2e",
+                "worktree_path": sb.home.to_string_lossy(),
+                "label": "killed-pre-swap",
+                "argv": ["bash", "--norc"],
+                "working_dir": sb.home.to_string_lossy(),
+                "session_type": "bash",
+                "cols": 80,
+                "rows": 24,
+                "env": {}
+            }),
+        ),
+    )
+    .expect("start_session C");
+    assert!(start.ok, "start_session C failed: {:?}", start.error);
+    let kill = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "kill_session",
+            serde_json::json!({ "session_uid": uid_c }),
+        ),
+    )
+    .expect("kill_session C");
+    assert!(kill.ok, "kill_session C failed: {:?}", kill.error);
+    // Wait for the reaper to tombstone C (the tombstone must exist
+    // BEFORE the swap for the sidecar to carry it).
+    {
+        let socket = sb.socket.clone();
+        let token = sb.token.clone();
+        wait_for(
+            Instant::now() + Duration::from_secs(20),
+            "C's pre-swap exited tombstone",
+            &sb.guard,
+            || {
+                let resp = round_trip(
+                    &socket,
+                    &operator_request(
+                        &token,
+                        "list_sessions",
+                        serde_json::json!({ "include_exited": true }),
+                    ),
+                )
+                .ok()?;
+                resp.result
+                    .as_ref()?
+                    .as_array()?
+                    .iter()
+                    .find(|r| {
+                        r.get("session_uid").and_then(|v| v.as_str())
+                            == Some(uid_c)
+                            && r.get("state").and_then(|v| v.as_str())
+                                == Some("exited")
+                    })
+                    .map(|_| ())
+            },
+        );
+    }
+
     // ---- The mid-swap gate: a wrapper that parks between execs. ----
     // exec #1 replaces the daemon with this script (same PID, no
     // reapers anywhere); it blocks opening the FIFO until the test
@@ -1724,6 +1816,16 @@ fn reexec_full_record_and_dead_record_tombstone() {
         "adopted 1/2 session(s)",
         "exited during the re-exec swap",
         "tombstoned",
+        // Phase 4g gap 4 (read side): the new image seeded C's pre-swap
+        // tombstone from the 4c sidecar at startup.
+        "seeded 1 read-after-exit tombstone(s) from",
+        // Phase 4g gap 2: the Adopted arm ran the non-spawning
+        // rehydrate — A's task binding derived from the swap-written
+        // daemon-sessions.json, and the daemon-registered workspace
+        // (ws-reexec-e2e, absent from any tui-sessions.json) re-entered
+        // state.workspaces.
+        "1 derived task->workspace binding(s)",
+        "1 workspace registration(s) on restore",
     ] {
         assert!(
             log.contains(needle),
@@ -1856,6 +1958,46 @@ fn reexec_full_record_and_dead_record_tombstone() {
         "B's pid still holds its starttime — the zombie was never reaped.\n\
          --- daemon log tail ---\n{}",
         sb.guard.log_tail()
+    );
+
+    // ---- C: the PRE-swap tombstone survived the swap (gap 4). ----
+    // Killed before the exec, tombstoned by the live reaper path,
+    // persisted to the 4c sidecar by the checked pass, seeded back by
+    // the new image — read-after-exit and kill provenance intact.
+    let row_c = rows
+        .iter()
+        .find(|r| r.get("session_uid").and_then(|v| v.as_str()) == Some(uid_c))
+        .unwrap_or_else(|| {
+            panic!(
+                "C's pre-swap tombstone vanished across the swap (gap 4): \
+                 {}\n--- daemon log tail ---\n{}",
+                serde_json::to_string_pretty(rows).unwrap_or_default(),
+                sb.guard.log_tail()
+            )
+        });
+    assert_eq!(
+        row_c.get("state").and_then(|v| v.as_str()),
+        Some("exited"),
+        "row C: {}",
+        row_c
+    );
+    assert_eq!(
+        row_c.get("label").and_then(|v| v.as_str()),
+        Some("killed-pre-swap"),
+        "seeded tombstone lost C's label: {}",
+        row_c
+    );
+    assert_eq!(
+        row_c.get("killed").and_then(|v| v.as_bool()),
+        Some(true),
+        "C's kill fact lost across the swap: {}",
+        row_c
+    );
+    assert_eq!(
+        row_c.get("killed_by").and_then(|v| v.as_str()),
+        Some("operator"),
+        "C's kill attribution lost across the swap: {}",
+        row_c
     );
 
     // ---- A's PTY still flows through the adopted reader. ----

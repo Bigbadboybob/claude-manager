@@ -855,6 +855,88 @@ impl DaemonState {
             .find(|t| t.session_uid == uid)
     }
 
+    /// Seed [`Self::recently_exited`] from the 4c tombstone sidecar
+    /// (`daemon-tombstones.json`) — the READ side of audit gap 4
+    /// (DESIGN_SEAMLESS_RESTART phase 4g). The sidecar is written by the
+    /// re-exec swap's checked persistence pass
+    /// ([`Self::save_daemon_tombstones_checked`]); rebuilding from it at
+    /// startup is what makes read-after-exit
+    /// (`list_sessions(include_exited)`, `read_session_output` on a dead
+    /// uid) and kill/reported provenance survive the swap instead of
+    /// degrading to bad-uid-shaped NotFounds.
+    ///
+    /// Called on EVERY startup path, not just handoffs: a legacy daemon
+    /// restart loses read-after-exit exactly the same way, and a
+    /// swap-written sidecar is the freshest tombstone snapshot that
+    /// exists on any of them — seeding everywhere makes the sidecar
+    /// useful on every path at the cost of one small read.
+    ///
+    /// Merge discipline:
+    ///   * rows are applied oldest-`exited_at` first through
+    ///     [`Self::record_exited`], so the ring's front stays the oldest
+    ///     and cap eviction ([`RECENTLY_EXITED_CAP`]) drops seeded rows
+    ///     before anything recorded later — a sidecar can never evict a
+    ///     newer swap-produced tombstone (those land AFTER this seed, in
+    ///     the rehydrate commit, and `record_exited`'s per-uid de-dupe
+    ///     keeps the newest);
+    ///   * a uid already resident with a newer-or-equal `exited_at` is
+    ///     skipped, never clobbered by a staler sidecar row.
+    ///
+    /// Staleness is bounded and benign: the sidecar may predate a revive
+    /// (which clears the in-memory tombstone but rewrites the sidecar
+    /// only at the next swap), so a seeded row can name a uid that is
+    /// live again post-restore — every consumer already prefers the live
+    /// registry (`list_sessions` skips a tombstone whose uid is live;
+    /// `resolve_authorized_session` resolves live first), so the stale
+    /// row is unreachable until the session genuinely exits, at which
+    /// point `record_exited` replaces it.
+    ///
+    /// Best-effort by design: an absent sidecar is a clean boot, a
+    /// corrupt one is logged and skipped — the strict consumer is the
+    /// `--verify-handoff` preflight, never startup.
+    pub fn seed_recently_exited_from_sidecar(&mut self, path: &Path) {
+        let file = match read_daemon_tombstones(path) {
+            Ok(Some(f)) => f,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!(
+                    "cm-daemon: tombstone sidecar {} failed to load ({}); \
+                     starting with no seeded read-after-exit tombstones",
+                    path.display(),
+                    e,
+                );
+                return;
+            }
+        };
+        let mut rows = file.recently_exited;
+        // Oldest first, so ring order (front = oldest) and per-uid
+        // de-dupe ("newest exited_at wins") both hold even for a
+        // hand-edited/duplicated sidecar.
+        rows.sort_by(|a, b| {
+            a.exited_at
+                .partial_cmp(&b.exited_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut seeded = 0usize;
+        for tomb in rows {
+            if self
+                .exited_tombstone(&tomb.session_uid)
+                .is_some_and(|resident| resident.exited_at >= tomb.exited_at)
+            {
+                continue;
+            }
+            self.record_exited(tomb);
+            seeded += 1;
+        }
+        if seeded > 0 {
+            eprintln!(
+                "cm-daemon: seeded {} read-after-exit tombstone(s) from {}",
+                seeded,
+                path.display(),
+            );
+        }
+    }
+
     /// Record an agent-minted task edge (see [`Self::agent_task_edges`]):
     /// the overlay entry plus the immediate `task_tree` edge, so a
     /// `start_session(task_id=<child>)` issued right after the mint
@@ -1608,6 +1690,140 @@ mod tests {
         // Present-but-corrupt: an error, not a skip.
         std::fs::write(&path, "{ not json").expect("corrupt file");
         assert!(read_daemon_tombstones(&path).is_err());
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 4g (audit gap 4, read side): a
+    /// tombstone persisted to the 4c sidecar pre-swap is visible via
+    /// state post-seed — provenance intact — and a NEWER tombstone
+    /// recorded after the seed (the swap-dead commit path) wins the
+    /// per-uid de-dupe, never the other way around.
+    #[test]
+    fn seed_recently_exited_rebuilds_from_sidecar_and_yields_to_newer() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("daemon-tombstones.json");
+
+        // Pre-swap state: one killed tombstone, persisted by the
+        // checked pass.
+        let mut old = DaemonState::default();
+        let mut killed = tomb("ts-4g-killed");
+        killed.exited_at = 100.0;
+        killed.killed = true;
+        killed.killed_by = Some("operator".to_string());
+        let mut reported = tomb("ts-4g-reported");
+        reported.exited_at = 50.0;
+        reported.reported_done_at = Some(49.0);
+        reported.report_reason = Some("all done".to_string());
+        old.record_exited(killed);
+        old.record_exited(reported);
+        old.save_daemon_tombstones_checked(&path)
+            .expect("checked tombstone persist");
+
+        // Post-swap image: seed from the sidecar.
+        let mut new = DaemonState::default();
+        new.seed_recently_exited_from_sidecar(&path);
+        assert_eq!(new.recently_exited.len(), 2);
+        let k = new
+            .exited_tombstone("ts-4g-killed")
+            .expect("killed tombstone survived the swap");
+        assert!(k.killed, "kill provenance survived");
+        assert_eq!(k.killed_by.as_deref(), Some("operator"));
+        let r = new
+            .exited_tombstone("ts-4g-reported")
+            .expect("reported tombstone survived the swap");
+        assert_eq!(r.report_reason.as_deref(), Some("all done"));
+        // Seeded oldest-first: front is the older row, so cap
+        // eviction would drop it before anything newer.
+        assert_eq!(new.recently_exited[0].session_uid, "ts-4g-reported");
+
+        // A swap-produced tombstone recorded AFTER the seed (same uid,
+        // newer exit) replaces the seeded row — newest exited_at wins.
+        let mut newer = tomb("ts-4g-killed");
+        newer.exited_at = 200.0;
+        newer.generation = 9;
+        new.record_exited(newer);
+        assert_eq!(new.recently_exited.len(), 2, "de-duped by uid");
+        assert_eq!(
+            new.exited_tombstone("ts-4g-killed").unwrap().generation,
+            9,
+            "the newer swap-produced tombstone wins"
+        );
+
+        // And the mirror: RE-seeding the stale sidecar over that newer
+        // in-memory row must NOT clobber it (newest exited_at wins in
+        // both directions).
+        new.seed_recently_exited_from_sidecar(&path);
+        assert_eq!(
+            new.exited_tombstone("ts-4g-killed").unwrap().generation,
+            9,
+            "a staler sidecar row never clobbers a newer resident one"
+        );
+        assert_eq!(new.recently_exited.len(), 2);
+    }
+
+    /// The seeder's failure modes are best-effort by design: an absent
+    /// sidecar is a clean boot (no-op), a corrupt one is logged and
+    /// skipped (startup must never fail on it — the strict consumer is
+    /// the `--verify-handoff` preflight), and rows are sorted + capped
+    /// so an oversized/mis-ordered sidecar seeds the NEWEST
+    /// [`RECENTLY_EXITED_CAP`] rows with the oldest at the front.
+    #[test]
+    fn seed_recently_exited_is_best_effort_sorted_and_capped() {
+        let dir = TempDir::new().expect("tempdir");
+
+        // Absent: no-op.
+        let mut s = DaemonState::default();
+        s.seed_recently_exited_from_sidecar(&dir.path().join("nope.json"));
+        assert!(s.recently_exited.is_empty());
+
+        // Corrupt: logged no-op, never a panic/error.
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "{ not json").expect("write corrupt");
+        s.seed_recently_exited_from_sidecar(&corrupt);
+        assert!(s.recently_exited.is_empty());
+
+        // Oversized + deliberately shuffled exited_at order: the seed
+        // sorts oldest-first, so the cap keeps exactly the newest CAP
+        // rows and the front of the ring is the oldest survivor.
+        let n = RECENTLY_EXITED_CAP + 10;
+        let mut file = TombstoneFile {
+            version: TOMBSTONE_FILE_VERSION,
+            recently_exited: (0..n)
+                .map(|i| {
+                    // Reverse order on disk: newest first.
+                    let mut t = tomb(&format!("ts-big-{i:04}"));
+                    t.exited_at = (n - i) as f64;
+                    t
+                })
+                .collect(),
+        };
+        // A duplicate uid with a NEWER exited_at than its twin: the
+        // newest must win the de-dupe regardless of file order.
+        file.recently_exited.push({
+            let mut t = tomb("ts-big-0005");
+            t.exited_at = 1_000_000.0;
+            t.generation = 42;
+            t
+        });
+        let big = dir.path().join("big.json");
+        std::fs::write(&big, serde_json::to_string(&file).unwrap())
+            .expect("write big sidecar");
+        let mut s = DaemonState::default();
+        s.seed_recently_exited_from_sidecar(&big);
+        assert_eq!(s.recently_exited.len(), RECENTLY_EXITED_CAP, "capped");
+        assert_eq!(
+            s.exited_tombstone("ts-big-0005").unwrap().generation,
+            42,
+            "newest exited_at wins the per-uid de-dupe"
+        );
+        // Front = oldest survivor; back = newest.
+        let front = s.recently_exited.front().unwrap().exited_at;
+        let back = s.recently_exited.back().unwrap().exited_at;
+        assert!(
+            front < back,
+            "ring order preserved (front {} < back {})",
+            front,
+            back
+        );
     }
 
     /// With no `daemon_sessions_path` set (the test/disabled default),

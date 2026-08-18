@@ -594,6 +594,19 @@ pub fn run() -> anyhow::Result<()> {
     // `~/.cm/`. See DESIGN_SESSION_DURABILITY.md.
     initial_state.daemon_sessions_path =
         Some(state::default_daemon_sessions_path());
+    // DESIGN_SEAMLESS_RESTART phase 4g (audit gap 4, read side): seed
+    // read-after-exit tombstones from the 4c sidecar
+    // (`daemon-tombstones.json`, written by the re-exec swap's checked
+    // persistence pass). Runs on EVERY startup path — fresh boot,
+    // Adopted handoff, terminal fallback — and deliberately BEFORE
+    // `complete_handoff` below, so swap-produced tombstones land ON TOP
+    // of the seeded rows (`record_exited`'s per-uid de-dupe keeps the
+    // newest, and cap eviction drops seeded rows first). Best-effort;
+    // see `seed_recently_exited_from_sidecar`.
+    {
+        let sidecar = state::default_daemon_tombstones_path();
+        initial_state.seed_recently_exited_from_sidecar(&sidecar);
+    }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
 
     // H2 (restart hardening): SIGHUP → `daemon.reload_config` without
@@ -739,7 +752,16 @@ pub fn run() -> anyhow::Result<()> {
     // reexec.rs; this match is deliberately thin). Three outcomes:
     //
     //   * `Adopted` — rehydrate committed; the inherited sessions are
-    //     in the registry, escrow released. Restore stays skipped.
+    //     in the registry, escrow released. The RESPAWNING half of
+    //     restore stays skipped, but its non-spawning half
+    //     (`rehydrate_derived_state`) runs — phase 4g, audit gap 2:
+    //     bindings, planning task-tree edges, the agent_task_edges
+    //     overlay, and daemon-registered workspace rows all live in
+    //     `daemon-sessions.json` (freshly written by the swap's checked
+    //     persistence pass) and were rebuilt only by legacy restore,
+    //     so an adopted daemon came back unable to spawn into existing
+    //     subtask worktrees and creators lost descendant scope over
+    //     agent-minted tasks (the phantom-task `unauthorized` class).
     //   * (never returns) — a recoverable rehydrate failure at
     //     attempt 0 exec'd the pinned ROLLBACK binary in place; the
     //     rollback image re-enters run() through the same detection
@@ -777,6 +799,10 @@ pub fn run() -> anyhow::Result<()> {
                             String::new()
                         },
                     );
+                    // Phase 4g (audit gap 2): the non-spawning half of
+                    // restore — see the outcome comment above. The
+                    // children are alive; only derived maps are rebuilt.
+                    control::methods::rehydrate_derived_state(&state);
                 }
                 reexec::HandoffOutcome::TerminalFallback { killed, total } => {
                     eprintln!(
