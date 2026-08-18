@@ -69,6 +69,7 @@ pub mod planning_client;
 pub mod reader_gate;
 pub mod reap_gate;
 pub mod reaper;
+pub mod reexec_manifest;
 pub mod restart_coordinator;
 pub mod session;
 pub mod session_watch;
