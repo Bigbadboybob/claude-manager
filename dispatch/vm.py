@@ -1,8 +1,13 @@
 """Launch and manage GCP spot VMs for worker tasks."""
+import logging
+import urllib.request
 import uuid
+from google.api_core import exceptions as gax
 from google.cloud import compute_v1
 from dispatch.config import GCP_PROJECT, GCP_ZONE, VM_MACHINE_TYPE, VM_IMAGE_FAMILY, VM_IMAGE_PROJECT, API_TOKEN
 from pathlib import Path
+
+logger = logging.getLogger("cm.dispatch")
 
 # GCE caps instance metadata at 256KB/value and 512KB total. The backtest
 # payload (inline YAML config + fields) plus the startup script sit far
@@ -20,13 +25,19 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
                   prompt: str, manager_callback_url: str, *,
                   overrides: dict | None = None,
                   startup_script: str | None = None,
-                  extra_metadata: dict[str, str] | None = None) -> tuple[str, str]:
+                  extra_metadata: dict[str, str] | None = None,
+                  network_tags: list[str] | None = None) -> tuple[str, str]:
     """Create a spot VM for a task. Returns (instance_name, external_ip).
 
     `overrides` may carry per-task VM settings (metadata.vm on backtest
     tasks): project, zone, machine_type, image_family, image_project,
     service_account, disk_size_gb. Anything absent falls back to the
     process-global config values, so existing callers are unchanged.
+
+    `network_tags` replaces the default tag set. The default keeps the
+    legacy `allow-ttyd` tag for the general worker lane; the backtest lane
+    passes its dedicated scoped tag instead (see ensure_ttyd_firewall) so
+    its ttyd is never matched by a 0.0.0.0/0 rule.
 
     The instance name carries a random suffix: SPOT preemption STOPs the
     instance (instance_termination_action="STOP"), so a preempt-requeued
@@ -103,7 +114,7 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],
             ),
         ],
-        tags=compute_v1.Tags(items=["cm-worker", "allow-ttyd"]),
+        tags=compute_v1.Tags(items=list(network_tags) if network_tags else ["cm-worker", "allow-ttyd"]),
     )
 
     op = client.insert(project=project, zone=zone, instance_resource=instance)
@@ -114,6 +125,100 @@ def launch_worker(task_id: str, repo_url: str, repo_branch: str,
     external_ip = inst.network_interfaces[0].access_configs[0].nat_i_p
 
     return instance_name, external_ip
+
+
+def _self_external_ip() -> str | None:
+    """External IP of the host this dispatcher runs on (None off-GCE).
+
+    Keeps cm-manager itself inside the backtest-ttyd allowlist without
+    hardcoding its address anywhere.
+    """
+    req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/"
+        "network-interfaces/0/access-configs/0/external-ip",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.read().decode().strip() or None
+    except Exception:
+        return None
+
+
+_FIREWALL_PERM_WARNED: set[str] = set()
+
+
+def ensure_ttyd_firewall(project: str, tag: str, source_ranges: list[str]) -> None:
+    """Idempotently align the scoped ttyd ingress rule for backtest workers.
+
+    One rule named after ``tag`` in ``project``'s default network: tcp:8080
+    from ``source_ranges`` plus this host's own external IP, to instances
+    carrying ``tag``. Replaces the old ``allow-ttyd`` 0.0.0.0/0 rule on this
+    lane — the workers' ttyd (a ROOT web terminal) was internet-reachable
+    and actively probed by scanners within hours of boot.
+
+    Best-effort by design, and every failure mode fails CLOSED (no rule /
+    stale rule -> ingress denied, never widened):
+      - The cm-manager SA holds only instanceAdmin on the backtest project,
+        so firewall calls may 403; the rule is then managed manually (the
+        warning carries the exact gcloud command) and this degrades to a
+        warn-once no-op.
+      - No reachable source ranges at all -> skip, warn, leave denied.
+    Callers must also wrap this in try/except: a firewall hiccup must never
+    stop a backtest launch (it only costs ttyd reachability).
+    """
+    self_ip = _self_external_ip()
+    ranges = list(dict.fromkeys(
+        source_ranges + ([f"{self_ip}/32"] if self_ip else [])
+    ))
+    if not ranges:
+        logger.warning(
+            f"ttyd firewall {tag}@{project}: no source ranges "
+            f"(CM_BACKTEST_TTYD_SOURCE_RANGES unset and no GCE self-IP) — "
+            f"leaving :8080 ingress denied; ttyd reachable via ssh tunnel only"
+        )
+        return
+
+    client = compute_v1.FirewallsClient()
+    desired = compute_v1.Firewall(
+        name=tag,
+        network="global/networks/default",
+        direction="INGRESS",
+        allowed=[compute_v1.Allowed(I_p_protocol="tcp", ports=["8080"])],
+        source_ranges=ranges,
+        target_tags=[tag],
+        description=(
+            "ttyd on cm backtest workers — operator + cm-manager IPs only. "
+            "Managed by claude-manager dispatch/vm.py::ensure_ttyd_firewall."
+        ),
+    )
+    try:
+        try:
+            existing = client.get(project=project, firewall=tag)
+        except gax.NotFound:
+            existing = None
+        if existing is not None:
+            if (sorted(existing.source_ranges) == sorted(ranges)
+                    and list(existing.target_tags) == [tag]
+                    and [(a.I_p_protocol, sorted(a.ports)) for a in existing.allowed]
+                    == [("tcp", ["8080"])]):
+                return
+            client.update(project=project, firewall=tag,
+                          firewall_resource=desired).result()
+            logger.info(f"ttyd firewall {tag}@{project}: updated, sources={ranges}")
+        else:
+            client.insert(project=project, firewall_resource=desired).result()
+            logger.info(f"ttyd firewall {tag}@{project}: created, sources={ranges}")
+    except gax.PermissionDenied:
+        if project not in _FIREWALL_PERM_WARNED:
+            _FIREWALL_PERM_WARNED.add(project)
+            logger.warning(
+                f"ttyd firewall {tag}@{project}: SA lacks firewall perms — "
+                f"managing the rule manually. Align it with: gcloud compute "
+                f"firewall-rules update {tag} --project={project} "
+                f"--source-ranges={','.join(ranges)} (create with the same "
+                f"ranges, --allow=tcp:8080 --target-tags={tag}, if missing)"
+            )
 
 
 def delete_worker(instance_name: str, project: str = GCP_PROJECT,

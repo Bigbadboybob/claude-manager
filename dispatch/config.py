@@ -57,6 +57,30 @@ BACKTEST_VM_DEFAULTS = {
     "disk_size_gb": int(os.getenv("CM_BACKTEST_DISK_SIZE_GB", "200")),
 }
 
+# --- Backtest worker ttyd exposure -----------------------------------------
+# ttyd on a backtest worker is a ROOT web terminal (tmux attach) on a VM that
+# carries a predictionTrading clone and the replica read DSN. It must never be
+# publicly reachable: internet scanners were observed probing a worker's :8080
+# (/.env.backup, /.git/config, /terraform.tfstate) within hours of boot. The
+# workers keep their external IP — the project has no Cloud NAT, and they need
+# egress for the GitHub clone + Secret Manager + gsutil — so the port is closed
+# at the firewall instead: a dedicated network tag (below, replacing the old
+# 0.0.0.0/0 `allow-ttyd` rule/tag on this lane) with an ingress allow scoped to
+# the operator's networks plus the cm-manager host, ensured at launch by
+# dispatch/vm.py::ensure_ttyd_firewall.
+BACKTEST_TTYD_TAG = os.getenv("CM_BACKTEST_TTYD_TAG", "cm-backtest-ttyd")
+# Comma-separated CIDRs allowed to reach :8080 on backtest workers (set in the
+# claude-manager.service drop-in ttyd-firewall.conf). The dispatcher appends
+# its own external IP when it runs on GCE, so this only needs the operator's
+# networks. Empty AND off-GCE means no rule is ensured — ingress stays denied
+# (GCP default-deny, fail closed); the ssh tunnel documented in
+# worker/backtest_startup.sh remains the access path.
+BACKTEST_TTYD_SOURCE_RANGES = [
+    r.strip()
+    for r in os.getenv("CM_BACKTEST_TTYD_SOURCE_RANGES", "").split(",")
+    if r.strip()
+]
+
 _missing = [name for name, value in (("CM_DB_DSN", DB_DSN), ("CM_API_TOKEN", API_TOKEN)) if not value]
 if _missing:
     raise RuntimeError(

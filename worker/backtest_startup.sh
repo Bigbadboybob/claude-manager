@@ -50,21 +50,64 @@ api_update() {
     fi
 }
 
-# POST an artifact row; 5 attempts with backoff. Returns 1 on exhaustion —
-# the caller must then PATCH blocked, never done (done implies results are
-# retrievable via the API).
+# Backoff schedule between artifact POST attempts: 10 attempts (9 sleeps)
+# spanning ~11 minutes, so a planning-API restart / transient 5xx window is
+# ridden out instead of stranding a finished run at `blocked`.
+ARTIFACT_POST_BACKOFF="5 10 20 40 60 90 120 150 180"
+
+# POST an artifact row. Returns 1 on exhaustion — the caller must then PATCH
+# blocked, never done (done implies results are retrievable via the API).
+#
+# Three hard-won properties, all from the 2026-07/08 "blocked with ZERO
+# artifacts" incidents (5 runs, 25 POSTs, every one a 422):
+#   1. An EMPTY body is refused outright. curl -sf -d "" POSTs a zero-length
+#      body, which FastAPI rejects as 422 {"type":"missing","loc":["body"]} —
+#      indistinguishable, under -f, from a server fault. A body-builder that
+#      silently produced nothing is a worker bug; say so loudly.
+#   2. The exact body is parked in GCS as backtest_artifact.json BEFORE the
+#      first attempt, so recovery never has to rebuild it
+#      (scripts/repost_backtest_artifact.py).
+#   3. -f is NOT used: the HTTP status and response body of every failed
+#      attempt are logged. -f collapses "422 your body is malformed" and
+#      "503 API is down" into the same silent exit 22.
 post_artifact() {
-    for i in 1 2 3 4 5; do
-        if curl -sf -X POST "$MANAGER_URL/tasks/$TASK_ID/artifacts" \
+    local body="$1"
+    if [ -z "${body//[[:space:]]/}" ]; then
+        echo "[cm-backtest] FATAL: artifact body is EMPTY — refusing to POST"
+        echo "[cm-backtest]        (an empty POST body is a 422 at the API; the bug is in the body builder, not the API)"
+        return 1
+    fi
+
+    printf '%s' "$body" > /tmp/cm-backtest-artifact.json
+    if [ -n "${GCS_PREFIX:-}" ]; then
+        if gsutil cp /tmp/cm-backtest-artifact.json "$GCS_PREFIX/backtest_artifact.json" >&2; then
+            echo "[cm-backtest] Artifact body parked at $GCS_PREFIX/backtest_artifact.json (${#body} bytes)"
+        else
+            echo "[cm-backtest] WARNING: could not park artifact body in GCS"
+        fi
+    fi
+
+    local attempt=0 code sleep_s
+    for sleep_s in $ARTIFACT_POST_BACKOFF ""; do
+        attempt=$((attempt + 1))
+        code=$(curl -sS -o /tmp/cm-artifact-resp.txt -w '%{http_code}' \
+            -X POST "$MANAGER_URL/tasks/$TASK_ID/artifacts" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $API_TOKEN" \
-            -d "$1" > /dev/null; then
-            echo "[cm-backtest] Artifact posted"
-            return 0
-        fi
-        echo "[cm-backtest] artifact POST failed (attempt $i)"
-        sleep $((i * 10))
+            -d "$body" 2>/tmp/cm-artifact-curl.err)
+        case "$code" in
+            2*)
+                echo "[cm-backtest] Artifact posted (HTTP $code, attempt $attempt)"
+                return 0
+                ;;
+        esac
+        echo "[cm-backtest] artifact POST failed (attempt $attempt/10): HTTP ${code:-000} bytes=${#body}"
+        echo "[cm-backtest]   response: $(head -c 1000 /tmp/cm-artifact-resp.txt 2>/dev/null | tr '\n' ' ')"
+        echo "[cm-backtest]   curl:     $(head -c 400 /tmp/cm-artifact-curl.err 2>/dev/null | tr '\n' ' ')"
+        [ -n "$sleep_s" ] && sleep "$sleep_s"
     done
+
+    echo "[cm-backtest] !!! ARTIFACT POST EXHAUSTED after $attempt attempts — RECOVER WITH: python3 scripts/repost_backtest_artifact.py $TASK_ID --gcs-prefix $GCS_PREFIX   (body parked at $GCS_PREFIX/backtest_artifact.json)"
     return 1
 }
 
@@ -117,26 +160,86 @@ publish_results() {
     fi
 }
 
-# $1 = partial ("true"/"false"). Wraps the run's summary into the artifact
-# body: {kind, partial, gcs_prefix, summary:{...summary, partial, gcs_pointer,
-# run_key}}. Prefers the PT publisher's compact backtest_summary.json (the
-# designed contract shape); falls back to the grid runner's summary.json.
+# Publish + build the artifact POST body in one step; echoes the body on
+# stdout (all logging goes to stderr — the whole script's stderr lands in
+# /var/log/cm-worker.log anyway).
+#
+# Real runs delegate to PT's publisher, which uploads the results dir AND
+# emits the contract-shaped summary ({total_pnl, realized_pnl, fill_count,
+# taker_pct, partial, grid_rows[], gcs_pointer}; {error:"no-summary",
+# partial:true} if the run died before writing) — one reshaping
+# implementation, owned repo-side. The stub path, and any run where the
+# venv doesn't exist yet (preempt before/mid `uv sync` — `uv run` would
+# auto-sync for minutes inside a ~30s trap), fall back to the bash
+# rsync + summary.json wrap below.
+emit_artifact() {   # $1 = partial ("true"/"false")
+    local partial="$1"
+    if [ "$BT_SCRIPT" != "__cm_stub__" ] && [ -d /workspace/.venv ]; then
+        local flag=""
+        [ "$partial" = "true" ] && flag="--partial"
+        local out body rc
+        if out=$(cd /workspace && timeout 240 uv run python -m \
+                analysis.backtests.scripts.publish_results \
+                --output-dir "$RESULTS_DIR" --gcs-prefix "$GCS_PREFIX" \
+                --upload $flag 2>/tmp/cm-publish.err); then
+            # The publisher's stdout is handed on through a FILE, never a pipe.
+            # `python3 - <<'PYEOF'` takes its *script* from stdin, so the heredoc
+            # WINS the stdin redirection and a piped payload is unreachable:
+            # json.load(sys.stdin) sees EOF, the wrap dies, and the old code's
+            # unconditional `return 0` reported success with an EMPTY body. That
+            # is the artifact-POST bug — every run whose PT publisher succeeded
+            # POSTed nothing and got 422'd 5/5 (runs cafef203, 61c1ffdf, 2c8ad55e,
+            # 4074659d, 218091b7). Reuse build_artifact_json so there is exactly
+            # ONE NaN-safe wrap implementation.
+            printf '%s' "$out" > /tmp/cm-publisher-summary.json
+            body=$(build_artifact_json "$partial" /tmp/cm-publisher-summary.json)
+            rc=$?
+            if [ "$rc" -eq 0 ] && [ -n "$body" ]; then
+                echo "[cm-backtest] PT publisher succeeded (${#body} byte artifact body)" >&2
+                printf '%s' "$body"
+                return 0
+            fi
+            echo "[cm-backtest] PT publisher summary unusable (wrap rc=$rc, ${#body} bytes); falling back to bash publish" >&2
+        else
+            echo "[cm-backtest] PT publisher failed; falling back to bash publish" >&2
+        fi
+        tail -3 /tmp/cm-publish.err >&2 2>/dev/null || true
+    fi
+    publish_results >&2 || true
+    build_artifact_json "$partial"
+}
+
+# $1 = partial ("true"/"false"), $2 = OPTIONAL explicit summary json path.
+# Wraps the run's summary into the artifact body: {kind, partial, gcs_prefix,
+# summary:{...summary, partial, gcs_pointer, run_key}}. With no $2 it prefers
+# the PT publisher's compact backtest_summary.json (the designed contract
+# shape) and falls back to the grid runner's summary.json; with $2 it uses
+# exactly that file and FAILS (exit 1, empty stdout) if it is unusable, so
+# emit_artifact can fall through to the bash publish path instead of shipping
+# a no-summary stub over a perfectly good results dir.
 # Non-finite floats (NaN/Infinity — common when a run has 0 trades) are coerced
 # to null: they are INVALID JSON and Postgres JSONB rejects them, which 500s the
 # artifact POST and leaves a successful run stuck "blocked".
 build_artifact_json() {
-    PARTIAL="$1" RESULTS_DIR="$RESULTS_DIR" GCS_PREFIX="$GCS_PREFIX" RUN_KEY="$RUN_KEY" \
+    PARTIAL="$1" SUMMARY_FILE="${2:-}" RESULTS_DIR="$RESULTS_DIR" GCS_PREFIX="$GCS_PREFIX" RUN_KEY="$RUN_KEY" \
     python3 - <<'PYEOF'
-import json, math, os
+import json, math, os, sys
 
 partial = os.environ["PARTIAL"] == "true"
 gcs = os.environ["GCS_PREFIX"]
 results_dir = os.environ["RESULTS_DIR"]
+explicit = os.environ.get("SUMMARY_FILE") or ""
+
+if explicit:
+    candidates = [explicit]
+else:
+    candidates = [os.path.join(results_dir, n)
+                  for n in ("backtest_summary.json", "summary.json")]
 
 summary = None
-for name in ("backtest_summary.json", "summary.json"):
+for path in candidates:
     try:
-        with open(os.path.join(results_dir, name)) as f:
+        with open(path) as f:
             loaded = json.load(f)
     except (OSError, ValueError):
         continue
@@ -144,6 +247,10 @@ for name in ("backtest_summary.json", "summary.json"):
         summary = loaded
         break
 if summary is None:
+    if explicit:
+        # Caller named a specific summary and it is missing / unparseable / not
+        # an object. Fail loudly and empty-handed; the caller has a fallback.
+        sys.exit("[cm-backtest] explicit summary file unusable: %s" % explicit)
     summary = {"error": "no-summary", "detail": "no readable summary json in results dir"}
 
 
@@ -180,8 +287,7 @@ PYEOF
 # merged into a freshly-GET'd copy rather than sent as a fragment.
 on_preempt() {
     echo "[cm-backtest] PREEMPTION DETECTED"
-    publish_results || true
-    post_artifact "$(build_artifact_json true)" || true
+    post_artifact "$(emit_artifact true)" || true
 
     MERGED_BODY=$(curl -sf "$MANAGER_URL/tasks/$TASK_ID" \
         -H "Authorization: Bearer $API_TOKEN" | python3 -c "
@@ -326,15 +432,26 @@ tmux new-session -d -s backtest -x 200 -y 50 \
     "bash /root/cm_pipeline.sh; echo \$? > /var/run/cm-pipeline-exit; sleep 3600"
 
 # ---------------------------------------------------------------------------
-# ttyd (observability)
+# ttyd (observability). NOT publicly reachable: :8080 ingress is scoped by the
+# cm-backtest-ttyd firewall rule (operator + cm-manager IPs only, ensured by
+# the dispatcher — dispatch/vm.py::ensure_ttyd_firewall; the old allow-ttyd
+# rule exposed this ROOT terminal to 0.0.0.0/0 and scanners probed it within
+# hours of boot). The ttyd_url on the task keeps working from allowlisted
+# networks; from anywhere else, tunnel instead:
+#   gcloud compute ssh <vm> --project=<project> --zone=<zone> -- -L 8080:localhost:8080
+# then open http://localhost:8080 (exact command logged below).
 # ---------------------------------------------------------------------------
 ttyd -i 0.0.0.0 -p 8080 --writable tmux attach -t backtest &
 
 EXTERNAL_IP=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" \
     -H "Metadata-Flavor: Google" || echo "")
+VM_NAME=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/name" -H "$META_HEADER" || echo "")
+VM_ZONE=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "$META_HEADER" | awk -F/ '{print $NF}' || echo "")
+VM_PROJECT=$(curl -sf "http://metadata.google.internal/computeMetadata/v1/project/project-id" -H "$META_HEADER" || echo "")
 if [ -n "$EXTERNAL_IP" ]; then
     api_update "{\"ttyd_url\": \"http://${EXTERNAL_IP}:8080\"}"
 fi
+echo "[cm-backtest] ttyd: http://${EXTERNAL_IP}:8080 (allowlisted IPs only; from elsewhere: gcloud compute ssh $VM_NAME --project=$VM_PROJECT --zone=$VM_ZONE -- -L 8080:localhost:8080 then open http://localhost:8080)"
 echo "running" > /var/log/cm-worker-state
 
 # ---------------------------------------------------------------------------
@@ -347,8 +464,7 @@ EXIT_CODE=$(cat /var/run/cm-pipeline-exit)
 echo "[cm-backtest] Pipeline finished (exit $EXIT_CODE)"
 
 if [ "$EXIT_CODE" = "0" ]; then
-    publish_results
-    if post_artifact "$(build_artifact_json false)"; then
+    if post_artifact "$(emit_artifact false)"; then
         api_update '{"status": "done"}'   # PATCH handler deletes this VM
     else
         echo "[cm-backtest] Artifact POST exhausted retries — blocking for operator"
@@ -356,8 +472,7 @@ if [ "$EXIT_CODE" = "0" ]; then
     fi
 else
     echo "[cm-backtest] Pipeline FAILED (exit $EXIT_CODE)"
-    publish_results || true
-    post_artifact "$(build_artifact_json true)" || true
+    post_artifact "$(emit_artifact true)" || true
     api_update '{"status": "blocked"}'
 fi
 

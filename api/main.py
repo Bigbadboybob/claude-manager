@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 
 import asyncpg
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 
 from api.auth import verify_token
 from api.models import (
@@ -100,6 +102,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Manager", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_request_validation_error(request: Request, exc: RequestValidationError):
+    """Log WHY a 422 happened, then answer exactly as FastAPI would.
+
+    Access logs record only `422 Unprocessable Entity`, so a malformed worker
+    callback looks identical to a server fault from the caller's side. That
+    cost a month of misdiagnosis on the backtest artifact POST: workers were
+    sending an EMPTY body (a broken body builder), the API dutifully answered
+    422 {"type":"missing","loc":["body"]}, and with `curl -sf` swallowing it on
+    the worker and nothing on the server, it read as "intermittent API 500s".
+    Behaviour is unchanged — this only adds the log line.
+    """
+    body = exc.body
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", errors="replace")
+    shown = body if isinstance(body, str) else repr(body)
+    logger.warning(
+        "422 %s %s: errors=%s body[:1000]=%s",
+        request.method, request.url.path, exc.errors(), shown[:1000],
+    )
+    return await request_validation_exception_handler(request, exc)
 
 
 def get_pool():
