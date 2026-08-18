@@ -322,7 +322,16 @@ chmod 600 /root/.ssh/bt_deploy 2>/dev/null || true
 export GIT_SSH_COMMAND="ssh -i /root/.ssh/bt_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 REPLICA_DSN=$(gcloud secrets versions access latest \
     --secret=replica-connection-string --project="$SECRETS_PROJECT" || echo "")
-echo "[cm-backtest] Credentials loaded (deploy-key: $([ -s /root/.ssh/bt_deploy ] && echo yes || echo NO), replica: $([ -n "$REPLICA_DSN" ] && echo yes || echo NO))"
+# Trading-environment telemetry (PT observability design Lane 3, §5 "cloud spot workers"): an
+# INSERT-only `telemetry_writer` role on the PROD db, reachable from this VPC on db-east4's internal
+# IP. Deliberately a SECOND, narrower credential than the replica DSN above — a spot worker may
+# append env_* telemetry and nothing else. Absent/failed fetch is NOT fatal: the run then emits into
+# the counting sink and its manifest records `dsn_source: none`, which is the honest outcome.
+TELEMETRY_DSN=$(gcloud secrets versions access latest \
+    --secret=telemetry-writer-dsn --project="$SECRETS_PROJECT" 2>/dev/null || echo "")
+# ⚠ PRESENCE ONLY, never the value. This log stream is /var/log/cm-worker.log AND the tmux session
+# ttyd serves on a public IP, so a DSN echoed anywhere here is a DSN published.
+echo "[cm-backtest] Credentials loaded (deploy-key: $([ -s /root/.ssh/bt_deploy ] && echo yes || echo NO), replica: $([ -n "$REPLICA_DSN" ] && echo yes || echo NO), telemetry-writer: $([ -n "$TELEMETRY_DSN" ] && echo yes || echo NO))"
 
 # ---------------------------------------------------------------------------
 # Local Postgres (baked into the cm-backtest-worker image)
@@ -369,10 +378,20 @@ git config url."git@github.com:".insteadOf "https://github.com/"
 # here the clone IS the root). POSTGRES_CONNECTION_STRING points at the
 # REPLICA — the download path treats it as the source; PT-side handles the
 # standby's read-only-ness (pg_is_in_recovery() auto-detect).
+#
+# ENV_TELEMETRY_CONNECTION_STRING is the env-telemetry writer DSN, consumed by
+# EnvTelemetryConfig.resolved_dsn() (config > this var > counting sink). It goes HERE, in the file
+# the runner already loads via load_dotenv(override=False), rather than into the submitted runner
+# config: the config is hashed into manifest.json, re-dumped as resolved_config.yaml and rsync'd to
+# GCS, so a credential placed there would be published with the run. It also never rides argv —
+# run_submission.py echoes its full exec line into the public ttyd stream.
+# Empty when the secret fetch failed; PT reads blank as unset and falls back to the counting sink.
 cat > /workspace/.env <<ENVEOF
 POSTGRES_CONNECTION_STRING=$REPLICA_DSN
 LOCAL_POSTGRES_CONNECTION_STRING=$LOCAL_DSN
+ENV_TELEMETRY_CONNECTION_STRING=$TELEMETRY_DSN
 ENVEOF
+chmod 600 /workspace/.env
 echo "[cm-backtest] Repo ready"
 
 # ---------------------------------------------------------------------------
