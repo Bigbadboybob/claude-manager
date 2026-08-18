@@ -38,6 +38,15 @@ uuid = { version = "1", features = ["v4"] }
 # daemon only needs the raw master/slave + child handles, not the
 # Term grid or EventLoop machinery that alacritty wraps around them.
 portable-pty = "0.9"
+# `MasterPty::get_termios` returns `nix::sys::termios::Termios` BY TYPE
+# IDENTITY, so implementing the trait honestly for the adopted-master
+# type (`daemon/src/adopt.rs`, DESIGN_SEAMLESS_RESTART phase 2c) needs
+# nix at exactly the version portable-pty pins (0.9 pins nix 0.28).
+# Drift when portable-pty bumps its nix breaks loudly at compile time,
+# never silently. Already in the tree via portable-pty with the same
+# `term` feature enabled, so this adds no new compilation units — it
+# only makes the existing crate nameable from daemon code.
+nix = { version = "0.28", features = ["term"] }
 # StreamFrame bytes are base64-encoded per the protocol-doc contract
 # (see `daemon/src/control/protocol.rs::StreamFrame` and the
 # decoder in `tui/src/term_shim.rs`). Slice 10c-c needs this on

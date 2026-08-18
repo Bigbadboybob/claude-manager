@@ -53,6 +53,7 @@
 // portability story is honest and single-source-of-truth.
 #![cfg(target_os = "linux")]
 
+pub mod adopt;
 pub mod attach;
 pub mod claude_trust;
 pub mod config;

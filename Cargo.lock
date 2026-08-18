@@ -369,6 +369,7 @@ dependencies = [
  "anyhow",
  "base64",
  "libc",
+ "nix 0.28.0",
  "portable-pty",
  "rustls",
  "rustls-pki-types",
