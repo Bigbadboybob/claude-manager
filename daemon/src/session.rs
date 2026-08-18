@@ -2011,67 +2011,272 @@ fn gated_reaper_body(
     // were one indivisible unit under the gate (R4).
 }
 
-/// Minimal identity metadata for [`DaemonSession::adopt`] —
-/// everything the skeleton re-exec manifest carries beyond the fds
-/// and the pid-identity cross-checks. DESIGN_SEAMLESS_RESTART phase
-/// 3b: fields the skeleton manifest does NOT carry (workspace_id,
-/// task binding, workflow tags, memory-cap bytes, transcript path)
-/// are defaulted honestly inside `adopt` rather than guessed here;
-/// phase 4's full rehydrate widens the record and this struct with
-/// it.
+/// The full session record for [`DaemonSession::build_adopted`] —
+/// everything the v2 re-exec manifest carries beyond the fds and the
+/// pid-identity cross-checks. DESIGN_SEAMLESS_RESTART phase 4b
+/// (R11): the 3b/4a skeleton adopted sessions as amnesiacs (hard-
+/// noted `"bash"`, no workspace/task binding, no transcript path, no
+/// perms, no done_report); this struct is the schema-v2 widening
+/// that lets an adopted session come back with its identity and
+/// status intact. The `Instant` cells arrive RECONSTRUCTED (the
+/// manifest carries ages; `crate::reexec` rebuilds `now - age`
+/// against one per-transaction anchor — see the manifest module's
+/// status-cell doc for the accepted sub-second swap skew).
 pub struct AdoptedSessionMeta {
-    /// Sidebar label. The skeleton manifest carries no label, so the
-    /// rehydrate path passes the uid — cosmetic only.
+    /// Sidebar label (`DaemonSession.title`).
     pub title: String,
-    /// Session-type discriminator. The skeleton manifest schema
-    /// carries no engine field, so the phase-3b rehydrate hard-notes
-    /// `"bash"` (the only engine the skeleton e2e exercises); phase 4
-    /// adds the field to the manifest.
+    /// Session-type discriminator (`"claude-code"` / `"codex"` /
+    /// `"bash"`), from the v2 manifest record — no more hard-noted
+    /// bash.
     pub session_type: String,
+    /// Workspace binding. May be empty (spawns that never carried
+    /// one) — restored verbatim, never guessed.
+    pub workspace_id: String,
+    /// Parent session uid for MCP-spawned sessions.
+    pub managed_by_uid: Option<String>,
+    /// Planning-task binding — what the descendant-scope auth walks.
+    pub task_id: Option<String>,
+    /// Transcript file PATH, so `resolve_authorized_session` (and
+    /// through it `read_session_output` / `read_last_turn`) works
+    /// immediately post-swap instead of reporting `pending`.
+    pub transcript_path: Option<String>,
+    /// Memory-cap byte pair, so MCP-driven child spawns keep
+    /// inheriting the cap across the swap.
+    pub memory_cap_soft_bytes: Option<u64>,
+    pub memory_cap_hard_bytes: Option<u64>,
+    /// Memory-cap cgroup scope prefix, when the session was capped.
+    pub cgroup_prefix: Option<PathBuf>,
+    /// Workflow tags — the workflow poller and the
+    /// `workflow_transition` auth check key off these.
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
+    /// Continuous-task tag.
+    pub continuous_task_id: Option<String>,
+    /// Global-permissions grant — an orchestrator must not lose its
+    /// scope across a deploy.
+    pub global_perms: bool,
     /// Transcript generation counter, restored from the manifest so
     /// post-handoff cursor semantics don't reset.
     pub generation: u64,
-    /// Memory-cap cgroup scope prefix, when the session was capped.
-    /// Carried for identity only in the skeleton — watcher
-    /// re-adoption from checkpoints is phase 4 (R12).
-    pub cgroup_prefix: Option<PathBuf>,
+    /// Reconstructed status cells (see the struct doc). `None` maps
+    /// a cell that was `None` pre-swap; `last_activity_at`'s `None`
+    /// falls back to adoption time inside `build_adopted` (the same
+    /// no-instant-idle rationale as the spawn-time stamp).
+    pub last_activity_at: Option<Instant>,
+    pub last_input_at: Option<Instant>,
+    pub last_operator_input_at: Option<Instant>,
+    pub last_turn_end_at: Option<Instant>,
+    /// The reconstructed `report_done` marker — THE R11 carry: an
+    /// `until="final"` watcher must see `status="reported"` after
+    /// the swap, not a regression to `awaiting_input`. Raw cell;
+    /// the superseded rule stays derived from `last_input_at`.
+    pub done_report: Option<ReportedDone>,
+    /// Kill-log directory for the memory-cap-kill probe, when the
+    /// session is capped (the rehydrate side mirrors
+    /// `start_session`'s rule: soft-cap present → real kills_dir).
+    /// `build_adopted` captures a FRESH baseline at adopt time via
+    /// [`crate::reaper::capture_baseline_for_spawn`] — the spawn-time
+    /// baseline died with the old image (its R12 checkpoint is still
+    /// future scope), and a fresh one scopes the probe to records
+    /// landing from adoption onward, which is exactly the window
+    /// this image can attribute.
+    pub kills_dir: Option<PathBuf>,
 }
 
-impl DaemonSession {
-    /// Construct an ARMED `DaemonSession` from promoted escrow parts —
-    /// the commit-gate side of the re-exec rehydrate
-    /// (DESIGN_SEAMLESS_RESTART phase 3b; the escrow/candidate side is
-    /// `crate::adopt`, phase 2c).
-    ///
-    /// This is the moment kill-on-drop semantics BEGIN, deliberately:
-    /// candidates were the non-killing stage (a failed rehydrate
-    /// unwinds them without touching children, R5); a session that
-    /// made it through the probes and into the registry must have
-    /// exactly the same lifecycle as a spawned one, including the
+/// The BUILD stage's product: a fully-constructed adopted session
+/// with **no threads started** — DESIGN_SEAMLESS_RESTART phase 4b's
+/// split of the 3b `adopt` into build + arm. Everything fallible
+/// short of `thread::Builder::spawn` (reader clone, poll-fd dup,
+/// `take_writer`, reaper pidfd dup, kills baseline capture) has
+/// already succeeded by the time one of these exists, so the
+/// rehydrate transaction can build EVERY record before any reader
+/// consumes a byte or any reaper can consume an exit status — the
+/// P4a byte-loss corner (a mid-commit failure after earlier records'
+/// readers had already drained kernel-buffered bytes into fanout
+/// rings that die at the rollback exec) is closed for every failure
+/// class except the arm stage's own thread spawns.
+///
+/// **Non-killing on drop, structurally**: no `Drop` impl — dropping
+/// one closes its dup'd fds and channel halves, signals nothing, and
+/// leaves the escrow originals (and the child) untouched, exactly
+/// like `crate::adopt::SessionCandidate`. Kill-on-drop begins at
+/// [`Self::arm`], which produces the real `DaemonSession`.
+pub struct AdoptedSessionBuild {
+    uid: String,
+    pid: libc::pid_t,
+    pidfd: OwnedFd,
+    master: crate::adopt::AdoptedMasterPty,
+    meta: AdoptedSessionMeta,
+    cols: u16,
+    rows: u16,
+    reader: Box<dyn Read + Send>,
+    poll_fd: OwnedFd,
+    writer: SessionWriter,
+    fanout: Arc<PtyByteFanout>,
+    last_activity_at: SharedLastActivity,
+    last_exit: SharedLastExit,
+    reaper_pidfd: OwnedFd,
+    exit_tx: mpsc::Sender<DaemonExitStatus>,
+    exit_rx: mpsc::Receiver<DaemonExitStatus>,
+}
+
+impl AdoptedSessionBuild {
+    /// The session uid this build carries (for commit-phase logging
+    /// and registry keys without unwrapping).
+    pub fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    /// The ARM stage: start the two threads and produce the armed
+    /// `DaemonSession`. **This is the moment kill-on-drop semantics
+    /// BEGIN**, deliberately: a session that made it through the
+    /// probes, the build, and into the registry must have exactly
+    /// the same lifecycle as a spawned one, including the
     /// pidfd-SIGKILL `Drop`.
     ///
     /// Reuses the spawn plumbing wholesale: the same gated reader
     /// loop ([`gated_reader_loop`]) on a CLOEXEC dup of the adopted
-    /// master, the same writer split (`take_writer` behind
-    /// `Arc<Mutex<_>>`), and the same pidfd-poll reaper body
+    /// master, the same pidfd-poll reaper body
     /// ([`gated_reaper_body`]) — with `child: None`, because no
     /// portable-pty `Child` handle exists for a process this image
-    /// never spawned (the reaper only needs pid + pidfd; see the body
-    /// doc).
+    /// never spawned (the reaper only needs pid + pidfd).
     ///
-    /// Failure semantics (skeleton): an error here (dup / take_writer
-    /// / thread-spawn failure — all vanishingly rare) returns `Err`
-    /// and drops the parts, which closes the adopted master fd; if
-    /// that was its last open description the child's pty hangs up
-    /// and the child takes SIGHUP. That is a consequence of fd
-    /// teardown, never a signal sent by this code — and phase 4's
-    /// transaction narrows the window further by validating
-    /// everything before any candidate is promoted.
-    pub fn adopt(
-        parts: crate::adopt::PromotedSessionParts,
-        meta: AdoptedSessionMeta,
+    /// The caller (the rehydrate transaction's commit phase) MUST
+    /// hold the state lock across arm + registry insert, exactly
+    /// like `start_session`'s two-phase spawn: the reaper's
+    /// `on_exit` takes that lock, so a fast-exit child's callback
+    /// blocks until the insert is visible.
+    ///
+    /// The only fallible ops here are the two `thread::Builder`
+    /// spawns (EAGAIN-class). On failure the remains drop non-
+    /// killing — but a reader spawned before a failed reaper spawn
+    /// is already draining; that residual (thread-spawn failure
+    /// only) is the one corner the build/arm split cannot close
+    /// in-process, and the transaction's disarm path still covers
+    /// it (do-not-regress, phase 4b).
+    pub fn arm(
+        self,
         on_exit: Option<OnExitCallback>,
     ) -> anyhow::Result<DaemonSession> {
+        let AdoptedSessionBuild {
+            uid,
+            pid,
+            pidfd,
+            master,
+            meta,
+            cols,
+            rows,
+            reader,
+            poll_fd,
+            writer,
+            fanout,
+            last_activity_at,
+            last_exit,
+            reaper_pidfd,
+            exit_tx,
+            exit_rx,
+        } = self;
+
+        // The pre-exec fanout ring died with the old image's memory —
+        // this one starts empty and the reader thread immediately
+        // drains the kernel's PTY backlog into it (the design's
+        // "start readers promptly" requirement; kernel buffers are
+        // ~64 KiB and a chatty child blocks on write until we drain).
+        let reader_fanout = Arc::clone(&fanout);
+        let reader_handle = std::thread::Builder::new()
+            .name(format!("cm-session-{}-reader", uid))
+            .spawn(move || gated_reader_loop(reader, poll_fd, reader_fanout))
+            .map_err(|e| {
+                anyhow::anyhow!("adopt {}: spawn reader thread: {}", uid, e)
+            })?;
+
+        let last_exit_for_reaper = last_exit.clone();
+        let reaper_handle = std::thread::Builder::new()
+            .name(format!("cm-session-{}-reaper", uid))
+            .spawn(move || {
+                gated_reaper_body(
+                    None,
+                    reaper_pidfd,
+                    pid,
+                    exit_tx,
+                    last_exit_for_reaper,
+                    on_exit,
+                )
+            })
+            .map_err(|e| {
+                anyhow::anyhow!("adopt {}: spawn reaper thread: {}", uid, e)
+            })?;
+
+        Ok(DaemonSession {
+            title: meta.title,
+            // Phase 4b (R11): the full v2 record lands verbatim — no
+            // more amnesiac defaults. See `AdoptedSessionMeta`.
+            workspace_id: meta.workspace_id,
+            session_type: meta.session_type,
+            managed_by_uid: meta.managed_by_uid,
+            task_id: meta.task_id,
+            transcript_path: meta.transcript_path,
+            memory_cap_soft_bytes: meta.memory_cap_soft_bytes,
+            memory_cap_hard_bytes: meta.memory_cap_hard_bytes,
+            cgroup_prefix: meta.cgroup_prefix,
+            last_cols: cols,
+            last_rows: rows,
+            workflow_run_id: meta.workflow_run_id,
+            workflow_role: meta.workflow_role,
+            continuous_task_id: meta.continuous_task_id,
+            global_perms: meta.global_perms,
+            generation: meta.generation,
+            last_activity_at,
+            // Reconstructed status cells (ages → Instants, done in
+            // `crate::reexec`): input/turn-end history and the
+            // done-report marker survive the swap, so
+            // `reported_done()` / `semantic_idle()` answer exactly
+            // what they answered pre-swap (modulo the accepted
+            // sub-second skew).
+            last_operator_input_at: Arc::new(Mutex::new(
+                meta.last_operator_input_at,
+            )),
+            last_input_at: Arc::new(Mutex::new(meta.last_input_at)),
+            last_turn_end_at: Arc::new(Mutex::new(meta.last_turn_end_at)),
+            done_report: Arc::new(Mutex::new(meta.done_report)),
+            fanout,
+            pid,
+            pidfd,
+            writer,
+            cached_exit: None,
+            exit_rx,
+            _reader_handle: reader_handle,
+            _reaper_handle: reaper_handle,
+            _master: Box::new(master),
+            last_exit,
+            watcher_handle: None,
+            uid,
+        })
+    }
+}
+
+impl DaemonSession {
+    /// The BUILD stage of re-exec adoption: construct everything an
+    /// armed session needs EXCEPT its two threads
+    /// (DESIGN_SEAMLESS_RESTART phase 4b — the escrow/candidate side
+    /// is `crate::adopt`, phase 2c; the arm stage is
+    /// [`AdoptedSessionBuild::arm`]).
+    ///
+    /// All the realistically-fallible adoption work happens here —
+    /// reader clone, poll-fd dup, `take_writer`, reaper pidfd dup —
+    /// so the rehydrate transaction can run build for EVERY record
+    /// before arming ANY of them: a failure in this stage means no
+    /// thread exists anywhere, nothing has consumed a byte or a
+    /// status, and the escrow originals are untouched for the
+    /// rollback exec (the P4a byte-loss corner, closed).
+    ///
+    /// Failure semantics: an error returns `Err` and drops the parts
+    /// (dups close; the escrow originals keep the pty alive, so the
+    /// child never even sees a hangup). Nothing is signaled.
+    pub fn build_adopted(
+        parts: crate::adopt::PromotedSessionParts,
+        meta: AdoptedSessionMeta,
+    ) -> anyhow::Result<AdoptedSessionBuild> {
         let crate::adopt::PromotedSessionParts {
             uid,
             pid,
@@ -2098,97 +2303,76 @@ impl DaemonSession {
                 .map_err(|e| anyhow::anyhow!("adopt {}: take_writer: {}", uid, e))?,
         ));
 
-        // Fresh activity cell stamped at adoption time — same
-        // rationale as spawn's stamp (a just-adopted session must
-        // not read as instantly idle) with the same fanout wiring.
-        let last_activity_at: SharedLastActivity =
-            Arc::new(Mutex::new(Some(Instant::now())));
+        // Activity cell: the carried pre-swap value when the record
+        // has one (an idle-for-40-minutes session must still read
+        // idle post-swap), falling back to adoption time (same
+        // no-instant-idle rationale as spawn's stamp) — a real v2
+        // record always carries one, since spawn stamps the cell.
+        let last_activity_at: SharedLastActivity = Arc::new(Mutex::new(Some(
+            meta.last_activity_at.unwrap_or_else(Instant::now),
+        )));
         let fanout = Arc::new(PtyByteFanout::with_activity_tracker(
             DEFAULT_FANOUT_CAPACITY,
             Some(Arc::clone(&last_activity_at)),
         ));
-        // The pre-exec fanout ring died with the old image's memory —
-        // this one starts empty and the reader thread immediately
-        // drains the kernel's PTY backlog into it (the design's
-        // "start readers promptly" requirement; kernel buffers are
-        // ~64 KiB and a chatty child blocks on write until we drain).
-        let reader_fanout = Arc::clone(&fanout);
-        let reader_handle = std::thread::Builder::new()
-            .name(format!("cm-session-{}-reader", uid))
-            .spawn(move || gated_reader_loop(reader, poll_fd, reader_fanout))
-            .map_err(|e| anyhow::anyhow!("adopt {}: spawn reader thread: {}", uid, e))?;
 
-        // Reaper on a dup of the adopted pidfd — identical topology
-        // to arm_reaper: the session's original stays for the kill
-        // paths, the dup is what the reaper polls and consumes
-        // through.
+        // Reaper dup — identical topology to arm_reaper: the
+        // session's original pidfd stays for the kill paths, the dup
+        // is what the reaper polls and consumes through.
         let reaper_pidfd = pidfd
             .try_clone()
             .map_err(|e| anyhow::anyhow!("adopt {}: dup pidfd for reaper: {}", uid, e))?;
-        // No kills_dir / baseline: the skeleton manifest doesn't
-        // carry the memory-cap watcher state (R12, phase 4), so the
-        // probe honestly reports memory_cap_kill=false for adopted
-        // sessions.
-        let last_exit: SharedLastExit =
-            Arc::new(LastExitProbe::new(uid.clone(), None, 0));
-        let last_exit_for_reaper = last_exit.clone();
-        let (exit_tx, exit_rx) = mpsc::channel::<DaemonExitStatus>();
-        let reaper_handle = std::thread::Builder::new()
-            .name(format!("cm-session-{}-reaper", uid))
-            .spawn(move || {
-                gated_reaper_body(
-                    None,
-                    reaper_pidfd,
-                    pid,
-                    exit_tx,
-                    last_exit_for_reaper,
-                    on_exit,
-                )
-            })
-            .map_err(|e| anyhow::anyhow!("adopt {}: spawn reaper thread: {}", uid, e))?;
 
-        Ok(DaemonSession {
-            title: meta.title,
-            // Honest defaults for everything the skeleton manifest
-            // doesn't carry (see `AdoptedSessionMeta`): the adopted
-            // session is workspace-less, task-less, unmanaged, and
-            // ungranted until phase 4's full record restores them.
-            workspace_id: String::new(),
-            session_type: meta.session_type,
-            managed_by_uid: None,
-            task_id: None,
-            // The manifest carries the transcript ID, not the path
-            // (the path is engine+cwd-derived and the skeleton is
-            // bash-only, which has no transcript). `None` is the
-            // honest value; phase 4 carries the full path.
-            transcript_path: None,
-            memory_cap_soft_bytes: None,
-            memory_cap_hard_bytes: None,
-            cgroup_prefix: meta.cgroup_prefix,
-            last_cols: cols,
-            last_rows: rows,
-            workflow_run_id: None,
-            workflow_role: None,
-            continuous_task_id: None,
-            global_perms: false,
-            generation: meta.generation,
-            last_activity_at,
-            last_operator_input_at: Arc::new(Mutex::new(None)),
-            last_input_at: Arc::new(Mutex::new(None)),
-            last_turn_end_at: Arc::new(Mutex::new(None)),
-            done_report: Arc::new(Mutex::new(None)),
-            fanout,
+        // Memory-cap-kill probe, re-enabled (phase 4b): the v2
+        // record's cap presence wires the real kills_dir, and the
+        // baseline is captured FRESH at adopt time — mirroring
+        // `PendingSession::spawn`'s pre-spawn capture, with the same
+        // best-effort fallback (0 = every record counts, preferring
+        // false positives over a cap kill rendered as a plain
+        // signal-9 exit). The spawn-time baseline died with the old
+        // image; carrying it is the R12 watcher-checkpoint slice.
+        let kills_baseline = match &meta.kills_dir {
+            Some(dir) => {
+                match crate::reaper::capture_baseline_for_spawn(dir, &uid) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!(
+                            "cm-daemon: kills_dir baseline capture failed for \
+                             adopted {}: {} (using 0 — may produce \
+                             stale-record false positives)",
+                            uid, e,
+                        );
+                        0
+                    }
+                }
+            }
+            None => 0,
+        };
+        let last_exit: SharedLastExit = Arc::new(LastExitProbe::new(
+            uid.clone(),
+            meta.kills_dir.clone(),
+            kills_baseline,
+        ));
+
+        let (exit_tx, exit_rx) = mpsc::channel::<DaemonExitStatus>();
+
+        Ok(AdoptedSessionBuild {
+            uid,
             pid,
             pidfd,
+            master,
+            meta,
+            cols,
+            rows,
+            reader,
+            poll_fd,
             writer,
-            cached_exit: None,
-            exit_rx,
-            _reader_handle: reader_handle,
-            _reaper_handle: reaper_handle,
-            _master: Box::new(master),
+            fanout,
+            last_activity_at,
             last_exit,
-            watcher_handle: None,
-            uid,
+            reaper_pidfd,
+            exit_tx,
+            exit_rx,
         })
     }
 }

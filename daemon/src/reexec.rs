@@ -45,11 +45,14 @@
 //! Failure injection for the e2e: [`ENV_TEST_FAIL_REHYDRATE`] — see
 //! its doc for the loud dev-flag gate.
 //!
-//! Deliberately OUT of scope, deferred to later phases:
+//! Deliberately OUT of scope, deferred to later phase-4 slices:
 //!
-//! - **`--verify-handoff` preflight subprocess** (phase 4b+).
-//! - **Watcher checkpoints / memory-cap re-adoption** (R12, phase 4b+)
-//!   — `watcher_checkpoint` is written as `None`.
+//! - **`--verify-handoff` preflight subprocess**.
+//! - **Watcher checkpoints / full memory-cap watcher re-adoption**
+//!   (R12) — `watcher_checkpoint` is written as `None`. (4b DID
+//!   re-enable the kill-log PROBE for adopted capped sessions — real
+//!   kills_dir + a fresh adopt-time baseline — but the watcher's
+//!   policy state still isn't checkpointed across the swap.)
 //! - **Workflow / continuous / TUI-reattach anything** beyond what
 //!   normal startup already rebuilds from disk (phases 4–5).
 //! - **The public `daemon.restart` RPC** (phase 6). The trigger is
@@ -57,11 +60,21 @@
 //!   the daemon started with `CM_REEXEC=1`.
 //! - **The full close-every-unlisted-inherited-fd audit** on the
 //!   rehydrate side; escrow closes exactly what it owns.
-//! - **Reaping/tombstoning SKIPPED records** (child exited during the
-//!   swap): same as 3b — the zombie's status is left unconsumed for
-//!   the phase-4b tombstone work; the record is simply not adopted.
 //! - **TLS listeners.** The exec side writes `tls_listener_fd: None`;
 //!   don't point the dev flag at a `[tls]`-configured daemon.
+//!
+//! Phase 4b (R11) closed three 4a gaps in this module: the manifest
+//! carries the FULL session record (schema v2 — identity, bindings,
+//! perms, transcript path, cap bytes, status cells as ages, the
+//! done_report marker), the transaction builds every session BEFORE
+//! arming any thread (the byte-loss corner: a mid-commit failure
+//! after earlier records' readers had drained kernel bytes into
+//! fanout rings that die at the rollback exec), and a record whose
+//! child exited during the swap is now reaped (`waitid(P_PIDFD)`
+//! under a reap-gate read permit) and tombstoned honestly instead of
+//! left an unreaped zombie. Start-time-MISMATCH records keep the 4a
+//! treatment exactly: unsignaled, unreaped, untombstoned — unknown
+//! identity, never fabricated provenance.
 //!
 //! ## The abort invariant
 //!
@@ -103,13 +116,15 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::adopt::SessionCandidate;
 use crate::reexec_manifest::{
     self, ReexecManifest, SessionRecord, MANIFEST_SCHEMA_VERSION,
 };
-use crate::session::{AdoptedSessionMeta, DaemonSession};
+use crate::session::{
+    AdoptedSessionBuild, AdoptedSessionMeta, DaemonSession, ReportedDone,
+};
 use crate::state::DaemonState;
 use crate::{reader_gate, reap_gate, restart_coordinator};
 
@@ -351,10 +366,20 @@ fn open_pinned_executable(target: &Path) -> Result<OwnedFd, anyhow::Error> {
 }
 
 /// Step (d) helper: project live daemon state into the manifest.
-/// Holds the state lock briefly (cheap /proc reads only). Runs under
-/// the gate freezes, so the session set cannot change underneath:
-/// no reaper can remove an entry (consumption frozen) and no
-/// mutating RPC can add one (quiesced + draining).
+/// Holds the state lock briefly (cheap /proc reads + cell locks
+/// only). Runs under the gate freezes, so the session set cannot
+/// change underneath: no reaper can remove an entry (consumption
+/// frozen) and no mutating RPC can add one (quiesced + draining).
+///
+/// Phase 4b (R11): the full `DaemonSession` record rides — identity,
+/// bindings, perms, transcript path, memory-cap bytes — plus the
+/// status cells as AGES against ONE anchor (`Instant::now()` taken
+/// once here), so the read side's single-anchor reconstruction
+/// preserves the cells' relative order exactly (the superseded rule
+/// and `semantic_idle` compare cells against each other). The
+/// monotonic-instant cells cannot ride as absolutes; the sub-second
+/// swap skew the age round trip introduces is documented acceptable
+/// in the manifest module.
 fn build_manifest(
     state: &Arc<Mutex<DaemonState>>,
     rollback_fd: &OwnedFd,
@@ -366,6 +391,8 @@ fn build_manifest(
              started through run(), so there is no bound listener to hand off"
         )
     })?;
+    // ONE anchor for every age in this manifest (see the doc above).
+    let now = std::time::Instant::now();
     let mut sessions: Vec<SessionRecord> = Vec::with_capacity(st.sessions.len());
     for (uid, s) in &st.sessions {
         let (pty_master_fd, pidfd) = s.reexec_handoff_fds().ok_or_else(|| {
@@ -385,6 +412,30 @@ fn build_manifest(
                     e
                 )
             })?;
+        // Status cells → ages. Cell mutexes are leaves (their stamp
+        // paths never take the state lock around them), so locking
+        // them under the state lock is inversion-free.
+        let cell_age = |cell: &crate::session::SharedLastActivity| {
+            cell.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .map(|t| now.saturating_duration_since(t).as_secs_f64())
+        };
+        // The RAW done-report cell, not `reported_done()`: the
+        // superseded-by-later-input rule stays derived on BOTH sides
+        // from `last_input_at`, so carrying the raw cell + the input
+        // age reproduces exactly the pre-swap answer.
+        let done_report = s
+            .done_report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .map(|r| reexec_manifest::DoneReportRecord {
+                at_unix: r.at_unix,
+                age_s: now
+                    .saturating_duration_since(r.at_instant)
+                    .as_secs_f64(),
+                reason: r.reason,
+            });
         sessions.push(SessionRecord {
             uid: uid.clone(),
             generation: s.generation,
@@ -392,6 +443,23 @@ fn build_manifest(
                 .transcript_path
                 .as_deref()
                 .and_then(crate::session::transcript_id_from_path),
+            transcript_path: s.transcript_path.clone(),
+            session_type: s.session_type.clone(),
+            title: s.title.clone(),
+            workspace_id: s.workspace_id.clone(),
+            task_id: s.task_id.clone(),
+            managed_by_uid: s.managed_by_uid.clone(),
+            workflow_run_id: s.workflow_run_id.clone(),
+            workflow_role: s.workflow_role.clone(),
+            continuous_task_id: s.continuous_task_id.clone(),
+            global_perms: s.global_perms,
+            memory_cap_soft_bytes: s.memory_cap_soft_bytes,
+            memory_cap_hard_bytes: s.memory_cap_hard_bytes,
+            last_activity_age_s: cell_age(&s.last_activity_at),
+            last_input_age_s: cell_age(&s.last_input_at),
+            last_operator_input_age_s: cell_age(&s.last_operator_input_at),
+            last_turn_end_age_s: cell_age(&s.last_turn_end_at),
+            done_report,
             child_pid: s.pid,
             child_start_time,
             pty_master_fd,
@@ -909,11 +977,16 @@ pub fn detect_handoff() -> Option<HandoffEscrow> {
 /// the boot is a handoff and only these two ends remain.
 pub enum HandoffOutcome {
     /// The rehydrate transaction committed: sessions are in the
-    /// registry, escrow is released. `run()` SKIPS legacy
-    /// `restore_sessions` (R13).
+    /// registry, swap-dead records are reaped + tombstoned (4b),
+    /// escrow is released. `run()` SKIPS legacy `restore_sessions`
+    /// (R13).
     Adopted {
         adopted: usize,
-        /// Manifest-listed total (adopted + per-record skips).
+        /// Records whose child exited during the swap — reaped and
+        /// recorded as exited tombstones (4b).
+        tombstoned: usize,
+        /// Manifest-listed total (adopted + tombstoned + per-record
+        /// identity-mismatch skips).
         total: usize,
     },
     /// The terminal fallback ran: every manifest-listed child was
@@ -975,12 +1048,14 @@ pub fn complete_handoff(
         Ok(Ok(stats)) => {
             eprintln!(
                 "cm-daemon: re-exec rehydrate committed at attempt {} \
-                 ({} adopted, {} skipped) — releasing escrow: closing the \
-                 original session fds (registry sessions run on dups), the \
-                 manifest fd, and the pinned rollback binary fd {} (no \
-                 rollback needed past the commit gate){}",
+                 ({} adopted, {} tombstoned, {} skipped) — releasing \
+                 escrow: closing the original session fds (registry \
+                 sessions run on dups), the manifest fd, and the pinned \
+                 rollback binary fd {} (no rollback needed past the commit \
+                 gate){}",
                 attempt,
                 stats.adopted,
+                stats.tombstoned,
                 stats.skipped,
                 escrow.rollback_fd.as_raw_fd(),
                 match &escrow.tls_listener_fd {
@@ -993,8 +1068,39 @@ pub fn complete_handoff(
                 },
             );
             drop(escrow);
+            // Phase 4f gap closure (wired at orchestrator integration):
+            // re-exec adoption bypasses the `start_session` spawn
+            // funnel where the codex rollout watch is normally armed
+            // (see `transcript_detect::spawn_codex_rollout_watch`), so
+            // arm it here for every adopted codex session — otherwise
+            // a compacted codex session's resume key would go silently
+            // stale again after a swap, exactly the lineage gap 4f
+            // closed for spawned sessions. Pre-serving, the registry
+            // holds exactly the sessions this transaction adopted;
+            // uids are collected under the lock and the detached
+            // watch threads spawn after it drops.
+            let codex_uids: Vec<String> = {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                st.sessions
+                    .iter()
+                    .filter(|(_, s)| s.session_type == "codex")
+                    .map(|(uid, _)| uid.clone())
+                    .collect()
+            };
+            for uid in codex_uids {
+                eprintln!(
+                    "cm-daemon: re-arming codex rollout watch for adopted \
+                     session '{}'",
+                    uid,
+                );
+                crate::transcript_detect::spawn_codex_rollout_watch(
+                    Arc::clone(state),
+                    uid,
+                );
+            }
             return HandoffOutcome::Adopted {
                 adopted: stats.adopted,
+                tombstoned: stats.tombstoned,
                 total,
             };
         }
@@ -1095,59 +1201,207 @@ fn disarm_partial_commit(state: &Arc<Mutex<DaemonState>>) {
 
 struct AdoptStats {
     adopted: usize,
+    /// Records whose child exited during the swap: reaped
+    /// (`waitid(P_PIDFD)`) and recorded as exited tombstones (4b).
+    tombstoned: usize,
+    /// Start-time-mismatch / broken-probe records: unsignaled,
+    /// unreaped, untombstoned — unknown identity (4a semantics,
+    /// kept).
     skipped: usize,
 }
 
-/// The escrow/commit-gate transaction (design step 6, R5/R6).
+/// Reconstruct a monotonic cell from its manifest age: `anchor -
+/// age`. `None` when the age can't be represented (rejected-as-
+/// corrupt values never get here — structural validation enforces
+/// finite ≥ 0 — but `checked_sub` can still underflow the clock's
+/// epoch for an age larger than the boot's monotonic range; honesty
+/// over guessing). One `anchor` per transaction, mirroring the write
+/// side's one-anchor rule, so cell ORDER is preserved exactly.
+fn instant_from_age(anchor: Instant, age_s: f64) -> Option<Instant> {
+    anchor.checked_sub(Duration::try_from_secs_f64(age_s).ok()?)
+}
+
+/// Project a v2 manifest record into the [`AdoptedSessionMeta`] the
+/// build stage consumes: identity verbatim, cells reconstructed
+/// against `anchor`, and the kills_dir wired by the same rule
+/// `start_session` uses (soft cap present → real kills_dir), so an
+/// adopted capped session's cap kill is attributed instead of
+/// reading as a plain signal-9 exit.
+fn adopted_meta_from_record(
+    rec: &SessionRecord,
+    anchor: Instant,
+) -> AdoptedSessionMeta {
+    let cell =
+        |age: Option<f64>| age.and_then(|a| instant_from_age(anchor, a));
+    let done_report = rec.done_report.as_ref().and_then(|dr| {
+        match instant_from_age(anchor, dr.age_s) {
+            Some(at_instant) => Some(ReportedDone {
+                at_unix: dr.at_unix,
+                at_instant,
+                reason: dr.reason.clone(),
+            }),
+            None => {
+                eprintln!(
+                    "cm-daemon: handoff session '{}': done_report age {}s \
+                     is not reconstructible on this clock — dropping the \
+                     marker (logged, never guessed)",
+                    rec.uid, dr.age_s,
+                );
+                None
+            }
+        }
+    });
+    AdoptedSessionMeta {
+        title: rec.title.clone(),
+        session_type: rec.session_type.clone(),
+        workspace_id: rec.workspace_id.clone(),
+        managed_by_uid: rec.managed_by_uid.clone(),
+        task_id: rec.task_id.clone(),
+        transcript_path: rec.transcript_path.clone(),
+        memory_cap_soft_bytes: rec.memory_cap_soft_bytes,
+        memory_cap_hard_bytes: rec.memory_cap_hard_bytes,
+        cgroup_prefix: rec.cgroup_prefix.clone().map(PathBuf::from),
+        workflow_run_id: rec.workflow_run_id.clone(),
+        workflow_role: rec.workflow_role.clone(),
+        continuous_task_id: rec.continuous_task_id.clone(),
+        global_perms: rec.global_perms,
+        generation: rec.generation,
+        last_activity_at: cell(rec.last_activity_age_s),
+        last_input_at: cell(rec.last_input_age_s),
+        last_operator_input_at: cell(rec.last_operator_input_age_s),
+        last_turn_end_at: cell(rec.last_turn_end_age_s),
+        done_report,
+        kills_dir: if rec.memory_cap_soft_bytes.is_some() {
+            crate::path::default_kills_dir()
+        } else {
+            None
+        },
+    }
+}
+
+/// Build the exited tombstone for a record whose child exited during
+/// the swap — the phase-4b honest-tombstone path, mirroring the
+/// provenance shape `handle_session_exit` records for live-session
+/// exits. Deliberately NOT a kill: `killed: false, killed_by: None`
+/// — nothing signaled this child; it exited on its own while the
+/// daemon was between images (the log line is what says "during the
+/// re-exec swap"). The done-report marker carries over under the
+/// same superseded rule the live cell derives (input newer than the
+/// report supersedes it — strict, matching
+/// `DaemonSession::reported_done`).
+fn swap_exit_tombstone(
+    rec: &SessionRecord,
+    worktree_path: Option<String>,
+    exited_at: f64,
+) -> crate::state::ExitedTombstone {
+    let report = rec.done_report.as_ref().filter(|dr| {
+        match rec.last_input_age_s {
+            // input_age < done age ⇔ input is NEWER than the report
+            // ⇔ superseded (strict, like the live `>` comparison).
+            Some(input_age) => input_age >= dr.age_s,
+            None => true,
+        }
+    });
+    crate::state::ExitedTombstone {
+        session_uid: rec.uid.clone(),
+        transcript_path: rec.transcript_path.clone(),
+        generation: rec.generation,
+        session_type: rec.session_type.clone(),
+        workspace_id: rec.workspace_id.clone(),
+        task_id: rec.task_id.clone(),
+        managed_by_uid: rec.managed_by_uid.clone(),
+        label: rec.title.clone(),
+        workflow_run_id: rec.workflow_run_id.clone(),
+        workflow_role: rec.workflow_role.clone(),
+        worktree_path,
+        global_perms: rec.global_perms,
+        exited_at,
+        killed: false,
+        killed_by: None,
+        reported_done_at: report.map(|r| r.at_unix),
+        report_reason: report.and_then(|r| r.reason.clone()),
+    }
+}
+
+/// The escrow/commit-gate transaction (design step 6, R5/R6; phase
+/// 4b restructured it into validate → build-all → reap-dead →
+/// commit).
 ///
 /// **Validation phase** — no promotion, nothing armed, nothing
 /// signaled: every record gets a [`SessionCandidate`] built from
 /// CLOEXEC **dups** (`OwnedFd::try_clone`) of its escrowed fds, then
 /// the non-consuming probes run: pidfd liveness and the R6
-/// start-time cross-check. Records whose child genuinely exited, or
-/// whose start-time mismatches/can't be read, are SKIPPED — logged,
-/// never signaled, status left unconsumed (phase-4b tombstones them
-/// honestly); they don't fail the transaction. Unexpected errors DO:
-/// a dup failure (fd exhaustion), a duplicate uid (corrupt manifest
-/// shape), an adopt failure at commit — each aborts with `Err`,
-/// candidates drop (dups close), and the caller's escrow originals
-/// are untouched for the rollback path.
+/// start-time cross-check. A record whose child EXITED during the
+/// swap is set aside for the commit phase's reap+tombstone (4b);
+/// one whose start-time mismatches or whose probe breaks is SKIPPED
+/// — logged, never signaled, never reaped, never tombstoned
+/// (unknown identity — 4a semantics, kept). Unexpected errors fail
+/// the transaction with `Err`: candidates drop (dups close), and
+/// the caller's escrow originals are untouched for the rollback
+/// path.
 ///
 /// The failure-injection knob ([`ENV_TEST_FAIL_REHYDRATE`], dev-flag
-/// gated) fires HERE — after validation, before commit — so the e2e
-/// drives the real rollback path through a real validated escrow.
+/// gated) fires HERE — after validation, before anything is built,
+/// reaped, or committed — so the e2e drives the real rollback path
+/// through a fully-intact escrow (zombies included).
 ///
-/// **Commit phase** — the gate: only after EVERY survivor validated.
-/// Under ONE continuous state-lock hold (the `start_session`
-/// fast-exit discipline: a reaper's `on_exit` blocks on this lock, so
-/// every insert is visible before any exit callback can run), each
-/// survivor is promoted and armed via [`DaemonSession::adopt`] **on
-/// its dups** and inserted. Kill-on-drop begins at adopt — that is
-/// the commit.
+/// **Build phase** (4b — closes the P4a byte-loss corner): every
+/// survivor is promoted and run through
+/// [`DaemonSession::build_adopted`] — all the realistically-fallible
+/// construction (reader clone, poll-fd dup, `take_writer`, reaper
+/// pidfd dup, kills-baseline capture) with **no thread started**. A
+/// failure here drops the builds (non-killing, dups close) and
+/// rolls back with ZERO bytes consumed — pre-4b, earlier records'
+/// readers were already draining kernel-buffered PTY bytes into
+/// fanout rings that die at the rollback exec.
+///
+/// **Reap phase** (4b): each swap-dead record's zombie is reaped via
+/// `waitid(P_PIDFD)` through its candidate's dup'd pidfd, under a
+/// reap-gate read permit (taken BEFORE the state lock, preserving
+/// the process-wide gate → state order). Past this point the
+/// transaction is morally committed — the only remaining failures
+/// are the arm stage's thread spawns.
+///
+/// **Commit phase** — the gate: under ONE continuous state-lock hold
+/// (the `start_session` fast-exit discipline: a reaper's `on_exit`
+/// blocks on this lock, so every insert is visible before any exit
+/// callback can run): tombstone the reaped dead records (mirroring
+/// `handle_session_exit`'s provenance shape — an exit during the
+/// swap, not a kill), then arm ([`AdoptedSessionBuild::arm`]) and
+/// insert each survivor. Kill-on-drop begins at arm — that is the
+/// commit. A thread-spawn failure mid-arm still disarms the
+/// already-inserted sessions inside the same lock hold (drain +
+/// `mem::forget` — never Drop, which SIGKILLs) and returns `Err`
+/// with escrow intact; that vanishing residual (already-armed
+/// readers may have drained bytes) is the one corner the build/arm
+/// split cannot close in-process.
 ///
 /// **Why commit on the dups** (the design offered two honest
 /// shapes): arming on the ORIGINALS would consume escrow record by
-/// record, so an adopt failure on session N+1 would leave a rollback
-/// with a partially-consumed escrow — exactly what R5 forbids.
-/// Arming on the dups keeps the originals intact in escrow until the
-/// WHOLE transaction has succeeded (a PTY dup shares the open file
+/// record, so a failure on session N+1 would leave a rollback with a
+/// partially-consumed escrow — exactly what R5 forbids. Arming on
+/// the dups keeps the originals intact in escrow until the WHOLE
+/// transaction has succeeded (a PTY dup shares the open file
 /// description, so the armed session's handles are functionally
 /// identical); the caller then closes the redundant originals in one
 /// place. Single-ownership stays honest: originals never leave
-/// escrow, dups are owned by the candidate → parts → armed session.
-/// A mid-commit adopt failure disarms the already-inserted sessions
-/// inside the same lock hold (drain + `mem::forget` — never Drop,
-/// which SIGKILLs) and returns `Err` with escrow intact.
+/// escrow, dups are owned by candidate → parts → build → armed
+/// session.
 fn rehydrate_transaction(
     state_arc: &Arc<Mutex<DaemonState>>,
     escrow: &HandoffEscrow,
     reexec_enabled: bool,
 ) -> Result<AdoptStats, String> {
     let manifest = &escrow.manifest;
+    // ONE reconstruction anchor for every age in this manifest —
+    // the read-side twin of build_manifest's single capture anchor,
+    // which is what keeps cell ORDER exact across the swap.
+    let anchor = Instant::now();
 
     // ---- Validation phase (dups only, no promotion) ----
     let mut seen_uids: HashSet<&str> = HashSet::new();
     let mut survivors: Vec<(usize, SessionCandidate)> = Vec::new();
+    let mut dead: Vec<(usize, SessionCandidate)> = Vec::new();
     let mut skipped = 0usize;
     for (i, rec) in manifest.sessions.iter().enumerate() {
         if !seen_uids.insert(rec.uid.as_str()) {
@@ -1181,19 +1435,21 @@ fn rehydrate_transaction(
             master_dup,
         );
 
-        // Probe 1: liveness (non-consuming pidfd poll — an exited
-        // child stays an unreaped zombie; skipped without reaping or
-        // tombstoning, same as 3b — phase 4b's business).
+        // Probe 1: liveness (non-consuming pidfd poll). An exited
+        // child parks as an unreaped zombie — set aside; the COMMIT
+        // phase reaps + tombstones it (4b), so a pre-commit failure
+        // still rolls back with the zombie intact for the rollback
+        // image's own honest probe.
         match candidate.child_alive() {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!(
                     "cm-daemon: handoff session '{}' (pid {}): child exited \
-                     during the swap — skipping adoption (no tombstone, \
-                     status left unreaped for later phases)",
+                     during the swap — will reap + tombstone at commit \
+                     (never adopted, never signaled)",
                     rec.uid, rec.child_pid,
                 );
-                skipped += 1;
+                dead.push((i, candidate));
                 continue;
             }
             Err(e) => {
@@ -1209,7 +1465,9 @@ fn rehydrate_transaction(
         // Probe 2: R6 identity cross-check — the recorded spawn-time
         // starttime must match the live read. The pidfd already makes
         // signaling pid-reuse-proof; this catches a corrupt/mismatched
-        // record before we build anything around it.
+        // record before we build anything around it. Mismatches stay
+        // exactly as 4a left them: unsignaled, unreaped, untombstoned
+        // — never fabricate provenance for an unknown identity.
         match candidate.child_start_time() {
             Ok(t) if t == rec.child_start_time => {}
             Ok(t) => {
@@ -1232,14 +1490,6 @@ fn rehydrate_transaction(
                 continue;
             }
         }
-        if let Some(tid) = rec.transcript_id.as_deref() {
-            eprintln!(
-                "cm-daemon: handoff session '{}': transcript_id {} noted but \
-                 not rebound (the manifest carries the id, not the path; \
-                 phase 4b)",
-                rec.uid, tid,
-            );
-        }
         survivors.push((i, candidate));
     }
 
@@ -1250,32 +1500,119 @@ fn rehydrate_transaction(
         return Err(reason);
     }
 
-    // ---- Commit phase (the gate) ----
-    let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    let mut adopted = 0usize;
+    // ---- Build phase (4b): everything fallible, zero threads. ----
+    let mut builds: Vec<(usize, AdoptedSessionBuild)> =
+        Vec::with_capacity(survivors.len());
     for (i, candidate) in survivors {
         let rec = &manifest.sessions[i];
-        if st.sessions.contains_key(&rec.uid) {
-            // Impossible pre-serving (the registry starts empty and
-            // only this loop inserts) — a collision means a program
-            // bug or a hostile manifest; unexpected → fail.
-            disarm_registry_locked(&mut st);
+        let meta = adopted_meta_from_record(rec, anchor);
+        let build = DaemonSession::build_adopted(candidate.promote(), meta)
+            .map_err(|e| {
+                format!(
+                    "build_adopted failed for session '{}': {} — \
+                     transaction aborted before any thread started \
+                     (escrow originals intact, nothing consumed)",
+                    rec.uid, e,
+                )
+            })?;
+        builds.push((i, build));
+    }
+
+    // ---- Reap phase (4b): consume the swap-dead zombies. ----
+    // Permit taken and released BEFORE the state lock below — the
+    // process-wide lock order is gate → state (see the module docs'
+    // ordering argument), and holding the state lock while blocking
+    // on the gate would invert it. waitid(P_PIDFD) through the
+    // candidate's dup'd pidfd targets the fd's bound task only, so
+    // the numeric pid is diagnostic, never an identity source.
+    let mut reaped: Vec<(usize, crate::session::DaemonExitStatus)> =
+        Vec::with_capacity(dead.len());
+    if !dead.is_empty() {
+        let _permit = reap_gate::read_permit();
+        for (i, candidate) in dead {
+            let rec = &manifest.sessions[i];
+            let status = crate::session::consume_exit_status(
+                candidate.pidfd(),
+                rec.child_pid,
+            );
+            eprintln!(
+                "cm-daemon: handoff session '{}' (pid {}): exited during \
+                 the re-exec swap — reaped (exit code {:?}, signal {:?}); \
+                 tombstone lands at commit",
+                rec.uid, rec.child_pid, status.code, status.signal,
+            );
+            reaped.push((i, status));
+            // candidate drops here: closes this record's dup'd pidfd
+            // + master; the escrow originals close with the escrow
+            // when the caller releases it post-commit.
+        }
+    }
+
+    // ---- Commit phase (the gate) ----
+    let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Registry-collision pre-check across the WHOLE batch before
+    // anything is inserted. Impossible pre-serving (the registry
+    // starts empty and only this transaction inserts) — a collision
+    // means a program bug or a hostile manifest; nothing to disarm
+    // because nothing has been inserted yet.
+    for (i, _) in &builds {
+        let uid = &manifest.sessions[*i].uid;
+        if st.sessions.contains_key(uid) {
             return Err(format!(
                 "session uid '{}' already present in the registry at commit \
                  — refusing a duplicate adoption",
-                rec.uid,
+                uid,
             ));
         }
-        let parts = candidate.promote();
-        let meta = AdoptedSessionMeta {
-            title: rec.uid.clone(),
-            // The manifest schema carries no engine field yet —
-            // hard-noted bash (the only engine the e2e exercises);
-            // phase 4b adds the field.
-            session_type: "bash".to_string(),
-            generation: rec.generation,
-            cgroup_prefix: rec.cgroup_prefix.clone().map(PathBuf::from),
-        };
+    }
+
+    // Tombstone the reaped dead records — the same recently-exited
+    // state `handle_session_exit` records for live exits, so
+    // `list_sessions(include_exited)` / read-after-exit answer for
+    // them post-swap. No `manifest.watch` broadcast: pre-serving,
+    // no subscriber can exist yet, and attach clients treat the
+    // generation bump as a new stream anyway. `killed: false` —
+    // provenance is an exit during the swap, not a kill.
+    let exited_at = crate::control::methods::now_unix_f64();
+    let tombstoned = reaped.len();
+    for (i, status) in reaped {
+        let rec = &manifest.sessions[i];
+        let worktree_path = st
+            .workspaces
+            .get(&rec.workspace_id)
+            .and_then(|w| w.worktree_path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned());
+        // Mirror handle_session_exit's workspace-entry mutation so
+        // the TUI's manifest view agrees with the tombstone.
+        // `memory_cap_kill: false` is the honest default — the old
+        // image's kill-log baseline died with it (R12 checkpoint is
+        // future scope), so a cap kill landing exactly in the swap
+        // window cannot be attributed.
+        if let Some(mw) = st.workspaces.get_mut(&rec.workspace_id) {
+            if let Some(entry) =
+                mw.sessions.iter_mut().find(|e| e.uid == rec.uid)
+            {
+                entry.last_exit = Some(crate::manifest::LastExit {
+                    code: status.code,
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at,
+                });
+            }
+        }
+        st.record_exited(swap_exit_tombstone(rec, worktree_path, exited_at));
+        eprintln!(
+            "cm-daemon: handoff session '{}' tombstoned (exited during the \
+             re-exec swap; exit code {:?}, signal {:?}, reaped — no zombie)",
+            rec.uid, status.code, status.signal,
+        );
+    }
+
+    // Arm + insert, all under this one continuous lock hold.
+    let mut adopted = 0usize;
+    for (i, build) in builds {
+        let rec = &manifest.sessions[i];
         let state_for_cleanup = Arc::clone(state_arc);
         let uid_for_cleanup = rec.uid.clone();
         let on_exit: crate::session::OnExitCallback = Box::new(move |_status| {
@@ -1284,34 +1621,43 @@ fn rehydrate_transaction(
                 .unwrap_or_else(|p| p.into_inner());
             crate::control::methods::handle_session_exit(&mut s, &uid_for_cleanup);
         });
-        match DaemonSession::adopt(parts, meta, Some(on_exit)) {
+        match build.arm(Some(on_exit)) {
             Ok(sess) => {
                 st.sessions.insert(rec.uid.clone(), sess);
                 adopted += 1;
                 eprintln!(
                     "cm-daemon: handoff session '{}' adopted (pid {}, \
-                     generation {})",
-                    rec.uid, rec.child_pid, rec.generation,
+                     type {}, generation {}, task {:?}, global_perms {})",
+                    rec.uid,
+                    rec.child_pid,
+                    rec.session_type,
+                    rec.generation,
+                    rec.task_id,
+                    rec.global_perms,
                 );
             }
             Err(e) => {
-                // Mid-commit adopt failure (dup/take_writer/thread
-                // spawn — vanishingly rare): disarm the sessions
-                // already inserted INSIDE this same lock hold (their
-                // on_exit callbacks stay blocked on the lock until
-                // the registry is clean), then fail the transaction.
-                // The failed record's DUPS died with its parts; the
-                // escrow ORIGINALS are intact for the rollback.
+                // Arm (thread-spawn) failure — vanishingly rare:
+                // disarm the sessions already inserted INSIDE this
+                // same lock hold (their on_exit callbacks stay
+                // blocked on the lock until the registry is clean),
+                // then fail the transaction. The failed record's
+                // DUPS died with its build; the escrow ORIGINALS are
+                // intact for the rollback.
                 disarm_registry_locked(&mut st);
                 return Err(format!(
-                    "DaemonSession::adopt failed at commit for session '{}': \
-                     {} — transaction aborted (escrow originals intact)",
+                    "arm failed at commit for session '{}': {} — \
+                     transaction aborted (escrow originals intact)",
                     rec.uid, e,
                 ));
             }
         }
     }
-    Ok(AdoptStats { adopted, skipped })
+    Ok(AdoptStats {
+        adopted,
+        tombstoned,
+        skipped,
+    })
 }
 
 /// [`disarm_partial_commit`]'s under-the-lock twin, for failure paths
@@ -1788,5 +2134,231 @@ mod tests {
             );
             assert!(test_fail_requested(false, 1).is_none());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4b: the status-cell age round trip (R11)
+    // ---------------------------------------------------------------
+
+    /// Write-side math (`elapsed` against one anchor) then read-side
+    /// math ([`instant_from_age`] against another anchor) recovers
+    /// the cell to within the anchor gap — the "sub-second swap
+    /// skew" the design accepts. Same-process here, so the recovered
+    /// instant must land within a tight epsilon of the original.
+    #[test]
+    fn age_round_trip_recovers_cells_within_epsilon() {
+        let stamped = Instant::now() - Duration::from_secs_f64(123.456);
+        // Write side (build_manifest's cell_age).
+        let write_anchor = Instant::now();
+        let age_s =
+            write_anchor.saturating_duration_since(stamped).as_secs_f64();
+        assert!(age_s >= 123.0 && age_s < 124.0, "age_s = {}", age_s);
+        // Read side.
+        let read_anchor = Instant::now();
+        let recovered = instant_from_age(read_anchor, age_s)
+            .expect("a real elapsed age reconstructs");
+        let drift = if recovered > stamped {
+            recovered - stamped
+        } else {
+            stamped - recovered
+        };
+        assert!(
+            drift < Duration::from_millis(250),
+            "same-process round trip drifted {:?}",
+            drift
+        );
+    }
+
+    /// Relative ORDER of cells is preserved exactly through the
+    /// round trip when both sides use one anchor — the property the
+    /// done-report superseded rule and `semantic_idle` depend on
+    /// (they compare cells against each other, never against wall
+    /// clock).
+    #[test]
+    fn age_round_trip_preserves_cell_order() {
+        let input_at = Instant::now() - Duration::from_secs_f64(60.0);
+        let report_at = Instant::now() - Duration::from_secs_f64(10.0);
+        assert!(report_at > input_at, "report postdates input by setup");
+
+        let write_anchor = Instant::now();
+        let input_age =
+            write_anchor.saturating_duration_since(input_at).as_secs_f64();
+        let report_age =
+            write_anchor.saturating_duration_since(report_at).as_secs_f64();
+        // Newer cell ⇒ smaller age.
+        assert!(report_age < input_age);
+
+        let read_anchor = Instant::now();
+        let input_rec = instant_from_age(read_anchor, input_age).unwrap();
+        let report_rec = instant_from_age(read_anchor, report_age).unwrap();
+        // The live superseded rule is `last_input > at_instant ⇒
+        // superseded`; input predates the report here, so the report
+        // must remain CURRENT after reconstruction.
+        assert!(
+            !(input_rec > report_rec),
+            "reconstruction inverted the input/report order — a current \
+             done report would read superseded post-swap"
+        );
+
+        // And the tombstone-side pure-age form of the same rule
+        // (swap_exit_tombstone): input_age >= report_age ⇔ current.
+        assert!(input_age >= report_age);
+    }
+
+    /// [`instant_from_age`] refuses what it can't represent instead
+    /// of guessing: NaN / negative (already rejected by manifest
+    /// validation, double-guarded here) and ages past the platform
+    /// clock's representable range. (Linux `Instant`s carry i64
+    /// seconds, so merely-beyond-boot ages like 1e18 still
+    /// reconstruct — to a pre-boot instant, harmless for the
+    /// ordering comparisons these cells feed; only past ~9.2e18
+    /// seconds does `checked_sub` underflow.)
+    #[test]
+    fn instant_from_age_refuses_unrepresentable() {
+        let now = Instant::now();
+        assert!(instant_from_age(now, f64::NAN).is_none());
+        assert!(instant_from_age(now, -1.0).is_none());
+        // Past the i64-seconds range: checked_sub underflows.
+        assert!(instant_from_age(now, 1.0e19).is_none());
+        // A sane age works.
+        assert!(instant_from_age(now, 0.0).is_some());
+        assert!(instant_from_age(now, 3600.0).is_some());
+    }
+
+    /// [`adopted_meta_from_record`] maps the record verbatim: the
+    /// identity fields land unchanged, `None` cells stay `None`, the
+    /// done report reconstructs, and kills_dir is wired iff the
+    /// record carries a soft memory cap (mirroring `start_session`).
+    #[test]
+    fn adopted_meta_maps_record_honestly() {
+        let anchor = Instant::now();
+        let rec = SessionRecord {
+            uid: "ts-meta-1".into(),
+            generation: 4,
+            transcript_id: Some("tid".into()),
+            transcript_path: Some("/tmp/tid.jsonl".into()),
+            session_type: "codex".into(),
+            title: "my worker".into(),
+            workspace_id: "ws-9".into(),
+            task_id: Some("task-1".into()),
+            managed_by_uid: Some("ts-parent".into()),
+            workflow_run_id: Some("run-1".into()),
+            workflow_role: Some("reviewer".into()),
+            continuous_task_id: Some("ct-2".into()),
+            global_perms: true,
+            memory_cap_soft_bytes: Some(1 << 30),
+            memory_cap_hard_bytes: Some(2 << 30),
+            last_activity_age_s: Some(5.0),
+            last_input_age_s: Some(50.0),
+            last_operator_input_age_s: None,
+            last_turn_end_age_s: Some(6.5),
+            done_report: Some(reexec_manifest::DoneReportRecord {
+                at_unix: 1_700_000_000.0,
+                age_s: 7.0,
+                reason: Some("done".into()),
+            }),
+            child_pid: 1234,
+            child_start_time: 42,
+            pty_master_fd: 30,
+            pidfd: 31,
+            cgroup_prefix: Some("/sys/fs/cgroup/x".into()),
+            watcher_checkpoint: None,
+        };
+        let meta = adopted_meta_from_record(&rec, anchor);
+        assert_eq!(meta.title, "my worker");
+        assert_eq!(meta.session_type, "codex");
+        assert_eq!(meta.workspace_id, "ws-9");
+        assert_eq!(meta.task_id.as_deref(), Some("task-1"));
+        assert_eq!(meta.managed_by_uid.as_deref(), Some("ts-parent"));
+        assert_eq!(meta.transcript_path.as_deref(), Some("/tmp/tid.jsonl"));
+        assert_eq!(meta.workflow_run_id.as_deref(), Some("run-1"));
+        assert_eq!(meta.workflow_role.as_deref(), Some("reviewer"));
+        assert_eq!(meta.continuous_task_id.as_deref(), Some("ct-2"));
+        assert!(meta.global_perms);
+        assert_eq!(meta.generation, 4);
+        assert_eq!(meta.memory_cap_soft_bytes, Some(1 << 30));
+        assert_eq!(meta.memory_cap_hard_bytes, Some(2 << 30));
+        assert!(meta.last_activity_at.is_some());
+        assert!(meta.last_operator_input_at.is_none(), "None stays None");
+        let report = meta.done_report.expect("done report reconstructs");
+        assert_eq!(report.at_unix, 1_700_000_000.0);
+        assert_eq!(report.reason.as_deref(), Some("done"));
+        // Report (age 7) postdates turn-end input (age 50) — order
+        // preserved through reconstruction.
+        assert!(report.at_instant > meta.last_input_at.unwrap());
+        // Capped record wires the kill-log probe (real HOME present
+        // in test env ⇒ Some; the rule is presence-of-soft-cap).
+        assert_eq!(
+            meta.kills_dir.is_some(),
+            crate::path::default_kills_dir().is_some()
+        );
+
+        // Uncapped record: no kills_dir, no probe.
+        let mut uncapped = rec.clone();
+        uncapped.memory_cap_soft_bytes = None;
+        uncapped.memory_cap_hard_bytes = None;
+        let meta = adopted_meta_from_record(&uncapped, anchor);
+        assert!(meta.kills_dir.is_none());
+    }
+
+    /// [`swap_exit_tombstone`] provenance: an exit during the swap
+    /// is NOT a kill; the done report rides onto the tombstone under
+    /// the superseded rule (input newer than the report drops it).
+    #[test]
+    fn swap_exit_tombstone_provenance_and_report_carry() {
+        let mut rec = SessionRecord {
+            uid: "ts-dead-1".into(),
+            generation: 2,
+            transcript_id: None,
+            transcript_path: Some("/tmp/t.jsonl".into()),
+            session_type: "bash".into(),
+            title: "doomed".into(),
+            workspace_id: "ws-x".into(),
+            task_id: Some("task-d".into()),
+            managed_by_uid: None,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            global_perms: false,
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            last_activity_age_s: Some(1.0),
+            last_input_age_s: Some(30.0),
+            last_operator_input_age_s: None,
+            last_turn_end_age_s: None,
+            done_report: Some(reexec_manifest::DoneReportRecord {
+                at_unix: 1_700_000_123.0,
+                age_s: 5.0,
+                reason: Some("finished".into()),
+            }),
+            child_pid: 999,
+            child_start_time: 7,
+            pty_master_fd: 40,
+            pidfd: 41,
+            cgroup_prefix: None,
+            watcher_checkpoint: None,
+        };
+
+        // Report (age 5) is newer than the last input (age 30):
+        // current → carried.
+        let tomb =
+            swap_exit_tombstone(&rec, Some("/wt/path".into()), 1_700_000_200.0);
+        assert_eq!(tomb.session_uid, "ts-dead-1");
+        assert_eq!(tomb.label, "doomed");
+        assert_eq!(tomb.session_type, "bash");
+        assert_eq!(tomb.task_id.as_deref(), Some("task-d"));
+        assert_eq!(tomb.transcript_path.as_deref(), Some("/tmp/t.jsonl"));
+        assert_eq!(tomb.worktree_path.as_deref(), Some("/wt/path"));
+        assert!(!tomb.killed, "a swap exit is not a kill");
+        assert!(tomb.killed_by.is_none(), "no fabricated kill provenance");
+        assert_eq!(tomb.reported_done_at, Some(1_700_000_123.0));
+        assert_eq!(tomb.report_reason.as_deref(), Some("finished"));
+
+        // Input newer than the report (input age 2 < report age 5):
+        // superseded → not carried.
+        rec.last_input_age_s = Some(2.0);
+        let tomb = swap_exit_tombstone(&rec, None, 1_700_000_200.0);
+        assert_eq!(tomb.reported_done_at, None, "superseded report dropped");
+        assert_eq!(tomb.report_reason, None);
     }
 }

@@ -757,11 +757,25 @@ pub fn run() -> anyhow::Result<()> {
     match reexec_handoff {
         Some(escrow) => {
             match reexec::complete_handoff(&state, escrow, reexec_enabled) {
-                reexec::HandoffOutcome::Adopted { adopted, total } => {
+                reexec::HandoffOutcome::Adopted {
+                    adopted,
+                    tombstoned,
+                    total,
+                } => {
                     eprintln!(
                         "cm-daemon: re-exec handoff — adopted {}/{} \
-                         session(s); legacy restore_sessions skipped",
-                        adopted, total,
+                         session(s){}; legacy restore_sessions skipped",
+                        adopted,
+                        total,
+                        if tombstoned > 0 {
+                            format!(
+                                " ({} exited during the swap: reaped + \
+                                 tombstoned)",
+                                tombstoned
+                            )
+                        } else {
+                            String::new()
+                        },
                     );
                 }
                 reexec::HandoffOutcome::TerminalFallback { killed, total } => {

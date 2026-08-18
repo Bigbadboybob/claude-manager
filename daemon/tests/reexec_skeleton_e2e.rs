@@ -147,15 +147,16 @@ fn find_bash_child(daemon_pid: i32, deadline: Instant) -> Option<i32> {
     None
 }
 
-/// Panic-safe cleanup: kill the sandbox daemon AND its bash child.
-/// Bash first — SIGKILLing the daemon skips every `Drop`, so the
-/// child would otherwise leak past the test. The bash pid is only
-/// signaled after re-verifying its recorded start time, so a
-/// recycled pid can never be hit.
+/// Panic-safe cleanup: kill the sandbox daemon AND its bash
+/// children. Bash first — SIGKILLing the daemon skips every `Drop`,
+/// so the children would otherwise leak past the test. Each bash pid
+/// is only signaled after re-verifying its recorded start time, so a
+/// recycled pid can never be hit. (A `Vec` since phase 4b's
+/// dead-record test runs two sessions per sandbox.)
 struct SandboxGuard {
     daemon: Child,
-    bash_pid: Option<i32>,
-    bash_start: Option<u64>,
+    /// `(pid, recorded starttime)` per tracked bash child.
+    bash: Vec<(i32, u64)>,
     log_path: PathBuf,
 }
 
@@ -166,11 +167,15 @@ impl SandboxGuard {
         let tail = lines.len().saturating_sub(40);
         lines[tail..].join("\n")
     }
+
+    fn track_bash(&mut self, pid: i32, start: u64) {
+        self.bash.push((pid, start));
+    }
 }
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
-        if let (Some(pid), Some(start)) = (self.bash_pid, self.bash_start) {
+        for &(pid, start) in &self.bash {
             if proc_starttime(pid) == Some(start) {
                 // SAFETY: our sandbox daemon's child, identity
                 // re-verified via starttime the instant before.
@@ -262,8 +267,7 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
     let daemon_pid = daemon.id() as i32;
     let mut guard = SandboxGuard {
         daemon,
-        bash_pid: None,
-        bash_start: None,
+        bash: Vec::new(),
         log_path: log_path.clone(),
     };
 
@@ -374,8 +378,7 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
             )
         });
     let bash_start = proc_starttime(bash_pid).expect("bash starttime");
-    guard.bash_pid = Some(bash_pid);
-    guard.bash_start = Some(bash_start);
+    guard.track_bash(bash_pid, bash_start);
     println!(
         "pre-exec: daemon pid {} | bash child pid {} (starttime {}) | PRE-50 drained",
         daemon_pid, bash_pid, bash_start
@@ -557,6 +560,29 @@ fn reexec_skeleton_pty_continuity_end_to_end() {
         "adopted session reads as exited: {}",
         row
     );
+    // Phase 4b: the adopted row carries the ORIGINAL identity — the
+    // 3b/4a skeleton hard-noted `"bash"` and re-used the uid as the
+    // label; the v2 record restores both for real (the full identity
+    // matrix — task binding, perms, transcript, done_report — is
+    // exercised by `reexec_full_record_and_dead_record_tombstone`).
+    assert_eq!(
+        row.get("label").and_then(|v| v.as_str()),
+        Some("reexec-e2e-bash"),
+        "adopted session lost its label: {}",
+        row
+    );
+    assert_eq!(
+        row.get("type").and_then(|v| v.as_str()),
+        Some("bash"),
+        "adopted session lost its session_type: {}",
+        row
+    );
+    assert_eq!(
+        row.get("workspace_id").and_then(|v| v.as_str()),
+        Some("ws-reexec-e2e"),
+        "adopted session lost its workspace binding: {}",
+        row
+    );
 
     // (6)+(7) PTY writable AND readable through the ADOPTED session:
     // post-exec markers go in via send_input and come back out of
@@ -694,8 +720,7 @@ fn spawn_sandbox(extra_env: &[(&str, &str)]) -> Sandbox {
     let daemon_pid = daemon.id() as i32;
     let guard = SandboxGuard {
         daemon,
-        bash_pid: None,
-        bash_start: None,
+        bash: Vec::new(),
         log_path: log_path.clone(),
     };
 
@@ -815,8 +840,7 @@ fn start_bash_session(sb: &mut Sandbox, uid: &str) -> (i32, u64) {
                 )
             });
     let bash_start = proc_starttime(bash_pid).expect("bash starttime");
-    sb.guard.bash_pid = Some(bash_pid);
-    sb.guard.bash_start = Some(bash_start);
+    sb.guard.track_bash(bash_pid, bash_start);
     (bash_pid, bash_start)
 }
 
@@ -1197,8 +1221,7 @@ fn reexec_terminal_fallback_after_double_failure() {
         );
         // Hand the restored child to the panic-safe guard, then tear
         // down through the daemon so the reaper path runs.
-        sb.guard.bash_pid = Some(new_bash);
-        sb.guard.bash_start = Some(new_start);
+        sb.guard.track_bash(new_bash, new_start);
         let _ = round_trip(
             &sb.socket,
             &operator_request(
@@ -1225,5 +1248,513 @@ fn reexec_terminal_fallback_after_double_failure() {
          ladder 0-fail → rollback → 1-fail → terminal kill+reap of pid {} | \
          daemon serving",
         sb.daemon_pid, bash_pid
+    );
+}
+
+// ===================================================================
+// Phase 4b: full session records across the handoff (R11) + honest
+// tombstones for records whose child exited during the swap.
+// ===================================================================
+
+/// All the daemon's direct bash children right now (one /proc walk,
+/// no retry — callers diff before/after a spawn to map uid → pid
+/// when more than one session is live).
+fn find_all_bash_children(daemon_pid: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if proc_ppid(pid) != Some(daemon_pid) {
+                continue;
+            }
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                .unwrap_or_default();
+            if comm.trim() == "bash" {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// `/proc/<pid>/stat` state (field 3 — index 0 after the comm split):
+/// `"Z"` for a zombie. `None` when the process is fully gone.
+fn proc_state(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().next().map(|s| s.to_string())
+}
+
+/// (c) Phase 4b: the FULL record rides the manifest, and a record
+/// whose child exited during the swap gets an honest tombstone.
+///
+/// Session A is spawned with everything the operator spawn RPC can
+/// set — label, type, workspace, task binding, managed_by,
+/// global_perms, transcript_path — and then calls `report_done`
+/// (Session-caller frame over the same socket; the uid is the
+/// caller identity on the local transport). Post-swap its
+/// list_sessions row must carry ALL of it: the R11 case is
+/// `reported_done` surviving so an `until="final"` watcher doesn't
+/// see the worker regress to plain awaiting-input.
+///
+/// Session B's child is SIGKILLed *by the test* while the swap is
+/// frozen mid-exec: the re-exec targets a WRAPPER script that
+/// blocks on a FIFO before exec'ing the real daemon binary, so
+/// between the two execs there is a deterministic window where the
+/// process has no reapers at all — the kill lands there, B's child
+/// parks as a zombie child of the wrapper, and the new image's
+/// rehydrate finds a manifest record whose child exited during the
+/// swap. Post-swap: an exited tombstone for B (killed=false — the
+/// daemon never signaled it; provenance is a swap exit, not a
+/// kill), and NO zombie (the pid fully reaped via waitid(P_PIDFD)).
+#[test]
+fn reexec_full_record_and_dead_record_tombstone() {
+    let bin = env!("CARGO_BIN_EXE_cm-daemon");
+    let mut sb = spawn_sandbox(&[]);
+
+    // ---- Session A: full identity + a real report_done. ----
+    let uid_a = "ts-e2ed-1";
+    // A transcript file the row's `state: "ready"` derivation keys
+    // off (the daemon never opens it — it only echoes the path).
+    let transcript_path = sb.home.join("fake-transcript.jsonl");
+    std::fs::write(&transcript_path, "{}\n").expect("touch transcript");
+    let start = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "start_session",
+            serde_json::json!({
+                "uid": uid_a,
+                "workspace_id": "ws-reexec-e2e",
+                "worktree_path": sb.home.to_string_lossy(),
+                "label": "identity-bash",
+                "argv": ["bash", "--norc"],
+                "working_dir": sb.home.to_string_lossy(),
+                "session_type": "bash",
+                "task_id": "task-e2e-identity",
+                "managed_by_uid": "ts-e2ed-parent",
+                "global_perms": true,
+                "transcript_path": transcript_path.to_string_lossy(),
+                "cols": 120,
+                "rows": 40,
+                "env": {}
+            }),
+        ),
+    )
+    .expect("start_session A");
+    assert!(
+        start.ok,
+        "start_session A failed: {:?}\n--- daemon log tail ---\n{}",
+        start.error,
+        sb.guard.log_tail()
+    );
+    let a_pid = find_bash_child(sb.daemon_pid, Instant::now() + Duration::from_secs(10))
+        .expect("bash child for session A");
+    let a_start = proc_starttime(a_pid).expect("A starttime");
+    sb.guard.track_bash(a_pid, a_start);
+
+    // Prove A's reader is live (the PRE condition all these e2es keep).
+    let send = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "send_input",
+            serde_json::json!({
+                "session_uid": uid_a,
+                "text": "echo PRE-A-OK",
+                "submit": true
+            }),
+        ),
+    )
+    .expect("send_input PRE A");
+    assert!(send.ok, "send_input PRE A failed: {:?}", send.error);
+    {
+        let socket = sb.socket.clone();
+        let token = sb.token.clone();
+        wait_for(
+            Instant::now() + Duration::from_secs(20),
+            "PRE-A-OK in pre-exec output",
+            &sb.guard,
+            || {
+                let resp = round_trip(
+                    &socket,
+                    &operator_request(
+                        &token,
+                        "read_session_output",
+                        serde_json::json!({ "session_uid": uid_a }),
+                    ),
+                )
+                .ok()?;
+                output_text(&resp).filter(|t| t.contains("PRE-A-OK"))
+            },
+        );
+    }
+
+    // The agent's own final report, via the wire (Session-caller
+    // frame — report_done is Session-callable only). AFTER the PRE
+    // input, so the live superseded rule keeps it CURRENT.
+    let report = round_trip(
+        &sb.socket,
+        &Request {
+            id: "e2e-report-done".into(),
+            caller: Caller::session(uid_a),
+            method: "report_done".into(),
+            params: serde_json::json!({
+                "reason": "identity e2e final report"
+            }),
+        },
+    )
+    .expect("report_done round trip");
+    assert!(report.ok, "report_done failed: {:?}", report.error);
+    assert_eq!(
+        report
+            .result
+            .as_ref()
+            .and_then(|r| r.get("status"))
+            .and_then(|v| v.as_str()),
+        Some("reported"),
+        "report_done result: {:?}",
+        report.result
+    );
+
+    // ---- Session B: plain bash, doomed to die mid-swap. ----
+    let uid_b = "ts-e2ed-2";
+    let start = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "start_session",
+            serde_json::json!({
+                "uid": uid_b,
+                "workspace_id": "ws-reexec-e2e",
+                "worktree_path": sb.home.to_string_lossy(),
+                "label": "doomed-bash",
+                "argv": ["bash", "--norc"],
+                "working_dir": sb.home.to_string_lossy(),
+                "session_type": "bash",
+                "cols": 80,
+                "rows": 24,
+                "env": {}
+            }),
+        ),
+    )
+    .expect("start_session B");
+    assert!(start.ok, "start_session B failed: {:?}", start.error);
+    // Map uid_b → pid by set difference against A's known pid.
+    let b_pid = {
+        let socket_deadline = Instant::now() + Duration::from_secs(10);
+        wait_for(socket_deadline, "session B's bash child", &sb.guard, || {
+            find_all_bash_children(sb.daemon_pid)
+                .into_iter()
+                .find(|p| *p != a_pid)
+        })
+    };
+    let b_start = proc_starttime(b_pid).expect("B starttime");
+    sb.guard.track_bash(b_pid, b_start);
+    println!(
+        "4b e2e pre-exec: daemon pid {} | A bash {} (start {}) | B bash {} \
+         (start {})",
+        sb.daemon_pid, a_pid, a_start, b_pid, b_start
+    );
+
+    // ---- The mid-swap gate: a wrapper that parks between execs. ----
+    // exec #1 replaces the daemon with this script (same PID, no
+    // reapers anywhere); it blocks opening the FIFO until the test
+    // releases it, then execs the real binary, which rehydrates from
+    // the inherited manifest env. The kill below lands in that
+    // window, so B's record is live in the manifest but its child is
+    // a zombie by validation time — the deterministic version of "a
+    // child exited during the swap". `read` is a builtin and the
+    // redirect-open is what blocks: the script forks NOTHING, so
+    // nothing can reap B's zombie before the new image does it
+    // deliberately.
+    let fifo = sb.home.join("swap-gate.fifo");
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain mkfifo on a path inside our tempdir.
+        let ret = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(ret, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+    let wrapper = sb.home.join("swap-gate-wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nread _ < '{}'\nexec '{}'\n",
+            fifo.display(),
+            bin
+        ),
+    )
+    .expect("write wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            &wrapper,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod wrapper");
+    }
+
+    // Fire at the wrapper. Success = the connection dies at exec #1.
+    let fired = fire_expect_drop(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "daemon.reexec_dev",
+            serde_json::json!({ "binary_path": wrapper.to_string_lossy() }),
+        ),
+    );
+    if let Some(resp) = fired {
+        panic!(
+            "daemon.reexec_dev answered instead of exec'ing: {:?}\n--- \
+             daemon log tail ---\n{}",
+            resp,
+            sb.guard.log_tail()
+        );
+    }
+
+    // The swap is now frozen at the FIFO. Kill B's child — identity
+    // re-verified via starttime first (never signal a recycled pid);
+    // it must park as a ZOMBIE (nothing can reap it: the wrapper
+    // forked nothing and the old image's reapers died at the exec).
+    assert_eq!(
+        proc_starttime(b_pid),
+        Some(b_start),
+        "B's bash vanished before the mid-swap kill"
+    );
+    // SAFETY: our sandbox daemon's child, starttime-verified above.
+    unsafe {
+        libc::kill(b_pid, libc::SIGKILL);
+    }
+    wait_for(
+        Instant::now() + Duration::from_secs(10),
+        "B's child to park as a zombie mid-swap",
+        &sb.guard,
+        || (proc_state(b_pid).as_deref() == Some("Z")).then_some(()),
+    );
+    println!(
+        "4b e2e: B (pid {}) is a zombie mid-swap; releasing the gate",
+        b_pid
+    );
+
+    // Release the gate: exec #2 (the real binary) runs rehydrate.
+    std::fs::write(&fifo, "go\n").expect("release swap gate");
+
+    let post_deadline = Instant::now() + Duration::from_secs(60);
+    wait_for(post_deadline, "daemon.health after the swap", &sb.guard, || {
+        round_trip(
+            &sb.socket,
+            &operator_request(&sb.token, "daemon.health", serde_json::json!({})),
+        )
+        .ok()
+        .filter(|r| r.ok)
+    });
+
+    // Same daemon process through both execs.
+    assert!(
+        matches!(sb.guard.daemon.try_wait(), Ok(None)),
+        "daemon process (pid {}) exited across the swap.\n--- daemon log \
+         tail ---\n{}",
+        sb.daemon_pid,
+        sb.guard.log_tail()
+    );
+    let log = std::fs::read_to_string(&sb.log_path).unwrap_or_default();
+    for needle in [
+        "adopted 1/2 session(s)",
+        "exited during the re-exec swap",
+        "tombstoned",
+    ] {
+        assert!(
+            log.contains(needle),
+            "daemon log missing {:?}.\n--- daemon log tail ---\n{}",
+            needle,
+            sb.guard.log_tail()
+        );
+    }
+
+    // ---- A: the full identity round-tripped. ----
+    let sessions = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "list_sessions",
+            serde_json::json!({ "include_exited": true }),
+        ),
+    )
+    .expect("list_sessions after swap");
+    assert!(sessions.ok, "list_sessions failed: {:?}", sessions.error);
+    let rows = sessions
+        .result
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .expect("list_sessions array");
+    let row_a = rows
+        .iter()
+        .find(|r| r.get("session_uid").and_then(|v| v.as_str()) == Some(uid_a))
+        .unwrap_or_else(|| {
+            panic!(
+                "session A missing post-swap: {}\n--- daemon log tail ---\n{}",
+                serde_json::to_string_pretty(rows).unwrap_or_default(),
+                sb.guard.log_tail()
+            )
+        });
+    let s = |k: &str| {
+        row_a.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
+    };
+    assert_eq!(s("label").as_deref(), Some("identity-bash"), "row A: {}", row_a);
+    assert_eq!(s("type").as_deref(), Some("bash"), "row A: {}", row_a);
+    assert_eq!(
+        s("task_id").as_deref(),
+        Some("task-e2e-identity"),
+        "row A: {}",
+        row_a
+    );
+    assert_eq!(
+        s("managed_by_uid").as_deref(),
+        Some("ts-e2ed-parent"),
+        "row A: {}",
+        row_a
+    );
+    assert_eq!(
+        s("workspace_id").as_deref(),
+        Some("ws-reexec-e2e"),
+        "row A: {}",
+        row_a
+    );
+    assert_eq!(
+        row_a.get("global_perms").and_then(|v| v.as_bool()),
+        Some(true),
+        "global_perms lost across the swap: {}",
+        row_a
+    );
+    // transcript_path carried → the state derivation reads "ready"
+    // (a 4a amnesiac read "pending" forever).
+    assert_eq!(s("state").as_deref(), Some("ready"), "row A: {}", row_a);
+    // THE R11 assertion: the done report survived the swap.
+    assert_eq!(
+        row_a.get("reported_done").and_then(|v| v.as_bool()),
+        Some(true),
+        "report_done regressed across the swap (R11): {}",
+        row_a
+    );
+    assert_eq!(
+        s("report_reason").as_deref(),
+        Some("identity e2e final report"),
+        "row A: {}",
+        row_a
+    );
+    // And A's child rode through untouched.
+    assert_eq!(proc_starttime(a_pid), Some(a_start), "A's child disturbed");
+    assert_eq!(proc_ppid(a_pid), Some(sb.daemon_pid), "A reparented");
+
+    // ---- B: honest tombstone, no zombie. ----
+    let row_b = rows
+        .iter()
+        .find(|r| r.get("session_uid").and_then(|v| v.as_str()) == Some(uid_b))
+        .unwrap_or_else(|| {
+            panic!(
+                "session B has no tombstone post-swap: {}\n--- daemon log \
+                 tail ---\n{}",
+                serde_json::to_string_pretty(rows).unwrap_or_default(),
+                sb.guard.log_tail()
+            )
+        });
+    assert_eq!(
+        row_b.get("state").and_then(|v| v.as_str()),
+        Some("exited"),
+        "row B: {}",
+        row_b
+    );
+    assert_eq!(
+        row_b.get("label").and_then(|v| v.as_str()),
+        Some("doomed-bash"),
+        "tombstone lost B's label: {}",
+        row_b
+    );
+    // Provenance: an exit during the swap, NOT a kill — the daemon
+    // never signaled this child (the test did, playing the role of
+    // "exited on its own mid-swap").
+    assert_eq!(
+        row_b.get("killed").and_then(|v| v.as_bool()),
+        Some(false),
+        "swap-exit tombstone must not claim a kill: {}",
+        row_b
+    );
+    assert!(
+        row_b
+            .get("exited_at")
+            .and_then(|v| v.as_f64())
+            .is_some_and(|t| t > 0.0),
+        "tombstone has no exited_at: {}",
+        row_b
+    );
+    // Fully reaped: no process (zombie included) holds B's identity.
+    assert_ne!(
+        proc_starttime(b_pid),
+        Some(b_start),
+        "B's pid still holds its starttime — the zombie was never reaped.\n\
+         --- daemon log tail ---\n{}",
+        sb.guard.log_tail()
+    );
+
+    // ---- A's PTY still flows through the adopted reader. ----
+    let send = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "send_input",
+            serde_json::json!({
+                "session_uid": uid_a,
+                "text": "echo POST-A-OK",
+                "submit": true
+            }),
+        ),
+    )
+    .expect("send_input POST A");
+    assert!(send.ok, "send_input POST A failed: {:?}", send.error);
+    {
+        let socket = sb.socket.clone();
+        let token = sb.token.clone();
+        wait_for(
+            Instant::now() + Duration::from_secs(20),
+            "POST-A-OK in post-swap output",
+            &sb.guard,
+            || {
+                let resp = round_trip(
+                    &socket,
+                    &operator_request(
+                        &token,
+                        "read_session_output",
+                        serde_json::json!({ "session_uid": uid_a }),
+                    ),
+                )
+                .ok()?;
+                output_text(&resp).filter(|t| t.contains("POST-A-OK"))
+            },
+        );
+    }
+
+    println!(
+        "4b e2e post-swap: daemon pid {} unchanged | A adopted with full \
+         identity (label/type/task/global_perms/transcript/reported_done) | \
+         B tombstoned (state=exited, killed=false) + fully reaped | \
+         POST-A-OK drained",
+        sb.daemon_pid
+    );
+
+    // Teardown through the daemon so the reaper path runs for A.
+    let _ = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "kill_session",
+            serde_json::json!({ "session_uid": uid_a }),
+        ),
     );
 }

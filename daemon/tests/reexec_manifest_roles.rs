@@ -160,6 +160,23 @@ impl RealFds {
                 uid: "roles-test".into(),
                 generation: 1,
                 transcript_id: None,
+                transcript_path: None,
+                session_type: "bash".into(),
+                title: "roles-test".into(),
+                workspace_id: String::new(),
+                task_id: None,
+                managed_by_uid: None,
+                workflow_run_id: None,
+                workflow_role: None,
+                continuous_task_id: None,
+                global_perms: false,
+                memory_cap_soft_bytes: None,
+                memory_cap_hard_bytes: None,
+                last_activity_age_s: Some(0.5),
+                last_input_age_s: None,
+                last_operator_input_age_s: None,
+                last_turn_end_age_s: None,
+                done_report: None,
                 child_pid: self
                     .child
                     .as_ref()

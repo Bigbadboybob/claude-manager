@@ -107,18 +107,31 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// [`ReexecManifest`] / [`SessionRecord`] shape; per the design's
 /// state-schema rule, a schema bump ships with a legacy (drain)
 /// restart, everything else re-execs.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (DESIGN_SEAMLESS_RESTART phase 4b, R11): [`SessionRecord`]
+/// grew the full session identity (engine, title, workspace/task
+/// binding, workflow/continuous tags, global perms, transcript path,
+/// memory-cap bytes) and the status cells as ages ([`SessionRecord`]
+/// field docs). The supported set stays a SINGLETON — no deployed v1
+/// writer exists (the skeleton never shipped), so there is nothing
+/// to stay compatible with and a v1 manifest is honestly refused.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Hard cap on the manifest file's TOTAL size (envelope included).
 /// Enforced on both sides: at write time (a coordinator bug fails
 /// the restart while the old image is still in charge — before any
 /// point of no return) and at read time (the reader trusts nothing
 /// it didn't verify, and refuses to buffer unbounded input).
-pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+///
+/// 8 MiB since schema v2: the full session record (paths, titles,
+/// report reasons) runs ~0.5–1 KiB of JSON, so [`MAX_SESSIONS`]
+/// records need low single-digit MiB; the v1 cap of 1 MiB would
+/// have made the two caps contradict each other.
+pub const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Hard cap on the session count. Consistent with
-/// [`MAX_MANIFEST_BYTES`]: ~250 bytes of JSON per session × 4096 is
-/// the same order as the byte cap. Also enforced on both sides.
+/// [`MAX_MANIFEST_BYTES`]: ~0.5–1 KiB of JSON per v2 session × 4096
+/// fits the byte cap with headroom. Also enforced on both sides.
 pub const MAX_SESSIONS: usize = 4096;
 
 /// Name passed to `memfd_create(2)`. The read side verifies the fd's
@@ -149,7 +162,10 @@ const REQUIRED_SEALS: libc::c_int = libc::F_SEAL_SHRINK
 /// JSON) — the manifest names inherited table slots; it never owns
 /// them. Ownership of the escrowed fds belongs to the handoff path
 /// (3b), which is also the only place CLOEXEC is cleared on them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// (`Eq` was dropped at schema v2: the status-cell ages are `f64`.
+/// `PartialEq` is all the round-trip tests need.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReexecManifest {
     /// Payload schema version — must equal
     /// [`MANIFEST_SCHEMA_VERSION`] to be accepted (checked before
@@ -178,10 +194,34 @@ pub struct ReexecManifest {
 }
 
 /// One live session's handoff record: identity, the two kernel
-/// handles (canonical PTY master + spawn-time pidfd), and the
-/// identity cross-checks the rehydrate transaction runs before
-/// building anything signal-capable (R6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// handles (canonical PTY master + spawn-time pidfd), the identity
+/// cross-checks the rehydrate transaction runs before building
+/// anything signal-capable (R6), and — schema v2
+/// (DESIGN_SEAMLESS_RESTART phase 4b, R11) — the FULL
+/// `DaemonSession` record: engine, title, workspace/task binding,
+/// workflow/continuous tags, global perms, transcript path,
+/// memory-cap bytes, and the status cells. Phase 4a adopted
+/// sessions as amnesiacs (hard-noted `"bash"`, no binding, no
+/// transcript, no done_report); the v2 record is what lets the new
+/// image reconstruct the session with its identity and status
+/// intact — a worker that called `report_done` pre-restart must not
+/// regress to `awaiting_input` and strand an `until="final"`
+/// watcher.
+///
+/// ## Status cells ride as AGES, not absolutes
+///
+/// The live cells (`last_activity_at` and friends) are monotonic
+/// `Instant`s — meaningless as raw values across an exec (and
+/// unserializable by design). The writer records `elapsed()` at
+/// manifest-build time against one anchor; the reader reconstructs
+/// `Instant::now() - age` against its own anchor. The sub-second
+/// skew this introduces (quiesce + exec + rehydrate wall time) is
+/// accepted: every consumer of these cells compares them against
+/// multi-second thresholds (idle) or against EACH OTHER (the
+/// done-report superseded rule, semantic_idle) — and relative order
+/// is preserved exactly, because both sides use a single per-build
+/// anchor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     /// Session uid — the registry key.
     pub uid: String,
@@ -190,6 +230,63 @@ pub struct SessionRecord {
     /// Detected transcript id, when one exists — rehydrate
     /// cross-checks it against on-disk state.
     pub transcript_id: Option<String>,
+    /// Full transcript-file PATH (v2). The id above is the resume
+    /// key; the path is what `resolve_authorized_session` serves so
+    /// `read_session_output` / `read_last_turn` keep working
+    /// immediately post-swap. Both ride the manifest because both
+    /// are honest, independently-consumed facts (the id is derived
+    /// from the path today, but the derivation lives daemon-side
+    /// and could drift — carry what the session actually holds).
+    pub transcript_path: Option<String>,
+    /// Session-type discriminator (`"claude-code"` / `"codex"` /
+    /// `"bash"`), mirroring `DaemonSession.session_type`. v2: the
+    /// 3b/4a skeleton carried no engine and the rehydrate hard-noted
+    /// `"bash"`. Must be non-empty (no real session has an empty
+    /// engine).
+    pub session_type: String,
+    /// Sidebar label (`DaemonSession.title`).
+    pub title: String,
+    /// Workspace binding (`DaemonSession.workspace_id`). May be
+    /// empty — `SpawnParams::new`'s default for callers that don't
+    /// thread one — so no non-empty invariant here.
+    pub workspace_id: String,
+    /// Planning-task binding (`DaemonSession.task_id`).
+    pub task_id: Option<String>,
+    /// Parent session for MCP-spawned sessions
+    /// (`DaemonSession.managed_by_uid`).
+    pub managed_by_uid: Option<String>,
+    /// Workflow tags (`DaemonSession.workflow_run_id` / `.workflow_role`).
+    pub workflow_run_id: Option<String>,
+    pub workflow_role: Option<String>,
+    /// Continuous-task tag (`DaemonSession.continuous_task_id`).
+    pub continuous_task_id: Option<String>,
+    /// Global-permissions grant (`DaemonSession.global_perms`) — an
+    /// orchestrator must not lose its scope across a deploy.
+    pub global_perms: bool,
+    /// Memory-cap byte pair (`DaemonSession.memory_cap_*_bytes`).
+    /// Presence of the soft cap is also the rehydrate-side signal to
+    /// re-wire the kill-log probe (mirroring `start_session`'s
+    /// kills_dir rule), so an adopted capped session's cap kill is
+    /// attributed instead of reading as a plain signal-9 exit.
+    pub memory_cap_soft_bytes: Option<u64>,
+    pub memory_cap_hard_bytes: Option<u64>,
+    /// Status cells as ages in seconds (see the struct doc). Each is
+    /// `None` when the live cell was `None`; when `Some`, the value
+    /// must be finite and non-negative (validated on both sides — a
+    /// NaN/negative age is a corrupt record, not a unit mixup to
+    /// guess around).
+    pub last_activity_age_s: Option<f64>,
+    pub last_input_age_s: Option<f64>,
+    pub last_operator_input_age_s: Option<f64>,
+    pub last_turn_end_age_s: Option<f64>,
+    /// The session's `report_done` marker (raw cell — the
+    /// superseded-by-later-input rule stays DERIVED on the read
+    /// side from `last_input_age_s`, exactly as the live
+    /// `DaemonSession::reported_done` derives it, so no input path
+    /// can be forgotten here either). The R11 carry: an
+    /// `until="final"` watcher must see `status="reported"` after
+    /// the swap.
+    pub done_report: Option<DoneReportRecord>,
     /// The child's numeric pid. NEVER an identity source on its own
     /// (pid reuse) — always paired with `pidfd` +
     /// `child_start_time`. Must be > 0.
@@ -213,6 +310,25 @@ pub struct SessionRecord {
     /// checkpoint slice defines the shape; the manifest just carries
     /// it opaquely so the framing doesn't churn when it lands.
     pub watcher_checkpoint: Option<serde_json::Value>,
+}
+
+/// The `report_done` marker's manifest projection (schema v2, R11) —
+/// the same three facts the live `ReportedDone` cell holds, with the
+/// monotonic clock as an age (see [`SessionRecord`]'s status-cell
+/// doc): `at_unix` is the wall-clock the wire reports verbatim (an
+/// absolute — no reconstruction), `age_s` reconstructs `at_instant`
+/// (what the superseded rule compares against `last_input_at`), and
+/// `reason` is the agent's own one-line summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoneReportRecord {
+    /// Wall-clock seconds of the report (`ReportedDone.at_unix`).
+    /// Must be finite and non-negative.
+    pub at_unix: f64,
+    /// Age in seconds of `ReportedDone.at_instant` at manifest-build
+    /// time. Must be finite and non-negative.
+    pub age_s: f64,
+    /// `ReportedDone.reason`, verbatim.
+    pub reason: Option<String>,
 }
 
 /// Typed validation failure — every variant names exactly what was
@@ -266,6 +382,17 @@ pub enum ManifestError {
     /// A session record's `child_start_time` is zero — no real
     /// spawn-time capture produces that.
     BadChildStartTime { uid: String },
+    /// A v2 age / timestamp field is NaN, infinite, or negative — no
+    /// real `elapsed()` / wall-clock capture produces those; a
+    /// corrupt record is refused, never guessed around.
+    BadAge {
+        uid: String,
+        field: &'static str,
+        value: f64,
+    },
+    /// A session record's `session_type` is empty — every real
+    /// session carries an engine discriminator.
+    EmptySessionType { uid: String },
     /// An fd exists but is not the kind of object its manifest role
     /// requires (from [`validate_fd_roles`] — the only variant that
     /// can be produced by touching an escrow fd).
@@ -370,6 +497,18 @@ impl std::fmt::Display for ManifestError {
                 f,
                 "session '{}' has child_start_time 0 — no real spawn-time \
                  capture produces that",
+                uid
+            ),
+            ManifestError::BadAge { uid, field, value } => write!(
+                f,
+                "session '{}' has {} = {:?} — ages/timestamps must be \
+                 finite and non-negative",
+                uid, field, value
+            ),
+            ManifestError::EmptySessionType { uid } => write!(
+                f,
+                "session '{}' has an empty session_type — every real \
+                 session carries an engine discriminator",
                 uid
             ),
             ManifestError::FdRoleMismatch { role, fd, detail } => write!(
@@ -801,6 +940,34 @@ fn validate_structure(m: &ReexecManifest) -> Result<(), ManifestError> {
                 uid: s.uid.clone(),
             });
         }
+        // v2 invariants (phase 4b): engine present, ages sane.
+        if s.session_type.is_empty() {
+            return Err(ManifestError::EmptySessionType {
+                uid: s.uid.clone(),
+            });
+        }
+        let check_age = |field: &'static str,
+                         value: Option<f64>|
+         -> Result<(), ManifestError> {
+            match value {
+                Some(v) if !v.is_finite() || v < 0.0 => {
+                    Err(ManifestError::BadAge {
+                        uid: s.uid.clone(),
+                        field,
+                        value: v,
+                    })
+                }
+                _ => Ok(()),
+            }
+        };
+        check_age("last_activity_age_s", s.last_activity_age_s)?;
+        check_age("last_input_age_s", s.last_input_age_s)?;
+        check_age("last_operator_input_age_s", s.last_operator_input_age_s)?;
+        check_age("last_turn_end_age_s", s.last_turn_end_age_s)?;
+        if let Some(dr) = &s.done_report {
+            check_age("done_report.age_s", Some(dr.age_s))?;
+            check_age("done_report.at_unix", Some(dr.at_unix))?;
+        }
     }
     Ok(())
 }
@@ -1073,6 +1240,29 @@ mod tests {
                     uid: "sess-a".into(),
                     generation: 3,
                     transcript_id: Some("abc-123".into()),
+                    transcript_path: Some(
+                        "/home/u/.claude/projects/x/abc-123.jsonl".into(),
+                    ),
+                    session_type: "claude-code".into(),
+                    title: "worker A".into(),
+                    workspace_id: "ws-1".into(),
+                    task_id: Some("task-9".into()),
+                    managed_by_uid: Some("ts-parent-1".into()),
+                    workflow_run_id: Some("run-7".into()),
+                    workflow_role: Some("worker".into()),
+                    continuous_task_id: None,
+                    global_perms: true,
+                    memory_cap_soft_bytes: Some(4 << 30),
+                    memory_cap_hard_bytes: Some(6 << 30),
+                    last_activity_age_s: Some(1.25),
+                    last_input_age_s: Some(90.0),
+                    last_operator_input_age_s: None,
+                    last_turn_end_age_s: Some(30.5),
+                    done_report: Some(DoneReportRecord {
+                        at_unix: 1_760_000_000.5,
+                        age_s: 12.75,
+                        reason: Some("all subtasks merged".into()),
+                    }),
                     child_pid: 4242,
                     child_start_time: 987654321,
                     pty_master_fd: 20,
@@ -1087,6 +1277,23 @@ mod tests {
                     uid: "sess-b".into(),
                     generation: 1,
                     transcript_id: None,
+                    transcript_path: None,
+                    session_type: "bash".into(),
+                    title: "sess-b".into(),
+                    workspace_id: String::new(),
+                    task_id: None,
+                    managed_by_uid: None,
+                    workflow_run_id: None,
+                    workflow_role: None,
+                    continuous_task_id: Some("ct-1".into()),
+                    global_perms: false,
+                    memory_cap_soft_bytes: None,
+                    memory_cap_hard_bytes: None,
+                    last_activity_age_s: Some(0.0),
+                    last_input_age_s: None,
+                    last_operator_input_age_s: None,
+                    last_turn_end_age_s: None,
+                    done_report: None,
                     child_pid: 4300,
                     child_start_time: 987654999,
                     pty_master_fd: 22,
@@ -1420,6 +1627,83 @@ mod tests {
         ));
     }
 
+    /// v2 invariants (phase 4b): a negative or non-finite age — on
+    /// any status cell or on the done-report record — is refused
+    /// with the field named, on the write side too. (NaN/∞ can't
+    /// survive a JSON round trip — serde_json writes them as `null`,
+    /// which fails deserialization — so the read side is driven with
+    /// a negative value, which CAN.)
+    #[test]
+    fn rejects_bad_ages() {
+        let mut m = sample_manifest();
+        m.sessions[0].last_activity_age_s = Some(-0.5);
+        match read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()) {
+            Err(ManifestError::BadAge {
+                field: "last_activity_age_s",
+                ..
+            }) => {}
+            other => panic!("expected BadAge, got {:?}", other),
+        }
+        assert_eq!(
+            write_manifest(&m).expect_err("write refuses too").kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut m = sample_manifest();
+        m.sessions[0].done_report.as_mut().unwrap().age_s = -1.0;
+        assert!(matches!(
+            read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()),
+            Err(ManifestError::BadAge {
+                field: "done_report.age_s",
+                ..
+            })
+        ));
+
+        let mut m = sample_manifest();
+        m.sessions[0].done_report.as_mut().unwrap().at_unix = -5.0;
+        assert!(matches!(
+            read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()),
+            Err(ManifestError::BadAge {
+                field: "done_report.at_unix",
+                ..
+            })
+        ));
+
+        // Non-finite values are caught at the write gate, before
+        // serialization can quietly turn them into `null`.
+        let mut m = sample_manifest();
+        m.sessions[1].last_input_age_s = Some(f64::NAN);
+        assert_eq!(
+            write_manifest(&m).expect_err("NaN age").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut m = sample_manifest();
+        m.sessions[1].last_turn_end_age_s = Some(f64::INFINITY);
+        assert_eq!(
+            write_manifest(&m).expect_err("infinite age").kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// v2 invariant: an empty engine discriminator is refused (the
+    /// 4a rehydrate hard-noted `"bash"` precisely because the record
+    /// carried none — a v2 record with an empty one is corrupt).
+    #[test]
+    fn rejects_empty_session_type() {
+        let mut m = sample_manifest();
+        m.sessions[1].session_type = String::new();
+        match read_manifest(sealed_memfd_from(&envelope_for(&m)).as_fd()) {
+            Err(ManifestError::EmptySessionType { uid }) => {
+                assert_eq!(uid, "sess-b")
+            }
+            other => panic!("expected EmptySessionType, got {:?}", other),
+        }
+        assert_eq!(
+            write_manifest(&m).expect_err("write refuses too").kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
     /// Unknown schema versions are refused before any field is
     /// believed.
     #[test]
@@ -1476,6 +1760,23 @@ mod tests {
                 uid: format!("s{}", i),
                 generation: 0,
                 transcript_id: None,
+                transcript_path: None,
+                session_type: "bash".into(),
+                title: format!("s{}", i),
+                workspace_id: String::new(),
+                task_id: None,
+                managed_by_uid: None,
+                workflow_run_id: None,
+                workflow_role: None,
+                continuous_task_id: None,
+                global_perms: false,
+                memory_cap_soft_bytes: None,
+                memory_cap_hard_bytes: None,
+                last_activity_age_s: None,
+                last_input_age_s: None,
+                last_operator_input_age_s: None,
+                last_turn_end_age_s: None,
+                done_report: None,
                 child_pid: 100 + i,
                 child_start_time: 1,
                 pty_master_fd: 100 + 2 * i,
