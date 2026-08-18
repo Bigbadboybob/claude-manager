@@ -2528,7 +2528,12 @@ fn open_pidfd(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
 /// pidfd's task identity, not via the now-possibly-recycled PID, so
 /// no foot-cannon: an unrelated process that happens to own the
 /// recycled PID slot won't receive our SIGKILL.
-fn send_sigkill_via_pidfd(pidfd: &OwnedFd) -> std::io::Result<()> {
+///
+/// `pub(crate)` for the re-exec terminal fallback
+/// (DESIGN_SEAMLESS_RESTART phase 4a, `crate::reexec`): the
+/// deliberate kill-then-reap of manifest-listed children goes through
+/// the SAME pidfd-targeted primitive as every other daemon kill path.
+pub(crate) fn send_sigkill_via_pidfd(pidfd: &OwnedFd) -> std::io::Result<()> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -2730,7 +2735,13 @@ fn poll_pidfd_until_exit_ready(pidfd: &OwnedFd) {
 /// [`wait_for_child`]`(pid)` — still under the caller's read
 /// permit, and non-blocking in practice because callers only get
 /// here after [`poll_pidfd_until_exit_ready`] observed the exit.
-fn consume_exit_status(pidfd: &OwnedFd, pid: libc::pid_t) -> DaemonExitStatus {
+///
+/// `pub(crate)` for the re-exec terminal fallback
+/// (DESIGN_SEAMLESS_RESTART phase 4a, `crate::reexec`): its
+/// deliberate kill-then-reap consumes each manifest-listed child's
+/// status through the escrowed pidfd — same permit discipline (the
+/// fallback takes a read permit per reap), same status fidelity.
+pub(crate) fn consume_exit_status(pidfd: &OwnedFd, pid: libc::pid_t) -> DaemonExitStatus {
     loop {
         // SAFETY: zeroed siginfo_t is a valid "empty" value for the
         // kernel to fill; all-zero bit patterns are in-range for its

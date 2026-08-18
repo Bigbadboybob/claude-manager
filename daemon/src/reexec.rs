@@ -1,39 +1,66 @@
-//! Re-exec handoff skeleton — the exec half of the in-place restart.
-//! DESIGN_SEAMLESS_RESTART phase 3b (restart-sequence steps 1, 3–5
-//! plus the minimal rehydrate of step 6; review findings R7, R9,
-//! R13), gated behind the `CM_REEXEC=1` dev flag.
+//! Re-exec handoff — the exec half of the in-place restart.
+//! DESIGN_SEAMLESS_RESTART phases 3b + 4a (restart-sequence steps 1,
+//! 3–6 and the "Failure classes, exhaustively" ladder; review
+//! findings R5, R6, R7, R9, R13), gated behind the `CM_REEXEC=1` dev
+//! flag.
 //!
 //! ## What this is (and is not)
 //!
-//! This is the FIRST slice where exec code exists: it wires the
-//! phase-2/3a primitives together — quiesce barrier
-//! (`crate::restart_coordinator`), reap/reader gate freezes
+//! Phase 3b wired the phase-2/3a primitives together — quiesce
+//! barrier (`crate::restart_coordinator`), reap/reader gate freezes
 //! (`crate::reap_gate` / `crate::reader_gate`), sealed FD manifest
 //! (`crate::reexec_manifest`), non-killing adoption
-//! (`crate::adopt`) — around a real `execveat`, and proves PTY
+//! (`crate::adopt`) — around a real `execveat`, and proved PTY
 //! continuity through a real daemon re-exec with one live bash
 //! session and a live reader draining
 //! (`daemon/tests/reexec_skeleton_e2e.rs`, the condition the phase-1
 //! OS proof deliberately skipped).
 //!
+//! Phase 4a makes the failure ladder real. The new-image side is now
+//! a **transaction against escrowed FDs** (R5's full form):
+//!
+//! - [`detect_handoff`] validates the inherited manifest and builds a
+//!   [`HandoffEscrow`] that owns the ORIGINAL inherited fds untouched
+//!   (CLOEXEC re-set immediately, so nothing spawned during startup —
+//!   the MCP preflight subprocess included — can inherit them).
+//! - [`complete_handoff`] runs the attempt state machine
+//!   ([`attempt_decision`] / [`on_rehydrate_failure`]) around the
+//!   rehydrate transaction: ALL records are probed on CLOEXEC
+//!   **dups** first (liveness + the R6 start-time cross-check, no
+//!   promotion, nothing signaled); only after every survivor
+//!   validates does the commit phase arm real sessions. A failure —
+//!   `Result` error or caught panic (the whole transaction runs under
+//!   `catch_unwind`, the design's "top-level recovery guard that
+//!   never exits while escrow FDs are live") — leaves the escrow
+//!   intact and execs the **pinned rollback binary** with attempt+1
+//!   ([`rollback_exec`]); attempt ≥ 2, or a rollback exec that itself
+//!   returns, lands in the **terminal fallback**
+//!   ([`terminal_fallback`]): deliberately SIGKILL + reap every
+//!   manifest-listed child through its escrowed pidfd, then return so
+//!   `run()` proceeds with legacy `restore_sessions`. Never fall
+//!   through with live orphans — live children plus `--resume`
+//!   duplicates is two writers per conversation, the 2026-08-18
+//!   split-brain class the review found in the original spec.
+//!
+//! Failure injection for the e2e: [`ENV_TEST_FAIL_REHYDRATE`] — see
+//! its doc for the loud dev-flag gate.
+//!
 //! Deliberately OUT of scope, deferred to later phases:
 //!
-//! - **The rollback exec.** The pinned `/proc/self/exe` fd rides in
-//!   the manifest (R7) and the attempt counter is written as 0 and
-//!   read back, but a rehydrate failure in the new image restores
-//!   state and logs — it never execs the rollback fd. Phase 4.
-//! - **`--verify-handoff` preflight subprocess** (phase 4).
-//! - **Watcher checkpoints / memory-cap re-adoption** (R12, phase 4)
+//! - **`--verify-handoff` preflight subprocess** (phase 4b+).
+//! - **Watcher checkpoints / memory-cap re-adoption** (R12, phase 4b+)
 //!   — `watcher_checkpoint` is written as `None`.
 //! - **Workflow / continuous / TUI-reattach anything** beyond what
 //!   normal startup already rebuilds from disk (phases 4–5).
-//! - **The public `daemon.restart` RPC** (phase 6). The skeleton's
-//!   trigger is the dev-gated `daemon.reexec_dev`, dispatched only
-//!   when the daemon started with `CM_REEXEC=1`.
+//! - **The public `daemon.restart` RPC** (phase 6). The trigger is
+//!   still the dev-gated `daemon.reexec_dev`, dispatched only when
+//!   the daemon started with `CM_REEXEC=1`.
 //! - **The full close-every-unlisted-inherited-fd audit** on the
-//!   rehydrate side (phase 4); the skeleton closes the manifest fd
-//!   and the rollback fd and restores CLOEXEC on what it adopts.
-//! - **TLS listeners.** The skeleton writes `tls_listener_fd: None`;
+//!   rehydrate side; escrow closes exactly what it owns.
+//! - **Reaping/tombstoning SKIPPED records** (child exited during the
+//!   swap): same as 3b — the zombie's status is left unconsumed for
+//!   the phase-4b tombstone work; the record is simply not adopted.
+//! - **TLS listeners.** The exec side writes `tls_listener_fd: None`;
 //!   don't point the dev flag at a `[tls]`-configured daemon.
 //!
 //! ## The abort invariant
@@ -66,15 +93,19 @@
 //! process (reaper: permit → state lock), so gate → state is a
 //! process-wide order.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io::Write as _;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::adopt::SessionCandidate;
 use crate::reexec_manifest::{
     self, ReexecManifest, SessionRecord, MANIFEST_SCHEMA_VERSION,
 };
@@ -599,76 +630,579 @@ fn restore_sigmask(old: &libc::sigset_t) {
 }
 
 // ============================================================
-// The rehydrate side (new image) — skeleton
+// The rehydrate side (new image) — escrow, transaction, ladder
 // ============================================================
 
-/// Adopt the manifest's sessions into the registry (the minimal
-/// rehydrate of the design's step 6). Called by `run()` on the
-/// handoff path, INSTEAD of `restore_sessions` (which would spawn
-/// `--resume` duplicates of children that are still alive — R13),
-/// after the manifest passed `read_manifest` + `validate_fd_roles`.
+/// The failure-injection knob for the phase-4a e2e:
+/// `CM_RESTART_TEST_FAIL_REHYDRATE`.
 ///
-/// Per record: take ownership of the two inherited fds (restoring
-/// CLOEXEC on them immediately — R9 hygiene, so a later ordinary
-/// child spawn can't inherit another session's master), build a
-/// non-killing [`crate::adopt::SessionCandidate`], probe
-/// `child_alive` + the R6 start-time cross-check against the record,
-/// and on ANY mismatch/death/error skip the record — tombstone-free
-/// for the skeleton: just don't adopt it, and NEVER signal it (the
-/// candidate's drop closes only its own fds). Survivors promote and
-/// arm through [`DaemonSession::adopt`] (kill-on-drop begins there —
-/// that is the commit gate) with the same registry-cleanup `on_exit`
-/// the spawn path installs, under the state lock across arm+insert
-/// so a fast exit can't race the insert (the `start_session`
-/// discipline).
+/// Deliberately **NOT** `CM_REEXEC_*`-prefixed: [`do_execveat`]
+/// strips that prefix from the envp it builds (the manifest pointer
+/// is a bootstrap, not a trust surface — R8/R9), so a prefixed knob
+/// would die at the first exec. This one must survive INTO the new
+/// image (and through the rollback exec into the rollback image),
+/// because the failure it injects happens there.
 ///
-/// Returns the number of sessions adopted.
-pub fn rehydrate_adopted_sessions(
-    state_arc: &Arc<Mutex<DaemonState>>,
-    manifest: &ReexecManifest,
-) -> usize {
-    let mut adopted = 0usize;
-    for rec in &manifest.sessions {
-        // Ownership transfer: the handoff path owns the inherited
-        // fds from the moment the manifest validated.
-        // SAFETY: fd numbers come from a sealed, role-validated
-        // manifest written by the previous image; each appears in
-        // exactly one slot (duplicate-fd validation), so single
-        // ownership holds.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(rec.pidfd) };
-        let master = unsafe { OwnedFd::from_raw_fd(rec.pty_master_fd) };
-        // R9: these crossed the exec CLOEXEC-cleared by necessity;
-        // re-set the flag now so nothing spawned later inherits them.
-        let _ = set_fd_flags(pidfd.as_raw_fd(), libc::FD_CLOEXEC);
-        let _ = set_fd_flags(master.as_raw_fd(), libc::FD_CLOEXEC);
+/// Value semantics (parsed by [`test_fail_requested`]):
+/// - a comma-separated list of attempt numbers — the knob names the
+///   attempts to fail, so `"0"` fails only the attempt-0 image (the
+///   rollback image at attempt 1 rehydrates cleanly: the rollback
+///   round-trip e2e), and `"0,1"` fails both (driving rollback and
+///   then the terminal fallback: the terminal e2e);
+/// - `"terminal"` — fail EVERY attempt, regardless of number.
+///
+/// **Honored ONLY when the daemon started with the `CM_REEXEC=1` dev
+/// flag.** A production daemon (no dev flag) ignores the knob
+/// entirely — it logs the refusal once and proceeds; no environment
+/// variable may be able to make a production rehydrate fail on
+/// purpose.
+pub const ENV_TEST_FAIL_REHYDRATE: &str = "CM_RESTART_TEST_FAIL_REHYDRATE";
 
-        let candidate = crate::adopt::SessionCandidate::from_raw_parts(
+/// Where [`append_crash_note`] writes: `$HOME/.cm/reexec-crash-note.log`.
+const CRASH_NOTE_FILENAME: &str = "reexec-crash-note.log";
+
+// ------------------------------------------------------------
+// The attempt state machine (design → "Failure classes")
+// ------------------------------------------------------------
+
+/// What to do with a RECEIVED manifest, keyed purely off its sealed
+/// `attempt` counter. One half of the phase-4a attempt state machine
+/// (the other is [`on_rehydrate_failure`]); a small explicit function
+/// so the ladder is testable, not scattered ifs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptDecision {
+    /// attempt 0 (a fresh handoff) or attempt 1 (this IS the rollback
+    /// image rehydrating): run the rehydrate transaction.
+    Rehydrate,
+    /// attempt ≥ 2: a manifest claiming this means the machine
+    /// already failed twice — never trust a third exec; go straight
+    /// to the terminal fallback.
+    TerminalFallback,
+}
+
+/// See [`AttemptDecision`].
+pub fn attempt_decision(attempt: u8) -> AttemptDecision {
+    if attempt >= 2 {
+        AttemptDecision::TerminalFallback
+    } else {
+        AttemptDecision::Rehydrate
+    }
+}
+
+/// What to do after the rehydrate transaction FAILED at `attempt`.
+/// The other half of the attempt state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureNext {
+    /// attempt 0 failed: exec the pinned rollback binary with the
+    /// manifest's counter bumped to `next_attempt` (always 1).
+    RollbackExec { next_attempt: u8 },
+    /// attempt 1 failed (the ROLLBACK image failed too — the attempt
+    /// counter would reach 2): terminal fallback. Also the total-
+    /// function answer for attempt ≥ 2, which [`attempt_decision`]
+    /// already diverted before any transaction could run.
+    TerminalFallback,
+}
+
+/// See [`FailureNext`].
+pub fn on_rehydrate_failure(attempt: u8) -> FailureNext {
+    match attempt {
+        0 => FailureNext::RollbackExec { next_attempt: 1 },
+        _ => FailureNext::TerminalFallback,
+    }
+}
+
+/// Parse [`ENV_TEST_FAIL_REHYDRATE`] against this image's `attempt`.
+/// Returns the artificial failure reason when the knob names this
+/// attempt AND the dev flag is set; `None` otherwise. See the
+/// constant's doc for the loud production gate.
+fn test_fail_requested(reexec_enabled: bool, attempt: u8) -> Option<String> {
+    let val = std::env::var(ENV_TEST_FAIL_REHYDRATE).ok()?;
+    let val = val.trim().to_string();
+    if val.is_empty() {
+        return None;
+    }
+    if !reexec_enabled {
+        eprintln!(
+            "cm-daemon: {}={} is set but CM_REEXEC=1 is not — IGNORING the \
+             failure-injection knob (a production daemon never honors it)",
+            ENV_TEST_FAIL_REHYDRATE, val,
+        );
+        return None;
+    }
+    let hit = val == "terminal"
+        || val
+            .split(',')
+            .any(|p| p.trim().parse::<u8>().map_or(false, |n| n == attempt));
+    if hit {
+        Some(format!(
+            "{}={} matched attempt {} — artificial rehydrate failure injected \
+             after validation, before commit (dev knob; see reexec.rs)",
+            ENV_TEST_FAIL_REHYDRATE, val, attempt,
+        ))
+    } else {
+        None
+    }
+}
+
+// ------------------------------------------------------------
+// Escrow (R5's full form)
+// ------------------------------------------------------------
+
+/// The escrowed kernel handles for one manifest session record —
+/// the ORIGINAL inherited fds, untouched.
+struct EscrowedSessionFds {
+    pidfd: OwnedFd,
+    master: OwnedFd,
+}
+
+/// Escrow table for one handoff: owns every ORIGINAL inherited fd
+/// the manifest names — untouched until the transaction's outcome is
+/// known (R5's full form: "rollback must use the original escrow
+/// FDs, not partially consumed objects"). Built by [`detect_handoff`]
+/// the moment the manifest validates; consumed by exactly one of
+/// three exits:
+///
+/// - **Commit** ([`complete_handoff`], transaction succeeded): the
+///   registry sessions were armed on CLOEXEC *dups*, so dropping the
+///   escrow closes the now-redundant originals plus the manifest and
+///   rollback fds (no rollback needed past the commit gate).
+/// - **Rollback exec** ([`rollback_exec`]): the intact originals are
+///   re-listed (same fd numbers) in a NEW sealed manifest and cross
+///   the exec again.
+/// - **Terminal fallback** ([`terminal_fallback`]): each child is
+///   deliberately SIGKILLed + reaped through its escrowed pidfd, then
+///   everything closes.
+///
+/// The control-socket LISTENER is deliberately NOT escrowed here:
+/// `run()` adopts it as its accept listener immediately at startup
+/// (the daemon must come back serving on every outcome, terminal
+/// fallback included), so its ownership lives in `run()`'s
+/// `UnixListener`; the manifest's `listener_fd` NUMBER is all the
+/// rollback exec needs (the fd stays open either way).
+///
+/// Every escrowed fd gets CLOEXEC re-set at construction (R9): they
+/// crossed the exec cleared by necessity, and startup work between
+/// detection and rehydrate spawns subprocesses (the MCP preflight),
+/// which must not inherit another session's master. (3b set the flag
+/// only at rehydrate time — this closes that transient window.)
+pub struct HandoffEscrow {
+    manifest: ReexecManifest,
+    manifest_fd: OwnedFd,
+    rollback_fd: OwnedFd,
+    tls_listener_fd: Option<OwnedFd>,
+    /// Parallel to `manifest.sessions` (index i ↔ record i).
+    sessions: Vec<EscrowedSessionFds>,
+}
+
+impl HandoffEscrow {
+    /// The validated manifest (read-only — `run()` needs
+    /// `listener_fd` for the early listener adoption).
+    pub fn manifest(&self) -> &ReexecManifest {
+        &self.manifest
+    }
+}
+
+/// Detect a re-exec handoff and build the escrow. Called by `run()`
+/// during single-threaded startup, right after the identity scrub,
+/// BEFORE `bind_socket` (normal startup's stale-socket probe would
+/// connect to its own inherited listener and refuse with AddrInUse)
+/// and BEFORE `restore_sessions` (legacy restore must never run on a
+/// handoff — it would spawn `--resume` duplicates of children that
+/// are still alive; R13).
+///
+/// `consume_env` scrubs `CM_REEXEC_MANIFEST_FD` unconditionally, so
+/// on ANY validation failure the daemon boots fresh with nothing
+/// left to bequeath to children — and on failure NO fd is touched,
+/// including the claimed manifest fd itself: a leaked env var (the
+/// 2026-08-18 pattern) may point at an unrelated inherited fd that
+/// belongs to something else. Sequencing per the manifest module's
+/// corrupt-manifest rule: integrity/structure first (`read_manifest`
+/// touches only the manifest fd), then — and only then — the
+/// escrow-fd role probes (`validate_fd_roles`, read-only,
+/// side-effect-free).
+///
+/// `None` means "not a handoff — boot fresh" (today's fresh boot):
+/// the var was absent, or validation failed and was logged.
+pub fn detect_handoff() -> Option<HandoffEscrow> {
+    let fd = reexec_manifest::consume_env()?;
+    // SAFETY: validation-only borrow of the claimed fd number;
+    // ownership is taken ONLY after the manifest verifies (below),
+    // and never on failure.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let manifest = match reexec_manifest::read_manifest(borrowed).and_then(|m| {
+        reexec_manifest::validate_fd_roles(&m)?;
+        Ok(m)
+    }) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: {}={} was present but manifest validation \
+                 FAILED: {} — booting FRESH (env already scrubbed; no \
+                 inherited fd touched)",
+                reexec_manifest::ENV_MANIFEST_FD, fd, e,
+            );
+            return None;
+        }
+    };
+    eprintln!(
+        "cm-daemon: re-exec handoff manifest validated (fd {}, {} \
+         session(s), attempt {})",
+        fd,
+        manifest.sessions.len(),
+        manifest.attempt,
+    );
+
+    // Ownership transfer into escrow: the handoff path owns every
+    // inherited fd from the moment the manifest validated.
+    // SAFETY: fd numbers come from a sealed, role-validated manifest
+    // written by the previous image; each appears in exactly one slot
+    // (duplicate-fd validation), so single ownership holds. The
+    // listener fd is deliberately NOT taken — `run()` owns it (see
+    // the type doc).
+    let manifest_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let rollback_fd = unsafe { OwnedFd::from_raw_fd(manifest.rollback_bin_fd) };
+    let tls_listener_fd = manifest
+        .tls_listener_fd
+        .map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
+    let sessions: Vec<EscrowedSessionFds> = manifest
+        .sessions
+        .iter()
+        .map(|rec| EscrowedSessionFds {
+            pidfd: unsafe { OwnedFd::from_raw_fd(rec.pidfd) },
+            master: unsafe { OwnedFd::from_raw_fd(rec.pty_master_fd) },
+        })
+        .collect();
+
+    // R9 hygiene, at the earliest possible moment: everything in
+    // escrow crossed the exec CLOEXEC-cleared by necessity; re-set
+    // the flag so no subprocess spawned between now and the
+    // transaction's outcome (MCP preflight, launcher refresh) can
+    // inherit a session's master or pidfd. Best-effort per fd — a
+    // failure here is not worth failing the handoff over (the fds
+    // provably exist; the flag write is a plain fcntl).
+    let _ = set_fd_flags(manifest_fd.as_raw_fd(), libc::FD_CLOEXEC);
+    let _ = set_fd_flags(rollback_fd.as_raw_fd(), libc::FD_CLOEXEC);
+    if let Some(fd) = &tls_listener_fd {
+        let _ = set_fd_flags(fd.as_raw_fd(), libc::FD_CLOEXEC);
+    }
+    for s in &sessions {
+        let _ = set_fd_flags(s.pidfd.as_raw_fd(), libc::FD_CLOEXEC);
+        let _ = set_fd_flags(s.master.as_raw_fd(), libc::FD_CLOEXEC);
+    }
+
+    Some(HandoffEscrow {
+        manifest,
+        manifest_fd,
+        rollback_fd,
+        tls_listener_fd,
+        sessions,
+    })
+}
+
+// ------------------------------------------------------------
+// complete_handoff — ladder wiring around the transaction
+// ------------------------------------------------------------
+
+/// How a handoff ended, for `run()`'s thin wiring. The third design
+/// outcome — *Fresh* (no/invalid manifest, today's fresh boot) — is
+/// [`detect_handoff`] returning `None`; by the time an escrow exists
+/// the boot is a handoff and only these two ends remain.
+pub enum HandoffOutcome {
+    /// The rehydrate transaction committed: sessions are in the
+    /// registry, escrow is released. `run()` SKIPS legacy
+    /// `restore_sessions` (R13).
+    Adopted {
+        adopted: usize,
+        /// Manifest-listed total (adopted + per-record skips).
+        total: usize,
+    },
+    /// The terminal fallback ran: every manifest-listed child was
+    /// deliberately SIGKILLed + reaped (or verified already
+    /// dead/mismatched and left unsignaled), and every escrow fd is
+    /// closed. The inherited LISTENER is untouched — `run()` adopted
+    /// it at startup, so the daemon comes back serving through it —
+    /// and `run()` now proceeds with NORMAL startup semantics: legacy
+    /// `restore_sessions` (resume from the H1-pinned stamps).
+    TerminalFallback { killed: usize, total: usize },
+}
+
+/// Run the attempt ladder around the rehydrate transaction.
+/// DESIGN_SEAMLESS_RESTART phase 4a — the "Failure classes,
+/// exhaustively" section, made real:
+///
+/// - attempt ≥ 2 in the received manifest → [`terminal_fallback`]
+///   immediately (the machine already failed twice — never trust a
+///   third exec).
+/// - attempt 0/1 → [`rehydrate_transaction`] under `catch_unwind`
+///   (the top-level recovery guard: a panic while escrow FDs are
+///   live must reach the ladder, not the process's unwind-to-exit).
+/// - transaction failed at attempt 0 → crash note + [`rollback_exec`]
+///   with attempt 1 (returns only if the exec itself failed, in which
+///   case: terminal — never exec-loop blindly).
+/// - transaction failed at attempt 1 → crash note + terminal.
+///
+/// On SUCCESS the escrow drops here: the registry sessions were
+/// armed on dups, so the originals (plus the manifest fd and the
+/// pinned rollback fd — no rollback needed past the commit gate)
+/// close, and R9's "close every inherited fd you didn't adopt" holds.
+pub fn complete_handoff(
+    state: &Arc<Mutex<DaemonState>>,
+    escrow: HandoffEscrow,
+    reexec_enabled: bool,
+) -> HandoffOutcome {
+    let attempt = escrow.manifest.attempt;
+    let total = escrow.manifest.sessions.len();
+
+    if attempt_decision(attempt) == AttemptDecision::TerminalFallback {
+        let what = format!(
+            "received manifest claims attempt {} (≥ 2): the restart machine \
+             already failed twice — refusing a third exec",
+            attempt,
+        );
+        eprintln!("cm-daemon: {}", what);
+        append_crash_note(attempt, &what, "terminal fallback");
+        return terminal_fallback(escrow);
+    }
+
+    // The transaction, under the recovery guard. It borrows the
+    // escrow (validation candidates are CLOEXEC dups; commit arms on
+    // those dups too), so on ANY failure — Err or panic — the escrow
+    // is still intact for the ladder below.
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        rehydrate_transaction(state, &escrow, reexec_enabled)
+    }));
+    let failure: String = match outcome {
+        Ok(Ok(stats)) => {
+            eprintln!(
+                "cm-daemon: re-exec rehydrate committed at attempt {} \
+                 ({} adopted, {} skipped) — releasing escrow: closing the \
+                 original session fds (registry sessions run on dups), the \
+                 manifest fd, and the pinned rollback binary fd {} (no \
+                 rollback needed past the commit gate){}",
+                attempt,
+                stats.adopted,
+                stats.skipped,
+                escrow.rollback_fd.as_raw_fd(),
+                match &escrow.tls_listener_fd {
+                    Some(fd) => format!(
+                        "; closing unadopted TLS listener fd {} (TLS handoff \
+                         is out of scope)",
+                        fd.as_raw_fd()
+                    ),
+                    None => String::new(),
+                },
+            );
+            drop(escrow);
+            return HandoffOutcome::Adopted {
+                adopted: stats.adopted,
+                total,
+            };
+        }
+        Ok(Err(msg)) => msg,
+        Err(panic) => format!(
+            "PANIC during rehydrate (caught by the recovery guard): {}",
+            panic_message(&panic),
+        ),
+    };
+
+    // Failure. Unbuffered stderr first (we may be about to exec),
+    // then disarm anything a mid-commit failure left in the registry
+    // WITHOUT signaling, then the ladder.
+    eprintln!(
+        "cm-daemon: re-exec rehydrate FAILED at attempt {}: {} — children \
+         are alive and unsignaled (candidates are non-killing by \
+         construction); escrow originals intact",
+        attempt, failure,
+    );
+    disarm_partial_commit(state);
+
+    match on_rehydrate_failure(attempt) {
+        FailureNext::RollbackExec { next_attempt } => {
+            append_crash_note(
+                attempt,
+                &failure,
+                &format!(
+                    "exec pinned rollback binary with attempt {}",
+                    next_attempt
+                ),
+            );
+            let exec_err = rollback_exec(&escrow, next_attempt);
+            // rollback_exec returns ONLY on failure: fall through to
+            // the terminal fallback — never exec-loop blindly.
+            let what = format!(
+                "rollback execveat itself failed after the attempt-{} \
+                 rehydrate failure: {}",
+                attempt, exec_err,
+            );
+            eprintln!("cm-daemon: {}", what);
+            append_crash_note(attempt, &what, "terminal fallback");
+            terminal_fallback(escrow)
+        }
+        FailureNext::TerminalFallback => {
+            append_crash_note(attempt, &failure, "terminal fallback");
+            terminal_fallback(escrow)
+        }
+    }
+}
+
+/// Best-effort text out of a `catch_unwind` payload.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Disarm anything a mid-commit failure left in the registry WITHOUT
+/// signaling: drain and `mem::forget` every registered session, so
+/// no `DaemonSession::Drop` can SIGKILL a child the ladder is about
+/// to hand back to the rollback image (or that the terminal fallback
+/// will kill deliberately, on its own identity-verified terms).
+///
+/// Sound because this runs during pre-serving startup: the accept
+/// loop hasn't started, so the ONLY possible registry entries are
+/// the ones this handoff's commit phase inserted. The forgotten
+/// sessions' reader/reaper threads keep running until the imminent
+/// rollback exec destroys them (all threads die at exec); on the
+/// terminal path they leak deliberately — their reaper may even race
+/// the fallback's reap of the same child (both target the task
+/// through pidfds; the loser gets ECHILD, which both handle). Logged
+/// per session because a leak, even a deliberate one, must be
+/// findable.
+fn disarm_partial_commit(state: &Arc<Mutex<DaemonState>>) {
+    let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+    if st.sessions.is_empty() {
+        return;
+    }
+    let drained: Vec<(String, DaemonSession)> = st.sessions.drain().collect();
+    for (uid, sess) in drained {
+        eprintln!(
+            "cm-daemon: disarming partially-committed session '{}' without \
+             signaling (mem::forget — threads/fds reclaimed at the imminent \
+             exec, or deliberately leaked on the terminal path)",
+            uid,
+        );
+        std::mem::forget(sess);
+    }
+}
+
+// ------------------------------------------------------------
+// The rehydrate transaction (validate on dups → commit gate)
+// ------------------------------------------------------------
+
+struct AdoptStats {
+    adopted: usize,
+    skipped: usize,
+}
+
+/// The escrow/commit-gate transaction (design step 6, R5/R6).
+///
+/// **Validation phase** — no promotion, nothing armed, nothing
+/// signaled: every record gets a [`SessionCandidate`] built from
+/// CLOEXEC **dups** (`OwnedFd::try_clone`) of its escrowed fds, then
+/// the non-consuming probes run: pidfd liveness and the R6
+/// start-time cross-check. Records whose child genuinely exited, or
+/// whose start-time mismatches/can't be read, are SKIPPED — logged,
+/// never signaled, status left unconsumed (phase-4b tombstones them
+/// honestly); they don't fail the transaction. Unexpected errors DO:
+/// a dup failure (fd exhaustion), a duplicate uid (corrupt manifest
+/// shape), an adopt failure at commit — each aborts with `Err`,
+/// candidates drop (dups close), and the caller's escrow originals
+/// are untouched for the rollback path.
+///
+/// The failure-injection knob ([`ENV_TEST_FAIL_REHYDRATE`], dev-flag
+/// gated) fires HERE — after validation, before commit — so the e2e
+/// drives the real rollback path through a real validated escrow.
+///
+/// **Commit phase** — the gate: only after EVERY survivor validated.
+/// Under ONE continuous state-lock hold (the `start_session`
+/// fast-exit discipline: a reaper's `on_exit` blocks on this lock, so
+/// every insert is visible before any exit callback can run), each
+/// survivor is promoted and armed via [`DaemonSession::adopt`] **on
+/// its dups** and inserted. Kill-on-drop begins at adopt — that is
+/// the commit.
+///
+/// **Why commit on the dups** (the design offered two honest
+/// shapes): arming on the ORIGINALS would consume escrow record by
+/// record, so an adopt failure on session N+1 would leave a rollback
+/// with a partially-consumed escrow — exactly what R5 forbids.
+/// Arming on the dups keeps the originals intact in escrow until the
+/// WHOLE transaction has succeeded (a PTY dup shares the open file
+/// description, so the armed session's handles are functionally
+/// identical); the caller then closes the redundant originals in one
+/// place. Single-ownership stays honest: originals never leave
+/// escrow, dups are owned by the candidate → parts → armed session.
+/// A mid-commit adopt failure disarms the already-inserted sessions
+/// inside the same lock hold (drain + `mem::forget` — never Drop,
+/// which SIGKILLs) and returns `Err` with escrow intact.
+fn rehydrate_transaction(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    escrow: &HandoffEscrow,
+    reexec_enabled: bool,
+) -> Result<AdoptStats, String> {
+    let manifest = &escrow.manifest;
+
+    // ---- Validation phase (dups only, no promotion) ----
+    let mut seen_uids: HashSet<&str> = HashSet::new();
+    let mut survivors: Vec<(usize, SessionCandidate)> = Vec::new();
+    let mut skipped = 0usize;
+    for (i, rec) in manifest.sessions.iter().enumerate() {
+        if !seen_uids.insert(rec.uid.as_str()) {
+            return Err(format!(
+                "manifest carries duplicate session uid '{}' — corrupt \
+                 manifest shape; failing the transaction",
+                rec.uid,
+            ));
+        }
+        let fds = &escrow.sessions[i];
+        let pidfd_dup = fds.pidfd.try_clone().map_err(|e| {
+            format!(
+                "dup escrowed pidfd for session '{}' (fd {}): {}",
+                rec.uid,
+                fds.pidfd.as_raw_fd(),
+                e
+            )
+        })?;
+        let master_dup = fds.master.try_clone().map_err(|e| {
+            format!(
+                "dup escrowed PTY master for session '{}' (fd {}): {}",
+                rec.uid,
+                fds.master.as_raw_fd(),
+                e
+            )
+        })?;
+        let candidate = SessionCandidate::from_raw_parts(
             rec.uid.clone(),
             rec.child_pid,
-            pidfd,
-            master,
+            pidfd_dup,
+            master_dup,
         );
 
         // Probe 1: liveness (non-consuming pidfd poll — an exited
-        // child stays an unreaped zombie; skeleton skips it without
-        // reaping or tombstoning).
+        // child stays an unreaped zombie; skipped without reaping or
+        // tombstoning, same as 3b — phase 4b's business).
         match candidate.child_alive() {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!(
                     "cm-daemon: handoff session '{}' (pid {}): child exited \
-                     during the swap — skipping adoption (skeleton: no \
-                     tombstone, status left unreaped for later phases)",
-                    rec.uid, rec.child_pid
+                     during the swap — skipping adoption (no tombstone, \
+                     status left unreaped for later phases)",
+                    rec.uid, rec.child_pid,
                 );
+                skipped += 1;
                 continue;
             }
             Err(e) => {
                 eprintln!(
                     "cm-daemon: handoff session '{}' (pid {}): pidfd probe \
                      failed ({}) — skipping adoption, never signaling",
-                    rec.uid, rec.child_pid, e
+                    rec.uid, rec.child_pid, e,
                 );
+                skipped += 1;
                 continue;
             }
         }
@@ -683,38 +1217,61 @@ pub fn rehydrate_adopted_sessions(
                     "cm-daemon: handoff session '{}' (pid {}): start-time \
                      mismatch (manifest {}, /proc {}) — skipping adoption, \
                      never signaling",
-                    rec.uid, rec.child_pid, rec.child_start_time, t
+                    rec.uid, rec.child_pid, rec.child_start_time, t,
                 );
+                skipped += 1;
                 continue;
             }
             Err(e) => {
                 eprintln!(
                     "cm-daemon: handoff session '{}' (pid {}): start-time \
                      read failed ({}) — skipping adoption, never signaling",
-                    rec.uid, rec.child_pid, e
+                    rec.uid, rec.child_pid, e,
                 );
+                skipped += 1;
                 continue;
             }
         }
-
         if let Some(tid) = rec.transcript_id.as_deref() {
             eprintln!(
                 "cm-daemon: handoff session '{}': transcript_id {} noted but \
-                 not rebound (skeleton carries the id, not the path; phase 4)",
-                rec.uid, tid
+                 not rebound (the manifest carries the id, not the path; \
+                 phase 4b)",
+                rec.uid, tid,
             );
         }
+        survivors.push((i, candidate));
+    }
 
-        // Commit: promote + arm + insert under one state-lock hold —
-        // same fast-exit race discipline as `start_session`'s
-        // arm_reaper-and-insert (the reaper's on_exit blocks on the
-        // lock we hold until the insert is visible).
+    // ---- Failure injection (dev-flag gated; see the const doc) ----
+    if let Some(reason) = test_fail_requested(reexec_enabled, manifest.attempt)
+    {
+        eprintln!("cm-daemon: {}", reason);
+        return Err(reason);
+    }
+
+    // ---- Commit phase (the gate) ----
+    let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let mut adopted = 0usize;
+    for (i, candidate) in survivors {
+        let rec = &manifest.sessions[i];
+        if st.sessions.contains_key(&rec.uid) {
+            // Impossible pre-serving (the registry starts empty and
+            // only this loop inserts) — a collision means a program
+            // bug or a hostile manifest; unexpected → fail.
+            disarm_registry_locked(&mut st);
+            return Err(format!(
+                "session uid '{}' already present in the registry at commit \
+                 — refusing a duplicate adoption",
+                rec.uid,
+            ));
+        }
         let parts = candidate.promote();
         let meta = AdoptedSessionMeta {
             title: rec.uid.clone(),
-            // Skeleton manifest schema carries no engine field —
-            // hard-noted bash (the only engine the skeleton
-            // exercises); phase 4 adds the field.
+            // The manifest schema carries no engine field yet —
+            // hard-noted bash (the only engine the e2e exercises);
+            // phase 4b adds the field.
             session_type: "bash".to_string(),
             generation: rec.generation,
             cgroup_prefix: rec.cgroup_prefix.clone().map(PathBuf::from),
@@ -727,16 +1284,6 @@ pub fn rehydrate_adopted_sessions(
                 .unwrap_or_else(|p| p.into_inner());
             crate::control::methods::handle_session_exit(&mut s, &uid_for_cleanup);
         });
-
-        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        if st.sessions.contains_key(&rec.uid) {
-            eprintln!(
-                "cm-daemon: handoff session '{}': uid already in the registry \
-                 — skipping duplicate adoption",
-                rec.uid
-            );
-            continue;
-        }
         match DaemonSession::adopt(parts, meta, Some(on_exit)) {
             Ok(sess) => {
                 st.sessions.insert(rec.uid.clone(), sess);
@@ -744,17 +1291,502 @@ pub fn rehydrate_adopted_sessions(
                 eprintln!(
                     "cm-daemon: handoff session '{}' adopted (pid {}, \
                      generation {})",
-                    rec.uid, rec.child_pid, rec.generation
+                    rec.uid, rec.child_pid, rec.generation,
+                );
+            }
+            Err(e) => {
+                // Mid-commit adopt failure (dup/take_writer/thread
+                // spawn — vanishingly rare): disarm the sessions
+                // already inserted INSIDE this same lock hold (their
+                // on_exit callbacks stay blocked on the lock until
+                // the registry is clean), then fail the transaction.
+                // The failed record's DUPS died with its parts; the
+                // escrow ORIGINALS are intact for the rollback.
+                disarm_registry_locked(&mut st);
+                return Err(format!(
+                    "DaemonSession::adopt failed at commit for session '{}': \
+                     {} — transaction aborted (escrow originals intact)",
+                    rec.uid, e,
+                ));
+            }
+        }
+    }
+    Ok(AdoptStats { adopted, skipped })
+}
+
+/// [`disarm_partial_commit`]'s under-the-lock twin, for failure paths
+/// that already hold the state guard (keeps the reaper `on_exit`
+/// callbacks blocked until the registry is clean).
+fn disarm_registry_locked(st: &mut DaemonState) {
+    let drained: Vec<(String, DaemonSession)> = st.sessions.drain().collect();
+    for (uid, sess) in drained {
+        eprintln!(
+            "cm-daemon: disarming partially-committed session '{}' without \
+             signaling (mem::forget)",
+            uid,
+        );
+        std::mem::forget(sess);
+    }
+}
+
+// ------------------------------------------------------------
+// Crash note
+// ------------------------------------------------------------
+
+/// Append one unbuffered line to `$HOME/.cm/reexec-crash-note.log` —
+/// the durable record of a ladder transition (the daemon's stderr may
+/// be a pipe nobody kept). `File::write_all` is a direct `write(2)`
+/// (no BufWriter anywhere), so the line is out before the exec / the
+/// fallback proceeds. Best-effort: a note that can't be written must
+/// never block recovery — the same text also goes to stderr.
+fn append_crash_note(attempt: u8, what: &str, action: &str) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "[{}] cm-daemon re-exec attempt {} failed: {} — action: {}\n",
+        ts, attempt, what, action,
+    );
+    eprint!("cm-daemon: crash note: {}", line);
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let dir = home.join(".cm");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(CRASH_NOTE_FILENAME);
+    match std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(line.as_bytes());
+        }
+        Err(e) => eprintln!(
+            "cm-daemon: could not append crash note to {}: {}",
+            path.display(),
+            e,
+        ),
+    }
+}
+
+// ------------------------------------------------------------
+// Rollback exec
+// ------------------------------------------------------------
+
+/// Exec the pinned rollback binary (R7: an inode held since the
+/// original restart's step 1, immune to deploys overwriting the
+/// path) with the escrow re-manifested at `next_attempt`. Returns
+/// ONLY on failure — success is the exec, and the rollback image
+/// rehydrates the same escrow fds through the normal handoff path.
+///
+/// The steps, mirroring the old image's exec side:
+///
+/// 1. **New sealed manifest** — the old one is sealed/immutable by
+///    design (R8), so a fresh memfd re-lists the ORIGINAL escrow fd
+///    NUMBERS (escrow holds those exact fds — R5) with `attempt`
+///    bumped and the SAME rollback fd. `write_manifest` re-runs the
+///    full structural validation, so a corrupt re-list fails here,
+///    before any point of no return.
+/// 2. **CLOEXEC discipline (R9)** — audit the whole table to CLOEXEC
+///    (nothing can fork here: pre-serving startup, poller/scheduler
+///    not yet running), then clear the flag on exactly the handed-off
+///    set: escrow session fds, the rollback fd, the listener (owned
+///    by `run()`'s `UnixListener`; we flip only its flag), the TLS
+///    listener when present, and the NEW manifest fd. No
+///    snapshot/restore here, unlike the old image's abort path: both
+///    continuations from a failure (terminal fallback) want
+///    everything CLOEXEC anyway — the failure path below re-sets the
+///    flag on the allowlist (the escrow fds are about to close, the
+///    listener must go back to CLOEXEC).
+/// 3. **Signal bracketing (R13/F8)** — block SIGHUP/SIGTERM; the mask
+///    survives the exec, dispositions don't, and SIGHUP's default is
+///    terminate. Restored on the failure path (run()'s unblock
+///    already ran, so nothing downstream would).
+/// 4. **`execveat(rollback_fd, "", AT_EMPTY_PATH)`** via the shared
+///    [`do_execveat`] body — same explicit-envp discipline as the
+///    forward exec (strips `CM_REEXEC_*`, injects the new manifest
+///    pointer; the dev flag and the test knob deliberately survive).
+fn rollback_exec(escrow: &HandoffEscrow, next_attempt: u8) -> anyhow::Error {
+    let m = &escrow.manifest;
+
+    // ---- 1: new sealed manifest over the ORIGINAL fd numbers. ----
+    let new_manifest = ReexecManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        attempt: next_attempt,
+        rollback_bin_fd: escrow.rollback_fd.as_raw_fd(),
+        sessions: m.sessions.clone(),
+        listener_fd: m.listener_fd,
+        tls_listener_fd: m.tls_listener_fd,
+    };
+    let new_manifest_fd = match reexec_manifest::write_manifest(&new_manifest) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return anyhow::anyhow!(
+                "write rollback manifest memfd (attempt {}): {}",
+                next_attempt,
+                e
+            )
+        }
+    };
+
+    // ---- 2: CLOEXEC discipline. ----
+    if let Err(e) = set_all_cloexec() {
+        return anyhow::anyhow!(
+            "CLOEXEC audit before rollback exec (close_range / fd walk): {}",
+            e
+        );
+    }
+    let mut inherit: Vec<RawFd> = vec![
+        new_manifest_fd.as_raw_fd(),
+        escrow.rollback_fd.as_raw_fd(),
+        m.listener_fd,
+    ];
+    if let Some(fd) = m.tls_listener_fd {
+        inherit.push(fd);
+    }
+    for s in &escrow.sessions {
+        inherit.push(s.master.as_raw_fd());
+        inherit.push(s.pidfd.as_raw_fd());
+    }
+    for &fd in &inherit {
+        if let Err(e) = set_fd_flags(fd, 0) {
+            // Undo what we cleared so far (the audit direction —
+            // everything CLOEXEC — is the safe direction to leave the
+            // table in for the terminal fallback).
+            for &back in &inherit {
+                let _ = set_fd_flags(back, libc::FD_CLOEXEC);
+            }
+            return anyhow::anyhow!(
+                "clear CLOEXEC on handed-off fd {} for rollback exec: {}",
+                fd,
+                e
+            );
+        }
+    }
+
+    // ---- 3: signal bracketing. ----
+    let old_mask = match block_sighup_sigterm() {
+        Ok(mask) => mask,
+        Err(e) => {
+            for &back in &inherit {
+                let _ = set_fd_flags(back, libc::FD_CLOEXEC);
+            }
+            return e;
+        }
+    };
+
+    // argv[0] hygiene: the rollback inode's recorded pathname (may
+    // carry a " (deleted)" suffix after a deploy overwrote the path —
+    // honest, and cosmetic only), falling back to our own argv[0].
+    let argv0: PathBuf = std::fs::read_link(format!(
+        "/proc/self/fd/{}",
+        escrow.rollback_fd.as_raw_fd()
+    ))
+    .unwrap_or_else(|_| {
+        std::env::args_os()
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cm-daemon"))
+    });
+
+    // Unbuffered logging at the exec point (design requirement).
+    eprintln!(
+        "cm-daemon: ROLLBACK EXEC — execveat'ing pinned rollback fd {} ({}) \
+         with attempt {}, {} session(s), listener fd {}, new manifest fd {}",
+        escrow.rollback_fd.as_raw_fd(),
+        argv0.display(),
+        next_attempt,
+        m.sessions.len(),
+        m.listener_fd,
+        new_manifest_fd.as_raw_fd(),
+    );
+
+    let err = do_execveat(&escrow.rollback_fd, &argv0, new_manifest_fd.as_raw_fd());
+
+    // ---- execveat returned — failure. Restore for the terminal path. ----
+    eprintln!(
+        "cm-daemon: ROLLBACK EXEC FAILED ({}) — falling through to the \
+         terminal fallback (never exec-loop blindly)",
+        err,
+    );
+    restore_sigmask(&old_mask);
+    for &fd in &inherit {
+        let _ = set_fd_flags(fd, libc::FD_CLOEXEC);
+    }
+    // new_manifest_fd drops here (its memfd dies with this scope).
+    err
+}
+
+// ------------------------------------------------------------
+// Terminal fallback
+// ------------------------------------------------------------
+
+/// The deliberate-kill terminal fallback (design → "Failure classes":
+/// attempt ≥ 2, or a rollback exec that itself failed). For every
+/// manifest-listed session: verify identity via the escrowed pidfd +
+/// the R6 start-time cross-check, then `pidfd_send_signal(SIGKILL)`
+/// and reap via `waitid(P_PIDFD)` — kill-then-reap, logged per
+/// session with uid + pid. Mismatched records are logged and left
+/// unsignaled; already-dead ones are reaped (zombie) or noted
+/// (already reaped) without signaling. Then every escrow fd closes —
+/// session fds, manifest fd, rollback fd, TLS fd — and this RETURNS,
+/// so `run()` proceeds with NORMAL startup semantics.
+///
+/// **The listener survives on purpose**: it was never escrowed —
+/// `run()` adopted the inherited listener at startup (the socket
+/// never unbound), so the daemon comes back SERVING through it, and
+/// `run()`'s wiring follows this return with legacy
+/// `restore_sessions` (resume from the H1-pinned stamps) INSTEAD of
+/// rehydrate. Sessions are killed deliberately, then resumed — never
+/// abandoned alive: falling through with live orphans while restore
+/// spawns `--resume` duplicates would be two live writers per
+/// conversation, the 2026-08-18 split-brain class (the review finding
+/// that turned the original spec's "sessions may die" into this
+/// function).
+fn terminal_fallback(escrow: HandoffEscrow) -> HandoffOutcome {
+    let HandoffEscrow {
+        manifest,
+        manifest_fd,
+        rollback_fd,
+        tls_listener_fd,
+        sessions,
+    } = escrow;
+    let total = manifest.sessions.len();
+    eprintln!(
+        "cm-daemon: TERMINAL FALLBACK — deliberately killing and reaping \
+         {} manifest-listed session child(ren) before legacy restore; the \
+         inherited control listener stays adopted, so the daemon comes back \
+         serving",
+        total,
+    );
+
+    let mut killed = 0usize;
+    for (rec, fds) in manifest.sessions.iter().zip(sessions) {
+        // A candidate over the ORIGINALS: its probes are the same
+        // non-consuming pidfd poll + /proc starttime read the
+        // transaction uses, and its end-of-iteration drop is the
+        // close-everything step this path wants anyway.
+        let candidate = SessionCandidate::from_raw_parts(
+            rec.uid.clone(),
+            rec.child_pid,
+            fds.pidfd,
+            fds.master,
+        );
+        match candidate.child_alive() {
+            Ok(true) => {
+                match candidate.child_start_time() {
+                    Ok(t) if t == rec.child_start_time => {
+                        // Identity verified: deliberate kill-then-reap
+                        // through the escrowed pidfd (pid-reuse-proof
+                        // by construction; the starttime check catches
+                        // a corrupt record, not a recycled pid).
+                        if let Err(e) = crate::session::send_sigkill_via_pidfd(
+                            candidate.pidfd(),
+                        ) {
+                            eprintln!(
+                                "cm-daemon: terminal fallback: SIGKILL via \
+                                 pidfd failed for session '{}' (pid {}): {} \
+                                 — NOT reaping (a reap would block on a live \
+                                 child)",
+                                rec.uid, rec.child_pid, e,
+                            );
+                            continue;
+                        }
+                        // Reap under the gate discipline every other
+                        // status consumer follows. Blocks only for the
+                        // SIGKILL to land (unblockable, prompt).
+                        let _permit = reap_gate::read_permit();
+                        let status = crate::session::consume_exit_status(
+                            candidate.pidfd(),
+                            rec.child_pid,
+                        );
+                        killed += 1;
+                        eprintln!(
+                            "cm-daemon: terminal fallback: deliberately \
+                             SIGKILLed and reaped session '{}' child pid {} \
+                             (exit code {:?}, signal {:?})",
+                            rec.uid, rec.child_pid, status.code, status.signal,
+                        );
+                    }
+                    Ok(t) => {
+                        eprintln!(
+                            "cm-daemon: terminal fallback: session '{}' (pid \
+                             {}) start-time mismatch (manifest {}, /proc {}) \
+                             — corrupt record; left UNSIGNALED",
+                            rec.uid, rec.child_pid, rec.child_start_time, t,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "cm-daemon: terminal fallback: session '{}' (pid \
+                             {}) start-time read failed ({}) — left \
+                             UNSIGNALED",
+                            rec.uid, rec.child_pid, e,
+                        );
+                    }
+                }
+            }
+            Ok(false) => {
+                // Already exited during the swap: reap the zombie so
+                // nothing lingers (waitid(P_PIDFD) targets the bound
+                // task only; if something else already consumed the
+                // status it answers ECHILD, decoded as unknown).
+                let _permit = reap_gate::read_permit();
+                let status = crate::session::consume_exit_status(
+                    candidate.pidfd(),
+                    rec.child_pid,
+                );
+                eprintln!(
+                    "cm-daemon: terminal fallback: session '{}' child pid {} \
+                     already exited — reaped without signaling (exit code \
+                     {:?}, signal {:?})",
+                    rec.uid, rec.child_pid, status.code, status.signal,
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "cm-daemon: handoff session '{}' FAILED to adopt: {} \
-                     (session lost — its master fd closed with the parts)",
-                    rec.uid, e
+                    "cm-daemon: terminal fallback: session '{}' (pid {}) \
+                     pidfd probe failed ({}) — left untouched",
+                    rec.uid, rec.child_pid, e,
                 );
             }
         }
+        // candidate drops here: closes this record's original pidfd +
+        // master. Closing the master after the deliberate kill is
+        // plain fd teardown (the child is already dead/reaped on the
+        // signaled path; on the mismatch path the close may SIGHUP
+        // whatever holds the slave — fd lifecycle, not a signal we
+        // send).
     }
-    adopted
+
+    // Close the remaining escrow fds. NOT the listener — never
+    // escrowed; run() owns it and keeps serving through it.
+    eprintln!(
+        "cm-daemon: terminal fallback: closing manifest fd {}, rollback fd \
+         {}{} — returning to normal startup (legacy restore_sessions runs \
+         next)",
+        manifest_fd.as_raw_fd(),
+        rollback_fd.as_raw_fd(),
+        match &tls_listener_fd {
+            Some(fd) => format!(", TLS listener fd {}", fd.as_raw_fd()),
+            None => String::new(),
+        },
+    );
+    drop(manifest_fd);
+    drop(rollback_fd);
+    drop(tls_listener_fd);
+
+    HandoffOutcome::TerminalFallback { killed, total }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::env_lock;
+
+    /// The receive-side ladder: attempts 0 and 1 rehydrate; a
+    /// manifest CLAIMING attempt ≥ 2 is never trusted with a third
+    /// exec — terminal immediately.
+    #[test]
+    fn attempt_decision_ladder() {
+        assert_eq!(attempt_decision(0), AttemptDecision::Rehydrate);
+        assert_eq!(attempt_decision(1), AttemptDecision::Rehydrate);
+        assert_eq!(attempt_decision(2), AttemptDecision::TerminalFallback);
+        assert_eq!(attempt_decision(3), AttemptDecision::TerminalFallback);
+        assert_eq!(attempt_decision(u8::MAX), AttemptDecision::TerminalFallback);
+    }
+
+    /// The failure-side ladder: attempt 0 → rollback exec with
+    /// attempt 1; attempt 1 (the rollback image failing) → terminal;
+    /// ≥ 2 stays terminal (total function — [`attempt_decision`]
+    /// already diverted those before any transaction ran).
+    #[test]
+    fn on_rehydrate_failure_ladder() {
+        assert_eq!(
+            on_rehydrate_failure(0),
+            FailureNext::RollbackExec { next_attempt: 1 }
+        );
+        assert_eq!(on_rehydrate_failure(1), FailureNext::TerminalFallback);
+        assert_eq!(on_rehydrate_failure(2), FailureNext::TerminalFallback);
+        assert_eq!(on_rehydrate_failure(u8::MAX), FailureNext::TerminalFallback);
+    }
+
+    struct KnobGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for KnobGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(ENV_TEST_FAIL_REHYDRATE, v),
+                None => std::env::remove_var(ENV_TEST_FAIL_REHYDRATE),
+            }
+        }
+    }
+    fn knob_guard() -> KnobGuard {
+        KnobGuard {
+            prev: std::env::var_os(ENV_TEST_FAIL_REHYDRATE),
+        }
+    }
+
+    /// The knob names the attempts to fail: "0" hits only attempt 0
+    /// (the rollback image at attempt 1 rehydrates cleanly), "0,1"
+    /// hits both, "terminal" hits everything, garbage hits nothing.
+    #[test]
+    fn test_fail_knob_names_attempts() {
+        let _g = env_lock();
+        let _restore = knob_guard();
+
+        std::env::remove_var(ENV_TEST_FAIL_REHYDRATE);
+        assert!(test_fail_requested(true, 0).is_none(), "absent var");
+
+        std::env::set_var(ENV_TEST_FAIL_REHYDRATE, "0");
+        assert!(test_fail_requested(true, 0).is_some());
+        assert!(
+            test_fail_requested(true, 1).is_none(),
+            "'0' must not fail the attempt-1 (rollback) image"
+        );
+
+        std::env::set_var(ENV_TEST_FAIL_REHYDRATE, "0,1");
+        assert!(test_fail_requested(true, 0).is_some());
+        assert!(test_fail_requested(true, 1).is_some());
+
+        std::env::set_var(ENV_TEST_FAIL_REHYDRATE, "1");
+        assert!(test_fail_requested(true, 0).is_none());
+        assert!(test_fail_requested(true, 1).is_some());
+
+        std::env::set_var(ENV_TEST_FAIL_REHYDRATE, "terminal");
+        for attempt in [0u8, 1, 2, 200] {
+            assert!(
+                test_fail_requested(true, attempt).is_some(),
+                "'terminal' must hit attempt {}",
+                attempt
+            );
+        }
+
+        for garbage in ["", "  ", "abc", "-1", "0x1"] {
+            std::env::set_var(ENV_TEST_FAIL_REHYDRATE, garbage);
+            assert!(
+                test_fail_requested(true, 0).is_none(),
+                "{:?} must hit nothing",
+                garbage
+            );
+        }
+    }
+
+    /// The production gate: without the CM_REEXEC=1 dev flag
+    /// (`reexec_enabled == false`) the knob is ignored entirely, no
+    /// matter its value.
+    #[test]
+    fn test_fail_knob_requires_dev_flag() {
+        let _g = env_lock();
+        let _restore = knob_guard();
+        for val in ["0", "0,1", "terminal"] {
+            std::env::set_var(ENV_TEST_FAIL_REHYDRATE, val);
+            assert!(
+                test_fail_requested(false, 0).is_none(),
+                "a production daemon (no dev flag) must ignore {}={}",
+                ENV_TEST_FAIL_REHYDRATE,
+                val
+            );
+            assert!(test_fail_requested(false, 1).is_none());
+        }
+    }
 }

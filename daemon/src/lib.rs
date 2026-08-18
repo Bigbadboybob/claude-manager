@@ -333,65 +333,22 @@ pub fn run() -> anyhow::Result<()> {
         );
     }
 
-    // DESIGN_SEAMLESS_RESTART phase 3b (R13): re-exec handoff
-    // detection. Runs HERE — during single-threaded startup, right
-    // after the identity scrub, BEFORE `bind_socket` (normal
+    // DESIGN_SEAMLESS_RESTART phases 3b + 4a (R13, R5): re-exec
+    // handoff detection. Runs HERE — during single-threaded startup,
+    // right after the identity scrub, BEFORE `bind_socket` (normal
     // startup's stale-socket probe would connect to its own
     // inherited listener and refuse with AddrInUse) and BEFORE
     // `restore_sessions` (legacy restore must never run on a handoff
     // — it would spawn `--resume` duplicates of children that are
-    // still alive). `consume_env` scrubs `CM_REEXEC_MANIFEST_FD`
-    // unconditionally, so on ANY validation failure the daemon boots
-    // fresh with nothing left to bequeath to children — and on
-    // failure NO fd is touched, including the claimed manifest fd
-    // itself: a leaked env var (the 2026-08-18 pattern) may point at
-    // an unrelated inherited fd that belongs to something else.
-    // Sequencing per the manifest module's corrupt-manifest rule:
-    // integrity/structure first (`read_manifest` touches only the
-    // manifest fd), then — and only then — the escrow-fd role probes
-    // (`validate_fd_roles`, read-only, side-effect-free).
-    let reexec_handoff: Option<(reexec_manifest::ReexecManifest, std::os::fd::OwnedFd)> =
-        match reexec_manifest::consume_env() {
-            None => None,
-            Some(fd) => {
-                // SAFETY: validation-only borrow of the claimed fd
-                // number; ownership is taken ONLY after the manifest
-                // verifies (below), and never on failure.
-                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                let validated = reexec_manifest::read_manifest(borrowed)
-                    .and_then(|m| {
-                        reexec_manifest::validate_fd_roles(&m)?;
-                        Ok(m)
-                    });
-                match validated {
-                    Ok(m) => {
-                        eprintln!(
-                            "cm-daemon: re-exec handoff manifest validated \
-                             (fd {}, {} session(s), attempt {})",
-                            fd,
-                            m.sessions.len(),
-                            m.attempt,
-                        );
-                        // SAFETY: a sealed, role-validated manifest
-                        // memfd of ours — the handoff path owns the
-                        // inherited fd from here on.
-                        Some((m, unsafe {
-                            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-                        }))
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "cm-daemon: CM_REEXEC_MANIFEST_FD={} was present \
-                             but manifest validation FAILED: {} — booting \
-                             FRESH (env already scrubbed; no inherited fd \
-                             touched)",
-                            fd, e,
-                        );
-                        None
-                    }
-                }
-            }
-        };
+    // still alive). On success the returned escrow OWNS every
+    // inherited fd untouched (CLOEXEC re-set, R9) except the
+    // listener, which is adopted below; `None` — absent or invalid
+    // manifest — is the design's *Fresh* outcome: today's fresh
+    // boot, env already scrubbed, no inherited fd touched. The full
+    // detection/validation/escrow logic lives in
+    // `reexec::detect_handoff` (decision logic in reexec.rs, wiring
+    // thin here).
+    let reexec_handoff: Option<reexec::HandoffEscrow> = reexec::detect_handoff();
 
     // DESIGN_SEAMLESS_RESTART phase 3b: the re-exec dev flag, read
     // ONCE at startup and stored on state — the `daemon.reexec_dev`
@@ -454,8 +411,13 @@ pub fn run() -> anyhow::Result<()> {
         // exec, so connects during the swap queued in the kernel
         // backlog — and `bind_socket`'s stale-probe would have
         // dialed our own inherited listener and refused AddrInUse.
-        Some((manifest, _)) => {
-            let raw = manifest.listener_fd;
+        // The listener is deliberately NOT escrowed (phase 4a): it is
+        // adopted here, on EVERY handoff outcome — rehydrate, rollback
+        // exec (which re-lists only its fd NUMBER), and terminal
+        // fallback — so the daemon comes back serving no matter how
+        // the ladder ends.
+        Some(escrow) => {
+            let raw = escrow.manifest().listener_fd;
             // SAFETY: role-validated as a listening socket
             // (SO_ACCEPTCONN true); the handoff path owns the
             // inherited fd, and this is its single ownership take.
@@ -768,58 +730,52 @@ pub fn run() -> anyhow::Result<()> {
     // ordering keeps S5's coordination simple). Best-effort + per-session
     // isolated; it never blocks startup.
     //
-    // DESIGN_SEAMLESS_RESTART phase 3b (R13): on a re-exec handoff,
-    // legacy restore is SKIPPED — its children are still alive, and
+    // DESIGN_SEAMLESS_RESTART phases 3b + 4a (R13, R5): on a re-exec
+    // handoff, legacy restore is SKIPPED while children are alive —
     // restore would spawn `--resume` duplicates of them (two live
     // writers per conversation, the 2026-08-18 split-brain class).
-    // The handoff path adopts the inherited sessions instead.
+    // `complete_handoff` runs the attempt ladder around the
+    // escrow/commit-gate rehydrate transaction (decision logic in
+    // reexec.rs; this match is deliberately thin). Three outcomes:
+    //
+    //   * `Adopted` — rehydrate committed; the inherited sessions are
+    //     in the registry, escrow released. Restore stays skipped.
+    //   * (never returns) — a recoverable rehydrate failure at
+    //     attempt 0 exec'd the pinned ROLLBACK binary in place; the
+    //     rollback image re-enters run() through the same detection
+    //     path with attempt 1.
+    //   * `TerminalFallback` — the ladder ended: every manifest-listed
+    //     child was deliberately SIGKILLed + reaped through its
+    //     escrowed pidfd (never fall through with live orphans), all
+    //     escrow fds are closed, and — because the LISTENER was
+    //     adopted as normal above — the daemon comes up serving.
+    //     run() proceeds with NORMAL startup semantics: legacy
+    //     `restore_sessions`, resuming from the H1-pinned stamps.
+    //
+    // The `None` arm is the design's *Fresh* outcome (no/invalid
+    // manifest): today's fresh boot.
     match reexec_handoff {
-        Some((manifest, manifest_fd)) => {
-            let adopted =
-                reexec::rehydrate_adopted_sessions(&state, &manifest);
-            eprintln!(
-                "cm-daemon: re-exec handoff — adopted {}/{} session(s); \
-                 legacy restore_sessions skipped",
-                adopted,
-                manifest.sessions.len(),
-            );
-            // Skeleton fd hygiene: close the manifest fd and the
-            // pinned rollback fd now that adoption is done. The
-            // rollback EXEC is later-phase work — log the pinned
-            // binary for the record before closing. (A hand-crafted
-            // manifest could carry a TLS listener fd; the skeleton
-            // never writes one, and closes it unused here.) A full
-            // close-every-unlisted-inherited-fd audit is phase-4
-            // work — the skeleton's exec side hands off nothing
-            // beyond the manifest-listed set, so there is nothing
-            // unlisted to close in practice.
-            let rb = manifest.rollback_bin_fd;
-            let rb_path = std::fs::read_link(format!("/proc/self/fd/{}", rb))
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<unknown>".into());
-            eprintln!(
-                "cm-daemon: re-exec handoff — closing pinned rollback binary \
-                 fd {} ({}); the rollback exec lands in a later phase",
-                rb, rb_path,
-            );
-            // SAFETY: role-validated manifest slots owned by the
-            // handoff path; single ownership take of each.
-            drop(unsafe {
-                <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(rb)
-            });
-            if let Some(tls_fd) = manifest.tls_listener_fd {
-                eprintln!(
-                    "cm-daemon: re-exec handoff — manifest carried a TLS \
-                     listener fd {}; TLS handoff is out of the skeleton's \
-                     scope, closing it",
-                    tls_fd,
-                );
-                // SAFETY: same ownership argument as the rollback fd.
-                drop(unsafe {
-                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(tls_fd)
-                });
+        Some(escrow) => {
+            match reexec::complete_handoff(&state, escrow, reexec_enabled) {
+                reexec::HandoffOutcome::Adopted { adopted, total } => {
+                    eprintln!(
+                        "cm-daemon: re-exec handoff — adopted {}/{} \
+                         session(s); legacy restore_sessions skipped",
+                        adopted, total,
+                    );
+                }
+                reexec::HandoffOutcome::TerminalFallback { killed, total } => {
+                    eprintln!(
+                        "cm-daemon: re-exec handoff ended in TERMINAL \
+                         FALLBACK ({}/{} child(ren) deliberately \
+                         killed+reaped) — running legacy restore_sessions \
+                         (resume from pinned stamps); the inherited listener \
+                         stays adopted, so the daemon serves through it",
+                        killed, total,
+                    );
+                    control::methods::restore_sessions(&state);
+                }
             }
-            drop(manifest_fd);
         }
         None => control::methods::restore_sessions(&state),
     }
