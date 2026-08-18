@@ -298,6 +298,17 @@ fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
 /// proved by this commit: a client can dial the daemon, send a
 /// request, and receive a structured response. End-to-end test in
 /// `daemon/tests/accept_loop.rs` confirms that.
+/// H2: set by the SIGHUP handler, drained by the watcher thread in
+/// [`run`]. A bare flag store is the only async-signal-safe action the
+/// handler may take (no locks, no allocation, no IO in signal context).
+static SIGHUP_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The actual SIGHUP handler — flag store only; see [`SIGHUP_PENDING`].
+extern "C" fn sighup_set_flag(_sig: libc::c_int) {
+    SIGHUP_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn run() -> anyhow::Result<()> {
     // FIRST, before anything reads env or spawns: scrub Claude-session
     // identity vars inherited from a launcher that ran inside a claude
@@ -496,6 +507,46 @@ pub fn run() -> anyhow::Result<()> {
     initial_state.daemon_sessions_path =
         Some(state::default_daemon_sessions_path());
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
+
+    // H2 (restart hardening): SIGHUP → `daemon.reload_config` without
+    // speaking the socket protocol (`kill -HUP $(pgrep cm-daemon)`), for
+    // operators and scripts. The handler only sets a flag — the one
+    // async-signal-safe thing — and a watcher thread applies it via the
+    // SAME `methods::reload_config` the Operator RPC uses, so the two
+    // entry points can't drift. `libc::signal` on glibc installs
+    // SA_RESTART semantics, so a HUP landing mid-`accept` restarts the
+    // syscall instead of surfacing EINTR into the accept loop.
+    unsafe {
+        libc::signal(libc::SIGHUP, sighup_set_flag as libc::sighandler_t);
+    }
+    {
+        let state_for_hup = std::sync::Arc::clone(&state);
+        // Spawn failure is non-fatal: the RPC path still works, and the
+        // daemon without a HUP watcher is exactly yesterday's daemon.
+        let spawned = std::thread::Builder::new()
+            .name("cm-daemon-sighup".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if SIGHUP_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("cm-daemon: SIGHUP — reloading daemon.toml");
+                    if let Err((code, msg)) =
+                        control::methods::reload_config(&state_for_hup)
+                    {
+                        eprintln!(
+                            "cm-daemon: SIGHUP reload failed ({:?}): {}",
+                            code, msg
+                        );
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!(
+                "cm-daemon: could not start SIGHUP watcher ({}); \
+                 config reload remains available via daemon.reload_config",
+                e
+            );
+        }
+    }
 
     // 12h: spawn the TLS-TCP listener if daemon.toml carries
     // a `[tls]` section. The TUI's TLS-TCP host transport

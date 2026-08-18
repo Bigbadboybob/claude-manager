@@ -3213,6 +3213,137 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 }
 
 // ============================================================
+// daemon.reload_config (H2 restart hardening)
+// ============================================================
+//
+// Re-read daemon.toml and hot-apply every key that doesn't change the
+// daemon's security or transport identity. Born from the 2026-08-17
+// `mcp_server_path` incident: a one-line config fix sat inert until a
+// full restart — which kills every hosted session — because config was
+// only ever read at startup. Consumers already read `state.config.*`
+// per call under the lock, so swapping the struct is the whole
+// hot-apply; the two startup-derived artifacts (base workflow
+// definitions, MCP preflight/launcher) are re-derived here when their
+// inputs changed.
+//
+// `auth` and `tls` stay startup-only ON PURPOSE: hot-swapping the trust
+// model of a socket with live connections is a downgrade surface, and
+// the TCP listener is bound once. Changed values there are REPORTED
+// (`requires_restart`) and NOT applied. Everything else is hot by
+// default — a new config key must opt INTO restart-only, so the list
+// can't silently rot as fields are added.
+//
+// **Auth: Operator-only** (dispatch gate): a config re-read changes
+// spawn behavior daemon-wide; Session callers must not trigger it.
+
+pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    let path = crate::config::default_config_path();
+    let new_cfg = crate::config::load_or_default(&path).map_err(|e| {
+        (
+            ErrorCode::Internal,
+            format!("daemon.reload_config: {}", e),
+        )
+    })?;
+
+    const RESTART_ONLY: &[&str] = &["auth", "tls"];
+
+    // Field-level diff via serde so `changed` names exactly what moved.
+    let (changed, requires_restart) = {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let old_v = serde_json::to_value(&st.config).unwrap_or_default();
+        let new_v = serde_json::to_value(&new_cfg).unwrap_or_default();
+        let mut changed: Vec<String> = Vec::new();
+        let mut requires_restart: Vec<String> = Vec::new();
+        if let (Value::Object(old), Value::Object(new)) = (&old_v, &new_v) {
+            for (key, new_val) in new {
+                if old.get(key) != Some(new_val) {
+                    if RESTART_ONLY.contains(&key.as_str()) {
+                        requires_restart.push(key.clone());
+                    } else {
+                        changed.push(key.clone());
+                    }
+                }
+            }
+        }
+        if !changed.is_empty() {
+            let mut applied = new_cfg.clone();
+            applied.auth = st.config.auth.clone();
+            applied.tls = st.config.tls.clone();
+            st.config = applied;
+        }
+        (changed, requires_restart)
+    };
+
+    // Re-derive the startup artifacts whose inputs moved. IO happens
+    // outside the state lock; results are assigned under it.
+    let mut workflow_defs_reloaded: Option<usize> = None;
+    if changed.iter().any(|k| k == "workflows_dir") {
+        let dir = if new_cfg.workflows_dir.trim().is_empty() {
+            crate::workflow::toml_schema::workflows_dir()
+        } else {
+            std::path::PathBuf::from(&new_cfg.workflows_dir)
+        };
+        let (defs, errors) = crate::workflow::toml_schema::load_all(&dir);
+        for (p, err) in &errors {
+            eprintln!("cm-daemon: skipping workflow def {}: {}", p.display(), err);
+        }
+        workflow_defs_reloaded = Some(defs.len());
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.base_workflow_definitions = defs;
+    }
+
+    let mut mcp_preflight: Value = Value::Null;
+    if changed.iter().any(|k| k == "mcp_server_path") {
+        let server_override = if new_cfg.mcp_server_path.trim().is_empty() {
+            None
+        } else {
+            Some(new_cfg.mcp_server_path.as_str())
+        };
+        // Same pair startup runs: refresh the drift-proof launcher, then
+        // prove the server actually starts — a reload that silently
+        // pointed spawns at a broken path would recreate the incident
+        // this RPC exists to prevent.
+        if let Some(server) = crate::mcp_config::resolve_server_path(server_override) {
+            if let Err(e) = crate::mcp_config::ensure_launcher(&server) {
+                eprintln!(
+                    "cm-daemon: reload_config: could not refresh MCP launcher: {}",
+                    e
+                );
+            }
+        }
+        let result = crate::mcp_config::run_mcp_preflight(server_override);
+        mcp_preflight = match &result {
+            Ok(summary) => json!({ "ok": true, "detail": summary }),
+            Err(msg) => json!({ "ok": false, "detail": msg }),
+        };
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        st.mcp_preflight = Some(result);
+    }
+
+    if changed.is_empty() && requires_restart.is_empty() {
+        eprintln!("cm-daemon: reload_config: no changes in {}", path.display());
+    } else {
+        eprintln!(
+            "cm-daemon: reload_config: applied [{}]{} from {}",
+            changed.join(", "),
+            if requires_restart.is_empty() {
+                String::new()
+            } else {
+                format!("; requires restart: [{}]", requires_restart.join(", "))
+            },
+            path.display(),
+        );
+    }
+
+    Ok(json!({
+        "changed": changed,
+        "requires_restart": requires_restart,
+        "mcp_preflight": mcp_preflight,
+        "workflow_definitions_reloaded": workflow_defs_reloaded,
+    }))
+}
+
+// ============================================================
 // tui.update_sessions_snapshot (10d-1)
 // ============================================================
 //
@@ -18114,6 +18245,81 @@ mod tests {
 
     fn make_state_arc() -> Arc<Mutex<DaemonState>> {
         Arc::new(Mutex::new(DaemonState::new()))
+    }
+
+    /// H2 (restart hardening): `daemon.reload_config` hot-applies
+    /// changed non-identity keys, leaves `auth`/`tls` untouched but
+    /// names them in `requires_restart`, and re-runs the MCP preflight
+    /// when `mcp_server_path` moved (failing loudly here, since the
+    /// test's new path is fake).
+    #[test]
+    fn reload_config_applies_hot_keys_and_reports_restart_only() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            {
+                let mut st = state.lock().unwrap();
+                st.config.mcp_server_path = "/old/server.py".into();
+            }
+            let home =
+                std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let cm = home.join(".cm");
+            std::fs::create_dir_all(&cm).unwrap();
+            let cfg_path = cm.join("daemon.toml");
+            std::fs::write(
+                &cfg_path,
+                "mcp_server_path = \"/new/server.py\"\n\
+                 api_url = \"http://example:8000\"\n\
+                 [auth]\nmode = \"token\"\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &cfg_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+
+            let out = reload_config(&state).expect("reload ok");
+            let changed: Vec<&str> = out["changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert!(changed.contains(&"mcp_server_path"), "{:?}", changed);
+            assert!(changed.contains(&"api_url"), "{:?}", changed);
+            let restart: Vec<&str> = out["requires_restart"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(restart, vec!["auth"], "auth is restart-only");
+            // Preflight re-ran against the (fake) new path and reported.
+            assert_eq!(out["mcp_preflight"]["ok"], serde_json::json!(false));
+
+            let st = state.lock().unwrap();
+            assert_eq!(st.config.mcp_server_path, "/new/server.py");
+            assert_eq!(st.config.api_url, "http://example:8000");
+            assert_eq!(
+                st.config.auth.mode,
+                crate::config::AuthMode::SshTrust,
+                "auth mode must NOT hot-swap",
+            );
+        });
+    }
+
+    /// H2: an unchanged config is a no-op — empty lists, no preflight
+    /// run, state untouched.
+    #[test]
+    fn reload_config_unchanged_is_noop() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let out = reload_config(&state).expect("reload ok");
+            assert!(out["changed"].as_array().unwrap().is_empty());
+            assert!(out["requires_restart"].as_array().unwrap().is_empty());
+            assert!(out["mcp_preflight"].is_null());
+        });
     }
 
     /// P0 session durability (S1): the `session.set_transcript_path`

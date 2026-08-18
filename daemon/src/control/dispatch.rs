@@ -367,6 +367,9 @@ pub fn dispatch_request(
         // fix-loud-preflight: post-restart health probe. Operator-only —
         // it reports host-environment diagnosis, not per-session state.
         "daemon.health" => DispatchOutcome::Done(dispatch_daemon_health(state, req)),
+        "daemon.reload_config" => {
+            DispatchOutcome::Done(dispatch_reload_config(state, req))
+        }
 
         // 10d-1: TUI-pushed session snapshot so the daemon
         // can recognize TUI-minted sessions for the future
@@ -1453,6 +1456,30 @@ fn dispatch_daemon_health(
         return resp;
     }
     match methods::daemon_health(state) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `daemon.reload_config` — re-read daemon.toml and hot-apply the keys
+/// that don't change the daemon's security/transport identity (H2
+/// restart hardening; see `methods::reload_config` for the split).
+/// Also reachable via SIGHUP (`lib.rs` spawns a sigwait thread that
+/// calls the same method), so operators can `kill -HUP` without
+/// speaking the socket protocol.
+fn dispatch_reload_config(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "daemon.reload_config is Operator-callable only — a config \
+         re-read changes spawn behavior daemon-wide; a Session caller \
+         must not be able to repoint mcp_server_path or the planning API",
+    ) {
+        return resp;
+    }
+    match methods::reload_config(state) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
