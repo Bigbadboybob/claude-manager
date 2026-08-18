@@ -2206,6 +2206,7 @@ impl App {
                 entry.session_id = task.session_id.clone();
                 entry.blocked_at = task.blocked_at.clone();
                 entry.is_cloud = is_cloud;
+                entry.is_continuous = task.kind == "continuous";
                 entry.project = task.project.clone();
                 entry.parent_task_id = task.parent_task_id.clone();
                 entry.worktree_mode = parse_worktree_mode(&task.worktree_mode);
@@ -2221,6 +2222,7 @@ impl App {
                     session_id: task.session_id.clone(),
                     blocked_at: task.blocked_at.clone(),
                     is_cloud,
+                    is_continuous: task.kind == "continuous",
                     workspace_id: None,
                     project: task.project.clone(),
                     parent_task_id: task.parent_task_id.clone(),

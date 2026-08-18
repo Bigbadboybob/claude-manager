@@ -1923,6 +1923,7 @@ mod nav_quickswitch_tests {
             session_id: None,
             blocked_at: None,
             is_cloud: false,
+            is_continuous: false,
             workspace_id: None,
             project: Some("claude-manager".into()),
             parent_task_id: parent.map(str::to_string),

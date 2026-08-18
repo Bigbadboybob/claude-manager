@@ -353,6 +353,13 @@ pub struct TaskEntry {
     pub session_id: Option<String>,
     pub blocked_at: Option<String>,
     pub is_cloud: bool,
+    /// Mirror of the API row's `kind == "continuous"`. A continuous
+    /// orchestrator task is perpetually `running` by design (the scheduler
+    /// owns it; it never flips Done), so task-liveness gates that read
+    /// "not Done" as "work still in flight" must exempt it — see
+    /// `workspace_is_spent`, where a non-exempt continuous task pinned
+    /// every one of its per-run agent markers open forever.
+    pub is_continuous: bool,
     /// FK to `App.workspaces`. None = task in backlog, not bound yet.
     pub workspace_id: Option<String>,
     /// Planning project this task belongs to. Read from the API row;

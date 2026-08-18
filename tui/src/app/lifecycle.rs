@@ -3374,6 +3374,7 @@ impl App {
                     session_id: Some(session_id),
                     blocked_at: None,
                     is_cloud: false,
+                    is_continuous: false,
                     workspace_id: Some(ws_id.clone()),
                     project: None,
                     parent_task_id: None,
@@ -3549,7 +3550,8 @@ impl App {
     /// and a dead session under a live task is the leaked-session condition
     /// the operator wants visible), **evidence it was used** (see below), and
     /// **no still-active task** (neither bound by `workspace_id` nor
-    /// referenced by a tombstone's `task_id`).
+    /// referenced by a tombstone's `task_id` — continuous tasks exempt from
+    /// both edges, being perpetually `running` by design).
     fn workspace_is_spent(ws: &Workspace, tasks: &[TaskEntry]) -> bool {
         if ws.is_cloud || ws.is_closed || !ws.sessions.is_empty() {
             return false;
@@ -3575,9 +3577,23 @@ impl App {
         // visible, not be swept as litter. `self.tasks` only retains
         // non-terminal tasks (reconcile drops Done ones), so "absent" reads
         // as terminal here.
+        //
+        // Continuous tasks are exempt from both edges: a continuous
+        // orchestrator is perpetually `running` (the scheduler owns it — it
+        // never flips Done), so reading its liveness as "work still in
+        // flight" pinned every per-run agent marker it ever spawned open
+        // forever, accruing one stray "agent: <label>" row per run (the
+        // momentum-detective pile-up). Reaping them loses nothing the
+        // operator needs: the orchestrator's own workspace stays visible
+        // through its live session rows, and the next run never lands in a
+        // reaped marker — `resolve_adopt_workspace` mints a fresh open
+        // synthetic per unmatched daemon workspace (and a continuous
+        // session reuses the workspace holding its predecessor), so a
+        // closed marker is permanently out of the adoption paths.
         if tasks.iter().any(|t| {
             t.workspace_id.as_deref() == Some(&ws.id)
                 && !matches!(t.api_status, TaskStatus::Done)
+                && !t.is_continuous
         }) {
             return false;
         }
@@ -3588,6 +3604,7 @@ impl App {
                 tasks.iter().any(|t| {
                     t.task_id.as_deref() == Some(tid)
                         && !matches!(t.api_status, TaskStatus::Done)
+                        && !t.is_continuous
                 })
             })
     }
@@ -4041,6 +4058,7 @@ impl App {
             session_id: None,
             blocked_at: None,
             is_cloud: false,
+            is_continuous: false,
             workspace_id: Some(ws_id),
             // Pin project synchronously so subtask inheritance
             // works before the next reconcile pass — without
@@ -4244,6 +4262,7 @@ impl App {
                 session_id: None,
                 blocked_at: None,
                 is_cloud: false,
+                is_continuous: false,
                 workspace_id: Some(workspace_id.to_string()),
                 // Same race fix as `launch_from_plan` — pin the
                 // project synchronously from the planning row so
@@ -8681,6 +8700,7 @@ mod spent_workspace_tests {
             session_id: None,
             blocked_at: None,
             is_cloud: false,
+            is_continuous: false,
             workspace_id: ws_id.map(str::to_string),
             project: None,
             parent_task_id: None,
@@ -8752,6 +8772,27 @@ mod spent_workspace_tests {
         // Task gone from the retained set (reconcile drops terminal
         // tasks) → reads as terminal → spent.
         assert!(App::workspace_is_spent(&w, &[]));
+    }
+
+    /// Continuous-orchestrator regression (the momentum-detective pile-up):
+    /// a continuous task is perpetually `running` — the scheduler owns it
+    /// and it never flips Done — so it must NOT hold its per-run agent
+    /// markers open, via either liveness edge. The identical shape under a
+    /// oneshot running task keeps the pre-existing behavior (stays open).
+    #[test]
+    fn continuous_task_does_not_block_reap() {
+        let mut w = ws("agent: detective-e669112d");
+        w.tombstones.push(tomb(Some("t-cont")));
+        // Tombstone-referenced edge.
+        let mut cont = task("t-cont", None, TaskStatus::Running);
+        cont.is_continuous = true;
+        assert!(App::workspace_is_spent(&w, &[cont.clone()]));
+        // workspace_id-bound edge.
+        cont.workspace_id = Some(w.id.clone());
+        assert!(App::workspace_is_spent(&w, &[cont]));
+        // Oneshot control: same shape, non-continuous → kept open.
+        let oneshot = task("t-cont", None, TaskStatus::Running);
+        assert!(!App::workspace_is_spent(&w, &[oneshot]));
     }
 
     /// Cloud and already-closed workspaces are never the sweep's business.

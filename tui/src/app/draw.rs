@@ -2993,6 +2993,7 @@ mod dispatch_pending_filter_tests {
             session_id: None,
             blocked_at: None,
             is_cloud: false,
+            is_continuous: false,
             workspace_id: None,
             project: None,
             parent_task_id: None,
