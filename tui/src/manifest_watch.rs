@@ -35,7 +35,12 @@
 //!     a fresh snapshot — the TUI's in-memory state stays
 //!     authoritative; missed mutations during the disconnect
 //!     window flow through later diffs / the next save's
-//!     read-from-disk reconciliation.
+//!     read-from-disk reconciliation. Each successful
+//!     (re)subscription additionally emits
+//!     [`ManifestEvent::StreamEstablished`] (before any frame),
+//!     which the App uses to invalidate the push worker's
+//!     de-dupe cache for that host and re-prime a possibly
+//!     re-exec'd daemon (seamless-restart audit gap 3).
 //!   - Exits its outer loop (no reconnect) on `SendError`. That
 //!     means the main loop's `Receiver` was dropped — the App is
 //!     gone, no reason to keep dialing.
@@ -89,6 +94,24 @@ pub struct ManifestSnapshotPayload {
 /// reconnect (the F1 finding).
 #[derive(Debug, Clone)]
 pub enum ManifestEvent {
+    /// Seamless-restart audit gap 3: the consumer (re)established
+    /// its stream to `host` — sent exactly once per successful
+    /// `connect_and_subscribe`, before any Snapshot/Diff frame
+    /// from the new stream, and never on a failed dial/retry.
+    ///
+    /// The App's drain uses it to invalidate the push worker's
+    /// payload-hash cache for that host and re-fire a full state
+    /// push: a daemon re-exec kills every `manifest.watch` stream
+    /// at the exec, and the swapped daemon's TUI-pushed state
+    /// (`task_tree` / `tui_sessions` / `workflow_definitions`) is
+    /// born empty — without the invalidation, the de-dupe would
+    /// keep skipping the unchanged payloads and an idle TUI would
+    /// never re-prime the new daemon (scope-sensitive auth
+    /// answers stay degraded indefinitely). One event per
+    /// successful re-establishment bounds the cost under a
+    /// flapping stream to one full push per reconnect, never a
+    /// per-push-cycle re-send storm.
+    StreamEstablished { host: HostId },
     /// Initial snapshot frame from the daemon after a fresh
     /// subscribe. Sent once per (re)connect, before any diff
     /// frames.
@@ -297,6 +320,22 @@ pub(crate) fn run_consumer_with_provider(
                 // A flaky daemon that goes down/up shouldn't
                 // accumulate exponential delay across sessions.
                 backoff = RECONNECT_BACKOFF_BASE;
+                // Gap 3 (seamless-restart audit): the subscribe
+                // succeeded — this is the consumer's ground-truth
+                // "stream (re)established" moment (same point the
+                // backoff resets). Signal the App BEFORE reading
+                // any frame so the push-cache invalidation is
+                // ordered ahead of everything the new stream
+                // delivers. Sent once per successful subscription
+                // by construction (never per retry attempt).
+                if event_tx
+                    .send(ManifestEvent::StreamEstablished { host: host.clone() })
+                    .is_err()
+                {
+                    // App dropped its receiver. Done forever
+                    // (mirrors DriveOutcome::ChannelDisconnected).
+                    return;
+                }
                 match drive_stream(stream, &host, &event_tx) {
                     DriveOutcome::ChannelDisconnected => {
                         // App dropped its receiver. Done forever.
@@ -554,6 +593,25 @@ mod tests {
         (path, listener, dir)
     }
 
+    /// Gap 3: every successful subscription now emits
+    /// `StreamEstablished` before any frame. Tests that drive the
+    /// full consumer loop drain (and pin) it with this helper so
+    /// their frame-level assertions stay focused.
+    fn expect_established(
+        event_rx: &mpsc::Receiver<ManifestEvent>,
+    ) -> HostId {
+        match event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("StreamEstablished must be the first event after subscribe")
+        {
+            ManifestEvent::StreamEstablished { host } => host,
+            other => panic!(
+                "expected StreamEstablished before any frame, got {:?}",
+                other,
+            ),
+        }
+    }
+
     /// Accept one client; send the OK response then a sequence of
     /// stream frames; close. Returns the request the client sent.
     fn accept_and_send_frames(
@@ -659,8 +717,15 @@ mod tests {
         ];
         let _req = accept_and_send_frames(&listener, frames);
 
-        // Receiver gets snapshot (now forwarded post-r1) + 2
-        // diffs (heartbeat ignored).
+        // Receiver gets StreamEstablished (gap 3, once per
+        // subscribe) + snapshot (forwarded post-r1) + 2 diffs
+        // (heartbeat ignored).
+        let established_host = expect_established(&event_rx);
+        assert_eq!(
+            established_host,
+            HostId::local(),
+            "run_consumer attributes the established stream to local",
+        );
         let snap_event =
             event_rx.recv_timeout(Duration::from_secs(2)).expect("snapshot");
         match snap_event {
@@ -716,6 +781,11 @@ mod tests {
             .collect();
         let _req = accept_and_send_frames(&listener, frames);
 
+        // Gap 3: the subscribe itself emits StreamEstablished —
+        // drain it; the heartbeat frames must contribute nothing
+        // beyond that.
+        let _ = expect_established(&event_rx);
+
         // Receiver gets nothing within a bounded window.
         match event_rx.recv_timeout(Duration::from_millis(200)) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -746,21 +816,34 @@ mod tests {
             run_consumer(&sock_clone, event_tx);
         });
 
-        // Accept the connection, send OK + one diff. The
-        // consumer's first try_send on the closed channel
-        // returns Err → DriveOutcome::ChannelDisconnected →
-        // outer loop returns.
-        let frames = vec![
-            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+        // Accept the connection, send OK + (best-effort) one diff.
+        // Gap 3 moved the consumer's first channel send EARLIER:
+        // the post-subscribe `StreamEstablished` send hits the
+        // closed channel and returns the consumer before it reads
+        // a single frame — so the diff write below may race the
+        // consumer's socket close (EPIPE) and must be tolerated,
+        // not expected. (Pre-gap-3 the first send was the diff
+        // forward inside drive_stream.)
+        {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let req = wire::read_request(&mut stream)
+                .expect("read request")
+                .expect("request present");
+            let resp = cm_daemon::control::protocol::Response::ok(
+                req.id.clone(),
+                serde_json::json!({ "subscribed": true }),
+            );
+            wire::write_response(&mut stream, &resp).expect("write response");
+            let frame = cm_daemon::control::protocol::StreamFrame::manifest_diff(
                 "req-t19",
                 serde_json::to_value(ManifestDiff::Tombstoned {
                     uid: "ts-t19".into(),
                     exited_at: 0.0,
                 })
                 .unwrap(),
-            ),
-        ];
-        let _req = accept_and_send_frames(&listener, frames);
+            );
+            let _ = wire::write_stream_frame(&mut stream, &frame);
+        }
 
         // Consumer thread MUST exit within a bounded window.
         // Without the SendError early-return, it would keep
@@ -823,14 +906,24 @@ mod tests {
             // first so we can then assert the diff arrived
             // after the snapshot.
             // Phase 1 we didn't send a snapshot frame, so there
-            // isn't one to drain here. Just receive the diff.
-            // (We DID send an empty workspaces snapshot in
-            // accept_and_send_frames for other tests, but T18
-            // uses a custom phase loop and doesn't send the
-            // snapshot frame in phase 1.)
-            let _first_event = event_rx
+            // isn't one to drain here. Gap 3: the subscribe
+            // emits StreamEstablished before any frame — drain
+            // it, then receive the diff.
+            let _ = expect_established(&event_rx);
+            let first_event = event_rx
                 .recv_timeout(Duration::from_secs(2))
-                .expect("first event (diff)");
+                .expect("first frame event (diff)");
+            match first_event {
+                ManifestEvent::Diff {
+                    diff: ManifestDiff::Tombstoned { ref uid, .. },
+                    ..
+                } => assert_eq!(uid, "ts-pre-disconnect"),
+                other => panic!(
+                    "expected pre-disconnect diff after the \
+                     established event, got {:?}",
+                    other,
+                ),
+            }
             // Phase 1 cleanup: drop the listener AND the stream
             // (closing the stream's daemon end → consumer's
             // read_stream_frame returns Ok(None) → consumer
@@ -901,6 +994,12 @@ mod tests {
         );
         wire::write_stream_frame(&mut stream2, &frame2).expect("frame 2");
 
+        // Gap 3 pin: the RE-establishment fires a second
+        // StreamEstablished (exactly the signal the App keys the
+        // push-cache invalidation on — one per successful
+        // re-subscribe, none for the failed dials in between).
+        let _ = expect_established(&event_rx);
+
         // Receive the post-reconnect diff. Phase-2 didn't send
         // a snapshot frame either, so the next event IS the diff.
         let post = event_rx
@@ -950,8 +1049,10 @@ mod tests {
 
         // accept_and_send_frames sends an OK + frames. Our
         // helper here built only `manifest_diff` frames (no
-        // snapshot), so first event from the receiver IS the
-        // valid diff (malformed was logged + dropped).
+        // snapshot), so after the gap-3 established event the
+        // first frame event from the receiver IS the valid diff
+        // (malformed was logged + dropped).
+        let _ = expect_established(&event_rx);
         let event = event_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("valid diff after malformed");
@@ -1027,7 +1128,9 @@ mod tests {
         ];
         let _req = accept_and_send_frames(&listener, frames);
 
-        // Receive the snapshot event.
+        // Receive the snapshot event (preceded by the gap-3
+        // established event, which every subscribe emits).
+        let _ = expect_established(&event_rx);
         let event = event_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("snapshot MUST arrive (was silently dropped pre-r1)");
@@ -1051,6 +1154,82 @@ mod tests {
                 assert!(without_exit.1.is_none());
             }
             other => panic!("expected Snapshot event, got {:?}", other),
+        }
+    }
+
+    /// Gap 3 (seamless-restart audit) — `StreamEstablished` fires
+    /// exactly ONCE per successful subscription, carries the
+    /// consumer's real host id (the per-host consumers pass their
+    /// own host, so the App can invalidate the RIGHT host's push
+    /// cache), and is NOT re-emitted while the stream stays up
+    /// (frames don't re-trigger it — the churn guard the App's
+    /// invalidate-and-repush hook relies on).
+    #[test]
+    fn stream_established_fires_once_per_connect_with_host() {
+        let (sock, listener, _dir) = spawn_test_listener();
+        let (event_tx, event_rx) = mpsc::channel();
+        let host = HostId::new("remote-x");
+        let provider = fixed_path_provider(sock.clone());
+        let host_for_thread = host.clone();
+        let _consumer = std::thread::spawn(move || {
+            run_consumer_with_provider(&provider, host_for_thread, event_tx);
+        });
+
+        // One subscribe, then a diff and a heartbeat on the SAME
+        // stream — neither may produce another established event.
+        let frames = vec![
+            cm_daemon::control::protocol::StreamFrame::manifest_diff(
+                "req-est",
+                serde_json::to_value(ManifestDiff::Tombstoned {
+                    uid: "ts-est".into(),
+                    exited_at: 1.0,
+                })
+                .unwrap(),
+            ),
+            cm_daemon::control::protocol::StreamFrame::heartbeat("req-est"),
+        ];
+        let _req = accept_and_send_frames(&listener, frames);
+
+        let got_host = expect_established(&event_rx);
+        assert_eq!(
+            got_host, host,
+            "the established event must carry the consumer's own host \
+             so the App invalidates that host's push cache, not local's",
+        );
+        // Next event is the diff — NOT a second established.
+        match event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("diff after established")
+        {
+            ManifestEvent::Diff {
+                diff: ManifestDiff::Tombstoned { uid, .. },
+                host: diff_host,
+            } => {
+                assert_eq!(uid, "ts-est");
+                assert_eq!(diff_host, host);
+            }
+            other => panic!(
+                "expected the diff (one established per connect, no \
+                 re-emit), got {:?}",
+                other,
+            ),
+        }
+        // Bounded quiet window: the heartbeat must not manufacture
+        // another established event.
+        match event_rx.recv_timeout(Duration::from_millis(200)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Listener side dropped; fine as long as no extra
+                // established event arrived first.
+            }
+            Ok(ManifestEvent::StreamEstablished { .. }) => panic!(
+                "StreamEstablished re-emitted mid-stream — it must fire \
+                 only at (re)subscription",
+            ),
+            Ok(_) => {
+                // Some other stray frame event — irrelevant to this
+                // pin (no second established observed).
+            }
         }
     }
 

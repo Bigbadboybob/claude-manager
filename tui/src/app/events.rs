@@ -1647,8 +1647,46 @@ impl App {
                 crate::manifest_watch::ManifestEvent::Snapshot(payload) => {
                     self.apply_manifest_snapshot(payload);
                 }
+                crate::manifest_watch::ManifestEvent::StreamEstablished {
+                    host,
+                } => {
+                    self.on_manifest_stream_established(host);
+                }
             }
         }
+    }
+
+    /// Seamless-restart audit gap 3: a host's `manifest.watch`
+    /// stream was (re)established. A daemon re-exec (and any other
+    /// daemon swap) kills every stream at the exec while the TUI
+    /// keeps running and the socket path never unbinds — so a
+    /// reconnect is the TUI's ground-truth signal that the daemon
+    /// behind `host` may be a NEW process whose TUI-pushed state
+    /// (`task_tree`, `tui_sessions`, `workflow_definitions`) was
+    /// born empty. The push worker de-dupes by payload hash and its
+    /// cache lives for the TUI's whole run, so without this hook an
+    /// idle TUI would never re-prime the swapped daemon: unchanged
+    /// payloads hash identically, every push is skipped, and
+    /// scope-sensitive auth answers stay degraded indefinitely.
+    ///
+    /// Invalidate that ONE host's hash cache, then fire a full
+    /// state push. The push fans out to all hosts, but hosts whose
+    /// caches are intact de-dupe it away — only the reconnected
+    /// host actually receives RPCs. mpsc FIFO (plus the worker
+    /// applying invalidations before the pushes of the same
+    /// drained batch) guarantees the clear lands before the
+    /// re-push's hash check.
+    ///
+    /// Churn guard: the consumer emits `StreamEstablished` at most
+    /// once per SUCCESSFUL re-subscription (never per failed
+    /// retry), so a flapping stream costs one full push per
+    /// re-establishment — never a per-push-cycle re-send storm.
+    pub(crate) fn on_manifest_stream_established(
+        &self,
+        host: cm_daemon::host_id::HostId,
+    ) {
+        self.push_worker.invalidate_host(host);
+        self.push_state_to_daemon();
     }
 
     /// 11d: drain the events.subscribe consumer's channel.
@@ -6219,5 +6257,270 @@ mod activity_summary_tests {
         assert!(s.contains("task=1914682b"), "{s}");
         // Full UUID must not bleed through — the column would overflow.
         assert!(!s.contains("20ba036427bc"), "{s}");
+    }
+}
+
+/// Seamless-restart audit gap 3, end-to-end across TWO real daemon
+/// generations: a daemon swap (re-exec) leaves the new process's
+/// TUI-pushed state born empty while the TUI's push worker still
+/// holds the payload hashes it successfully pushed to generation 1 —
+/// so with an IDLE TUI (no task mutation, byte-identical payload)
+/// nothing would ever re-prime generation 2. The fix chain under
+/// test: the real `manifest.watch` consumer detects the stream
+/// restart → emits `StreamEstablished` → `drain_manifest_watch_events`
+/// invalidates that host's push cache and re-fires a full state push
+/// → the re-push lands in generation 2's `DaemonState.task_tree`.
+#[cfg(test)]
+mod manifest_stream_reprime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Like [`pending_workflow_events_tests::spawn_inproc_daemon`]
+    /// but stashes a `try_clone` of every accepted `manifest.watch`
+    /// stream so the test can sever them — the in-proc equivalent of
+    /// the re-exec moment, where the old daemon's exec closes every
+    /// streaming socket at once. (Without the sever, gen-1's stream
+    /// handler thread would keep the socket healthy and the consumer
+    /// would never reconnect.)
+    fn spawn_tapped_inproc_daemon(
+        sock: std::path::PathBuf,
+        state: Arc<Mutex<cm_daemon::state::DaemonState>>,
+    ) -> (
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    ) {
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let taps: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let dstop = stop.clone();
+        let dtaps = taps.clone();
+        let handle = std::thread::spawn(move || {
+            while !dstop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let st = state.clone();
+                        let taps = dtaps.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(
+                                std::time::Duration::from_secs(2),
+                            ));
+                            let _ = stream.set_write_timeout(Some(
+                                std::time::Duration::from_secs(2),
+                            ));
+                            let req = match cm_daemon::control::wire::read_request(
+                                &mut stream,
+                            ) {
+                                Ok(Some(r)) => r,
+                                _ => return,
+                            };
+                            use cm_daemon::control::dispatch::DispatchOutcome::*;
+                            match cm_daemon::control::dispatch::dispatch_request(
+                                &st, &req,
+                            ) {
+                                Done(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(
+                                        &mut stream,
+                                        &resp,
+                                    );
+                                }
+                                AttachStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(
+                                        &mut stream,
+                                        &response,
+                                    )
+                                    .is_ok()
+                                    {
+                                        cm_daemon::control::stream::handle_attach_stream(
+                                            &mut stream,
+                                            st,
+                                            handle,
+                                        );
+                                    }
+                                }
+                                ManifestWatchStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(
+                                        &mut stream,
+                                        &response,
+                                    )
+                                    .is_ok()
+                                    {
+                                        if let Ok(clone) = stream.try_clone() {
+                                            taps.lock().unwrap().push(clone);
+                                        }
+                                        cm_daemon::control::stream::handle_manifest_watch_stream(
+                                            &mut stream,
+                                            handle,
+                                        );
+                                    }
+                                }
+                                EventsSubscribeStream { response, handle } => {
+                                    if cm_daemon::control::wire::write_response(
+                                        &mut stream,
+                                        &response,
+                                    )
+                                    .is_ok()
+                                    {
+                                        cm_daemon::control::stream::handle_events_subscribe_stream(
+                                            &mut stream,
+                                            handle,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (stop, handle, taps)
+    }
+
+    #[test]
+    fn stream_reconnect_reprimes_swapped_daemon_across_two_generations() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        // The App's synthesized-local host resolves
+        // `default_socket_path()` = $HOME/.cm/daemon.sock at
+        // App::new time — bind generation 1 there FIRST so the
+        // consumer's initial dial succeeds.
+        let sock = cm_dir.join("daemon.sock");
+        let state1 = Arc::new(Mutex::new(cm_daemon::state::DaemonState::new()));
+        let (stop1, h1, taps) =
+            spawn_tapped_inproc_daemon(sock.clone(), state1.clone());
+
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        // One backlog task = the pushed payload. It NEVER changes
+        // for the rest of the test — the whole point is that the
+        // gen-2 re-push must fire on the reconnect signal alone,
+        // with a byte-identical payload the hash cache already holds.
+        app.tasks.push(TaskEntry {
+            task_id: Some("task-e2e-reprime".to_string()),
+            name: "reprime".to_string(),
+            api_status: TaskStatus::Backlog,
+            repo_url: None,
+            prompt: None,
+            wip_branch: None,
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            is_continuous: false,
+            workspace_id: None,
+            project: None,
+            parent_task_id: None,
+            worktree_mode: Default::default(),
+            metadata: None,
+        });
+
+        // Generation 1: the consumer's FIRST StreamEstablished
+        // triggers the (startup) push; the tree lands on gen-1 and
+        // the worker's hash cache now holds this exact payload.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.drain_manifest_watch_events();
+            if state1
+                .lock()
+                .unwrap()
+                .task_tree
+                .contains_key("task-e2e-reprime")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gen-1 never received the task tree (consumer or push \
+                 worker not wired against the in-proc daemon)",
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // --- the re-exec moment -----------------------------------
+        // Stop gen-1's accept loop, then sever its live
+        // manifest.watch stream(s): the old image's exec closes
+        // every streaming socket. The consumer sees a bare EOF and
+        // enters its reconnect loop.
+        stop1.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+        let _ = h1.join();
+        {
+            use std::os::fd::AsRawFd;
+            let taps = taps.lock().unwrap();
+            assert!(
+                !taps.is_empty(),
+                "precondition: the App's consumer must have an open \
+                 manifest.watch stream against gen-1",
+            );
+            for s in taps.iter() {
+                unsafe { libc::shutdown(s.as_raw_fd(), libc::SHUT_RDWR) };
+            }
+        }
+        std::fs::remove_file(&sock).expect("unlink gen-1 socket");
+
+        // Generation 2: same socket path, FRESH DaemonState — the
+        // swapped daemon whose task_tree was born empty.
+        let state2 = Arc::new(Mutex::new(cm_daemon::state::DaemonState::new()));
+        let (stop2, h2) = pending_workflow_events_tests::spawn_inproc_daemon(
+            sock.clone(),
+            state2.clone(),
+        );
+        assert!(
+            state2.lock().unwrap().task_tree.is_empty(),
+            "precondition: gen-2 is born with an empty task_tree",
+        );
+
+        // No task mutation happens. The ONLY trigger left is the
+        // consumer's reconnect → StreamEstablished → cache
+        // invalidation → unconditional re-push. Pre-fix this loop
+        // times out: the payload hash matches gen-1's push, so the
+        // worker skips every re-send forever.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.drain_manifest_watch_events();
+            if state2
+                .lock()
+                .unwrap()
+                .task_tree
+                .contains_key("task-e2e-reprime")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "GAP-3 PIN: the re-push never landed on generation 2 — \
+                 an idle TUI left the swapped daemon's task_tree empty \
+                 (reconnect signal or cache invalidation broken)",
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // --- cleanup ------------------------------------------------
+        stop2.store(true, Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+        let _ = h2.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }
