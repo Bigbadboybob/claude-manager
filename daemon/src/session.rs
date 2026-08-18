@@ -1362,7 +1362,9 @@ impl PendingSession {
     /// to reap the zombie.
     ///
     /// Errors propagate from `portable-pty`'s `openpty` /
-    /// `spawn_command` / `try_clone_reader` / `take_writer` and
+    /// `spawn_command` / `try_clone_reader` / `take_writer`, from
+    /// the master-fd dup the reader's poll loop needs (phase 2b,
+    /// R3 — see [`dup_master_fd_for_poll`]) and
     /// from the reader-thread spawn. Each failure path explicitly
     /// tears down the child via the still-owned Child handle
     /// (before pidfd exists) or the pidfd + manual waitpid (after).
@@ -1518,6 +1520,28 @@ impl PendingSession {
                 return Err(anyhow::anyhow!("try_clone_reader: {}", e));
             }
         };
+        // Restart hardening / DESIGN_SEAMLESS_RESTART phase 2b (R3):
+        // the reader thread's own dup of the master fd, used ONLY
+        // for readiness `poll(2)` in its detect-then-consume loop.
+        // Dup'd here because (a) the boxed reader from
+        // `try_clone_reader` hides its fd behind `dyn Read`, and
+        // (b) the master itself moves into the `DaemonSession` with
+        // an independent lifetime — an `OwnedFd` the thread owns can
+        // never be closed under its poll. A dup shares the master's
+        // open file description, so readability on this fd and
+        // readable bytes on the cloned reader are the same kernel
+        // state. Failing the spawn on dup failure is deliberate: a
+        // session whose reader can't reach the gated loop would
+        // silently violate the reader-gate freeze contract (see
+        // `crate::reader_gate`).
+        let poll_fd = match dup_master_fd_for_poll(pair.master.as_ref()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!("dup master fd for reader poll: {}", e));
+            }
+        };
         let writer: SessionWriter = match pair.master.take_writer() {
             Ok(w) => Arc::new(Mutex::new(w)),
             Err(e) => {
@@ -1558,14 +1582,48 @@ impl PendingSession {
             .name(format!("cm-session-{}-reader", params.uid))
             .spawn(move || {
                 let mut reader = reader;
+                let poll_fd = poll_fd;
                 let mut buf = [0u8; 8192];
+                // Restart hardening / DESIGN_SEAMLESS_RESTART phase
+                // 2b (R3): detect-then-consume, never blocking-
+                // consume. Pre-2b this loop parked in a blocking
+                // `read()` — at a future re-exec handoff, up to one
+                // read-buffer of bytes could sit on this stack
+                // between `read()` and `fanout.push()`, already
+                // removed from the kernel and about to vanish with
+                // the thread. Now:
+                //
+                //   1. Wait for readability via non-consuming
+                //      poll(2) on the master fd dup (finite timeout
+                //      per iteration keeps the loop responsive; no
+                //      permit is held while parked here).
+                //   2. Acquire the shared reader permit. The restart
+                //      coordinator's exclusive `freeze()` blocks
+                //      right here — the bytes wait in the kernel's
+                //      PTY buffer, which survives the exec.
+                //   3. read→push as one indivisible unit under that
+                //      permit, so a freeze can never observe bytes
+                //      consumed-but-not-yet-pushed.
+                //
+                // EOF/error semantics are unchanged from the
+                // blocking loop: EOF (the boxed PtyFd reader maps
+                // the master's EIO-on-slave-gone to `Ok(0)`) and
+                // unrecoverable errors close the fanout, so the
+                // memory-cap-kill EOF paths and idle detection see
+                // exactly what they saw before. Latency is also
+                // unchanged: data arrival and hangup WAKE the poll
+                // immediately — the interval only bounds the park.
                 loop {
+                    poll_master_until_read_ready(&poll_fd);
+                    let _permit = crate::reader_gate::read_permit();
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             // EOF on the PTY master. Signal
                             // subscribers via close() so their
                             // `recv_timeout` returns Disconnected
-                            // (slice-10c-c review fix).
+                            // (slice-10c-c review fix). Still under
+                            // the permit: a freeze observes the
+                            // close either fully done or not begun.
                             reader_fanout.close();
                             return;
                         }
@@ -1573,6 +1631,8 @@ impl PendingSession {
                         Err(e)
                             if e.kind() == std::io::ErrorKind::Interrupted =>
                         {
+                            // Re-poll; readability is level-
+                            // triggered, so nothing is lost.
                             continue;
                         }
                         Err(_) => {
@@ -1580,6 +1640,10 @@ impl PendingSession {
                             return;
                         }
                     }
+                    // `_permit` drops here — held only around the
+                    // bounded read+push unit, NEVER across the poll
+                    // wait (a permit held while parked would block
+                    // the coordinator's freeze indefinitely).
                 }
             }) {
             Ok(h) => h,
@@ -2270,6 +2334,104 @@ fn send_sigkill_via_pidfd(pidfd: &OwnedFd) -> std::io::Result<()> {
 /// in `daemon/tests/reap_gate_freeze.rs` sizes its "no delivery"
 /// window in multiples of this.
 pub const REAPER_POLL_INTERVAL_MS: libc::c_int = 500;
+
+/// How long each `poll(2)` iteration of the PTY reader loop waits
+/// before re-arming. As with [`REAPER_POLL_INTERVAL_MS`], byte
+/// delivery is NOT delayed by this — output arriving on the master
+/// (and hangup at EOF) makes the fd readable and wakes the poll
+/// immediately; the timeout only bounds how long the thread can sit
+/// parked in a single syscall (restart hardening /
+/// DESIGN_SEAMLESS_RESTART phase 2b, R3). Shorter than the reaper's
+/// interval: reader threads are the hot byte path, and the freeze
+/// test in `daemon/tests/reader_gate_freeze.rs` sizes its
+/// "fanout stopped growing" window in multiples of this — a small
+/// interval keeps that window (and any future coordinator
+/// diagnostics counted in poll periods) tight without measurable
+/// idle cost (ten 0-fd-event wakeups per second per session).
+pub const READER_POLL_INTERVAL_MS: libc::c_int = 100;
+
+/// Dup the PTY master's fd into an `OwnedFd` the reader thread can
+/// poll for readability independently of the master's lifetime
+/// (restart hardening / DESIGN_SEAMLESS_RESTART phase 2b, R3).
+///
+/// A dup shares the master's open file description: readability
+/// here and readable bytes on `try_clone_reader`'s dup are the same
+/// kernel state, so "poll this fd, then read through the boxed
+/// reader" has no lost-wakeup window. `F_DUPFD_CLOEXEC` keeps the
+/// extra fd out of spawned children (and out of a future re-exec'd
+/// image — the handoff manifest, not fd inheritance, is how state
+/// crosses the exec).
+///
+/// Errors when the platform master exposes no raw fd (never the
+/// case for the native unix PTY this crate requires) or when the
+/// dup itself fails (fd exhaustion).
+fn dup_master_fd_for_poll(
+    master: &dyn portable_pty::MasterPty,
+) -> std::io::Result<OwnedFd> {
+    let raw = master.as_raw_fd().ok_or_else(|| {
+        std::io::Error::other("PTY master exposes no raw fd on this platform")
+    })?;
+    let duped = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    if duped < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl(F_DUPFD_CLOEXEC) returned a fresh non-negative
+    // fd; we are its sole owner.
+    Ok(unsafe { OwnedFd::from_raw_fd(duped) })
+}
+
+/// Wait for the PTY master behind `fd` to have something for the
+/// reader — data (`POLLIN`) or hangup/error (`POLLHUP`/`POLLERR`,
+/// the slave-side-gone states that the subsequent `read` resolves
+/// into EOF). Restart hardening / DESIGN_SEAMLESS_RESTART phase 2b
+/// (R3): this is the non-consuming half of the reader's
+/// detect-then-consume split — the structural mirror of
+/// [`poll_pidfd_until_exit_ready`] for the byte path. Consumption
+/// (the `read`→`fanout.push` unit) happens separately, under
+/// `crate::reader_gate::read_permit()`, in the reader thread loop.
+///
+/// Loops on `poll(2)` with a finite per-iteration timeout
+/// ([`READER_POLL_INTERVAL_MS`]) so the thread is never parked in an
+/// unbounded syscall. Returns as soon as the fd reports any event:
+/// `POLLIN` means bytes are waiting; `POLLHUP`/`POLLERR` mean the
+/// slave side is gone (child exited and no slave fds remain), where
+/// the read path's EIO→EOF mapping produces the same `fanout.close`
+/// the blocking loop produced; `POLLNVAL` would mean the fd itself
+/// is broken (a program bug — the thread owns its dup and never
+/// closes it early), in which case waiting longer can't help and
+/// the read resolves the truth. Transient poll failures (`EINTR`,
+/// `ENOMEM`) retry after one interval.
+fn poll_master_until_read_ready(fd: &OwnedFd) {
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, READER_POLL_INTERVAL_MS) };
+        if ret > 0 {
+            // Some event is pending (see doc comment) — go read.
+            return;
+        }
+        if ret == 0 {
+            // Timeout — child alive and quiet; re-arm.
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        // ENOMEM or another transient failure: back off one
+        // interval and retry rather than falling through to a
+        // blocking read — the invariant "never hold the reader
+        // permit before readiness, never park in an unbounded
+        // syscall" outranks latency on a path that is unreachable
+        // in practice.
+        std::thread::sleep(std::time::Duration::from_millis(
+            READER_POLL_INTERVAL_MS as u64,
+        ));
+    }
+}
 
 /// Wait for the child behind `pidfd` to become exit-READY without
 /// consuming its wait status. Restart hardening /
