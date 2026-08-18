@@ -2154,9 +2154,11 @@ fn adopted_meta_from_record(
 ///   the checkpoint — watched cgroup path as discovered by the OLD
 ///   image, `last_high` watermark (a breach that landed mid-swap
 ///   fires on the first poll instead of being re-baselined away),
-///   and the finalized protected set (stabilize/followup SKIPPED —
-///   recomputing from the current cgroup would newly protect late
-///   workers the pre-swap policy left killable). A checkpoint taken
+///   and the finalized protected set — `(pid, starttime)` pairs
+///   since checkpoint v2 (S13), verified both-halves on use —
+///   (stabilize/followup SKIPPED — recomputing from the current
+///   cgroup would newly protect late workers the pre-swap policy
+///   left killable). A checkpoint taken
 ///   mid-stabilize carries `protected: None`, and the restored
 ///   watcher re-runs the phases — what the old one would have done.
 /// - **No checkpoint** (pre-4d manifest, parse failure — already
@@ -2203,9 +2205,12 @@ fn respawn_adopted_watcher(
         Some(cp) => (
             PathBuf::from(&cp.cgroup_path),
             cp.last_high,
+            // (pid, starttime) pairs since checkpoint v2 (S13) —
+            // carried through unchanged; the watcher's membership
+            // check verifies both halves on use.
             cp.protected
                 .as_ref()
-                .map(|v| v.iter().copied().collect::<HashSet<u32>>()),
+                .map(|v| v.iter().copied().collect::<HashSet<(u32, u64)>>()),
         ),
         None => {
             eprintln!(
@@ -2261,7 +2266,9 @@ fn respawn_adopted_watcher(
                 },
                 initial_high,
                 match &restored_protected {
-                    Some(set) => format!("{} pid(s) restored", set.len()),
+                    Some(set) => {
+                        format!("{} (pid, starttime) pair(s) restored", set.len())
+                    }
                     None => "to be computed".to_string(),
                 },
             );
@@ -3395,7 +3402,7 @@ mod tests {
         let cp = crate::session_watch::WatcherCheckpoint {
             version: crate::session_watch::WATCHER_CHECKPOINT_VERSION,
             cgroup_path: "/sys/fs/cgroup/x/cm-sess-1.scope".into(),
-            protected: Some(vec![1234]),
+            protected: Some(vec![(1234, 42)]),
             last_high: 3,
             kills_baseline: 777,
         };
@@ -4010,7 +4017,7 @@ mod tests {
         let cp = crate::session_watch::WatcherCheckpoint {
             version: crate::session_watch::WATCHER_CHECKPOINT_VERSION,
             cgroup_path: cgroup.to_string_lossy().into_owned(),
-            protected: Some(vec![41, 42]),
+            protected: Some(vec![(41, 410), (42, 420)]),
             last_high: 4,
             kills_baseline: 99,
         };
@@ -4041,12 +4048,13 @@ mod tests {
                 st.protected
                     .as_ref()
                     .map(|s| {
-                        let mut v: Vec<u32> = s.iter().copied().collect();
+                        let mut v: Vec<(u32, u64)> =
+                            s.iter().copied().collect();
                         v.sort_unstable();
                         v
                     }),
-                Some(vec![41, 42]),
-                "protected set restored, not recomputed"
+                Some(vec![(41, 410), (42, 420)]),
+                "protected pairs restored, not recomputed"
             );
             assert_eq!(st.last_high, 4, "breach watermark restored");
         }

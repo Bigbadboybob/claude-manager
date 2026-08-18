@@ -14,7 +14,9 @@
 //!   1. Waits for the cgroup at `cgroup_path` to materialize
 //!      (post-`systemd-run` lag).
 //!   2. Stabilization phase: snapshots the initial PID set as
-//!      the *protected* set (agent + its initial children).
+//!      the *protected* set (agent + its initial children) —
+//!      each entry a `(pid, starttime)` pair, the R6 pid-reuse
+//!      guard (see [`is_protected`]).
 //!   3. Follow-up phase: admits late-forking workers if their
 //!      ppid is already protected.
 //!   4. Main loop: polls `memory.events` for `high` counter
@@ -407,22 +409,39 @@ fn argv_sha256_prefix(argv: &[Vec<u8>]) -> String {
 /// manifest carries the checkpoint **opaquely**
 /// (`SessionRecord.watcher_checkpoint: Option<serde_json::Value>`), so
 /// this version is the checkpoint's OWN compatibility gate — bumping
-/// it never bumps the manifest schema. A checkpoint whose version
+/// it never bumps the manifest schema. The supported set is a
+/// SINGLETON — exactly this version; a checkpoint whose version
 /// isn't this one is treated exactly like an unparseable one: the
 /// re-adopted watcher degrades LOUDLY to fresh policy
 /// (see [`parse_watcher_checkpoint`]), never guesses.
-pub const WATCHER_CHECKPOINT_VERSION: u32 = 1;
+///
+/// History: v1 carried the protected set as bare pids; v2 upgrades
+/// the entries to `(pid, starttime)` pairs (the holder-split
+/// review's S13 finding — see the field doc on
+/// [`WatcherCheckpoint::protected`]). A v1 blob fails the gate
+/// either way: a bare-pid `protected` array doesn't deserialize as
+/// pairs (parse error), and a v1 blob with `protected: null` parses
+/// but trips the version check — both land in the same loud
+/// degrade-to-fresh path, never a crash.
+pub const WATCHER_CHECKPOINT_VERSION: u32 = 2;
 
 /// The watcher's policy state, checkpointed across a re-exec swap
 /// (R12). Everything a freshly-recomputed watcher would get WRONG:
 ///
-/// - `protected`: the stabilize+followup-finalized PID set. A fresh
-///   watcher re-snapshots the CURRENT cgroup, newly protecting late
-///   workers the pre-swap policy deliberately left killable. `None`
-///   means the pre-swap watcher had not finished stabilize/followup
-///   when the checkpoint was taken (a capped session spawned seconds
-///   before the restart) — the re-adopted watcher re-runs those
-///   phases, which is exactly what the old watcher would have done.
+/// - `protected`: the stabilize+followup-finalized protected set,
+///   as `(pid, starttime)` pairs. A fresh watcher re-snapshots the
+///   CURRENT cgroup, newly protecting late workers the pre-swap
+///   policy deliberately left killable. `None` means the pre-swap
+///   watcher had not finished stabilize/followup when the checkpoint
+///   was taken (a capped session spawned seconds before the restart)
+///   — the re-adopted watcher re-runs those phases, which is exactly
+///   what the old watcher would have done. The pairing is the R6
+///   idiom (S13): a bare pid is recycling-unsafe across a
+///   checkpoint's lifetime — by the time a restored (or long-outage-
+///   recovering) watcher consults it, the kernel may have handed the
+///   number to an unrelated process, wrongly PROTECTING a new hog
+///   from the cap kill — so every consult verifies both halves
+///   ([`is_protected`]).
 /// - `last_high`: the `memory.events` `high` watermark already
 ///   accounted for. A fresh watcher re-seeds from the current
 ///   counter, silently baselining away a breach that landed
@@ -446,9 +465,10 @@ pub struct WatcherCheckpoint {
     pub version: u32,
     /// The watched cgroup scope directory.
     pub cgroup_path: String,
-    /// Finalized protected PID set (sorted for determinism); `None`
-    /// when stabilize/followup had not completed at checkpoint time.
-    pub protected: Option<Vec<u32>>,
+    /// Finalized protected set as `(pid, starttime)` pairs (sorted
+    /// by pid for determinism); `None` when stabilize/followup had
+    /// not completed at checkpoint time.
+    pub protected: Option<Vec<(u32, u64)>>,
     /// `memory.events high` watermark already accounted for.
     pub last_high: u64,
     /// Spawn-time kill-log baseline byte offset.
@@ -471,8 +491,9 @@ pub struct WatcherLiveState {
     pub cgroup_path: PathBuf,
     /// `None` until stabilize+followup finalize the set; `Some`
     /// thereafter. A RESTORED watcher is born `Some` (the set was
-    /// finalized pre-swap).
-    pub protected: Option<HashSet<u32>>,
+    /// finalized pre-swap). Entries are `(pid, starttime)` pairs —
+    /// see [`is_protected`] for the verify-both-halves rule.
+    pub protected: Option<HashSet<(u32, u64)>>,
     /// The breach watermark; updated by the watcher before each
     /// `handle_breach`.
     pub last_high: u64,
@@ -484,7 +505,7 @@ impl WatcherLiveState {
     /// watcher never holds — the caller joins the two).
     pub fn checkpoint(&self, kills_baseline: u64) -> WatcherCheckpoint {
         let protected = self.protected.as_ref().map(|set| {
-            let mut v: Vec<u32> = set.iter().copied().collect();
+            let mut v: Vec<(u32, u64)> = set.iter().copied().collect();
             v.sort_unstable();
             v
         });
@@ -619,10 +640,11 @@ pub fn default_watcher_spawn_fn() -> WatcherSpawnFn {
 ///   exec. `Weak` — the watcher must never keep daemon state alive;
 ///   `None` for tests that don't exercise the barrier.
 /// - `restored_protected`: `Some(set)` re-adopts a checkpointed
-///   protected set — stabilize/followup are SKIPPED (recomputing
-///   would newly protect late workers the pre-swap policy left
-///   killable). `None` is the fresh-spawn path (and the honest
-///   restore path for a checkpoint taken mid-stabilize).
+///   protected set (`(pid, starttime)` pairs) — stabilize/followup
+///   are SKIPPED (recomputing would newly protect late workers the
+///   pre-swap policy left killable). `None` is the fresh-spawn path
+///   (and the honest restore path for a checkpoint taken
+///   mid-stabilize).
 ///
 /// The returned [`SpawnedWatcher`] carries the shared
 /// [`WatcherLiveState`] cell the watcher publishes its policy state
@@ -638,7 +660,7 @@ pub fn spawn_watcher(
     initial_high: u64,
     spawn_fn: WatcherSpawnFn,
     coordinator: Option<Weak<RestartCoordinator>>,
-    restored_protected: Option<HashSet<u32>>,
+    restored_protected: Option<HashSet<(u32, u64)>>,
 ) -> std::io::Result<SpawnedWatcher> {
     // The cell is created HERE (not in the thread body) so the caller
     // holds a valid handle from the moment the spawn returns — a
@@ -679,7 +701,7 @@ fn run_watcher(
     initial_high: u64,
     state: SharedWatcherState,
     coordinator: Option<Weak<RestartCoordinator>>,
-    restored_protected: Option<HashSet<u32>>,
+    restored_protected: Option<HashSet<(u32, u64)>>,
 ) {
     // Phase 4d (R12): register with the quiescence barrier FIRST,
     // before any waiting, so a restart that begins during our
@@ -760,7 +782,7 @@ fn run_watcher(
     // checkpoint taken mid-stabilize carries `protected: None` and
     // lands in the fresh arm below — honest: the pre-swap watcher
     // hadn't finalized a set either.
-    let protected: HashSet<u32> = match restored_protected {
+    let protected: HashSet<(u32, u64)> = match restored_protected {
         Some(set) => set,
         None => {
             let started = Instant::now();
@@ -774,8 +796,22 @@ fn run_watcher(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let mut protected: HashSet<u32> =
-                read_cgroup_procs(&cgroup_path).into_iter().collect();
+            // Collection point (S13): every admitted pid is recorded
+            // WITH its /proc starttime — the pair [`is_protected`]
+            // later verifies. A pid whose starttime can't be read
+            // exited between the procs read and here, which is
+            // exactly what membership would have concluded about it,
+            // so it is skipped (a later same-numbered pid is a
+            // recycle and must not inherit protection).
+            let mut protected: HashSet<(u32, u64)> =
+                read_cgroup_procs(&cgroup_path)
+                    .into_iter()
+                    .filter_map(|pid| {
+                        crate::adopt::proc_starttime(pid as libc::pid_t)
+                            .ok()
+                            .map(|st| (pid, st))
+                    })
+                    .collect();
 
             while Instant::now() < followup_until {
                 park();
@@ -785,12 +821,24 @@ fn run_watcher(
                 }
                 let current = read_cgroup_procs(&cgroup_path);
                 for pid in current {
-                    if protected.contains(&pid) {
+                    // pid-only dedupe: a stale entry whose pid was
+                    // recycled inside the followup window fails the
+                    // starttime half at kill time — erring toward
+                    // killable, never toward wrongly protected.
+                    if protected.iter().any(|(p, _)| *p == pid) {
                         continue;
                     }
                     if let Some(ppid) = read_ppid(pid) {
-                        if protected.contains(&ppid) {
-                            protected.insert(pid);
+                        // Protection inheritance is a protection
+                        // decision — verify BOTH halves of the
+                        // parent's entry, then record the child
+                        // with its own starttime.
+                        if is_protected(&protected, ppid) {
+                            if let Ok(st) = crate::adopt::proc_starttime(
+                                pid as libc::pid_t,
+                            ) {
+                                protected.insert((pid, st));
+                            }
                         }
                     }
                 }
@@ -843,6 +891,31 @@ fn run_watcher(
     }
 }
 
+/// R6-guarded protected-set membership (the holder-split review's
+/// S13 finding): an entry protects `pid` only when the pid matches
+/// AND the pid's LIVE `/proc` starttime equals the one recorded at
+/// collection time. A mismatch means the kernel recycled the pid to
+/// an unrelated process after the set was built — a checkpoint
+/// restore stretches that window across a whole swap (or, in a
+/// future holder/brain split, a long outage) — and a recycled pid
+/// is an ordinary victim candidate, never the agent's own tree.
+/// Cheap by construction: the starttime read (one
+/// `/proc/<pid>/stat` read via the shared `adopt::proc_starttime`
+/// parser, the same one the manifest's R6 `child_start_time`
+/// cross-check uses) happens only for pids that match on pid; a
+/// pid whose stat line is gone just exited, which is equally "not
+/// the recorded process any more".
+fn is_protected(protected: &HashSet<(u32, u64)>, pid: u32) -> bool {
+    let Some(&(_, recorded)) = protected.iter().find(|(p, _)| *p == pid)
+    else {
+        return false;
+    };
+    matches!(
+        crate::adopt::proc_starttime(pid as libc::pid_t),
+        Ok(live) if live == recorded
+    )
+}
+
 /// Watcher's per-breach handler: identify the highest-RSS
 /// unprotected PID in the cgroup, snapshot its identity for
 /// forensics, write a `killed_by_us` record to the kill log
@@ -858,7 +931,7 @@ fn run_watcher(
 pub(crate) fn handle_breach(
     session_uid: &str,
     cgroup_path: &Path,
-    protected: &HashSet<u32>,
+    protected: &HashSet<(u32, u64)>,
     soft_cap_bytes: u64,
     hard_cap_bytes: u64,
     kills_dir: &Path,
@@ -902,7 +975,9 @@ pub(crate) fn handle_breach(
     let mut any_unprotected = false;
     for pid in &pids {
         let rss = read_rss_kb(*pid).unwrap_or(0);
-        if protected.contains(pid) {
+        // S13: membership verifies pid AND live starttime — a
+        // recycled pid falls through to the victim-candidate arm.
+        if is_protected(protected, *pid) {
             match best_protected {
                 Some((_, br)) if br >= rss => {}
                 _ => best_protected = Some((*pid, rss)),
@@ -1437,9 +1512,14 @@ mod tests {
         )
         .unwrap();
         // Mark test_pid as protected (the agent's own process
-        // tree).
+        // tree) — recorded with its REAL starttime so the S13
+        // verify passes.
         let mut protected = HashSet::new();
-        protected.insert(test_pid);
+        protected.insert((
+            test_pid,
+            crate::adopt::proc_starttime(test_pid as libc::pid_t)
+                .expect("own starttime reads"),
+        ));
 
         handle_breach(
             "ts-protected-test",
@@ -2208,7 +2288,11 @@ mod tests {
     fn watcher_checkpoint_serde_round_trip() {
         let live = WatcherLiveState {
             cgroup_path: PathBuf::from("/sys/fs/cgroup/u/cm-sess-x.scope"),
-            protected: Some([31337u32, 42, 7].into_iter().collect()),
+            protected: Some(
+                [(31337u32, 900u64), (42, 800), (7, 700)]
+                    .into_iter()
+                    .collect(),
+            ),
             last_high: 9,
         };
         let cp = live.checkpoint(12_345);
@@ -2216,8 +2300,9 @@ mod tests {
         assert_eq!(cp.cgroup_path, "/sys/fs/cgroup/u/cm-sess-x.scope");
         assert_eq!(
             cp.protected.as_deref(),
-            Some(&[7u32, 42, 31337][..]),
-            "protected set serializes sorted (deterministic manifests)"
+            Some(&[(7u32, 700u64), (42, 800), (31337, 900)][..]),
+            "protected pairs serialize sorted by pid (deterministic \
+             manifests)"
         );
         assert_eq!(cp.last_high, 9);
         assert_eq!(cp.kills_baseline, 12_345);
@@ -2247,6 +2332,30 @@ mod tests {
         wrong["version"] = serde_json::json!(WATCHER_CHECKPOINT_VERSION + 1);
         assert!(parse_watcher_checkpoint("ts-cp", &wrong).is_none());
 
+        // A v1 blob (bare protected pids): the pid array doesn't
+        // even deserialize as pairs, so it lands in the Err arm of
+        // the gate — the same loud degrade-to-fresh path, never a
+        // crash and never a half-parsed set.
+        let v1 = serde_json::json!({
+            "version": 1,
+            "cgroup_path": "/sys/fs/cgroup/u/cm-sess-x.scope",
+            "protected": [7, 42, 31337],
+            "last_high": 9,
+            "kills_baseline": 12_345,
+        });
+        assert!(parse_watcher_checkpoint("ts-cp", &v1).is_none());
+        // A v1 blob whose set was unfinalized (`protected: null`)
+        // deserializes fine but trips the version singleton — same
+        // reset.
+        let v1_null = serde_json::json!({
+            "version": 1,
+            "cgroup_path": "/x",
+            "protected": null,
+            "last_high": 0,
+            "kills_baseline": 0,
+        });
+        assert!(parse_watcher_checkpoint("ts-cp", &v1_null).is_none());
+
         // Garbage: same.
         assert!(parse_watcher_checkpoint(
             "ts-cp",
@@ -2268,7 +2377,8 @@ mod tests {
         let inert: WatcherSpawnFn = Box::new(|name, _body| {
             std::thread::Builder::new().name(name).spawn(|| {})
         });
-        let restored: HashSet<u32> = [11u32, 22].into_iter().collect();
+        let restored: HashSet<(u32, u64)> =
+            [(11u32, 110u64), (22, 220)].into_iter().collect();
         let spawned = spawn_watcher(
             "ts-cell-birth".into(),
             PathBuf::from("/tmp/ts-cell-birth-cgroup"),
@@ -2426,8 +2536,17 @@ mod tests {
     ///   away and never fire; the restored one fires on its FIRST
     ///   poll with no post-restore bump at all.
     ///
-    /// Runtime ~2s (1s poll + 500ms SIGTERM grace + margins) — kept
-    /// in the normal suite because it pins the slice's core behavior.
+    /// Plus the S13 half (checkpoint shape v2): a second `sleep`
+    /// child IS in the checkpointed set, but recorded with a WRONG
+    /// starttime — simulating a pid the kernel recycled to an
+    /// unrelated process during the checkpoint's lifetime. On the
+    /// second breach the restored watcher must treat that
+    /// pid-matching entry as UNPROTECTED (recycled = ordinary victim
+    /// candidate) and kill it.
+    ///
+    /// Runtime ~3.5s (two 1s polls + two 500ms SIGTERM graces +
+    /// margins) — kept in the normal suite because it pins the
+    /// slice's core behavior.
     #[test]
     fn restored_watcher_preserves_protected_set_and_last_high() {
         let cgroup_dir = TempDir::new().unwrap();
@@ -2441,8 +2560,23 @@ mod tests {
             .expect("spawn sleep child");
         let child_pid = child.id();
         let own_pid = std::process::id();
+        let own_start = crate::adopt::proc_starttime(own_pid as libc::pid_t)
+            .expect("own starttime reads");
 
-        // Current cgroup state at adoption: BOTH pids present, and
+        // The S13 child: spawned NOW so its (deliberately wrong)
+        // starttime pair can ride the restored set from birth; it
+        // enters the cgroup only in phase 2.
+        let mut recycled = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn recycled-sim child");
+        let recycled_pid = recycled.id();
+        let recycled_wrong_start =
+            crate::adopt::proc_starttime(recycled_pid as libc::pid_t)
+                .expect("child starttime reads")
+                + 1;
+
+        // Current cgroup state at adoption: own pid + child, and
         // the high counter one past the checkpointed watermark (the
         // mid-swap breach).
         std::fs::write(
@@ -2453,7 +2587,12 @@ mod tests {
         std::fs::write(cgroup_path.join("memory.events"), b"high 5\nmax 0\n")
             .unwrap();
 
-        let restored: HashSet<u32> = [own_pid].into_iter().collect();
+        let restored: HashSet<(u32, u64)> = [
+            (own_pid, own_start),
+            (recycled_pid, recycled_wrong_start),
+        ]
+        .into_iter()
+        .collect();
         let spawned = spawn_watcher(
             "ts-restored-policy".into(),
             cgroup_path.clone(),
@@ -2463,7 +2602,7 @@ mod tests {
             4, // checkpoint.last_high — one BELOW the file's 5
             default_watcher_spawn_fn(),
             None,
-            Some(restored),
+            Some(restored.clone()),
         )
         .expect("spawn watcher");
 
@@ -2486,6 +2625,10 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if !child_dead {
+            let _ = recycled.kill();
+            let _ = recycled.wait();
+        }
         assert!(
             child_dead,
             "restored watcher must kill the divergent pid {} — it is in \
@@ -2506,17 +2649,62 @@ mod tests {
         assert_eq!(v["pid"], child_pid as u64);
         assert_eq!(v["session_uid"], "ts-restored-policy");
 
+        // Phase 2 — the S13 assertion: put the wrong-starttime
+        // entry's pid into the cgroup (procs FIRST, then the counter
+        // bump, so a poll between the writes sees no breach) and
+        // fire a second breach. The entry matches on pid but its
+        // live starttime differs from the checkpointed one, so the
+        // restored watcher must treat it as unprotected and kill it.
+        std::fs::write(
+            cgroup_path.join("cgroup.procs"),
+            format!("{}\n{}\n", own_pid, recycled_pid).as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(cgroup_path.join("memory.events"), b"high 6\nmax 0\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut recycled_dead = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            match recycled.try_wait() {
+                Ok(Some(_)) => {
+                    recycled_dead = true;
+                    break;
+                }
+                Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+        if !recycled_dead {
+            let _ = recycled.kill();
+            let _ = recycled.wait();
+        }
+        assert!(
+            recycled_dead,
+            "restored watcher must kill pid {} — it matches a \
+             checkpointed protected entry on pid, but its live \
+             starttime differs from the recorded one (a recycled pid \
+             is an ordinary victim, never protected)",
+            recycled_pid,
+        );
+        let content =
+            std::fs::read_to_string(&log_path).expect("kill log written");
+        let v2: serde_json::Value = serde_json::from_str(
+            content.lines().nth(1).expect("second kill record"),
+        )
+        .unwrap();
+        assert_eq!(v2["kill_status"], "killed_by_us");
+        assert_eq!(v2["pid"], recycled_pid as u64);
+
         // The cell published the consumed watermark — the NEXT
-        // checkpoint would carry 5, not re-report this breach.
-        assert_eq!(spawned.state.lock().unwrap().last_high, 5);
-        // And the restored protected set was published as finalized.
+        // checkpoint would carry 6, not re-report these breaches.
+        assert_eq!(spawned.state.lock().unwrap().last_high, 6);
+        // And the restored protected set was published as finalized,
+        // pairs intact (kills never mutate the set — the stale entry
+        // stays and keeps failing its starttime verify).
         assert_eq!(
-            spawned.state.lock().unwrap().protected.as_ref().map(|s| {
-                let mut v: Vec<u32> = s.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }),
-            Some(vec![own_pid]),
+            spawned.state.lock().unwrap().protected.as_ref(),
+            Some(&restored),
         );
 
         drop(cgroup_dir);
