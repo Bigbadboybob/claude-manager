@@ -11827,7 +11827,9 @@ struct ContinuousCreateParams {
     #[serde(default)]
     max_runtime_secs: Option<u32>,
     /// Phase 3 memory-cap per-task override (bytes). `None` → the daemon's
-    /// `[scheduler] default_cap`; `Some(0)` → uncapped.
+    /// `[scheduler] default_cap`; `Some(0)` → uncapped. A non-zero value is
+    /// bounds-checked via `config::validate_mem_cap_bytes` (the 3-byte-cap
+    /// config trap).
     #[serde(default)]
     mem_cap_bytes: Option<u64>,
 }
@@ -11868,6 +11870,10 @@ pub fn continuous_create(
             ErrorCode::InvalidParams,
             "compact_every must be 0 (disabled) or >= 2 — a compact-only fire consumes the whole cycle, so the prompt would never run on schedule".into(),
         ));
+    }
+    if let Some(v) = p.mem_cap_bytes {
+        crate::config::validate_mem_cap_bytes(v)
+            .map_err(|e| (ErrorCode::InvalidParams, format!("mem_cap_bytes: {}", e)))?;
     }
 
     // Worktree slug defaults to the (already allowlist-validated) task_id. A
@@ -12118,6 +12124,10 @@ pub fn continuous_update(
             ErrorCode::InvalidParams,
             "compact_every must be 0 (disabled) or >= 2 — a compact-only fire consumes the whole cycle, so the prompt would never run on schedule".into(),
         ));
+    }
+    if let Some(v) = p.mem_cap_bytes {
+        crate::config::validate_mem_cap_bytes(v)
+            .map_err(|e| (ErrorCode::InvalidParams, format!("mem_cap_bytes: {}", e)))?;
     }
 
     let mut updated: Vec<&'static str> = Vec::new();

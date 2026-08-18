@@ -422,6 +422,12 @@ pub fn run() -> anyhow::Result<()> {
         }
     };
 
+    // Arm the worktree disk guard (`[scheduler] max_worktrees`). Enforcement
+    // lives at worktree creation (worktree.rs); this is the only wiring point,
+    // so the guard is exactly as configured — pre-fix the field was parsed and
+    // enforced nowhere (the 2026-08-17 148-worktree disk-full incident).
+    worktree::set_max_worktrees(daemon_config.scheduler.max_worktrees);
+
     let path = default_socket_path();
     let listener = match &reexec_handoff {
         // Handoff (phase 3b, R13): adopt the inherited listener

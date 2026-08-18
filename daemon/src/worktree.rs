@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// Base directory for all worktrees.
@@ -7,6 +8,62 @@ fn worktree_base() -> PathBuf {
     dirs::home_dir()
         .expect("HOME unset; cannot locate worktree base")
         .join(".cm/worktrees")
+}
+
+/// `[scheduler] max_worktrees` disk guard, wired in at daemon startup via
+/// [`set_max_worktrees`]. `0` = unguarded (the config-family "0 disables"
+/// convention; also the default so library users — the TUI, tests — are
+/// unaffected unless they opt in).
+///
+/// Enforced at worktree CREATION, inside [`create_worktree`] and
+/// [`create_subtask_worktree`] after their reuse fast-paths — so every daemon
+/// mint route (`continuous.create`, `create_subtask` branch mode,
+/// `mint_task_worktree` for `mcp_start_session`) hits the guard, and reusing
+/// an existing checkout never does. Before this existed the field was parsed
+/// but enforced nowhere; 148 worktrees filled cm-manager's disk to 99% on
+/// 2026-08-17 while the operator believed a guard was in place.
+static MAX_WORKTREES: AtomicU32 = AtomicU32::new(0);
+
+/// Install the worktree-count ceiling (from `[scheduler] max_worktrees`).
+/// `None` or `Some(0)` = unguarded.
+pub fn set_max_worktrees(limit: Option<u32>) {
+    MAX_WORKTREES.store(limit.unwrap_or(0), Ordering::SeqCst);
+}
+
+/// Number of live worktree directories under `~/.cm/worktrees`.
+pub fn count_worktrees() -> usize {
+    std::fs::read_dir(worktree_base())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Refuse a NEW worktree when the guard is armed and the base dir is at
+/// capacity. The message is the operator's remediation, since this surfaces
+/// mid-`create_subtask` / `continuous.create` where the caller is often an
+/// agent relaying it.
+fn enforce_worktree_capacity() -> anyhow::Result<()> {
+    let max = MAX_WORKTREES.load(Ordering::SeqCst);
+    if max == 0 {
+        return Ok(());
+    }
+    let count = count_worktrees();
+    if count >= max as usize {
+        anyhow::bail!(
+            "worktree limit reached: {} live worktrees under {} >= \
+             [scheduler] max_worktrees = {} — remove stale worktrees \
+             (`git worktree remove <path>` from the main repo; dirty trees \
+             refuse, protecting uncommitted work) or raise max_worktrees in \
+             daemon.toml",
+            count,
+            worktree_base().display(),
+            max,
+        );
+    }
+    Ok(())
 }
 
 /// Convert a task name into a branch-safe slug.
@@ -139,6 +196,10 @@ pub fn create_worktree(
             ),
         };
     }
+
+    // Disk guard — only a NEW worktree counts against the ceiling (the
+    // reuse fast-path above already returned).
+    enforce_worktree_capacity()?;
 
     let add_result = if let Some(start) = start_branch {
         // Fetch the branch first; OK if it fails (offline / no remote).
@@ -461,6 +522,10 @@ pub fn create_subtask_worktree(
     if worktree_path.exists() {
         return Ok(worktree_path);
     }
+
+    // Disk guard — only a NEW worktree counts against the ceiling (the
+    // reuse fast-path above already returned).
+    enforce_worktree_capacity()?;
 
     // Explicit base: resolve to a sha up front so an unresolvable ref
     // fails with the precise "base '<x>' does not resolve to a commit"
@@ -1624,5 +1689,77 @@ mod tests {
         // A path that doesn't exist is treated as clean (nothing to lose),
         // so the teardown guard never blocks an already-gone worktree.
         assert_eq!(worktree_is_dirty(&repo.join("nope")), Ok(false));
+    }
+
+    /// RAII reset for the process-global worktree ceiling so a failing
+    /// assertion can't leak an armed guard into other tests. Constructed
+    /// under `with_home`'s env_lock, which also serializes the global.
+    struct GuardReset;
+    impl Drop for GuardReset {
+        fn drop(&mut self) {
+            set_max_worktrees(None);
+        }
+    }
+
+    /// Wedge campaign F1: `[scheduler] max_worktrees` is enforced at worktree
+    /// creation — at capacity a NEW mint refuses with an actionable message
+    /// naming the knob, while REUSING an existing checkout still succeeds.
+    #[test]
+    fn max_worktrees_guard_blocks_new_mints_but_not_reuse() {
+        with_home(|home| {
+            let _reset = GuardReset;
+            let base = home.join(".cm/worktrees");
+            std::fs::create_dir_all(base.join("existing-one")).unwrap();
+
+            set_max_worktrees(Some(1));
+            assert_eq!(count_worktrees(), 1);
+
+            // NEW subtask mint at capacity: refused BEFORE any git state is
+            // touched (the repo path here doesn't even exist).
+            let err = create_subtask_worktree(
+                Path::new("/nonexistent-repo"),
+                "cm-sub/blocked-abc1234",
+                SubtaskStart::Base("main"),
+            )
+            .expect_err("guard must refuse at capacity");
+            let msg = err.to_string();
+            assert!(msg.contains("max_worktrees"), "names the knob: {}", msg);
+            assert!(msg.contains("git worktree remove"), "remediation: {}", msg);
+            assert!(
+                !base.join("cm-sub-blocked-abc1234").exists(),
+                "nothing half-made",
+            );
+
+            // Same refusal on the create_worktree route.
+            let err = create_worktree(Path::new("/nonexistent-repo"), "blocked", None)
+                .expect_err("guard must refuse at capacity");
+            assert!(err.to_string().contains("max_worktrees"));
+
+            // REUSE of an existing subtask worktree is always allowed.
+            std::fs::create_dir_all(base.join("cm-sub-reused-abc1234")).unwrap();
+            let reused = create_subtask_worktree(
+                Path::new("/nonexistent-repo"),
+                "cm-sub/reused-abc1234",
+                SubtaskStart::Base("main"),
+            )
+            .expect("reuse path bypasses the guard");
+            assert_eq!(reused, base.join("cm-sub-reused-abc1234"));
+
+            // Raising the ceiling (or disabling) unblocks; the git failure
+            // that follows is the ordinary unresolvable-repo error, proving
+            // the guard itself stood down.
+            set_max_worktrees(None);
+            let err = create_subtask_worktree(
+                Path::new("/nonexistent-repo"),
+                "cm-sub/unblocked-abc1234",
+                SubtaskStart::Base("main"),
+            )
+            .expect_err("repo still doesn't exist");
+            assert!(
+                !err.to_string().contains("max_worktrees"),
+                "guard disarmed: {}",
+                err,
+            );
+        });
     }
 }

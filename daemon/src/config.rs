@@ -133,19 +133,37 @@ pub struct SchedulerConfig {
     /// (250 ms).
     #[serde(default = "default_scheduler_tick_micros")]
     pub tick_interval: u64,
-    /// Optional disk guard: the maximum number of live continuous worktrees the
-    /// scheduler permits. `None` (default) = unguarded. Enforcement lives in the
-    /// scheduler's due-check (Phase 3), NOT in this config struct.
+    /// Disk guard: the maximum number of live worktrees under `~/.cm/worktrees`
+    /// the daemon will mint. `None` (default) = unguarded. Enforced at worktree
+    /// CREATION (`worktree::create_worktree` / `create_subtask_worktree`, i.e.
+    /// every daemon mint path: `continuous.create`, `create_subtask` branch
+    /// mode, `mcp_start_session`'s task-worktree mint) — reusing an existing
+    /// worktree is always allowed. Wired into the guard at daemon startup via
+    /// `worktree::set_max_worktrees`. (Pre-2026-08 this field was parsed but
+    /// enforced NOWHERE — the operator believed a disk guard existed while 148
+    /// worktrees filled the disk to 99% on 2026-08-17.)
     #[serde(default)]
     pub max_worktrees: Option<u32>,
-    /// Default per-fire memory cap in BYTES, applied to continuous spawns as the
+    /// Default per-fire memory cap, applied to continuous spawns as the
     /// memory-cap triple (`memory_cap_bytes` / `memory_cap_hard_bytes` /
     /// `cgroup_prefix`) unless a task overrides it via
-    /// `ContinuousTask::mem_cap_bytes`. `0` opts out (uncapped). Default `0`
-    /// (uncapped) — a non-zero cap needs a usable `systemd-run --user --scope`
-    /// (a reachable user manager bus); opt in per-task or set this on a host
-    /// where the capped path works.
-    #[serde(default = "default_scheduler_default_cap")]
+    /// `ContinuousTask::mem_cap_bytes`. `0` opts out (uncapped, the default).
+    ///
+    /// Accepts either an integer (BYTES) or a unit string: `"6G"`, `"512M"`,
+    /// `"4GiB"` (1024-based; suffixes K/M/G/T with optional `iB`/`B`). A
+    /// non-zero value below 64 MiB is REJECTED at config load — this field
+    /// used to silently accept `default_cap = 3` as a **3-byte** MemoryMax
+    /// (set on cm-manager 2026-08-14 in the belief it was a concurrency cap),
+    /// so absurd values now fail loudly instead of arming a boot trap.
+    ///
+    /// A non-zero cap also needs a usable `systemd-run --user --scope` (a
+    /// reachable user manager bus — see DESIGN_MEMORY_CAP.md "Daemon-side
+    /// capping"); without one the spawn degrades to uncapped with a logged
+    /// reason.
+    #[serde(
+        default = "default_scheduler_default_cap",
+        deserialize_with = "de_mem_cap_bytes"
+    )]
     pub default_cap: u64,
     /// Continuous Tasks Phase 3b (stuck-story watchdog): how many investigators
     /// the watchdog may spawn for one stuck fresh run before it gives up and
@@ -218,6 +236,108 @@ fn default_scheduler_default_cap() -> u64 {
     // default matches usage: no cap unless a task explicitly sets one, or the
     // operator sets `[scheduler] default_cap` on a host where caps work.
     0
+}
+
+/// Floor for a NON-ZERO memory cap: 64 MiB. Anything smaller cannot hold any
+/// agent process and is diagnostic of the "bare small integer" config mistake
+/// (`default_cap = 3` = a 3-byte MemoryMax). `0` (uncapped) is always valid.
+pub const MEM_CAP_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling: 1 TiB. Nothing this daemon hosts legitimately wants more; a value
+/// above it is a units mistake in the other direction.
+pub const MEM_CAP_MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+
+/// Validate a memory-cap byte value (shared by the `[scheduler] default_cap`
+/// deserializer and the per-task `mem_cap_bytes` RPC params). `0` = uncapped =
+/// always fine; a non-zero value must land in `[MEM_CAP_MIN_BYTES,
+/// MEM_CAP_MAX_BYTES]`.
+pub fn validate_mem_cap_bytes(v: u64) -> Result<(), String> {
+    if v == 0 {
+        return Ok(());
+    }
+    if v < MEM_CAP_MIN_BYTES {
+        return Err(format!(
+            "memory cap {} parses as a {}-BYTE MemoryMax, which is absurd (this \
+             field is bytes, not a count). Use a unit string like \"6G\" / \
+             \"512M\", a byte value >= {} (64 MiB), or 0 to disable",
+            v, v, MEM_CAP_MIN_BYTES,
+        ));
+    }
+    if v > MEM_CAP_MAX_BYTES {
+        return Err(format!(
+            "memory cap {} exceeds {} (1 TiB) — almost certainly a units \
+             mistake; use a unit string like \"6G\"",
+            v, MEM_CAP_MAX_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+/// Parse a human memory-size string: bare digits are BYTES; suffixes `K`/`M`/
+/// `G`/`T` (case-insensitive, optionally followed by `iB`/`B`) are 1024-based.
+/// `"6G"` → 6442450944, `"512MiB"` → 536870912.
+pub fn parse_mem_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty memory size".into());
+    }
+    let digits_end = t
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(t.len());
+    if digits_end == 0 {
+        return Err(format!("memory size '{}' has no leading number", s));
+    }
+    let num: u64 = t[..digits_end]
+        .parse()
+        .map_err(|e| format!("memory size '{}': {}", s, e))?;
+    let suffix = t[digits_end..].trim();
+    let mult: u64 = match suffix.to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" | "KIB" => 1024,
+        "M" | "MB" | "MIB" => 1024 * 1024,
+        "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
+        "T" | "TB" | "TIB" => 1024u64.pow(4),
+        other => {
+            return Err(format!(
+                "memory size '{}': unknown unit '{}' (use K/M/G/T)",
+                s, other,
+            ))
+        }
+    };
+    num.checked_mul(mult)
+        .ok_or_else(|| format!("memory size '{}' overflows u64", s))
+}
+
+/// serde deserializer for `[scheduler] default_cap`: accepts an integer
+/// (bytes) or a unit string, then validates via [`validate_mem_cap_bytes`] so
+/// an absurd value refuses the config at LOAD (the daemon's startup is loud)
+/// instead of arming a 3-byte cap.
+fn de_mem_cap_bytes<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as DeError;
+    struct MemCapVisitor;
+    impl serde::de::Visitor<'_> for MemCapVisitor {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a byte count or a unit string like \"6G\" (0 = uncapped)")
+        }
+        fn visit_u64<E: DeError>(self, v: u64) -> Result<u64, E> {
+            validate_mem_cap_bytes(v).map_err(E::custom)?;
+            Ok(v)
+        }
+        fn visit_i64<E: DeError>(self, v: i64) -> Result<u64, E> {
+            let v = u64::try_from(v)
+                .map_err(|_| E::custom(format!("memory cap {} is negative", v)))?;
+            self.visit_u64(v)
+        }
+        fn visit_str<E: DeError>(self, s: &str) -> Result<u64, E> {
+            let v = parse_mem_size(s).map_err(E::custom)?;
+            validate_mem_cap_bytes(v).map_err(E::custom)?;
+            Ok(v)
+        }
+    }
+    d.deserialize_any(MemCapVisitor)
 }
 
 fn default_scheduler_max_investigations() -> u32 {
@@ -854,6 +974,77 @@ default_investigator_runtime_secs = 1200
         // Untouched keys keep their serde defaults.
         assert!(cfg.scheduler.enabled);
         assert_eq!(cfg.scheduler.default_cap, 0);
+    }
+
+    /// Memory-cap units + validation (wedge campaign F1): `default_cap`
+    /// accepts an integer (bytes) or a unit string, and a non-zero value
+    /// below 64 MiB refuses the config at load — the `default_cap = 3`
+    /// "3-byte MemoryMax" trap that shipped live on cm-manager 2026-08-14.
+    #[test]
+    fn default_cap_parses_units_and_rejects_absurd_values() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let write = |body: &str| {
+            let path = tmp.path().join("daemon.toml");
+            std::fs::write(&path, body).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+            path
+        };
+
+        // Unit string.
+        let cfg = load_or_default(&write("[scheduler]\ndefault_cap = \"6G\"\n"))
+            .expect("6G loads");
+        assert_eq!(cfg.scheduler.default_cap, 6 * 1024 * 1024 * 1024);
+        let cfg = load_or_default(&write("[scheduler]\ndefault_cap = \"512MiB\"\n"))
+            .expect("512MiB loads");
+        assert_eq!(cfg.scheduler.default_cap, 512 * 1024 * 1024);
+
+        // Plain byte integers still parse (existing config key stays).
+        let cfg = load_or_default(&write("[scheduler]\ndefault_cap = 6442450944\n"))
+            .expect("byte integer loads");
+        assert_eq!(cfg.scheduler.default_cap, 6442450944);
+
+        // 0 = uncapped, always valid.
+        let cfg =
+            load_or_default(&write("[scheduler]\ndefault_cap = 0\n")).expect("0 loads");
+        assert_eq!(cfg.scheduler.default_cap, 0);
+
+        // The live cm-manager trap: `default_cap = 3` is a 3-BYTE cap. Reject.
+        let err = load_or_default(&write("[scheduler]\ndefault_cap = 3\n"))
+            .expect_err("3 bytes must refuse the config");
+        let msg = err.to_string();
+        assert!(msg.contains("3-BYTE"), "diagnostic names the trap: {}", msg);
+        assert!(msg.contains("\"6G\""), "diagnostic names the fix: {}", msg);
+
+        // Garbage unit string rejects.
+        assert!(load_or_default(&write("[scheduler]\ndefault_cap = \"6 gallons\"\n"))
+            .is_err());
+    }
+
+    #[test]
+    fn parse_mem_size_units() {
+        assert_eq!(parse_mem_size("0").unwrap(), 0);
+        assert_eq!(parse_mem_size("123").unwrap(), 123);
+        assert_eq!(parse_mem_size("1K").unwrap(), 1024);
+        assert_eq!(parse_mem_size("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_mem_size("6g").unwrap(), 6 * 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_size("1T").unwrap(), 1024u64.pow(4));
+        assert_eq!(parse_mem_size(" 512 MB ").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_mem_size("64MiB").unwrap(), MEM_CAP_MIN_BYTES);
+        assert!(parse_mem_size("").is_err());
+        assert!(parse_mem_size("G").is_err());
+        assert!(parse_mem_size("5X").is_err());
+        assert!(parse_mem_size("99999999999T").is_err(), "overflow rejects");
+    }
+
+    #[test]
+    fn validate_mem_cap_bounds() {
+        assert!(validate_mem_cap_bytes(0).is_ok(), "0 = uncapped");
+        assert!(validate_mem_cap_bytes(MEM_CAP_MIN_BYTES).is_ok());
+        assert!(validate_mem_cap_bytes(MEM_CAP_MAX_BYTES).is_ok());
+        assert!(validate_mem_cap_bytes(3).is_err(), "the 3-byte trap");
+        assert!(validate_mem_cap_bytes(MEM_CAP_MIN_BYTES - 1).is_err());
+        assert!(validate_mem_cap_bytes(MEM_CAP_MAX_BYTES + 1).is_err());
     }
 
     /// 12h: `[tls]` section parses when present. All three fields
