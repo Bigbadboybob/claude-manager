@@ -652,6 +652,24 @@ pub struct DaemonState {
     /// `DaemonConfig::default()` so an in-test `DaemonState::new()`
     /// doesn't touch the filesystem.
     pub config: crate::config::DaemonConfig,
+    /// DESIGN_SEAMLESS_RESTART phase 3b: raw fd NUMBER of the bound
+    /// control-socket listener, stamped by `run()` right after
+    /// bind/adopt. **Manifest input only**: `crate::reexec` copies
+    /// the number into the FD manifest so the new image inherits the
+    /// bound socket (no connection-refused window). The listener is
+    /// never closed, dup'd, or otherwise operated on through this
+    /// field — the accept loop owns it. `None` only in states not
+    /// built by `run()` (tests), where a re-exec attempt fails
+    /// cleanly before any point of no return.
+    pub listener_raw_fd: Option<std::os::fd::RawFd>,
+    /// DESIGN_SEAMLESS_RESTART phase 3b: `CM_REEXEC=1` was in the
+    /// daemon's env at startup — the dev flag that makes the
+    /// `daemon.reexec_dev` skeleton trigger dispatchable at all.
+    /// Checked ONCE in `run()` and stored here so the dispatch gate
+    /// keys off an immutable startup fact rather than re-reading env
+    /// (which a later `setenv` anywhere in-process could flip).
+    /// `false` = the method answers exactly like any unknown method.
+    pub reexec_enabled: bool,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -761,6 +779,8 @@ impl Default for DaemonState {
             restart_coordinator: Arc::new(
                 crate::restart_coordinator::RestartCoordinator::new(),
             ),
+            listener_raw_fd: None,
+            reexec_enabled: false,
         }
     }
 }

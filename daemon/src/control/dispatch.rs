@@ -335,6 +335,12 @@ pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
     "daemon.drain",
     "daemon.reload_config",
     "daemon.restart",
+    // DESIGN_SEAMLESS_RESTART phase 3b: the dev-gated re-exec
+    // skeleton trigger RUNS the coordinator (begin → wait_quiesced →
+    // gate freezes → exec) — counting it as a mutation would deadlock
+    // the barrier against its own caller, exactly the `daemon.restart`
+    // rationale above.
+    "daemon.reexec_dev",
 ];
 
 /// Does dispatching `method` hold the restart barrier's in-flight
@@ -465,6 +471,13 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }
         "daemon.drain" => DispatchOutcome::Done(dispatch_daemon_drain(state, req)),
+        // DESIGN_SEAMLESS_RESTART phase 3b: dev-gated re-exec handoff
+        // skeleton. Answers unknown-method unless the daemon started
+        // with CM_REEXEC=1; strong-operator gated when enabled. On
+        // success the connection dies at the exec (fire-and-verify).
+        "daemon.reexec_dev" => {
+            DispatchOutcome::Done(dispatch_daemon_reexec_dev(state, req))
+        }
 
         // 10d-1: TUI-pushed session snapshot so the daemon
         // can recognize TUI-minted sessions for the future
@@ -1600,6 +1613,83 @@ fn dispatch_daemon_drain(
     }
 }
 
+/// `daemon.reexec_dev` — the dev-gated trigger for the re-exec handoff
+/// skeleton (DESIGN_SEAMLESS_RESTART phase 3b). Params:
+/// `{binary_path: string}` — the binary to exec in place.
+///
+/// Dispatched ONLY when the daemon started with `CM_REEXEC=1`
+/// (checked once at startup, stored on `DaemonState::reexec_enabled`);
+/// otherwise it answers with the byte-identical unknown-method
+/// response the `_ =>` fallback arm produces, so a production daemon
+/// exposes no discoverable surface for it.
+///
+/// When enabled, the caller is gated by
+/// `operator::require_strong_operator` — this is that gate's FIRST
+/// consumer (phase 2e, R14): the method execs caller-named code into
+/// the process holding every session's PTY, so it fails CLOSED where
+/// every other Operator method keeps the compat fail-open path.
+///
+/// Fire-and-verify contract: the SUCCESS case never writes a response
+/// — the connection dies at the exec (the per-connection socket is
+/// CLOEXEC'd by the R9 audit) and the caller polls `daemon.health`.
+/// Only the failure case returns, inline, after `perform_reexec`'s
+/// abort path restored the daemon to its pre-call state.
+fn dispatch_daemon_reexec_dev(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    let enabled = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        st.reexec_enabled
+    };
+    if !enabled {
+        // Byte-identical to the `_ =>` fallback arm's response so a
+        // daemon without the dev flag is indistinguishable from one
+        // that never heard of the method.
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::UnknownMethod,
+            format!(
+                "method '{}' is still served by the TUI; relocation deferred to slice 10c (see doc/persistent-host-daemon.md + daemon/NOTES.md)",
+                req.method,
+            ),
+        );
+    }
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller)
+    {
+        return Response::err(req.id.clone(), code, message);
+    }
+    let binary_path = match req.params.get("binary_path").and_then(|v| v.as_str())
+    {
+        Some(p) if !p.trim().is_empty() => p.to_string(),
+        _ => {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::InvalidParams,
+                "daemon.reexec_dev requires params.binary_path (non-empty \
+                 string): the binary to exec in place"
+                    .to_string(),
+            );
+        }
+    };
+    // No state lock held across the call: perform_reexec's quiesce
+    // barrier waits on in-flight mutations that need it, and the gate
+    // freezes must be taken lock-free (see `crate::reexec`'s module
+    // docs). Success never reaches the line below — the exec replaces
+    // the process image mid-call.
+    let err =
+        crate::reexec::perform_reexec(state, std::path::Path::new(&binary_path));
+    Response::err(
+        req.id.clone(),
+        ErrorCode::Internal,
+        format!(
+            "daemon.reexec_dev failed; the daemon has been restored to its \
+             pre-call state: {:#}",
+            err
+        ),
+    )
+}
+
 /// `tui.update_sessions_snapshot` — TUI-pushed session
 /// snapshot (10d-1). Operator-only — same rationale as
 /// `task.update_tree`: a Session caller pushing rows could
@@ -2291,6 +2381,9 @@ mod tests {
             "daemon.drain",
             "daemon.reload_config",
             "daemon.restart",
+            // Phase 3b: runs the coordinator — counting it would
+            // deadlock the barrier against its own caller.
+            "daemon.reexec_dev",
         ] {
             assert!(
                 !method_counts_as_restart_mutation(m),
@@ -2298,6 +2391,158 @@ mod tests {
                 m
             );
         }
+    }
+
+    // --- daemon.reexec_dev (DESIGN_SEAMLESS_RESTART phase 3b) ----------
+
+    /// Without `CM_REEXEC=1` at startup (`reexec_enabled == false`,
+    /// the default), the method is BYTE-INDISTINGUISHABLE from any
+    /// unknown method — a production daemon exposes no discoverable
+    /// surface for the skeleton.
+    #[test]
+    fn reexec_dev_without_dev_flag_is_unknown_method() {
+        let state = make_state();
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "daemon.reexec_dev",
+                serde_json::json!({"binary_path": "/bin/true"}),
+            ),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::UnknownMethod);
+        // Same message the `_ =>` fallback produces for this method
+        // name — indistinguishability is the contract, so pin it.
+        let fallback = dispatch_request(
+            &state,
+            &operator_request("daemon.reexec_dev_x", serde_json::json!({})),
+        )
+        .into_response();
+        let fallback_msg = fallback.error.expect("fallback error").message;
+        assert_eq!(
+            err.message,
+            fallback_msg.replace("daemon.reexec_dev_x", "daemon.reexec_dev"),
+            "gated-off response must match the unknown-method fallback shape"
+        );
+    }
+
+    /// With the dev flag ON but strong operator auth NOT configured
+    /// (the compat fail-open world every other Operator method
+    /// accepts), the method fails CLOSED — R14, the strong gate's
+    /// first consumer.
+    #[test]
+    fn reexec_dev_fails_closed_without_strong_operator_auth() {
+        let _g = crate::test_support::env_lock();
+        let _world = crate::control::operator::test_override::set(None);
+        let state = make_state();
+        state.lock().unwrap().reexec_enabled = true;
+        let resp = dispatch_request(
+            &state,
+            &operator_request(
+                "daemon.reexec_dev",
+                serde_json::json!({"binary_path": "/bin/true"}),
+            ),
+        )
+        .into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+        assert!(
+            err.message.contains("CM_OPERATOR_TOKEN"),
+            "refusal must name what's missing: {}",
+            err.message
+        );
+    }
+
+    /// With the flag on and a token configured: Session callers and
+    /// wrong-token Operators are refused; a matching Operator passes
+    /// the gate and reaches param validation (missing binary_path →
+    /// InvalidParams — proving gate order without ever exec'ing).
+    #[test]
+    fn reexec_dev_strong_gate_then_param_validation() {
+        let _g = crate::test_support::env_lock();
+        let _world =
+            crate::control::operator::test_override::set(Some("strong-tok"));
+        let state = make_state();
+        state.lock().unwrap().reexec_enabled = true;
+
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "daemon.reexec_dev",
+                serde_json::json!({"binary_path": "/bin/true"}),
+                "ts-hosted",
+            ),
+        )
+        .into_response();
+        assert_eq!(
+            resp.error.expect("session caller refused").code,
+            ErrorCode::Unauthorized
+        );
+
+        let mut wrong = operator_request(
+            "daemon.reexec_dev",
+            serde_json::json!({"binary_path": "/bin/true"}),
+        );
+        wrong.caller = Caller::operator("guessed-wrong");
+        let resp = dispatch_request(&state, &wrong).into_response();
+        assert_eq!(
+            resp.error.expect("wrong token refused").code,
+            ErrorCode::Unauthorized
+        );
+
+        let mut ok_caller =
+            operator_request("daemon.reexec_dev", serde_json::json!({}));
+        ok_caller.caller = Caller::operator("strong-tok");
+        let resp = dispatch_request(&state, &ok_caller).into_response();
+        assert_eq!(
+            resp.error.expect("missing binary_path").code,
+            ErrorCode::InvalidParams,
+            "a matching strong operator must clear the gate and hit param \
+             validation next"
+        );
+    }
+
+    /// A gate-cleared attempt against a state with no recorded
+    /// listener fd (any state not built by `run()`) aborts cleanly
+    /// AFTER the quiesce + gate freezes: inline Internal error naming
+    /// the missing listener, and the abort restores
+    /// `restarting`/`draining` exactly. (This is the in-process slice
+    /// of the abort invariant; the deep execveat-failure abort and the
+    /// successful exec are proven end-to-end in
+    /// `daemon/tests/reexec_skeleton_e2e.rs`.)
+    #[test]
+    fn reexec_dev_attempt_without_listener_aborts_and_restores() {
+        let _g = crate::test_support::env_lock();
+        let _world =
+            crate::control::operator::test_override::set(Some("strong-tok"));
+        let state = make_state();
+        state.lock().unwrap().reexec_enabled = true;
+
+        let mut req = operator_request(
+            "daemon.reexec_dev",
+            // The test binary itself: opens fine, exec bit set — the
+            // attempt proceeds past step (a) into the quiesce +
+            // freezes, then fails at the manifest build (no
+            // listener_raw_fd on a test-built state).
+            serde_json::json!({"binary_path": "/proc/self/exe"}),
+        );
+        req.caller = Caller::operator("strong-tok");
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("listener_raw_fd"),
+            "error must name the missing listener: {}",
+            err.message
+        );
+
+        let st = state.lock().unwrap();
+        assert!(!st.restarting, "abort must clear restarting");
+        assert!(!st.draining, "abort must un-drain");
     }
 
     // --- ping ---------------------------------------------------------

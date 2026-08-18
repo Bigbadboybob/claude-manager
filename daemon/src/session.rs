@@ -25,6 +25,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+// Anonymous import: brings the trait's methods into scope for the
+// CONCRETE `crate::adopt::AdoptedMasterPty` in `DaemonSession::adopt`
+// (calls on `dyn MasterPty` objects resolve without it) while
+// avoiding a name in this module's namespace.
+use portable_pty::MasterPty as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
@@ -1232,6 +1237,21 @@ impl DaemonSession {
             host_id: crate::host_id::HostId::local(),
         }
     }
+
+    /// The two kernel handles the re-exec FD manifest lists for this
+    /// session (DESIGN_SEAMLESS_RESTART phase 3b, restart-sequence
+    /// step 4): `(pty_master_fd, pidfd)` — the ONE canonical PTY
+    /// master (reader/writer handles re-derive by dup post-exec and
+    /// are never separately listed) and the spawn-time pidfd (handed
+    /// off, not re-acquired, so pid reuse is structurally impossible
+    /// for signaling). Raw NUMBERS only: the session keeps ownership;
+    /// the manifest names inherited table slots. `None` when the
+    /// master exposes no raw fd — never the case for the native unix
+    /// PTYs this crate spawns or adopts.
+    pub(crate) fn reexec_handoff_fds(&self) -> Option<(RawFd, RawFd)> {
+        let master = self._master.as_raw_fd()?;
+        Some((master, self.pidfd.as_raw_fd()))
+    }
 }
 
 /// Phase-1 result of [`DaemonSession::spawn`]. Holds a live child
@@ -1580,72 +1600,8 @@ impl PendingSession {
         let reader_fanout = Arc::clone(&fanout);
         let reader_handle = match std::thread::Builder::new()
             .name(format!("cm-session-{}-reader", params.uid))
-            .spawn(move || {
-                let mut reader = reader;
-                let poll_fd = poll_fd;
-                let mut buf = [0u8; 8192];
-                // Restart hardening / DESIGN_SEAMLESS_RESTART phase
-                // 2b (R3): detect-then-consume, never blocking-
-                // consume. Pre-2b this loop parked in a blocking
-                // `read()` — at a future re-exec handoff, up to one
-                // read-buffer of bytes could sit on this stack
-                // between `read()` and `fanout.push()`, already
-                // removed from the kernel and about to vanish with
-                // the thread. Now:
-                //
-                //   1. Wait for readability via non-consuming
-                //      poll(2) on the master fd dup (finite timeout
-                //      per iteration keeps the loop responsive; no
-                //      permit is held while parked here).
-                //   2. Acquire the shared reader permit. The restart
-                //      coordinator's exclusive `freeze()` blocks
-                //      right here — the bytes wait in the kernel's
-                //      PTY buffer, which survives the exec.
-                //   3. read→push as one indivisible unit under that
-                //      permit, so a freeze can never observe bytes
-                //      consumed-but-not-yet-pushed.
-                //
-                // EOF/error semantics are unchanged from the
-                // blocking loop: EOF (the boxed PtyFd reader maps
-                // the master's EIO-on-slave-gone to `Ok(0)`) and
-                // unrecoverable errors close the fanout, so the
-                // memory-cap-kill EOF paths and idle detection see
-                // exactly what they saw before. Latency is also
-                // unchanged: data arrival and hangup WAKE the poll
-                // immediately — the interval only bounds the park.
-                loop {
-                    poll_master_until_read_ready(&poll_fd);
-                    let _permit = crate::reader_gate::read_permit();
-                    match reader.read(&mut buf) {
-                        Ok(0) => {
-                            // EOF on the PTY master. Signal
-                            // subscribers via close() so their
-                            // `recv_timeout` returns Disconnected
-                            // (slice-10c-c review fix). Still under
-                            // the permit: a freeze observes the
-                            // close either fully done or not begun.
-                            reader_fanout.close();
-                            return;
-                        }
-                        Ok(n) => reader_fanout.push(&buf[..n]),
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::Interrupted =>
-                        {
-                            // Re-poll; readability is level-
-                            // triggered, so nothing is lost.
-                            continue;
-                        }
-                        Err(_) => {
-                            reader_fanout.close();
-                            return;
-                        }
-                    }
-                    // `_permit` drops here — held only around the
-                    // bounded read+push unit, NEVER across the poll
-                    // wait (a permit held while parked would block
-                    // the coordinator's freeze indefinitely).
-                }
-            }) {
+            .spawn(move || gated_reader_loop(reader, poll_fd, reader_fanout))
+        {
             Ok(h) => h,
             Err(e) => {
                 let _ = child.kill();
@@ -1797,61 +1753,14 @@ impl PendingSession {
         let reaper_handle = match std::thread::Builder::new()
             .name(format!("cm-session-{}-reaper", uid))
             .spawn(move || {
-                // Keep `child` in scope until after the status has
-                // been consumed; explicit drop at end documents the
-                // lifetime even though it's a no-op.
-                let _child = child;
-
-                // Restart hardening / DESIGN_SEAMLESS_RESTART phase
-                // 2a (R4): detect-then-consume, never blocking-
-                // consume. Pre-2a this thread parked in `waitpid`
-                // and consumed the kernel's one copy of the exit
-                // status the instant the child died — during a
-                // future re-exec handoff, a status consumed
-                // microseconds before the exec is lost between
-                // `waitpid` and persistence. Now:
-                //
-                //   1. Wait for exit-READINESS via non-consuming
-                //      poll(2) on the pidfd (finite timeout per
-                //      iteration keeps the loop responsive).
-                //   2. Acquire the shared reap permit. The restart
-                //      coordinator's exclusive `freeze()` blocks
-                //      right here — the child parks as a zombie,
-                //      fully reconstructible by the new image.
-                //   3. Consume via waitid(P_PIDFD) and run ALL of
-                //      the downstream persistence (exit channel,
-                //      LastExitProbe, on_exit registry callback)
-                //      under that same permit, so a freeze can
-                //      never observe a consumed-but-unpersisted
-                //      status.
-                poll_pidfd_until_exit_ready(&reaper_pidfd);
-                let _reap_permit = crate::reap_gate::read_permit();
-                let status = consume_exit_status(&reaper_pidfd, pid);
-                let _ = exit_tx.send(status.clone());
-
-                // Cache ONLY the kernel-observable exit at
-                // consumption time. memory_cap_kill gets classified
-                // lazily by `LastExitProbe::snapshot()` at
-                // End-frame emission time — the slice-10c-e-2
-                // review-6 fix that closes the race between the
-                // cgroup-OOM writer and the status consumption.
-                last_exit_for_reaper.set_kernel(KernelExitStatus {
-                    code: status.code,
-                    // Slice 10d watcher-fix #1.5: signal is what
-                    // distinguishes a kernel kill (signal-exit) from
-                    // a clean exit-with-transient-soft-breach. The
-                    // lazy `LastExitProbe::snapshot` reads both and
-                    // joins with kill_status via `is_cap_kill`.
-                    signal: status.signal,
-                });
-
-                if let Some(cb) = on_exit {
-                    cb(&status);
-                }
-                drop(_child);
-                // `_reap_permit` drops here — consumption and its
-                // persistence were one indivisible unit under the
-                // gate (R4).
+                gated_reaper_body(
+                    Some(child),
+                    reaper_pidfd,
+                    pid,
+                    exit_tx,
+                    last_exit_for_reaper,
+                    on_exit,
+                )
             }) {
             Ok(h) => h,
             Err(e) => {
@@ -1923,6 +1832,322 @@ impl PendingSession {
             // existence, while `start_session` is where the
             // watcher's lifetime decisions are made.
             watcher_handle: None,
+        })
+    }
+}
+
+/// The gated PTY reader loop — one body, shared by SPAWNED sessions
+/// ([`PendingSession::spawn`]'s reader thread) and ADOPTED ones
+/// ([`DaemonSession::adopt`], DESIGN_SEAMLESS_RESTART phase 3b), so a
+/// session that crossed a re-exec drains under exactly the same gate
+/// discipline as one that didn't.
+///
+/// Restart hardening / DESIGN_SEAMLESS_RESTART phase 2b (R3):
+/// detect-then-consume, never blocking-consume. Pre-2b this loop
+/// parked in a blocking `read()` — at a re-exec handoff, up to one
+/// read-buffer of bytes could sit on this stack between `read()` and
+/// `fanout.push()`, already removed from the kernel and about to
+/// vanish with the thread. Now:
+///
+///   1. Wait for readability via non-consuming poll(2) on the master
+///      fd dup (finite timeout per iteration keeps the loop
+///      responsive; no permit is held while parked here).
+///   2. Acquire the shared reader permit. The restart coordinator's
+///      exclusive `freeze()` blocks right here — the bytes wait in
+///      the kernel's PTY buffer, which survives the exec.
+///   3. read→push as one indivisible unit under that permit, so a
+///      freeze can never observe bytes consumed-but-not-yet-pushed.
+///
+/// EOF/error semantics match the original blocking loop: EOF (both
+/// the boxed PtyFd reader and [`crate::adopt::AdoptedMasterPty`]'s
+/// reader map the master's EIO-on-slave-gone to `Ok(0)`) and
+/// unrecoverable errors close the fanout, so the memory-cap-kill EOF
+/// paths and idle detection see exactly what they always saw.
+/// Latency is unchanged: data arrival and hangup WAKE the poll
+/// immediately — the interval only bounds the park.
+fn gated_reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    poll_fd: OwnedFd,
+    fanout: Arc<PtyByteFanout>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        poll_master_until_read_ready(&poll_fd);
+        let _permit = crate::reader_gate::read_permit();
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                // EOF on the PTY master. Signal subscribers via
+                // close() so their `recv_timeout` returns
+                // Disconnected (slice-10c-c review fix). Still under
+                // the permit: a freeze observes the close either
+                // fully done or not begun.
+                fanout.close();
+                return;
+            }
+            Ok(n) => fanout.push(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // Re-poll; readability is level-triggered, so
+                // nothing is lost.
+                continue;
+            }
+            Err(_) => {
+                fanout.close();
+                return;
+            }
+        }
+        // `_permit` drops here — held only around the bounded
+        // read+push unit, NEVER across the poll wait (a permit held
+        // while parked would block the coordinator's freeze
+        // indefinitely).
+    }
+}
+
+/// The gated reaper body — one body, shared by SPAWNED sessions
+/// ([`PendingSession::arm_reaper`]'s reaper thread) and ADOPTED ones
+/// ([`DaemonSession::adopt`], DESIGN_SEAMLESS_RESTART phase 3b).
+///
+/// `child` is the portable-pty `Child` handle for spawned sessions —
+/// kept in scope until after the status has been consumed (explicit
+/// drop at the end documents the lifetime even though it's a no-op).
+/// **`None` for adopted sessions**: no `Child` handle exists for a
+/// process this image never spawned, and none is needed — readiness
+/// detection polls the pidfd and consumption goes through
+/// `waitid(P_PIDFD)`, both of which key off the fd's bound task
+/// identity, not a handle. Same-PID reparenting across the exec means
+/// the kernel still lets this process (the child's parent) reap it.
+///
+/// Restart hardening / DESIGN_SEAMLESS_RESTART phase 2a (R4):
+/// detect-then-consume, never blocking-consume. Pre-2a this thread
+/// parked in `waitpid` and consumed the kernel's one copy of the exit
+/// status the instant the child died — during a re-exec handoff, a
+/// status consumed microseconds before the exec is lost between
+/// `waitpid` and persistence. Now:
+///
+///   1. Wait for exit-READINESS via non-consuming poll(2) on the
+///      pidfd (finite timeout per iteration keeps the loop
+///      responsive).
+///   2. Acquire the shared reap permit. The restart coordinator's
+///      exclusive `freeze()` blocks right here — the child parks as
+///      a zombie, fully reconstructible by the new image.
+///   3. Consume via waitid(P_PIDFD) and run ALL of the downstream
+///      persistence (exit channel, LastExitProbe, on_exit registry
+///      callback) under that same permit, so a freeze can never
+///      observe a consumed-but-unpersisted status.
+fn gated_reaper_body(
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    reaper_pidfd: OwnedFd,
+    pid: libc::pid_t,
+    exit_tx: mpsc::Sender<DaemonExitStatus>,
+    last_exit: SharedLastExit,
+    on_exit: Option<OnExitCallback>,
+) {
+    let _child = child;
+    poll_pidfd_until_exit_ready(&reaper_pidfd);
+    let _reap_permit = crate::reap_gate::read_permit();
+    let status = consume_exit_status(&reaper_pidfd, pid);
+    let _ = exit_tx.send(status.clone());
+
+    // Cache ONLY the kernel-observable exit at consumption time.
+    // memory_cap_kill gets classified lazily by
+    // `LastExitProbe::snapshot()` at End-frame emission time — the
+    // slice-10c-e-2 review-6 fix that closes the race between the
+    // cgroup-OOM writer and the status consumption.
+    last_exit.set_kernel(KernelExitStatus {
+        code: status.code,
+        // Slice 10d watcher-fix #1.5: signal is what distinguishes a
+        // kernel kill (signal-exit) from a clean
+        // exit-with-transient-soft-breach. The lazy
+        // `LastExitProbe::snapshot` reads both and joins with
+        // kill_status via `is_cap_kill`.
+        signal: status.signal,
+    });
+
+    if let Some(cb) = on_exit {
+        cb(&status);
+    }
+    drop(_child);
+    // `_reap_permit` drops here — consumption and its persistence
+    // were one indivisible unit under the gate (R4).
+}
+
+/// Minimal identity metadata for [`DaemonSession::adopt`] —
+/// everything the skeleton re-exec manifest carries beyond the fds
+/// and the pid-identity cross-checks. DESIGN_SEAMLESS_RESTART phase
+/// 3b: fields the skeleton manifest does NOT carry (workspace_id,
+/// task binding, workflow tags, memory-cap bytes, transcript path)
+/// are defaulted honestly inside `adopt` rather than guessed here;
+/// phase 4's full rehydrate widens the record and this struct with
+/// it.
+pub struct AdoptedSessionMeta {
+    /// Sidebar label. The skeleton manifest carries no label, so the
+    /// rehydrate path passes the uid — cosmetic only.
+    pub title: String,
+    /// Session-type discriminator. The skeleton manifest schema
+    /// carries no engine field, so the phase-3b rehydrate hard-notes
+    /// `"bash"` (the only engine the skeleton e2e exercises); phase 4
+    /// adds the field to the manifest.
+    pub session_type: String,
+    /// Transcript generation counter, restored from the manifest so
+    /// post-handoff cursor semantics don't reset.
+    pub generation: u64,
+    /// Memory-cap cgroup scope prefix, when the session was capped.
+    /// Carried for identity only in the skeleton — watcher
+    /// re-adoption from checkpoints is phase 4 (R12).
+    pub cgroup_prefix: Option<PathBuf>,
+}
+
+impl DaemonSession {
+    /// Construct an ARMED `DaemonSession` from promoted escrow parts —
+    /// the commit-gate side of the re-exec rehydrate
+    /// (DESIGN_SEAMLESS_RESTART phase 3b; the escrow/candidate side is
+    /// `crate::adopt`, phase 2c).
+    ///
+    /// This is the moment kill-on-drop semantics BEGIN, deliberately:
+    /// candidates were the non-killing stage (a failed rehydrate
+    /// unwinds them without touching children, R5); a session that
+    /// made it through the probes and into the registry must have
+    /// exactly the same lifecycle as a spawned one, including the
+    /// pidfd-SIGKILL `Drop`.
+    ///
+    /// Reuses the spawn plumbing wholesale: the same gated reader
+    /// loop ([`gated_reader_loop`]) on a CLOEXEC dup of the adopted
+    /// master, the same writer split (`take_writer` behind
+    /// `Arc<Mutex<_>>`), and the same pidfd-poll reaper body
+    /// ([`gated_reaper_body`]) — with `child: None`, because no
+    /// portable-pty `Child` handle exists for a process this image
+    /// never spawned (the reaper only needs pid + pidfd; see the body
+    /// doc).
+    ///
+    /// Failure semantics (skeleton): an error here (dup / take_writer
+    /// / thread-spawn failure — all vanishingly rare) returns `Err`
+    /// and drops the parts, which closes the adopted master fd; if
+    /// that was its last open description the child's pty hangs up
+    /// and the child takes SIGHUP. That is a consequence of fd
+    /// teardown, never a signal sent by this code — and phase 4's
+    /// transaction narrows the window further by validating
+    /// everything before any candidate is promoted.
+    pub fn adopt(
+        parts: crate::adopt::PromotedSessionParts,
+        meta: AdoptedSessionMeta,
+        on_exit: Option<OnExitCallback>,
+    ) -> anyhow::Result<DaemonSession> {
+        let crate::adopt::PromotedSessionParts {
+            uid,
+            pid,
+            pidfd,
+            master,
+        } = parts;
+
+        // The pty's winsize lives on the kernel object and survived
+        // the exec — read it back rather than resetting to 80×24 (an
+        // MCP child spawned off this session inherits these).
+        let (cols, rows) = master
+            .get_size()
+            .map(|s| (s.cols, s.rows))
+            .unwrap_or((80, 24));
+
+        let reader = master
+            .try_clone_reader()
+            .map_err(|e| anyhow::anyhow!("adopt {}: try_clone_reader: {}", uid, e))?;
+        let poll_fd = dup_master_fd_for_poll(&master)
+            .map_err(|e| anyhow::anyhow!("adopt {}: dup master fd for reader poll: {}", uid, e))?;
+        let writer: SessionWriter = Arc::new(Mutex::new(
+            master
+                .take_writer()
+                .map_err(|e| anyhow::anyhow!("adopt {}: take_writer: {}", uid, e))?,
+        ));
+
+        // Fresh activity cell stamped at adoption time — same
+        // rationale as spawn's stamp (a just-adopted session must
+        // not read as instantly idle) with the same fanout wiring.
+        let last_activity_at: SharedLastActivity =
+            Arc::new(Mutex::new(Some(Instant::now())));
+        let fanout = Arc::new(PtyByteFanout::with_activity_tracker(
+            DEFAULT_FANOUT_CAPACITY,
+            Some(Arc::clone(&last_activity_at)),
+        ));
+        // The pre-exec fanout ring died with the old image's memory —
+        // this one starts empty and the reader thread immediately
+        // drains the kernel's PTY backlog into it (the design's
+        // "start readers promptly" requirement; kernel buffers are
+        // ~64 KiB and a chatty child blocks on write until we drain).
+        let reader_fanout = Arc::clone(&fanout);
+        let reader_handle = std::thread::Builder::new()
+            .name(format!("cm-session-{}-reader", uid))
+            .spawn(move || gated_reader_loop(reader, poll_fd, reader_fanout))
+            .map_err(|e| anyhow::anyhow!("adopt {}: spawn reader thread: {}", uid, e))?;
+
+        // Reaper on a dup of the adopted pidfd — identical topology
+        // to arm_reaper: the session's original stays for the kill
+        // paths, the dup is what the reaper polls and consumes
+        // through.
+        let reaper_pidfd = pidfd
+            .try_clone()
+            .map_err(|e| anyhow::anyhow!("adopt {}: dup pidfd for reaper: {}", uid, e))?;
+        // No kills_dir / baseline: the skeleton manifest doesn't
+        // carry the memory-cap watcher state (R12, phase 4), so the
+        // probe honestly reports memory_cap_kill=false for adopted
+        // sessions.
+        let last_exit: SharedLastExit =
+            Arc::new(LastExitProbe::new(uid.clone(), None, 0));
+        let last_exit_for_reaper = last_exit.clone();
+        let (exit_tx, exit_rx) = mpsc::channel::<DaemonExitStatus>();
+        let reaper_handle = std::thread::Builder::new()
+            .name(format!("cm-session-{}-reaper", uid))
+            .spawn(move || {
+                gated_reaper_body(
+                    None,
+                    reaper_pidfd,
+                    pid,
+                    exit_tx,
+                    last_exit_for_reaper,
+                    on_exit,
+                )
+            })
+            .map_err(|e| anyhow::anyhow!("adopt {}: spawn reaper thread: {}", uid, e))?;
+
+        Ok(DaemonSession {
+            title: meta.title,
+            // Honest defaults for everything the skeleton manifest
+            // doesn't carry (see `AdoptedSessionMeta`): the adopted
+            // session is workspace-less, task-less, unmanaged, and
+            // ungranted until phase 4's full record restores them.
+            workspace_id: String::new(),
+            session_type: meta.session_type,
+            managed_by_uid: None,
+            task_id: None,
+            // The manifest carries the transcript ID, not the path
+            // (the path is engine+cwd-derived and the skeleton is
+            // bash-only, which has no transcript). `None` is the
+            // honest value; phase 4 carries the full path.
+            transcript_path: None,
+            memory_cap_soft_bytes: None,
+            memory_cap_hard_bytes: None,
+            cgroup_prefix: meta.cgroup_prefix,
+            last_cols: cols,
+            last_rows: rows,
+            workflow_run_id: None,
+            workflow_role: None,
+            continuous_task_id: None,
+            global_perms: false,
+            generation: meta.generation,
+            last_activity_at,
+            last_operator_input_at: Arc::new(Mutex::new(None)),
+            last_input_at: Arc::new(Mutex::new(None)),
+            last_turn_end_at: Arc::new(Mutex::new(None)),
+            done_report: Arc::new(Mutex::new(None)),
+            fanout,
+            pid,
+            pidfd,
+            writer,
+            cached_exit: None,
+            exit_rx,
+            _reader_handle: reader_handle,
+            _reaper_handle: reaper_handle,
+            _master: Box::new(master),
+            last_exit,
+            watcher_handle: None,
+            uid,
         })
     }
 }

@@ -431,17 +431,7 @@ impl SessionCandidate {
     /// exited AND was reaped), `InvalidData` when the stat line
     /// doesn't parse.
     pub fn child_start_time(&self) -> std::io::Result<u64> {
-        let stat =
-            std::fs::read_to_string(format!("/proc/{}/stat", self.pid))?;
-        parse_proc_stat_starttime(&stat).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "unparseable /proc/{}/stat line: {:?}",
-                    self.pid, stat
-                ),
-            )
-        })
+        proc_starttime(self.pid)
     }
 
     /// Leave escrow: consume the candidate and hand out the parts
@@ -488,6 +478,28 @@ pub struct PromotedSessionParts {
     pub pid: libc::pid_t,
     pub pidfd: OwnedFd,
     pub master: AdoptedMasterPty,
+}
+
+/// Read a live process's kernel start time (`/proc/<pid>/stat`
+/// field 22, clock ticks since boot) — the design's R6 pid-reuse
+/// cross-check value. Shared by [`SessionCandidate::child_start_time`]
+/// (the rehydrate-side probe) and the re-exec manifest's write side
+/// (`crate::reexec`, DESIGN_SEAMLESS_RESTART phase 3b), so the value
+/// the old image records and the value the new image re-reads come
+/// from the SAME parser — a divergence there would fail every
+/// cross-check silently.
+///
+/// Errors: `NotFound`-shaped when `/proc/<pid>` is gone (process
+/// exited AND was reaped; a zombie still has a stat line),
+/// `InvalidData` when the line doesn't parse.
+pub(crate) fn proc_starttime(pid: libc::pid_t) -> std::io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid))?;
+    parse_proc_stat_starttime(&stat).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unparseable /proc/{}/stat line: {:?}", pid, stat),
+        )
+    })
 }
 
 /// Parse the `starttime` field (field 22) out of a
