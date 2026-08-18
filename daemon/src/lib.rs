@@ -56,6 +56,7 @@
 pub mod attach;
 pub mod claude_trust;
 pub mod config;
+pub mod env_sanitize;
 pub mod continuous;
 pub mod control;
 pub mod host_id;
@@ -298,6 +299,23 @@ fn bind_with_tight_umask(path: &Path) -> std::io::Result<UnixListener> {
 /// request, and receive a structured response. End-to-end test in
 /// `daemon/tests/accept_loop.rs` confirms that.
 pub fn run() -> anyhow::Result<()> {
+    // FIRST, before anything reads env or spawns: scrub Claude-session
+    // identity vars inherited from a launcher that ran inside a claude
+    // session. Children inherit our env, so a leaked foreign
+    // CLAUDE_CODE_SESSION_ID redirects every spawned session's
+    // transcript (the 2026-08-18 orphaned-session-I/O incident). See
+    // `env_sanitize` for the full mechanism and the exact list.
+    let scrubbed = env_sanitize::scrub_inherited_session_env();
+    if !scrubbed.is_empty() {
+        eprintln!(
+            "cm-daemon: launcher env carried Claude-session identity vars \
+             (daemon started from inside a claude session?) — scrubbed {} \
+             so spawned sessions don't inherit a foreign identity: {}",
+            scrubbed.len(),
+            scrubbed.join(", "),
+        );
+    }
+
     // Operator-token validation reads $CM_OPERATOR_TOKEN from env
     // exactly once at startup. If unset, validation is disabled and
     // the helper logs a one-time warning. The TUI sets this when
