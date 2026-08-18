@@ -26,9 +26,11 @@ pub mod probe;
 pub mod queue;
 pub mod runlog;
 pub mod scheduler;
+pub mod startup_sweep;
 pub mod task;
 
 pub use scheduler::ContinuousScheduler;
+pub use startup_sweep::startup_orphan_sweep;
 pub use task::{
     ContinuousTask, Engine, InFlight, ModePreset, Retention, RunMode, RunRecord, RunStatus,
     Schedule,

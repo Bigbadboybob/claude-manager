@@ -428,6 +428,13 @@ pub fn run() -> anyhow::Result<()> {
     // enforced nowhere (the 2026-08-17 148-worktree disk-full incident).
     worktree::set_max_worktrees(daemon_config.scheduler.max_worktrees);
 
+    // Wedge-campaign F3: sweep runs stranded `Running` by the previous daemon
+    // instance BEFORE any session restore — after a restart/reboot no restored
+    // session will re-drive a mid-flight run, so an open run whose session
+    // process is gone can only wedge its task. Close them attributed as
+    // restart orphans (or re-adopt when the process demonstrably survived).
+    continuous::startup_orphan_sweep();
+
     let path = default_socket_path();
     let listener = match &reexec_handoff {
         // Handoff (phase 3b, R13): adopt the inherited listener
