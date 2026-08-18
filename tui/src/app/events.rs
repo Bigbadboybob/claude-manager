@@ -542,26 +542,40 @@ impl App {
                                     cap_kill_notes.push(ts.uid.clone());
                                 }
                             }
-                            // Remote auto-reconnect: distinguish a
-                            // TRANSPORT death (the attach socket
-                            // EOF'd with no daemon `End` frame —
-                            // typically the SSH tunnel dropped when
-                            // the laptop lost connectivity) from a
+                            // Auto-reconnect: distinguish a TRANSPORT
+                            // death (the attach socket EOF'd with no
+                            // daemon `End` frame — the SSH tunnel
+                            // dropped when the laptop lost
+                            // connectivity, or the LOCAL daemon
+                            // re-exec'd for a deploy and every attach
+                            // connection died at the exec) from a
                             // genuine daemon-side child exit. Only
                             // the former is recoverable: the daemon-
-                            // side PTY + workflow keep running
-                            // (daemon-side execution), so instead of
-                            // tearing the session slot down we keep
-                            // it alive, mark it reconnecting, and
-                            // requeue it for reattach once the per-
-                            // host manifest.watch consumer warms the
-                            // tunnel back up. The `daemon_transport_eof`
+                            // side PTY + workflow keep running (a
+                            // re-exec'd daemon adopts its children —
+                            // DESIGN_SEAMLESS_RESTART phase 5), so
+                            // instead of tearing the session slot
+                            // down we keep it alive, mark it
+                            // reconnecting (⟳), and requeue it for
+                            // reattach. The `daemon_transport_eof`
                             // flag is the GROUND-TRUTH signal latched
                             // by the attach reader on EOF — we do NOT
                             // infer transport death from a transient
                             // `live_socket_path()==None`, which can
                             // momentarily be None during a HEALTHY
-                            // tunnel respawn. LOCAL sessions have no
+                            // tunnel respawn. The gate is the flag
+                            // ITSELF, not the row's host: local rows
+                            // are daemon-attached too, and pre-phase-5
+                            // an `is_remote` gate here marked every
+                            // attached local session exited on a
+                            // daemon re-exec even though the daemon
+                            // had adopted them all. A genuine child
+                            // exit always arrives as a structured
+                            // `End` frame (the flag stays false) and
+                            // tears down normally — that distinction
+                            // is the whole signal. Sessions with a
+                            // truly-local PTY (gcloud backtest watch,
+                            // the bash fallback) have no
                             // `daemon_transport_eof` Arc (None) and
                             // always take the normal exit path —
                             // completely unaffected.
@@ -576,9 +590,7 @@ impl App {
                                     )
                                 })
                                 .unwrap_or(false);
-                            let is_remote = ts.host_id
-                                != cm_daemon::host_id::HostId::local();
-                            if is_remote && transport_died {
+                            if transport_died {
                                 // Keep the slot (do NOT set
                                 // `exited`); the post-loop requeue
                                 // marks it reconnecting and enqueues
@@ -1026,14 +1038,19 @@ impl App {
             self.try_emit_cap_kill_toast(&uid);
         }
 
-        // Remote auto-reconnect: for each REMOTE session whose attach
+        // Auto-reconnect: for each daemon-attached session (remote OR
+        // local — DESIGN_SEAMLESS_RESTART phase 5) whose attach
         // stream died this pass, mark it reconnecting (drives the
         // `⟳` sidebar indicator + keeps the slot) and requeue its
         // manifest entry into the existing deferred-reattach flow.
-        // The per-host manifest.watch consumer (its own thread, with
-        // exponential-backoff reconnect) re-warms the tunnel on its
-        // own; `drain_deferred_remote_reattach` then rebinds the PTY
-        // to the still-alive daemon session — no work lost. We do NOT
+        // For a remote host the per-host manifest.watch consumer (its
+        // own thread, with exponential-backoff reconnect) re-warms the
+        // tunnel on its own; for the local host there is no tunnel —
+        // the reattach dial IS the probe (a refused connect during the
+        // daemon's restart gap classifies TransportDown and retries on
+        // the drain cadence). Either way
+        // `drain_deferred_remote_reattach` then rebinds the PTY to the
+        // still-alive daemon session — no work lost. We do NOT
         // add to `skipped_manifest_entries` here: the slot stays live
         // in `ws.sessions`, so `save_session_manifest` already
         // round-trips it; a skipped copy would double-write.

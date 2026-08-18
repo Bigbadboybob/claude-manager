@@ -1,4 +1,20 @@
-//! Remote-session reattach machinery: deferred reattach queue, tunnel-death detection, reconnect retries.
+//! Session-reattach machinery: deferred reattach queue, tunnel-death detection, reconnect retries.
+//!
+//! Named "remote" for its origin (the SSH-tunnel auto-reconnect flow), but
+//! since DESIGN_SEAMLESS_RESTART phase 5 the same queue serves LOCAL
+//! daemon-attached rows too: a local daemon re-exec drops every attach
+//! socket with no `End` frame — the exact transport-EOF signature — and the
+//! re-exec'd daemon adopts the sessions, so the recovery is identical
+//! (⟳ + requeue + rebind in place). The only host-specific part is the
+//! readiness probe: remote hosts wait on their tunnel; the local host's
+//! socket path is always "live" (`UnixDirect`), so the reattach dial itself
+//! is the probe — a refused connect during the restart gap classifies
+//! `TransportDown` and retries on the normal cadence without burning the
+//! give-up budget. Workflow participants and continuous sessions ride the
+//! queue exactly as the remote flow always had them (stale workflow tags
+//! are cleaned at reattach via `untag_stale_workflow`; no new special
+//! cases). cm-redeploy's wholesale TUI kill still exists; deleting it is
+//! phase 6, when `daemon.restart` lands and the script's contract changes.
 
 use super::*;
 
@@ -419,11 +435,14 @@ impl App {
         }
     }
 
-    /// Mark a REMOTE session's slot `reconnecting` and enqueue it into the
-    /// deferred-reattach flow (idempotent per uid). Shared by the transport-EOF
-    /// exit path (`drain_pty_events`) and the tunnel-generation watchdog
-    /// (`requeue_stale_generation_remote_sessions`) so both route into the
-    /// exact same recovery machinery. `reason` is logged. Returns true if it
+    /// Mark a daemon-attached session's slot `reconnecting` and enqueue it
+    /// into the deferred-reattach flow (idempotent per uid). Host-agnostic
+    /// since DESIGN_SEAMLESS_RESTART phase 5: LOCAL rows arrive here when the
+    /// daemon re-execs (every attach socket EOFs with no `End` frame), remote
+    /// rows on tunnel death — same recovery either way. Shared by the
+    /// transport-EOF exit path (`drain_pty_events`) and the tunnel-generation
+    /// watchdog (`requeue_stale_generation_remote_sessions`) so both route
+    /// into the exact same machinery. `reason` is logged. Returns true if it
     /// NEWLY enqueued the uid (so the caller can set `needs_redraw`); false if
     /// the uid was already queued.
     pub(super) fn requeue_remote_reconnect(&mut self, wi: usize, si: usize, reason: &str) -> bool {
@@ -454,7 +473,7 @@ impl App {
         true
     }
 
-    /// Catch a remote attach stream that's dead but that never produced a clean
+    /// Catch an attach stream that's dead but that never produced a clean
     /// EOF — the half-open freeze (renders stale, normal indicator, dead to
     /// input; `transport_eof` never fires because there's no `read()==0`, and
     /// alacritty's EventLoop SPINS at 100% CPU on the fd's `POLLHUP`). Two
@@ -475,6 +494,16 @@ impl App {
     /// live sessions are baselined at the current generation (safety net for
     /// attach paths that don't record explicitly). Cheap: one non-blocking
     /// `poll`, one HashMap lookup + atomic read per remote session per tick.
+    ///
+    /// LOCAL daemon-attached rows get the **S5 probe only**
+    /// (DESIGN_SEAMLESS_RESTART phase 5): a daemon re-exec closes every
+    /// attach socket, and when alacritty's EventLoop spins on the `POLLHUP`
+    /// instead of reading the EOF (the exact half-open shape S5 was built
+    /// for — observed in the phase-5 e2e), this probe is what routes the
+    /// row into the reconnect flow. S3 is tunnel machinery and doesn't
+    /// apply (no tunnel; the local generation is always 0), so local uids
+    /// stay out of the generation records entirely. Truly-local-PTY
+    /// sessions have no `attach_hup_fd` and are never touched.
     pub fn requeue_stale_generation_remote_sessions(&mut self) {
         let local = cm_daemon::host_id::HostId::local();
         // (wi, si, reason). Two triggers, both meaning "this attached remote
@@ -490,9 +519,10 @@ impl App {
             }
             for si in 0..self.workspaces[wi].sessions.len() {
                 let ts = &self.workspaces[wi].sessions[si];
-                if ts.host_id == local || ts.uid.is_empty() || ts.session.exited {
+                if ts.uid.is_empty() || ts.session.exited {
                     continue;
                 }
+                let is_local = ts.host_id == local;
                 let uid = ts.uid.clone();
                 let host = ts.host_id.clone();
                 // S5: probe the attach socket for POLLHUP/POLLERR while we hold
@@ -500,6 +530,14 @@ impl App {
                 let hung_up = ts.session.attach_socket_hung_up();
                 // A session already in the reconnect flow is handled there.
                 if self.reconnecting_sessions.contains(&uid) {
+                    continue;
+                }
+                // Local rows: S5 only (see the doc comment) — no tunnel, so
+                // no generation record and no S3 arm.
+                if is_local {
+                    if hung_up {
+                        dead.push((wi, si, "socket hangup (POLLHUP)"));
+                    }
                     continue;
                 }
                 let current = self.host_pool.tunnel_generation(&host);
@@ -1083,7 +1121,20 @@ mod remote_reconnect_tests {
         } else {
             None
         };
-        let ts = TerminalSession {
+        let ts = wrap_terminal_session(uid, host, session);
+        (ts, tx, teof)
+    }
+
+    /// Wrap an already-built `Session` in a `TerminalSession` slot with
+    /// neutral metadata. Shared by `session_with_injected_exit` (injected
+    /// event channel) and the phase-5 e2e (a REAL daemon-attached
+    /// `Session::new_attached` session).
+    fn wrap_terminal_session(
+        uid: &str,
+        host: cm_daemon::host_id::HostId,
+        session: crate::session::Session,
+    ) -> TerminalSession {
+        TerminalSession {
             color: None,
             uid: uid.into(),
             label: "claude".into(),
@@ -1113,8 +1164,7 @@ mod remote_reconnect_tests {
             seeded_from_snapshot: None,
             preserved_last_exit: None,
             host_id: host,
-        };
-        (ts, tx, teof)
+        }
     }
 
     fn workspace_with(ts: TerminalSession) -> Workspace {
@@ -1217,6 +1267,148 @@ mod remote_reconnect_tests {
         assert!(
             !app.workspaces[0].sessions[0].session.exited,
             "the preserved slot is not exited",
+        );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 5 — the LOCAL twin of the freeze
+    /// regression above: a daemon re-exec drops every attach socket with no
+    /// `End` frame, and the daemon adopts the sessions. A LOCAL
+    /// daemon-attached row observing that transport EOF must take the SAME
+    /// reconnect path as a remote one — ⟳ (reconnecting) + queued for
+    /// reattach, NOT marked exited. RED before phase 5: the `is_remote`
+    /// gate in `drain_terminal_events` marked every attached local session
+    /// exited on a re-exec even though the daemon had adopted them all.
+    ///
+    /// Also covers the daemon-down gap: the local host's socket path is
+    /// always "live" (`UnixDirect`), so the drain's reattach attempt IS the
+    /// probe — with nothing listening it fails as `TransportDown`, stays
+    /// queued, and must NOT burn the (session-gone-only) give-up budget.
+    #[test]
+    fn transport_death_on_attached_local_session_reconnects_instead_of_exiting() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        // Local host socket = cm_dir/daemon.sock — NOTHING listens there
+        // (the daemon is mid-restart from this test's perspective).
+        let (mut app, _ghost) = app_with_ghost_unix_host(&cm_dir);
+        let local = cm_daemon::host_id::HostId::local();
+        let (ts, tx, teof) =
+            session_with_injected_exit("uid-local-teof", local.clone(), true);
+        let teof = teof.expect("daemon-attached local session has the flag");
+        let mut ws = workspace_with(ts);
+        // A worktree_path so the reattach attempt proceeds to the (failing)
+        // dial rather than short-circuiting on a missing path.
+        ws.worktree_path = Some(home.join("wt"));
+        app.workspaces.push(ws);
+        app.sessions_restored = false;
+
+        // The attach stream died at the re-exec: bare EOF, no End frame.
+        tx.send(TermEvent::Exit).expect("send exit");
+        app.drain_terminal_events();
+
+        // 1) The slot is NOT torn down — the daemon adopted the session.
+        assert!(
+            !app.workspaces[0].sessions[0].session.exited,
+            "a transport EOF on a LOCAL daemon-attached session must NOT mark \
+             the slot exited — the re-exec'd daemon adopted the PTY child",
+        );
+        // 2) Flagged reconnecting (drives the ⟳ sidebar indicator) — the row
+        //    must never look healthy while its transport is dead.
+        assert!(
+            app.reconnecting_sessions.contains("uid-local-teof"),
+            "the local session must be marked reconnecting (⟳)",
+        );
+        // 3) Requeued into the SAME deferred-reattach flow as remote rows.
+        assert_eq!(app.pending_remote_reattach.len(), 1);
+        assert_eq!(app.pending_remote_reattach[0].entry.uid, "uid-local-teof");
+        assert_eq!(app.pending_remote_reattach[0].entry.host_id, local);
+        // 4) The flag was consumed (read-and-clear).
+        assert!(!teof.load(Ordering::SeqCst));
+
+        // --- restart gap: daemon not accepting yet -----------------------
+        // Unlike a remote host (whose un-warmed tunnel gates the attempt
+        // off), the local drain attempts immediately and the dial fails
+        // (connect refused → TransportDown). The entry must stay queued and
+        // reconnecting with the give-up budget untouched.
+        app.drain_deferred_remote_reattach();
+        assert_eq!(
+            app.pending_remote_reattach.len(),
+            1,
+            "while the daemon is down the entry stays queued for retry",
+        );
+        assert_eq!(
+            app.pending_remote_reattach[0].attempts, 0,
+            "a TransportDown failure during the restart gap must not burn \
+             the give-up budget — only a daemon-confirmed NotFound counts",
+        );
+        assert!(
+            app.reconnecting_sessions.contains("uid-local-teof"),
+            "still ⟳ until the daemon comes back",
+        );
+        assert!(!app.workspaces[0].sessions[0].session.exited);
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// Regression pin for the OTHER half of the phase-5 signal: a genuine
+    /// daemon-side child exit arrives as a structured `End` frame, so the
+    /// reader never latches `transport_eof` — and a LOCAL daemon-attached
+    /// session (flag present but FALSE) must tear down exactly as today:
+    /// exited, no ⟳, no requeue. This is the distinction that makes the
+    /// EOF-without-End signature trustworthy; losing it would resurrect
+    /// genuinely-dead sessions as eternal reconnectors.
+    #[test]
+    fn local_end_frame_exit_still_marks_exited() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let (mut app, _ghost) = app_with_ghost_unix_host(&home.join(".cm"));
+        let local = cm_daemon::host_id::HostId::local();
+        // Daemon-attached shape (the Arc EXISTS) but the exit came through a
+        // structured End frame, so the flag was never latched.
+        let (mut ts, tx, _none) =
+            session_with_injected_exit("uid-local-end", local, false);
+        ts.session.daemon_transport_eof =
+            Some(Arc::new(AtomicBool::new(false)));
+        app.workspaces.push(workspace_with(ts));
+        app.sessions_restored = false;
+
+        tx.send(TermEvent::Exit).expect("send exit");
+        app.drain_terminal_events();
+
+        assert!(
+            app.workspaces[0].sessions[0].session.exited,
+            "an End-frame exit (transport_eof=false) on a local daemon-\
+             attached session must mark the slot exited as before",
+        );
+        assert!(
+            app.reconnecting_sessions.is_empty(),
+            "a genuine exit never enters the reconnect flow",
+        );
+        assert!(
+            app.pending_remote_reattach.is_empty(),
+            "a genuine exit is never requeued for reattach",
         );
 
         match orig_home {
@@ -2051,10 +2243,13 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// LOCAL sessions are completely unaffected: a child exit marks
-    /// them exited as before — no reconnect, no requeue.
-    /// `daemon_transport_eof` is `None` for local sessions, so the
-    /// transport-death branch can never fire.
+    /// TRULY-LOCAL-PTY sessions (built via `Session::new` — the gcloud
+    /// backtest watch pane, the bash fallback) are completely unaffected:
+    /// a child exit marks them exited as before — no reconnect, no requeue.
+    /// They carry no `daemon_transport_eof` Arc (`None`), so the
+    /// transport-death branch can never fire. (Daemon-attached LOCAL rows
+    /// DO carry the Arc since DESIGN_SEAMLESS_RESTART phase 5 — see
+    /// `transport_death_on_attached_local_session_reconnects_instead_of_exiting`.)
     #[test]
     fn local_session_exit_is_unaffected_by_reconnect_path() {
         let _guard = crate::test_support::home_lock();
@@ -2078,7 +2273,10 @@ mod remote_reconnect_tests {
             cm_daemon::host_id::HostId::local(),
             false,
         );
-        assert!(teof.is_none(), "local sessions carry no transport_eof flag");
+        assert!(
+            teof.is_none(),
+            "truly-local-PTY sessions carry no transport_eof flag",
+        );
         app.workspaces.push(workspace_with(ts));
         app.sessions_restored = false;
 
@@ -2499,6 +2697,77 @@ mod remote_reconnect_tests {
         );
     }
 
+    /// DESIGN_SEAMLESS_RESTART phase 5: the S5 HUP probe covers LOCAL
+    /// daemon-attached rows too. A daemon re-exec closes every attach
+    /// socket; when alacritty's EventLoop spins on the `POLLHUP` instead of
+    /// reading the EOF (so `transport_eof` never latches — the half-open
+    /// shape), the watchdog must route the local row into the reconnect
+    /// flow instead of leaving it frozen. RED before phase 5: locals were
+    /// skipped wholesale.
+    #[test]
+    fn hung_up_attach_socket_requeues_local_session_too() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, _ghost) = app_with_ghost_unix_host(&cm_dir);
+        let local = cm_daemon::host_id::HostId::local();
+
+        let (mut ts, _tx, _teof) =
+            session_with_injected_exit("uid-local-hup", local.clone(), false);
+        // Make the attach fd look hung-up: a connected pair whose peer we
+        // drop → the kept end reports POLLHUP on poll (the re-exec closing
+        // the daemon side of the attach socket).
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(b);
+        ts.session.attach_hup_fd = Some(std::os::fd::OwnedFd::from(a));
+        app.workspaces.push(workspace_with(ts));
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(
+            app.reconnecting_sessions.contains("uid-local-hup"),
+            "a hung-up LOCAL attach socket must be re-queued (⟳), not frozen",
+        );
+        assert!(
+            app.pending_remote_reattach
+                .iter()
+                .any(|p| p.entry.uid == "uid-local-hup"),
+        );
+        assert!(
+            !app.workspaces[0].sessions[0].session.exited,
+            "the slot is preserved for the rebind",
+        );
+        // Locals stay out of the tunnel-generation records (no tunnel).
+        assert!(
+            !app.attached_tunnel_generation.contains_key("uid-local-hup"),
+        );
+    }
+
+    /// A HEALTHY (still-connected) LOCAL attach socket is left alone by the
+    /// watchdog — the phase-5 extension must not blip working local rows.
+    #[test]
+    fn healthy_local_attach_socket_not_requeued_by_hup_watchdog() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, _ghost) = app_with_ghost_unix_host(&cm_dir);
+        let local = cm_daemon::host_id::HostId::local();
+
+        let (mut ts, _tx, _teof) =
+            session_with_injected_exit("uid-local-ok", local, false);
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        ts.session.attach_hup_fd = Some(std::os::fd::OwnedFd::from(a));
+        app.workspaces.push(workspace_with(ts));
+
+        app.requeue_stale_generation_remote_sessions();
+
+        assert!(!app.reconnecting_sessions.contains("uid-local-ok"));
+        assert!(app.pending_remote_reattach.is_empty());
+        drop(b); // keep the peer alive across the poll above
+    }
+
     /// A HEALTHY (still-connected) attach socket is NOT requeued by the HUP
     /// watchdog — no false teardown of a working remote session.
     #[test]
@@ -2617,8 +2886,12 @@ mod remote_reconnect_tests {
         );
     }
 
-    /// Local sessions are never touched by the generation watchdog, even if a
-    /// bogus generation is forced for the local host.
+    /// Local sessions are never touched by the GENERATION (S3) arm of the
+    /// watchdog, even if a bogus generation is forced for the local host —
+    /// there is no tunnel to go stale. (Since DESIGN_SEAMLESS_RESTART
+    /// phase 5 locals DO get the S5 HUP probe — see
+    /// `hung_up_attach_socket_requeues_local_session_too` — but this
+    /// session has no `attach_hup_fd`, so nothing fires.)
     #[test]
     fn local_session_ignored_by_generation_watchdog() {
         let _guard = crate::test_support::home_lock();
@@ -2849,6 +3122,344 @@ mod remote_reconnect_tests {
             "kill_session must cancel the queued reattach so the killed \
              session can't be resurrected on reconnect",
         );
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 5, end-to-end against REAL in-proc
+    /// daemons: an attached LOCAL session whose transport dies (a genuine
+    /// socket shutdown — bare EOF through the whole `StreamReader` stack,
+    /// no `End` frame) flips to ⟳, and the deferred-reattach drain rebinds
+    /// the slot IN PLACE against a SECOND daemon generation on the same
+    /// socket path whose fanout ring restarted at byte offset ZERO.
+    ///
+    /// Pins three things at once:
+    ///
+    ///  1. **The historic half-open bug** ("frozen remote session", the
+    ///     read-rebound-input-dead rebind): after the rebind, input written
+    ///     through the slot MUST reach the NEW daemon's PTY (write half),
+    ///     AND the new stream's output MUST render into the slot's terminal
+    ///     (read half). The rebind swaps the whole `Session` (term +
+    ///     EventLoop sender + reader) in one assignment, so both halves
+    ///     move atomically from the app's perspective — this test fails if
+    ///     either half stays wired to the dead transport.
+    ///  2. **Offset regression**: the attach stream carries NO client byte
+    ///     offset (`attach.open` sends only ticket + cols/rows; the daemon
+    ///     replays its current ring via `fanout.subscribe()`), so a
+    ///     reattach after a ring reset is a new stream by construction.
+    ///     The client consumed a HIGH offset from generation 1; generation
+    ///     2's ring restarts near zero (asserted); the reattach must
+    ///     neither error nor request from the stale offset — fresh I/O
+    ///     flows, the pre-restart scrollback gap is simply accepted.
+    ///  3. The ⟳ marker (reconnecting_sessions) is up for the whole gap —
+    ///     the row is never healthy-looking-but-dead.
+    #[test]
+    fn local_reexec_reattach_rebinds_both_halves_over_ring_reset() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        // The app's LOCAL host socket (see `app_with_ghost_unix_host`).
+        let sock = cm_dir.join("daemon.sock");
+        // The daemon validates uids against the TUI format ts-<hex>-<hex>.
+        let uid = format!("ts-{:x}-e2e", std::process::id());
+
+        let seed_state = |attach_addr: &std::path::Path, worktree: &std::path::Path| {
+            let mut s = cm_daemon::state::DaemonState::new();
+            s.attach_addr = attach_addr.to_string_lossy().into_owned();
+            s.workspaces.insert(
+                "ws-l".into(),
+                cm_daemon::manifest::ManifestWorkspace {
+                    color: None,
+                    pinned: false,
+                    id: "ws-l".into(),
+                    name: "l".into(),
+                    is_closed: false,
+                    is_cloud: false,
+                    worktree_path: Some(worktree.to_path_buf()),
+                    main_repo_path: None,
+                    repo_url: None,
+                    worker_vm: None,
+                    worker_zone: None,
+                    host_id: cm_daemon::host_id::HostId::local(),
+                    sessions: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+            );
+            std::sync::Arc::new(std::sync::Mutex::new(s))
+        };
+        fn cat_config<'a>(
+            argv: &'a [String],
+            sock: &'a std::path::Path,
+            uid: &'a str,
+            wt: &'a std::path::Path,
+        ) -> crate::client_session::ClientSessionConfig<'a> {
+            crate::client_session::ClientSessionConfig {
+                daemon_socket: sock,
+                operator_token_id: crate::daemon_launch::operator_token(),
+                uid,
+                workspace_id: "ws-l",
+                label: "reexec-e2e",
+                session_type: "bash",
+                argv,
+                working_dir: wt,
+                env: std::collections::BTreeMap::new(),
+                cols: 80,
+                rows: 24,
+                memory_cap_bytes: None,
+                memory_cap_hard_bytes: None,
+                cgroup_prefix: None,
+                cgroup_path: None,
+                worktree_path: None,
+                task_id: None,
+                transcript_path: None,
+                workflow_run_id: None,
+                workflow_role: None,
+            }
+        }
+        let argv = vec!["/bin/cat".to_string()];
+
+        // --- generation 1: spawn + attach + prove the stream is live ----
+        let state1 = seed_state(&sock, &wt);
+        let (stop1, h1) =
+            crate::app::events::pending_workflow_events_tests::spawn_inproc_daemon(
+                sock.clone(),
+                state1.clone(),
+            );
+        let session =
+            crate::session::Session::new_attached(cat_config(&argv, &sock, &uid, &wt))
+                .expect("gen-1 spawn + attach");
+
+        let (mut app, _ghost) = app_with_ghost_unix_host(&cm_dir);
+        let mut ws = workspace_with(wrap_terminal_session(
+            &uid,
+            cm_daemon::host_id::HostId::local(),
+            session,
+        ));
+        ws.worktree_path = Some(wt.clone());
+        app.workspaces.push(ws);
+        app.sessions_restored = false;
+
+        // Push 2 KiB through the gen-1 stream so (a) the stream is proven
+        // live and (b) the client-consumed byte offset lands well past
+        // where generation 2's reset ring will start.
+        app.workspaces[0].sessions[0]
+            .session
+            .write(&vec![b'A'; 2048])
+            .expect("gen-1 write");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let old_offset = loop {
+            let cur = state1
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&uid)
+                .expect("gen-1 session in registry")
+                .fanout
+                .snapshot_since(None)
+                .cursor;
+            if cur >= 2048 {
+                break cur;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gen-1 echo never arrived (fanout cursor {})",
+                cur,
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        // --- the re-exec moment: a REAL bare-EOF sever -------------------
+        // SHUT_RDWR on the dup'd attach fd (shared file description) makes
+        // the EventLoop's reads return 0 with no End frame — the exact wire
+        // signature of a daemon re-exec dropping every attach connection.
+        {
+            use std::os::fd::AsRawFd;
+            let fd = app.workspaces[0].sessions[0]
+                .session
+                .attach_hup_fd
+                .as_ref()
+                .expect("daemon-attached session keeps a hup fd")
+                .as_raw_fd();
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+        // Detection mirrors the production main-loop tick: both the S5 HUP
+        // watchdog AND the PTY-event drain run each pass. Which one fires
+        // depends on how alacritty's EventLoop observes the dead socket —
+        // reading the EOF latches `transport_eof` and emits an Exit event
+        // (the drain path); spinning on the bare `POLLHUP` without a read
+        // (the half-open shape, what this harness reliably produces) is
+        // caught by the watchdog probe on the dup'd fd. Both route into the
+        // same `requeue_remote_reconnect`.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.reconnecting_sessions.contains(&uid) {
+            if Instant::now() >= deadline {
+                let s = &app.workspaces[0].sessions[0].session;
+                panic!(
+                    "the real transport EOF never routed the local session into \
+                     the reconnect flow (debug: exited={} teof_latched={:?} hup={})",
+                    s.exited,
+                    s.daemon_transport_eof
+                        .as_ref()
+                        .map(|f| f.load(Ordering::SeqCst)),
+                    s.attach_socket_hung_up(),
+                );
+            }
+            app.requeue_stale_generation_remote_sessions();
+            app.drain_terminal_events();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !app.workspaces[0].sessions[0].session.exited,
+            "⟳ (reconnecting), never exited, across the restart gap",
+        );
+
+        // --- generation 2: same socket path, same uid, FRESH ring --------
+        stop1.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+        let _ = h1.join();
+        std::fs::remove_file(&sock).expect("unlink gen-1 socket");
+        let state2 = seed_state(&sock, &wt);
+        let (stop2, h2) =
+            crate::app::events::pending_workflow_events_tests::spawn_inproc_daemon(
+                sock.clone(),
+                state2.clone(),
+            );
+        // From the client's perspective a re-exec'd daemon that adopted its
+        // children IS "same socket path, same uid, fanout restarted at 0".
+        let argv2 = vec!["/bin/cat".to_string()];
+        let started = crate::client_session::rpc_start_session_full(&cat_config(
+            &argv2, &sock, &uid, &wt,
+        ))
+        .expect("gen-2 spawn at the same uid");
+        assert_eq!(started.session_uid, uid);
+        let reset_cursor = state2
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&uid)
+            .expect("gen-2 session in registry")
+            .fanout
+            .snapshot_since(None)
+            .cursor;
+        assert!(
+            reset_cursor < old_offset,
+            "precondition: the ring must have RESTARTED below the client's \
+             consumed offset (gen-2 cursor {} vs consumed {})",
+            reset_cursor,
+            old_offset,
+        );
+
+        // --- rebind in place ---------------------------------------------
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.reconnecting_sessions.contains(&uid) {
+            assert!(
+                Instant::now() < deadline,
+                "the deferred reattach never rebound the local slot",
+            );
+            app.drain_deferred_remote_reattach();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.pending_remote_reattach.is_empty());
+        {
+            let slot = &app.workspaces[0].sessions[0];
+            assert_eq!(slot.uid, uid, "same slot, same uid — rebind, not re-add");
+            assert!(!slot.session.exited);
+            assert_eq!(slot.status, SessionStatus::Running);
+            assert_eq!(
+                slot.session.daemon_session_uid.as_deref(),
+                Some(uid.as_str()),
+                "the slot is bound to the gen-2 daemon session",
+            );
+        }
+        assert_eq!(
+            app.workspaces[0].sessions.len(),
+            1,
+            "rebind must not duplicate the slot",
+        );
+
+        // --- historic-bug pin, WRITE half ---------------------------------
+        // Input written through the slot after the rebind must reach the
+        // GEN-2 daemon's PTY. If the input path were still wired to the
+        // dead gen-1 transport (the half-open rebind bug), zero bytes
+        // arrive and this fails.
+        let rx2 = state2
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&uid)
+            .expect("gen-2 session")
+            .fanout
+            .subscribe();
+        app.workspaces[0].sessions[0]
+            .session
+            .write(&vec![b'Z'; 128])
+            .expect("post-rebind write");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut z_count = 0usize;
+        while z_count < 128 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "HISTORIC-BUG PIN: input written after the rebind never \
+                 reached the gen-2 daemon PTY ({}/128 'Z' bytes observed) — \
+                 the write half is still wired to the dead transport",
+                z_count,
+            );
+            if let Ok(chunk) =
+                rx2.recv_timeout(remaining.min(Duration::from_millis(100)))
+            {
+                z_count += chunk.iter().filter(|&&b| b == b'Z').count();
+            }
+        }
+
+        // --- historic-bug pin, READ half ----------------------------------
+        // The gen-2 stream's echo must render into the REBOUND slot's
+        // terminal grid (the new Term + EventLoop replaced the dead pair in
+        // the same assignment).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text: String = {
+                let term = app.workspaces[0].sessions[0].session.term.lock();
+                term.renderable_content()
+                    .display_iter
+                    .map(|indexed| indexed.cell.c)
+                    .collect()
+            };
+            if text.contains("ZZZZ") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "READ-HALF PIN: the gen-2 stream's echo never rendered into \
+                 the rebound slot's terminal",
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // --- cleanup -------------------------------------------------------
+        let _ = crate::client_session::rpc_kill_session(
+            &sock,
+            crate::daemon_launch::operator_token(),
+            &uid,
+        );
+        stop2.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&sock);
+        let _ = h2.join();
+        // Dropping gen-1's orphaned DaemonSession kills its cat child
+        // (normal Drop semantics — the master fd closes → SIGHUP).
+        state1.lock().unwrap().sessions.clear();
 
         match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },

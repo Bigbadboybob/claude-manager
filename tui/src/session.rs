@@ -85,19 +85,25 @@ pub struct Session {
     /// instead.
     pub daemon_memory_cap_kill: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Latched `transport_eof` flag for daemon-attached sessions
-    /// (remote auto-reconnect). The attach-stream reader half stores
+    /// (auto-reconnect). The attach-stream reader half stores
     /// `true` here when the daemon's attach socket EOF'd WITHOUT an
-    /// `End` frame — the transport (typically the SSH tunnel) died
-    /// while the daemon-side PTY + workflow keep running. The exit
-    /// handler at `app.rs::drain_pty_events` reads-and-clears it via
+    /// `End` frame — the transport died (an SSH-tunnel drop, or the
+    /// local daemon re-exec'ing across a deploy —
+    /// DESIGN_SEAMLESS_RESTART phase 5) while the daemon-side PTY +
+    /// workflow keep running. The exit handler at
+    /// `app.rs::drain_pty_events` reads-and-clears it via
     /// `swap(false, SeqCst)` after observing
-    /// `TermEvent::Exit`/`ChildExit`; for a REMOTE session a `true`
-    /// here means "this session's I/O stream died, but the daemon
-    /// session is alive — mark it reconnecting and requeue for
-    /// reattach" instead of tearing the session slot down.
+    /// `TermEvent::Exit`/`ChildExit`; a `true` here means "this
+    /// session's I/O stream died, but the daemon session is alive —
+    /// mark it reconnecting and requeue for reattach" instead of
+    /// tearing the session slot down. Host-agnostic: local rows are
+    /// daemon-attached too, and a genuine child exit always arrives
+    /// as a structured `End` frame (flag stays false).
     ///
-    /// `None` for local-PTY sessions — a local PTY has no detachable
-    /// transport, so its exits are always genuine child exits.
+    /// `None` for truly-local-PTY sessions (built via
+    /// [`Session::new`], e.g. the gcloud backtest watch pane) — a
+    /// local PTY has no detachable transport, so its exits are
+    /// always genuine child exits.
     pub daemon_transport_eof: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// S5: a dup of the remote attach socket fd, for the main-loop HUP
     /// watchdog (`App::requeue_stale_generation_remote_sessions`). `Some` only
