@@ -86,9 +86,19 @@
 //! Deliberately OUT of scope, deferred to later phase-4 slices:
 //! - **Workflow / continuous / TUI-reattach anything** beyond what
 //!   normal startup already rebuilds from disk (phases 4–5).
-//! - **The public `daemon.restart` RPC** (phase 6). The trigger is
-//!   still the dev-gated `daemon.reexec_dev`, dispatched only when
-//!   the daemon started with `CM_REEXEC=1`.
+//! - ~~The public `daemon.restart` RPC~~ — LANDED (phase 6):
+//!   `daemon.restart` is the always-dispatched production twin of the
+//!   dev method (`control/dispatch.rs::dispatch_daemon_restart`) —
+//!   strong-operator gated, pinned-artifact target policy
+//!   ([`resolve_restart_target`]: default = the daemon's own
+//!   executable path re-resolved at RPC time, which the deploy flow
+//!   overwrites with the new binary; the same-inode case is a
+//!   WARNING, never a refusal), **no `skip_preflight`** (the P4c
+//!   deviation note — the preflight is load-bearing in production;
+//!   only the dev method keeps the escape hatch), and the manifest's
+//!   schema-v3 `reexec_generation` + `build_id` on `daemon.health`
+//!   close the fire-and-verify loop for cm-redeploy. The dev-gated
+//!   `daemon.reexec_dev` remains, unchanged, for e2e work.
 //! - **The full close-every-unlisted-inherited-fd audit** on the
 //!   rehydrate side; escrow closes exactly what it owns.
 //! - **TLS listeners.** The exec side writes `tls_listener_fd: None`.
@@ -235,16 +245,19 @@ const VERIFY_OUTPUT_CAP: usize = 2000;
 /// error says which step refused.
 ///
 /// Must be called from a context holding NO state lock and NO gate
-/// permit (see the module docs' ordering argument). The dispatch
-/// entry (`daemon.reexec_dev`) is on `RESTART_BARRIER_EXEMPT_METHODS`
-/// for the same reason: it RUNS the coordinator, so counting it as a
+/// permit (see the module docs' ordering argument). Both dispatch
+/// entries (`daemon.restart` — phase 6 — and the dev-gated
+/// `daemon.reexec_dev`) are on `RESTART_BARRIER_EXEMPT_METHODS` for
+/// the same reason: they RUN the coordinator, so counting them as a
 /// mutation would deadlock the barrier against its own caller.
 ///
 /// `skip_preflight` bypasses the phase-4c `--verify-handoff` step —
 /// a dev/test escape hatch (the e2e uses it to reach the deep abort
 /// paths, which sit BEHIND a passing preflight and are otherwise
 /// unreachable with a broken target). Production callers pass
-/// `false`.
+/// `false`; the production `daemon.restart` RPC does not even expose
+/// the parameter (the P4c deviation note) — only `daemon.reexec_dev`
+/// can reach `true`.
 pub fn perform_reexec(
     state: &Arc<Mutex<DaemonState>>,
     target: &Path,
@@ -567,6 +580,126 @@ fn open_pinned_executable(target: &Path) -> Result<OwnedFd, anyhow::Error> {
         ));
     }
     Ok(fd)
+}
+
+// ============================================================
+// Phase 6: daemon.restart target resolution (pinned-artifact policy)
+// ============================================================
+
+/// The resolved target of a `daemon.restart` call.
+pub struct RestartTarget {
+    /// The path [`perform_reexec`] will pin and exec.
+    pub path: PathBuf,
+    /// The target currently resolves to the SAME inode as the running
+    /// image (`/proc/self/exe`) — the design's deferred
+    /// new-inode ≠ rollback-inode assertion, implemented as a
+    /// **warning, not a refusal** (phase 6): a same-binary restart is
+    /// legitimate (config-adjacent state reload, post-crash
+    /// freshening), but the caller should know no code change is
+    /// taking effect. Best-effort probe (path-level stat — the real
+    /// pin happens inside [`perform_reexec`]); a probe failure reads
+    /// as `false`, never blocks the restart.
+    pub same_binary: bool,
+}
+
+/// Resolve `daemon.restart`'s target binary (phase 6's
+/// pinned-artifact policy, design § Security posture):
+///
+/// - **Default** (`binary_path` absent): the daemon's own current
+///   executable PATH, resolved via `readlink("/proc/self/exe")` at
+///   RPC time (any ` (deleted)` suffix stripped — a deploy that
+///   replaced the file leaves the link pointing at the old, unlinked
+///   inode's pathname). This default is exactly the intended deploy
+///   flow: `cargo build` / `cp` overwrite that path with the NEW
+///   binary, then `daemon.restart` opens the path and execs the new
+///   inode. Note `File::open(path)` downstream opens whatever inode
+///   the path NOW names, not the running image's.
+/// - **Caller-supplied**: must be an ABSOLUTE path to an existing
+///   regular file — anything else is refused with an error naming the
+///   constraint. (Execute permission and the deeper shape checks stay
+///   with [`perform_reexec`]'s pin, which is fd-based and
+///   TOCTOU-free; this is the cheap parameter-shape gate.)
+///
+/// Errors are plain strings for the dispatcher to wrap as
+/// `invalid_params`.
+pub fn resolve_restart_target(
+    binary_path: Option<&str>,
+) -> Result<RestartTarget, String> {
+    let path: PathBuf = match binary_path {
+        Some(p) => {
+            let p = p.trim();
+            if p.is_empty() {
+                return Err(
+                    "binary_path, when supplied, must be a non-empty \
+                     ABSOLUTE path to the binary to exec (omit it to \
+                     restart into the daemon's own executable path — \
+                     the normal deploy flow overwrites that path with \
+                     the new binary first)"
+                        .to_string(),
+                );
+            }
+            let pb = PathBuf::from(p);
+            if !pb.is_absolute() {
+                return Err(format!(
+                    "binary_path {:?} is not absolute — daemon.restart \
+                     accepts only absolute paths to a regular file \
+                     (pinned-artifact policy, DESIGN_SEAMLESS_RESTART \
+                     § Security posture)",
+                    p,
+                ));
+            }
+            pb
+        }
+        None => {
+            let link = std::fs::read_link("/proc/self/exe").map_err(|e| {
+                format!(
+                    "could not resolve the default target: \
+                     readlink(/proc/self/exe) failed: {} — pass \
+                     binary_path explicitly",
+                    e,
+                )
+            })?;
+            // A replaced-on-disk binary leaves the link reading
+            // "<path> (deleted)"; the PATH half is what the deploy
+            // flow overwrote with the new artifact.
+            let s = link.to_string_lossy();
+            match s.strip_suffix(" (deleted)") {
+                Some(stripped) => PathBuf::from(stripped),
+                None => PathBuf::from(s.into_owned()),
+            }
+        }
+    };
+
+    let st = std::fs::metadata(&path).map_err(|e| {
+        format!(
+            "restart target {} is not usable: {} — the target must be \
+             an existing regular file (did the deploy actually land \
+             the new binary there?)",
+            path.display(),
+            e,
+        )
+    })?;
+    if !st.is_file() {
+        return Err(format!(
+            "restart target {} is not a regular file",
+            path.display(),
+        ));
+    }
+
+    // Same-inode probe against the RUNNING image. /proc/self/exe
+    // opens the original inode even after a deploy overwrote the
+    // path, so dev+ino equality means "this restart execs the code
+    // already running". Best-effort — warning-grade only.
+    let same_binary = File::open("/proc/self/exe")
+        .ok()
+        .and_then(|f| f.metadata().ok())
+        .map(|self_md| {
+            use std::os::unix::fs::MetadataExt as _;
+            self_md.dev() == st.dev() && self_md.ino() == st.ino()
+        })
+        .unwrap_or(false);
+
+    Ok(RestartTarget { path, same_binary })
 }
 
 // ============================================================
@@ -1327,6 +1460,11 @@ fn build_manifest(
         // Written as 0 and read back by the new image; the rollback
         // attempt state machine that ACTS on it is phase-4 scope.
         attempt: 0,
+        // Phase 6 (schema v3): the generation this handoff BECOMES if
+        // it commits — our own lineage + 1. Stamped onto the new
+        // image's state by the rehydrate commit; a rollback exec
+        // carries it unchanged (one restart attempt = one generation).
+        reexec_generation: st.reexec_generation + 1,
         rollback_bin_fd: rollback_fd.as_raw_fd(),
         sessions,
         listener_fd,
@@ -2753,6 +2891,16 @@ fn rehydrate_transaction(
             }
         }
     }
+    // Phase 6 (schema v3): the handoff COMMITTED — stamp the
+    // manifest's lineage counter onto this image's state, where
+    // `daemon.health` serves it as `reexec_generation`. Inside the
+    // same lock hold as the arms above, so no health poll can observe
+    // adopted sessions with a stale generation. Every failure path
+    // returned before this line, and the terminal fallback never runs
+    // this transaction — a fallback boot stays generation 0 (it IS a
+    // fresh boot: children killed, legacy restore).
+    st.reexec_generation = manifest.reexec_generation;
+
     Ok(AdoptStats {
         adopted,
         tombstoned,
@@ -2857,6 +3005,12 @@ fn rollback_exec(escrow: &HandoffEscrow, next_attempt: u8) -> anyhow::Error {
     let new_manifest = ReexecManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         attempt: next_attempt,
+        // Phase 6: the generation rides UNCHANGED through a rollback —
+        // it counts committed handoffs, not execs, and this restart
+        // attempt (however many execs its ladder takes) is one
+        // generation. The rollback image's commit stamps the same
+        // value the forward image would have.
+        reexec_generation: m.reexec_generation,
         rollback_bin_fd: escrow.rollback_fd.as_raw_fd(),
         sessions: m.sessions.clone(),
         listener_fd: m.listener_fd,

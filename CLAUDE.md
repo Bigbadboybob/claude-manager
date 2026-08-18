@@ -8,6 +8,17 @@ Task orchestration system for planning and running Claude coding sessions. Prima
 
 - **`tui/`** — Rust TUI client. The user-facing entry point. Workflow orchestration, planning board rendering, API communication, and the attach-stream side of session I/O. Build with `cargo build --workspace` (the TUI binary lives in `tui/` and depends on `daemon/`).
 - **`daemon/`** — `cm-daemon`, the persistent host daemon. Owns session PTY lifecycle, manifest, manifest.watch broadcasts, workflow state, and the control-socket dispatcher. The TUI launches it automatically at startup if it isn't already running; mandatory since slice 10f (Phase 1's default flip).
+
+  **Restarting the daemon** (decision table, DESIGN_SEAMLESS_RESTART phase 6 — pick the weakest primitive that covers the change):
+
+  | Change | Primitive | Sessions |
+  |---|---|---|
+  | Config value (`mcp_server_path`, `api_*`, `notify_command`, …) | `daemon.reload_config` RPC or `kill -HUP` | untouched |
+  | Daemon code | `daemon.restart` (in-place re-exec) via `scripts/cm-redeploy` — the default path | untouched — never signaled; attach streams blip and auto-reattach |
+  | Re-exec machinery itself / a manifest-schema bump | `scripts/cm-redeploy --hard` (drain → legacy kill+restart) | killed deliberately, resumed from spawn-pinned stamps (codex: at most one ~5s rollout-observation interval stale) |
+  | Machine reboot | startup-restore | die, resume from pinned stamps (same codex caveat) |
+
+  `daemon.restart` is strong-operator gated (fails CLOSED when the daemon started without `CM_OPERATOR_TOKEN` — the TUI sets it and persists the token at `~/.cm/operator-token`, which cm-redeploy reads) and refuses on `[tls]`-configured daemons (listener handoff unimplemented — use the `--hard` row there). Verification is fire-and-verify: the RPC connection dies at the exec, so cm-redeploy polls `daemon.health` for the `reexec_generation` increment (proof the swap committed — `build_id` can't move on a same-commit rebuild) and asserts the session count and MCP preflight survived.
 - **`workflows/`** — TOML definitions for multi-agent workflows (e.g. `feedback.toml`). Loaded at TUI startup; each defines roles, transitions, and activation prompts. See the Workflows section below.
 - **`mcp_server/`** — MCP server exposing tools that agents running inside the TUI can call:
   - `propose_task(...)` — push a task to the planning backlog. When the proposer is a tasked session, the daemon records a creator edge (`DaemonState::agent_task_edges`, surviving TUI `task.update_tree` pushes and daemon restarts) so the proposer can `start_session(task_id=<proposed>)` and drive the worker it spawns — pre-fix every such spawn bounced `unauthorized: task '<id>' is not the caller's task or a descendant` (the "phantom task each attempt" bug). A proposed task has no worktree; `start_session` **mints** it one (see below) rather than spawning the worker in the creator's workspace.

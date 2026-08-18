@@ -675,6 +675,20 @@ pub struct DaemonState {
     /// (which a later `setenv` anywhere in-process could flip).
     /// `false` = the method answers exactly like any unknown method.
     pub reexec_enabled: bool,
+    /// DESIGN_SEAMLESS_RESTART phase 6 (restart-sequence step 7): the
+    /// re-exec handoff lineage counter. `0` on a fresh boot (and after
+    /// a terminal-fallback boot — that path killed the children and
+    /// ran legacy restore, so it is a fresh boot in every way that
+    /// matters); on a COMMITTED handoff the rehydrate transaction
+    /// stamps the manifest's `reexec_generation` here (the old image
+    /// wrote its own value + 1 into the manifest at build time, and a
+    /// rollback exec carries the value unchanged — one restart
+    /// attempt is one generation no matter how many execs the ladder
+    /// took). Surfaced on `daemon.health` beside `build_id`:
+    /// cm-redeploy's fire-and-verify polls for the increment, which —
+    /// unlike `build_id`, unchanged across a same-commit rebuild — is
+    /// proof the swap actually committed.
+    pub reexec_generation: u64,
 }
 
 /// 10d-1: TUI-side view of a single session. Carried by the
@@ -786,6 +800,7 @@ impl Default for DaemonState {
             ),
             listener_raw_fd: None,
             reexec_enabled: false,
+            reexec_generation: 0,
         }
     }
 }

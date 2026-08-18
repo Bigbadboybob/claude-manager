@@ -828,8 +828,17 @@ struct Sandbox {
 
 /// Spawn the real daemon with the sandbox environment plus
 /// `extra_env` (the fail knob), verify its /proc environ carries the
-/// tempdir HOME, and wait for health.
+/// tempdir HOME, and wait for health. Sets the `CM_REEXEC=1` dev
+/// flag — the shape every ladder test wants.
 fn spawn_sandbox(extra_env: &[(&str, &str)]) -> Sandbox {
+    spawn_sandbox_with(extra_env, true)
+}
+
+/// [`spawn_sandbox`]'s general form: `dev_flag: false` spawns a
+/// PRODUCTION-shaped daemon (no `CM_REEXEC` anywhere in its env) —
+/// what the phase-6 `daemon.restart` e2e needs, since the production
+/// method must dispatch without the dev gate.
+fn spawn_sandbox_with(extra_env: &[(&str, &str)], dev_flag: bool) -> Sandbox {
     let bin = env!("CARGO_BIN_EXE_cm-daemon");
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
@@ -850,7 +859,6 @@ fn spawn_sandbox(extra_env: &[(&str, &str)]) -> Sandbox {
     cmd.env_clear()
         .env("HOME", &home)
         .env("CM_DAEMON_SOCKET", &socket)
-        .env("CM_REEXEC", "1")
         .env("CM_OPERATOR_TOKEN", &token)
         .env(
             "PATH",
@@ -860,6 +868,9 @@ fn spawn_sandbox(extra_env: &[(&str, &str)]) -> Sandbox {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_for_stderr));
+    if dev_flag {
+        cmd.env("CM_REEXEC", "1");
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -2052,6 +2063,260 @@ fn reexec_full_record_and_dead_record_tombstone() {
             &sb.token,
             "kill_session",
             serde_json::json!({ "session_uid": uid_a }),
+        ),
+    );
+}
+
+// ===================================================================
+// Phase 6: the PRODUCTION `daemon.restart` RPC — the always-dispatched
+// twin of `daemon.reexec_dev` (strong-operator gated, pinned-artifact
+// target policy, NO skip_preflight) plus the fire-and-verify pair on
+// `daemon.health` (`build_id` + `reexec_generation`, design step 7).
+// ===================================================================
+
+/// Extract `(reexec_generation, build_id)` from a daemon.health
+/// response.
+fn health_generation_and_build_id(socket: &Path, token: &str) -> Option<(u64, String)> {
+    let resp = round_trip(
+        socket,
+        &operator_request(token, "daemon.health", serde_json::json!({})),
+    )
+    .ok()
+    .filter(|r| r.ok)?;
+    let result = resp.result?;
+    Some((
+        result.get("reexec_generation")?.as_u64()?,
+        result.get("build_id")?.as_str()?.to_string(),
+    ))
+}
+
+/// The phase-6 e2e: a PRODUCTION-shaped sandbox daemon (no CM_REEXEC
+/// dev flag anywhere in its env) is swapped via `daemon.restart` with
+/// the operator token, and the verify contract proves it:
+///
+///   * pre-swap health: `strong_operator_auth: true` (the RPC's
+///     precondition, checkable up front by cm-redeploy),
+///     `reexec_generation: 0` (fresh boot), `build_id` present and
+///     shaped `<version>+<sha>`;
+///   * the fire answers NOTHING — the connection dies at the exec
+///     (production fire-and-verify, same as dev);
+///   * post-swap health: `reexec_generation: 1` (the committed
+///     handoff stamped the manifest's counter — THE proof the swap
+///     landed, since a same-artifact restart can't move `build_id`),
+///     `build_id` unchanged (same binary on both sides);
+///   * the daemon log carries the `same_binary: true` warning — the
+///     target IS the running image's inode here, which phase 6 treats
+///     as warning-not-refusal (config-adjacent restarts are
+///     legitimate; the operator just learns no code changed);
+///   * and the full continuity matrix still holds: same daemon PID
+///     through the exec, same live bash child (pid, starttime, ppid),
+///     same session uid non-exited, POST markers drain through the
+///     adopted reader.
+#[test]
+fn daemon_restart_rpc_generation_and_continuity() {
+    let bin = env!("CARGO_BIN_EXE_cm-daemon");
+    // dev_flag: false — the production method must dispatch without
+    // CM_REEXEC (the load-bearing difference from reexec_dev).
+    let mut sb = spawn_sandbox_with(&[], false);
+    let uid = "ts-e2e6-1";
+    let (bash_pid, bash_start) = start_bash_session(&mut sb, uid);
+
+    // Pre-swap: the fire-and-verify baseline.
+    let health = round_trip(
+        &sb.socket,
+        &operator_request(&sb.token, "daemon.health", serde_json::json!({})),
+    )
+    .expect("pre-swap health");
+    let hr = health.result.expect("health result");
+    assert_eq!(
+        hr["strong_operator_auth"],
+        serde_json::json!(true),
+        "sandbox daemon has CM_OPERATOR_TOKEN — the RPC precondition holds"
+    );
+    let (gen_before, build_before) =
+        health_generation_and_build_id(&sb.socket, &sb.token)
+            .expect("pre-swap generation/build_id");
+    assert_eq!(gen_before, 0, "fresh boot is generation 0");
+    assert!(
+        build_before.contains('+') && !build_before.is_empty(),
+        "build_id is <version>+<sha>: {}",
+        build_before
+    );
+    println!(
+        "phase-6 e2e pre-swap: daemon pid {} | bash pid {} (starttime {}) | \
+         generation {} | build_id {}",
+        sb.daemon_pid, bash_pid, bash_start, gen_before, build_before
+    );
+
+    // Fire the PRODUCTION RPC. Success = the connection dies at the
+    // exec with no response.
+    let fired = fire_expect_drop(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "daemon.restart",
+            serde_json::json!({ "binary_path": bin }),
+        ),
+    );
+    if let Some(resp) = fired {
+        panic!(
+            "daemon.restart answered instead of exec'ing: {:?}\n--- daemon \
+             log tail ---\n{}",
+            resp,
+            sb.guard.log_tail()
+        );
+    }
+
+    // Verify: poll health until the GENERATION increments — the
+    // signal cm-redeploy keys on (build_id can't move on a
+    // same-artifact swap).
+    let post_deadline = Instant::now() + Duration::from_secs(60);
+    let (gen_after, build_after) = {
+        let socket = sb.socket.clone();
+        let token = sb.token.clone();
+        wait_for(
+            post_deadline,
+            "daemon.health with reexec_generation 1 after daemon.restart",
+            &sb.guard,
+            || {
+                health_generation_and_build_id(&socket, &token)
+                    .filter(|(g, _)| *g > 0)
+            },
+        )
+    };
+    assert_eq!(
+        gen_after, 1,
+        "exactly one committed handoff must read generation 1"
+    );
+    assert_eq!(
+        build_after, build_before,
+        "same artifact on both sides of the swap — build_id must not move"
+    );
+
+    // Same process through the exec.
+    assert!(
+        matches!(sb.guard.daemon.try_wait(), Ok(None)),
+        "daemon process (pid {}) exited across daemon.restart.\n--- daemon \
+         log tail ---\n{}",
+        sb.daemon_pid,
+        sb.guard.log_tail()
+    );
+
+    // The handoff genuinely ran, through the PRODUCTION method: the
+    // dispatch log line carries the resolved target + the same-binary
+    // warning (the target inode IS the running image's here), the
+    // preflight PASSed (no skip_preflight exists on this method), and
+    // the adoption committed.
+    let log = std::fs::read_to_string(&sb.log_path).unwrap_or_default();
+    for needle in [
+        "cm-daemon: daemon.restart — target",
+        "same_binary: true",
+        "re-exec preflight PASS",
+        "adopted 1/1 session(s)",
+    ] {
+        assert!(
+            log.contains(needle),
+            "daemon log missing {:?}.\n--- daemon log tail ---\n{}",
+            needle,
+            sb.guard.log_tail()
+        );
+    }
+
+    // Continuity matrix, same as the skeleton test.
+    assert_eq!(
+        proc_starttime(bash_pid),
+        Some(bash_start),
+        "bash child pid {} is gone or recycled across daemon.restart",
+        bash_pid
+    );
+    assert_eq!(
+        proc_ppid(bash_pid),
+        Some(sb.daemon_pid),
+        "bash child pid {} is no longer parented to the daemon",
+        bash_pid
+    );
+    let sessions = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "list_sessions",
+            serde_json::json!({ "include_exited": true }),
+        ),
+    )
+    .expect("list_sessions after daemon.restart");
+    let rows = sessions
+        .result
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .expect("list_sessions array");
+    let row = rows
+        .iter()
+        .find(|r| r.get("session_uid").and_then(|v| v.as_str()) == Some(uid))
+        .unwrap_or_else(|| {
+            panic!(
+                "session '{}' missing post-swap: {}\n--- daemon log tail \
+                 ---\n{}",
+                uid,
+                serde_json::to_string_pretty(rows).unwrap_or_default(),
+                sb.guard.log_tail()
+            )
+        });
+    assert_ne!(
+        row.get("state").and_then(|v| v.as_str()),
+        Some("exited"),
+        "adopted session reads as exited: {}",
+        row
+    );
+    let send = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "send_input",
+            serde_json::json!({
+                "session_uid": uid,
+                "text": "for i in $(seq 1 50); do echo POST-$i; done",
+                "submit": true
+            }),
+        ),
+    )
+    .expect("send_input POST");
+    assert!(send.ok, "send_input POST failed: {:?}", send.error);
+    {
+        let socket = sb.socket.clone();
+        let token = sb.token.clone();
+        wait_for(
+            Instant::now() + Duration::from_secs(20),
+            "POST-50 in post-swap output",
+            &sb.guard,
+            || {
+                let resp = round_trip(
+                    &socket,
+                    &operator_request(
+                        &token,
+                        "read_session_output",
+                        serde_json::json!({ "session_uid": uid }),
+                    ),
+                )
+                .ok()?;
+                output_text(&resp).filter(|t| t.contains("POST-50"))
+            },
+        );
+    }
+
+    println!(
+        "phase-6 e2e post-swap: daemon pid {} unchanged | generation {} -> {} \
+         | build_id {} (unchanged, same artifact) | bash pid {} alive \
+         (starttime {} unchanged) | POST-50 drained via adopted reader",
+        sb.daemon_pid, gen_before, gen_after, build_after, bash_pid, bash_start
+    );
+
+    // Teardown through the daemon so the reaper path runs.
+    let _ = round_trip(
+        &sb.socket,
+        &operator_request(
+            &sb.token,
+            "kill_session",
+            serde_json::json!({ "session_uid": uid }),
         ),
     );
 }

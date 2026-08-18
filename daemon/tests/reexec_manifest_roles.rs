@@ -155,6 +155,7 @@ impl RealFds {
         ReexecManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             attempt: 0,
+            reexec_generation: 1,
             rollback_bin_fd: self.rollback.as_raw_fd(),
             sessions: vec![SessionRecord {
                 uid: "roles-test".into(),

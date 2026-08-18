@@ -40,6 +40,7 @@ fn minimal_manifest() -> ReexecManifest {
     ReexecManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         attempt: 0,
+        reexec_generation: 1,
         rollback_bin_fd: 10,
         sessions: vec![],
         listener_fd: 11,

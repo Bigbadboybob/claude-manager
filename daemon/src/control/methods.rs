@@ -3299,6 +3299,19 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         // refusal.
         "strong_operator_auth":
             crate::control::operator::strong_operator_auth_configured(),
+        // DESIGN_SEAMLESS_RESTART phase 6 (restart-sequence step 7):
+        // the fire-and-verify pair. `daemon.restart`'s success case
+        // never answers (the connection dies at the exec), so the
+        // caller polls THESE: `build_id` is the compile-time identity
+        // (crate version + git short sha — unchanged across a
+        // same-commit rebuild, see `cm_daemon::build_id`), and
+        // `reexec_generation` is the handoff lineage counter — 0 on a
+        // fresh boot, stamped from the sealed manifest by every
+        // COMMITTED rehydrate — whose strict increment is the proof a
+        // swap actually landed. cm-redeploy verifies on the
+        // generation and reports the build_id transition.
+        "build_id": crate::build_id(),
+        "reexec_generation": state.reexec_generation,
     }))
 }
 
@@ -15255,6 +15268,41 @@ mod tests {
                 "configured token validation must read as strong",
             );
         }
+    }
+
+    /// DESIGN_SEAMLESS_RESTART phase 6 (restart-sequence step 7):
+    /// `daemon.health` carries the fire-and-verify pair. `build_id`
+    /// is the compile-time identity (crate version + git sha, never
+    /// empty — the build.rs fallback is the literal "unknown", not
+    /// ""), and `reexec_generation` is 0 on a fresh boot and reflects
+    /// the state cell a committed rehydrate stamps.
+    #[test]
+    fn daemon_health_reports_build_id_and_reexec_generation() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let h = daemon_health(&state).expect("health ok");
+        let build_id = h["build_id"].as_str().expect("build_id is a string");
+        assert!(!build_id.is_empty(), "build_id must not be empty");
+        assert_eq!(
+            build_id,
+            crate::build_id(),
+            "health serves the compile-time identity verbatim"
+        );
+        assert!(
+            build_id.contains('+'),
+            "build_id is <version>+<sha>: {}",
+            build_id
+        );
+        assert_eq!(
+            h["reexec_generation"],
+            json!(0),
+            "a fresh boot is generation 0"
+        );
+
+        // A committed rehydrate stamps the manifest's counter onto
+        // state; health serves whatever the cell holds.
+        state.lock().unwrap().reexec_generation = 3;
+        let h = daemon_health(&state).expect("health ok");
+        assert_eq!(h["reexec_generation"], json!(3));
     }
 
     #[test]

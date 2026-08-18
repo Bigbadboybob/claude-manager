@@ -88,6 +88,23 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+/// Compile-time build identity: `<crate version>+<git short sha>`
+/// (sha `unknown` when the build ran without git — see
+/// `daemon/build.rs` for the honesty rules).
+///
+/// DESIGN_SEAMLESS_RESTART phase 6, restart-sequence step 7:
+/// surfaced on `daemon.health` as `build_id` so `daemon.restart`'s
+/// fire-and-verify contract has a compile-time identity to poll for
+/// — the caller's connection dies at the exec, so "did the new code
+/// actually take over?" is answerable only by asking the (possibly
+/// new) image what it was built from. Note two builds of the SAME
+/// commit share a build_id (a dirty-tree rebuild doesn't move the
+/// sha); `reexec_generation` is the per-swap monotonic signal —
+/// cm-redeploy verifies on that and only reports this.
+pub fn build_id() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("CM_BUILD_GIT_HASH"))
+}
+
 /// Resolve the daemon socket path.
 ///
 /// Resolution order:

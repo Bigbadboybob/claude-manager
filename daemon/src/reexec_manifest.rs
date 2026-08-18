@@ -115,7 +115,14 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// field docs). The supported set stays a SINGLETON — no deployed v1
 /// writer exists (the skeleton never shipped), so there is nothing
 /// to stay compatible with and a v1 manifest is honestly refused.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (DESIGN_SEAMLESS_RESTART phase 6): [`ReexecManifest`] grew
+/// `reexec_generation` — the handoff lineage counter `daemon.health`
+/// surfaces for cm-redeploy's fire-and-verify (restart-sequence step
+/// 7). Same singleton discipline: nothing pre-phase-6 ever deployed a
+/// v2 writer, so a v2 manifest is honestly refused rather than
+/// compatibility-shimmed.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Hard cap on the manifest file's TOTAL size (envelope included).
 /// Enforced on both sides: at write time (a coordinator bug fails
@@ -176,6 +183,17 @@ pub struct ReexecManifest {
     /// fallback). Lives HERE, inside the sealed manifest, so it
     /// cannot be looped by env alone (R8).
     pub attempt: u8,
+    /// Handoff lineage counter (schema v3, phase 6): the generation
+    /// this handoff BECOMES if it commits. The write side stamps its
+    /// own `DaemonState::reexec_generation` + 1; the rollback exec
+    /// carries the value UNCHANGED (one restart attempt is one
+    /// generation, however many execs the ladder takes); the
+    /// rehydrate commit copies it onto the new image's state, where
+    /// `daemon.health` serves it. A fresh boot — terminal fallback
+    /// included — is generation 0. Counts committed handoffs, not
+    /// execs, so cm-redeploy's "did the swap land?" poll can key on a
+    /// strict increment.
+    pub reexec_generation: u64,
     /// The pinned OLD executable (`/proc/self/exe` opened at restart
     /// time, step 1 — an inode, not a pathname, because deploys
     /// overwrite the path; R7). Validated as a regular file with
@@ -1251,6 +1269,7 @@ mod tests {
         ReexecManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             attempt: 1,
+            reexec_generation: 7,
             rollback_bin_fd: 10,
             sessions: vec![
                 SessionRecord {

@@ -1,32 +1,47 @@
 #!/usr/bin/env bash
 #
-# cm-redeploy — rebuild workspace, kill running daemon + TUI, start fresh daemon.
+# cm-redeploy — rebuild the workspace, then get the daemon onto the new
+# binary. Two paths (DESIGN_SEAMLESS_RESTART phase 6):
 #
-# The mistake this protects against: `cargo build --release` produces a new
-# binary on disk, but the running cm-daemon process keeps using the in-memory
-# code it loaded at its start time. Until you kill + restart the daemon, none
-# of your code changes are actually live. This is easy to forget because
-# nothing about a normal interaction tells you you're on stale code.
+#   DEFAULT (seamless): call the `daemon.restart` RPC — an in-place
+#   re-exec. Hosted sessions are NEVER killed and the TUI stays up (its
+#   attach streams blip and auto-reattach — phase 5). Requires a daemon
+#   that (a) serves daemon.restart (its daemon.health carries `build_id`)
+#   and (b) has strong operator auth configured (CM_OPERATOR_TOKEN was set
+#   on the daemon's spawn env — the TUI does this, persisting the token at
+#   ~/.cm/operator-token; daemon.restart fails CLOSED without it).
+#   Verification is fire-and-verify: the RPC connection dies at the exec,
+#   so this script polls daemon.health until `reexec_generation`
+#   increments (build_id can't move on a same-commit rebuild, so the
+#   generation is the authoritative "the swap landed" signal), then
+#   asserts the session count survived and the MCP preflight passed.
 #
-# What this script does:
-#   1. `cargo build --release --workspace` from the repo root.
-#   2. Compares the new cm-daemon binary's mtime to the running daemon's
-#      start time. Bails early if nothing actually needs reloading.
-#   3. Shows the kill list (daemon PID + every child PTY) so you can see
-#      exactly what's about to die before confirming.
-#   4. SIGTERM-then-SIGKILL the TUI and daemon. Sessions die — that's
-#      the cost of loading new daemon code.
-#   5. Starts the new daemon detached (setsid + nohup so it survives the
-#      shell exit), logs to ~/.cm/daemon.log.
-#   6. Prints the TUI launch command for you to run in your interactive
-#      terminal (we can't start the TUI from a script — it needs your tty).
+#   --hard (legacy): the old kill-everything flow, verbatim — drain, kill
+#   TUI + daemon (sessions die), start a fresh daemon detached, smoke-test
+#   it. Use for re-exec-machinery changes or manifest-schema bumps (see
+#   CLAUDE.md's "Restarting the daemon" decision table), or when the
+#   seamless path explains that it can't run.
+#
+# The mistake this protects against: `cargo build --release` produces a
+# new binary on disk, but the running cm-daemon keeps using the in-memory
+# code it loaded at its start time. Until it re-execs (seamless) or is
+# restarted (--hard), none of your code changes are live.
 #
 # Usage:
-#   scripts/cm-redeploy            # interactive confirm, local only
-#   scripts/cm-redeploy --yes      # skip confirm (CI / cron / autonomous use)
-#   scripts/cm-redeploy --dry      # show what would happen, don't kill anything
-#   scripts/cm-redeploy --manager  # ALSO deploy the built daemon to cm-manager
-#                                  # (restarts the prod daemon; confirms unless --yes)
+#   scripts/cm-redeploy            # seamless restart; falls back to the
+#                                  # legacy flow with a loud explanation
+#                                  # when the daemon can't do it
+#   scripts/cm-redeploy --hard     # legacy kill-everything flow
+#   scripts/cm-redeploy --yes      # skip confirms (CI / autonomous use)
+#   scripts/cm-redeploy --dry      # show what would happen, change nothing
+#   scripts/cm-redeploy --manager  # ALSO deploy the built daemon to
+#                                  # cm-manager (restarts the prod daemon;
+#                                  # confirms unless --yes)
+#
+# Env: CM_DAEMON_SOCKET overrides the daemon socket (default
+# ~/.cm/daemon.sock — the override is how a sandbox daemon is targeted);
+# CM_OPERATOR_TOKEN overrides the operator token (default: read from
+# ~/.cm/operator-token, the file the TUI generates at first launch).
 
 set -euo pipefail
 
@@ -50,6 +65,28 @@ DAEMON_BINARY="$TARGET_DIR/release/cm-daemon"
 TUI_BINARY="$TARGET_DIR/release/claude-manager-tui"
 DAEMON_LOG="$HOME/.cm/daemon.log"
 
+# The daemon control socket. Overridable so the script can be driven
+# against a sandbox daemon (never point this at a socket you don't own).
+SOCKET="${CM_DAEMON_SOCKET:-$HOME/.cm/daemon.sock}"
+
+# Operator token: the daemon validates Caller::Operator frames against the
+# CM_OPERATOR_TOKEN it was started with. The TUI generates that token and
+# persists it at ~/.cm/operator-token (0600) exactly so that later
+# processes — this script — can authenticate against the running daemon.
+# Same sourcing order here: explicit env first, then the persisted file.
+# HAVE_TOKEN records whether we found a REAL token (the strong-auth gate
+# on daemon.restart needs one); compat daemons with validation disabled
+# accept any token_id, so a recognizable placeholder rides otherwise.
+OP_TOKEN="${CM_OPERATOR_TOKEN:-}"
+HAVE_TOKEN=0
+if [ -n "$OP_TOKEN" ]; then
+    HAVE_TOKEN=1
+elif [ -f "$HOME/.cm/operator-token" ]; then
+    OP_TOKEN=$(tr -d '[:space:]' < "$HOME/.cm/operator-token" || true)
+    [ -n "$OP_TOKEN" ] && HAVE_TOKEN=1
+fi
+[ -n "$OP_TOKEN" ] || OP_TOKEN="cm-redeploy"
+
 # Remote daemon host (the always-on cm-manager VM). Deploying there is
 # gated behind --manager because it restarts the prod cm-daemon, which
 # kills any sessions running on it. Resolved via ~/.ssh/config alias.
@@ -59,13 +96,15 @@ MANAGER_REMOTE_BINARY="/opt/cm-daemon/cm-daemon"
 YES=0
 DRY=0
 MANAGER=0
+HARD=0
 for arg in "$@"; do
     case "$arg" in
         --yes|-y) YES=1 ;;
         --dry|--dry-run) DRY=1 ;;
         --manager|-m) MANAGER=1 ;;
+        --hard) HARD=1 ;;
         --help|-h)
-            sed -n '3,30p' "$0"
+            sed -n '/^# cm-redeploy/,/^set -euo/p' "$0" | sed '$d;s/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -77,6 +116,97 @@ for arg in "$@"; do
 done
 
 step() { printf '\n=== %s ===\n' "$1"; }
+
+# Operator RPC helper (4-byte-BE-length JSON framing). Prints the raw JSON
+# response; non-zero exit = socket-level failure (daemon down / socket
+# missing). Sends the real operator token so a daemon with strong auth
+# configured accepts the frame.
+cm_op_call() {
+    python3 - "$SOCKET" "$OP_TOKEN" "$1" "$2" <<'PY' 2>/dev/null
+import json, os, socket, struct, sys
+sock, token, method, params = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+body = json.dumps({"id": os.urandom(8).hex(),
+                   "caller": {"token_id": token},
+                   "method": method, "params": params}).encode()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5.0)
+s.connect(sock)
+try:
+    s.sendall(struct.pack(">I", len(body)) + body)
+    raw = b""
+    while len(raw) < 4:
+        chunk = s.recv(4 - len(raw))
+        if not chunk:
+            raise OSError("eof")
+        raw += chunk
+    (n,) = struct.unpack(">I", raw)
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError("eof")
+        buf += chunk
+finally:
+    s.close()
+print(buf.decode())
+PY
+}
+
+# Fire-and-verify variant for daemon.restart: the SUCCESS case never
+# answers — the connection dies at the exec — so EOF-after-send is the
+# in-progress signal, printed as {"fired": true}. A full response means
+# the daemon refused inline (and restored itself); it is printed verbatim.
+# Non-zero exit = could not even connect/send.
+cm_op_fire() {
+    python3 - "$SOCKET" "$OP_TOKEN" "$1" "$2" <<'PY' 2>/dev/null
+import json, os, socket, struct, sys
+sock, token, method, params = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+body = json.dumps({"id": os.urandom(8).hex(),
+                   "caller": {"token_id": token},
+                   "method": method, "params": params}).encode()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(90.0)  # the preflight subprocess can take a while
+s.connect(sock)
+try:
+    s.sendall(struct.pack(">I", len(body)) + body)
+    raw = b""
+    try:
+        while len(raw) < 4:
+            chunk = s.recv(4 - len(raw))
+            if not chunk:
+                raise OSError("eof")
+            raw += chunk
+        (n,) = struct.unpack(">I", raw)
+        buf = b""
+        while len(buf) < n:
+            chunk = s.recv(n - len(buf))
+            if not chunk:
+                raise OSError("eof")
+            buf += chunk
+    except OSError:
+        # Connection died without a response: the exec happened (or is
+        # happening). This is the expected success shape.
+        print(json.dumps({"fired": True}))
+        sys.exit(0)
+finally:
+    s.close()
+print(buf.decode())
+PY
+}
+
+# Tiny JSON field extractors over a response captured in $1.
+resp_field() {  # $1 = json, $2 = python expression over d (the parsed dict)
+    printf '%s' "$1" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+v = $2
+print('' if v is None else v)
+" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
 
 step "cargo build --release --workspace"
 if [ "$DRY" = "1" ]; then
@@ -90,10 +220,10 @@ if [ ! -x "$DAEMON_BINARY" ]; then
     exit 1
 fi
 
-# Deploy to the remote manager daemon BEFORE the local-daemon freshness
-# check below (which may early-exit when the local daemon is already
-# current). The remote deploy depends only on the freshly-built binary,
-# not on local daemon state. Same arch (linux x86_64) as the VM.
+# Deploy to the remote manager daemon BEFORE the local flow below (which
+# may early-exit when the local daemon is already current). The remote
+# deploy depends only on the freshly-built binary, not on local daemon
+# state. Same arch (linux x86_64) as the VM.
 if [ "$MANAGER" = "1" ]; then
     step "deploy daemon to $MANAGER_SSH_HOST"
     if [ "$DRY" = "1" ]; then
@@ -125,218 +255,200 @@ fi
 DAEMON_BIN_MTIME=$(stat -c %Y "$DAEMON_BINARY")
 DAEMON_BIN_HUMAN=$(date -d "@$DAEMON_BIN_MTIME" '+%Y-%m-%d %H:%M:%S')
 
-step "current daemon state"
-# Path-agnostic on purpose. These used to anchor on "/target/release/…",
-# which silently stopped matching when the build moved to a shared
-# target-dir: the TUI launches the daemon from
-# ~/.cm/shared-target/release/cm-daemon, and the "-" before "target" kills
-# the match. The failure mode was nasty — no daemon found, so the
-# freshness check and kill-list preview were both skipped, the TUI was
-# killed anyway (its pattern still matched), and the "fresh" daemon then
-# died on bind because the stale one still owned the socket. Net: TUI
-# dead, stale daemon still serving, no code reloaded.
-DAEMON_PID=$(pgrep -f "release/cm-daemon$" | head -1 || true)
-if [ -z "$DAEMON_PID" ]; then
-    # Nothing matched — but is the socket actually free? If something is
-    # still listening we'd kill the TUI and then fail on bind, which is
-    # exactly the damage described above. Bail while it's still cheap.
-    if [ -S "$HOME/.cm/daemon.sock" ] && command -v ss >/dev/null 2>&1 \
-        && ss -lx 2>/dev/null | grep -q "$HOME/.cm/daemon.sock"; then
-        echo "ERROR: no cm-daemon process matched, but $HOME/.cm/daemon.sock is still" >&2
-        echo "       being listened on. Something owns that socket under a name this" >&2
-        echo "       script doesn't recognize. Refusing to kill the TUI and fail on bind." >&2
-        echo "       Find it with: ss -lxp | grep daemon.sock" >&2
-        exit 1
+# ---------------------------------------------------------------------------
+# Legacy flow (--hard, and the fallback when seamless can't run): the
+# pre-phase-6 behavior, preserved verbatim — kill list preview, drain,
+# TUI + daemon kill, detached fresh daemon, health smoke test.
+# ---------------------------------------------------------------------------
+legacy_flow() {
+    step "current daemon state"
+    # Path-agnostic on purpose. These used to anchor on "/target/release/…",
+    # which silently stopped matching when the build moved to a shared
+    # target-dir: the TUI launches the daemon from
+    # ~/.cm/shared-target/release/cm-daemon, and the "-" before "target" kills
+    # the match. The failure mode was nasty — no daemon found, so the
+    # freshness check and kill-list preview were both skipped, the TUI was
+    # killed anyway (its pattern still matched), and the "fresh" daemon then
+    # died on bind because the stale one still owned the socket. Net: TUI
+    # dead, stale daemon still serving, no code reloaded.
+    DAEMON_PID=$(pgrep -f "release/cm-daemon$" | head -1 || true)
+    if [ -z "$DAEMON_PID" ]; then
+        # Nothing matched — but is the socket actually free? If something is
+        # still listening we'd kill the TUI and then fail on bind, which is
+        # exactly the damage described above. Bail while it's still cheap.
+        if [ -S "$SOCKET" ] && command -v ss >/dev/null 2>&1 \
+            && ss -lx 2>/dev/null | grep -q "$SOCKET"; then
+            echo "ERROR: no cm-daemon process matched, but $SOCKET is still" >&2
+            echo "       being listened on. Something owns that socket under a name this" >&2
+            echo "       script doesn't recognize. Refusing to kill the TUI and fail on bind." >&2
+            echo "       Find it with: ss -lxp | grep daemon.sock" >&2
+            exit 1
+        fi
+        echo "no running cm-daemon found; will start fresh"
+        DAEMON_START_EPOCH=0
+    else
+        DAEMON_START_HUMAN=$(ps -p "$DAEMON_PID" -o lstart= | xargs)
+        DAEMON_START_EPOCH=$(date -d "$DAEMON_START_HUMAN" +%s)
+        echo "daemon PID:        $DAEMON_PID"
+        echo "daemon started:    $DAEMON_START_HUMAN"
+        echo "binary on disk:    $DAEMON_BIN_HUMAN"
+        if [ "$DAEMON_BIN_MTIME" -le "$DAEMON_START_EPOCH" ]; then
+            echo
+            echo "Binary is NOT newer than the running daemon. Nothing to deploy."
+            echo "(If you want to restart anyway, kill the daemon manually and re-run.)"
+            exit 0
+        fi
+        AGE_SECS=$((DAEMON_BIN_MTIME - DAEMON_START_EPOCH))
+        echo "binary newer by:   ${AGE_SECS}s"
     fi
-    echo "no running cm-daemon found; will start fresh"
-    DAEMON_START_EPOCH=0
-else
-    DAEMON_START_HUMAN=$(ps -p "$DAEMON_PID" -o lstart= | xargs)
-    DAEMON_START_EPOCH=$(date -d "$DAEMON_START_HUMAN" +%s)
-    echo "daemon PID:        $DAEMON_PID"
-    echo "daemon started:    $DAEMON_START_HUMAN"
-    echo "binary on disk:    $DAEMON_BIN_HUMAN"
-    if [ "$DAEMON_BIN_MTIME" -le "$DAEMON_START_EPOCH" ]; then
-        echo
-        echo "Binary is NOT newer than the running daemon. Nothing to deploy."
-        echo "(If you want to restart anyway, kill the daemon manually and re-run.)"
+
+    TUI_PID=$(pgrep -f "release/claude-manager-tui$" | head -1 || true)
+    if [ -n "$TUI_PID" ]; then
+        TUI_START_HUMAN=$(ps -p "$TUI_PID" -o lstart= | xargs)
+        echo "TUI PID:           $TUI_PID  (started $TUI_START_HUMAN)"
+    fi
+
+    if [ -n "$DAEMON_PID" ]; then
+        step "kill list (these die on restart)"
+        pgrep -P "$DAEMON_PID" -af | sed 's/^/  /' || echo "  (no daemon children)"
+    fi
+
+    if [ "$DRY" = "1" ]; then
+        step "dry-run complete — no processes killed"
         exit 0
     fi
-    AGE_SECS=$((DAEMON_BIN_MTIME - DAEMON_START_EPOCH))
-    echo "binary newer by:   ${AGE_SECS}s"
-fi
 
-TUI_PID=$(pgrep -f "release/claude-manager-tui$" | head -1 || true)
-if [ -n "$TUI_PID" ]; then
-    TUI_START_HUMAN=$(ps -p "$TUI_PID" -o lstart= | xargs)
-    echo "TUI PID:           $TUI_PID  (started $TUI_START_HUMAN)"
-fi
-
-if [ -n "$DAEMON_PID" ]; then
-    step "kill list (these die on restart)"
-    pgrep -P "$DAEMON_PID" -af | sed 's/^/  /' || echo "  (no daemon children)"
-fi
-
-if [ "$DRY" = "1" ]; then
-    step "dry-run complete — no processes killed"
-    exit 0
-fi
-
-# Operator RPC helper (same 4-byte-length JSON framing as the smoke test
-# below). Prints the raw JSON response; non-zero exit = socket-level
-# failure (daemon down / predates the method) — callers treat that as
-# "skip gracefully", never as fatal.
-cm_op_call() {
-    python3 - "$HOME/.cm/daemon.sock" "$1" "$2" <<'PY' 2>/dev/null
-import json, os, socket, struct, sys
-sock, method, params = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
-body = json.dumps({"id": os.urandom(8).hex(),
-                   "caller": {"token_id": "cm-redeploy"},
-                   "method": method, "params": params}).encode()
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(5.0)
-s.connect(sock)
-try:
-    s.sendall(struct.pack(">I", len(body)) + body)
-    raw = b""
-    while len(raw) < 4:
-        chunk = s.recv(4 - len(raw))
-        if not chunk:
-            raise OSError("eof")
-        raw += chunk
-    (n,) = struct.unpack(">I", raw)
-    buf = b""
-    while len(buf) < n:
-        chunk = s.recv(n - len(buf))
-        if not chunk:
-            raise OSError("eof")
-        buf += chunk
-finally:
-    s.close()
-print(buf.decode())
-PY
-}
-
-# H3: drain before killing. Stops new spawns + parks the continuous
-# scheduler, drops a heads-up in every live session's Stop-hook inbox,
-# then waits (bounded) for in-flight turns to reach a boundary so the
-# kill lands on a quiet seam instead of mid-thought. Best-effort: an
-# old daemon without daemon.drain just logs and proceeds — exactly the
-# pre-drain behavior.
-if [ -n "$DAEMON_PID" ]; then
-    step "draining daemon (bounded wait for turn boundaries)"
-    if cm_op_call daemon.drain '{"enable": true}' | grep -q '"ok":true'; then
-        DRAIN_DEADLINE=$(( $(date +%s) + 60 ))
-        DRAINED=0
-        while [ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]; do
-            MID=$(cm_op_call daemon.health '{}' \
-                | python3 -c 'import json,sys; print((json.load(sys.stdin).get("result") or {}).get("sessions_mid_turn", ""))' 2>/dev/null)
-            if [ "$MID" = "0" ]; then
-                DRAINED=1
-                break
+    # H3: drain before killing. Stops new spawns + parks the continuous
+    # scheduler, drops a heads-up in every live session's Stop-hook inbox,
+    # then waits (bounded) for in-flight turns to reach a boundary so the
+    # kill lands on a quiet seam instead of mid-thought. Best-effort: an
+    # old daemon without daemon.drain just logs and proceeds — exactly the
+    # pre-drain behavior.
+    if [ -n "$DAEMON_PID" ]; then
+        step "draining daemon (bounded wait for turn boundaries)"
+        if cm_op_call daemon.drain '{"enable": true}' | grep -q '"ok":true'; then
+            DRAIN_DEADLINE=$(( $(date +%s) + 60 ))
+            DRAINED=0
+            while [ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]; do
+                MID=$(cm_op_call daemon.health '{}' \
+                    | python3 -c 'import json,sys; print((json.load(sys.stdin).get("result") or {}).get("sessions_mid_turn", ""))' 2>/dev/null)
+                if [ "$MID" = "0" ]; then
+                    DRAINED=1
+                    break
+                fi
+                echo "  sessions mid-turn: ${MID:-?} — waiting..."
+                sleep 3
+            done
+            if [ "$DRAINED" = "1" ]; then
+                echo "drained: no sessions mid-turn"
+            else
+                echo "drain wait hit the 60s bound — proceeding anyway (sessions may be mid-turn)"
             fi
-            echo "  sessions mid-turn: ${MID:-?} — waiting..."
-            sleep 3
-        done
-        if [ "$DRAINED" = "1" ]; then
-            echo "drained: no sessions mid-turn"
         else
-            echo "drain wait hit the 60s bound — proceeding anyway (sessions may be mid-turn)"
+            echo "daemon.drain unavailable (old daemon?) — proceeding without drain"
         fi
+    fi
+
+    if [ "$YES" != "1" ]; then
+        echo
+        read -r -p "Proceed with restart? [y/N] " confirm
+        case "$confirm" in
+            y|Y|yes|YES) ;;
+            *)
+                # Undo the drain — an aborted redeploy must not leave the
+                # daemon refusing spawns.
+                if [ -n "$DAEMON_PID" ]; then
+                    cm_op_call daemon.drain '{"enable": false}' >/dev/null || true
+                    echo "drain cancelled"
+                fi
+                echo "aborted"
+                exit 0
+                ;;
+        esac
+    fi
+
+    step "stopping TUI"
+    if [ -n "$TUI_PID" ]; then
+        kill -TERM "$TUI_PID" 2>/dev/null || true
+        for _ in 1 2 3; do
+            kill -0 "$TUI_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$TUI_PID" 2>/dev/null; then
+            echo "TUI didn't exit on SIGTERM — sending SIGKILL"
+            kill -KILL "$TUI_PID" 2>/dev/null || true
+        fi
+        echo "TUI stopped"
     else
-        echo "daemon.drain unavailable (old daemon?) — proceeding without drain"
+        echo "no TUI running"
     fi
-fi
 
-if [ "$YES" != "1" ]; then
-    echo
-    read -r -p "Proceed with restart? [y/N] " confirm
-    case "$confirm" in
-        y|Y|yes|YES) ;;
-        *)
-            # Undo the drain — an aborted redeploy must not leave the
-            # daemon refusing spawns.
-            if [ -n "$DAEMON_PID" ]; then
-                cm_op_call daemon.drain '{"enable": false}' >/dev/null || true
-                echo "drain cancelled"
-            fi
-            echo "aborted"
-            exit 0
-            ;;
-    esac
-fi
-
-step "stopping TUI"
-if [ -n "$TUI_PID" ]; then
-    kill -TERM "$TUI_PID" 2>/dev/null || true
-    for _ in 1 2 3; do
-        kill -0 "$TUI_PID" 2>/dev/null || break
-        sleep 1
-    done
-    if kill -0 "$TUI_PID" 2>/dev/null; then
-        echo "TUI didn't exit on SIGTERM — sending SIGKILL"
-        kill -KILL "$TUI_PID" 2>/dev/null || true
+    step "stopping daemon"
+    if [ -n "$DAEMON_PID" ]; then
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$DAEMON_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "daemon didn't exit on SIGTERM — sending SIGKILL"
+            kill -KILL "$DAEMON_PID" 2>/dev/null || true
+            sleep 1
+        fi
+        echo "daemon stopped"
+    else
+        echo "no daemon was running"
     fi
-    echo "TUI stopped"
-else
-    echo "no TUI running"
-fi
 
-step "stopping daemon"
-if [ -n "$DAEMON_PID" ]; then
-    kill -TERM "$DAEMON_PID" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do
-        kill -0 "$DAEMON_PID" 2>/dev/null || break
-        sleep 1
-    done
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then
-        echo "daemon didn't exit on SIGTERM — sending SIGKILL"
-        kill -KILL "$DAEMON_PID" 2>/dev/null || true
-        sleep 1
+    step "starting new daemon"
+    mkdir -p "$(dirname "$DAEMON_LOG")"
+    # setsid + nohup: detach from this shell so the daemon survives our exit.
+    # Redirect stdout/stderr to the log file with a date header for grep-ability.
+    {
+        echo
+        echo "===== cm-daemon start at $(date -Iseconds) (binary $DAEMON_BIN_HUMAN) ====="
+    } >> "$DAEMON_LOG"
+    # Hand the operator token to the daemon we start (the same token
+    # this script resolves for its own RPCs — env or ~/.cm/operator-token).
+    # Without this, a script-launched daemon comes up with operator-token
+    # validation DISABLED, daemon.restart fails closed against it, and
+    # every later run of this script falls back to the legacy
+    # kill-everything path forever: the seamless flow could never
+    # bootstrap through its own legacy restart. Empty token → unset
+    # (today's behavior), so a host with no token file is unchanged.
+    if [ -n "$OP_TOKEN" ]; then
+        setsid nohup env CM_OPERATOR_TOKEN="$OP_TOKEN" "$DAEMON_BINARY" >> "$DAEMON_LOG" 2>&1 < /dev/null &
+    else
+        setsid nohup "$DAEMON_BINARY" >> "$DAEMON_LOG" 2>&1 < /dev/null &
     fi
-    echo "daemon stopped"
-else
-    echo "no daemon was running"
-fi
+    NEW_DAEMON_PID=$!
+    disown "$NEW_DAEMON_PID" 2>/dev/null || true
+    sleep 1
+    if ! kill -0 "$NEW_DAEMON_PID" 2>/dev/null; then
+        echo "ERROR: daemon failed to start. tail of $DAEMON_LOG:" >&2
+        tail -20 "$DAEMON_LOG" >&2
+        exit 1
+    fi
+    echo "new daemon PID: $NEW_DAEMON_PID"
+    echo "log:            $DAEMON_LOG"
 
-step "starting new daemon"
-mkdir -p "$(dirname "$DAEMON_LOG")"
-# setsid + nohup: detach from this shell so the daemon survives our exit.
-# Redirect stdout/stderr to the log file with a date header for grep-ability.
-{
-    echo
-    echo "===== cm-daemon start at $(date -Iseconds) (binary $DAEMON_BIN_HUMAN) ====="
-} >> "$DAEMON_LOG"
-setsid nohup "$DAEMON_BINARY" >> "$DAEMON_LOG" 2>&1 < /dev/null &
-NEW_DAEMON_PID=$!
-disown "$NEW_DAEMON_PID" 2>/dev/null || true
-sleep 1
-if ! kill -0 "$NEW_DAEMON_PID" 2>/dev/null; then
-    echo "ERROR: daemon failed to start. tail of $DAEMON_LOG:" >&2
-    tail -20 "$DAEMON_LOG" >&2
-    exit 1
-fi
-echo "new daemon PID: $NEW_DAEMON_PID"
-echo "log:            $DAEMON_LOG"
-
-# ---------------------------------------------------------------------------
-# Smoke test. "The process is alive" is NOT the same as "the daemon can spawn
-# working sessions" — on 2026-08-03 a daemon came up healthy-looking with a
-# failed MCP preflight, and every session it spawned ran real work while
-# staying invisible in the TUI for ~45 minutes. The only signal was a warning
-# in this log. So ask the daemon directly and fail loudly.
-# ---------------------------------------------------------------------------
-step "smoke test"
-SOCKET="$HOME/.cm/daemon.sock"
-HEALTH=$(python3 - "$SOCKET" <<'PY' 2>/dev/null || true
+    # -----------------------------------------------------------------------
+    # Smoke test. "The process is alive" is NOT the same as "the daemon can
+    # spawn working sessions" — on 2026-08-03 a daemon came up healthy-looking
+    # with a failed MCP preflight, and every session it spawned ran real work
+    # while staying invisible in the TUI for ~45 minutes. The only signal was
+    # a warning in this log. So ask the daemon directly and fail loudly.
+    # -----------------------------------------------------------------------
+    step "smoke test"
+    HEALTH=$(python3 - "$SOCKET" "$OP_TOKEN" <<'PY' 2>/dev/null || true
 import json, os, socket, struct, sys, time
-sock = sys.argv[1]
+sock, token = sys.argv[1], sys.argv[2]
 deadline = time.time() + 15
 last = ""
 while time.time() < deadline:
     try:
         body = json.dumps({"id": os.urandom(8).hex(),
-                           "caller": {"token_id": "cm-redeploy"},
+                           "caller": {"token_id": token},
                            "method": "daemon.health", "params": {}}).encode()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5.0)
@@ -373,36 +485,36 @@ print(json.dumps({"unreachable": last}))
 PY
 )
 
-if [ -z "$HEALTH" ]; then
-    echo "WARNING: could not run the smoke test (no python3?). Check by hand:" >&2
-    echo "         tail -30 $DAEMON_LOG" >&2
-elif echo "$HEALTH" | grep -q '"unreachable"'; then
-    echo "ERROR: daemon is running but did not answer daemon.health." >&2
-    echo "       $HEALTH" >&2
-    echo "       If this daemon predates daemon.health that's expected; otherwise" >&2
-    echo "       check: tail -30 $DAEMON_LOG" >&2
-    exit 1
-else
-    MCP_OK=$(echo "$HEALTH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mcp_ok"))' 2>/dev/null || echo "?")
-    echo "sessions restored: $(echo "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"{d.get(\"sessions\")} ({d.get(\"sessions_with_transcript\")} with a transcript)")' 2>/dev/null || echo '?')"
-    if [ "$MCP_OK" = "True" ]; then
-        echo "MCP preflight:     OK"
-    else
-        echo >&2
-        echo "ERROR: MCP PREFLIGHT FAILED on the new daemon." >&2
-        echo "       Every session it spawns will have a dead MCP server and a dead cm" >&2
-        echo "       Stop hook: they will run, but never appear ready in the TUI." >&2
-        echo "       Do not trust this deploy. Diagnosis:" >&2
-        echo "$HEALTH" | python3 -c 'import json,sys; print("       "+str(json.load(sys.stdin).get("mcp_detail","")).replace(chr(10),chr(10)+"       "))' >&2 2>/dev/null || true
-        echo >&2
-        echo "       Common cause: this script was run from a git WORKTREE, so the" >&2
-        echo "       daemon inherited a checkout with no mcp_server/.venv." >&2
+    if [ -z "$HEALTH" ]; then
+        echo "WARNING: could not run the smoke test (no python3?). Check by hand:" >&2
+        echo "         tail -30 $DAEMON_LOG" >&2
+    elif echo "$HEALTH" | grep -q '"unreachable"'; then
+        echo "ERROR: daemon is running but did not answer daemon.health." >&2
+        echo "       $HEALTH" >&2
+        echo "       If this daemon predates daemon.health that's expected; otherwise" >&2
+        echo "       check: tail -30 $DAEMON_LOG" >&2
         exit 1
+    else
+        MCP_OK=$(echo "$HEALTH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mcp_ok"))' 2>/dev/null || echo "?")
+        echo "sessions restored: $(echo "$HEALTH" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"{d.get(\"sessions\")} ({d.get(\"sessions_with_transcript\")} with a transcript)")' 2>/dev/null || echo '?')"
+        if [ "$MCP_OK" = "True" ]; then
+            echo "MCP preflight:     OK"
+        else
+            echo >&2
+            echo "ERROR: MCP PREFLIGHT FAILED on the new daemon." >&2
+            echo "       Every session it spawns will have a dead MCP server and a dead cm" >&2
+            echo "       Stop hook: they will run, but never appear ready in the TUI." >&2
+            echo "       Do not trust this deploy. Diagnosis:" >&2
+            echo "$HEALTH" | python3 -c 'import json,sys; print("       "+str(json.load(sys.stdin).get("mcp_detail","")).replace(chr(10),chr(10)+"       "))' >&2 2>/dev/null || true
+            echo >&2
+            echo "       Common cause: this script was run from a git WORKTREE, so the" >&2
+            echo "       daemon inherited a checkout with no mcp_server/.venv." >&2
+            exit 1
+        fi
     fi
-fi
 
-step "ready"
-cat <<EOF
+    step "ready"
+    cat <<EOF
 Daemon restarted on the new binary. To bring the TUI back up, run from
 your interactive terminal:
 
@@ -410,4 +522,201 @@ your interactive terminal:
 
 (The TUI reads ~/.config/claude-manager/.env directly, so you don't need
 to source it first.)
+EOF
+    exit 0
+}
+
+# Route a would-be-seamless run into the legacy flow with the reason up
+# front — the operator must see WHY sessions are about to die.
+fall_back_to_legacy() {
+    echo
+    echo "!!! SEAMLESS RESTART UNAVAILABLE — falling back to the LEGACY flow (sessions WILL die):"
+    printf '!!!   %s\n' "$1"
+    legacy_flow
+}
+
+if [ "$HARD" = "1" ]; then
+    step "hard restart requested (--hard)"
+    legacy_flow
+fi
+
+# ---------------------------------------------------------------------------
+# Seamless path (default): probe → daemon.restart → verify via health.
+# ---------------------------------------------------------------------------
+
+step "probing daemon for seamless-restart support"
+HEALTH_RESP=$(cm_op_call daemon.health '{}' || true)
+if [ -z "$HEALTH_RESP" ]; then
+    fall_back_to_legacy "no daemon answered daemon.health on $SOCKET (down, or socket missing) — the legacy flow will start one fresh"
+fi
+
+HEALTH_OK=$(resp_field "$HEALTH_RESP" "d.get('ok')")
+if [ "$HEALTH_OK" != "True" ]; then
+    ERR_CODE=$(resp_field "$HEALTH_RESP" "(d.get('error') or {}).get('code')")
+    ERR_MSG=$(resp_field "$HEALTH_RESP" "(d.get('error') or {}).get('message')")
+    if [ "$ERR_CODE" = "unauthorized" ]; then
+        echo "ERROR: the daemon rejected this script's operator token (daemon.health -> unauthorized)." >&2
+        echo "       Token source tried: \$CM_OPERATOR_TOKEN, then ~/.cm/operator-token." >&2
+        echo "       Is the token file stale relative to the running daemon's CM_OPERATOR_TOKEN?" >&2
+        echo "       Fix the token, or run scripts/cm-redeploy --hard for the legacy flow." >&2
+        echo "       Daemon said: $ERR_MSG" >&2
+        exit 2
+    fi
+    fall_back_to_legacy "daemon.health answered a structured error ($ERR_CODE: $ERR_MSG)"
+fi
+
+OLD_BUILD_ID=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('build_id')")
+STRONG_AUTH=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('strong_operator_auth')")
+OLD_GEN=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('reexec_generation')")
+OLD_SESSIONS=$(resp_field "$HEALTH_RESP" "(d.get('result') or {}).get('sessions')")
+
+if [ -z "$OLD_BUILD_ID" ]; then
+    fall_back_to_legacy "this daemon predates daemon.restart (its daemon.health carries no build_id) — only the legacy restart can load the new code"
+fi
+
+if [ "$STRONG_AUTH" != "True" ]; then
+    fall_back_to_legacy "the daemon reports strong_operator_auth=false: it was started without CM_OPERATOR_TOKEN, so daemon.restart will refuse (it fails CLOSED — code replacement must never ride the compat fail-open operator path; ssh-trust doesn't count either). Restart the daemon through the TUI's launch path (which sets the token) to enable seamless restarts"
+fi
+
+if [ "$HAVE_TOKEN" != "1" ]; then
+    echo "ERROR: the daemon has strong operator auth configured, but this script found no" >&2
+    echo "       operator token to authenticate with. daemon.restart requires it." >&2
+    echo "       Provide it via the CM_OPERATOR_TOKEN env var, or ensure the TUI's persisted" >&2
+    echo "       token file exists at ~/.cm/operator-token (the TUI writes it at launch —" >&2
+    echo "       the same value it passed to the daemon)." >&2
+    echo "       Deliberately NOT falling back to the session-killing legacy flow over a" >&2
+    echo "       missing token; run scripts/cm-redeploy --hard if you really want that." >&2
+    exit 2
+fi
+
+step "current daemon state (seamless)"
+DAEMON_PID=$(pgrep -f "release/cm-daemon$" | head -1 || true)
+if [ -n "$DAEMON_PID" ]; then
+    DAEMON_START_HUMAN=$(ps -p "$DAEMON_PID" -o lstart= | xargs)
+    DAEMON_START_EPOCH=$(date -d "$DAEMON_START_HUMAN" +%s)
+    echo "daemon PID:        $DAEMON_PID  (started $DAEMON_START_HUMAN)"
+    echo "binary on disk:    $DAEMON_BIN_HUMAN"
+    if [ "$DAEMON_BIN_MTIME" -le "$DAEMON_START_EPOCH" ]; then
+        echo
+        echo "Binary is NOT newer than the running daemon. Nothing to deploy."
+        echo "(daemon.restart into the same artifact is legal but loads no new code;"
+        echo " re-run after a build, or restart by hand if you want it anyway.)"
+        exit 0
+    fi
+    echo "binary newer by:   $((DAEMON_BIN_MTIME - DAEMON_START_EPOCH))s"
+else
+    echo "no cm-daemon process matched by name, but the socket answers health —"
+    echo "proceeding on the RPC alone (the freshness shortcut is skipped)."
+fi
+echo "build_id:          $OLD_BUILD_ID"
+echo "reexec_generation: $OLD_GEN"
+echo "sessions:          $OLD_SESSIONS (all survive a seamless restart)"
+
+if [ "$DRY" = "1" ]; then
+    step "dry-run complete — would call daemon.restart"
+    echo "would fire: daemon.restart {\"binary_path\": \"$DAEMON_BINARY\"}"
+    echo "then poll daemon.health (~30s) until reexec_generation > $OLD_GEN,"
+    echo "assert sessions == $OLD_SESSIONS survived, and report the build_id change."
+    echo "No TUI kill on this path — attach streams auto-reattach."
+    exit 0
+fi
+
+if [ "$YES" != "1" ]; then
+    echo
+    read -r -p "Proceed with SEAMLESS in-place restart (sessions survive)? [y/N] " confirm
+    case "$confirm" in y|Y|yes|YES) ;; *) echo "aborted (nothing happened)"; exit 0 ;; esac
+fi
+
+step "firing daemon.restart"
+FIRE_RESP=$(cm_op_fire daemon.restart "{\"binary_path\": \"$DAEMON_BINARY\"}" || true)
+if [ -z "$FIRE_RESP" ]; then
+    echo "ERROR: could not send daemon.restart (socket refused mid-flight?)." >&2
+    echo "       The daemon was NOT restarted. Check: ss -lx | grep daemon.sock" >&2
+    exit 1
+fi
+if echo "$FIRE_RESP" | grep -q '"fired"'; then
+    echo "connection died at the exec — restart in progress (fire-and-verify)"
+else
+    FIRE_OK=$(resp_field "$FIRE_RESP" "d.get('ok')")
+    if [ "$FIRE_OK" = "True" ]; then
+        echo "WARNING: daemon.restart answered ok — unexpected (success should never" >&2
+        echo "         answer). Continuing to the verify step anyway." >&2
+    else
+        ERR_CODE=$(resp_field "$FIRE_RESP" "(d.get('error') or {}).get('code')")
+        ERR_MSG=$(resp_field "$FIRE_RESP" "(d.get('error') or {}).get('message')")
+        if [ "$ERR_CODE" = "unknown_method" ]; then
+            fall_back_to_legacy "the daemon does not serve daemon.restart (unknown_method) despite advertising build_id — version skew?"
+        fi
+        echo "ERROR: daemon.restart REFUSED — the daemon restored itself to its pre-call" >&2
+        echo "       state; nothing was restarted. Diagnosis:" >&2
+        echo "       [$ERR_CODE] $ERR_MSG" >&2
+        exit 1
+    fi
+fi
+
+step "verifying the swap (poll daemon.health for a generation increment)"
+VERIFY_DEADLINE=$(( $(date +%s) + 30 ))
+NEW_HEALTH=""
+while [ "$(date +%s)" -lt "$VERIFY_DEADLINE" ]; do
+    H=$(cm_op_call daemon.health '{}' || true)
+    if [ -n "$H" ] && [ "$(resp_field "$H" "d.get('ok')")" = "True" ]; then
+        GEN=$(resp_field "$H" "(d.get('result') or {}).get('reexec_generation')")
+        if [ -n "$GEN" ] && [ "$GEN" -gt "$OLD_GEN" ] 2>/dev/null; then
+            NEW_HEALTH="$H"
+            break
+        fi
+    fi
+    sleep 1
+done
+
+if [ -z "$NEW_HEALTH" ]; then
+    echo "ERROR: daemon.health never reported reexec_generation > $OLD_GEN within 30s." >&2
+    echo "       The swap did not verify. Possible states:" >&2
+    echo "         - rehydrate failed and the daemon ROLLED BACK to the old binary" >&2
+    echo "           (sessions intact, old code still running), or" >&2
+    echo "         - the terminal fallback ran (sessions killed + legacy-restored)." >&2
+    echo "       Diagnose: tail -50 $DAEMON_LOG ; cat ~/.cm/reexec-crash-note.log" >&2
+    exit 1
+fi
+
+NEW_BUILD_ID=$(resp_field "$NEW_HEALTH" "(d.get('result') or {}).get('build_id')")
+NEW_GEN=$(resp_field "$NEW_HEALTH" "(d.get('result') or {}).get('reexec_generation')")
+NEW_SESSIONS=$(resp_field "$NEW_HEALTH" "(d.get('result') or {}).get('sessions')")
+NEW_MCP_OK=$(resp_field "$NEW_HEALTH" "(d.get('result') or {}).get('mcp_ok')")
+
+step "verify verdict"
+echo "reexec_generation: $OLD_GEN -> $NEW_GEN (swap committed)"
+if [ "$NEW_BUILD_ID" != "$OLD_BUILD_ID" ]; then
+    echo "build_id:          $OLD_BUILD_ID -> $NEW_BUILD_ID"
+else
+    echo "build_id:          $NEW_BUILD_ID (unchanged — a same-commit rebuild can't move"
+    echo "                   the git sha; the generation increment above is the proof the"
+    echo "                   new artifact is running)"
+fi
+echo "sessions:          $OLD_SESSIONS before -> $NEW_SESSIONS after"
+if [ "$NEW_SESSIONS" -lt "$OLD_SESSIONS" ] 2>/dev/null; then
+    echo >&2
+    echo "ERROR: session count DROPPED across the swap ($OLD_SESSIONS -> $NEW_SESSIONS)." >&2
+    echo "       A session may have exited naturally in the window, but verify before" >&2
+    echo "       trusting this deploy: check list_sessions / the TUI sidebar, and" >&2
+    echo "       tail -50 $DAEMON_LOG" >&2
+    exit 1
+fi
+if [ "$NEW_MCP_OK" = "True" ]; then
+    echo "MCP preflight:     OK"
+else
+    echo >&2
+    echo "ERROR: MCP PREFLIGHT FAILED on the swapped daemon." >&2
+    echo "       Every session it spawns will have a dead MCP server and a dead cm" >&2
+    echo "       Stop hook. Do not trust this deploy. Diagnosis:" >&2
+    resp_field "$NEW_HEALTH" "(d.get('result') or {}).get('mcp_detail')" >&2
+    exit 1
+fi
+
+step "ready"
+cat <<EOF
+Seamless restart verified: same daemon process, new code, sessions intact.
+The TUI was left RUNNING — its attach streams dropped at the exec and
+auto-reattach on their own (no action needed). If a pane looks stuck,
+A-a re-attaches it by hand.
 EOF

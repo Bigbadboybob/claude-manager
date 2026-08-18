@@ -324,10 +324,10 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
 /// these — `daemon.drain` is the front door it composes with,
 /// `daemon.health` is how the caller polls the attempt (and how
 /// cm-redeploy verifies it), `daemon.reload_config` is drain-window
-/// operator tooling, and `daemon.restart` (future slice) is the RPC
-/// that RUNS the coordinator. Counting any of them would deadlock the
-/// barrier against its own operator: a `daemon.health` poll arriving
-/// mid-quiesce would hold the counter above zero, and the eventual
+/// operator tooling, and `daemon.restart` (phase 6 — landed) is the
+/// RPC that RUNS the coordinator. Counting any of them would deadlock
+/// the barrier against its own operator: a `daemon.health` poll
+/// arriving mid-quiesce would hold the counter above zero, and a
 /// `daemon.restart` call would wait on a counter it is itself
 /// inflating.
 pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
@@ -474,6 +474,15 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }
         "daemon.drain" => DispatchOutcome::Done(dispatch_daemon_drain(state, req)),
+        // DESIGN_SEAMLESS_RESTART phase 6: the PRODUCTION in-place
+        // restart. Always dispatched (no dev gate); strong-operator
+        // gated (fail-closed, R14); pinned-artifact target policy; NO
+        // skip_preflight. On success the connection dies at the exec
+        // (fire-and-verify — the caller polls daemon.health for
+        // build_id / reexec_generation).
+        "daemon.restart" => {
+            DispatchOutcome::Done(dispatch_daemon_restart(state, req))
+        }
         // DESIGN_SEAMLESS_RESTART phase 3b: dev-gated re-exec handoff
         // skeleton. Answers unknown-method unless the daemon started
         // with CM_REEXEC=1; strong-operator gated when enabled. On
@@ -1616,6 +1625,131 @@ fn dispatch_daemon_drain(
     }
 }
 
+/// `daemon.restart` — the PRODUCTION in-place restart
+/// (DESIGN_SEAMLESS_RESTART phase 6): exec the target binary in the
+/// same process, sessions untouched. The production twin of
+/// [`dispatch_daemon_reexec_dev`], differing in exactly the
+/// load-bearing ways:
+///
+/// - **Always dispatched** — no `CM_REEXEC` dev gate. The security
+///   boundary is the strong-operator gate, not discoverability.
+/// - **`operator::require_strong_operator`** — same fail-closed shape
+///   as the dev method (R14): refuses outright when operator-token
+///   validation isn't configured, regardless of `[auth] mode`.
+/// - **Pinned-artifact policy** (design § Security posture): params
+///   carry an OPTIONAL `binary_path`. The DEFAULT is the daemon's own
+///   executable path re-resolved via `/proc/self/exe` at RPC time —
+///   which a deploy overwrites with the NEW binary (`cp` /
+///   `cargo build`), so "build then `daemon.restart`" is exactly the
+///   intended flow. A caller-supplied path must be an ABSOLUTE path
+///   to a regular file. When the target inode equals the RUNNING
+///   image's (`/proc/self/exe`), the design's deferred
+///   new-inode ≠ rollback-inode assertion fires as a **warning, not a
+///   refusal** — a same-binary restart is legitimate (config-adjacent
+///   state reload, post-crash freshening) but no code change takes
+///   effect: `same_binary: true` is logged up front and, since the
+///   success case never answers, appended to any inline failure text.
+/// - **NO `skip_preflight`** — the P4c deviation note: the
+///   `--verify-handoff` preflight is load-bearing in production, so
+///   the parameter is REJECTED (not silently ignored — an operator
+///   script that thinks it skipped the preflight must not be told the
+///   call succeeded on different semantics). Only the dev method
+///   keeps the escape hatch.
+///
+/// Fire-and-verify contract, same as dev: SUCCESS never writes a
+/// response — the connection dies at the exec — and the caller polls
+/// `daemon.health` for `build_id` / `reexec_generation` (step 7);
+/// only failures answer, inline, after `perform_reexec`'s abort path
+/// restored the daemon to its pre-call state.
+fn dispatch_daemon_restart(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err((code, message)) = operator::require_strong_operator(&req.caller)
+    {
+        return Response::err(req.id.clone(), code, message);
+    }
+    if req.params.get("skip_preflight").is_some() {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::InvalidParams,
+            "daemon.restart does not expose skip_preflight — the \
+             --verify-handoff preflight is load-bearing on the production \
+             method (DESIGN_SEAMLESS_RESTART phase 6, P4c deviation note). \
+             The dev-gated daemon.reexec_dev keeps the escape hatch."
+                .to_string(),
+        );
+    }
+    let binary_path = match req.params.get("binary_path") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(other) => {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::InvalidParams,
+                format!(
+                    "daemon.restart params.binary_path must be a string \
+                     (absolute path) when supplied; got {}",
+                    other,
+                ),
+            );
+        }
+    };
+    let target = match crate::reexec::resolve_restart_target(binary_path) {
+        Ok(t) => t,
+        Err(msg) => {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::InvalidParams,
+                format!("daemon.restart: {}", msg),
+            );
+        }
+    };
+    // The early, non-fatal log line (unbuffered stderr): on success
+    // nothing else ever reports what was targeted or whether it was a
+    // same-binary restart.
+    eprintln!(
+        "cm-daemon: daemon.restart — target {} ({}), same_binary: {}{}",
+        target.path.display(),
+        if binary_path.is_some() {
+            "caller-supplied"
+        } else {
+            "default: own executable path via /proc/self/exe"
+        },
+        target.same_binary,
+        if target.same_binary {
+            " — the target inode equals the running image's \
+             (/proc/self/exe): legitimate (config-adjacent state reload, \
+             post-crash freshening) but NO code change will take effect"
+        } else {
+            ""
+        },
+    );
+    // No state lock held across the call: perform_reexec's quiesce
+    // barrier waits on in-flight mutations that need it, and the gate
+    // freezes must be taken lock-free (see `crate::reexec`'s module
+    // docs). Success never reaches the line below — the exec replaces
+    // the process image mid-call. `skip_preflight` is hard-wired
+    // false: the production method cannot reach the escape hatch.
+    let err = crate::reexec::perform_reexec(state, &target.path, false);
+    Response::err(
+        req.id.clone(),
+        ErrorCode::Internal,
+        format!(
+            "daemon.restart failed; the daemon has been restored to its \
+             pre-call state: {:#}{}",
+            err,
+            if target.same_binary {
+                " (note: same_binary=true — the target inode equals the \
+                 running image's, so even a retry that succeeds will load \
+                 no new code)"
+            } else {
+                ""
+            },
+        ),
+    )
+}
+
 /// `daemon.reexec_dev` — the dev-gated trigger for the re-exec handoff
 /// skeleton (DESIGN_SEAMLESS_RESTART phase 3b). Params:
 /// `{binary_path: string}` — the binary to exec in place — plus
@@ -2559,6 +2693,253 @@ mod tests {
         let st = state.lock().unwrap();
         assert!(!st.restarting, "abort must clear restarting");
         assert!(!st.draining, "abort must un-drain");
+    }
+
+    // --- daemon.restart (DESIGN_SEAMLESS_RESTART phase 6) ---------------
+
+    /// The production method fails CLOSED in both auth worlds:
+    /// validation-disabled (compat fail-open — the R14 gap) refuses
+    /// even a perfectly Operator-shaped caller, and the configured
+    /// world refuses Session callers and wrong-token Operators. Note
+    /// the state carries `reexec_enabled: false` throughout — unlike
+    /// `daemon.reexec_dev`, the production method is ALWAYS
+    /// dispatched (an Unauthorized answer, not unknown-method, is
+    /// itself proof of that).
+    #[test]
+    fn daemon_restart_fails_closed_without_strong_operator_auth() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state();
+        assert!(
+            !state.lock().unwrap().reexec_enabled,
+            "precondition: no dev flag — production dispatch is ungated"
+        );
+
+        // World 1: validation disabled → refuse any Operator claim.
+        {
+            let _world = crate::control::operator::test_override::set(None);
+            let resp = dispatch_request(
+                &state,
+                &operator_request("daemon.restart", serde_json::json!({})),
+            )
+            .into_response();
+            assert!(!resp.ok);
+            let err = resp.error.expect("error body");
+            assert_eq!(err.code, ErrorCode::Unauthorized);
+            assert!(
+                err.message.contains("CM_OPERATOR_TOKEN"),
+                "refusal must name what's missing: {}",
+                err.message
+            );
+        }
+
+        // World 2: token configured → Session callers and wrong-token
+        // Operators are refused.
+        {
+            let _world =
+                crate::control::operator::test_override::set(Some("strong-tok"));
+            let resp = dispatch_request(
+                &state,
+                &session_request(
+                    "daemon.restart",
+                    serde_json::json!({}),
+                    "ts-hosted",
+                ),
+            )
+            .into_response();
+            assert_eq!(
+                resp.error.expect("session caller refused").code,
+                ErrorCode::Unauthorized
+            );
+
+            let mut wrong =
+                operator_request("daemon.restart", serde_json::json!({}));
+            wrong.caller = Caller::operator("guessed-wrong");
+            let resp = dispatch_request(&state, &wrong).into_response();
+            assert_eq!(
+                resp.error.expect("wrong token refused").code,
+                ErrorCode::Unauthorized
+            );
+        }
+    }
+
+    /// The P4c deviation note, enforced: the production method REJECTS
+    /// `skip_preflight` (never silently ignores it — an operator
+    /// script that believes it skipped the preflight must not proceed
+    /// on different semantics). And the strong gate still comes FIRST:
+    /// an unauthorized caller passing the param learns nothing beyond
+    /// Unauthorized.
+    #[test]
+    fn daemon_restart_rejects_skip_preflight() {
+        let _g = crate::test_support::env_lock();
+        let _world =
+            crate::control::operator::test_override::set(Some("strong-tok"));
+        let state = make_state();
+
+        // Gate first: a Session caller with the param is refused as
+        // Unauthorized, not InvalidParams.
+        let resp = dispatch_request(
+            &state,
+            &session_request(
+                "daemon.restart",
+                serde_json::json!({"skip_preflight": true}),
+                "ts-hosted",
+            ),
+        )
+        .into_response();
+        assert_eq!(
+            resp.error.expect("gate before params").code,
+            ErrorCode::Unauthorized
+        );
+
+        // A cleared gate + the param → rejected, naming the contract.
+        // Even `skip_preflight: false` is rejected: the parameter does
+        // not exist on this method.
+        for val in [serde_json::json!(true), serde_json::json!(false)] {
+            let mut req = operator_request(
+                "daemon.restart",
+                serde_json::json!({
+                    "binary_path": "/bin/true",
+                    "skip_preflight": val
+                }),
+            );
+            req.caller = Caller::operator("strong-tok");
+            let resp = dispatch_request(&state, &req).into_response();
+            let err = resp.error.expect("skip_preflight rejected");
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+            assert!(
+                err.message.contains("skip_preflight")
+                    && err.message.contains("daemon.reexec_dev"),
+                "rejection must name the param and the dev alternative: {}",
+                err.message
+            );
+        }
+    }
+
+    /// Pinned-artifact parameter policy: a caller-supplied
+    /// `binary_path` must be an absolute path to an existing regular
+    /// file, and must be a string.
+    #[test]
+    fn daemon_restart_binary_path_validation() {
+        let _g = crate::test_support::env_lock();
+        let _world =
+            crate::control::operator::test_override::set(Some("strong-tok"));
+        let state = make_state();
+        let strong = |params: serde_json::Value| {
+            let mut req = operator_request("daemon.restart", params);
+            req.caller = Caller::operator("strong-tok");
+            dispatch_request(&state, &req).into_response()
+        };
+
+        let resp = strong(serde_json::json!({"binary_path": "relative/bin"}));
+        let err = resp.error.expect("relative path rejected");
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("not absolute"),
+            "must name the absolute-path constraint: {}",
+            err.message
+        );
+
+        let resp = strong(
+            serde_json::json!({"binary_path": "/nonexistent/cm-daemon-x"}),
+        );
+        let err = resp.error.expect("missing file rejected");
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("is not usable"),
+            "must say the file is unusable: {}",
+            err.message
+        );
+
+        let resp = strong(serde_json::json!({"binary_path": 42}));
+        let err = resp.error.expect("non-string rejected");
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("must be a string"),
+            "must name the type constraint: {}",
+            err.message
+        );
+    }
+
+    /// A gate-cleared `daemon.restart` with NO binary_path resolves
+    /// the DEFAULT target (the daemon's own executable path via
+    /// /proc/self/exe — here the test binary) and reaches
+    /// `perform_reexec`'s preflight, which refuses on a listenerless
+    /// test state exactly like the dev method's test — proving the
+    /// production wiring reaches the same engine. The default target
+    /// IS the running image here (nothing rebuilt it), so the inline
+    /// error also carries the same-binary warning-not-refusal
+    /// (design's deferred new-inode ≠ rollback-inode assertion,
+    /// phase-6 shape).
+    #[test]
+    fn daemon_restart_default_target_reaches_preflight_and_warns_same_binary()
+    {
+        let _g = crate::test_support::env_lock();
+        let _world =
+            crate::control::operator::test_override::set(Some("strong-tok"));
+        let state = make_state();
+
+        let mut req =
+            operator_request("daemon.restart", serde_json::json!({}));
+        req.caller = Caller::operator("strong-tok");
+        let resp = dispatch_request(&state, &req).into_response();
+        assert!(!resp.ok);
+        let err = resp.error.expect("error body");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("listener_raw_fd"),
+            "the preflight's dry-manifest build must name the missing \
+             listener: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("dry manifest"),
+            "the failure must come from the preflight stage (no \
+             skip_preflight exists to bypass it): {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("same_binary=true"),
+            "restarting into the running image's own inode must carry the \
+             warning (not a refusal): {}",
+            err.message
+        );
+
+        let st = state.lock().unwrap();
+        assert!(!st.restarting, "abort must clear restarting");
+        assert!(!st.draining, "abort must un-drain");
+    }
+
+    /// The `[tls]` refusal (phase 4g) holds on the production method:
+    /// a TLS-configured daemon refuses `daemon.restart` before any
+    /// side effect, naming the limitation.
+    #[test]
+    fn daemon_restart_refuses_under_tls() {
+        let _g = crate::test_support::env_lock();
+        let _world =
+            crate::control::operator::test_override::set(Some("strong-tok"));
+        let state = make_state();
+        state.lock().unwrap().config.tls = Some(crate::config::TlsConfig {
+            cert_path: "/nonexistent/cert.pem".into(),
+            key_path: "/nonexistent/key.pem".into(),
+            listen_addr: "127.0.0.1:18444".into(),
+        });
+
+        let mut req =
+            operator_request("daemon.restart", serde_json::json!({}));
+        req.caller = Caller::operator("strong-tok");
+        let resp = dispatch_request(&state, &req).into_response();
+        let err = resp.error.expect("tls refusal");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("re-exec REFUSED")
+                && err.message.contains("[tls]"),
+            "refusal must name the [tls] limitation: {}",
+            err.message
+        );
+
+        let st = state.lock().unwrap();
+        assert!(!st.restarting, "refusal happens before the coordinator");
+        assert!(!st.draining, "refusal must not leave the daemon draining");
     }
 
     // --- ping ---------------------------------------------------------
